@@ -1,16 +1,19 @@
 //! Every catalog target the executor admits derives complete assessment
 //! terms on every backend: its decode demand under both native codecs, its
 //! memory terms, and every graph a load prepares, so no call lies outside
-//! its kernel's domain. A form the executor does not run is refused at
-//! admission, with a typed reason, before any term is derived; a target past
-//! admission whose terms or graphs fail is a failure.
+//! its kernel's domain; where its experts stream on a backend, the same of
+//! its load with them in an expert bank at its floor. A form the executor
+//! does not run, or does not stream, is refused with a typed reason before
+//! any term is derived; a target past admission whose terms or graphs fail
+//! is a failure.
 
 use super::demand::DecodeDemand;
 use super::launches::Declarations;
 use super::AssessmentError;
 use crate::{
     resident_layout, AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection,
-    ExecutionPath, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
+    ExecutionPath, ModelLoadPlan, PlanError, PlannedMethod, ResourceCapacity, ResourceLimits,
+    ResourcePlanner,
 };
 use magnitude_artifacts::catalog_headers::{CatalogComponent, ComponentRole};
 use magnitude_artifacts::{
@@ -43,6 +46,13 @@ const FAMILIES: [&dyn ModelFamily; 7] = [
 /// Catalog models whose target's load must derive whatever their catalog
 /// support level.
 const REQUIRED: [&str; 1] = ["qwen3.8-flash-next:gguf:q4"];
+
+/// Catalog models whose experts must stream on every backend whose recorded
+/// device streams experts at all (whose refusal is no fact of the device or
+/// its backend, [`refused_by_the_device`]), by catalog model ID:
+/// each variant of the headline model, split across files, NVFP4 scales and
+/// an n-gram table beside the bank.
+const STREAMED: [&str; 2] = ["qwen3.8-flash-next:gguf:q4", "qwen3.8-flash-next:gguf:nvfp4"];
 
 /// Each catalog model's support level (`catalog/models.json`), by catalog
 /// model ID.
@@ -84,6 +94,8 @@ const LIMITS: ResourceLimits = ResourceLimits {
     max_images_per_request: 1,
     max_image_cells: 0,
     lookahead: true,
+    chain_capacity: std::num::NonZeroUsize::MIN,
+    conversations: std::num::NonZeroUsize::MIN,
 };
 
 #[test]
@@ -97,6 +109,8 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     let mut failures = Vec::new();
     let levels = support_levels();
     let mut required_seen = Vec::new();
+    // Each target's refusal to stream on a backend, and why.
+    let mut unstreamed = Vec::new();
     for component in headers::index() {
         if component.role != ComponentRole::Target {
             continue;
@@ -136,28 +150,9 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             refused.push(format!("{name}: {error}"));
             continue;
         }
-        let manifest = PackageManifest {
-            identity,
-            target: ComponentManifest {
-                files: vec![ComponentFile {
-                    path: component.path.clone(),
-                    size: target.tensors.iter().map(|tensor| tensor.nbytes).sum(),
-                }],
-                identity: identity.target,
-                tensors: target.tensors.clone(),
-            },
-            projector: None,
-            draft: None,
-        };
-        let selection = ComponentSelection {
-            head: false,
-            vision: false,
-        };
+        let manifest = target_manifest(component, &target, identity);
         for backend in BackendName::ALL {
-            let layout = resident_layout(ExecutionPath::Native, backend);
-            let load = match ModelLoadPlan::derive(&manifest, &definition, selection, layout)
-                .and_then(|load| load.with_selected_reads(&definition, PlannedMethod::Plain, LIMITS))
-            {
+            let load = match plain_load(&manifest, &definition, backend) {
                 Ok(load) => load,
                 // A target that must serve derives its load on every
                 // backend; another may lack a resident form.
@@ -171,110 +166,36 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                     continue;
                 }
             };
-            // Admission binds every weight to its entries' ports, a
-            // second-level scale included (`PlanError::UnportedScale`).
-            if let Err(error) = load.program_plan(&definition, KvCodec::AffineK8V4) {
-                failures.push(format!("{name} {}: {error}", backend.as_str()));
-                continue;
-            }
-            // Each call's launches are its entry's declaration's at the
-            // statics the load prepares it with.
-            let demands = [KvCodec::Dense, KvCodec::AffineK8V4]
-                .into_iter()
-                .map(|codec| {
-                    let program = load
-                        .program_plan(&definition, codec)
-                        .map_err(|error| AssessmentError::Demand(error.to_string()))?;
-                    let declarations = Declarations::of_load(
-                        backend,
-                        &program,
-                        &definition,
-                        &load,
-                        crate::native::TuningLimits::of(LIMITS, &definition),
-                    )?;
-                    let demand =
-                        DecodeDemand::from_model(&definition, &load, codec, &declarations)?;
-                    // Every call's launches at one and at the decode rows'
-                    // most.
-                    for call in &demand.calls {
-                        for rows in [1, crate::operators::attention::graph::DECODE_ROWS] {
-                            call.launches.at(rows)?;
-                        }
-                    }
-                    Ok(demand)
-                })
-                .collect::<Result<Vec<_>, AssessmentError>>();
-            let memory = AssessmentMemoryTerms::derive(
-                &definition,
-                &load,
-                selection,
-                KvCodec::AffineK8V4,
-                PlannedMethod::Plain,
-                LIMITS,
-            );
-            // Building every graph the load prepares proves no call lies
-            // outside its kernel's domain on the backend.
-            let graphs = ResourcePlanner::state_plan(
-                &definition,
-                &load,
-                PlannedMethod::Plain,
-                KvCodec::AffineK8V4,
-                LIMITS,
-                ResourceCapacity {
-                    domain_bytes: 64 << 30,
-                    tensor_operations: crate::TensorOperations::Absent,
-                },
-            )
-            .and_then(|state| {
-                AssessmentGraphResourceBounds::derive(
-                    &definition,
-                    &load,
-                    &state,
-                    PlannedMethod::Plain,
-                    KvCodec::AffineK8V4,
-                    LIMITS,
-                    backend,
-                )
-                .map_err(|error| error.to_string())
-            });
-            match (demands, memory, graphs) {
-                // A decode step streams its weights and launches its entries.
-                (Ok(demands), Ok(_), Ok(_))
-                    if demands.iter().all(|demand| {
-                        !demand.calls.is_empty()
-                            && demand
-                                .calls
-                                .iter()
-                                .any(|call| call.work.weights.iter().any(|bytes| bytes.bytes > 0))
-                    }) =>
-                {
-                    admitted.push(format!(
-                        "{name} {}: {} calls, {} weight bytes",
-                        backend.as_str(),
-                        demands[0].calls.len(),
-                        demands[0]
-                            .calls
-                            .iter()
-                            .flat_map(|call| &call.work.weights)
-                            .map(|bytes| bytes.bytes)
-                            .sum::<u64>()
-                    ))
+            // Experts that stream on the backend are planned in its bank too,
+            // at its floor: what the most constrained streamed load holds.
+            // Experts that do not stream are refused with their reason.
+            let banked = match bank_reservations(&definition, backend) {
+                Ok((reservation, host)) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host).and_then(|floor| {
+                    load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
+                })),
+                Err(PlanError::Unstreamed(reason)) => {
+                    refused.push(format!("{name} {} banked: {reason}", backend.as_str()));
+                    unstreamed.push((name.to_string(), backend, reason));
+                    None
                 }
-                (Ok(demands), Ok(_), Ok(_)) => failures.push(format!(
-                    "{name} {}: an empty decode step: {demands:?}",
-                    backend.as_str()
-                )),
-                (demands, memory, graphs) => failures.push(format!(
-                    "{name} {}: {:?} / {:?} / {:?}",
-                    backend.as_str(),
-                    demands.err(),
-                    memory.err(),
-                    graphs.err()
-                )),
+                Err(error) => {
+                    failures.push(format!("{name} {} banked: {error}", backend.as_str()));
+                    None
+                }
+            };
+            // Every routed form streams: a bank that refuses one fails.
+            let loads = std::iter::once(("resident", Ok(load))).chain(banked.map(|banked| ("banked", banked)));
+            for (form, load) in loads {
+                match load
+                    .map_err(|error| error.to_string())
+                    .and_then(|load| derive_terms(&definition, &load, SELECTION, backend))
+                {
+                    Ok(terms) => admitted.push(format!("{name} {} {form}: {terms}", backend.as_str())),
+                    Err(error) => failures.push(format!("{name} {} {form}: {error}", backend.as_str())),
+                }
             }
         }
     }
-    println!("admitted:\n  {}", admitted.join("\n  "));
     println!("refused:\n  {}", refused.join("\n  "));
     assert!(
         failures.is_empty(),
@@ -290,13 +211,326 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             "required target {name} has no catalog header"
         );
         for backend in BackendName::ALL {
-            let prefix = format!("{name} {}:", backend.as_str());
+            let prefix = format!("{name} {} resident:", backend.as_str());
             assert!(
                 admitted.iter().any(|line| line.starts_with(&prefix)),
                 "required target {name} is not admitted on {}",
                 backend.as_str()
             );
         }
+    }
+    // The targets that must stream derive their banked terms on every
+    // backend, unless the recorded device or its backend streams no experts.
+    for backend in BackendName::ALL {
+        for name in STREAMED {
+            let prefix = format!("{name} {} banked:", backend.as_str());
+            let refusal = unstreamed.iter().find(|(target, at, _)| target == name && *at == backend).map(|(_, _, reason)| reason);
+            assert!(
+                admitted.iter().any(|line| line.starts_with(&prefix)) || refusal.is_some_and(refused_by_the_device),
+                "{name} does not stream on {}: {refusal:?}",
+                backend.as_str()
+            );
+        }
+    }
+}
+
+/// Whether `reason` is a fact of the device or its backend, which refuses
+/// every model alike, rather than of the model.
+fn refused_by_the_device(reason: &crate::UnstreamedExperts) -> bool {
+    use crate::UnstreamedExperts::*;
+    matches!(reason, Backend(_) | Unreserved(_) | Unreservable { .. } | Untiered { .. })
+}
+
+/// The components a plain load of a target selects: neither an embedded
+/// head nor vision.
+const SELECTION: ComponentSelection = ComponentSelection {
+    head: false,
+    vision: false,
+};
+
+/// The package of catalog target `component` alone, its directory
+/// `target`.
+fn target_manifest(
+    component: &CatalogComponent,
+    target: &magnitude_artifacts::gguf::Directory,
+    identity: PackageIdentity,
+) -> PackageManifest {
+    PackageManifest {
+        identity,
+        target: ComponentManifest {
+            files: vec![ComponentFile {
+                path: component.path.clone(),
+                size: target.tensors.iter().map(|tensor| tensor.nbytes).sum(),
+            }],
+            identity: identity.target,
+            tensors: target.tensors.clone(),
+        },
+        projector: None,
+        draft: None,
+    }
+}
+
+/// The plain load of `manifest` on `backend`, as the standard service
+/// plans it.
+fn plain_load(
+    manifest: &PackageManifest,
+    definition: &magnitude_family_contracts::ModelDefinition,
+    backend: BackendName,
+) -> Result<ModelLoadPlan, String> {
+    let layout = resident_layout(ExecutionPath::Native, backend);
+    ModelLoadPlan::derive(manifest, definition, SELECTION, layout, PlannedMethod::Plain, LIMITS)
+}
+
+/// Where the experts of `definition` stream on `backend`: the device's and
+/// the host tier's reservations of the recorded machine of the backend.
+/// Experts that do not stream are refused with their reason.
+fn bank_reservations(
+    definition: &magnitude_family_contracts::ModelDefinition,
+    backend: BackendName,
+) -> Result<(seismic::Reservation, crate::planning::HostTier), PlanError> {
+    let recorded = recorded_reservation(backend).map_err(|why| why.to_string());
+    let substrate = crate::planning::bank_substrate(
+        backend,
+        recorded.as_ref().map(|recorded| recorded.map(|(reservation, _)| reservation)).map_err(String::as_str),
+        Ok(recorded.as_ref().ok().copied().flatten().and_then(|(_, host)| host)),
+        definition,
+    )?;
+    crate::planning::routed_experts(definition)?;
+    Ok(substrate)
+}
+
+/// Every expert record form a served catalog target streams on CUDA (each
+/// routed tensor's stored and resident elements and matrix, as its bank
+/// plans it) is resident as stored, or converts on the host, piece by piece
+/// as a landing converts it (`RowConversion::piece`), into exactly the
+/// registry's reference bytes:
+/// one record of every form, in its conversion's domain, as pieces of one
+/// tile and as pieces of the most whole tiles of 128 KiB of its source (a
+/// landing's read unit).
+#[test]
+fn every_streamed_cuda_record_converts_on_the_host_as_its_reference() {
+    let identity = PackageIdentity {
+        target: ArtifactIdentity([7; 32]),
+        projector: None,
+    };
+    let levels = support_levels();
+    let backend = BackendName::Cuda;
+    // Each form, and the targets that stream it.
+    let mut forms = BTreeMap::<(String, String, [u64; 2]), Vec<String>>::new();
+    for component in headers::index() {
+        if component.role != ComponentRole::Target {
+            continue;
+        }
+        let name = component.model.as_str();
+        let served = REQUIRED.contains(&name)
+            || !matches!(
+                levels.get(name).map(String::as_str),
+                Some("disabled" | "deprecated")
+            );
+        if !served {
+            continue;
+        }
+        let target = headers::component(component);
+        let family = FAMILIES
+            .iter()
+            .find(|family| family.recognizes(&target))
+            .unwrap_or_else(|| panic!("{name}: a family recognizes the served target"));
+        let definition = family
+            .inspect(&target, None, identity)
+            .unwrap_or_else(|error| panic!("{name}: its family inspects it: {error}"));
+        crate::operators::admit(&definition, false).unwrap_or_else(|error| panic!("{name}: admitted: {error}"));
+        // Only a target that routes experts streams them.
+        let routes = definition
+            .decoder
+            .sublayers()
+            .any(|(_, sublayer)| crate::operators::routed::routed_ffn(&sublayer.op).is_some());
+        if !routes {
+            continue;
+        }
+        let manifest = target_manifest(component, &target, identity);
+        let load = plain_load(&manifest, &definition, backend)
+            .unwrap_or_else(|error| panic!("{name}: its plain load plans on CUDA: {error}"));
+        let banked = bank_reservations(&definition, backend)
+            .and_then(|(reservation, host)| {
+                let floor = load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host)?;
+                load.with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
+            })
+            .unwrap_or_else(|error| panic!("{name}: its bank plans on CUDA: {error}"));
+        let bank = banked.expert_bank().expect("a banked load has a bank");
+        for group in &bank.groups {
+            for (_, tensor) in group.record.iter() {
+                let form = (
+                    tensor.source.name().to_owned(),
+                    tensor.resident.name().to_owned(),
+                    tensor.matrix,
+                );
+                forms.entry(form).or_default().push(name.to_owned());
+            }
+        }
+    }
+    assert!(
+        forms.keys().any(|(_, resident, _)| resident.ends_with("@mma16")),
+        "some catalog target streams mma16 records on CUDA: {forms:?}"
+    );
+    for ((source, resident, [n, k]), targets) in &forms {
+        let (source, resident) = (
+            seismic::Element::named(source).unwrap(),
+            seismic::Element::named(resident).unwrap(),
+        );
+        let context = format!("{} -> {} [{n}, {k}] of {targets:?}", source.name(), resident.name());
+        // A record resident as stored lands as its bytes.
+        if source == resident {
+            println!("{context}: resident as stored");
+            continue;
+        }
+        let conversion = seismic::cpu::repack::resolve(source.name(), resident.name())
+            .unwrap_or_else(|| panic!("{context}: no host conversion into a row layout"));
+        let (n, k) = (*n as usize, *k as usize);
+        let (tile, row) = (conversion.tile(), conversion.source_row_bytes(k));
+        let bytes = (0..n * row)
+            .map(|index| (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(29) as u8)
+            .collect();
+        let stored = resident.repack_source(source, bytes).unwrap();
+        let expected = resident
+            .repack_reference(source, &[n as u64, k as u64], &stored)
+            .unwrap_or_else(|| panic!("{context}: no reference"));
+        let largest = ((128 << 10) / (tile * row)).max(1);
+        for tiles in [1, largest] {
+            let mut converted = vec![0xa5; expected.len()];
+            let pieces = std::num::NonZeroUsize::new(tiles).unwrap();
+            for (from, to) in conversion.pieces(k, n, pieces).expect("a stored row") {
+                conversion
+                    .piece(k, &stored[from], &mut converted[to])
+                    .unwrap_or_else(|| panic!("{context}: a piece of {tiles} tiles"));
+            }
+            assert!(
+                converted == expected,
+                "{context}: pieces of {tiles} tiles differ from the reference"
+            );
+        }
+        println!("{context}: equal");
+    }
+}
+
+/// The address reservation a recorded machine's executor of `backend`
+/// makes for an expert bank (`seismic::fixtures::recorded`): the first that
+/// reserves; none where none reserves, and why where one would but cannot.
+fn recorded_reservation(
+    backend: BackendName,
+) -> Result<Option<(seismic::Reservation, Option<crate::planning::HostTier>)>, seismic::Unreservable> {
+    use seismic::fixtures::recorded;
+    for topology in [recorded::m4_pro(), recorded::rtx3090()] {
+        for executor in topology.executors().iter().filter(|executor| executor.backend() == backend) {
+            let contract = crate::planning::BankTier::Bank.contract(&topology, executor);
+            if let Some(reservation) = executor.reserving(contract).map_err(Clone::clone)? {
+                let host = crate::platform::host_tier(&topology, executor).expect("a recorded machine reads how it reserves host storage");
+                return Ok(Some((reservation, host)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The assessment terms `load` of `definition` derives on `backend`: its
+/// decode demand under both native codecs, its memory terms and every graph
+/// it prepares, summarized; or why one fails. Admission binds every weight
+/// to its entries' ports, a second-level scale included
+/// (`PlanError::UnportedScale`).
+fn derive_terms(
+    definition: &magnitude_family_contracts::ModelDefinition,
+    load: &ModelLoadPlan,
+    selection: ComponentSelection,
+    backend: BackendName,
+) -> Result<String, String> {
+    load.program_plan(definition, KvCodec::AffineK8V4)
+        .map_err(|error| error.to_string())?;
+    // Each call's launches are its entry's declaration's at the statics the
+    // load prepares it with.
+    let demands = [KvCodec::Dense, KvCodec::AffineK8V4]
+        .into_iter()
+        .map(|codec| {
+            let program = load
+                .program_plan(definition, codec)
+                .map_err(|error| AssessmentError::Demand(error.to_string()))?;
+            let declarations = Declarations::of_load(
+                backend,
+                &program,
+                definition,
+                load,
+                crate::native::TuningLimits::of(LIMITS, definition),
+            )?;
+            let demand = DecodeDemand::from_model(definition, load, codec, &declarations)?;
+            // Every call's launches at one and at the decode rows' most.
+            for call in &demand.calls {
+                for rows in [1, crate::operators::attention::graph::DECODE_ROWS] {
+                    call.launches.at(rows)?;
+                }
+            }
+            Ok(demand)
+        })
+        .collect::<Result<Vec<_>, AssessmentError>>();
+    let memory = AssessmentMemoryTerms::derive(
+        definition,
+        load,
+        selection,
+        KvCodec::AffineK8V4,
+        PlannedMethod::Plain,
+        LIMITS,
+    );
+    // Building every graph the load prepares proves no call lies outside
+    // its kernel's domain on the backend.
+    let graphs = ResourcePlanner::state_plan(
+        definition,
+        load,
+        PlannedMethod::Plain,
+        KvCodec::AffineK8V4,
+        LIMITS,
+        ResourceCapacity {
+            domain_bytes: 64 << 30,
+            tensor_operations: crate::TensorOperations::Absent,
+        },
+    )
+    .and_then(|state| {
+        AssessmentGraphResourceBounds::derive(
+            definition,
+            load,
+            &state,
+            PlannedMethod::Plain,
+            KvCodec::AffineK8V4,
+            LIMITS,
+            backend,
+        )
+        .map_err(|error| error.to_string())
+    });
+    match (demands, memory, graphs) {
+        // A decode step streams its weights and launches its entries.
+        (Ok(demands), Ok(_), Ok(_))
+            if demands.iter().all(|demand| {
+                !demand.calls.is_empty()
+                    && demand
+                        .calls
+                        .iter()
+                        .any(|call| call.work.weights.iter().any(|bytes| bytes.bytes > 0))
+            }) =>
+        {
+            Ok(format!(
+                "{} calls, {} weight bytes",
+                demands[0].calls.len(),
+                demands[0]
+                    .calls
+                    .iter()
+                    .flat_map(|call| &call.work.weights)
+                    .map(|bytes| bytes.bytes)
+                    .sum::<u64>()
+            ))
+        }
+        (Ok(demands), Ok(_), Ok(_)) => Err(format!("an empty decode step: {demands:?}")),
+        (demands, memory, graphs) => Err(format!(
+            "{:?} / {:?} / {:?}",
+            demands.err(),
+            memory.err(),
+            graphs.err()
+        )),
     }
 }
 
@@ -496,8 +730,7 @@ fn plan_and_charge_separate_draft(
         for backend in BackendName::ALL {
             let context = format!("{draft_file} {}", backend.as_str());
             let layout = resident_layout(ExecutionPath::Native, backend);
-            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout)
-                .and_then(|load| load.with_selected_reads(&definition, method, LIMITS))
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, method, LIMITS)
                 .unwrap_or_else(|error| panic!("{context}: {error}"));
             let terms = AssessmentMemoryTerms::derive(
                 &definition,
@@ -717,6 +950,8 @@ fn every_catalog_variant_lists_kernels_over_every_finalized_readout() {
                                 &definition,
                                 selection,
                                 resident_layout(ExecutionPath::Native, backend),
+                                PlannedMethod::Plain,
+                                LIMITS,
                             )
                         })
                         .and_then(|load| {

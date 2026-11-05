@@ -1,7 +1,7 @@
 //! Seismic graph slots for numerical execution and owned import sources.
 
 mod graph;
-pub(crate) use graph::VisionGrowth;
+pub(crate) use graph::{Outputs, VisionGrowth};
 pub use graph::{
     GraphOutputOwner, GraphOutputTensor, NativeGraphOutputLease, NativeGraphPool,
     NativeGraphWorkspaceLease, TargetGraphOutputLease, TargetGraphPool, TargetGraphWorkspaceLease,
@@ -9,6 +9,7 @@ pub use graph::{
 };
 
 use crate::Stored;
+use crate::programs::graph::readout;
 use crate::{
     ExecutionPlan, InvariantError, PreparedDrafterGraphs, PreparedStateCopyGraphs,
     PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, ResourceDomainId,
@@ -86,10 +87,44 @@ impl ImportSource {
             }
             // SAFETY: the importer fills this exact tensor before binding
             // it as a kernel source.
-            _ => unsafe { Tensor::uninitialized(device, weight.upload, &[count]) }
-                .map(Self::Staged)
-                .map_err(AllocationError::Tensor),
+            _ => unsafe { Self::upload(weight, device) }.map(Self::Staged),
         }
+    }
+
+    /// An upload of `weight`'s source bytes on `device`, not yet written.
+    ///
+    /// # Safety
+    /// The caller fills it
+    /// ([`crate::programs::native_import::fill_staged_source`]) before
+    /// binding it as a kernel source.
+    pub(crate) unsafe fn upload(
+        weight: &WeightPlan,
+        device: &Device,
+    ) -> Result<Tensor, AllocationError> {
+        unsafe { Tensor::uninitialized(device, weight.upload, &[source_count(weight)?]) }
+            .map_err(AllocationError::Tensor)
+    }
+
+    /// An upload of `weight`'s source bytes on `device`, filled by a read of
+    /// `artifact` around the file cache: what an expert bank's stacks are
+    /// imported from, a load's or a tuning unit's: none of their bytes stay
+    /// in it.
+    pub(crate) fn uncached(
+        weight: &WeightPlan,
+        artifact: &magnitude_artifacts::gguf::GgufArtifact,
+        device: &Device,
+    ) -> Result<Tensor, String> {
+        let stored = Stored::from_gguf(artifact, &weight.descriptor).map_err(|error| error.to_string())?;
+        // SAFETY: filled here, before any entry binds it.
+        let mut upload = unsafe { Self::upload(weight, device) }.map_err(|error| error.to_string())?;
+        crate::programs::native_import::fill_staged_source(
+            &stored,
+            weight,
+            &mut upload,
+            magnitude_artifacts::CachePolicy::Uncached,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(upload)
     }
 
     pub(crate) fn tensor(&self) -> &Tensor {
@@ -307,6 +342,25 @@ impl From<AllocationError> for seismic::BuildError {
     }
 }
 
+/// A target readout pool ([`AllocatedResources::readout_pool`]).
+#[derive(Clone, Copy)]
+enum ReadoutPool {
+    /// Any launch's: the floor's slots.
+    Launch,
+    /// A prompt chunk's (`readout::chunk_holds`): a group's places beyond
+    /// the floor.
+    Chunk,
+}
+
+/// A prompt-group class whose pools' slots [`AllocatedResources::grow_class`]
+/// allocated, for [`AllocatedResources::hold_class`] to hold: only an
+/// allocated class is held.
+#[must_use]
+pub(crate) struct GrownClass {
+    places: std::num::NonZeroUsize,
+    slots: crate::StartupSlots,
+}
+
 /// Numerical graph slots authorized by one ResourcePlan. Import sources are
 /// allocated separately during component materialization.
 pub struct AllocatedResources {
@@ -314,33 +368,44 @@ pub struct AllocatedResources {
     /// The device's one graph workspace, which every pool's activations bind.
     arena: seismic::NativeExecutionArena,
     target_graph: NativeGraphPool,
+    /// Readout slots any launch's readout runs in: the floor's, a step and
+    /// its lookahead successor.
     target_readout_graph: NativeGraphPool,
+    /// Readout slots a prompt chunk's readout runs in, sized by what it
+    /// exports (`readout::chunk_holds`): a group's places beyond
+    /// the floor.
+    target_readout_chunk_graph: NativeGraphPool,
     head_graph: Option<NativeGraphPool>,
     vision_graph: Option<VisionGraphPool>,
     state_graph: NativeGraphPool,
+    /// The places of the prompt-group class the pools hold: at least the
+    /// floor's one.
+    places: std::num::NonZeroUsize,
 }
 
 impl AllocatedResources {
-    /// The workspace arena once, and the arenas these pools own while their
-    /// slots are lent to launches or output views.
+    /// The workspace arena once, with the record tables slots formed over
+    /// it, and the arenas these pools own while their slots are lent to
+    /// launches or output views.
     pub fn committed_bytes(&self) -> Result<u64, &'static str> {
         [
             Some(&self.target_graph),
             Some(&self.target_readout_graph),
+            Some(&self.target_readout_chunk_graph),
             self.head_graph.as_ref(),
             Some(&self.state_graph),
         ]
         .into_iter()
         .flatten()
-        .try_fold(self.arena.bytes(), |bytes, pool| {
+        .try_fold(self.arena.charged_bytes(), |bytes, pool| {
             bytes
-                .checked_add(pool.committed_bytes())
+                .checked_add(pool.committed_bytes()?)
                 .ok_or("graph pool charge overflows")
         })?
         .checked_add(
             self.vision_graph
                 .as_ref()
-                .map_or(0, VisionGraphPool::committed_bytes),
+                .map_or(Ok(0), VisionGraphPool::committed_bytes)?,
         )
         .ok_or("graph pool charge overflows")
     }
@@ -353,8 +418,36 @@ impl AllocatedResources {
         &self.target_graph
     }
 
-    pub fn target_readout_graph(&self) -> &NativeGraphPool {
-        &self.target_readout_graph
+    /// The readout pool a launch projecting `projected` rows takes its
+    /// activation and output slot from ([`Self::readout_pool`]).
+    pub fn target_readout_graph(&self, projected: usize) -> &NativeGraphPool {
+        self.readout(self.readout_pool(projected))
+    }
+
+    /// The one choice of a launch's readout pool, among those whose output
+    /// class holds its `projected` rows, smallest first: the first with an
+    /// activation and an output slot free; else the first with an
+    /// activation free, whose retained outputs grow by a slot
+    /// (`ExecutorDomain::provision_output`); else the launch pool, which
+    /// holds any launch's.
+    fn readout_pool(&self, projected: usize) -> ReadoutPool {
+        let pools = readout::chunk_holds(projected as u64)
+            .then_some(ReadoutPool::Chunk)
+            .into_iter()
+            .chain([ReadoutPool::Launch]);
+        let first = |holds: fn(&NativeGraphPool) -> bool| {
+            pools.clone().find(|&pool| holds(self.readout(pool)))
+        };
+        first(|pool| pool.available_workspace() > 0 && pool.available_output() > 0)
+            .or_else(|| first(|pool| pool.available_workspace() > 0))
+            .unwrap_or(ReadoutPool::Launch)
+    }
+
+    fn readout(&self, pool: ReadoutPool) -> &NativeGraphPool {
+        match pool {
+            ReadoutPool::Launch => &self.target_readout_graph,
+            ReadoutPool::Chunk => &self.target_readout_chunk_graph,
+        }
     }
     pub fn head_graph(&self) -> Option<&NativeGraphPool> {
         self.head_graph.as_ref()
@@ -370,31 +463,115 @@ impl AllocatedResources {
     }
 
     /// The pool whose output slots `lane`'s launches retain beyond their
-    /// completion: target readout or head outputs. Encoded images hold
-    /// slots of their own class ([`VisionGraphPool`]).
+    /// completion, for a launch projecting `projected` rows: target readout
+    /// or head outputs. A target launch's is the readout pool it takes its
+    /// slots from ([`Self::readout_pool`]). Encoded images hold slots of
+    /// their own class ([`VisionGraphPool`]).
     pub(crate) fn retained_outputs_mut(
         &mut self,
         lane: crate::domain::ReservationLane,
+        projected: usize,
     ) -> Option<&mut NativeGraphPool> {
         match lane {
-            crate::domain::ReservationLane::Target => Some(&mut self.target_readout_graph),
+            crate::domain::ReservationLane::Target => Some(match self.readout_pool(projected) {
+                ReadoutPool::Launch => &mut self.target_readout_graph,
+                ReadoutPool::Chunk => &mut self.target_readout_chunk_graph,
+            }),
             crate::domain::ReservationLane::Head => self.head_graph.as_mut(),
             crate::domain::ReservationLane::Vision => None,
         }
     }
 
-    /// Release every pool's free output slots beyond its startup count and
-    /// vision's free storage; returns how many slots were released.
-    pub(crate) fn release_idle_slots(&mut self) -> usize {
+    /// The places of the prompt-group class held ([`Self::hold_class`]): a
+    /// chain runs at most that many launches. The one record of it: the
+    /// family's group buffers are held with it (`grant_group`).
+    pub fn group_places(&self) -> std::num::NonZeroUsize {
+        self.places
+    }
+
+    /// The bytes [`Self::grow_class`] of `slots` allocates.
+    pub(crate) fn class_bytes(&mut self, slots: crate::StartupSlots) -> Result<u64, &'static str> {
+        self.class_pools(slots).try_fold(0u64, |bytes, (pool, slots)| {
+            bytes
+                .checked_add(pool.hold_bytes(slots)?)
+                .ok_or("a graph class's bytes overflow")
+        })
+    }
+
+    /// What the pools' slots of a class whose pools hold `slots` add to the
+    /// device's graph budget beyond those allocated
+    /// ([`NativeGraphPool::hold_graphs`]).
+    pub(crate) fn class_graphs(&mut self, slots: crate::StartupSlots) -> Result<seismic::GraphCensus, &'static str> {
+        self.class_pools(slots).try_fold(seismic::GraphCensus::default(), |census, (pool, slots)| {
+            pool.hold_graphs(slots)
+                .and_then(|graphs| census.plus(graphs))
+                .ok_or("a graph class's graphs overflow")
+        })
+    }
+
+    /// Allocate the pools' slots of the class of `places` places, whose
+    /// pools hold `slots` (`ResourceLimits::class_slots`), to be held by
+    /// [`Self::hold_class`]. The caller holds a heap claim for
+    /// [`Self::class_bytes`] across this call. On a failure the class held
+    /// before stays, and what was allocated idles until released.
+    pub(crate) fn grow_class(
+        &mut self,
+        places: std::num::NonZeroUsize,
+        slots: crate::StartupSlots,
+    ) -> Result<GrownClass, AllocationError> {
+        for (pool, slots) in self.class_pools(slots) {
+            pool.grow(slots)?;
+        }
+        Ok(GrownClass { places, slots })
+    }
+
+    /// Hold the class [`Self::grow_class`] allocated.
+    pub(crate) fn hold_class(&mut self, grown: GrownClass) {
+        for (pool, slots) in self.class_pools(grown.slots) {
+            pool.hold(slots);
+        }
+        self.places = grown.places;
+    }
+
+    /// The pools a prompt group's class sizes, each with its slots of
+    /// `slots`. The class's readout slots beyond the launch pool's floor run
+    /// prompt chunks' readouts: they are the chunk pool's.
+    fn class_pools(
+        &mut self,
+        slots: crate::StartupSlots,
+    ) -> impl Iterator<Item = (&mut NativeGraphPool, crate::GraphSlots)> {
+        let floor = self.target_readout_graph.floor();
+        let chunks = crate::GraphSlots {
+            activations: slots.readout.activations.saturating_sub(floor.activations),
+            output: slots.readout.output.saturating_sub(floor.output),
+        };
+        [
+            (Some(&mut self.target_graph), slots.target),
+            (Some(&mut self.target_readout_chunk_graph), chunks),
+            (self.head_graph.as_mut(), slots.head),
+        ]
+        .into_iter()
+        .filter_map(|(pool, slots)| pool.map(|pool| (pool, slots)))
+    }
+
+    /// Release every pool's free slots beyond its held class, the held
+    /// prompt-group class down to the floor of one place once `reclaim`
+    /// releases it, and vision's free storage; returns how many slots were
+    /// released.
+    pub(crate) fn release_idle_slots(&mut self, reclaim: bool) -> usize {
+        if reclaim {
+            self.places = std::num::NonZeroUsize::MIN;
+        }
         [
             Some(&mut self.target_graph),
             Some(&mut self.target_readout_graph),
+            Some(&mut self.target_readout_chunk_graph),
             self.head_graph.as_mut(),
             Some(&mut self.state_graph),
         ]
         .into_iter()
         .flatten()
-        .map(NativeGraphPool::release_idle_outputs)
+        .map(|pool| pool.release_idle(reclaim))
         .sum::<usize>()
             + self
                 .vision_graph
@@ -478,28 +655,30 @@ impl ResourceAllocator {
             }));
         }
         let plan = execution.resources();
-        // The admitted charge was derived from this family's footprint.
-        let admitted = |family: &seismic::NativeGraphFamily, charge: crate::NativeGraphCharge| {
+        // The admitted charge was derived from a serial family's footprint.
+        let admitted = |family: &seismic::NativeGraphFamily, charge: &crate::NativeGraphCharge| {
             family.workspace_bytes() == charge.workspace_bytes
                 && family.output_bytes() == charge.output_bytes
-                && family.upload_bytes() == charge.upload_bytes
+                && crate::planning::serial_upload_regions(family.upload_bytes())
+                    == charge.upload_regions
         };
         let arena = device
             .execution_arena(plan.arena_bytes())
             .map_err(AllocationError::Tensor)?;
-        let graph_charge = plan.target_graph();
-        if !admitted(target_graphs.family(), graph_charge)
-            || target_graphs.runs_per_step() != graph_charge.upload_regions
-        {
-            return Err(AllocationError::Plan(InvariantError {
-                context: "resource allocator",
-                detail: "prepared target graph differs from admitted Seismic footprint".into(),
-            }));
-        }
-        let target_graph =
-            NativeGraphPool::new(domain.clone(), target_graphs.family(), graph_charge, &arena)?;
+        // The target's charge is the prepared graphs' footprint
+        // (`NativeGraphCharge::from_prepared`).
+        let target_graph = NativeGraphPool::new(
+            domain.clone(),
+            target_graphs.family(),
+            plan.target_graph(),
+            &arena,
+            Outputs::Device,
+        )?;
         let readout_charge = plan.target_readout_graph();
-        if !admitted(target_readout_graphs.family(), readout_charge) {
+        let chunk_charge = plan.target_readout_chunk_graph();
+        if !admitted(target_readout_graphs.family(), readout_charge)
+            || !admitted(target_readout_graphs.chunk_family(), chunk_charge)
+        {
             return Err(AllocationError::Plan(InvariantError {
                 context: "resource allocator",
                 detail: "prepared target readout graph differs from admitted Seismic footprint"
@@ -511,10 +690,18 @@ impl ResourceAllocator {
             target_readout_graphs.family(),
             readout_charge,
             &arena,
+            Outputs::Host,
+        )?;
+        let target_readout_chunk_graph = NativeGraphPool::new(
+            domain.clone(),
+            target_readout_graphs.chunk_family(),
+            chunk_charge,
+            &arena,
+            Outputs::Host,
         )?;
         let head_graph = match (head_graphs, plan.head_graph()) {
             (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => Some(
-                NativeGraphPool::new(domain.clone(), graphs.family(), charge, &arena)?,
+                NativeGraphPool::new(domain.clone(), graphs.family(), charge, &arena, Outputs::Host)?,
             ),
             (None, None) => None,
             _ => {
@@ -526,11 +713,7 @@ impl ResourceAllocator {
         };
         let vision_graph = match (vision_graphs, plan.vision_graph()) {
             (Some(graphs), Some(charge)) if admitted(graphs.family(), charge) => {
-                Some(VisionGraphPool::new(
-                    domain.clone(),
-                    charge.upload_regions,
-                    graphs.class_families(),
-                ))
+                Some(VisionGraphPool::new(domain.clone(), graphs.class_families()))
             }
             (None, None) => None,
             _ => {
@@ -548,15 +731,17 @@ impl ResourceAllocator {
             }));
         }
         let state_graph =
-            NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge, &arena)?;
+            NativeGraphPool::new(domain.clone(), state_graphs.family(), state_charge, &arena, Outputs::Device)?;
         let allocated = AllocatedResources {
             domain: domain.clone(),
             arena,
             target_graph,
             target_readout_graph,
+            target_readout_chunk_graph,
             head_graph,
             vision_graph,
             state_graph,
+            places: std::num::NonZeroUsize::MIN,
         };
         Ok(allocated)
     }

@@ -9,7 +9,7 @@
 //!
 //! Nothing here knows which table it holds or what its readers compute.
 
-use crate::planning::DirectoryForm;
+use crate::planning::{DirectoryForm, TableFlights};
 use crate::slot_directory::SlotDirectory;
 use crate::stored_table::StoredTable;
 use sha2::{Digest, Sha256};
@@ -58,7 +58,7 @@ impl ResidentTable {
             Self::Whole => {}
             Self::Streamed(table) => {
                 visit(&table.shared.directory);
-                visit(&table.staging);
+                table.staging.borrow().values().for_each(&mut *visit);
                 visit(&table.shared.landing_staging);
                 visit(&table.shared.notice);
             }
@@ -108,7 +108,7 @@ impl ResidentTable {
             Self::Whole => 0,
             Self::Streamed(table) => {
                 table.shared.directory.storage_bytes()
-                    + table.staging.storage_bytes()
+                    + table.staging.borrow().values().map(seismic::Tensor::storage_bytes).sum::<u64>()
                     + table.shared.landing_staging.storage_bytes()
                     + table.shared.notice.storage_bytes()
             }
@@ -118,9 +118,15 @@ impl ResidentTable {
 
     /// The indices a kernel gathers `rows` by: the rows themselves, or a
     /// streamed table's slots, which brings the rows the device lacks ahead
-    /// of the work queued next. A stored table's rows are read only through
-    /// its directory.
+    /// of the work queued next. -1 names no row (`gathered_row`): it stays
+    /// -1, which a reader reads as zeros, and brings nothing. A stored
+    /// table's rows are read only through its directory.
     pub fn indices(&self, rows: &[i32]) -> Result<Vec<i32>, String> {
+        let named = rows
+            .iter()
+            .filter(|row| **row != -1)
+            .map(|row| u64::try_from(*row).map_err(|_| format!("{row} names no table row")))
+            .collect::<Result<Vec<_>, _>>()?;
         let table = match self {
             Self::Whole => return Ok(rows.to_vec()),
             Self::Streamed(table) => table,
@@ -128,11 +134,14 @@ impl ResidentTable {
                 return Err("a stored table's rows are read through its directory".into());
             }
         };
-        let rows = rows
+        let mut slots = table.slots(&named)?.into_iter();
+        Ok(rows
             .iter()
-            .map(|row| u64::try_from(*row).map_err(|_| format!("{row} names no table row")))
-            .collect::<Result<Vec<_>, _>>()?;
-        table.slots(&rows)
+            .map(|row| match row {
+                -1 => -1,
+                _ => slots.next().expect("a slot for each named row"),
+            })
+            .collect())
     }
 }
 
@@ -147,12 +156,15 @@ pub struct TileRun<'a> {
 pub trait TileSource {
     /// Queue the tiles of every run into their slots, together, through
     /// `staging`: the tiles' rows as the table stores them, run after run.
-    /// Device work queued after it finds the tiles in their slots.
+    /// Device work queued after it finds the tiles in their slots. The
+    /// completion of the device work that reads `staging`, which the host
+    /// writes again only once it has completed; none where nothing on the
+    /// device reads it.
     fn bring(
         &self,
         runs: &[TileRun<'_>],
         staging: &mut seismic::Tensor,
-    ) -> Result<TilesBrought, String>;
+    ) -> Result<Option<seismic::NativeTensorBatchCompletion>, String>;
 
     /// The table's rows as stored, which the filler lands for the reads of
     /// rows the device selects.
@@ -164,10 +176,6 @@ pub trait StoredRows: Send + Sync {
     /// The bytes of the rows from `first`, as many as `out` holds whole.
     fn read(&self, first: u64, out: &mut [u8]) -> Result<(), String>;
 }
-
-/// Waits for queued tiles to reach their slots, after which their staging
-/// holds nothing the device reads.
-pub type TilesBrought = Box<dyn FnOnce() -> Result<(), String>>;
 
 /// A streamed gathered table: the device holds slots for only some of the
 /// table's row tiles (a tile is the rows its storage lays out together; one
@@ -197,18 +205,23 @@ pub type TilesBrought = Box<dyn FnOnce() -> Result<(), String>>;
 /// filled, and its slot is overwritten only by device work queued after
 /// every read the filler pointed at it. So every read finds each row it
 /// names in a slot that holds it when it reads. The owner never waits for
-/// the device but to reuse its staging.
+/// the device: each bring stages its tiles in a staging entry of its own
+/// whose last conversion has completed (`TableFlights::stagings`).
 pub struct DeviceTable {
     /// The slots, then the landing slots: the leading rows of the table's
     /// shape.
     slots: seismic::Tensor,
-    /// The rows a host step's tiles pass through, as stored.
-    staging: seismic::Tensor,
+    /// The stagings a host step's tiles pass through, as stored: one for
+    /// each bring the table's lanes can have in flight at the class held
+    /// (`TableFlights::stagings`), each written again only once the
+    /// conversion that last read it has completed.
+    staging: RefCell<seismic::FlightRing<seismic::Tensor, seismic::NativeTensorBatchCompletion>>,
+    /// The rows one staging holds, as `stored`.
+    staging_rows: u64,
+    stored: seismic::Element,
+    flights: TableFlights,
     source: Box<dyn TileSource>,
     kept: Option<KeptRows>,
-    /// The tiles the last host step brought, while the device may still
-    /// read their staging.
-    brought: RefCell<Option<TilesBrought>>,
     shared: Arc<Shared>,
     /// The reads the filler takes: each one's value and rows.
     reads: Mutex<Option<mpsc::Sender<(u64, u64)>>>,
@@ -430,7 +443,8 @@ impl DeviceTable {
 
     /// A table of `rows` rows, each of `element` and `row_shape` and stored
     /// as `stored`, in `slots` slots and `landing` landing slots on `device`,
-    /// with staging for host steps that bring up to `staging_rows` rows. Its
+    /// with stagings for host steps that bring up to `staging_rows` rows, as
+    /// many as `flights` has in flight at the floor's class of one place. Its
     /// slots are empty (`seed`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -442,6 +456,7 @@ impl DeviceTable {
         slots: u64,
         landing: u64,
         staging_rows: u64,
+        flights: TableFlights,
         form: DirectoryForm,
         source: Box<dyn TileSource>,
         kept: Option<KeptRows>,
@@ -469,7 +484,19 @@ impl DeviceTable {
         let mut tiles = SlotDirectory::new(rows, slots + landing, tile, form);
         let slots_tensor = seismic::Tensor::zeros(device, element, &shape(slots + landing))
             .map_err(|error| failed(&error))?;
-        let directory = seismic::Tensor::shared(
+        // Every import into the slots (a run of tiles, a landed read) binds
+        // one record of whole tiles from a tile's boundary: the table of the
+        // slots' tiles, held from now, serves every one of them
+        // (`WeightPlan::record_table_entries`).
+        let tiled = [(slots + landing) / tile, tile]
+            .into_iter()
+            .chain(row_shape.iter().copied())
+            .collect::<Vec<_>>();
+        slots_tensor
+            .reshape(&tiled)
+            .and_then(|tiles| tiles.hold_record_table())
+            .map_err(|error| failed(&error))?;
+        let directory = seismic::Tensor::words(
             device,
             seismic::Element::i32(),
             &[form.entries(rows, slots + landing), form.fields()],
@@ -482,7 +509,7 @@ impl DeviceTable {
             fields: form.fields(),
             landing_staging: seismic::Tensor::shared(device, stored, &shape(landing))
                 .map_err(|error| failed(&error))?,
-            notice: seismic::Tensor::shared(device, seismic::Element::i32(), &[landing, 2])
+            notice: seismic::Tensor::words(device, seismic::Element::i32(), &[landing, 2])
                 .map_err(|error| failed(&error))?,
             noticed: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
             gate: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
@@ -514,16 +541,41 @@ impl DeviceTable {
                 .spawn(move || shared.fill_reads(taken))
                 .map_err(|error| failed(&error))?
         };
-        Ok(Self {
-            staging: staging(&slots_tensor, stored, staging_rows)?,
+        let table = Self {
+            staging: RefCell::default(),
+            staging_rows,
+            stored,
+            flights,
             slots: slots_tensor,
             source,
             kept,
-            brought: RefCell::new(None),
             shared,
             reads: Mutex::new(Some(reads)),
             filler: Some(filler),
-        })
+        };
+        table.hold_places(1)?;
+        Ok(table)
+    }
+
+    /// Hold the stagings a class of `places` places has in flight
+    /// (`TableFlights::stagings`): grown for a larger class, the least
+    /// recently used released for a smaller once their conversions complete.
+    pub fn hold_places(&self, places: usize) -> Result<(), String> {
+        self.staging
+            .borrow_mut()
+            .resize(self.flights.stagings(places), || staging(&self.slots, self.stored, self.staging_rows))
+    }
+
+    /// The bytes of the stagings a class of `places` places holds
+    /// ([`Self::hold_places`]).
+    pub fn staging_bytes(&self, places: usize) -> Result<u64, String> {
+        let shape = std::iter::once(self.staging_rows)
+            .chain(self.slots.extents()[1..].iter().copied())
+            .collect::<Vec<_>>();
+        let entry = self.stored.canonical_byte_len(&shape).map_err(|error| format!("device table staging: {error}"))?;
+        entry
+            .checked_mul(self.flights.stagings(places) as u64)
+            .ok_or_else(|| "device table staging bytes overflow".to_owned())
     }
 
     pub fn slots_tensor(&self) -> &seismic::Tensor {
@@ -575,9 +627,18 @@ impl DeviceTable {
             state.seeded += absent.len();
             (absent, taken)
         };
-        self.bring(&absent, &taken, served)?;
-        let brought = self.brought.borrow_mut().take();
-        brought.map_or(Ok(()), |brought| brought())
+        // More tiles than a step brings (the load's) are staged in a tensor
+        // of their own, freed once their conversion completes: the load
+        // waits for it, before any step.
+        let rows = absent.len() as u64 * tile;
+        let mut seeding = match rows {
+            0 => return Ok(()),
+            rows => staging(&self.slots, self.stored, rows)?,
+        };
+        match self.bring(&absent, &taken, served, &mut seeding)? {
+            Some(converted) => converted.wait().map_err(|error| format!("device table: {error}")),
+            None => Ok(()),
+        }
     }
 
     /// A read of rows the device selects, at most `rows` of them, is being
@@ -655,6 +716,9 @@ impl DeviceTable {
                 .collect::<Vec<_>>();
             absent.sort_unstable();
             absent.dedup();
+            // A staging's tiles at most: one the staging leaves is landed
+            // again when a read names it.
+            absent.truncate((self.staging_rows / self.tile_rows()) as usize);
             let mut taken = Vec::with_capacity(absent.len());
             for _ in &absent {
                 let Some(slot) = self.free_regular(state, None) else {
@@ -665,7 +729,7 @@ impl DeviceTable {
             absent.truncate(taken.len());
             (absent, taken)
         };
-        self.bring(&absent, &taken, true)
+        self.bring_staged(&absent, &taken, true)
     }
 
     /// The clock's next regular tile of slots that no step named since it
@@ -726,7 +790,7 @@ impl DeviceTable {
             }
             (absent, taken)
         };
-        self.bring(&absent, &taken, true)?;
+        self.bring_staged(&absent, &taken, true)?;
         let state = self.state();
         if state.step == Self::KEPT_AFTER_STEPS {
             self.keep(&state);
@@ -749,11 +813,38 @@ impl DeviceTable {
     /// until the next read queued, the first queued after their conversion;
     /// else every read the filler takes from now on is queued after it, and
     /// they are held at once. `served`: a step named the tiles, now or when
-    /// the table was last served.
-    fn bring(&self, tiles: &[u64], taken: &[usize], served: bool) -> Result<(), String> {
+    /// the table was last served. The tiles pass through the next of the
+    /// table's stagings, whose last conversion completed (`FlightRing`):
+    /// the stagings are as many as the brings the table's lanes have in
+    /// flight, so it has, and the host never waits for the device.
+    fn bring_staged(&self, tiles: &[u64], taken: &[usize], served: bool) -> Result<(), String> {
         if tiles.is_empty() {
             return Ok(());
         }
+        assert!(
+            tiles.len() as u64 * self.tile_rows() <= self.staging_rows,
+            "a step brings at most a staging's rows: {} tiles of {} rows past {}",
+            tiles.len(),
+            self.tile_rows(),
+            self.staging_rows
+        );
+        let mut ring = self.staging.borrow_mut();
+        let mut entry = ring.next().map_err(|error| format!("device table: {error}"))?;
+        if let Some(converted) = self.bring(tiles, taken, served, entry.value())? {
+            entry.submitted(converted);
+        }
+        Ok(())
+    }
+
+    /// [`Self::bring_staged`] through `staging`, of at least the tiles'
+    /// rows; the completion of the conversion that reads it.
+    fn bring(
+        &self,
+        tiles: &[u64],
+        taken: &[usize],
+        served: bool,
+        staging: &mut seismic::Tensor,
+    ) -> Result<Option<seismic::NativeTensorBatchCompletion>, String> {
         let device = |error: seismic::TensorError| format!("device table: {error}");
         let tile = self.tile_rows();
         let mut taken = taken.to_vec();
@@ -774,24 +865,9 @@ impl DeviceTable {
             });
             at += run;
         }
-        // The last step's tiles left the staging before these enter it.
-        let previous = self.brought.borrow_mut().take();
-        if let Some(previous) = previous {
-            previous()?;
-        }
-        // More tiles than a step brings (the load's) are staged in a tensor
-        // of their own.
         let rows = tiles.len() as u64 * tile;
-        let transient;
-        let staging = match rows <= self.staging.extents()[0] {
-            true => &self.staging,
-            false => {
-                transient = staging(&self.slots, self.staging.element(), rows)?;
-                &transient
-            }
-        };
         let mut staged = staging.slice_leading(0, rows).map_err(device)?;
-        *self.brought.borrow_mut() = Some(self.source.bring(&runs, &mut staged)?);
+        let converted = self.source.bring(&runs, &mut staged)?;
         let mut state = self.state();
         let from = state.queued + 1;
         let outstanding = state.filled < state.queued;
@@ -807,7 +883,7 @@ impl DeviceTable {
             }
             state.served[*slot] = served;
         }
-        Ok(())
+        Ok(converted)
     }
 
     /// Keep the first row of every regular tile the device holds or brings
@@ -866,8 +942,12 @@ impl Shared {
     fn fill(&self, value: u64, rows: u64) -> Option<Result<Vec<u64>, String>> {
         // The read before is done with the landing slots and staging, and
         // the device has passed it.
-        if value > 1 && !self.read.wait(value - 1, DEVICE_WAIT) {
-            return Some(Err("the selected read before never finished".into()));
+        if value > 1 {
+            match self.read.wait(value - 1, DEVICE_WAIT) {
+                Ok(true) => {}
+                Ok(false) => return Some(Err("the selected read before never finished".into())),
+                Err(error) => return Some(Err(format!("the selected read before: {error}"))),
+            }
         }
         // The read's selection reached the host, or the read was abandoned.
         // A read is abandoned before any read queued after it is submitted,
@@ -875,7 +955,10 @@ impl Shared {
         // notice or a later read's, the abandonment is recorded.
         let started = Instant::now();
         loop {
-            let noticed = self.noticed.wait(value, ABANDON_POLL);
+            let noticed = match self.noticed.wait(value, ABANDON_POLL) {
+                Ok(noticed) => noticed,
+                Err(error) => return Some(Err(format!("a selected read's selection: {error}"))),
+            };
             if self
                 .state
                 .lock()
@@ -1017,7 +1100,7 @@ mod tests {
             &self,
             runs: &[TileRun<'_>],
             staging: &mut seismic::Tensor,
-        ) -> Result<TilesBrought, String> {
+        ) -> Result<Option<seismic::NativeTensorBatchCompletion>, String> {
             let text = |error: seismic::TensorError| error.to_string();
             let bytes = runs
                 .iter()
@@ -1032,7 +1115,7 @@ mod tests {
                 run.slots.clone().write_from_host(&bytes).map_err(text)?;
                 staged += rows;
             }
-            Ok(Box::new(|| Ok(())))
+            Ok(None)
         }
 
         fn rows(&self) -> Arc<dyn StoredRows> {
@@ -1041,8 +1124,8 @@ mod tests {
     }
 
     /// An 8-row, 3-column F32 table on the CPU backend, stored as it is
-    /// held, in four slots and two landing slots with staging for a step
-    /// that brings one row, seeded with the rows `kept` keeps.
+    /// held, in four slots and two landing slots with stagings for a step
+    /// that brings up to every slot's row, seeded with the rows `kept` keeps.
     fn device_table(kept: Option<&Path>) -> Rc<DeviceTable> {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
@@ -1054,7 +1137,8 @@ mod tests {
             &[3],
             4,
             2,
-            1,
+            4,
+            crate::planning::TableFlights { flights: crate::FlightDepth::SERIAL, lanes: 1 },
             DirectoryForm::Dense,
             Box::new(Rows),
             kept.map(|directory| KeptRows::of(directory, "table")),
@@ -1099,7 +1183,7 @@ mod tests {
         // read the notice yet.
         unsafe { read.notice.write_shared(0, &selection) }.unwrap();
         read.noticed.signal(read.value).unwrap();
-        assert!(read.gate.wait(read.value, Duration::from_secs(10)));
+        assert!(read.gate.wait(read.value, Duration::from_secs(10)).unwrap());
         let mut staged = vec![0u8; read.staging.byte_len() as usize];
         // SAFETY: the filler wrote the staging before it opened the gate.
         unsafe { read.staging.read_shared(0, &mut staged) }.unwrap();
@@ -1121,7 +1205,8 @@ mod tests {
         let table = ResidentTable::whole();
         assert!(table.directory().is_none());
         assert_eq!(table.streamed_bytes(), 0);
-        assert_eq!(table.indices(&[5, 0, 5]).unwrap(), [5, 0, 5]);
+        assert_eq!(table.indices(&[5, 0, -1, 5]).unwrap(), [5, 0, -1, 5]);
+        assert!(table.indices(&[-2]).is_err());
     }
 
     #[test]
@@ -1131,9 +1216,11 @@ mod tests {
         let streamed = device_table(None);
         assert_eq!(slot(&streamed, 2), row(2));
         let table = ResidentTable::streamed(streamed.clone());
-        // Its directory, its one staged row, its two landing staging rows
-        // and their notice.
-        assert_eq!(table.streamed_bytes(), 8 * 4 + 12 + 2 * 12 + 2 * 8);
+        // Its directory, its four stagings of four rows (a lane's one launch
+        // in flight and one more, each bringing twice:
+        // `TableFlights::stagings`), its two landing staging rows and their
+        // notice.
+        assert_eq!(table.streamed_bytes(), 8 * 4 + 4 * 4 * 12 + 2 * 12 + 2 * 8);
 
         // A step's rows gather by slot. An absent row replaces a row no
         // step named, once however often the step names it: the clock
@@ -1141,8 +1228,8 @@ mod tests {
         assert_eq!(table.indices(&[6, 1, 6]).unwrap(), [3, 1, 3]);
         assert_eq!(slot(&streamed, 3), row(6));
 
-        // The row a step named (1) is passed over. More rows than the
-        // staging holds are brought together.
+        // The row a step named (1) is passed over. A step's absent rows are
+        // brought together.
         assert_eq!(table.indices(&[4, 5]).unwrap(), [0, 2]);
         assert_eq!(slot(&streamed, 0), row(4));
         assert_eq!(slot(&streamed, 2), row(5));
@@ -1156,8 +1243,13 @@ mod tests {
         // outside the table, changes nothing.
         assert!(table.indices(&[0, 1, 2, 3, 4]).is_err());
         assert!(table.indices(&[8]).is_err());
-        assert!(table.indices(&[-1]).is_err());
+        assert!(table.indices(&[-2]).is_err());
         assert_eq!(table.indices(&[7, 4, 5, 1]).unwrap(), [3, 0, 2, 1]);
+        // -1 names no row: it stays -1 and brings nothing, beside rows that
+        // gather by slot.
+        assert_eq!(table.indices(&[4, -1, 1, -1]).unwrap(), [0, -1, 1, -1]);
+        assert_eq!(table.indices(&[-1, -1]).unwrap(), [-1, -1]);
+        assert_eq!(slot(&streamed, 0), row(4));
         // The filler publishes the directory: none of this before a read.
         assert_eq!(directory(&streamed), [-1; 8]);
     }

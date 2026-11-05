@@ -9,7 +9,7 @@ use crate::{
     native::import::ImportKernels,
     resources::{ImportSource, ImportWindow},
 };
-use magnitude_artifacts::{Package, gguf::GgufArtifact};
+use magnitude_artifacts::{CachePolicy, Package, gguf::GgufArtifact};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use seismic::{BuildError, Device, Element, Tensor};
 use std::collections::HashMap;
@@ -23,6 +23,20 @@ pub trait TuningWeightSource {
     /// The tensor an import entry reads `weight` from on `device`: its
     /// source in its upload representation, one row of every element.
     fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, BuildError>;
+
+    /// [`Self::import_source`] of a streamed load's banked expert stack,
+    /// read so that none of its bytes stay in the page cache: a
+    /// streamed load holds its experts only in its bank. Tuning reads real
+    /// values rather than zeros because a tuned entry's time can depend on
+    /// them: an NVFP4 operand recipe quantizes the expert product row
+    /// (`silu(gate) · up`), and its block scales branch on the values
+    /// (`nvfp4::value`'s zero scale, `nvfp4::global_scale`'s binade
+    /// corrections, `projection/stage.h`).
+    fn uncached_import_source(
+        &self,
+        device: &Device,
+        weight: &WeightPlan,
+    ) -> Result<Tensor, BuildError>;
 }
 
 impl TuningWeightSource for Package {
@@ -54,10 +68,19 @@ impl TuningWeightSource for Package {
             .transpose()?;
         let mut source = ImportSource::acquire(weight, &stored, window.as_ref(), device)?;
         if let Some(upload) = source.staged_mut() {
-            crate::programs::native_import::fill_staged_source(&stored, weight, upload)
+            crate::programs::native_import::fill_staged_source(&stored, weight, upload, CachePolicy::Cached)
                 .map_err(|error| error.to_string())?;
         }
         Ok(source.into_tensor())
+    }
+
+    /// An upload filled by a read around the file cache.
+    fn uncached_import_source(
+        &self,
+        device: &Device,
+        weight: &WeightPlan,
+    ) -> Result<Tensor, BuildError> {
+        Ok(ImportSource::uncached(weight, artifact(self, weight.component)?, device)?)
     }
 }
 
@@ -99,21 +122,41 @@ impl TuningWeightSource for ZeroTuningWeights {
     fn import_source(&self, device: &Device, weight: &WeightPlan) -> Result<Tensor, BuildError> {
         Ok(Tensor::zeros(device, weight.upload, &[logical_count(&weight.shape)?])?)
     }
+
+    /// Zeros read nothing.
+    fn uncached_import_source(
+        &self,
+        device: &Device,
+        weight: &WeightPlan,
+    ) -> Result<Tensor, BuildError> {
+        self.import_source(device, weight)
+    }
 }
 
 fn logical_count(shape: &[u64]) -> Result<u64, String> {
     crate::planning::elements(shape).ok_or_else(|| "weight element count overflows".to_owned())
 }
 
-/// The load plan's weight of one role.
+/// The load plan's weight of one role. A banked expert stack's is its
+/// resident plan: tuning measures the entries a bank shares with a resident
+/// load on the weights as a resident load holds them.
 pub(crate) fn weight_plan(
     load: &ModelLoadPlan,
     scope: WeightScope,
     kind: WeightKind,
 ) -> Result<&WeightPlan, String> {
-    let role = WeightRole { scope, kind };
+    located_plan(load, WeightRole { scope, kind }).map(|(plan, _)| plan)
+}
+
+/// [`weight_plan`] of `role`, and whether it is a banked expert stack's
+/// resident plan (`true`), whose stack the bank reads uncached.
+fn located_plan(load: &ModelLoadPlan, role: WeightRole) -> Result<(&WeightPlan, bool), String> {
+    if let Some(resident) = load.expert_bank().and_then(|bank| bank.resident_plan(role)) {
+        return Ok((resident, true));
+    }
     load.planned_weights()
         .find(|weight| weight.role == role)
+        .map(|plan| (plan, false))
         .ok_or_else(|| format!("weight {role:?} is absent from the load plan"))
 }
 
@@ -194,7 +237,7 @@ impl<'a> TuningWeights<'a> {
         if let Some(tensor) = self.resident.get(&role) {
             return Ok(tensor.clone());
         }
-        let plan = self.plan(scope, kind)?;
+        let (plan, banked) = located_plan(self.load, role)?;
         // A plane the host places is uploaded as placed, as loading
         // uploads it.
         if plan.placed_on_host() {
@@ -203,7 +246,10 @@ impl<'a> TuningWeights<'a> {
             self.resident.insert(role, tensor.clone());
             return Ok(tensor);
         }
-        let source = self.source.import_source(self.device, plan)?;
+        let source = match banked {
+            true => self.source.uncached_import_source(self.device, plan)?,
+            false => self.source.import_source(self.device, plan)?,
+        };
         let destination = Tensor::zeros(self.device, plan.resident, &plan.shape)?;
         let mut bound = (plan.bound != 0)
             .then(|| Tensor::zeros(self.device, Element::f32(), &[plan.bound]))

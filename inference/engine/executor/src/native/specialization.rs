@@ -78,6 +78,12 @@ impl<'a> UntunedEntries<'a> {
         self.formations.len()
     }
 
+    /// Every request formed by these entries' formations or by those of
+    /// the rounds before them ([`Specializer::count_untuned`]).
+    pub fn formed(&self) -> std::collections::HashSet<KernelRequest> {
+        self.requests.clone()
+    }
+
     pub fn into_formations(self) -> Vec<UntunedFormation<'a>> {
         self.formations
     }
@@ -89,7 +95,7 @@ impl<'a> UntunedEntries<'a> {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InvocationDemand {
     pub units: std::collections::HashMap<
-        super::tuning::TuningKey,
+        super::tuning::DemandKey,
         crate::programs::invocation_demand::InvocationCounts,
     >,
     pub objective: super::tuning::Objective,
@@ -158,22 +164,32 @@ impl<'a> Tuning<'a> {
         &self,
         case: &T,
     ) -> Result<Option<super::tuning::TuningKey>, CatalogFailure> {
-        let Some(device) = self.device() else {
-            return Ok(None);
-        };
-        let entry = <T::Entry as Entry>::NAME;
-        let bindings = case.bindings();
-        let implementation = seismic::generated::native_implementation_at::<T::Entry>(
-            device.backend(),
-            case.entry().elements(),
-        )
-        .map_err(|error| failure(entry, &bindings, error.to_string()))?
-        .ok_or_else(|| failure(entry, &bindings, "native implementation absent".into()))?;
-        let values = case
-            .statics(&self.model())
-            .map_err(|error| failure(entry, &bindings, error))?;
-        let fixed = domain_statics(implementation, entry, &bindings, &values)?;
-        Ok(Some((entry, bindings, fixed.statics().clone())))
+        self.device()
+            .map(|device| unit_of(device, &self.model(), case))
+            .transpose()
+    }
+
+    /// `fixed`, the static values of the entry `entry` at `bindings`, with
+    /// `implementation`'s arithmetic parameters at the choice of the unit
+    /// of `prerequisite`'s case ([`Tuner::following`]). A walk without
+    /// choices leaves them free: a demand walk, which collects a unit's
+    /// launches by its static values alone, and a listing.
+    fn following<P: EntryTuning>(
+        &mut self,
+        prerequisite: &P,
+        (entry, bindings): (&'static str, &str),
+        implementation: &NativeImplementation,
+        fixed: NativeSpecialization,
+    ) -> Result<NativeSpecialization, CatalogFailure> {
+        match self {
+            Self::Tuner(tuner) => {
+                let key = unit_of(tuner.device(), &tuner.model(), prerequisite)?;
+                tuner
+                    .following(&key, implementation, fixed)
+                    .map_err(|outcome| failure(entry, bindings, outcome))
+            }
+            Self::Demand { .. } | Self::Listing(_) => Ok(fixed),
+        }
     }
 
     pub fn choice(&self, key: &super::tuning::TuningKey) -> Option<&NativeSpecialization> {
@@ -331,9 +347,9 @@ fn domain_statics(
     }
 }
 
-/// [`domain_statics`] of `entry` on `backend`, at its element bindings: a
-/// call site that drives several entries from one set of `values` gives each
-/// only what it declares.
+/// [`domain_statics`] of `entry` on `backend`, at the element bindings it
+/// prepares (its `where` may read them): a call site that drives several
+/// entries from one set of `values` gives each only what it declares.
 pub(crate) fn entry_statics<E: Entry>(
     backend: BackendName,
     entry: &BoundEntry<E>,
@@ -368,12 +384,22 @@ impl<'a> Specializer<'a> {
 
     /// A specializer for a search's count of `device`'s programs: it forms
     /// nothing, and collects every entry without tuning parameters
-    /// ([`Specializer::into_untuned`]).
-    pub fn count_untuned(device: &'a Device) -> Self {
+    /// ([`Specializer::into_untuned`]) but those of `formed`, which an
+    /// earlier round of the search formed ([`UntunedEntries::formed`]).
+    pub fn count_untuned(
+        device: &'a Device,
+        formed: std::collections::HashSet<KernelRequest>,
+    ) -> Self {
         Self {
             backend: device.backend(),
             tensor_operations: device.forms_tensor_operations(),
-            mode: Mode::CountUntuned(device, UntunedEntries::default()),
+            mode: Mode::CountUntuned(
+                device,
+                UntunedEntries {
+                    requests: formed,
+                    formations: Vec::new(),
+                },
+            ),
         }
     }
 
@@ -487,14 +513,44 @@ impl<'a> Specializer<'a> {
         tuning: &mut Tuning<'_>,
         case: &T,
     ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
+        let implementation = self.implementation(&case.entry(), &case.bindings())?;
+        let fixed = case_statics(&tuning.model(), case, implementation)?;
+        self.specialized(tuning, case, implementation, fixed)
+    }
+
+    /// Prepare an entry through its tuning case as [`Self::tuned`] does, a
+    /// dependant of the unit of `prerequisite`'s case: its arithmetic
+    /// parameters are at that unit's choice ([`Tuner::following`]), so its
+    /// results carry the prerequisite's bits, and it is tuned in the others.
+    pub fn tuned_following<T: EntryTuning, P: EntryTuning>(
+        &mut self,
+        tuning: &mut Tuning<'_>,
+        case: &T,
+        prerequisite: &P,
+    ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
+        let bindings = case.bindings();
+        let implementation = self.implementation(&case.entry(), &bindings)?;
+        let fixed = case_statics(&tuning.model(), case, implementation)?;
+        let fixed = tuning.following(
+            prerequisite,
+            (<T::Entry as Entry>::NAME, &bindings),
+            implementation,
+            fixed,
+        )?;
+        self.specialized(tuning, case, implementation, fixed)
+    }
+
+    /// Prepare `case`'s entry at `fixed`: tuned in its free parameters by a
+    /// tuner, specialized at `fixed` by any other walk.
+    fn specialized<T: EntryTuning>(
+        &mut self,
+        tuning: &mut Tuning<'_>,
+        case: &T,
+        implementation: &NativeImplementation,
+        fixed: NativeSpecialization,
+    ) -> Result<Option<NativeKernel<T::Entry>>, CatalogFailure> {
         let entry = <T::Entry as Entry>::NAME;
         let bindings = case.bindings();
-        let bound = case.entry();
-        let implementation = self.implementation(&bound, &bindings)?;
-        let values = case
-            .statics(&tuning.model())
-            .map_err(|outcome| failure(entry, &bindings, outcome))?;
-        let fixed = domain_statics(implementation, entry, &bindings, &values)?;
         let tuning_model = tuning.model();
         let specialization = match tuning {
             Tuning::Tuner(tuner) if implementation.has_tuning_parameters() => {
@@ -525,27 +581,113 @@ impl<'a> Specializer<'a> {
             }
             Tuning::Tuner(_) | Tuning::Listing(_) => fixed,
         };
-        self.form(bound, &bindings, &specialization)
+        self.form(case.entry(), &bindings, &specialization)
     }
+}
+
+/// The static values `case` fixes `implementation` at for `model`.
+fn case_statics<T: EntryTuning>(
+    model: &ModelInputs<'_>,
+    case: &T,
+    implementation: &NativeImplementation,
+) -> Result<NativeSpecialization, CatalogFailure> {
+    let entry = <T::Entry as Entry>::NAME;
+    let bindings = case.bindings();
+    let values = case
+        .statics(model)
+        .map_err(|outcome| failure(entry, &bindings, outcome))?;
+    domain_statics(implementation, entry, &bindings, &values)
+}
+
+/// The unit of `case` on `device` for `model`.
+fn unit_of<T: EntryTuning>(
+    device: &Device,
+    model: &ModelInputs<'_>,
+    case: &T,
+) -> Result<super::tuning::TuningKey, CatalogFailure> {
+    let entry = <T::Entry as Entry>::NAME;
+    let bindings = case.bindings();
+    let implementation = seismic::generated::native_implementation_at::<T::Entry>(
+        device.backend(),
+        case.entry().elements(),
+    )
+    .map_err(|error| failure(entry, &bindings, error.to_string()))?
+    .ok_or_else(|| failure(entry, &bindings, "native implementation absent".into()))?;
+    let fixed = case_statics(model, case, implementation)?;
+    Ok(super::tuning::unit_key(entry, bindings, &fixed))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_kernels::routed_output;
+    use magnitude_kernels::{
+        routed_output, routed_route_shared, routed_route_streamed, routed_select,
+        routed_select_streamed,
+    };
     use seismic::BackendName;
+
+    /// A streamed layer's route and selection follow their resident entry:
+    /// on every backend that declares both, a dependant is fixed at
+    /// exactly its arithmetic parameters, each at the resident choice's
+    /// value, which the resident declares arithmetic over the same values;
+    /// each other parameter, its launch shape, is left to its search with
+    /// every value it declares.
+    #[test]
+    fn a_streamed_route_follows_its_residents_arithmetic_and_searches_its_launch() {
+        fn follows<R: Entry, S: Entry>(backend: BackendName) {
+            let Some(resident) =
+                seismic::generated::native_implementation_for_backend::<R>(backend).unwrap()
+            else {
+                return;
+            };
+            let streamed = seismic::generated::native_implementation_for_backend::<S>(backend)
+                .unwrap()
+                .unwrap();
+            // A resident choice away from every default.
+            let choice = resident
+                .params
+                .iter()
+                .fold(NativeSpecialization::new(), |choice, parameter| {
+                    choice.with_param(parameter.name.clone(), *parameter.values.last().unwrap())
+                });
+            let fixed = super::super::tuning::arithmetic_of(&streamed, &choice).unwrap();
+            let searched = streamed
+                .params
+                .iter()
+                .filter(|parameter| !fixed.iter().any(|(name, _)| *name == parameter.name))
+                .collect::<Vec<_>>();
+            assert!(
+                !searched.is_empty(),
+                "{} on {backend:?} has no launch shape to search",
+                S::NAME
+            );
+            for parameter in searched {
+                assert!(parameter.values.len() > 1, "{parameter:?}");
+            }
+            for (name, value) in fixed {
+                let own = resident.params.iter().find(|parameter| parameter.name == name).unwrap();
+                let followed = streamed.params.iter().find(|parameter| parameter.name == name).unwrap();
+                assert!(own.arithmetic && own.values == followed.values, "{name} on {backend:?}");
+                assert_eq!(choice.param(&name), Some(value));
+            }
+        }
+        for backend in [BackendName::Metal, BackendName::Cuda] {
+            follows::<routed_route_shared::Entry, routed_route_streamed::Entry>(backend);
+            follows::<routed_select::Entry, routed_select_streamed::Entry>(backend);
+        }
+    }
 
     /// The load's twin of graph construction's domain check: a down
     /// projection wider than the Metal kernel's register budget admits is
     /// refused before any tuning, naming the call's statics.
     #[test]
     fn statics_outside_the_kernel_domain_are_refused() {
-        let Ok(device) = seismic::Devices::discover(&[])
-            .unwrap()
-            .open_backend(BackendName::Metal)
-        else {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        // Only a host with Metal runs it.
+        if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
-        };
+        }
+        let device = catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens");
         let implementation =
             seismic::generated::native_implementation::<routed_output::Entry>(&device)
                 .unwrap()

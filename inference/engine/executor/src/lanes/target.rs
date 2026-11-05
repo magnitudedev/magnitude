@@ -32,7 +32,9 @@ pub struct TargetLaunchInputs {
     /// of a model without one): the host's form of the n-gram token window.
     preceding: Vec<Vec<u64>>,
     graph_workspace: TargetGraphWorkspaceLease,
-    graph_outputs: [TargetGraphOutputLease; 2],
+    /// The launch's place in its chain's output rotation
+    /// (`TargetProgram::submit`).
+    graph_output: TargetGraphOutputLease,
     readout_workspace: NativeGraphWorkspaceLease,
     readout_output: Option<NativeGraphOutputLease>,
 }
@@ -53,7 +55,7 @@ impl TargetLaunchInputs {
         conditioning: Vec<Option<ConditioningRef>>,
         conditioning_slices: Vec<Vec<ConditioningSlice>>,
         graph_workspace: TargetGraphWorkspaceLease,
-        graph_outputs: [TargetGraphOutputLease; 2],
+        graph_output: TargetGraphOutputLease,
         readout_workspace: NativeGraphWorkspaceLease,
         readout_output: NativeGraphOutputLease,
     ) -> Self {
@@ -64,7 +66,7 @@ impl TargetLaunchInputs {
             conditioning,
             conditioning_slices,
             graph_workspace,
-            graph_outputs,
+            graph_output,
             readout_workspace,
             readout_output: Some(readout_output),
             boundary: None,
@@ -151,10 +153,7 @@ impl TargetLaunchInputs {
             }
         }
         if self.graph_workspace.domain() != domain
-            || self
-                .graph_outputs
-                .iter()
-                .any(|lease| lease.domain() != domain)
+            || self.graph_output.domain() != domain
             || self.readout_workspace.domain() != domain
             || self
                 .readout_output
@@ -187,7 +186,7 @@ impl TargetLaunchInputs {
                     "slot {index} publishes to another recurrent successor bank"
                 )));
             }
-            if slot.history_domains() != store.history_reads() {
+            if slot.history_domains() != store.history_reads().len() {
                 return Err(invalid(format!(
                     "slot {index} history domain count differs from its store"
                 )));
@@ -195,8 +194,10 @@ impl TargetLaunchInputs {
             // A Shared source domain's reads: its accepted rows, then rows its
             // source appends in this advance.
             for (read, domain) in store
-                .shared_source_domains()
-                .into_iter()
+                .history_reads()
+                .shared_sources()
+                .iter()
+                .copied()
                 .enumerate()
                 .map(|(position, domain)| (store.history_domains().count() + position, domain))
             {
@@ -360,7 +361,7 @@ impl TargetLaunchInputs {
 pub struct ValidatedTargetLaunch {
     core: TargetLaunchCore,
     graph_workspace: TargetGraphWorkspaceLease,
-    graph_outputs: [TargetGraphOutputLease; 2],
+    graph_output: TargetGraphOutputLease,
     readout_workspace: NativeGraphWorkspaceLease,
     readout_output: Option<NativeGraphOutputLease>,
 }
@@ -385,7 +386,7 @@ impl ValidatedTargetLaunch {
             boundary,
             preceding,
             graph_workspace,
-            graph_outputs,
+            graph_output,
             readout_workspace,
             readout_output,
         } = inputs;
@@ -402,7 +403,7 @@ impl ValidatedTargetLaunch {
                 domain: domain.clone(),
             },
             graph_workspace,
-            graph_outputs,
+            graph_output,
             readout_workspace,
             readout_output,
         })
@@ -412,8 +413,18 @@ impl ValidatedTargetLaunch {
         PoolClass::Target(self.core.batch.class())
     }
 
+    pub(crate) fn batch(&self) -> &ValidatedTargetBatch {
+        self.core.batch()
+    }
+
     pub fn domain(&self) -> &ResourceDomainId {
         &self.core.domain
+    }
+
+    /// The launch's state advances, one per slot: a step chained behind it
+    /// follows them.
+    pub(crate) fn advances(&self) -> &[TentativeAdvance] {
+        self.core.advances()
     }
 
     pub(crate) fn submission_parts_mut(
@@ -421,14 +432,14 @@ impl ValidatedTargetLaunch {
     ) -> (
         &TargetLaunchCore,
         &mut TargetGraphWorkspaceLease,
-        &mut [TargetGraphOutputLease; 2],
+        &mut TargetGraphOutputLease,
         &mut NativeGraphWorkspaceLease,
         &mut Option<NativeGraphOutputLease>,
     ) {
         (
             &self.core,
             &mut self.graph_workspace,
-            &mut self.graph_outputs,
+            &mut self.graph_output,
             &mut self.readout_workspace,
             &mut self.readout_output,
         )
@@ -436,9 +447,9 @@ impl ValidatedTargetLaunch {
 
     /// The reconciliation payload and the device leases the submitted work
     /// uses; the leases stay held until the submission is finished. The
-    /// residual pair returns to its pool now: every reader of it was queued
-    /// by this submission, and the device runs the next launch that takes the
-    /// pair after this one.
+    /// launch's output returns to its pool now: every reader of it was
+    /// queued by this submission, and the device runs the next launch that
+    /// takes it after this one.
     pub(crate) fn into_submission_parts(self) -> (TargetLaunchCore, TargetLaunchWorkspace) {
         (
             self.core,

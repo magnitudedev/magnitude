@@ -21,12 +21,15 @@
 
 pub(crate) mod fused_graph;
 pub(crate) mod graph;
+pub(crate) mod grouped;
+pub(crate) mod split;
+pub(crate) mod streamed;
 
 use crate::error::PlanError;
 use crate::{DenseScales, RoutedBinding, ScalableWeight};
 use magnitude_family_contracts::{
-    ActivationFunction, ExpertSelection, FeedForwardUp, RouteNormalization, RoutedFfn, RouterInput,
-    ScoreFunction, SharedExpert, SharedExpertGate, WeightKind,
+    ActivationFunction, ExpertSelection, FeedForwardUp, Operator, RouteNormalization, RoutedFfn,
+    RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, WeightKind,
 };
 use seismic::Element;
 
@@ -41,7 +44,7 @@ pub struct Expansion {
 }
 
 impl Expansion {
-    fn of(up: &FeedForwardUp) -> Self {
+    pub(crate) fn of(up: &FeedForwardUp) -> Self {
         Self {
             gated: up.gate().is_some(),
             activation: activation_code(up.activation()),
@@ -200,6 +203,19 @@ pub struct GeneralRoutedScales {
     pub latent: (u64, u64),
 }
 
+/// The routed feed-forward of a feed-forward operator: its own, or a
+/// parallel sublayer's routed branch's.
+pub(crate) fn routed_ffn(op: &Operator) -> Option<&RoutedFfn> {
+    match op {
+        Operator::RoutedFfn(routed) => Some(routed),
+        Operator::Parallel(branches) => branches.iter().find_map(|branch| routed_ffn(&branch.op)),
+        _ => None,
+    }
+}
+
+/// The expansion function of the fused form's experts (`is_fused`).
+pub(crate) const FUSED_ACTIVATION: i32 = magnitude_kernels::cpu_library::cpu::lib::core::functions::SILU;
+
 /// The routed form Qwen's fused entries implement: a softmax top-k router on
 /// the normalized input without bias, the plain sum normalization, SiLU-gated
 /// experts in the hidden width and one sigmoid-gated SiLU shared expert.
@@ -228,6 +244,25 @@ pub(crate) fn is_fused(routed: &RoutedFfn) -> bool {
         && routed.shared.as_ref().is_some_and(|shared| {
             silu_gated(&shared.up) && matches!(shared.gate, SharedExpertGate::Sigmoid(_))
         })
+}
+
+/// The weights a streamed layer's decode route reads of the layer it
+/// predicts in place of its own, in its hint ports' order: the fused
+/// route's input norm and router; the general selection's router norm
+/// (its own where the router reads the residual, else the input norm),
+/// router and selection bias.
+pub(crate) fn hint_kinds(routed: &RoutedFfn) -> Vec<WeightKind> {
+    match is_fused(routed) {
+        true => vec![WeightKind::InputNorm, WeightKind::Router],
+        false => vec![
+            match routed.router.input {
+                RouterInput::Residual(_) => WeightKind::RouterInputNorm,
+                _ => WeightKind::InputNorm,
+            },
+            WeightKind::Router,
+            WeightKind::RouterSelectionBias,
+        ],
+    }
 }
 
 /// The forms the general routed entries implement: softmax or sigmoid

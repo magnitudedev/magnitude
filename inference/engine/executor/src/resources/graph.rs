@@ -1,6 +1,6 @@
 //! Bounded Seismic graph storage owned by the executor resource plan.
 
-use crate::{CapacityError, InvariantError, ResourceDomainId, ResourceKind};
+use crate::{CapacityError, GraphSlots, InvariantError, ResourceDomainId, ResourceKind};
 use seismic::{
     NativeExecutionArena, NativeGraphFamily, NativeGraphFamilyOutputSlot, NativeGraphFamilySlot,
     NativeGraphOutputs, NativeGraphPlan, Tensor, WorkflowTensor,
@@ -9,73 +9,146 @@ use std::{cell::RefCell, rc::Rc};
 
 /// One family's graph storage. Activations cover the launches of the family
 /// in flight at once; each holds its upload regions and binds the device's
-/// one workspace arena. They are fixed at startup. Output slots outlive their
-/// launches (a request retains its last published features), so their count
-/// follows the live requests: the pool starts with what one request needs
-/// and grows one slot at a time under a heap claim, and slots idle beyond
-/// that start are released as surplus.
+/// one workspace arena. Output slots outlive their launches (a request
+/// retains its last published features), so their count follows the live
+/// requests: they grow one slot at a time under a heap claim. Both start at
+/// the floor of a prompt group of one place and grow to the class a group is
+/// granted (`hold`); what idles beyond the held class is released as
+/// surplus, and the held class itself down to the floor in Reclaim.
 pub struct NativeGraphPool {
     domain: ResourceDomainId,
     family: NativeGraphFamily,
+    arena: NativeExecutionArena,
+    upload_regions: Vec<u64>,
     /// Upload regions of one activation.
     activation_bytes: u64,
-    /// Activations allocated now, lent or free.
-    activations: usize,
     output_bytes: u64,
-    minimum_outputs: usize,
-    /// Output slots allocated now, lent or free.
-    outputs: usize,
+    /// Who reads its outputs ([`Outputs`]).
+    outputs: Outputs,
+    /// The slots of a group of one place, never released.
+    floor: GraphSlots,
+    /// The slots of the class held now: the floor or more.
+    held: GraphSlots,
+    /// Activations and output slots allocated now, lent or free.
+    allocated: GraphSlots,
     workspace: Rc<RefCell<Vec<NativeGraphFamilySlot>>>,
     output: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
 }
 
+/// Who reads a family's outputs. The host reads a selection as its step
+/// completes, with the next step already queued: read from device memory, it
+/// would queue a copy behind that step and hold the host until it ends, so
+/// no step would ever be queued ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Outputs {
+    /// Device work reads them: `DeviceOnly`.
+    Device,
+    /// The host reads them: `Shared`.
+    Host,
+}
+
 impl NativeGraphPool {
     /// The startup slots of `charge`: its activations in `arena`, each with
-    /// `upload_regions` upload regions, and its startup output slots.
+    /// its upload regions, and its startup output slots. Each activation's
+    /// slot holds the graphs its launches replay
+    /// (`seismic::NativeGraphFamily::slot_graphs`).
     pub(crate) fn new(
         domain: ResourceDomainId,
         family: &NativeGraphFamily,
-        charge: crate::NativeGraphCharge,
+        charge: &crate::NativeGraphCharge,
         arena: &NativeExecutionArena,
+        outputs: Outputs,
     ) -> Result<Self, super::AllocationError> {
-        let workspace = (0..charge.activations)
-            .map(|_| family.new_slot_in(arena, charge.upload_regions))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(super::AllocationError::Workflow)?;
-        let output = (0..charge.output_slots)
-            .map(|_| family.new_output_slot())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(super::AllocationError::Tensor)?;
-        let activation_bytes = charge
-            .upload_bytes
-            .checked_mul(charge.upload_regions as u64)
-            .ok_or_else(|| {
-                super::AllocationError::Plan(crate::InvariantError {
-                    context: "graph pool",
-                    detail: "activation byte count overflows".into(),
-                })
-            })?;
-        Ok(Self {
+        let floor = GraphSlots {
+            activations: charge.activations,
+            output: charge.output_slots,
+        };
+        let mut pool = Self {
             domain,
             family: family.clone(),
-            activation_bytes,
-            activations: charge.activations,
+            arena: arena.clone(),
+            upload_regions: charge.upload_regions.clone(),
+            activation_bytes: charge.activation_bytes(),
             output_bytes: charge.output_bytes,
-            minimum_outputs: charge.output_slots,
-            outputs: charge.output_slots,
-            workspace: Rc::new(RefCell::new(workspace)),
-            output: Rc::new(RefCell::new(output)),
-        })
+            outputs,
+            floor,
+            held: floor,
+            allocated: GraphSlots {
+                activations: 0,
+                output: 0,
+            },
+            workspace: Rc::new(RefCell::new(Vec::new())),
+            output: Rc::new(RefCell::new(Vec::new())),
+        };
+        pool.grow(floor)?;
+        Ok(pool)
+    }
+
+    /// The bytes [`Self::grow`] of `slots` allocates.
+    pub(crate) fn hold_bytes(&self, slots: GraphSlots) -> Result<u64, &'static str> {
+        class_bytes(
+            self.activation_bytes,
+            slots.activations.saturating_sub(self.allocated.activations),
+            self.output_bytes,
+            slots.output.saturating_sub(self.allocated.output),
+        )
+    }
+
+    /// What the activations up to `slots`' count beyond those allocated
+    /// add to the device's graph budget: each slot's graphs
+    /// (`seismic::NativeGraphFamily::slot_graphs`), which it makes as it
+    /// is allocated ([`Self::grow`]).
+    pub(crate) fn hold_graphs(&self, slots: GraphSlots) -> Option<seismic::GraphCensus> {
+        let more = slots.activations.saturating_sub(self.allocated.activations);
+        self.family.slot_graphs().times(u64::try_from(more).ok()?)
+    }
+
+    /// Allocate activations and output slots up to `slots`' counts, held
+    /// only by [`Self::hold`]. The caller holds a heap claim for
+    /// [`Self::hold_bytes`] across this call. On a failure what was
+    /// allocated idles until released.
+    pub(crate) fn grow(&mut self, slots: GraphSlots) -> Result<(), super::AllocationError> {
+        while self.allocated.activations < slots.activations {
+            let slot = self
+                .family
+                .new_slot_in(&self.arena, &self.upload_regions)
+                .map_err(super::AllocationError::Workflow)?;
+            self.workspace.borrow_mut().push(slot);
+            self.allocated.activations += 1;
+        }
+        while self.allocated.output < slots.output {
+            self.grow_output().map_err(super::AllocationError::Tensor)?;
+        }
+        Ok(())
+    }
+
+    /// Hold `slots`' class, which [`Self::grow`] allocated: its slots are
+    /// kept until Reclaim releases the class.
+    pub(crate) fn hold(&mut self, slots: GraphSlots) {
+        self.held = GraphSlots {
+            activations: self.held.activations.max(slots.activations),
+            output: self.held.output.max(slots.output),
+        };
     }
 
     pub fn domain(&self) -> &ResourceDomainId {
         &self.domain
     }
 
+    /// The slots of a group of one place, never released.
+    pub(crate) fn floor(&self) -> GraphSlots {
+        self.floor
+    }
+
     /// Physical arenas owned by this pool, including slots currently lent
     /// to a submission or a published output view.
-    pub fn committed_bytes(&self) -> u64 {
-        self.activation_bytes * self.activations as u64 + self.output_bytes * self.outputs as u64
+    pub fn committed_bytes(&self) -> Result<u64, &'static str> {
+        class_bytes(
+            self.activation_bytes,
+            self.allocated.activations,
+            self.output_bytes,
+            self.allocated.output,
+        )
     }
 
     /// The charge of one more output slot.
@@ -94,24 +167,31 @@ impl NativeGraphPool {
     /// Allocate one more output slot. The caller holds a heap claim for
     /// [`Self::output_slot_bytes`] across this call.
     pub(crate) fn grow_output(&mut self) -> Result<(), seismic::TensorError> {
-        let slot = self.family.new_output_slot()?;
+        let slot = match self.outputs {
+            Outputs::Device => self.family.new_output_slot()?,
+            Outputs::Host => self.family.new_host_output_slot()?,
+        };
         self.output.borrow_mut().push(slot);
-        self.outputs += 1;
+        self.allocated.output += 1;
         Ok(())
     }
 
-    /// Release free output slots beyond the startup count; returns how many
-    /// were released. Lent slots stay until their last view drops.
-    pub(crate) fn release_idle_outputs(&mut self) -> usize {
-        let mut free = self.output.borrow_mut();
-        let releasable = self
-            .outputs
-            .saturating_sub(self.minimum_outputs)
-            .min(free.len());
-        let kept = free.len() - releasable;
-        free.truncate(kept);
-        self.outputs -= releasable;
-        releasable
+    /// Release free activations and output slots beyond the held class's
+    /// counts, the held class being the floor's once `reclaim` releases it;
+    /// returns how many were released. Lent slots stay until their last view
+    /// drops.
+    pub(crate) fn release_idle(&mut self, reclaim: bool) -> usize {
+        if reclaim {
+            self.held = self.floor;
+        }
+        fn release<T>(free: &mut Vec<T>, allocated: &mut usize, kept: usize) -> usize {
+            let releasable = allocated.saturating_sub(kept).min(free.len());
+            free.truncate(free.len() - releasable);
+            *allocated -= releasable;
+            releasable
+        }
+        release(&mut self.workspace.borrow_mut(), &mut self.allocated.activations, self.held.activations)
+            + release(&mut self.output.borrow_mut(), &mut self.allocated.output, self.held.output)
     }
 
     pub fn acquire_workspace(&self) -> Result<NativeGraphWorkspaceLease, CapacityError> {
@@ -149,7 +229,6 @@ impl NativeGraphPool {
 /// slots are released when idle.
 pub struct VisionGraphPool {
     domain: ResourceDomainId,
-    upload_regions: usize,
     classes: Vec<VisionGraphClass>,
 }
 
@@ -162,15 +241,25 @@ struct VisionGraphClass {
     output: Rc<RefCell<Vec<NativeGraphFamilyOutputSlot>>>,
 }
 
+impl VisionGraphClass {
+    /// An encode runs one graph at a time to completion.
+    fn upload_regions(&self) -> Vec<u64> {
+        crate::planning::serial_upload_regions(self.family.upload_bytes())
+    }
+
+    /// One activation's own workspace and its upload regions.
+    fn activation_bytes(&self) -> u64 {
+        self.family.workspace_bytes() + self.upload_regions().iter().sum::<u64>()
+    }
+}
+
 impl VisionGraphPool {
     pub(crate) fn new<'a>(
         domain: ResourceDomainId,
-        upload_regions: usize,
         classes: impl IntoIterator<Item = (u64, &'a NativeGraphFamily)>,
     ) -> Self {
         Self {
             domain,
-            upload_regions,
             classes: classes
                 .into_iter()
                 .map(|(patch_rows, family)| VisionGraphClass {
@@ -210,8 +299,14 @@ impl VisionGraphPool {
     /// The charge of one activation of the class of `patch_rows`: its own
     /// workspace and its upload regions.
     pub fn activation_bytes(&self, patch_rows: u64) -> Result<u64, CapacityError> {
-        let family = &self.class(patch_rows)?.family;
-        Ok(family.workspace_bytes() + family.upload_bytes() * self.upload_regions as u64)
+        Ok(self.class(patch_rows)?.activation_bytes())
+    }
+
+    /// What the next activation of the class of `patch_rows` adds to the
+    /// device's graph budget: what its slot holds
+    /// (`seismic::NativeGraphFamily::slot_graphs`).
+    pub fn activation_graphs(&self, patch_rows: u64) -> Result<seismic::GraphCensus, CapacityError> {
+        Ok(self.class(patch_rows)?.family.slot_graphs())
     }
 
     /// The charge of one output slot of the class of `patch_rows`.
@@ -232,11 +327,10 @@ impl VisionGraphPool {
     /// Allocate one more activation of the class of `patch_rows`. The caller
     /// holds a heap claim for [`Self::activation_bytes`] across this call.
     pub(crate) fn grow_activation(&mut self, patch_rows: u64) -> Result<(), VisionGrowth> {
-        let regions = self.upload_regions;
         let class = self.class_mut(patch_rows).map_err(VisionGrowth::Class)?;
         let slot = class
             .family
-            .new_slot(regions)
+            .new_slot(&class.upload_regions())
             .map_err(VisionGrowth::Device)?;
         class.workspace.borrow_mut().push(slot);
         class.activations += 1;
@@ -304,17 +398,30 @@ impl VisionGraphPool {
     }
 
     /// Storage allocated now, lent or free.
-    pub fn committed_bytes(&self) -> u64 {
-        self.classes
-            .iter()
-            .map(|class| {
-                let family = &class.family;
-                let activation =
-                    family.workspace_bytes() + family.upload_bytes() * self.upload_regions as u64;
-                activation * class.activations as u64 + family.output_bytes() * class.outputs as u64
-            })
-            .sum()
+    pub fn committed_bytes(&self) -> Result<u64, &'static str> {
+        self.classes.iter().try_fold(0u64, |bytes, class| {
+            class_bytes(
+                class.activation_bytes(),
+                class.activations,
+                class.family.output_bytes(),
+                class.outputs,
+            )?
+            .checked_add(bytes)
+            .ok_or(OVERFLOW)
+        })
     }
+}
+
+const OVERFLOW: &str = "a graph pool's bytes overflow";
+
+/// The bytes of `activations` activations of `activation_bytes` and
+/// `outputs` output slots of `output_bytes`.
+fn class_bytes(activation_bytes: u64, activations: usize, output_bytes: u64, outputs: usize) -> Result<u64, &'static str> {
+    let slots = |bytes: u64, slots: usize| u64::try_from(slots).ok().and_then(|slots| bytes.checked_mul(slots));
+    slots(activation_bytes, activations)
+        .zip(slots(output_bytes, outputs))
+        .and_then(|(activations, outputs)| activations.checked_add(outputs))
+        .ok_or(OVERFLOW)
 }
 
 /// A failed vision slot growth: a class the load did not prepare, or the
@@ -473,3 +580,16 @@ impl GraphOutputTensor {
 pub type TargetGraphPool = NativeGraphPool;
 pub type TargetGraphWorkspaceLease = NativeGraphWorkspaceLease;
 pub type TargetGraphOutputLease = NativeGraphOutputLease;
+
+#[cfg(test)]
+mod tests {
+    /// A class's bytes are its slots' bytes, and refused where either
+    /// product or their sum leaves `u64`.
+    #[test]
+    fn a_class_refuses_bytes_beyond_u64() {
+        assert_eq!(super::class_bytes(3, 2, 5, 4), Ok(26));
+        assert!(super::class_bytes(u64::MAX, 2, 0, 0).is_err());
+        assert!(super::class_bytes(0, 0, u64::MAX / 2 + 1, 2).is_err());
+        assert!(super::class_bytes(u64::MAX, 1, 1, 1).is_err());
+    }
+}

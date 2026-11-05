@@ -82,11 +82,7 @@ pub fn describe_projector(
     directory: &Directory,
     target_width: u64,
 ) -> Result<VisionDescription, Error> {
-    projector_type(
-        directory,
-        &[("lfm3vl", ())],
-        target_width,
-    )?;
+    projector_type(directory, &[("lfm3vl", ())], target_width)?;
     if let Some(entry) = directory
         .metadata
         .iter()

@@ -409,7 +409,11 @@ pub(crate) struct PreparedTargetReadoutGraph {
 pub struct PreparedTargetReadoutGraphs {
     pub(crate) residual_width: Option<u64>,
     classes: BTreeMap<ReadoutClass, PreparedTargetReadoutGraph>,
+    /// Every class: any launch's readout runs in its slots.
     family: NativeGraphFamily,
+    /// The classes a prompt chunk's readout runs ([`chunk_holds`]), whose
+    /// slots hold no more than it exports.
+    chunk_family: NativeGraphFamily,
     max_projected_rows: usize,
     certified_classes: Vec<u64>,
 }
@@ -419,6 +423,15 @@ pub(crate) struct BoundTargetReadoutGraphs {
     /// its attested programs.
     pub prepared: std::sync::Arc<PreparedTargetReadoutGraphs>,
     bound: BTreeMap<ReadoutClass, BoundNativeGraphPlan>,
+}
+
+/// Whether a readout projecting `projected` rows is of a prompt chunk's
+/// classes: at most its final row (`domain::projected_rows`). Such a
+/// readout's slots come from the chunk family, and its class's layout is of
+/// a regime of its own (`readout_regime`), both sized by what such a
+/// readout exports, not by the load's widest export.
+pub(crate) fn chunk_holds(projected: u64) -> bool {
+    projected <= 1
 }
 
 /// Whether the load's projecting readout classes export their logits: only
@@ -568,6 +581,7 @@ impl PreparedTargetReadoutGraphs {
                 .map_err(error)?;
         let mut classes = BTreeMap::new();
         let mut plans = Vec::new();
+        let mut chunk_plans = Vec::new();
         let mut add = |class: ReadoutClass| -> Result<(), String> {
             let layout = regimes
                 .get(&readout_regime(class))
@@ -584,6 +598,9 @@ impl PreparedTargetReadoutGraphs {
                 layout,
             )?;
             plans.push(variant.plan.clone());
+            if chunk_holds(class.projected) {
+                chunk_plans.push(variant.plan.clone());
+            }
             classes.insert(class, variant);
             Ok(())
         };
@@ -591,10 +608,12 @@ impl PreparedTargetReadoutGraphs {
             add(class)?;
         }
         let family = NativeGraphFamily::new(&plans).map_err(|error| error.to_string())?;
+        let chunk_family = NativeGraphFamily::new(&chunk_plans).map_err(|error| error.to_string())?;
         Ok(Self {
             residual_width: load.residual_conditioning(),
             classes,
             family,
+            chunk_family,
             max_projected_rows: max_projected_rows(limits),
             certified_classes: magnitude_batching::row_classes(limits.max_selected_rows)
                 .into_iter()
@@ -606,6 +625,11 @@ impl PreparedTargetReadoutGraphs {
 
     pub fn family(&self) -> &NativeGraphFamily {
         &self.family
+    }
+    /// The family of the classes a prompt chunk's readout runs
+    /// ([`chunk_holds`]).
+    pub fn chunk_family(&self) -> &NativeGraphFamily {
+        &self.chunk_family
     }
     pub fn workspace_bytes(&self) -> u64 {
         self.family.workspace_bytes()
@@ -1785,22 +1809,22 @@ pub(crate) fn checked_readout_family_storage(
     regimes
         .values()
         .map(NativeGraphLayout::storage_bytes)
-        .reduce(|previous, bytes| NativeGraphStorageBytes {
-            workspace: previous.workspace.max(bytes.workspace),
-            output: previous.output.max(bytes.output),
-            upload: previous.upload.max(bytes.upload),
-        })
+        .reduce(NativeGraphStorageBytes::most)
         .ok_or_else(|| "readout graph family has no classes".into())
 }
 
-/// The structure a readout class selects: its kind and, for a selection,
-/// the selected-row count its sampling view is built from.
-type ReadoutRegime = (ReadoutKind, u64);
+/// The structure a readout class selects: its kind; for a selection, the
+/// selected-row count its sampling view is built from; and whether it is a
+/// prompt chunk's class ([`chunk_holds`]). A regime's classes share the
+/// layout of its widest, so a chunk's classes form regimes of their own:
+/// the chunk family's slots hold what a chunk exports.
+type ReadoutRegime = (ReadoutKind, u64, bool);
 
 fn readout_regime(class: ReadoutClass) -> ReadoutRegime {
+    let chunk = chunk_holds(class.projected);
     match class.kind {
-        ReadoutKind::Selection { .. } => (class.kind, class.selected),
-        kind => (kind, 0),
+        ReadoutKind::Selection { .. } => (class.kind, class.selected, chunk),
+        kind => (kind, 0, chunk),
     }
 }
 
@@ -1838,7 +1862,8 @@ fn certify_readout_regimes(
     }
     regimes
         .into_iter()
-        .map(|((kind, selected), classes)| {
+        .map(|(regime, classes)| {
+            let (kind, selected, _) = regime;
             let largest = |field: fn(&ReadoutClass) -> u64| {
                 classes
                     .iter()
@@ -1893,7 +1918,7 @@ fn certify_readout_regimes(
             )?
             .seal_template()
             .and_then(|template| template.certify(&slices))?;
-            Ok(((kind, selected), layout))
+            Ok((regime, layout))
         })
         .collect()
 }
@@ -2139,8 +2164,8 @@ mod resource_regime_tests {
     /// class; and a row whose sampling cuts or penalizes is never certified.
     #[test]
     fn readers_of_a_scope_stored_as_planes_read_the_planes() {
-        let definition = crate::planning::tests::fixture_definition();
-        let mut manifest = crate::planning::tests::fixture_manifest(&definition);
+        let definition = crate::planning::fixtures::fixture_definition();
+        let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
         let output = manifest
             .target
             .tensors
@@ -2158,6 +2183,8 @@ mod resource_regime_tests {
                 vision: false,
             },
             crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap()
         .with_readout_candidates(&definition)
@@ -2191,6 +2218,8 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let norm = target_readout_norm(&load, &definition.decoder).unwrap();
         let classes = qualified_readout_classes(limits, selecting, backend).unwrap();
@@ -2236,8 +2265,8 @@ mod resource_regime_tests {
     fn every_readout_class_fits_its_shared_regime_layout() {
         // A Q8_0 head, so a backend that reads progressive heads places it
         // in planes and certifies selection classes.
-        let definition = crate::planning::tests::fixture_definition();
-        let mut manifest = crate::planning::tests::fixture_manifest(&definition);
+        let definition = crate::planning::fixtures::fixture_definition();
+        let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
         let output = manifest
             .target
             .tensors
@@ -2255,6 +2284,8 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let diagnostic = ResourceLimits {
             exported_logits_rows: 64,
@@ -2275,6 +2306,8 @@ mod resource_regime_tests {
                     vision: false,
                 },
                 layout,
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let progressive = reads_progressive_heads(backend).unwrap();
@@ -2361,9 +2394,9 @@ mod resource_regime_tests {
     /// certified regime layout on Metal (progressive head) and CPU.
     #[test]
     fn a_hyper_connection_exit_certifies_its_readout_graphs_without_a_norm() {
-        let definition = crate::planning::tests::hyper_connection_fixture_definition();
+        let definition = crate::planning::fixtures::hyper_connection_fixture_definition();
         let decoder = &definition.decoder;
-        let mut manifest = crate::planning::tests::fixture_manifest(&definition);
+        let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
         let output = manifest
             .target
             .tensors
@@ -2381,6 +2414,8 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         for backend in [BackendName::Metal, BackendName::Cpu] {
             let load = ModelLoadPlan::derive(
@@ -2391,6 +2426,8 @@ mod resource_regime_tests {
                     vision: false,
                 },
                 crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let progressive = reads_progressive_heads(backend).unwrap();
@@ -2460,6 +2497,8 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let classes = readout_classes(limits, 4).unwrap();
         assert!(

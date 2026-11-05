@@ -46,10 +46,9 @@ pub struct VisionFlight<F: ProgramFamily = NativeFamily> {
     pub(super) image: ImageRef,
     pub(super) submission: F::VisionSubmission,
     pub(super) started: Instant,
-    /// The device's recorded graph count at submission: the flight paid a
-    /// recording if it grew before the flight finished.
-    pub(super) recorded_graphs: u64,
-    pub(super) bindings: StateBindings<F>,
+    /// The epoch the flight's launches are timed across ([`LaunchEpoch`]).
+    pub(super) epoch: Option<LaunchEpoch>,
+    pub(super) bindings: StateBindings,
 }
 
 impl<F: ProgramFamily> VisionFlight<F> {
@@ -65,12 +64,11 @@ pub struct HeadFlight<F: ProgramFamily = NativeFamily> {
     pub(super) steps: usize,
     pub(super) submission: F::HeadSubmission,
     pub(super) started: Instant,
-    /// The device's recorded graph count at submission: the flight paid a
-    /// recording if it grew before the flight finished.
-    pub(super) recorded_graphs: u64,
+    /// The epoch the flight's launches are timed across ([`LaunchEpoch`]).
+    pub(super) epoch: Option<LaunchEpoch>,
     /// Optional one-flight launch attribution for diagnosing a proposing head.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
-    pub(super) bindings: StateBindings<F>,
+    pub(super) bindings: StateBindings,
 }
 
 impl<F: ProgramFamily> HeadFlight<F> {
@@ -85,14 +83,14 @@ impl<F: ProgramFamily> HeadFlight<F> {
 pub(super) struct PrimingFlight<H> {
     pub(super) request: RequestId,
     pub(super) submission: H,
-    /// For a claimed lookahead: the accepted head state its successor
+    /// For a claimed queued step: the accepted head state its successor
     /// advance attaches to at finish, or `None` when nobody claimed it (its
     /// rows are discarded). `None` for an ordinary flight.
     pub(super) continuation: Option<Option<InFlightState>>,
 }
 
-/// One submitted target step: a group's flight, or the lookahead queued
-/// behind one.
+/// One submitted target step: a group's flight, or a step queued behind one
+/// (`queue`).
 pub(super) struct TargetWork<F: ProgramFamily> {
     pub(super) requests: Vec<(
         RequestId,
@@ -107,19 +105,17 @@ pub(super) struct TargetWork<F: ProgramFamily> {
     /// Optional attribution for one prefill flight selected by diagnostics.
     pub(super) launch_trace: Option<seismic::SubmissionTrace>,
     pub(super) started: Instant,
-    /// The device's recorded graph count at submission: the flight paid a
-    /// recording if it grew before the flight finished.
-    pub(super) recorded_graphs: u64,
+    /// The epoch the flight's launches are timed across ([`LaunchEpoch`]).
+    pub(super) epoch: Option<LaunchEpoch>,
     /// When the device could begin this step: its submission, or for a step
-    /// queued behind its predecessor (lookahead), the predecessor's
-    /// completion. The step's physical duration is measured from here, so
+    /// queued behind its predecessor, the predecessor's completion. The step's physical duration is measured from here, so
     /// pipelined steps never charge their predecessor's time again.
     pub(super) runnable: Instant,
     /// When the domain last read a selection before this step was submitted.
     pub(super) previous_selection: Option<Instant>,
-    /// Identifies the step a lookahead continues.
+    /// Identifies the step a queued step follows.
     pub(super) id: u64,
-    /// For a claimed lookahead, per slot: the accepted state its successor
+    /// For a claimed queued step, per slot: the accepted state its successor
     /// advance attaches to at finish, or `None` for a slot nobody claimed
     /// (its rows are discarded). `None` for an ordinary step.
     pub(super) continuation: Option<Vec<Option<InFlightState>>>,
@@ -127,8 +123,8 @@ pub(super) struct TargetWork<F: ProgramFamily> {
 
 pub struct TargetFlight<F: ProgramFamily = NativeFamily> {
     pub(super) work: TargetWork<F>,
-    /// Carries the lookahead queued behind `work`.
-    pub(super) bindings: StateBindings<F>,
+    /// The binding right, held while `work` is on the device.
+    pub(super) bindings: StateBindings,
 }
 
 impl<F: ProgramFamily> TargetFlight<F> {
@@ -164,7 +160,7 @@ pub(super) fn decode_selected(bytes: &[u8]) -> Result<Vec<Selected>, String> {
 
 /// The binding right returns only after every submitted use is complete.
 pub enum TargetContinuation<F: ProgramFamily> {
-    Ready(StateBindings<F>),
+    Ready(StateBindings),
     Priming(PrimingCompletionFlight<F>),
 }
 
@@ -174,7 +170,7 @@ pub enum TargetContinuation<F: ProgramFamily> {
 pub struct PrimingCompletionFlight<F: ProgramFamily> {
     pub(super) work: PrimingFlight<F::HeadSubmission>,
     pub(super) target_end: usize,
-    pub(super) bindings: StateBindings<F>,
+    pub(super) bindings: StateBindings,
     pub(super) started: Instant,
 }
 

@@ -6,13 +6,70 @@ use super::graph::{GraphError, draft::GraphDraft};
 use seismic::{Device, Element, HostHeap, NativeGraphStorageBytes, NativePort, Tensor};
 use std::sync::{Arc, Mutex};
 
-/// A constant of one graph: the port it binds and its value. The value is
-/// shared: the graphs of a family that bind one value refer to the family's
-/// one copy of it (`FamilyConstants`).
+/// A constant of one graph: the port it binds, its value, and how that
+/// value follows the graph's class rows. The value is shared: the graphs of
+/// a family that bind one value refer to the family's one copy of it
+/// (`FamilyConstants`).
 #[derive(Clone)]
 pub(crate) struct GraphConstant {
     port: Option<NativePort>,
     value: Arc<ConstantStorage>,
+    /// The rule its value is made from at its graph's class rows, of a
+    /// constant whose extents or values follow them; none of one whose
+    /// value is the same at every class.
+    rows: Option<RowRule>,
+}
+
+/// How a constant's extents and values follow its graph's class rows: the
+/// one description its builder declares it from and a plan counts it from
+/// at each class a template certifies (`GraphConstant::at_rows`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowRule {
+    /// The rank-1 `i32` row table `0, 1, …, rows - 1`.
+    Identity,
+    /// The zero matrix `[rows, width]`.
+    Zeros { element: Element, width: u64 },
+    /// The empty tensor `[0, rows, width]`.
+    Empty { element: Element, width: u64 },
+    /// The rank-1 `i32` table of `rows` copies of one value.
+    Filled(i32),
+    /// The one `i32` `rows` itself.
+    Count,
+}
+
+impl RowRule {
+    fn storage(self, rows: u64) -> Result<ConstantStorage, String> {
+        let table = |values: Vec<i32>| ConstantStorage {
+            element: Element::i32(),
+            extents: vec![rows],
+            value: ConstantValue::Bytes(values.iter().flat_map(|value| value.to_le_bytes()).collect()),
+        };
+        Ok(match self {
+            Self::Identity => table(
+                (0..rows)
+                    .map(|index| i32::try_from(index).map_err(|_| "identity index exceeds i32".to_owned()))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Zeros { element, width } => {
+                element.canonical_byte_len(&[rows, width]).map_err(|error| error.to_string())?;
+                ConstantStorage { element, extents: vec![rows, width], value: ConstantValue::Zero }
+            }
+            Self::Empty { element, width } => ConstantStorage {
+                element,
+                extents: vec![0, rows, width],
+                value: ConstantValue::Bytes(Arc::from([])),
+            },
+            Self::Filled(value) => table(vec![value; usize::try_from(rows).map_err(|_| "row count exceeds usize")?]),
+            Self::Count => {
+                let rows = i32::try_from(rows).map_err(|_| "row count exceeds i32")?;
+                ConstantStorage {
+                    element: Element::i32(),
+                    extents: vec![1],
+                    value: ConstantValue::Bytes(rows.to_le_bytes().into()),
+                }
+            }
+        })
+    }
 }
 
 /// A constant's value: what the binder uploads for it.
@@ -91,7 +148,33 @@ impl GraphConstant {
                 extents,
                 value,
             }),
+            rows: None,
         }
+    }
+
+    /// The constant `rule` makes at `rows` rows, its port of those extents
+    /// following the class dimension `class`, or fixed without one.
+    fn of_rows<G: GraphDraft>(
+        graph: &mut G,
+        rule: RowRule,
+        rows: u64,
+        class: Option<&'static str>,
+    ) -> Result<Self, GraphError> {
+        let value = rule.storage(rows)?;
+        let port = match class {
+            Some(class) => graph.port_with_class_extent(value.element, &value.extents, 0, class)?,
+            None => graph.port(value.element, &value.extents)?,
+        };
+        Ok(Self { port: Some(port), value: Arc::new(value), rows: Some(rule) })
+    }
+
+    /// This constant's value at `rows` class rows, as its graph built at
+    /// that class binds it: its own where it does not follow them.
+    pub(crate) fn at_rows(&self, rows: u64) -> Result<Self, String> {
+        Ok(match self.rows {
+            None => self.clone(),
+            Some(rule) => Self { port: None, value: Arc::new(rule.storage(rows)?), rows: Some(rule) },
+        })
     }
 
     fn same_storage_as(&self, other: &Self) -> bool {
@@ -150,7 +233,21 @@ impl GraphConstant {
         element: Element,
         constants: &mut Vec<Self>,
     ) -> Result<seismic::WorkflowTensor, GraphError> {
-        let constant = Self::rank1(graph, element, 0, Arc::from([]))?;
+        Self::empty_of(graph, element, &[0], constants)
+    }
+
+    /// A typed empty tensor of `extents`, one of them zero (a port its
+    /// entry binds and reads nothing of), bound like every other graph
+    /// constant.
+    pub(crate) fn empty_of<G: GraphDraft>(
+        graph: &mut G,
+        element: Element,
+        extents: &[u64],
+        constants: &mut Vec<Self>,
+    ) -> Result<seismic::WorkflowTensor, GraphError> {
+        assert!(extents.contains(&0), "an empty tensor has a zero extent");
+        let port = graph.port(element, extents)?;
+        let constant = Self::of(Some(port), element, extents.to_vec(), ConstantValue::Bytes(Arc::from([])));
         let tensor = constant.port().tensor().clone();
         constants.push(constant);
         Ok(tensor)
@@ -187,14 +284,7 @@ impl GraphConstant {
         class: Option<&'static str>,
         constants: &mut Vec<Self>,
     ) -> Result<seismic::WorkflowTensor, GraphError> {
-        let inject = match class {
-            Some(class) => Self::zeros_for_class(graph, rows, 0, class)?,
-            None => {
-                let mut inject = Self::zeros_value(rows, 0)?;
-                inject.port = Some(graph.port(Element::f32(), &[rows, 0])?);
-                inject
-            }
-        };
+        let inject = Self::row_zeros(graph, Element::f32(), rows, 0, class)?;
         let tensor = inject.port().tensor().clone();
         constants.push(inject);
         Ok(tensor)
@@ -246,47 +336,15 @@ impl GraphConstant {
         ))
     }
 
-    /// The `u32` zero matrix `[count, width]`, for resource accounting
-    /// without a graph port.
-    pub(crate) fn u32_zeros_value(count: u64, width: u64) -> Result<Self, String> {
-        Element::u32()
-            .canonical_byte_len(&[count, width])
-            .map_err(|error| error.to_string())?;
-        Ok(Self::of(
-            None,
-            Element::u32(),
-            vec![count, width],
-            ConstantValue::Zero,
-        ))
-    }
-
     /// The `u32` zero matrix `[count, width]` of fixed extents.
     pub(crate) fn u32_zeros<G: GraphDraft>(
         graph: &mut G,
         count: u64,
         width: u64,
     ) -> Result<Self, GraphError> {
-        let mut constant = Self::u32_zeros_value(count, width)?;
-        constant.port = Some(graph.port(Element::u32(), &constant.value.extents)?);
-        Ok(constant)
-    }
-
-    /// The `u32` zero matrix `[count, width]` whose rows follow the class
-    /// dimension `class_dimension`.
-    pub(crate) fn u32_zeros_for_class<G: GraphDraft>(
-        graph: &mut G,
-        count: u64,
-        width: u64,
-        class_dimension: &'static str,
-    ) -> Result<Self, GraphError> {
-        let mut constant = Self::u32_zeros_value(count, width)?;
-        constant.port = Some(graph.port_with_class_extent(
-            Element::u32(),
-            &constant.value.extents,
-            0,
-            class_dimension,
-        )?);
-        Ok(constant)
+        let value = RowRule::Zeros { element: Element::u32(), width }.storage(count)?;
+        let port = graph.port(value.element, &value.extents)?;
+        Ok(Self { port: Some(port), value: Arc::new(value), rows: None })
     }
 
     /// An `f32` constant value of the given extents, for resource accounting
@@ -324,75 +382,81 @@ impl GraphConstant {
         )
     }
 
-    /// The rank-1 `i32` constant `0, 1, …, count - 1`.
+    /// The rank-1 `i32` constant `0, 1, …, count - 1` of a count that does
+    /// not follow the class rows.
     pub(crate) fn identity<G: GraphDraft>(graph: &mut G, count: u64) -> Result<Self, GraphError> {
-        Self::identity_for_class(graph, count, None)
+        let mut constant = Self::identity_value(count)?;
+        constant.port = Some(graph.port(Element::i32(), &constant.value.extents)?);
+        Ok(constant)
     }
 
     /// Identity constant value for resource accounting without a graph port.
     pub(crate) fn identity_value(count: u64) -> Result<Self, String> {
-        let values = (0..count)
-            .map(|index| i32::try_from(index).map_err(|_| "identity index exceeds i32".to_owned()))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::of(
-            None,
-            Element::i32(),
-            vec![count],
-            ConstantValue::Bytes(
-                values
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect(),
-            ),
-        ))
+        Ok(Self {
+            port: None,
+            value: Arc::new(RowRule::Identity.storage(count)?),
+            rows: None,
+        })
     }
 
-    pub(crate) fn identity_for_class<G: GraphDraft>(
+    /// The row table `0, 1, …, rows - 1` of the class's `rows` rows, its
+    /// port following the class dimension `class`, or fixed without one.
+    pub(crate) fn row_identity<G: GraphDraft>(
         graph: &mut G,
-        count: u64,
-        class_dimension: Option<&'static str>,
+        rows: u64,
+        class: Option<&'static str>,
     ) -> Result<Self, GraphError> {
-        let mut constant = Self::identity_value(count)?;
-        let port = match class_dimension {
-            Some(name) => {
-                graph.port_with_class_extent(Element::i32(), &constant.value.extents, 0, name)?
-            }
-            None => graph.port(Element::i32(), &constant.value.extents)?,
-        };
-        constant.port = Some(port);
-        Ok(constant)
+        Self::of_rows(graph, RowRule::Identity, rows, class)
+    }
+
+    /// The rank-1 `i32` constant holding the class's `rows` itself.
+    pub(crate) fn row_count<G: GraphDraft>(graph: &mut G, rows: u64) -> Result<Self, GraphError> {
+        Self::of_rows(graph, RowRule::Count, rows, None)
     }
 
     /// The `f32` zero matrix `[count, width]`, for resource accounting
     /// without a graph port.
-    pub(crate) fn zeros_value(count: u64, width: u64) -> Result<Self, String> {
-        Element::f32()
-            .canonical_byte_len(&[count, width])
-            .map_err(|error| error.to_string())?;
-        Ok(Self::of(
-            None,
-            Element::f32(),
-            vec![count, width],
-            ConstantValue::Zero,
-        ))
+    #[cfg(test)]
+    fn zeros_value(count: u64, width: u64) -> Result<Self, String> {
+        Ok(Self {
+            port: None,
+            value: Arc::new(RowRule::Zeros { element: Element::f32(), width }.storage(count)?),
+            rows: None,
+        })
     }
 
-    /// The `f32` zero matrix `[count, width]` whose rows follow the class
-    /// dimension `class_dimension` (a zero base for a sum).
-    pub(crate) fn zeros_for_class<G: GraphDraft>(
+    /// The zero matrix `[rows, width]` of `element` at the class's `rows`
+    /// rows (a zero base for a sum, an absent bitmap or inject), its port
+    /// following the class dimension `class`, or fixed without one.
+    pub(crate) fn row_zeros<G: GraphDraft>(
         graph: &mut G,
-        count: u64,
+        element: Element,
+        rows: u64,
         width: u64,
-        class_dimension: &'static str,
+        class: Option<&'static str>,
     ) -> Result<Self, GraphError> {
-        let mut constant = Self::zeros_value(count, width)?;
-        constant.port = Some(graph.port_with_class_extent(
-            Element::f32(),
-            &constant.value.extents,
-            0,
-            class_dimension,
-        )?);
-        Ok(constant)
+        Self::of_rows(graph, RowRule::Zeros { element, width }, rows, class)
+    }
+
+    /// The empty tensor `[0, rows, width]` of `element` at the class's
+    /// `rows` rows (a port its entry binds and reads nothing of).
+    pub(crate) fn row_empty<G: GraphDraft>(
+        graph: &mut G,
+        element: Element,
+        rows: u64,
+        width: u64,
+        constants: &mut Vec<Self>,
+    ) -> Result<seismic::WorkflowTensor, GraphError> {
+        let constant = Self::of_rows(graph, RowRule::Empty { element, width }, rows, None)?;
+        let tensor = constant.port().tensor().clone();
+        constants.push(constant);
+        Ok(tensor)
+    }
+
+    /// The rank-1 `i32` table of `value` for each of the class's `rows`
+    /// rows.
+    pub(crate) fn row_filled<G: GraphDraft>(graph: &mut G, rows: u64, value: i32) -> Result<Self, GraphError> {
+        Self::of_rows(graph, RowRule::Filled(value), rows, None)
     }
 
     fn rank1<G: GraphDraft>(
@@ -472,11 +536,7 @@ impl CheckedGraphFamilyResources {
     ) {
         self.storage = Some(match self.storage {
             None => storage,
-            Some(previous) => NativeGraphStorageBytes {
-                workspace: previous.workspace.max(storage.workspace),
-                output: previous.output.max(storage.output),
-                upload: previous.upload.max(storage.upload),
-            },
+            Some(previous) => previous.most(storage),
         });
         for constant in constants {
             if !self
@@ -487,6 +547,23 @@ impl CheckedGraphFamilyResources {
                 self.constants.push(constant);
             }
         }
+    }
+
+    /// Include a template's graph certified at each of `rows` class rows:
+    /// its storage, and each of its constants as a graph of that class binds
+    /// it (`GraphConstant::at_rows`).
+    pub(crate) fn include_classes(
+        &mut self,
+        storage: NativeGraphStorageBytes,
+        constants: &[GraphConstant],
+        rows: &[u64],
+    ) -> Result<(), String> {
+        let classes = rows
+            .iter()
+            .flat_map(|&rows| constants.iter().map(move |constant| constant.at_rows(rows)))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.include(storage, classes);
+        Ok(())
     }
 
     /// The host heap of the family's one copy of each distinct constant
@@ -644,7 +721,7 @@ mod tests {
                 .unwrap()
                 .open_backend(backend)
                 .unwrap();
-            let charged = || device.storage_usage(seismic::StorageKind::Device).charged;
+            let charged = || device.device_ledger().charged;
             let before = charged();
             let mut uploaded = ConstantTensors::new(device.clone());
             let tensor = uploaded.tensor(&zero).unwrap();
@@ -668,7 +745,7 @@ mod tests {
         let tied = GraphConstant::i32(&mut graph, &[1, 2, 3]).unwrap();
         let other = GraphConstant::f32(&mut graph, &[1.0, 2.0]).unwrap();
         let claim = distinct_storage_bytes([&first, &tied, &other]).unwrap();
-        let charged = || device.storage_usage(seismic::StorageKind::Device).charged;
+        let charged = || device.device_ledger().charged;
         let before = charged();
         let mut uploaded = ConstantTensors::new(device.clone());
         uploaded.tensor(&first).unwrap();

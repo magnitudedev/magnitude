@@ -29,12 +29,15 @@ use head::HeadKernels;
 pub(crate) use import::ImportKernels;
 use preparation::NativePreparationCache;
 pub(crate) use preparation::kernel_requests;
+pub(crate) use qualification::admit_site;
 use qualification::QualificationView;
 pub use readout::ProjectionKernels;
 use shared_head::SharedHeadKernels;
 use target::TargetKernels;
 pub(crate) use target::{
-    AttentionHistoryKernels, AttentionKernels, DenseExpansionKernel, DenseKernels, ExpertKernels,
+    AttentionHistoryKernels, AttentionKernels, BankCombine, BankMoves, BankRouteForm, BankRouteKernels, DevicePlacement,
+    BankSite, SiteAdmission, SiteForm,
+    DenseExpansionKernel, DenseKernels, ExpertBankKernels, ExpertKernels, LEADS,
     GeneralRoutedKernels, NGramKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,
     PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
     RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
@@ -43,7 +46,6 @@ pub(crate) use target::{
     SublayerOutput, TableConversion,
     TapKernels,
 };
-#[cfg(feature = "pinned-tuning")]
 pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
@@ -228,9 +230,11 @@ mod qualification_tests {
     #[test]
     fn packed_recurrent_prepares_with_the_qwen_4b_binding() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let Ok(device) = catalog.open_backend(BackendName::Metal) else {
+        // Only a host with Metal runs it; a Metal executor it has must open.
+        if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
-        };
+        }
+        let device = catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens");
         // Native Metal residents use the rows16 layout.
         let rows16 =
             |representation| Element::stored(representation, seismic::Layout::Rows16).unwrap();
@@ -260,91 +264,74 @@ mod qualification_tests {
             .with_static("H", 2560)
             .with_static("PT", 1)
             .with_static("NM", 2560);
-        let statics = heads.with_static("C", binding.convolution_width);
-        /// The declared defaults of `E` at `statics`.
-        fn defaults<E: seismic::Entry>(
+        let statics = heads.clone().with_static("C", binding.convolution_width);
+        /// Prepares `entry` in its default configuration at `statics`, which
+        /// its element bindings decide (`where` reads their forms).
+        fn prepare<E: seismic::Entry>(
             device: &seismic::Device,
+            entry: seismic::BoundEntry<E>,
             statics: &seismic::NativeSpecialization,
-        ) -> seismic::NativeSpecialization {
-            seismic::generated::native_implementation::<E>(device)
+        ) {
+            let specialization = entry
+                .default_specialization(device, statics)
                 .unwrap()
-                .unwrap()
-                .default_specialization(statics)
-                .unwrap()
+                .unwrap();
+            entry.prepare(device, &specialization).unwrap();
         }
-        gated_delta_project::native_for_device_with(
+        prepare(
             &device,
-            gated_delta_project::Elements {
+            gated_delta_project::native_entry_with(gated_delta_project::Elements {
                 NW: binding.norm,
                 QW: binding.qkv,
                 GW: binding.gate,
                 AW: binding.alpha,
                 BW: binding.beta,
                 A: binding.activation,
-            },
+            }),
             // Unbounded projections (no packing bound).
-            &defaults::<gated_delta_project::Entry>(
-                &device,
-                &projections
-                    .clone()
-                    .with_static("QB", 0)
-                    .with_static("ZB", 0),
-            ),
-        )
-        .unwrap();
-        let step = defaults::<gated_delta_step::Entry>(&device, &statics);
-        gated_delta_step::native_for_device_with(
+            &projections
+                .clone()
+                .with_static("QB", 0)
+                .with_static("ZB", 0),
+        );
+        prepare(
             &device,
-            gated_delta_step::Elements {
+            gated_delta_step::native_entry_with(gated_delta_step::Elements {
                 RN: binding.recurrent_norm,
                 A: binding.activation,
-            },
-            &step,
-        )
-        .unwrap();
-        gated_delta_project_convolved::native_for_device_with(
+            }),
+            &statics,
+        );
+        prepare(
             &device,
-            gated_delta_project_convolved::Elements {
-                NW: binding.norm,
-                QW: binding.qkv,
-                GW: binding.gate,
-                AW: binding.alpha,
-                BW: binding.beta,
-                A: binding.activation,
-            },
-            &defaults::<gated_delta_project_convolved::Entry>(
-                &device,
-                &projections
-                    .clone()
-                    .with_static("C", binding.convolution_width),
+            gated_delta_project_convolved::native_entry_with(
+                gated_delta_project_convolved::Elements {
+                    NW: binding.norm,
+                    QW: binding.qkv,
+                    GW: binding.gate,
+                    AW: binding.alpha,
+                    BW: binding.beta,
+                    A: binding.activation,
+                },
             ),
-        )
-        .unwrap();
-        gated_delta_step_convolved::native_for_device_with(
+            &projections.with_static("C", binding.convolution_width),
+        );
+        prepare(
             &device,
-            gated_delta_step_convolved::Elements {
+            gated_delta_step_convolved::native_entry_with(gated_delta_step_convolved::Elements {
                 RN: binding.recurrent_norm,
                 A: binding.activation,
-            },
-            &defaults::<gated_delta_step_convolved::Entry>(
-                &device,
-                &seismic::NativeSpecialization::new()
-                    .with_static("NK", binding.key_heads)
-                    .with_static("NV", binding.value_heads)
-                    .with_static("W", binding.width),
-            ),
-        )
-        .unwrap();
-        let chunk = defaults::<gated_delta_chunk::Entry>(&device, &statics);
-        gated_delta_chunk::native_for_device_with(
+            }),
+            &heads,
+        );
+        prepare(
             &device,
-            gated_delta_chunk::Elements {
+            gated_delta_chunk::native_entry_with(gated_delta_chunk::Elements {
                 RN: binding.recurrent_norm,
                 A: binding.activation,
-            },
-            &chunk,
-        )
-        .unwrap();
+            }),
+            &statics,
+        );
         let output = seismic::NativeSpecialization::new()
             .with_static("D", 2560)
             .with_static("SN", 1)
@@ -353,14 +340,13 @@ mod qualification_tests {
             .with_static("W", binding.width)
             .with_static("OS", 0)
             .with_static("OB", 0);
-        attention_output::native_for_device_with(
+        prepare(
             &device,
-            attention_output::Elements {
+            attention_output::native_entry_with(attention_output::Elements {
                 OW: binding.output,
                 A: binding.activation,
-            },
-            &defaults::<attention_output::Entry>(&device, &output),
-        )
-        .unwrap();
+            }),
+            &output,
+        );
     }
 }

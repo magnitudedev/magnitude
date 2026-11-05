@@ -1,6 +1,10 @@
+mod bank;
 mod glue;
 mod head;
 mod helpers;
+mod site;
+
+pub(crate) use site::admit_site;
 mod streams;
 mod target;
 mod vision;
@@ -17,6 +21,11 @@ pub(super) struct QualificationView<'a> {
     geometry: &'a magnitude_family_contracts::Decoder,
     vision: Option<&'a magnitude_family_contracts::VisionDescription>,
     load: &'a crate::ModelLoadPlan,
+    /// The load's numerical requirement, which a sited layer's split points
+    /// are admitted under.
+    profile: &'a ResolvedNumericalProfile,
+    /// Where the measurement job keeps a site's admission verdict.
+    cache: Option<&'a crate::kernel_cache::KernelCache>,
 }
 
 impl<'a> QualificationView<'a> {
@@ -26,6 +35,8 @@ impl<'a> QualificationView<'a> {
         geometry: &'a magnitude_family_contracts::Decoder,
         vision: Option<&'a magnitude_family_contracts::VisionDescription>,
         load: &'a crate::ModelLoadPlan,
+        profile: &'a ResolvedNumericalProfile,
+        cache: Option<&'a crate::kernel_cache::KernelCache>,
     ) -> Self {
         Self {
             programs,
@@ -33,6 +44,8 @@ impl<'a> QualificationView<'a> {
             geometry,
             vision,
             load,
+            profile,
+            cache,
         }
     }
 
@@ -56,7 +69,16 @@ impl<'a> QualificationView<'a> {
             })
     }
 
-    pub(super) fn qualify(&self, device: &Device) -> Result<(), CatalogFailure> {
+    /// Qualify every entry; each sited streamed block's stored site verdict,
+    /// by target block index (`BankSite::admitted`).
+    pub(super) fn qualify(&self, device: &Device) -> Result<Vec<(usize, crate::assessment::Priced<()>)>, CatalogFailure> {
+        let began = std::time::Instant::now();
+        let mut lap = began;
+        let mut laps = Vec::new();
+        let mut timed = |part: &'static str| {
+            laps.push(format!("{part} {:.2} s", lap.elapsed().as_secs_f64()));
+            lap = std::time::Instant::now();
+        };
         for (slot, handle) in &self.programs.imports {
             let (
                 ImportProgramSlot::Dense {
@@ -143,16 +165,21 @@ impl<'a> QualificationView<'a> {
                 ));
             }
         }
+        timed("imports");
         self.qualify_shape_rows(device)?;
         self.qualify_sample_rows(device)?;
         self.qualify_conditioning_overlay(device)?;
         self.qualify_selection_notice(device)?;
         self.qualify_feature_copy(device)?;
-        self.qualify_target(device)?;
+        timed("glue");
+        let admitted = self.qualify_target(device)?;
+        timed("target");
         self.qualify_streams(device)?;
+        timed("streams");
         self.qualify_ngram(device)?;
         self.qualify_head(device)?;
         self.qualify_vision(device)?;
+        timed("ngram, head and vision");
         for (element, binding) in [
             (Element::f32(), "A=f32"),
             (Element::f16(), "A=f16"),
@@ -163,6 +190,12 @@ impl<'a> QualificationView<'a> {
                 self.qualify_copy_rows(device, element, binding)?;
             }
         }
-        Ok(())
+        timed("state copies");
+        tracing::info!(
+            "programs qualified in {:.2} s: {}",
+            began.elapsed().as_secs_f64(),
+            laps.join(", ")
+        );
+        Ok(admitted)
     }
 }

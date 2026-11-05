@@ -48,13 +48,14 @@ impl ResolvedNumericalProfile {
     /// profile: within α rounding steps, measured against the entry's
     /// activation type beside each subject's own.
     pub(super) fn requirement<E: Entry>(&self, entry: &BoundEntry<E>) -> NumericalRequirement {
-        NumericalRequirement::RoundingSteps {
-            alpha: self.alpha,
-            activation: entry
-                .element(ACTIVATION_ELEMENT)
-                .and_then(|element| element.dtype())
-                .filter(|dtype| dtype.is_float()),
-        }
+        self.requirement_of(entry.element(ACTIVATION_ELEMENT).and_then(|element| element.dtype()))
+    }
+
+    /// What a unit whose activations are stored as `activation` is held to
+    /// under this profile: within α rounding steps, measured against that
+    /// type (a floating one) beside each subject's own.
+    pub(crate) fn requirement_of(&self, activation: Option<seismic::DType>) -> NumericalRequirement {
+        NumericalRequirement::RoundingSteps { alpha: self.alpha, activation: activation.filter(|dtype| dtype.is_float()) }
     }
 }
 

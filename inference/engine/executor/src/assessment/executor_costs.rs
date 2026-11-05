@@ -10,7 +10,7 @@
 //! The costs are made of measured points (spec §2.6): a kernel's calls, or a
 //! sealed chain of them. One deterministic walk ([`walk`]) names them, in
 //! order, and derives the costs from their timings: the measurement job
-//! measures it ([`ExecutorCosts::measure`]), loading each point's record or
+//! measures it as its requests ask ([`Walks`]), loading each point's record or
 //! timing and storing it, and every start retraces it from the records alone
 //! ([`ExecutorCosts::stored`]), so what a start derives from is exactly what
 //! the job measured. The costs themselves are never stored.
@@ -42,11 +42,12 @@
 //! and every point of an executor whose device is the host's CPU) are timed
 //! only once every compile has ended.
 //!
-//! The costs need one point: the probe, the activation dtype's rate along
-//! device storage's first route, the walk's first. Every other figure is
-//! held where its point was read and priced from those that were until
-//! then ([`ExecutorCosts`]), so the costs exist, and price every model, once
-//! the probe is stored. The walk's steps after it are one plan ([`plan`]),
+//! The costs need the probe, the activation dtype's rate along device
+//! storage's first route, the walk's first, and the figures no other prices
+//! ([`Required`]: the launch graph's times and the composition chain). Every
+//! other figure is held where its point was read and priced from those that
+//! were until then ([`ExecutorCosts`]), so the costs exist, and price every
+//! model, once those are stored; until then they are pending. The walk's steps after it are one plan ([`plan`]),
 //! each figure before those whose prices without it are less far off, so
 //! what a job's time leaves unread is what is priced closest. A job takes
 //! [`MEASUREMENT_SECONDS`] of wall time from its start at most, whatever
@@ -77,8 +78,8 @@
 //! rows a point appends are zeroed again once it is timed.
 //!
 //! A point that fails, or that the job records unobtainable, leaves its
-//! figure priced from those read; a probe that does means the executor
-//! cannot stream its own weights, and it has no costs.
+//! figure priced from those read; a required one that does means the
+//! executor has no costs.
 
 use super::demand::{Bytes, Flops, HistoryRead, Work};
 use super::AssessmentError;
@@ -87,19 +88,21 @@ use magnitude_artifacts::gguf::Encoding;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
 use magnitude_family_contracts::{Rotary, ScaledActivations};
 use magnitude_kernels::{
-    attention_decode, attention_decode_k8v4, conditioning_overlay, dense_expand, dense_output,
+    attention_decode, attention_decode_k8v4, conditioning_overlay, constants, dense_expand, dense_output,
+    routed_move,
 };
 use magnitude_state::{HistoryEncoding, KvCodec};
 use seismic::measure::{Attempt, Measure, Outcome, Reason, Record, RecordStore, Timing, Unformed};
 use seismic::{
-    AccessPathId, AccessRoute, BoundEntry, CallError, DType, Device, DeviceTopology, Element,
+    AccessPathId, BoundEntry, CallError, DType, Device, DeviceTopology, Element,
     Entry, Executor, GraphTiming, Identity, KernelIdentity, Measurer, NativeKernel,
-    NativeSpecialization, Point, PointKey, Reported, ReportedBy, SlabLayout, SlabRegion,
-    SlabTensor, StorageKind, Tensor,
+    NativeKind, NativeSpecialization, Point, PointKey, Reported, ReportedBy, SlabLayout, SlabRegion,
+    SlabTensor, Tensor,
 };
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The format the composition chain's projections are resident in: the
 /// reference model's (Qwen3.5-9B at Q4).
@@ -193,10 +196,11 @@ const GRAPH_WIDTH: u64 = 64;
 const CHAIN_LAYER_CALLS: usize = 4;
 
 /// The wall seconds a measurement job takes at most, from its start,
-/// whatever the machine. Its points share them equally ([`plan`]): each
-/// samples for its share, or until its median is resolved, so a slower
-/// machine takes fewer samples of each point rather than longer, and a
-/// faster one ends sooner.
+/// whatever the machine and however many points are requested. Its points,
+/// in the order of who waits on them ([`super::requests`]), each sample for
+/// an equal part of the time left, or until its median is resolved, so a
+/// slower machine takes fewer samples of each point rather than longer, a
+/// faster one ends sooner, and what one job leaves the next resumes.
 pub const MEASUREMENT_SECONDS: f64 = 10.0;
 
 /// The depths a history layout's ladder is read at, in tokens, as far as
@@ -235,7 +239,7 @@ const UNROTATED: f64 = seismic::measure::MEDIAN_TOLERANCE / 2.;
 /// cache, or an approximation of one, keeps none of the bytes when they
 /// come round again; a cache that kept a whole cache's worth would still
 /// serve at most a quarter of them.
-const CACHE_MULTIPLE: u64 = 4;
+pub(super) const CACHE_MULTIPLE: u64 = 4;
 
 /// The reference attention geometry (Qwen3.5-9B's): key/value heads, query
 /// heads per key/value head, rotated pairs and unrotated columns of a head.
@@ -268,6 +272,21 @@ impl MeasuredCost {
         }
     }
 
+    /// `beside`'s time over `alone`'s: a ratio, its interval from the two
+    /// intervals' far ends, where both have one.
+    fn ratio(beside: &Timing, alone: &Timing) -> Self {
+        Self {
+            value: beside.median / alone.median,
+            interval: beside
+                .interval
+                .zip(alone.interval)
+                .map(|((beside_low, beside_high), (alone_low, alone_high))| {
+                    (beside_low / alone_high, beside_high / alone_low)
+                }),
+            samples: beside.samples.min(alone.samples),
+        }
+    }
+
     /// `units` over each of `timing`'s times: a rate, its interval from the
     /// times' (the slowest time bounds it below).
     fn rate(units: f64, timing: &Timing) -> Self {
@@ -282,9 +301,9 @@ impl MeasuredCost {
 }
 
 /// The weight rate of one format along one allocation route of the
-/// executor's placements. Every access path along a route allocates the
-/// same memory (`seismic::AccessRoute`), so each path along it has this
-/// rate.
+/// executor's placements: one of its storage kinds (`seismic::NativeKind`),
+/// whose memory every path it is charged along allocates, so each path
+/// along it has this rate.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WeightRate {
     /// Weight bytes per second its `dense_expand` streams at one row (its
@@ -301,7 +320,7 @@ pub struct WeightRate {
 /// holds rows alone.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RouteCosts<A = Option<WeightRate>> {
-    pub route: AccessRoute,
+    pub route: NativeKind,
     /// The activation dtype's (bf16) rate, its weights streaming from
     /// memory: along device storage's first route the probe, which the
     /// costs require ([`ExecutorCosts::first`]); along another, where read.
@@ -424,13 +443,13 @@ impl HistoryCosts {
 /// least one, as an executor that places none of a kind has no costs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placement {
-    pub first: AccessRoute,
-    pub rest: Vec<AccessRoute>,
+    pub first: NativeKind,
+    pub rest: Vec<NativeKind>,
 }
 
 impl Placement {
     /// A placement along `route` alone.
-    pub fn along(route: AccessRoute) -> Self {
+    pub fn along(route: NativeKind) -> Self {
         Self {
             first: route,
             rest: Vec::new(),
@@ -438,19 +457,47 @@ impl Placement {
     }
 }
 
-/// The placement of each storage kind.
+/// The storage kinds operands are allocated in, whose routes the costs
+/// measure: a graph run's inputs lie in upload storage (`Tensor::upload`);
+/// host storage (`Tensor::shared`) holds shared words and an expert bank's
+/// host tier, which a streamed layer's GPU reads in place (the cost
+/// function's link line, `ExpertPass::lines`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperandStorage {
+    Device,
+    Upload,
+    Host,
+}
+
+impl OperandStorage {
+    /// Every kind, in declaration order.
+    pub const ALL: [Self; 3] = [Self::Device, Self::Upload, Self::Host];
+
+    /// The storage kind.
+    pub const fn kind(self) -> seismic::Contract {
+        match self {
+            Self::Device => seismic::Contract::DeviceOnly,
+            Self::Upload => seismic::Contract::Upload,
+            Self::Host => seismic::Contract::Shared,
+        }
+    }
+}
+
+/// The placement of each operand storage kind.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placements {
     pub device: Placement,
     pub upload: Placement,
+    pub host: Placement,
 }
 
 impl Placements {
     /// The placement of `storage`.
-    pub fn of(&self, storage: StorageKind) -> &Placement {
+    pub fn of(&self, storage: OperandStorage) -> &Placement {
         match storage {
-            StorageKind::Device => &self.device,
-            StorageKind::Upload => &self.upload,
+            OperandStorage::Device => &self.device,
+            OperandStorage::Upload => &self.upload,
+            OperandStorage::Host => &self.host,
         }
     }
 }
@@ -461,30 +508,38 @@ impl Placements {
 pub enum Derived {
     /// The activation dtype's rate along a route other than device
     /// storage's first.
-    ActivationRate(AccessRoute),
+    ActivationRate(NativeKind),
     /// A format's rate streaming along a route of device storage's
     /// placement.
-    WeightRate(AccessRoute, Element),
+    WeightRate(NativeKind, Element),
     /// The activation dtype's matrix throughput.
     ActivationMatrix,
     /// A format's matrix throughput.
     MatrixThroughput(Element),
     /// A history layout's costs at the depths past its last rung read.
     History(KvCodec),
-    /// The composition ratio.
-    Composition,
+}
+
+/// A figure the costs need beside the probe, which no other prices: the
+/// costs are pending until it is read ([`StoredCosts::Missing`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Required {
     /// The launch cost.
     Launch,
-    /// The step costs.
+    /// The step costs, pipelined and round trip.
     Step,
+    /// The composition chain.
+    Composition,
 }
 
 /// What the engine's kernels achieve on one executor: every figure an
-/// estimate reads. One is required: the probe, the activation dtype's rate
-/// along device storage's first route, the walk's first point. Every other
-/// is held where it was read, and until then priced from what was by its
-/// accessor ([`Derived`]), so the costs give an estimate once the probe is
-/// read, and a closer one with every figure read after it.
+/// estimate reads. Some are required: the probe, the activation dtype's rate
+/// along device storage's first route, the walk's first point, and the
+/// figures no other prices ([`Required`]: the launch and step costs and the
+/// composition chain). Every other is held where it was read, and until
+/// then priced from what was by its accessor ([`Derived`]), so the costs
+/// give an estimate once the required figures are read, and a closer one
+/// with every figure read after them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutorCosts {
     /// Each storage kind's placement as the routes of its paths, in order:
@@ -503,46 +558,60 @@ pub struct ExecutorCosts {
     pub dense: HistoryCosts,
     /// The affine K8/V4 history's costs.
     pub affine: HistoryCosts,
-    /// The device time of the composition chain's sealed graph over its
-    /// calls' as the other figures price them alone, where read.
-    pub composition: Option<MeasuredCost>,
-    /// Device seconds of one call inside a sealed graph, where read.
-    pub launch_seconds: Option<MeasuredCost>,
+    /// The composition chain as read: its sealed graph's device time, which
+    /// over its calls as the other figures price them alone is the
+    /// composition ratio ([`Self::composition`]).
+    pub chain: ChainCost,
+    /// Device seconds of one call inside a sealed graph.
+    pub launch_seconds: MeasuredCost,
     /// Host seconds per run beyond its device time, runs queued back to back
-    /// (decode with lookahead), where read.
-    pub step_pipelined_seconds: Option<MeasuredCost>,
+    /// (decode with lookahead).
+    pub step_pipelined_seconds: MeasuredCost,
     /// Host seconds of one submit and wait beyond its device time (decode
-    /// without lookahead), where read.
-    pub step_round_trip_seconds: Option<MeasuredCost>,
+    /// without lookahead).
+    pub step_round_trip_seconds: MeasuredCost,
+    /// What a shrink's release (a reservation's granules unmapped and
+    /// freed) costs device work running beside it: that work's time beside
+    /// a release over its time alone, where read (a backend that moves bank
+    /// records, whose move point is that work). A release slows a decode
+    /// step it overlaps by at most this ratio less one. The bank's own move
+    /// rate is measured at its record forms (`MoveCosts`).
+    pub release_step_ratio: Option<MeasuredCost>,
 }
 
 impl ExecutorCosts {
-    /// The step cost a decode under `lookahead` pays; none until read.
+    /// The step cost a decode under `lookahead` pays.
     pub fn step_seconds(&self, lookahead: bool) -> f64 {
-        let step = if lookahead {
-            self.step_pipelined_seconds
-        } else {
-            self.step_round_trip_seconds
-        };
-        step.map_or(0., |step| step.value)
+        match lookahead {
+            true => self.step_pipelined_seconds.value,
+            false => self.step_round_trip_seconds.value,
+        }
     }
 
-    /// The device seconds of one call inside a sealed graph; none until
-    /// read.
+    /// The device seconds of one call inside a sealed graph.
     pub fn launch(&self) -> f64 {
-        self.launch_seconds.map_or(0., |launch| launch.value)
+        self.launch_seconds.value
     }
 
-    /// The composition ratio; until read, 1, as the calls run alone.
-    pub fn composition(&self) -> f64 {
-        self.composition.map_or(1., |composition| composition.value)
+    /// The composition ratio: the chain's time over its calls as the costs
+    /// price them alone, at one row and its depth, each a launch.
+    pub fn composition(&self) -> Result<MeasuredCost, AssessmentError> {
+        let depth = u32::try_from(HISTORY_DEPTHS[0])
+            .map_err(|_| AssessmentError::Demand("the chain's depth exceeds u32".into()))?;
+        let priced = self.chain.layers as f64 * super::estimate::calls_seconds(&self.chain.calls, self, depth)?;
+        let timing = self.chain.timing;
+        Ok(MeasuredCost {
+            value: timing.median / priced,
+            interval: timing.interval.map(|(low, high)| (low / priced, high / priced)),
+            samples: timing.samples,
+        })
     }
 
     /// The costs of `route`, a route of the placements: the activation
     /// dtype's bytes per second along it (the probe along device storage's
     /// first route, the rate read along another, and until read there, the
     /// probe), and each other format's rates.
-    fn route(&self, route: AccessRoute) -> (f64, &[(Element, FormatRates)]) {
+    fn route(&self, route: NativeKind) -> (f64, &[(Element, FormatRates)]) {
         let probe = &self.first.activation;
         if route == self.first.route {
             return (probe.bytes_per_second.value, &self.first.formats);
@@ -563,7 +632,7 @@ impl ExecutorCosts {
     /// bytes' time from memory. Where its pilot could not be read, the
     /// activation dtype's alone, which streams the bytes at least as fast as
     /// a format that decodes them.
-    pub fn route_rate(&self, route: AccessRoute, format: Element) -> f64 {
+    pub fn route_rate(&self, route: NativeKind, format: Element) -> f64 {
         let (activation, formats) = self.route(route);
         if format == Element::bf16() {
             return activation;
@@ -577,10 +646,21 @@ impl ExecutorCosts {
         }
     }
 
+    /// Whether every route of `storage`'s placement has its activation
+    /// dtype's rate read, so its weight rates are measured along it, not
+    /// priced from device storage's probe.
+    pub fn reads_along(&self, storage: OperandStorage) -> bool {
+        let placement = self.placements.of(storage);
+        std::iter::once(&placement.first).chain(&placement.rest).all(|&route| {
+            route == self.first.route
+                || self.routes.iter().any(|costs| costs.route == route && costs.activation.is_some())
+        })
+    }
+
     /// The bytes per second of `format` in `storage`: the slowest rate of
     /// its placement's paths, since a load's bytes may lie along any of
     /// them.
-    pub fn weight_rate(&self, storage: StorageKind, format: Element) -> f64 {
+    pub fn weight_rate(&self, storage: OperandStorage, format: Element) -> f64 {
         let placement = self.placements.of(storage);
         placement.rest.iter().fold(
             self.route_rate(placement.first, format),
@@ -653,17 +733,7 @@ impl ExecutorCosts {
             .into_iter()
             .filter(|history| history.rungs.len() < HISTORY_DEPTHS.len())
             .map(|history| Derived::History(history.layout));
-        let unread = [
-            (self.activation_matrix.is_none(), Derived::ActivationMatrix),
-            (self.composition.is_none(), Derived::Composition),
-            (self.launch_seconds.is_none(), Derived::Launch),
-            (
-                self.step_pipelined_seconds.is_none() || self.step_round_trip_seconds.is_none(),
-                Derived::Step,
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(unread, figure)| unread.then_some(figure));
+        let unread = self.activation_matrix.is_none().then_some(Derived::ActivationMatrix);
         activations
             .chain(rates)
             .chain(unread)
@@ -699,7 +769,7 @@ impl ExecutorCosts {
         let measured_along = self.placements.device.first;
         let activation = Element::bf16();
         let along = self.route_rate(measured_along, activation);
-        let slowdown = self.weight_rate(StorageKind::Device, activation) / along;
+        let slowdown = self.weight_rate(OperandStorage::Device, activation) / along;
         let line = self.history(layout)?.line(tokens, along);
         Ok(HistoryLine {
             seconds_per_byte: line.seconds_per_byte / slowdown,
@@ -720,14 +790,14 @@ impl fmt::Display for ExecutorCostsError {
 
 impl std::error::Error for ExecutorCostsError {}
 
-fn failed(what: &str) -> impl Fn(&dyn fmt::Display) -> ExecutorCostsError + '_ {
+pub(super) fn failed(what: &str) -> impl Fn(&dyn fmt::Display) -> ExecutorCostsError + '_ {
     move |error| ExecutorCostsError(format!("{what}: {error}"))
 }
 
 /// What the stored records give of an executor's costs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StoredCosts {
-    /// The probe is stored.
+    /// Every required figure is stored.
     Complete {
         costs: ExecutorCosts,
         /// The records the costs were derived from, in the walk's order:
@@ -737,21 +807,20 @@ pub enum StoredCosts {
         /// its figure is priced until it is.
         pending: bool,
     },
-    /// The probe, which no record holds: never attempted, or not to its
-    /// end.
+    /// A point of a required figure (the probe, or one of [`Required`])
+    /// that no record holds: never attempted, or not to its end.
     Missing(PointKey),
 }
 
-/// What a measurement job's walk did.
+/// What a measurement job did ([`super::requests::measure`]).
 #[derive(Debug)]
 pub struct Measurement {
-    /// Why the walk ended before its end where no visited point's outcome
-    /// says: the probe's kernel identity that cannot be derived, or a
-    /// placement the executor lacks. None when it reached its end or the
-    /// probe's own outcome ended it.
-    pub ended: Option<ExecutorCostsError>,
-    /// Why a step after the probe could not be read outside its points'
-    /// timings: its figure stays priced.
+    /// Why a request's measuring ended before its end where no visited
+    /// point's outcome says: the probe's kernel identity that cannot be
+    /// derived, or a placement the executor lacks.
+    pub ended: Vec<ExecutorCostsError>,
+    /// Why a figure could not be read outside its points' timings: it stays
+    /// priced.
     pub failures: Vec<ExecutorCostsError>,
     /// What the job's points were made in and from, which its caller
     /// releases once it has reported the job: every record is stored by
@@ -763,7 +832,25 @@ pub struct Measurement {
 /// The storage a job's points' rotations viewed and the kernels it formed.
 pub struct Held {
     _backings: Backings,
-    _programs: Option<Programs>,
+    _programs: Option<Formed>,
+}
+
+/// A job's programs and the thread forming them, which ends with the job
+/// ([`ProgramSet::form`]): dropping it waits for that thread, so no
+/// formation outlives the job that held it, and none is driving the
+/// device as the process that ran the job tears down.
+struct Formed {
+    programs: Programs,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Formed {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            // The thread catches its jobs' panics, so it ends by returning.
+            thread.join().expect("the formation thread ends by returning");
+        }
+    }
 }
 
 impl fmt::Debug for Held {
@@ -813,7 +900,7 @@ struct PointSpec {
     point: BTreeMap<String, u64>,
 }
 
-fn named(values: &[(&str, u64)]) -> BTreeMap<String, u64> {
+pub(super) fn named(values: &[(&str, u64)]) -> BTreeMap<String, u64> {
     values
         .iter()
         .map(|(name, value)| ((*name).to_owned(), *value))
@@ -836,7 +923,7 @@ impl PointSpec {
 
 /// The kernels a point forms, by entry, element bindings and the values its
 /// statics take.
-struct Formation<E: Entry> {
+pub(super) struct Formation<E: Entry> {
     entry: BoundEntry<E>,
     values: Vec<(&'static str, u64)>,
 }
@@ -873,7 +960,7 @@ impl Rows {
 const SELECTED_ROWS: &str = "O";
 
 impl<E: Entry> Formation<E> {
-    fn new(entry: BoundEntry<E>, values: &[(&'static str, u64)]) -> Self {
+    pub(super) fn new(entry: BoundEntry<E>, values: &[(&'static str, u64)]) -> Self {
         Self {
             entry,
             values: values.to_vec(),
@@ -910,7 +997,7 @@ impl<E: Entry> Formation<E> {
     }
 
     /// Its source identity on `backend`, formable without a device.
-    fn identity(
+    pub(super) fn identity(
         &self,
         backend: seismic::BackendName,
     ) -> Result<KernelIdentity, ExecutorCostsError> {
@@ -920,7 +1007,7 @@ impl<E: Entry> Formation<E> {
 
     /// Formed on `device` at its default specialization, its calls held to
     /// `rows` selected rows where given.
-    fn form(
+    pub(super) fn form(
         &self,
         device: &Device,
         rows: Option<u64>,
@@ -958,6 +1045,8 @@ struct ProgramSet {
     dense: Formation<attention_decode::Entry>,
     affine: Formation<attention_decode_k8v4::Entry>,
     copy: Formation<conditioning_overlay::Entry>,
+    /// An expert bank's record moves, over records of the chain's format.
+    moves: Formation<routed_move::Entry>,
 }
 
 impl ProgramSet {
@@ -984,6 +1073,7 @@ impl ProgramSet {
             dense: attend::<attention_decode::Entry>(KvCodec::Dense)?,
             affine: attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?,
             copy: copy(),
+            moves: moves(chain),
         })
     }
 
@@ -1003,8 +1093,9 @@ impl ProgramSet {
     /// own, the walk's early reads first, while the walk goes on:
     /// a point waits only for its own kernels, and a compile is host work
     /// while most points are timed on the device ([`Programs::settled`]),
-    /// no point waiting past `deadline`.
-    fn form(&self, device: &Device, deadline: std::time::Instant) -> Programs {
+    /// no point waiting past `deadline`, nor any program beginning to form
+    /// past it: no point could read it.
+    fn form(&self, device: &Device, deadline: std::time::Instant) -> Formed {
         let host = matches!(
             device
                 .topology()
@@ -1024,9 +1115,11 @@ impl ProgramSet {
             dense: Pending::new(),
             affine: Pending::new(),
             copy: Pending::new(),
+            moves: Pending::new(),
+            finished: Pending::new(),
         };
         let (set, device, forming) = (self.clone(), device.clone(), programs.clone());
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name("measurement-formation".into())
             .spawn(move || {
                 let index = |format: Element| {
@@ -1058,6 +1151,7 @@ impl ProgramSet {
                     Job::Copy,
                     Job::Output,
                     Job::Expand(activation, Rows::Matrix),
+                    Job::Moves,
                 ];
                 // The chain's format is a backend's resident form of Q4_K,
                 // which may be the activation dtype's.
@@ -1065,6 +1159,7 @@ impl ProgramSet {
                 jobs.extend(decodes.chain(matrices));
                 let formed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     seismic::Workers::of_the_host().each(&jobs, |job| match *job {
+                        _ if std::time::Instant::now() >= deadline => {}
                         Job::Expand(index, rows) => {
                             let (_, decode, matrix) = &forming.expands[index];
                             let formed = set.expands[index]
@@ -1079,15 +1174,27 @@ impl ProgramSet {
                         Job::Dense => forming.dense.set(set.dense.form(&device, None)),
                         Job::Affine => forming.affine.set(set.affine.form(&device, None)),
                         Job::Output => forming.output.set(set.output.form(&device, Some(1))),
+                        Job::Moves => forming.moves.set(set.moves.form(&device, None)),
                     })
                 }));
-                if formed.is_err() {
-                    forming.abandon();
+                match formed {
+                    Ok(_) => forming.end(),
+                    Err(_) => forming.abandon(),
                 }
             })
             .expect("the host starts the formation thread");
-        programs
+        Formed { programs, thread: Some(thread) }
     }
+}
+
+/// What of the walk a request reads ([`super::PointRequest`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Scope {
+    /// Its whole plan: assessment's costs.
+    Whole,
+    /// The probe and the routes beside device storage's: a host tier's
+    /// link line (`ExpertPass::lines`).
+    HostRoutes,
 }
 
 /// One program [`ProgramSet::form`] forms.
@@ -1098,6 +1205,7 @@ enum Job {
     Dense,
     Affine,
     Output,
+    Moves,
 }
 
 /// The F of `format`'s program: the executor's ([`Sizes`]), halved while a
@@ -1133,6 +1241,11 @@ struct Programs {
     dense: Forming<attention_decode::Entry>,
     affine: Forming<attention_decode_k8v4::Entry>,
     copy: Forming<conditioning_overlay::Entry>,
+    moves: Forming<routed_move::Entry>,
+    /// Set as the formation thread ends, every program it forms formed
+    /// ([`Self::end`]): what a point that touches the host waits for, so no
+    /// compile shares the host it is timed on ([`Self::settled`]).
+    finished: Arc<Pending<()>>,
     /// When the job's [`MEASUREMENT_SECONDS`] end: a point waits for its
     /// kernels no longer.
     deadline: std::time::Instant,
@@ -1236,25 +1349,17 @@ impl Programs {
             .map_err(|error| Unformed::Never(error.clone()))
     }
 
-    /// Every program formed, or the job's deadline passed first: no compile
-    /// runs beside a point that touches the host.
+    /// The formation thread ended, or the job's deadline passed first: no
+    /// compile runs beside a point that touches the host.
     fn settled(&self) -> Result<(), Unformed<ExecutorCostsError>> {
-        let formed = self
-            .expands
-            .iter()
-            .flat_map(|(_, decode, matrix)| {
-                [decode.wait(self.deadline), matrix.wait(self.deadline)]
-            })
-            .all(|formed| formed.is_some())
-            && self.output.wait(self.deadline).is_some()
-            && self.dense.wait(self.deadline).is_some()
-            && self.affine.wait(self.deadline).is_some()
-            && self.copy.wait(self.deadline).is_some();
-        if formed {
-            Ok(())
-        } else {
-            Err(Unformed::Expired)
-        }
+        self.finished.wait(self.deadline).map(drop).ok_or(Unformed::Expired)
+    }
+
+    /// The formation thread ended: the formation is finished, every
+    /// program it skipped past the deadline expiring for its waiters
+    /// (`Pending::wait`).
+    fn end(&self) {
+        self.finished.set(());
     }
 
     /// Every program not formed yet is never formed: the formation thread
@@ -1268,6 +1373,8 @@ impl Programs {
         self.dense.abandon();
         self.affine.abandon();
         self.copy.abandon();
+        self.moves.abandon();
+        self.finished.abandon();
     }
 }
 
@@ -1308,21 +1415,15 @@ trait Times {
     ) -> Result<Timing, Stop<Self::Missing>>;
 }
 
-/// A step's part of the job: one point of the `left` the plan reads from
-/// it on, its own among them, each sampling for an equal part of the time
-/// the job has left. A point that ends before its part passes the rest
-/// to the points after it, and one that takes longer (its fewest samples
-/// longer than its part) takes it from them, so the job keeps its time.
+/// How a point's reading is forecast, where records forecast it (a deeper
+/// rung from the rung below, a format's streaming rate and throughput from
+/// its pilot): the job starts no point whose making and fewest passes, a
+/// lead and a sample, end past its time, as the first a point submits has
+/// no reading of its own to forecast it by (a GB10's CPU started a 262K rung
+/// 9.6 s into a job and ended it at 10.85 s, 2026-10-22). Its time is the
+/// job's to share ([`Measured::within`]).
 #[derive(Clone, Copy, Debug)]
 struct Share {
-    left: usize,
-    /// What reading its point is forecast to take, where records forecast
-    /// it (a deeper rung from the rung below, a format's streaming rate and
-    /// throughput from its pilot): the job starts no point whose making and
-    /// fewest passes, a lead and a sample, end past its time, as the first a
-    /// point submits has no reading of its own to forecast it by (a GB10's
-    /// CPU started a 262K rung 9.6 s into a job and ended it at 10.85 s,
-    /// 2026-10-22).
     forecast: Option<Forecast>,
 }
 
@@ -1335,13 +1436,33 @@ struct Forecast {
 }
 
 impl Share {
+    /// No forecast.
+    const UNFORECAST: Self = Self { forecast: None };
+
     /// This share where a pass of its point's calls is forecast to take
     /// `pass` seconds and its making to lay out `bytes`.
     fn forecast(self, pass: f64, bytes: u64) -> Self {
         Self {
             forecast: Some(Forecast { pass, bytes }),
-            ..self
         }
+    }
+}
+
+/// What a job's caller is told of each point it visits, as soon as it is
+/// known: what became of it, its failures as text.
+pub type Visit<'a> = dyn FnMut(PointKey, Outcome<String, String>) + 'a;
+
+/// `outcome` as a job's caller is told it ([`Visit`]).
+fn told<E: fmt::Display, G: fmt::Display>(outcome: Outcome<E, G>) -> Outcome<String, String> {
+    match outcome {
+        Outcome::Loaded(record) => Outcome::Loaded(record),
+        Outcome::Measured(timing) => Outcome::Measured(timing),
+        Outcome::Skipped(reason) => Outcome::Skipped(reason),
+        Outcome::Unformed(error) => Outcome::Unformed(error.to_string()),
+        Outcome::Unmade(error) => Outcome::Unmade(error.to_string()),
+        Outcome::Failed(error) => Outcome::Failed(error.to_string()),
+        Outcome::Expired => Outcome::Expired,
+        Outcome::Store(error) => Outcome::Store(error),
     }
 }
 
@@ -1443,15 +1564,23 @@ struct Measured<'a, 'd> {
     attempting: &'a mut dyn FnMut(&PointKey) -> Attempt,
     /// The walk's kernels, formed before the first point no record holds: a
     /// job whose points are all stored forms nothing.
-    programs: std::cell::OnceCell<Programs>,
+    programs: std::cell::OnceCell<Formed>,
     /// The storage every point's rotated operands view, allocated as the
     /// first points that need it are made.
     backings: Backings,
     /// Told of every point visited, in order, with what became of it, as
     /// soon as it is known.
-    visit: &'a mut dyn FnMut(PointKey, Outcome<CallError, ExecutorCostsError>),
+    visit: &'a mut Visit<'a>,
     /// When the job's [`MEASUREMENT_SECONDS`] end.
     deadline: std::time::Instant,
+    /// The points the job has still to visit, its own next among them, in
+    /// the order its requests are measured ([`super::requests`]): each
+    /// samples for an equal part of the time left. A point that ends before
+    /// its part passes the rest to the points after it, and one that takes
+    /// longer (its fewest samples longer than its part) takes it from them,
+    /// so the job keeps its time; what it does not reach the next job
+    /// measures.
+    left: usize,
 }
 
 impl Measured<'_, '_> {
@@ -1466,11 +1595,11 @@ impl Measured<'_, '_> {
         })
     }
 
-    /// How a point is sampled in its `share` of the time the job has left:
-    /// until its median is resolved or its share is spent, each sample
-    /// covering at least tuning's least device time (which sets its
-    /// repetitions: tuning's, the one owner).
-    fn within(&self, share: Share) -> Measure {
+    /// How the next point is sampled in its part of the time the job has
+    /// left ([`Self::left`]): until its median is resolved or its part is
+    /// spent, each sample covering at least tuning's least device time
+    /// (which sets its repetitions: tuning's, the one owner).
+    fn within(&self) -> Measure {
         let remaining = self
             .deadline
             .saturating_duration_since(std::time::Instant::now())
@@ -1478,7 +1607,7 @@ impl Measured<'_, '_> {
         Measure {
             stop: seismic::measure::Stop::Within {
                 error_rate: crate::SEARCH_SETTINGS.error_rate,
-                seconds: remaining / share.left as f64,
+                seconds: remaining / self.left.max(1) as f64,
             },
             min_sample_seconds: crate::MIN_SAMPLE_SECONDS,
         }
@@ -1497,12 +1626,13 @@ impl Times for Measured<'_, '_> {
         share: Share,
     ) -> Result<Timing, Stop<Self::Missing>> {
         let key = self.records.key(spec);
+        let how = self.within();
+        self.left = self.left.saturating_sub(1);
         // One no record holds that cannot be read in the time left is not
         // attempted, so not recorded: the next job reads it.
         if !self.starts(share) && self.records.load::<Self::Missing>(&key)?.is_none() {
             return Err(Stop::Expired);
         }
-        let how = self.within(share);
         let deadline = self.deadline;
         // The point is made only when no record holds it and the host
         // attempts it, so a stored or skipped point is never made. Every
@@ -1517,7 +1647,7 @@ impl Times for Measured<'_, '_> {
             vec![(key, || {
                 build(
                     device,
-                    formed.get_or_init(|| programs.form(device, deadline)),
+                    &formed.get_or_init(|| programs.form(device, deadline)).programs,
                     backings,
                 )
             })],
@@ -1531,7 +1661,7 @@ impl Times for Measured<'_, '_> {
         );
         let (key, outcome) = outcomes.pop().expect("one point is measured");
         let result = timed(&outcome);
-        (self.visit)(key, outcome);
+        (self.visit)(key, told(outcome));
         // The next point reads zeros where this one wrote.
         self.backings.restore().map_err(Stop::Failed)?;
         result
@@ -1562,10 +1692,18 @@ impl Times for Measured<'_, '_> {
 /// a gigabyte in up to 1.5 s, is most of its job. macOS reports an Apple
 /// CPU's L2, behind which its system-level cache sits.
 fn largest_cache(topology: &DeviceTopology, executor: &Executor) -> u64 {
-    match topology
-        .physical_device(executor.physical())
-        .and_then(|physical| physical.cache())
-    {
+    cache_bound(topology.physical_device(executor.physical()))
+}
+
+/// The largest cache that can serve host memory ([`largest_cache`]'s, of the
+/// host's own physical device): what a sweep of host memory is sized beyond
+/// ([`super::streaming_costs::MemoryCosts`]).
+pub(super) fn host_cache(topology: &DeviceTopology) -> u64 {
+    cache_bound(topology.physical_devices().first())
+}
+
+fn cache_bound(physical: Option<&seismic::PhysicalDevice>) -> u64 {
+    match physical.and_then(|physical| physical.cache()) {
         Some(Reported {
             value,
             by: ReportedBy::LinuxSysfsCache | ReportedBy::WindowsProcessorCache,
@@ -1585,12 +1723,12 @@ fn rotation_sets(cache: u64, bytes: u64) -> u64 {
 
 /// One allocation route of the executor's placements, and how an operand
 /// is allocated along it: in the first storage kind whose placement reaches
-/// it, passing over the paths before it there. Every path along a route
-/// allocates the same memory (`seismic::AccessRoute`), so one rate is
-/// measured per route.
+/// it, passing over the paths before it there. A route is one of the
+/// executor's kinds (`seismic::NativeKind`), whose memory every path it is
+/// charged along allocates, so one rate is measured per route.
 struct Route {
-    route: AccessRoute,
-    storage: StorageKind,
+    route: NativeKind,
+    storage: OperandStorage,
     /// The placement's paths before the route's first: each is held at what
     /// it has charged while an operand allocates, so the allocation moves
     /// on along the placement (spec §2.3).
@@ -1599,22 +1737,21 @@ struct Route {
     along: Vec<AccessPathId>,
 }
 
-/// The route `path` of `topology` allocates along.
-fn route_of(topology: &DeviceTopology, path: AccessPathId) -> AccessRoute {
-    topology
-        .access_path(path)
-        .expect("a placement's paths belong to its topology")
-        .route()
-}
-
-/// A route's figure in a point's key: device storage 0, upload storage 1,
-/// Vulkan heap `h` 2 + `h`.
-fn route_ordinal(route: AccessRoute) -> u64 {
-    match route {
-        AccessRoute::Device => 0,
-        AccessRoute::Upload => 1,
-        AccessRoute::VulkanHeap(heap) => 2 + u64::from(heap),
+/// The kinds of `storage`'s placement an operand can be allocated along,
+/// in order: a kind every path of which an earlier one of the placement is
+/// charged along is no route of its own, as an allocation is steered only
+/// by the paths it passes over.
+fn routes_of<'a>(topology: &'a DeviceTopology, executor: &Executor, storage: OperandStorage) -> Vec<&'a seismic::Kind> {
+    let mut reached: Vec<AccessPathId> = Vec::new();
+    let mut routes = Vec::new();
+    for id in executor.placement(seismic::Placing::Fixed(storage.kind())) {
+        let kind = topology.kind(*id).expect("a placement's kinds belong to its topology");
+        if kind.paths().iter().any(|path| !reached.contains(path)) {
+            reached.extend(kind.paths());
+            routes.push(kind);
+        }
     }
+    routes
 }
 
 /// Every route of an executor's placements, each with the storage kind
@@ -1633,24 +1770,19 @@ impl Routes {
 }
 
 impl Route {
-    /// The route of `path`, the `index`th of `storage`'s `placement`: in
-    /// `storage`, passing over the paths before it.
-    fn of(
-        topology: &DeviceTopology,
-        storage: StorageKind,
-        placement: &[AccessPathId],
-        index: usize,
-    ) -> Self {
-        let route = route_of(topology, placement[index]);
+    /// The route of `kind`, one of `storage`'s placement on `executor`: in
+    /// `storage`, passing over the placement's paths before its first.
+    fn of(executor: &Executor, storage: OperandStorage, kind: &seismic::Kind) -> Self {
+        let placement = executor.paths(seismic::Placing::Fixed(storage.kind()));
+        let first = placement
+            .iter()
+            .position(|path| *path == kind.paths()[0])
+            .expect("a placement's kinds are charged along its paths");
         Self {
-            route,
+            route: kind.native(),
             storage,
-            passed: placement[..index].to_vec(),
-            along: placement
-                .iter()
-                .filter(|path| route_of(topology, **path) == route)
-                .copied()
-                .collect(),
+            passed: placement[..first].to_vec(),
+            along: kind.paths().to_vec(),
         }
     }
 
@@ -1660,40 +1792,36 @@ impl Route {
         topology: &DeviceTopology,
         executor: &Executor,
     ) -> Result<(Routes, Placements), ExecutorCostsError> {
-        let placement = |storage: StorageKind| {
-            let paths = executor.placement(storage);
-            let (first, rest) = paths.split_first().ok_or_else(|| {
+        let placement = |storage: OperandStorage| {
+            let routes = routes_of(topology, executor, storage);
+            let (first, rest) = routes.split_first().ok_or_else(|| {
                 ExecutorCostsError(format!(
                     "executor {} places no {storage:?} storage",
                     executor.selector()
                 ))
             })?;
             Ok::<_, ExecutorCostsError>(Placement {
-                first: route_of(topology, *first),
-                rest: rest.iter().map(|path| route_of(topology, *path)).collect(),
+                first: first.native(),
+                rest: rest.iter().map(|kind| kind.native()).collect(),
             })
         };
         let placements = Placements {
-            device: placement(StorageKind::Device)?,
-            upload: placement(StorageKind::Upload)?,
+            device: placement(OperandStorage::Device)?,
+            upload: placement(OperandStorage::Upload)?,
+            host: placement(OperandStorage::Host)?,
         };
         let mut routes = Routes {
             device: Self::of(
-                topology,
-                StorageKind::Device,
-                executor.placement(StorageKind::Device),
-                0,
+                executor,
+                OperandStorage::Device,
+                routes_of(topology, executor, OperandStorage::Device)[0],
             ),
             others: Vec::new(),
         };
-        for storage in StorageKind::ALL {
-            let placement = executor.placement(storage);
-            for (index, path) in placement.iter().enumerate() {
-                let route = route_of(topology, *path);
-                if !routes.iter().any(|known| known.route == route) {
-                    routes
-                        .others
-                        .push(Self::of(topology, storage, placement, index));
+        for storage in OperandStorage::ALL {
+            for kind in routes_of(topology, executor, storage) {
+                if !routes.iter().any(|known| known.route == kind.native()) {
+                    routes.others.push(Self::of(executor, storage, kind));
                 }
             }
         }
@@ -1704,7 +1832,7 @@ impl Route {
     fn point(&self) -> [(&'static str, u64); 2] {
         [
             ("storage", self.storage as u64),
-            ("route", route_ordinal(self.route)),
+            ("route", u64::from(self.route.id)),
         ]
     }
 
@@ -1719,8 +1847,10 @@ impl Route {
     ) -> Result<Vec<Tensor>, ExecutorCostsError> {
         let error = failed("placing an operand");
         let charges = device
-            .path_charges()
+            .ledgers()
+            .paths
             .into_iter()
+            .map(|path| (path.path, path.claim))
             .collect::<BTreeMap<_, _>>();
         // Every path held is released whatever fails: the limits set before
         // a failure to set one, and after the allocation.
@@ -1728,7 +1858,7 @@ impl Route {
         let mut holding = Ok(());
         for path in &self.passed {
             let charged = charges.get(path).copied().unwrap_or(0);
-            holding = device.set_path_limit(*path, Some(charged));
+            holding = device.bound(seismic::Ledger::Path(*path), Some(charged));
             if holding.is_err() {
                 break;
             }
@@ -1740,7 +1870,7 @@ impl Route {
         let released = held
             .iter()
             .fold(Ok(()), |released, path| {
-                released.and(device.set_path_limit(*path, None))
+                released.and(device.bound(seismic::Ledger::Path(*path), None))
             })
             .map_err(|cause| error(&cause));
         let tensors = allocated?;
@@ -1768,8 +1898,9 @@ impl Route {
         extents: &[u64],
     ) -> Result<Tensor, seismic::TensorError> {
         match self.storage {
-            StorageKind::Device => Tensor::zeros(device, element, extents),
-            StorageKind::Upload => Tensor::shared(device, element, extents),
+            OperandStorage::Device => Tensor::zeros(device, element, extents),
+            OperandStorage::Upload => Tensor::upload(device, element, extents),
+            OperandStorage::Host => Tensor::shared(device, element, extents),
         }
     }
 }
@@ -1826,7 +1957,7 @@ impl Operand {
 /// zeros once it is timed ([`Self::restore`]) and every point reads zeros.
 #[derive(Default)]
 struct Backings {
-    routes: Vec<(AccessRoute, Vec<Tensor>)>,
+    routes: Vec<(NativeKind, Vec<Tensor>)>,
     /// The views of the backings the points made since the last restore
     /// write.
     written: Vec<Tensor>,
@@ -2656,6 +2787,164 @@ fn copy() -> Formation<conditioning_overlay::Entry> {
     Formation::new(conditioning_overlay::native_entry(), &[])
 }
 
+/// The records a move point moves at once, here and in a bank form's move
+/// line (`MoveForm`): a whole bank's first shrink moves tens a layer, and
+/// `routed_move` copies `LIST_ROWS` records at a time, so its time grows by
+/// one such pass per `LIST_ROWS` records from here on.
+pub(super) const MOVED_RECORDS: u64 = 32;
+
+/// A moved record's rows of [`HIDDEN`]: an expert's projection of the
+/// catalog's routed models (512 rows of 2048 in Qwen3.5-35B-A3B's), at the
+/// walk's H.
+const MOVED_ROWS: u64 = 512;
+
+/// `routed_move` over [`MOVED_RECORDS`] moves among twice as many records of
+/// `record`, [`MOVED_ROWS`] × [`HIDDEN`] each: what a bank's shrink carries.
+fn moves(record: Element) -> Formation<routed_move::Entry> {
+    Formation::new(
+        routed_move::native_entry_with(routed_move::Elements { U: record }),
+        &[("D", 2 * MOVED_RECORDS), ("L", MOVED_RECORDS), ("N", MOVED_ROWS), ("K", HIDDEN)],
+    )
+}
+
+/// Whether `backend` moves a bank's records (`routed_move` has its native
+/// there, as every entry of a streamed load does): only there does the walk
+/// read the moves.
+fn moves_records(backend: seismic::BackendName) -> Result<bool, ExecutorCostsError> {
+    seismic::generated::native_implementation_for_backend::<routed_move::Entry>(backend)
+        .map(|implementation| implementation.is_some())
+        .map_err(|error| failed(routed_move::Entry::NAME)(&error))
+}
+
+/// The bytes one moved record of `record` holds.
+fn moved_record_bytes(record: Element) -> Result<u64, ExecutorCostsError> {
+    record
+        .canonical_byte_len(&[MOVED_ROWS, HIDDEN])
+        .map_err(|error| failed("moved records")(&error))
+}
+
+/// A move point's operands: its records, zeros along device storage's first
+/// route, and its list, each upper record moved onto the one below it.
+struct MoveCase {
+    records: Tensor,
+    list: Tensor,
+}
+
+impl MoveCase {
+    fn new(device: &Device, record: Element) -> Result<Self, ExecutorCostsError> {
+        let error = failed("move operands");
+        let records = Tensor::zeros(device, record, &[2 * MOVED_RECORDS, MOVED_ROWS, HIDDEN])
+            .map_err(|cause| error(&cause))?;
+        let mut words = vec![0i32; magnitude_kernels::list_extent(MOVED_RECORDS) as usize];
+        words[constants::LIST_COUNT as usize] = MOVED_RECORDS as i32;
+        for entry in 0..MOVED_RECORDS {
+            let at = magnitude_kernels::list_extent(entry) as usize;
+            words[at + constants::LIST_FROM as usize] = (MOVED_RECORDS + entry) as i32;
+            words[at + constants::LIST_TO as usize] = entry as i32;
+        }
+        let mut list = Tensor::zeros(device, Element::i32(), &[words.len() as u64]).map_err(|cause| error(&cause))?;
+        let bytes = words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+        list.write_from_host(&bytes).map_err(|cause| error(&cause))?;
+        Ok(Self { records, list })
+    }
+
+    fn args(&mut self) -> routed_move::Args<'_> {
+        routed_move::Args {
+            records: &mut self.records,
+            list: &self.list,
+        }
+    }
+}
+
+/// A reservation's granules released beside the move point
+/// ([`ReleaseCase`]): rows of the Metal and CUDA reservation granule, as
+/// many as keep a release running through each call. A release's slowdown
+/// of device work beside it does not grow with its bytes: on a GB10,
+/// releasing 1, 4 and 14 GB slowed copies running beside it from 9.43 ms to
+/// a median 10.06, 10.09 and 10.14 ms, and 500 small launches from 0.80 to
+/// 0.88 ms, 2026-10-28; at about 5 GB/s released, 256 MiB outlasts a call.
+const RELEASED_ROW: u64 = 2 << 20;
+const RELEASED_ROWS: u64 = 128;
+
+/// A thread releasing a reservation's granules beside timed device work
+/// (all but one in one release, as a bank's shrink releases its tail, and
+/// backed again), until dropped. On a GB10 and an M4 Pro, releasing one
+/// granule at a time instead, or timing 200 move calls a pass (a step's
+/// many launches) instead of one, read no consistently larger cost (GB10
+/// 1.13 this way, 1.01 with the 200 calls, 1.05 granule by granule; M4 Pro
+/// 1.05, 1.06 and 1.12, 8 samples each, 2026-10-28).
+struct Releases {
+    stop: Arc<AtomicBool>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<Result<(), String>>>>,
+}
+
+impl Releases {
+    fn start(device: &Device) -> Result<Self, ExecutorCostsError> {
+        let (tensor, resizer) = Tensor::reserved(device, Element::bool(), &[RELEASED_ROWS, RELEASED_ROW], RELEASED_ROWS)
+            .map_err(|cause| failed("a released reservation")(&cause))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let _held = tensor;
+            let mut resizer = resizer;
+            while !stopped.load(Ordering::Relaxed) {
+                for rows in [1, RELEASED_ROWS] {
+                    resizer = resizer.recommit(rows).map_err(|refusal| refusal.error.to_string())?;
+                }
+            }
+            Ok(())
+        });
+        Ok(Self { stop, thread: std::sync::Mutex::new(Some(thread)) })
+    }
+}
+
+impl Drop for Releases {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let thread = self.thread.get_mut().expect("the releases' lock").take().expect("releases end once");
+        if let Err(error) = thread.join().expect("the releases do not panic") {
+            panic!("the releases beside the move point failed: {error}");
+        }
+    }
+}
+
+/// The move point timed: its `routed_move` call over [`MOVED_RECORDS`]
+/// records of the chain's format, alone or, `releasing`, beside a
+/// reservation being released ([`Releases`]), the releases held by the
+/// point so they run for as long as it is timed (a case of the point's
+/// making is dropped once the point is made).
+fn move_timing<T: Times>(
+    backend: seismic::BackendName,
+    programs: &ProgramSet,
+    times: &mut T,
+    share: Share,
+    releasing: bool,
+) -> Result<Timing, Stop<T::Missing>> {
+    let record = programs.chain;
+    let moved = [("records", MOVED_RECORDS), ("rows", MOVED_ROWS)];
+    let point = match releasing {
+        false => moved.to_vec(),
+        // Keyed apart from the records made while the point dropped its
+        // releases before timing them (`released_rows`), which measured none.
+        true => [&moved[..], &[("releasing_rows", RELEASED_ROWS)]].concat(),
+    };
+    let identities = vec![programs.moves.identity(backend)?];
+    let mut build = move |device: &Device, formed: &Programs, _: &mut Backings| {
+        let kernel = formed.kernel(&formed.moves)?;
+        let mut case = MoveCase::new(device, record).map_err(Unformed::Now)?;
+        let rotation = vec![case.args()];
+        let point = match releasing {
+            false => kernel.point(rotation),
+            true => {
+                let releases = Releases::start(device).map_err(Unformed::Now)?;
+                kernel.point_beside(rotation, Arc::new(releases))
+            }
+        };
+        point.map(Point::Kernel).map_err(|error| Unformed::Now(failed(routed_move::Entry::NAME)(&error)))
+    };
+    times.time(PointSpec::new(identities, &[], &point), programs, &mut build, share)
+}
+
 fn attend<E: Attention>(layout: KvCodec) -> Result<Formation<E>, ExecutorCostsError> {
     Ok(Formation::new(E::entry(), &attention_values(layout)?))
 }
@@ -2952,6 +3241,10 @@ enum Step {
     Chain,
     /// A format's matrix throughput.
     Matrix(Element),
+    /// An expert bank's record moves.
+    Moves,
+    /// The record moves beside a reservation being released.
+    Releases,
 }
 
 /// A point of a weight rate: its pilot, its calls over one argument set,
@@ -2988,6 +3281,11 @@ impl Step {
         Self::WeightRate(0, Element::bf16(), Pass::Rate)
     }
 
+    /// Whether it reads a figure the costs require ([`Required`]).
+    fn required(self) -> bool {
+        matches!(self, Self::Launch(_) | Self::Chain)
+    }
+
     /// Whether it reads a format's rate streaming from memory, which its
     /// pilot prices until then.
     fn streams(self) -> bool {
@@ -3007,6 +3305,8 @@ impl fmt::Display for Step {
             }
             Self::Chain => formatter.write_str("the composition chain"),
             Self::Matrix(format) => write!(formatter, "the {} matrix throughput", format.name()),
+            Self::Moves => formatter.write_str("the expert bank's record moves"),
+            Self::Releases => formatter.write_str("the record moves beside a release"),
         }
     }
 }
@@ -3034,8 +3334,10 @@ impl fmt::Display for Step {
 /// 75K tokens 33% slow on its first rungs' line, 2026-10-22); then the
 /// formats' matrix throughputs, which their pilots price within the 7 to
 /// 9.4 eighths of a row's time eight rows took on a 12-core M6's CPU, and
-/// which price a step only where arithmetic bounds it.
-fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
+/// which price a step only where arithmetic bounds it. The expert bank's
+/// record moves follow the activation dtype's matrix throughput: no figure
+/// prices them unread.
+fn plan(routes: &[&Route], formats: &[Element], moves: bool) -> Vec<Step> {
     let activation = Element::bf16();
     let others = formats
         .iter()
@@ -3043,7 +3345,7 @@ fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
         .filter(|format| *format != activation)
         .collect::<Vec<_>>();
     let (device, host): (Vec<usize>, Vec<usize>) =
-        (0..routes.len()).partition(|&index| routes[index].storage == StorageKind::Device);
+        (0..routes.len()).partition(|&index| routes[index].storage == OperandStorage::Device);
     let first_rungs = |layout| {
         [Rung::Pilot, Rung::Depth(0), Rung::Depth(1)].map(move |rung| Step::Rung(layout, rung))
     };
@@ -3058,6 +3360,10 @@ fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
     steps.extend(first_rungs(KvCodec::Dense));
     steps.push(Step::Chain);
     steps.push(Step::Matrix(activation));
+    // Unread, an expert bank's shrink is unpaced: one resize takes the
+    // whole deficit, however long its moves hold a decode step. Beside
+    // them, what the shrink's release costs device work running with it.
+    steps.extend(moves.then_some([Step::Moves, Step::Releases]).into_iter().flatten());
     steps.extend(first_rungs(KvCodec::AffineK8V4));
     steps.extend(
         host.iter()
@@ -3085,9 +3391,12 @@ fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
 /// whose figure is otherwise priced could not be read outside its points'
 /// timings (a kernel's identity that cannot be derived), which the job
 /// reports.
-struct Walked {
-    costs: ExecutorCosts,
+struct Walked<M> {
+    /// The costs, or the required figures unread.
+    costs: Result<ExecutorCosts, Vec<Required>>,
     pending: bool,
+    /// The first point of a required figure no record holds.
+    missing: Option<M>,
     failures: Vec<ExecutorCostsError>,
 }
 
@@ -3100,7 +3409,8 @@ fn walk<T: Times>(
     topology: &DeviceTopology,
     executor: &Executor,
     times: &mut T,
-) -> Result<Walked, Stop<T::Missing>> {
+    scope: Scope,
+) -> Result<Walked<T::Missing>, Stop<T::Missing>> {
     let backend = executor.backend();
     let formats = &measured_formats(backend);
     let largest = executor.limits().max_allocation.value;
@@ -3113,7 +3423,7 @@ fn walk<T: Times>(
     let programs = ProgramSet::new(Sizes::of(backend), formats, chain, largest)?;
     let (routes, placements) = Route::all(topology, executor)?;
     let routes = routes.iter().collect::<Vec<_>>();
-    let steps = plan(&routes, formats);
+    let steps = plan(&routes, formats, moves_records(backend)?);
     // Each step is one point, after the probe.
     let points = 1 + steps.len();
     let walk = Walk {
@@ -3123,24 +3433,22 @@ fn walk<T: Times>(
         cache: largest_cache(topology, executor),
         largest,
         room: rotation_room(topology, routes[0]),
-        // A point's part of the job, which shapes are sized to from records
-        // (a history rung, the composition chain): a start derives it from
-        // the same plan, so it retraces the same points.
+        // What shapes are sized to from records (a history rung, the
+        // composition chain): a whole plan's equal part of a job's time. It
+        // keys their records, so a start derives it from the same plan and
+        // retraces the same points, whatever the scope; it is no point's
+        // part of a job's time, which follows the job's requests
+        // (`Measured::left`).
         point_seconds: MEASUREMENT_SECONDS / points as f64,
         routes,
     };
-    let probe = walk.probe(
-        Share {
-            left: points,
-            forecast: None,
-        },
-        times,
-    )?;
+    let probe = walk.probe(Share::UNFORECAST, times)?;
     let mut read = Read::new(walk.routes.len(), probe);
-    let mut left = points - 1;
     let mut pending = false;
+    let mut missing = None;
     let mut failures = Vec::new();
     let mut steps = steps;
+    scoped(&mut steps, &walk.routes, scope);
     for index in 0..steps.len() {
         // The formats' streaming rates are read in the order their pilots
         // price them furthest off ([`Read::overlap`]), once every pilot is
@@ -3152,19 +3460,19 @@ fn walk<T: Times>(
                 .sort_by(|near, far| read.overlap(*far).total_cmp(&read.overlap(*near)));
         }
         let step = steps[index];
-        let share = Share {
-            left,
-            forecast: None,
-        };
-        left -= 1;
-        match walk.step(step, share, &mut read, times) {
+        match walk.step(step, Share::UNFORECAST, &mut read, times) {
             Ok(()) => {}
             Err(stop) => {
                 if let Step::Rung(layout, _) = step {
                     read.ladder(layout).ended = true;
                 }
                 match stop {
-                    Stop::Missing(_) => pending = true,
+                    Stop::Missing(key) => {
+                        pending = true;
+                        if step.required() && missing.is_none() {
+                            missing = Some(key);
+                        }
+                    }
                     Stop::Failed(error) => failures.push(failed(&step.to_string())(&error)),
                     // The point's own outcome reports it.
                     Stop::Point(_) | Stop::Expired => {}
@@ -3175,8 +3483,26 @@ fn walk<T: Times>(
     Ok(Walked {
         costs: read.costs(&walk, placements)?,
         pending,
+        missing,
         failures,
     })
+}
+
+/// The steps of a plan over `routes` that `scope` reads after its probe.
+fn scoped(steps: &mut Vec<Step>, routes: &[&Route], scope: Scope) {
+    if scope == Scope::HostRoutes {
+        steps.retain(|step| matches!(step, Step::WeightRate(route, _, Pass::Rate) if routes[*route].storage != OperandStorage::Device));
+    }
+}
+
+/// The points a walk of `scope` on `executor` visits, its probe among them:
+/// what a job counts of it ahead ([`Measured::left`]).
+pub(super) fn walk_points(topology: &DeviceTopology, executor: &Executor, scope: Scope) -> Result<usize, ExecutorCostsError> {
+    let (routes, _) = Route::all(topology, executor)?;
+    let routes = routes.iter().collect::<Vec<_>>();
+    let mut steps = plan(&routes, &measured_formats(executor.backend()), moves_records(executor.backend())?);
+    scoped(&mut steps, &routes, scope);
+    Ok(1 + steps.len())
 }
 
 /// What every step of a walk reads from: the executor's programs, its
@@ -3235,6 +3561,9 @@ struct Read {
     chain: Option<ChainRead>,
     activation_matrix: Option<MatrixCosts>,
     matrices: Vec<(Element, MatrixCosts)>,
+    /// The move point alone, and beside a reservation being released.
+    moves: Option<Timing>,
+    releases: Option<Timing>,
 }
 
 /// A history layout's ladder as the walk has read it.
@@ -3263,6 +3592,8 @@ impl Read {
             chain: None,
             activation_matrix: None,
             matrices: Vec::new(),
+            moves: None,
+            releases: None,
         }
     }
 
@@ -3309,28 +3640,35 @@ impl Read {
             .value
     }
 
-    /// The costs of what the walk read.
+    /// The costs of what the walk read, or the figures they require that
+    /// it did not read ([`Required`]).
     fn costs(
         self,
         walk: &Walk<'_>,
         placements: Placements,
-    ) -> Result<ExecutorCosts, ExecutorCostsError> {
+    ) -> Result<Result<ExecutorCosts, Vec<Required>>, ExecutorCostsError> {
+        let unread = [
+            (self.launch.is_none(), Required::Launch),
+            (self.waited.is_none() || self.queued.is_none(), Required::Step),
+            (self.chain.is_none(), Required::Composition),
+        ]
+        .into_iter()
+        .filter_map(|(unread, figure)| unread.then_some(figure))
+        .collect::<Vec<_>>();
+        let (Some(launch), Some(waited), Some(queued), Some(chain)) = (self.launch, self.waited, self.queued, self.chain) else {
+            return Ok(Err(unread));
+        };
         // A run's device time is its calls' (the launch cost is its share
-        // of one), none where unread.
-        let device = self.launch.map_or(0., |device| device.median);
-        // A run's host time beyond its device time is the step cost, whose
-        // interval is the host time's beyond the median device time.
-        let beyond = |timing: Option<Timing>| {
-            timing.map(|timing| MeasuredCost {
-                value: timing.median - device,
-                interval: timing
-                    .interval
-                    .map(|(low, high)| (low - device, high - device)),
-                samples: timing.samples,
-            })
+        // of one); its host time beyond it is the step cost, whose interval
+        // is the host time's beyond the median device time.
+        let device = launch.median;
+        let beyond = |timing: Timing| MeasuredCost {
+            value: timing.median - device,
+            interval: timing.interval.map(|(low, high)| (low - device, high - device)),
+            samples: timing.samples,
         };
         let mut formats = self.formats.into_iter();
-        let mut costs = ExecutorCosts {
+        Ok(Ok(ExecutorCosts {
             first: RouteCosts {
                 route: walk.routes[0].route,
                 activation: self.probe,
@@ -3351,23 +3689,21 @@ impl Read {
             matrices: self.matrices,
             dense: HistoryCosts::new(KvCodec::Dense, self.dense.rungs)?,
             affine: HistoryCosts::new(KvCodec::AffineK8V4, self.affine.rungs)?,
-            composition: None,
-            launch_seconds: self.launch.map(|device| MeasuredCost {
-                value: device.median / GRAPH_CALLS as f64,
-                interval: device
+            chain: chain.cost(&walk.programs)?,
+            launch_seconds: MeasuredCost {
+                value: launch.median / GRAPH_CALLS as f64,
+                interval: launch
                     .interval
                     .map(|(low, high)| (low / GRAPH_CALLS as f64, high / GRAPH_CALLS as f64)),
-                samples: device.samples,
-            }),
-            step_pipelined_seconds: beyond(self.queued),
-            step_round_trip_seconds: beyond(self.waited),
-        };
-        // The chain's calls are priced from every other figure.
-        costs.composition = self
-            .chain
-            .map(|chain| chain.composition(&walk.programs, &costs))
-            .transpose()?;
-        Ok(costs)
+                samples: launch.samples,
+            },
+            step_pipelined_seconds: beyond(queued),
+            step_round_trip_seconds: beyond(waited),
+            release_step_ratio: self
+                .releases
+                .zip(self.moves)
+                .map(|(beside, alone)| MeasuredCost::ratio(&beside, &alone)),
+        }))
     }
 }
 
@@ -3511,6 +3847,8 @@ impl Walk<'_> {
                     read.matrices.push((format, matrix));
                 }
             }
+            Step::Moves => read.moves = Some(move_timing(self.backend, &self.programs, times, share, false)?),
+            Step::Releases => read.releases = Some(move_timing(self.backend, &self.programs, times, share, true)?),
         }
         Ok(())
     }
@@ -3603,7 +3941,18 @@ impl Walk<'_> {
     }
 }
 
-/// What the composition chain read: its device time over its layers.
+/// What the composition chain read: its device time over its layers, and
+/// the calls of one layer as a decode demand states them
+/// ([`ExecutorCosts::composition`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChainCost {
+    pub timing: Timing,
+    pub layers: u64,
+    pub calls: Vec<Work>,
+}
+
+/// What the composition chain's point read: its device time over its
+/// layers.
 #[derive(Clone, Copy)]
 struct ChainRead {
     timing: Timing,
@@ -3662,24 +4011,9 @@ impl ChainRead {
     /// price them alone, the chain of `programs` ([`super::estimate::calls_seconds`]), so a step
     /// priced from the same costs is scaled to what composing its calls
     /// takes.
-    fn composition(
-        &self,
-        programs: &ProgramSet,
-        costs: &ExecutorCosts,
-    ) -> Result<MeasuredCost, ExecutorCostsError> {
-        let depth = u32::try_from(HISTORY_DEPTHS[0])
-            .map_err(|_| ExecutorCostsError("the chain's depth exceeds u32".into()))?;
-        let priced = self.layers as f64
-            * super::estimate::calls_seconds(&Self::layer(programs)?, costs, depth)
-                .map_err(|error| failed("pricing the composition chain")(&error))?;
-        Ok(MeasuredCost {
-            value: self.timing.median / priced,
-            interval: self
-                .timing
-                .interval
-                .map(|(low, high)| (low / priced, high / priced)),
-            samples: self.timing.samples,
-        })
+    /// The chain's cost: its timing and one layer's calls of `programs`.
+    fn cost(&self, programs: &ProgramSet) -> Result<ChainCost, ExecutorCostsError> {
+        Ok(ChainCost { timing: self.timing, layers: self.layers, calls: Self::layer(programs)?.to_vec() })
     }
 }
 
@@ -3709,7 +4043,7 @@ fn weight_rate<T: Times>(
         &mut calls::<dense_expand::Entry, _>(
             move |formed: &Programs| {
                 // Host memory is timed with no compile sharing the host.
-                if route.storage != StorageKind::Device {
+                if route.storage != OperandStorage::Device {
                     formed.settled()?;
                 }
                 formed.expand(format, Rows::Decode)
@@ -3894,7 +4228,7 @@ impl Walk<'_> {
 }
 
 /// The executor `executor` names in `topology`, and its identity.
-fn executor_identity(
+pub(super) fn executor_identity(
     topology: &DeviceTopology,
     executor: &Executor,
 ) -> Result<Identity, ExecutorCostsError> {
@@ -3906,32 +4240,40 @@ fn executor_identity(
     })
 }
 
-impl ExecutorCosts {
-    /// Measure `device`'s cost points through `measurer`: each point of the
-    /// walk goes to `measure_all`, which loads it from `store` or reports it to
-    /// `attempting`, makes it only when attempted (the walk's kernels formed
-    /// with the first, [`ProgramSet::form`]), times it at the sustained
-    /// clock for its share of the time left before `deadline` (the job's
-    /// [`MEASUREMENT_SECONDS`] from its start) or until its median is
-    /// resolved, and stores its record; `visit` is told what became of each
-    /// point as soon as it is known. A point the deadline ends before any
-    /// sample expires ([`Outcome::Expired`]), unrecorded, and the probe so
-    /// ends the walk. `device` holds no path limit: the walk
-    /// passes over a placement's paths by holding them. Fails when
-    /// `device`'s executor is not of its own topology's revision; otherwise
-    /// returns what ended the walk early, and what the job's points were
-    /// made in and from ([`Measurement::held`]).
-    pub fn measure(
-        measurer: &mut Measurer,
-        device: &Device,
-        store: &dyn RecordStore<PointKey>,
+/// A measurement job's walks on one device ([`super::requests::measure`]):
+/// each point of a walk goes to `measure_all`, which loads it from the
+/// store or reports it to `attempting`, makes it only when attempted (every
+/// walk's kernels formed with the first, [`ProgramSet::form`]), times it at
+/// the sustained clock for its part of the time the job has left before its
+/// deadline ([`Measured::left`]) or until its median is resolved, and stores
+/// its record; `visit` is told what became of each point as soon as it is
+/// known. A point the deadline ends before any sample expires
+/// ([`Outcome::Expired`]), unrecorded. The device holds no path limit: a
+/// walk passes over a placement's paths by holding them. The walks share
+/// the job's kernels and backings, so a point one walk stored another
+/// loads.
+pub(super) struct Walks<'a, 'd> {
+    topology: Arc<DeviceTopology>,
+    executor: Executor,
+    measured: Measured<'a, 'd>,
+}
+
+impl<'a, 'd> Walks<'a, 'd> {
+    /// The walks of a job on `device` with `left` points to visit, or why
+    /// its executor has no records: it is not of its own topology's
+    /// revision.
+    pub(super) fn new(
+        measurer: &'a mut Measurer,
+        device: &'d Device,
+        store: &'a dyn RecordStore<PointKey>,
         deadline: std::time::Instant,
-        attempting: &mut dyn FnMut(&PointKey) -> Attempt,
-        visit: &mut dyn FnMut(PointKey, Outcome<CallError, ExecutorCostsError>),
-    ) -> Result<Measurement, ExecutorCostsError> {
+        left: usize,
+        attempting: &'a mut dyn FnMut(&PointKey) -> Attempt,
+        visit: &'a mut Visit<'a>,
+    ) -> Result<Self, ExecutorCostsError> {
         let topology = device.topology().clone();
         let executor = device.info().clone();
-        let mut measured = Measured {
+        let measured = Measured {
             records: Records {
                 executor: executor_identity(&topology, &executor)?,
                 store,
@@ -3943,28 +4285,154 @@ impl ExecutorCosts {
             backings: Backings::default(),
             visit,
             deadline,
+            left,
         };
-        // What the walk derives is the start's to derive from the records;
-        // the job reports the records as they come, and why the walk ended
-        // early, or left a figure derived, where no visited point says.
-        let walked = walk(&topology, &executor, &mut measured);
-        let held = Held {
-            _backings: measured.backings,
-            _programs: measured.programs.into_inner(),
-        };
-        let (ended, failures) = match walked {
+        Ok(Self { topology, executor, measured })
+    }
+
+    /// The records the job stores into.
+    pub(super) fn store(&self) -> &'a dyn RecordStore<PointKey> {
+        self.measured.records.store
+    }
+
+    /// Walk `scope`: why the walk ended before its end where no visited
+    /// point's outcome says (the probe's kernel identity that cannot be
+    /// derived, or a placement the executor lacks), and why a step after
+    /// the probe could not be read outside its points' timings (its figure
+    /// stays priced).
+    pub(super) fn walk(&mut self, scope: Scope) -> (Option<ExecutorCostsError>, Vec<ExecutorCostsError>) {
+        match walk(&self.topology, &self.executor, &mut self.measured, scope) {
             Ok(walked) => (None, walked.failures),
             Err(Stop::Point(_) | Stop::Expired) => (None, Vec::new()),
             Err(Stop::Failed(error)) => (Some(error), Vec::new()),
             Err(Stop::Missing(never)) => match never {},
-        };
-        Ok(Measurement {
-            ended,
-            failures,
-            held,
-        })
+        }
     }
 
+    /// The job's device.
+    pub(super) fn device(&self) -> &'d Device {
+        self.measured.device
+    }
+
+    /// Take the point `key` by `make`, on the job's device, under the job's
+    /// attempts and deadline: a point no timing loop measures. What `make`
+    /// returns is stored and told as the walks' records are; why it fails
+    /// is told, nothing stored, and the next job attempts it again.
+    pub(super) fn record(&mut self, key: PointKey, make: impl FnOnce(&'d Device) -> Result<Record, String>) {
+        let measured = &mut self.measured;
+        if std::time::Instant::now() >= measured.deadline {
+            return (measured.visit)(key, Outcome::Expired);
+        }
+        let made = match (measured.attempting)(&key) {
+            Attempt::Skip(reason) => Ok(Record::Unobtainable { reason }),
+            Attempt::Proceed => make(measured.device),
+        };
+        let stored = made.and_then(|record| {
+            measured.records.store.store(&key, &record).map_err(|error| error.to_string())?;
+            Ok(record)
+        });
+        (measured.visit)(key, match stored {
+            Ok(Record::Measured(timing)) => Outcome::Measured(timing),
+            Ok(Record::Unobtainable { reason }) => Outcome::Skipped(reason),
+            Err(reason) => Outcome::Failed(reason),
+        });
+    }
+
+    /// The job's executor's identity, every point's key's.
+    pub(super) fn identity(&self) -> Identity {
+        self.measured.records.executor.clone()
+    }
+
+    /// Time the device point `build` makes under `key`, as the job times a
+    /// walk's: its record loaded, or attempted and measured for its part of
+    /// the time left, and stored.
+    pub(super) fn time<F>(&mut self, key: PointKey, build: F)
+    where
+        F: FnOnce() -> Result<Point, Unformed<ExecutorCostsError>>,
+    {
+        let how = self.measured.within();
+        self.measured.left = self.measured.left.saturating_sub(1);
+        let measured = &mut self.measured;
+        let mut outcomes = measured.measurer.measure_all(
+            vec![(key, build)],
+            &how,
+            seismic::measure::Deadline::new(Some(measured.deadline)),
+            measured.records.store,
+            &mut *measured.attempting,
+        );
+        let (key, outcome) = outcomes.pop().expect("one point is measured");
+        (measured.visit)(key, told(outcome));
+    }
+
+    /// Time the host point `build` makes under `key` (work on the host's
+    /// CPUs, which holds no clock), as [`Self::time`] times a device's.
+    pub(super) fn time_host<W, F>(&mut self, key: PointKey, build: F)
+    where
+        W: seismic::measure::Work<Error = String, Clock = ()>,
+        F: FnOnce() -> Result<W, Unformed<ExecutorCostsError>>,
+    {
+        let how = self.measured.within();
+        self.measured.left = self.measured.left.saturating_sub(1);
+        let measured = &mut self.measured;
+        let mut clocks = seismic::measure::HeldClocks::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
+        let mut outcomes = seismic::measure::measure_all(
+            vec![(key, build)],
+            &how,
+            seismic::measure::Deadline::new(Some(measured.deadline)),
+            &mut clocks,
+            measured.records.store,
+            &mut *measured.attempting,
+        );
+        let (key, outcome) = outcomes.pop().expect("one point is measured");
+        (measured.visit)(key, told(outcome));
+    }
+
+    /// What the walks' points were made in and from, which the job's caller
+    /// releases once it has reported the job.
+    pub(super) fn held(self) -> Held {
+        Held {
+            _backings: self.measured.backings,
+            _programs: self.measured.programs.into_inner(),
+        }
+    }
+}
+
+/// What `store`'s records give `executor` of the walk of `scope`
+/// ([`ExecutorCosts::stored`]).
+pub(super) fn retraced(
+    topology: &DeviceTopology,
+    executor: &Executor,
+    store: &dyn RecordStore<PointKey>,
+    scope: Scope,
+) -> Result<StoredCosts, ExecutorCostsError> {
+    let mut stored = Retraced {
+        records: Records {
+            executor: executor_identity(topology, executor)?,
+            store,
+        },
+        read: Vec::new(),
+    };
+    // A failure outside a point's timing, which leaves its figure
+    // derived, is the job's to report: it recurs at each of its walks.
+    match walk(topology, executor, &mut stored, scope) {
+        Ok(Walked { costs: Ok(costs), pending, .. }) => Ok(StoredCosts::Complete {
+            costs,
+            records: stored.read,
+            pending,
+        }),
+        Ok(Walked { costs: Err(_), missing: Some(key), .. }) => Ok(StoredCosts::Missing(key)),
+        // A required figure whose point is recorded unobtainable: no
+        // estimate is had on this executor.
+        Ok(Walked { costs: Err(unread), missing: None, .. }) => Err(ExecutorCostsError(format!(
+            "the executor's costs require {unread:?}, which cannot be measured on it"
+        ))),
+        Err(Stop::Missing(key)) => Ok(StoredCosts::Missing(key)),
+        Err(Stop::Point(error) | Stop::Failed(error)) => Err(error),
+        Err(Stop::Expired) => unreachable!("timings from records alone have no deadline"),
+    }
+}
+
+impl ExecutorCosts {
     /// The costs `store`'s records give `executor`, retracing the walk the job
     /// measures and measuring nothing (forming nothing): complete once the
     /// probe is stored ([`Step::probe`]), pending while a later point no
@@ -3978,31 +4446,100 @@ impl ExecutorCosts {
         executor: &Executor,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<StoredCosts, ExecutorCostsError> {
-        let mut stored = Retraced {
-            records: Records {
-                executor: executor_identity(topology, executor)?,
-                store,
-            },
-            read: Vec::new(),
+        retraced(topology, executor, store, Scope::Whole)
+    }
+
+    /// The most a job's points lay out in `executor`'s device storage at
+    /// once, which a job beside a resident model claims of that model's
+    /// memory first: along each route of the walk whose store is device
+    /// storage's (a host-backed route lays out in host memory), its backing
+    /// ([`Backings`]) holds the most any point there lays out. A point lays
+    /// out a rotation of argument sets each of at most the walk's largest
+    /// set (a format's two weights, or the composition chain's weights and
+    /// first rung of history), as many as span [`CACHE_MULTIPLE`] times its
+    /// largest cache beyond one set, at least two ([`rotation_sets`]); or,
+    /// along device storage's first route alone, where the history ladders
+    /// run, a rung's rotation within the walk's room ([`rotation_room`]).
+    /// Beside them, the move point's records ([`MoveCase`]).
+    pub fn scratch(topology: &DeviceTopology, executor: &Executor) -> Result<u64, ExecutorCostsError> {
+        let backend = executor.backend();
+        let largest = executor.limits().max_allocation.value;
+        let chain = chain_element(backend).ok_or_else(|| {
+            ExecutorCostsError(format!("{CHAIN_FORMAT:?} has no resident form on {}", backend.as_str()))
+        })?;
+        let programs = ProgramSet::new(Sizes::of(backend), &measured_formats(backend), chain, largest)?;
+        let (routes, _) = Route::all(topology, executor)?;
+        let weights = programs
+            .expands
+            .iter()
+            .map(|&(format, features, _)| expand_weight_bytes(format, features))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (features, _) = programs.expand(chain);
+        let chain_set = expand_weight_bytes(chain, features)?
+            + chain
+                .canonical_byte_len(&[HIDDEN, features])
+                .map_err(|error| failed("dense_output weights")(&error))?
+            + AttendCase::operand(KvCodec::Dense, HISTORY_DEPTHS[0], 1)?.bytes()?;
+        let set = weights.into_iter().fold(chain_set, u64::max);
+        let rotation = CACHE_MULTIPLE * largest_cache(topology, executor) + 2 * set;
+        let store = |route: &Route| {
+            topology
+                .access_path(route.along[0])
+                .expect("a placement's paths belong to its topology")
+                .store()
         };
-        // A failure outside a point's timing, which leaves its figure
-        // derived, is the job's to report: it recurs at each of its walks.
-        match walk(topology, executor, &mut stored) {
-            Ok(walked) => Ok(StoredCosts::Complete {
-                costs: walked.costs,
-                records: stored.read,
-                pending: walked.pending,
-            }),
-            Err(Stop::Missing(key)) => Ok(StoredCosts::Missing(key)),
-            Err(Stop::Point(error) | Stop::Failed(error)) => Err(error),
-            Err(Stop::Expired) => unreachable!("timings from records alone have no deadline"),
-        }
+        // The other routes in device storage's store each hold a rotation.
+        let device = store(&routes.device);
+        let others = routes.others.iter().filter(|route| store(route) == device).count() as u64;
+        // The move point's records, apart from the backings.
+        let moved = match moves_records(backend)? {
+            true => 2 * MOVED_RECORDS * moved_record_bytes(chain)?,
+            false => 0,
+        };
+        Ok(rotation.max(rotation_room(topology, &routes.device)) + rotation * others + moved)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A formation that ends settles at once: a point that touches the host
+    /// waits for the formation to end, and a program it skipped past the
+    /// deadline expires for its waiter rather than failing.
+    #[test]
+    fn a_formation_settles_once_it_ends() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let programs = Programs {
+            expands: vec![(Element::bf16(), Pending::new(), Pending::new())],
+            output: Pending::new(),
+            dense: Pending::new(),
+            affine: Pending::new(),
+            copy: Pending::new(),
+            moves: Pending::new(),
+            finished: Pending::new(),
+            deadline,
+            host: false,
+        };
+        programs.end();
+        assert!(programs.settled().is_ok(), "a finished formation settles");
+        assert!(matches!(programs.kernel(&programs.moves), Err(Unformed::Expired)), "a skipped program expires");
+    }
+
+    /// A job's scratch is what it lays out in device storage: on a machine
+    /// whose upload route is host memory it is the device route's backing
+    /// alone (with the move point's records), not one backing a route.
+    #[test]
+    fn scratch_is_the_device_stores_backings() {
+        let topology = seismic::fixtures::recorded::rtx3090();
+        let executor =
+            topology.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Cuda).unwrap();
+        let (routes, _) = Route::all(&topology, executor).unwrap();
+        let room = rotation_room(&topology, &routes.device);
+        let scratch = ExecutorCosts::scratch(&topology, executor).unwrap();
+        assert!(!routes.others.is_empty(), "the 3090 has a host-backed route");
+        assert!(scratch >= room && scratch < 2 * room, "scratch {scratch}, the device route's room {room}");
+    }
 
     /// A depth is priced on the segment of the ladder it lies in, and one
     /// outside it on the nearest: a ladder whose time per token falls with
@@ -4099,21 +4636,21 @@ mod tests {
     #[test]
     fn the_plan_reads_every_step_after_the_probe_in_order() {
         let route = |storage| Route {
-            route: AccessRoute::Device,
+            route: crate::assessment::fixtures::kind(0),
             storage,
             passed: Vec::new(),
             along: Vec::new(),
         };
-        let (device, upload) = (route(StorageKind::Device), route(StorageKind::Upload));
+        let (device, upload) = (route(OperandStorage::Device), route(OperandStorage::Upload));
         let (bf16, f32) = (Element::bf16(), Element::f32());
-        let steps = plan(&[&device, &upload], &[bf16, f32]);
+        let steps = plan(&[&device, &upload], &[bf16, f32], true);
         let first = |layout| {
             [Rung::Pilot, Rung::Depth(0), Rung::Depth(1)].map(|rung| Step::Rung(layout, rung))
         };
         let deeper = |layout| (2..HISTORY_DEPTHS.len()).map(move |index| Step::Rung(layout, Rung::Depth(index)));
         let mut expected = vec![Step::Launch(GraphTiming::Device)];
         expected.extend(first(KvCodec::Dense));
-        expected.extend([Step::Chain, Step::Matrix(bf16)]);
+        expected.extend([Step::Chain, Step::Matrix(bf16), Step::Moves, Step::Releases]);
         expected.extend(first(KvCodec::AffineK8V4));
         expected.extend([
             Step::WeightRate(1, bf16, Pass::Rate),
@@ -4125,6 +4662,10 @@ mod tests {
         expected.extend(deeper(KvCodec::Dense).chain(deeper(KvCodec::AffineK8V4)));
         expected.push(Step::Matrix(f32));
         assert_eq!(steps, expected);
+        // A backend that moves no bank's records reads no moves, nor what
+        // their release costs.
+        expected.retain(|step| !matches!(step, Step::Moves | Step::Releases));
+        assert_eq!(plan(&[&device, &upload], &[bf16, f32], false), expected);
     }
 
     /// The composition ratio is the chain's time over its layers' calls as
@@ -4160,7 +4701,8 @@ mod tests {
             },
             layers,
         };
-        let ratio = read.composition(&programs, &costs).unwrap();
+        let costs = ExecutorCosts { chain: read.cost(&programs).unwrap(), ..costs };
+        let ratio = costs.composition().unwrap();
         assert!((ratio.value / 1.25 - 1.).abs() < 1e-12, "{}", ratio.value);
     }
 
@@ -4188,11 +4730,13 @@ mod tests {
         }
     }
 
-    /// The stored records give the probe until it is stored; then complete
-    /// costs, pending while every later point is not, each figure but the
-    /// probe priced. The probe recorded unobtainable gives no costs.
+    /// The stored records give the probe until it is stored, then each
+    /// other required figure's point (the launch graph's device time, the
+    /// composition chain, the step's two host times) until it is; then
+    /// complete costs, pending while every later point is not, each other
+    /// figure priced. The probe recorded unobtainable gives no costs.
     #[test]
-    fn stored_costs_complete_with_the_probe() {
+    fn stored_costs_complete_with_the_required_figures() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
         let topology = catalog.topology();
         let executor = topology
@@ -4207,33 +4751,28 @@ mod tests {
             samples: 8,
         });
         let stored = Held::default();
-        let StoredCosts::Missing(probe) =
-            ExecutorCosts::stored(&topology, &executor, &stored).unwrap()
-        else {
-            panic!("nothing is stored")
+        let mut missing = Vec::new();
+        let (costs, records, pending) = loop {
+            match ExecutorCosts::stored(&topology, &executor, &stored).unwrap() {
+                StoredCosts::Missing(key) => {
+                    assert!(missing.len() < 5, "a required point is missing again: {key:?}");
+                    stored.store(&key, &measured).unwrap();
+                    missing.push(key);
+                }
+                StoredCosts::Complete { costs, records, pending } => break (costs, records, pending),
+            }
         };
-        stored.store(&probe, &measured).unwrap();
-        let StoredCosts::Complete {
-            costs,
-            records,
-            pending,
-        } = ExecutorCosts::stored(&topology, &executor, &stored).unwrap()
-        else {
-            panic!("the probe is stored")
-        };
+        // The probe, the launch graph's device time, the chain and the
+        // step's two host times.
+        assert_eq!(missing.len(), 5, "{missing:?}");
+        let probe = missing[0].clone();
         assert!(pending, "the later points are still to be measured");
-        assert_eq!(records.len(), 1);
+        assert_eq!(records.len(), 5);
         assert!(costs.first.formats.is_empty());
-        assert!(costs
-            .routes
-            .iter()
-            .all(|route| route.activation.is_none() && route.formats.is_empty()));
+        assert!(costs.composition().unwrap().value > 0.);
         let derived = costs.derived(seismic::BackendName::Cpu);
         for figure in [
             Derived::ActivationMatrix,
-            Derived::Composition,
-            Derived::Launch,
-            Derived::Step,
             Derived::History(KvCodec::Dense),
             Derived::History(KvCodec::AffineK8V4),
         ] {
@@ -4296,11 +4835,58 @@ mod tests {
                 programs.affine.statics(backend),
                 programs.copy.statics(backend),
             ];
+            // The moves where the walk reads them.
+            if moves_records(backend).unwrap() {
+                statics.push(programs.moves.statics(backend));
+            }
             statics.extend(programs.expands.iter().map(|(_, _, expand)| expand.statics(backend)));
             for given in statics {
                 given.unwrap_or_else(|error| panic!("{backend:?}: {}", error.0));
             }
         }
+    }
+
+    /// On Metal, where `routed_move` has its native, the move point forms
+    /// and is timed beside the probe and the required figures, alone and
+    /// beside a release, the rest skipped, and the costs the records give carry the release's ratio.
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "the bank's moves are Metal's native")]
+    fn the_release_ratio_is_measured_where_the_bank_moves() {
+        let device = seismic::Devices::discover(&[])
+            .unwrap()
+            .open_backend(seismic::BackendName::Metal)
+            .unwrap();
+        let records = std::env::temp_dir().join(format!("moves-{}", std::process::id()));
+        let store = seismic::measure::JsonFileStore::new(&records);
+        let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
+        let moves = |key: &PointKey| key.point.get("records") == Some(&MOVED_RECORDS);
+        let (mut probe, mut moved) = (true, None);
+        super::super::requests::measure(
+            &mut measurer,
+            &device,
+            &store,
+            &[super::super::PointRequest::Costs],
+            std::time::Instant::now() + std::time::Duration::from_secs(20),
+            // The probe, the move points and the figures the costs require
+            // beside it (the launch graph's and the chain's, of `calls`).
+            &mut |key| match std::mem::take(&mut probe) || moves(key) || key.configuration.contains_key("calls") {
+                true => Attempt::Proceed,
+                false => Attempt::Skip(Reason::new("not this test's point".to_owned())),
+            },
+            &mut |key, outcome| {
+                if moves(&key) {
+                    moved = Some(format!("{outcome:?}"));
+                }
+            },
+        )
+        .unwrap();
+        assert!(moved.as_deref().is_some_and(|outcome| outcome.starts_with("Measured")), "{moved:?}");
+        let Ok(StoredCosts::Complete { costs, .. }) = ExecutorCosts::stored(device.topology(), device.info(), &store) else {
+            panic!("the probe and the required figures give the costs")
+        };
+        // The moves timed alone and while a reservation is released.
+        assert!(costs.release_step_ratio.is_some_and(|ratio| ratio.value > 0.), "{:?}", costs.release_step_ratio);
+        std::fs::remove_dir_all(records).unwrap();
     }
 
     /// A rotation spans four times the cache in at least two sets: a call

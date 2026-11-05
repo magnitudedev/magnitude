@@ -1,7 +1,7 @@
 use super::cases::DenseOutputTuning;
 use super::*;
 use crate::native::import::ImportKernels;
-use crate::planning::tests::{fixture_definition, fixture_manifest};
+use crate::planning::fixtures::{fixture_definition, fixture_manifest};
 use crate::{ComponentSelection, ModelLoadPlan};
 use magnitude_kernels::{dense_output, shape_rows};
 use seismic::TuningMethod;
@@ -227,7 +227,6 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
         backend: "fixture".into(),
         points: Vec::new(),
         requirement: steps(8.),
-        measurement_identity: "fixture-measurements".into(),
         observations: Vec::new(),
         served: vec![default, overall.clone()],
         reselection: None,
@@ -308,6 +307,8 @@ fn draft_readout_tuning_preserves_the_complete_artifact_vocabulary() {
             vision: false,
         },
         crate::resident_layout(crate::ExecutionPath::Native, BackendName::Metal),
+        crate::PlannedMethod::Plain,
+        crate::planning::fixtures::LIMITS,
     )
     .unwrap();
     let inputs = ModelInputs {
@@ -396,7 +397,8 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
-    let mut spec = crate::native::specialization::Specializer::count_untuned(&device);
+    let mut spec =
+        crate::native::specialization::Specializer::count_untuned(&device, Default::default());
     for (element, bindings) in [
         (seismic::Element::bf16(), "A=bf16"),
         (seismic::Element::u32(), "A=u32"),
@@ -691,11 +693,96 @@ fn rotations_take_distinct_layers_spread_over_depth() {
     assert_eq!(TuningInputs::rotation_scopes(&few, &rows(1)), few);
 }
 
+/// The host's Metal device, where it has one: an available Metal executor
+/// opens, or the test fails.
 fn metal() -> Option<Device> {
-    seismic::Devices::discover(&[])
-        .ok()?
-        .open_backend(BackendName::Metal)
-        .ok()
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    crate::test_support::available(&catalog, BackendName::Metal)
+        .then(|| catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens"))
+}
+
+/// A dependant (a streamed layer's route of its resident route) is a unit
+/// of the search's own count, fixed at its prerequisite's arithmetic as the
+/// choice stands and free in the rest, so the mandatory phase forms it and
+/// no load forms it alone. A search that promotes other arithmetic leaves
+/// it stale; the next round counts it at the promoted values and forms it
+/// there, and forms nothing an earlier round decided.
+#[test]
+fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
+    let Some(device) = metal() else {
+        return;
+    };
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let context = TuningContext {
+        definition: &definition,
+        weights: &ZeroTuningWeights,
+        observer: &UnreportedTuning,
+        cache: None,
+        numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+        settings: TuningSettings::STANDARD,
+    };
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = [("H", 8), ("F", 16), ("DS", 0), ("DB", 0)]
+        .into_iter()
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(name, value)
+        });
+    // The prerequisite's search promotes another BATCH_FROM (arithmetic);
+    // TALL (not arithmetic) is the dependant's own to search.
+    let mut prerequisite = FakeCase::new(&implementation, &statics, "prerequisite");
+    prerequisite.chosen.params.insert("BATCH_FROM".into(), 3);
+    let mut dependant = FakeCase::new(&implementation, &statics, "dependant");
+    dependant.bindings = "dependant".into();
+    let mut invocations = fixture_invocations(&prerequisite, &statics, limits);
+    fixture_add(&mut invocations, &dependant, &statics, limits);
+    let key = unit_key("dense_output", prerequisite.bindings(), &statics);
+    let mut tuner = Tuner::count(
+        &device,
+        context,
+        limits,
+        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        invocations,
+    );
+    let walk = |tuner: &mut Tuner<'_>| {
+        tuner.tune(&prerequisite, &implementation, &statics).unwrap();
+        let fixed = tuner
+            .following(&key, &implementation, statics.clone())
+            .unwrap();
+        tuner.tune(&dependant, &implementation, &fixed).unwrap();
+        fixed
+    };
+    let counted = walk(&mut tuner);
+    assert_eq!(counted.param("BATCH_FROM"), Some(5));
+    assert_eq!(counted.param("TALL"), None);
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    assert_eq!(
+        (prerequisite.formations.get(), dependant.formations.get()),
+        (1, 1)
+    );
+    walk(&mut tuner);
+    let tuner = tuner.search().unwrap();
+    assert!(tuner.stale());
+    let mut tuner = tuner.recount();
+    let recounted = walk(&mut tuner);
+    assert_eq!(recounted.param("BATCH_FROM"), Some(3));
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    assert_eq!(
+        (prerequisite.formations.get(), dependant.formations.get()),
+        (1, 2)
+    );
+    walk(&mut tuner);
+    let tuner = tuner.search().unwrap();
+    assert!(!tuner.stale());
 }
 
 fn fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {
@@ -709,6 +796,8 @@ fn fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan
             vision: false,
         },
         crate::resident_layout(crate::ExecutionPath::Native, seismic::BackendName::Metal),
+        crate::PlannedMethod::Plain,
+        crate::planning::fixtures::LIMITS,
     )
     .unwrap();
     (definition, load)
@@ -1059,7 +1148,6 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
                 })
                 .collect(),
             requirement: steps(self.alpha),
-            measurement_identity: "synthetic-allocator-fixture".into(),
             observations,
             served: std::iter::once(self.case.defaults.clone())
                 .chain(self.promoted.then(|| self.case.chosen.clone()))
@@ -1441,7 +1529,7 @@ fn profile_what_compiles_on_workers_add_to_the_process_footprint() {
         DW: Element::bf16(),
         A: Element::bf16(),
     };
-    let footprint = || super::process_footprint_bytes().expect("macOS reports a footprint");
+    let footprint = || seismic::ProcessMemory::footprint_now().expect("macOS reports a footprint");
     let mib = |bytes: i64| bytes as f64 / (1 << 20) as f64;
     // What stays once a compile's kernel is released follows the compiles:
     // the first half of the specializations, compiled and released one at
@@ -1656,6 +1744,9 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
         fn key(&self) -> String {
             "unused".into()
         }
+        fn pin_identity(&self) -> String {
+            self.key()
+        }
         fn label(&self) -> &'static str {
             "test_recipe"
         }
@@ -1759,7 +1850,6 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
 /// A pinned unit's choice is final at the count, so a composed recipe that
 /// depends on it resolves its prerequisite on an empty cache: a defaults
 /// load censuses the recipe and qualifies it against the unit's default.
-#[cfg(feature = "pinned-tuning")]
 #[test]
 fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
     struct Recipe {
@@ -1786,6 +1876,9 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
         }
         fn key(&self) -> String {
             "pinned-prerequisite".into()
+        }
+        fn pin_identity(&self) -> String {
+            self.key()
         }
         fn label(&self) -> &'static str {
             "test_recipe"
@@ -1845,7 +1938,7 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
     let dependency: TuningKey = (
         <dense_output::Entry as seismic::Entry>::NAME,
         case.bindings(),
-        statics.statics().clone(),
+        FixedValues::of(&statics),
     );
     let mut invocations = fixture_invocations(&case, &statics, LIMITS);
     invocations.units.insert(
@@ -2787,15 +2880,15 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
     );
     // The count walk forms nothing. Entering census first forms all canonical
     // artifacts inside the clock, without importing weights.
-    let formed = device.programs_formed();
+    let formed = device.programs_formed().programs;
     tuner.tune(&case, &implementation, &statics).unwrap();
-    assert_eq!(device.programs_formed(), formed);
+    assert_eq!(device.programs_formed().programs, formed);
     // The mandatory phase forms the canonical artifact without inputs; the
     // unit's discovery builds them, its weights among them. A weight that
     // cannot be imported is a defect, not a matter of time: it is a typed
     // failure of the load.
     let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
-    assert!(device.programs_formed() > formed);
+    assert!(device.programs_formed().programs > formed);
     tuner.tune(&case, &implementation, &statics).unwrap();
     assert!(matches!(
         tuner.search(),
@@ -2826,16 +2919,16 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
         invocations,
     );
-    let formed = device.programs_formed();
+    let formed = device.programs_formed().programs;
     tuner.tune(&case, &implementation, &statics).unwrap();
-    assert_eq!(device.programs_formed(), formed);
+    assert_eq!(device.programs_formed().programs, formed);
     assert!(tuner.tuned.is_empty());
     let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
-    let formed = device.programs_formed();
+    let formed = device.programs_formed().programs;
     tuner.tune(&case, &implementation, &statics).unwrap();
     tuner.tune(&case, &implementation, &statics).unwrap();
     assert_eq!(
-        device.programs_formed(),
+        device.programs_formed().programs,
         formed,
         "terminal selection forms nothing"
     );
@@ -3225,7 +3318,6 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         backend: "metal".into(),
         points: Vec::new(),
         requirement: context.numerical_profile.requirement(&case.entry()),
-        measurement_identity: String::new(),
         observations: Vec::new(),
         served: vec![configuration(&defaults)],
         reselection: None,
@@ -3625,4 +3717,163 @@ fn cpu_projection_default_form_follows_the_tier_integer_dots() {
     // exactly when they share the default.
     let digest = |case: &DenseOutputTuning| case.digest(&device, &statics).unwrap();
     assert_eq!(digest(&packed[0]) != digest(&dense), vector);
+}
+
+/// A search of a streamed load forms and runs every streamed tuning case
+/// on the device, its all-defaults configuration included, over operands
+/// bound as a step binds them: the fused route (`routed_route_streamed`)
+/// at every lead, and the general selection (`routed_select_streamed`), of
+/// loads whose record's gate and up stage in the same stored form. Its
+/// three streamed layers route at a lead each (a route predicts only the
+/// layers that exist, `ExpertBankPlan::hints`), the second's experts' down
+/// stored in a form of its own, so its binding holds its lead alone: a lead
+/// none of a binding's layers launches builds no case.
+/// A case whose operands alias where the kernel forbids it fails here, and
+/// so does one whose launch condition's word a timed pass's cold copies
+/// (CUDA's) do not keep where the host reads it. It runs on the device the
+/// host has.
+#[test]
+fn a_streamed_load_searches_every_streamed_case_on_the_device() {
+    use crate::planning::fixtures::{relaid_manifest, streamed_experts_manifest};
+    use magnitude_family_contracts::{Operator, ScoreFunction};
+    use std::collections::BTreeSet;
+    /// Each finished unit's entry and lead (`AHEAD`).
+    struct Finished(RefCell<Vec<(&'static str, Option<u64>)>>);
+    impl TuningObserver for Finished {
+        fn event(&self, event: &TuningEvent) {
+            if let TuningEvent::Finished(tuned) = event {
+                self.0.borrow_mut().push((tuned.entry, tuned.statics.get("AHEAD").copied()));
+            }
+        }
+    }
+    // Its search qualifies the bank's entries, a CPU site's among them,
+    // sized from the CPUs the process may run on.
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).unwrap();
+    let selected = crate::platform::select_device(
+        &catalog,
+        crate::ExecutionPath::Native,
+        crate::platform::DeviceRequest::Automatic,
+        &crate::platform::MemoryReserves::standard(),
+    )
+    .unwrap();
+    let device = catalog.open(catalog.resolve(selected.info.selector()).unwrap()).unwrap();
+    // The planning fixture (an attention block, which every backend runs)
+    // three times, the later ones its first's mixer (tied), each with its
+    // feed-forward routed over experts of its own: by a softmax score
+    // beside a gated shared expert in the fused form, by a sigmoid score
+    // and no shared expert in the general form. Every lead is a unit.
+    let routed = |experts: u64, score, shared: bool| {
+        use crate::planning::fixtures::{descriptor, fixture_definition};
+        use magnitude_family_contracts::{
+            ActivationFunction, ExpertSelection, FeedForwardUp, RouteNormalization, RoutedFfn, Router,
+            RouterInput, SharedExpert, SharedExpertGate,
+        };
+        let (features, hidden) = (128, 128);
+        let silu = |gate: &str, up: &str, extents: &[u64]| FeedForwardUp::Gated {
+            activation: ActivationFunction::Silu,
+            gate: descriptor(gate, extents),
+            up: descriptor(up, extents),
+        };
+        let ffn = |block: u64| {
+            let name = |part: &str| format!("blk.{block}.{part}");
+            Operator::RoutedFfn(Box::new(RoutedFfn {
+                experts,
+                selected: 2,
+                intermediate: features,
+                router: Router {
+                    weight: descriptor(&name("ffn_gate_inp"), &[experts, hidden]),
+                    input: RouterInput::Operator,
+                    score,
+                    selection: ExpertSelection::TopK { bias: None },
+                    normalization: RouteNormalization::Sum,
+                    scale: 1.0,
+                },
+                expert_up: silu(&name("ffn_gate_exps"), &name("ffn_up_exps"), &[experts, features, hidden]),
+                expert_down: descriptor(&name("ffn_down_exps"), &[experts, hidden, features]),
+                expert_scale: None,
+                latent: None,
+                shared: shared.then(|| SharedExpert {
+                    intermediate: features,
+                    up: silu(&name("ffn_gate_shexp"), &name("ffn_up_shexp"), &[features, hidden]),
+                    down: descriptor(&name("ffn_down_shexp"), &[hidden, features]),
+                    gate: SharedExpertGate::Sigmoid(descriptor(&name("ffn_gate_inp_shexp"), &[hidden])),
+                }),
+            }))
+        };
+        let mut definition = fixture_definition();
+        let blocks = &mut definition.decoder.blocks;
+        blocks.extend([blocks[0].clone(), blocks[0].clone()]);
+        for (block, layer) in blocks.iter_mut().enumerate() {
+            layer.sublayers[1].op = ffn(block as u64);
+        }
+        definition
+    };
+    // Metal's fused route routes over a multiple of 32 experts.
+    let forms = [
+        ("routed_route_streamed", routed(32, ScoreFunction::Softmax, true)),
+        ("routed_select_streamed", routed(8, ScoreFunction::Sigmoid, false)),
+    ];
+    for (streamed, definition) in forms {
+        // The second layer's down as Q4_0 blocks: a binding of its own.
+        let manifest = relaid_manifest(
+            streamed_experts_manifest(&definition),
+            &["blk.1.ffn_down_exps".to_owned()],
+            magnitude_artifacts::gguf::Encoding::Q4_0,
+            18,
+        );
+        let draft = crate::ExecutionPlanner::prepare(
+            &selected,
+            &manifest,
+            &definition,
+            crate::ComponentSelection { head: false, vision: false },
+            crate::ExecutionPath::Native,
+            crate::PlannedMethod::Plain,
+            magnitude_state::KvCodec::Dense,
+            crate::ResourceLimits {
+                max_launch_rows: 2,
+                max_launch_slots: 2,
+                max_selected_rows: 2,
+                max_drafting_slots: 2,
+                exported_logits_rows: 0,
+                max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+                max_image_cells: 0,
+                lookahead: false,
+                chain_capacity: std::num::NonZeroUsize::MIN,
+                conversations: std::num::NonZeroUsize::MIN,
+            },
+        )
+        .unwrap()
+        .with_bank(&definition, None, None)
+        .unwrap();
+        assert!(draft.load().expert_bank().is_some(), "{streamed}: the load streams its experts");
+        let observer = Finished(RefCell::new(Vec::new()));
+        crate::AttestedPrograms::search_draft(
+            &draft,
+            &device,
+            crate::TuningContext {
+                definition: &definition,
+                weights: &crate::ZeroTuningWeights,
+                observer: &observer,
+                cache: None,
+                numerical_profile: crate::ResolvedNumericalProfile::standard(),
+                settings: crate::TuningSettings {
+                    budget: Duration::from_secs(20),
+                    fresh: true,
+                },
+            },
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{streamed}: {error}"));
+        // Every lead's unit is searched; a round that recounts a follower
+        // at its resident unit's replaced choice searches it again.
+        let finished = observer.0.borrow();
+        let leads = finished
+            .iter()
+            .filter(|(entry, _)| *entry == streamed)
+            .map(|&(_, ahead)| ahead)
+            .collect::<BTreeSet<_>>();
+        let every = (0..crate::native::LEADS as u64).map(Some).collect::<BTreeSet<_>>();
+        assert_eq!(leads, every, "{streamed}: every lead's unit is searched: {finished:?}");
+    }
 }

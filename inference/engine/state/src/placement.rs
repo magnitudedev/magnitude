@@ -57,6 +57,15 @@ impl Placement {
         self.resources.get(&id).copied()
     }
 
+    /// Retire a live logical claim. Removing an entry cannot introduce an
+    /// invalid slot or alias, and changes the published generation once.
+    pub(crate) fn release(&mut self, id: LogicalId) -> Result<(), PlacementError> {
+        let generation = self.next_generation()?;
+        self.resources.remove(&id).expect("released claim has a placement");
+        self.generation = generation;
+        Ok(())
+    }
+
     pub fn with_resources(
         &self,
         resources: BTreeMap<LogicalId, usize>,
@@ -132,5 +141,20 @@ mod tests {
             changed.with_capacity(3).unwrap().generation(),
             Generation(5)
         );
+    }
+
+    #[test]
+    fn releasing_a_claim_preserves_slots_and_is_atomic_on_generation_exhaustion() {
+        let mut placement = Placement::new(Generation(3), 4,
+            BTreeMap::from([(LogicalId(0), 0), (LogicalId(1), 3)])).unwrap();
+        placement.release(LogicalId(1)).unwrap();
+        assert_eq!(placement.generation(), Generation(4));
+        assert_eq!(placement.resolve(LogicalId(0)), Some(0));
+        assert_eq!(placement.resolve(LogicalId(1)), None);
+        let mut exhausted = Placement::new(Generation(u64::MAX), 4,
+            BTreeMap::from([(LogicalId(0), 0), (LogicalId(1), 3)])).unwrap();
+        let before = exhausted.clone();
+        assert_eq!(exhausted.release(LogicalId(1)), Err(PlacementError::GenerationExhausted));
+        assert_eq!(exhausted, before);
     }
 }

@@ -69,6 +69,11 @@ pub(crate) struct AttestedTargetBlock {
     pub streams: Option<StreamsKernels>,
     /// The n-gram input's entries, when the block has one.
     pub ngram: Option<NGramKernels>,
+    /// The bank entries of a routed feed-forward whose experts stream.
+    pub bank: Option<super::ExpertBankKernels>,
+    /// Why its bank's entries' CPU site was refused at qualification, where
+    /// it was (the site is then gone).
+    pub site_refused: Option<String>,
 }
 
 /// The factor a sublayer's post-norm row op scales its result by: 1, or the
@@ -336,9 +341,19 @@ where
 }
 
 impl AttestedPrograms {
-    /// Graphs the programs' device has recorded for submissions so far.
-    pub(crate) fn recorded_graphs(&self) -> u64 {
-        self.owner.device().recorded_graphs()
+    /// What the graphs of the programs' graph families cost serving so far
+    /// (`seismic::NativeGraphFamily::graph_replays`): this load's of what
+    /// its device counts.
+    pub(crate) fn graph_replays(&self) -> seismic::GraphReplays {
+        let readouts = self.target_readout_graphs.iter().flat_map(|graphs| [graphs.family(), graphs.chunk_family()]);
+        self.target_graphs
+            .iter()
+            .map(|graphs| graphs.family())
+            .chain(readouts)
+            .chain(self.drafter_graphs.iter().map(|graphs| graphs.family()))
+            .chain(self.vision_graphs.iter().map(|graphs| graphs.family()))
+            .chain(self.state_graphs.iter().map(|graphs| graphs.family()))
+            .fold(seismic::GraphReplays::default(), |counts, family| counts.plus(family.graph_replays()))
     }
 
     pub fn readout_choices(&self) -> &[crate::ReadoutClassChoice] {
@@ -574,6 +589,71 @@ impl AttestedPrograms {
 
     pub fn target_graphs(&self) -> Option<&crate::PreparedTargetGraphs> {
         self.target_graphs.as_deref()
+    }
+
+    /// Each bank group's record moves (`DevicePlacement::moves`), its
+    /// first layer's bank entries': every layer of a group shares its
+    /// binding. None where the host places: its shrinks move nothing on the
+    /// device.
+    pub(crate) fn expert_bank_moves(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<super::BankMoves>, String> {
+        if plan.placer() == crate::planning::Placer::Bank {
+            return Ok(Vec::new());
+        }
+        plan.groups
+            .iter()
+            .map(|group| {
+                let layer = &plan.layers[group.layers[0]];
+                let (scope, index) = (layer.scope, layer.sublayer());
+                self.target
+                    .blocks
+                    .get(index.block as usize)
+                    .and_then(|block| block.bank.as_ref())
+                    .and_then(|bank| bank.placement.as_ref())
+                    .map(|placement| placement.moves.clone())
+                    .ok_or_else(|| format!("{scope:?} has no bank entries"))
+            })
+            .collect()
+    }
+
+    /// Each streamed layer's CPU site as its qualification left it
+    /// ([`Self::expert_bank_sites`], and the refusals it kept): the layers
+    /// the plan charges a site's words and buffers for, and those whose
+    /// arithmetic was refused (`ExecutionPlanDraft::finalize_sites`).
+    pub fn sited_layers(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<crate::planning::LayerSite>, String> {
+        use crate::planning::LayerSite;
+        let sites = self.expert_bank_sites(plan)?;
+        plan.layers
+            .iter()
+            .zip(sites)
+            .map(|(layer, site)| {
+                Ok(match (site, &self.target.blocks[layer.sublayer().block as usize].site_refused) {
+                    (Some(site), _) => match site.admitted {
+                        Some(_) => LayerSite::Served,
+                        None => LayerSite::Pending,
+                    },
+                    (None, Some(reason)) => LayerSite::Refused(reason.clone()),
+                    (None, None) => LayerSite::Unserved,
+                })
+            })
+            .collect()
+    }
+
+    /// Each streamed layer's CPU site, where its bank entries serve one
+    /// (`ExpertBankKernels::site`: its form and its admission),
+    /// else none.
+    pub(crate) fn expert_bank_sites(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<Option<super::BankSite>>, String> {
+        plan.layers
+            .iter()
+            .map(|layer| {
+                let (scope, index) = (layer.scope, layer.sublayer());
+                self.target
+                    .blocks
+                    .get(index.block as usize)
+                    .and_then(|block| block.bank.as_ref())
+                    .map(|bank| bank.site.clone())
+                    .ok_or_else(|| format!("{scope:?} has no bank entries"))
+            })
+            .collect()
     }
 
     pub fn prepare_target_graphs(
@@ -918,6 +998,19 @@ impl AttestedPrograms {
                             .ok_or_else(|| missing("ngram_inject", binding))
                     })
                     .transpose()?;
+                // Only the target's routed layers stream: a draft head reading
+                // the target's history runs blocks of its own, held whole.
+                let bank = block
+                    .bank()
+                    .map(|(slot, bank)| {
+                        prepared
+                            .target
+                            .banks
+                            .get(&(slot, bank))
+                            .cloned()
+                            .ok_or_else(|| missing("routed_bank", bank))
+                    })
+                    .transpose()?;
                 blocks.push(AttestedTargetBlock {
                     mixer,
                     feed_forward,
@@ -925,6 +1018,8 @@ impl AttestedPrograms {
                     per_layer,
                     streams,
                     ngram,
+                    bank,
+                    site_refused: None,
                 });
             }
             Ok(blocks)
@@ -1262,7 +1357,7 @@ impl AttestedPrograms {
                 .ok_or_else(|| missing("weight_import", binding))?;
             imports.push((binding, handle));
         }
-        let attested = Self {
+        let mut attested = Self {
             backend: device.backend(),
             readout_choices: prepared.readout_choices.clone(),
             tuned,
@@ -1283,14 +1378,36 @@ impl AttestedPrograms {
             vision_graphs: None,
             state_graphs: None,
         };
-        QualificationView::new(
+        let admitted = QualificationView::new(
             &attested,
             topology,
             &definition.decoder,
             definition.vision.as_ref(),
             load,
+            tuning.numerical_profile,
+            tuning.cache,
         )
         .qualify(device)?;
+        // A layer whose site's arithmetic the precision system refuses
+        // has no CPU site: nothing of it is served, encoded or charged, and
+        // its refusal is kept (`LayerSite::Refused`). One whose verdict the
+        // job has not stored keeps its site unadmitted.
+        for (block, admission) in admitted {
+            let block = &mut attested.target.blocks[block];
+            if let Some(bank) = block.bank.as_mut() {
+                match admission {
+                    crate::assessment::Priced::Measured(()) => {
+                        let admitted = Some(super::SiteAdmission);
+                        bank.site = bank.site.take().map(|site| super::BankSite { admitted, ..site });
+                    }
+                    crate::assessment::Priced::Pending(_) => {}
+                    crate::assessment::Priced::Unavailable(reason) => {
+                        bank.site = None;
+                        block.site_refused = Some(reason);
+                    }
+                }
+            }
+        }
         Ok(attested)
     }
 

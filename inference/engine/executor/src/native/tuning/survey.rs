@@ -14,7 +14,7 @@
 //! quality at the evaluations the survey's load would have allowed its
 //! search, the configurations needed, and the per-point gap of one
 //! configuration for all points (`replay.md` beside a harness survey's
-//! records, which `mrig kernel` reports).
+//! records).
 //!
 //! On a shared host the whole surveying process must run under the host's
 //! GPU lock: its model load, the tuning of entries it does not survey and
@@ -83,8 +83,9 @@ pub(super) fn record(
     let survey = guard
         .as_ref()
         .expect("a survey result implies an installed survey");
-    let (entry, bindings, statics) = key;
-    let instance = crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{statics:?}"));
+    let (entry, bindings, fixed) = key;
+    let statics = &fixed.statics;
+    let instance = crate::kernel_cache::TuningCacheKey::of(&format!("{bindings}{fixed:?}"));
     let path = survey
         .directory
         .join(format!("{entry}-{}.json", &instance.as_str()[..12]));
@@ -92,6 +93,7 @@ pub(super) fn record(
         "entry": entry,
         "bindings": bindings,
         "statics": statics,
+        "fixed": fixed.params,
         "allowance_seconds": allowance.as_secs_f64(),
         "result": result,
     });

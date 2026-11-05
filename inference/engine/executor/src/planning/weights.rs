@@ -3,6 +3,7 @@ use super::{
     ProgramPlan,
 };
 use crate::error::PlanError;
+use crate::memory::ClaimDemand;
 use crate::streamed_table::STREAMED_TABLE_ROWS;
 use crate::{ExecutionPath, operators};
 use magnitude_artifacts::{
@@ -41,10 +42,25 @@ pub struct WeightPlan {
     /// The extent of the weight's resident packing bound (`packing_bound`):
     /// one F32 value per run of its columns, or 0 without one.
     pub bound: u64,
-    /// A gathered table that is streamed (`device_table`): `shape` is then
-    /// its slots', which hold only some of the table's rows. `None` for a
-    /// weight held whole.
-    pub streamed: Option<StreamedRows>,
+    /// How the load holds the weight's values.
+    pub holding: Holding,
+}
+
+/// How a load holds a planned weight's values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holding {
+    /// Every value, imported at load.
+    Whole,
+    /// A gathered table streamed by rows (`device_table`, `stored_table`):
+    /// `shape` is its slots', which hold only some of the table's rows.
+    Streamed(StreamedRows),
+    /// A routed expert stack streamed through the load's expert bank
+    /// (`ExpertBankPlan`), bank group `group`: `shape` is the group's
+    /// `[records, N, K]`, which every member layer's entries address, and
+    /// `resident_bytes` charges the layer's own records. Its values are the
+    /// bank's (empty, or imported whole into its records when it holds
+    /// every expert), and it holds its `scale` per expert.
+    Banked { group: usize },
 }
 
 /// The rows of a streamed gathered table.
@@ -60,13 +76,35 @@ pub struct StreamedRows {
     /// rows the device selects finds each row it names that the other slots
     /// do not hold, landed by the host as stored (`landing_bytes`) and
     /// converted ahead of the read. The most rows one such read of the load
-    /// names (`ModelLoadPlan::with_selected_reads`); 0 of a load without
+    /// names (`selected_read_rows`); 0 of a load without
     /// one, and of a stored table, whose filler writes every row a read
     /// names into its slots.
     pub landing_rows: u64,
     /// How readers find a row's slot.
     pub directory: DirectoryForm,
     pub fill: TableFill,
+}
+
+/// The launches a streamed table's stagings serve: the lanes whose launches
+/// may name its rows, at the load's depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableFlights {
+    pub flights: super::FlightDepth,
+    pub lanes: usize,
+}
+
+impl TableFlights {
+    /// A launch brings a table's absent tiles at most twice: as the host
+    /// builds it (`ResidentTable::indices`), and as the host observes its
+    /// completion, landing its selected read's tiles in slots of their own
+    /// (`SubmittedRead::complete`).
+    pub const BRINGS: usize = 2;
+
+    /// The stagings a held class of `places` places has in flight
+    /// ([`super::FlightDepth::capacity`]).
+    pub fn stagings(self, places: usize) -> usize {
+        self.flights.capacity(places, self.lanes, Self::BRINGS)
+    }
 }
 
 /// How the readers of a streamed table find a row's slot (`gathered_row`):
@@ -115,8 +153,9 @@ impl DirectoryForm {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableFill {
     /// In the table's resident representation, converted by the weight's
-    /// import entry from staging, queued ahead of the step that names them.
-    Imported,
+    /// import entry from staging, queued ahead of the step that names them;
+    /// the stagings serve the load's flights (`TableFlights`).
+    Imported(TableFlights),
     /// In the table's resident representation, read from the artifact as
     /// stored and converted row by row by the host (the CPU backend's
     /// registered row conversion), which writes them into slots the device
@@ -126,6 +165,23 @@ pub enum TableFill {
 }
 
 impl WeightPlan {
+    /// The rows of a gathered table that is streamed; `None` for a weight
+    /// held otherwise.
+    pub fn streamed(&self) -> Option<StreamedRows> {
+        match self.holding {
+            Holding::Streamed(streamed) => Some(streamed),
+            Holding::Whole | Holding::Banked { .. } => None,
+        }
+    }
+
+    /// The bank group of a routed expert stack the load streams.
+    pub fn banked(&self) -> Option<usize> {
+        match self.holding {
+            Holding::Banked { group } => Some(group),
+            Holding::Whole | Holding::Streamed(_) => None,
+        }
+    }
+
     /// Whether the importer uploads host-prepared bytes (transformed or
     /// dequantized) rather than the stored range as is. A second-level
     /// scale leaves the weight's bytes as stored.
@@ -148,7 +204,7 @@ impl WeightPlan {
     /// (`TableFill::Stored`): it takes no import entry.
     pub fn stored_in_slots(&self) -> bool {
         matches!(
-            self.streamed,
+            self.streamed(),
             Some(StreamedRows {
                 fill: TableFill::Stored,
                 ..
@@ -161,9 +217,9 @@ impl WeightPlan {
     /// not (`StreamedRows::landing_rows`).
     pub fn lands_selected_rows(&self) -> bool {
         matches!(
-            self.streamed,
+            self.streamed(),
             Some(StreamedRows {
-                fill: TableFill::Imported,
+                fill: TableFill::Imported(_),
                 landing_rows: 1..,
                 ..
             })
@@ -176,27 +232,44 @@ impl WeightPlan {
     }
 
     /// The shape of the stored tensor this weight is made of: `shape`, with
-    /// a streamed table's rows in place of its slots.
+    /// a streamed table's rows in place of its slots, and a banked stack's
+    /// experts in place of its group's records.
     pub fn stored_shape(&self) -> Vec<u64> {
-        let mut shape = self.shape.clone();
-        if let Some(streamed) = self.streamed {
-            shape[0] = streamed.table_rows;
+        match self.holding {
+            Holding::Whole => self.shape.clone(),
+            Holding::Streamed(streamed) => self.table_rows_shape(streamed.table_rows),
+            Holding::Banked { .. } => self.descriptor.shape.clone(),
         }
-        shape
     }
 
     /// The shape `[R, F]` of a streamed table's device directory
     /// (`DirectoryForm`); `[0, 1]`, the empty directory, of a weight held
     /// whole.
     pub fn directory_shape(&self) -> [u64; 2] {
-        self.streamed.map_or([0, 1], |streamed| {
+        self.streamed().map_or([0, 1], |streamed| {
             [
                 streamed
                     .directory
-                    .entries(streamed.table_rows, self.shape[0]),
+                    .entries(streamed.table_rows, self.table_slots()),
                 streamed.directory.fields(),
             ]
         })
+    }
+
+    /// A streamed table's slots: the rows of `shape` (a stored table's
+    /// records of rows, `[records, rows, width]`).
+    pub fn table_slots(&self) -> u64 {
+        self.shape[..self.shape.len() - 1].iter().product()
+    }
+
+    /// The width of a streamed table's rows.
+    pub fn table_width(&self) -> u64 {
+        self.shape[self.shape.len() - 1]
+    }
+
+    /// `rows` rows of a streamed table, `[rows, width]`.
+    fn table_rows_shape(&self, rows: u64) -> Vec<u64> {
+        vec![rows, self.table_width()]
     }
 
     /// The allocations a streamed table holds beside its slots: the
@@ -205,17 +278,19 @@ impl WeightPlan {
     /// selected read's step copies its `[rows, 2]` selection into. Zeros for
     /// a weight held whole.
     pub fn streamed_bytes(&self) -> Result<[u64; 4], String> {
-        let Some(streamed) = self.streamed else {
+        let Some(streamed) = self.streamed() else {
             return Ok([0; 4]);
         };
-        let rows = |rows| {
-            let mut shape = self.shape.clone();
-            shape[0] = rows;
-            shape
+        let rows = |rows| self.table_rows_shape(rows);
+        let stagings = match streamed.fill {
+            TableFill::Imported(flights) => flights.stagings(1) as u64,
+            TableFill::Stored => 0,
         };
         Ok([
             representation_bytes(Element::i32(), &self.directory_shape())?,
-            representation_bytes(self.upload, &rows(streamed.staging_rows))?,
+            representation_bytes(self.upload, &rows(streamed.staging_rows))?
+                .checked_mul(stagings)
+                .ok_or("a streamed table's stagings overflow")?,
             representation_bytes(self.upload, &rows(streamed.landing_rows))?,
             representation_bytes(Element::i32(), &[streamed.landing_rows, 2])?,
         ])
@@ -232,6 +307,31 @@ impl WeightPlan {
             .chain(self.streamed_bytes()?)
             .try_fold(self.resident_bytes, u64::checked_add)
             .ok_or_else(overflow)
+    }
+
+    /// The entries of the record table the weight's storage holds where its
+    /// import entry writes it through a record port
+    /// (`ModelLoadPlan::with_record_ports`): a weight imported whole binds
+    /// its import view's matrices (`native_import::import_view`), and a
+    /// streamed imported table's slots hold the table of their tiles, into
+    /// which every run and landed read binds (`DeviceTable::new`); a stored
+    /// table's slots, which `stored_rows` reads through a record port, hold
+    /// the table of their records (`StoredTable::new`). None of a weight no
+    /// entry imports: a banked stack (its records are the bank's) and a
+    /// plane the host places.
+    pub fn record_table_entries(&self) -> Result<u64, String> {
+        match self.holding {
+            Holding::Banked { .. } => Ok(0),
+            Holding::Streamed(StreamedRows {
+                fill: TableFill::Stored,
+                ..
+            }) => Ok(self.shape[0]),
+            Holding::Streamed(_) => Ok(self.shape[0] / self.resident.tile_rows()),
+            Holding::Whole if self.placed_on_host() => Ok(0),
+            Holding::Whole => crate::programs::native_import::import_view(&self.shape)
+                .map(|[matrices, ..]| matrices)
+                .map_err(|error| error.to_string()),
+        }
     }
 
     /// The extent of the weight's accumulator-scale port: 0 without a
@@ -758,6 +858,15 @@ pub struct ModelLoadPlan {
     /// them stand and their demand is derived, and not placed. A weight has
     /// one stored form.
     pub(super) unplaced_output: Vec<WeightPlan>,
+    /// The expert bank of a load that streams its routed experts
+    /// (`with_expert_bank`): the target's expert stacks are `Banked`.
+    pub(super) bank: Option<super::ExpertBankPlan>,
+    /// The backend whose native import entries write the weights through
+    /// record ports (`with_record_ports`), which on a backend that binds
+    /// record tables leaves each imported weight's storage holding one
+    /// (`WeightPlan::record_table_entries`); none of a load no native
+    /// entry imports.
+    pub(super) record_ports: Option<seismic::BackendName>,
 }
 
 /// Whether a readout scope's weights are planned with the head component's.
@@ -790,19 +899,58 @@ impl ModelLoadPlan {
         })
     }
 
-    /// The host-shared bytes of the target's stored tables
-    /// (`TableFill::Stored`): their slots and directories, part of the
-    /// target's weights, and upload storage, held where the executor's upload
-    /// placement lands.
-    pub fn shared_table_bytes(&self) -> Result<u64, String> {
-        self.target
-            .iter()
-            .filter(|weight| weight.stored_in_slots())
-            .try_fold(0u64, |total, weight| {
+    /// Physical weight demand by component, with tied storage owned by its
+    /// first component, exactly as the resident byte total.
+    pub fn weight_demands(&self) -> Result<[ClaimDemand; 3], String> {
+        weight_demands_by_component(self)
+    }
+
+    /// The expert bank of a load that streams its routed experts.
+    pub fn expert_bank(&self) -> Option<&super::ExpertBankPlan> {
+        self.bank.as_ref()
+    }
+
+    /// Every weight byte the load holds beside its host tier: each
+    /// component's, and the expert bank's (what a weight cap bounds). The
+    /// host tier's records are the host's room's, which bounds the tier as
+    /// it grows, so the cap charges none of them, its floor included.
+    pub fn weight_bytes(&self) -> Result<u64, String> {
+        self.weight_demands()?
+            .into_iter()
+            .try_fold(0u64, |total, demand| {
                 total
-                    .checked_add(weight.storage_bytes()?)
-                    .ok_or_else(|| "stored table bytes overflow".to_owned())
+                    .checked_add(demand.device)?
+                    .checked_add(demand.reserved)?
+                    .checked_add(demand.upload)?
+                    .checked_add(demand.shared)
             })
+            .ok_or_else(|| "resident weight byte count overflow".to_owned())
+    }
+
+    /// What a weight cap bounds ([`Self::weight_bytes`]), by the owner of
+    /// each byte: each component's weights beside the expert bank, then the
+    /// bank's parts ([`super::ExpertBankPlan::charges`]); their sum is the
+    /// weight bytes.
+    pub fn weight_owners(&self) -> Result<Vec<(&'static str, u64)>, String> {
+        // A weight byte as `weight_bytes` counts it: the host's are not.
+        let total = |demand: ClaimDemand| {
+            demand.device.checked_add(demand.reserved)?.checked_add(demand.upload)?.checked_add(demand.shared)
+        };
+        let overflow = || "resident weight byte count overflow".to_owned();
+        let [target, head, vision] = self.weight_demands()?;
+        let bank = match &self.bank {
+            Some(bank) => bank.charges()?.into_iter().map(|(owner, demand)| Some((owner, total(demand)?))).collect::<Option<Vec<_>>>().ok_or_else(overflow)?,
+            None => Vec::new(),
+        };
+        let banked = bank.iter().map(|&(_, bytes)| bytes).sum::<u64>();
+        let target = total(target).ok_or_else(overflow)?.checked_sub(banked).ok_or("the bank charges more than the target's weights")?;
+        let mut owners = vec![
+            ("target weights beside the bank", target),
+            ("head weights", total(head).ok_or_else(overflow)?),
+            ("vision weights", total(vision).ok_or_else(overflow)?),
+        ];
+        owners.extend(bank);
+        Ok(owners)
     }
 
     /// The most of one target weight's import the host holds at once. A
@@ -860,9 +1008,22 @@ pub(crate) fn elements(extents: &[u64]) -> Option<u64> {
         .try_fold(1u64, |count, extent| count.checked_mul(*extent))
 }
 
+/// Each component's weight bytes in the device's allocation domain: all its
+/// storage but a linked host tier's records, which lie in host storage.
 pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3], String> {
+    let [target, head, vision] = load.weight_demands()?;
+    let bytes = |demand: ClaimDemand| {
+        demand
+            .checked_bytes()
+            .and_then(|bytes| bytes.checked_sub(demand.host))
+            .ok_or_else(|| "resident weight byte count overflow".to_owned())
+    };
+    Ok([bytes(target)?, bytes(head)?, bytes(vision)?])
+}
+
+fn weight_demands_by_component(load: &ModelLoadPlan) -> Result<[ClaimDemand; 3], String> {
     let mut seen = HashMap::new();
-    let mut bytes = [0u64; 3];
+    let mut demands = [ClaimDemand::default(); 3];
     for (index, weights) in [
         load.target.as_slice(),
         load.head.as_deref().unwrap_or_default(),
@@ -882,8 +1043,8 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
             match seen.entry(weight.storage_identity()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(storage);
-                    bytes[index] = bytes[index]
-                        .checked_add(weight.storage_bytes()?)
+                    demands[index] = demands[index]
+                        .checked_plus(load.weight_storage_demand(weight)?)
                         .ok_or("resident weight byte count overflow")?;
                 }
                 std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &storage => {
@@ -893,7 +1054,15 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
             }
         }
     }
-    Ok(bytes)
+    // The bank's committed records are charged by its banked weights; what
+    // it is charged beyond them is the target's weights' too (a cap bounds
+    // every weight byte the plan holds).
+    if let Some(bank) = &load.bank {
+        demands[0] = demands[0]
+            .checked_plus(bank.storage_beyond_records()?)
+            .ok_or("resident weight byte count overflow")?;
+    }
+    Ok(demands)
 }
 
 impl ModelLoadPlan {
@@ -937,18 +1106,23 @@ impl ModelLoadPlan {
             self.vision.as_deref(),
             &self.host_tables,
             &self.readout_choices,
+            self.bank.as_ref(),
             history,
         )
     }
 
-    /// Plan every selected weight. Packed weights become resident in
-    /// `layout` (`resident_layout` of the engine's execution path and
-    /// device backend).
+    /// Plan every selected weight of a load of `limits` drafting by
+    /// `method`. Packed weights become resident in `layout`
+    /// (`resident_layout` of the engine's execution path and device
+    /// backend); streamed tables stage for the load's flights and land the
+    /// rows its reads of selected rows name (`selected_read_rows`).
     pub fn derive(
         manifest: &PackageManifest,
         definition: &ModelDefinition,
         selection: ComponentSelection,
         layout: Layout,
+        method: super::PlannedMethod,
+        limits: super::ResourceLimits,
     ) -> Result<Self, String> {
         Self::derive_components(
             manifest.identity,
@@ -964,6 +1138,8 @@ impl ModelLoadPlan {
             definition,
             selection,
             layout,
+            method,
+            limits,
         )
     }
 
@@ -975,6 +1151,8 @@ impl ModelLoadPlan {
         definition: &ModelDefinition,
         selection: ComponentSelection,
         layout: Layout,
+        method: super::PlannedMethod,
+        limits: super::ResourceLimits,
     ) -> Result<Self, String> {
         let identity = headers.identity();
         let projector = headers
@@ -998,9 +1176,12 @@ impl ModelLoadPlan {
             definition,
             selection,
             layout,
+            method,
+            limits,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn derive_components(
         identity: PackageIdentity,
         target_tensors: &[TensorDescriptor],
@@ -1009,11 +1190,20 @@ impl ModelLoadPlan {
         definition: &ModelDefinition,
         selection: ComponentSelection,
         layout: Layout,
+        method: super::PlannedMethod,
+        limits: super::ResourceLimits,
     ) -> Result<Self, String> {
         definition.validate().map_err(|error| error.to_string())?;
         if identity != definition.artifact_identity {
             return Err("load plan package identity mismatch".into());
         }
+        // Every lane of the load may name a streamed table's rows: the
+        // target's, and a drafter head's, whose embedding may be the
+        // target's.
+        let reads = TableReads {
+            flights: TableFlights { flights: limits.flights(), lanes: 1 + usize::from(selection.head) },
+            selected_rows: selected_read_rows(definition, method, limits)?,
+        };
         let target_component = ArtifactComponent {
             kind: ArtifactComponentKind::Target,
             identity: identity.target,
@@ -1069,6 +1259,7 @@ impl ModelLoadPlan {
                 .chain([(target_role(WeightKind::Output), &decoder.exit.output)])
                 .collect(),
             target_form,
+            reads,
         )?;
 
         // The executed definition carries at most one drafter.
@@ -1098,7 +1289,7 @@ impl ModelLoadPlan {
                         tensors: &[TensorDescriptor],
                         component: ArtifactComponent,
                         weights: Vec<(WeightRole, &WeightDescriptor)>| {
-            push_weights(plans, tensors, component, weights, target_form)
+            push_weights(plans, tensors, component, weights, target_form, reads)
         };
         let head = match (selection.head, &definition.head, &definition.draft, draft) {
             (false, ..) => None,
@@ -1184,7 +1375,71 @@ impl ModelLoadPlan {
             readout_candidates: Vec::new(),
             readout_choices: Vec::new(),
             unplaced_output: Vec::new(),
+            bank: None,
+            record_ports: None,
         })
+    }
+
+    /// The load as `backend`'s native import entries import it: through
+    /// record ports, whose tables its weights' storage holds where the
+    /// backend binds them.
+    pub fn with_record_ports(self, backend: seismic::BackendName) -> Self {
+        Self {
+            record_ports: Some(backend),
+            ..self
+        }
+    }
+
+    /// Every byte `weight`, one of this load's, holds: its allocations
+    /// (`WeightPlan::storage_bytes`) and the record table its storage holds
+    /// (Seismic's rule, `seismic::record_table_bytes`).
+    pub fn weight_storage_bytes(&self, weight: &WeightPlan) -> Result<u64, String> {
+        self.weight_storage_demand(weight)?.checked_bytes()
+            .ok_or_else(|| "resident weight byte count overflows".to_owned())
+    }
+
+    /// A weight's physical demand ([`Self::weight_storage_bytes`]) by where
+    /// each of its allocations lies.
+    fn weight_storage_demand(&self, weight: &WeightPlan) -> Result<ClaimDemand, String> {
+        let bytes = weight.storage_bytes()?;
+        let mut demand = if weight.banked().is_some() {
+            ClaimDemand { reserved: weight.resident_bytes,
+                device: bytes.checked_sub(weight.resident_bytes).ok_or("banked weight storage underflows")?,
+                ..ClaimDemand::default() }
+        } else if weight.stored_in_slots() {
+            if let Some((bank, table)) = self.bank.as_ref().and_then(|bank| {
+                bank.tables.iter().find(|table| table.role == weight.role).map(|table| (bank, table))
+            }) {
+                // StoredTable::new commits the complete reservation at load,
+                // not its floor. Its own table replaces the ordinary table.
+                let committed = table.record_bytes.get().checked_mul(table.records.get())
+                    .ok_or("stored table backing overflows")?;
+                let charges = bank.reservation.charges(bank.host.contract(crate::planning::BankTier::Bank), seismic::ReservedRecords::of(table.record_bytes), table.records.get(), committed)
+                    .ok_or("stored table demand overflows")?;
+                let mut demand = ClaimDemand::reservation(crate::planning::BankTier::Bank, charges);
+                demand.shared = demand.shared.checked_add(bytes.checked_sub(weight.resident_bytes)
+                    .ok_or("stored table directory charge underflows")?).ok_or("stored table demand overflows")?;
+                return Ok(demand);
+            }
+            ClaimDemand { shared: bytes, ..ClaimDemand::default() }
+        } else {
+            // DeviceTable owns ordinary slots and regular staging, but its
+            // directory, landed-read staging and notice are host-shared.
+            let [directory, _, landed, notice] = weight.streamed_bytes()?;
+            let shared = directory.checked_add(landed).and_then(|bytes| bytes.checked_add(notice))
+                .ok_or("streamed table shared storage overflows")?;
+            ClaimDemand { device: bytes.checked_sub(shared).ok_or("shared table storage exceeds its weight")?,
+                shared, ..ClaimDemand::default() }
+        };
+        // Ordinary record tables use api::record_table -> DeviceInner::allocate
+        // on every backend, independently of the tensor's own placement.
+        let tables = match self.record_ports {
+            Some(backend) if backend.binds_record_tables() => seismic::record_table_bytes(weight.record_table_entries()?)
+                .ok_or_else(|| "record table byte count overflows".to_owned())?,
+            Some(_) | None => 0,
+        };
+        demand.device = demand.device.checked_add(tables).ok_or("record table demand overflows")?;
+        Ok(demand)
     }
 
     /// Offer lossless bounded-selection views of the target's output
@@ -1269,7 +1524,7 @@ impl ModelLoadPlan {
                         shape,
                         scale: None,
                         bound: 0,
-                        streamed: None,
+                        holding: Holding::Whole,
                     });
                 }
             }
@@ -1288,41 +1543,6 @@ impl ModelLoadPlan {
         } else {
             select(&self.target)?
         };
-        Ok(self)
-    }
-
-    /// The load of `limits` drafting by `method`: every imported streamed
-    /// table holds landing slots after its slots for the most rows one of
-    /// its reads of rows the device selects names (`StreamedRows::
-    /// landing_rows`), whole tiles of them.
-    pub fn with_selected_reads(
-        mut self,
-        definition: &ModelDefinition,
-        method: super::PlannedMethod,
-        limits: super::ResourceLimits,
-    ) -> Result<Self, String> {
-        let rows = selected_read_rows(definition, method, limits)?;
-        let tables = self
-            .target
-            .iter_mut()
-            .chain(self.head.iter_mut().flatten())
-            .filter(|weight| {
-                matches!(
-                    weight.streamed,
-                    Some(StreamedRows {
-                        fill: TableFill::Imported,
-                        ..
-                    })
-                )
-            });
-        for weight in tables {
-            let streamed = weight.streamed.as_mut().expect("an imported streamed table");
-            let tile = weight.resident.tile_rows();
-            let landing = rows.div_ceil(tile) * tile;
-            weight.shape[0] = weight.shape[0] - streamed.landing_rows + landing;
-            streamed.landing_rows = landing;
-            weight.resident_bytes = representation_bytes(weight.resident, &weight.shape)?;
-        }
         Ok(self)
     }
 
@@ -1623,6 +1843,7 @@ fn push_weights(
     component: ArtifactComponent,
     weights: Vec<(WeightRole, &WeightDescriptor)>,
     form: ResidentForm,
+    reads: TableReads,
 ) -> Result<(), String> {
     for (role, descriptor) in &weights {
         if gathered_table(role.kind) {
@@ -1630,7 +1851,7 @@ fn push_weights(
                 .iter()
                 .any(|(other, stored)| other != role && stored.name == descriptor.name);
             push_gathered_table(
-                out, inventory, component, *role, descriptor, form, read_whole,
+                out, inventory, component, *role, descriptor, form, read_whole, reads,
             )?;
         } else {
             push_weight(
@@ -1651,7 +1872,11 @@ fn push_weights(
 ///   a second-level scale accompanies them).
 ///
 /// Then it is planned as any weight is. An n-gram table is a stored table
-/// instead (`push_stored_table`).
+/// instead (`push_stored_table`). A streamed table stages for the load's
+/// flights and holds landing slots after its slots for the most rows one
+/// of its reads of rows the device selects names (`StreamedRows::
+/// landing_rows`), whole tiles of them (`reads`).
+#[allow(clippy::too_many_arguments)]
 fn push_gathered_table(
     out: &mut Vec<WeightPlan>,
     inventory: &[TensorDescriptor],
@@ -1660,6 +1885,7 @@ fn push_gathered_table(
     descriptor: &WeightDescriptor,
     form: ResidentForm,
     read_whole: bool,
+    reads: TableReads,
 ) -> Result<(), String> {
     if role.kind == WeightKind::NGramTable {
         return push_stored_table(out, inventory, component, role, descriptor, form);
@@ -1698,21 +1924,32 @@ fn push_gathered_table(
     streamed.shape[0] = slots;
     // A streamed table is read by row, never through a packed projection.
     streamed.bound = 0;
-    streamed.resident_bytes = representation_bytes(streamed.resident, &streamed.shape)?;
     // The load uploads the rows that fill the slots; nothing more of the
     // table is ever uploaded at once.
     streamed.source_bytes = representation_bytes(streamed.upload, &streamed.shape)?;
-    streamed.streamed = Some(StreamedRows {
+    let landing_rows = reads.selected_rows.div_ceil(tile) * tile;
+    streamed.shape[0] = slots + landing_rows;
+    streamed.resident_bytes = representation_bytes(streamed.resident, &streamed.shape)?;
+    streamed.holding = Holding::Streamed(StreamedRows {
         table_rows,
         // The largest step any backend admits, each row of which may bring
         // its tile.
         staging_rows: slots.min(magnitude_batching::MAX_CLASS_ROWS as u64 * tile),
-        landing_rows: 0,
+        landing_rows,
         directory: DirectoryForm::of(table_rows, slots),
-        fill: TableFill::Imported,
+        fill: TableFill::Imported(reads.flights),
     });
     out.push(streamed);
     Ok(())
+}
+
+/// What a load's streamed tables stage and land: the flights their stagings
+/// serve, and the most rows one read of rows the device selects names
+/// (`selected_read_rows`).
+#[derive(Clone, Copy)]
+struct TableReads {
+    flights: TableFlights,
+    selected_rows: u64,
 }
 
 /// The most table rows one read of rows the device selects names in a load
@@ -1757,8 +1994,9 @@ pub const NGRAM_TABLE_STORED_ROWS: u64 = 180 * 16_384;
 /// (`stored_table::row_conversion`) and writes, and a directory of the form
 /// the plan picks (`DirectoryForm::of`). A table with import transforms,
 /// rows past I32 or without a host row conversion into its resident
-/// representation is refused. The slots are the weight's shape and resident
-/// bytes; the load uploads nothing.
+/// representation is refused. The slots, `[records, rows, width]` (one
+/// record of them here), are the weight's shape and resident bytes; the load
+/// uploads nothing.
 fn push_stored_table(
     out: &mut Vec<WeightPlan>,
     inventory: &[TensorDescriptor],
@@ -1814,12 +2052,14 @@ fn push_stored_table(
     }
     let budget = representation_bytes(table.upload, &[NGRAM_TABLE_STORED_ROWS, width])?;
     let slots = (budget / representation_bytes(table.resident, &[1, width])?).min(table_rows);
-    table.shape = vec![slots, width];
+    // One record of every slot; a bank holding the table records them in
+    // the units it commits (`BankTable::of`).
+    table.shape = vec![1, slots, width];
     table.resident_bytes = representation_bytes(table.resident, &table.shape)?;
     table.source_bytes = 0;
     // A stored table is read by row, never through a packed projection.
     table.bound = 0;
-    table.streamed = Some(StreamedRows {
+    table.holding = Holding::Streamed(StreamedRows {
         table_rows,
         staging_rows: 0,
         landing_rows: 0,
@@ -1922,7 +2162,7 @@ fn push_weight(
         resident_bytes,
         scale,
         bound: 0,
-        streamed: None,
+        holding: Holding::Whole,
     };
     // The import makes the bound: a weight the host places has none.
     if !plan.placed_on_host() {
@@ -2200,7 +2440,7 @@ pub fn resident_elements(layout: Layout) -> Vec<Element> {
     elements
 }
 
-fn representation_bytes(element: Element, shape: &[u64]) -> Result<u64, String> {
+pub(super) fn representation_bytes(element: Element, shape: &[u64]) -> Result<u64, String> {
     element
         .canonical_byte_len(shape)
         .map_err(|error| format!("{} shape {shape:?}: {error}", element.name()))
@@ -2355,6 +2595,39 @@ mod stored_table_tests {
     use super::*;
     use magnitude_family_contracts::SublayerIndex;
 
+    #[test]
+    fn imported_table_shared_state_uses_upload_but_slots_and_record_table_use_device() {
+        let definition = crate::planning::fixtures::fixture_definition();
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let limits = crate::ResourceLimits { max_launch_rows: 2, max_launch_slots: 2, max_selected_rows: 2,
+            max_drafting_slots: 2, exported_logits_rows: 0, max_images_per_request: 1, max_image_cells: 0,
+            lookahead: false, chain_capacity: std::num::NonZeroUsize::MIN, conversations: std::num::NonZeroUsize::MIN };
+        let mut load = ModelLoadPlan::derive(&manifest, &definition,
+            ComponentSelection { head: false, vision: false }, Layout::Rows16, crate::PlannedMethod::Plain, limits).unwrap();
+        let rows = STREAMED_TABLE_ROWS * 2;
+        let descriptor = WeightDescriptor::stored("gathered", [rows, 128]);
+        let inventory = [TensorDescriptor { name: descriptor.name.clone(), shape: vec![rows, 128],
+            encoding: Encoding::F16, offset: 0, nbytes: rows * 128 * 2 }];
+        let component = load.target[0].component;
+        load.target.clear();
+        push_gathered_table(&mut load.target, &inventory, component,
+            WeightRole { scope: WeightScope::Target, kind: WeightKind::Embedding }, &descriptor,
+            ResidentForm { activation: DType::F16, layout: Layout::Rows16 }, false, TableReads {
+                flights: TableFlights { flights: limits.flights(), lanes: 1 },
+                selected_rows: selected_read_rows(&definition, super::super::PlannedMethod::Plain, limits).unwrap(),
+            }).unwrap();
+        let load = load.with_record_ports(BackendName::Vulkan);
+        let table = &load.target[0];
+        assert!(table.lands_selected_rows());
+        let [directory, staged, landed, notice] = table.streamed_bytes().unwrap();
+        let demand = load.weight_demands().unwrap()[0];
+        assert_eq!(demand.shared, directory + landed + notice);
+        assert_eq!(demand.device, table.resident_bytes + staged
+            + seismic::record_table_bytes(table.record_table_entries().unwrap()).unwrap());
+        assert_eq!(demand.checked_bytes().unwrap(), table.storage_bytes().unwrap()
+            + seismic::record_table_bytes(table.record_table_entries().unwrap()).unwrap());
+    }
+
     fn ngram_role() -> WeightRole {
         WeightRole {
             scope: WeightScope::TargetSublayer(SublayerIndex {
@@ -2416,11 +2689,11 @@ mod stored_table_tests {
                     table.resident,
                     Element::stored(resident, Layout::Rows16).unwrap()
                 );
-                assert_eq!(table.shape, vec![slots, 160], "{encoding:?}");
+                assert_eq!(table.shape, vec![1, slots, 160], "{encoding:?}");
                 assert_eq!(table.resident_bytes, slots * row, "{encoding:?}");
                 let budget = NGRAM_TABLE_STORED_ROWS * stored_row;
                 assert!(table.resident_bytes <= budget && budget < table.resident_bytes + row);
-                assert_eq!(table.streamed.unwrap().fill, TableFill::Stored);
+                assert_eq!(table.streamed().unwrap().fill, TableFill::Stored);
                 assert_eq!(
                     representation_bytes(table.upload, &table.stored_shape()).unwrap(),
                     ROWS * stored_row,
@@ -2467,8 +2740,8 @@ mod stored_table_tests {
     /// its n-gram input reading the table's resident rows16 slots.
     #[test]
     fn a_q5_0_ngram_table_plans() {
-        let definition = crate::planning::tests::qwen4exp_fixture_definition();
-        let mut manifest = crate::planning::tests::stored_table_manifest(&definition);
+        let definition = crate::planning::fixtures::qwen4exp_fixture_definition();
+        let mut manifest = crate::planning::fixtures::stored_table_manifest(&definition);
         let mut offset = 0;
         for tensor in &mut manifest.target.tensors {
             if tensor.encoding == Encoding::Iq4Nl {
@@ -2488,6 +2761,8 @@ mod stored_table_tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();

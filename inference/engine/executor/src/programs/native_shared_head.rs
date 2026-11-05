@@ -505,13 +505,18 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
             else {
                 return Err("a head block other than unlisted attention".into());
             };
-            residual = sublayers.feed_forward(
+            // A draft head's blocks hold their experts whole: no bank.
+            (residual, _) = sublayers.feed_forward(
                 &mut graph,
-                (entries.feed_forward)(index)?,
+                crate::operators::block::FeedForwardGraph {
+                    entries: (entries.feed_forward)(index)?,
+                    bank: None,
+                },
                 None,
                 mixed,
                 &mut weights,
                 &mut constants,
+                None,
             )?;
             blocks.push(BlockPorts {
                 coordinates,

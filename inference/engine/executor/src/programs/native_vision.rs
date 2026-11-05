@@ -267,7 +267,7 @@ impl Constant {
             Self::Unit(width) => {
                 GraphConstant::f32_shaped(graph, &[1, width], &vec![1.0; width as usize])
             }
-            Self::Identity => GraphConstant::identity_for_class(graph, rows, Some("O")),
+            Self::Identity => GraphConstant::row_identity(graph, rows, Some("O")),
         }
     }
 }
@@ -1015,18 +1015,10 @@ fn certify_vision_family(
                 .scoped(CELLS, "C", [patches / cell])])?)
         })
         .collect::<Result<Vec<_>, GraphError>>()?;
-    let storage = layouts.iter().map(NativeGraphLayout::storage_bytes).fold(
-        NativeGraphStorageBytes {
-            workspace: 0,
-            output: 0,
-            upload: 0,
-        },
-        |largest, class| NativeGraphStorageBytes {
-            workspace: largest.workspace.max(class.workspace),
-            output: largest.output.max(class.output),
-            upload: largest.upload.max(class.upload),
-        },
-    );
+    let storage = layouts
+        .iter()
+        .map(NativeGraphLayout::storage_bytes)
+        .fold(NativeGraphStorageBytes::default(), NativeGraphStorageBytes::most);
     Ok((storage, layouts))
 }
 

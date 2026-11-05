@@ -12,9 +12,9 @@ use super::tuning::{
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
     general_routed::{
-        RoutedDownTuning, RoutedExpandDecodeTuning, RoutedExpertTilesTuning, RoutedGateUpTuning,
-        RoutedGatedTilesTuning, RoutedScatterTuning, RoutedSelectTuning, RoutedUpTilesTuning,
-        RoutedUpTuning, routing_shape,
+        RoutedDownProjectTuning, RoutedDownTuning, RoutedExpandDecodeTuning, RoutedExpertTilesTuning, RoutedGateUpTuning,
+        RoutedGatedTilesTuning, RoutedScatterTuning, RoutedSelectStreamedTuning,
+        RoutedSelectTuning, RoutedUpTilesTuning, RoutedUpTuning, routing_shape,
     },
     post_norm::ProjectRowsTuning,
     readout::{
@@ -28,8 +28,9 @@ use super::tuning::{
     },
     routed::{
         RoutedChoicesTuning, RoutedCombineTuning, RoutedExpandTuning, RoutedExpertsTuning,
-        RoutedGroupTuning, RoutedOutputTuning, RoutedRouteSharedTuning, RoutedRouteTuning,
-        RoutedShape,
+        RoutedGroupTuning, RoutedOutputProjectTuning, RoutedOutputTuning, RoutedRouteSharedTuning,
+        RoutedRouteStreamedTuning,
+        RoutedRouteTuning, RoutedShape,
     },
     short_conv::{ShortConvOutputTuning, ShortConvProjectTuning},
     state_space::{
@@ -164,6 +165,26 @@ fn ordered_layers<K: Eq>(
     ordered
 }
 
+/// A streamed binding's kernel of each `AHEAD` (`LEADS`: without hints,
+/// then at each count of leads) one of its layers launches, none of an
+/// `AHEAD` none does; or the first `AHEAD`'s failure; none where a launched
+/// one formed none (a count or a listing, which forms nothing at every
+/// `AHEAD`).
+fn each_lead<K>(
+    leads: [Option<Result<Option<K>, CatalogFailure>>; super::LEADS],
+) -> Result<Option<[Option<K>; super::LEADS]>, CatalogFailure> {
+    let leads = leads.into_iter().map(Option::transpose).collect::<Result<Vec<_>, _>>()?;
+    // An `AHEAD` no layer launches is whole without a kernel.
+    let formed = leads
+        .into_iter()
+        .map(|lead| match lead {
+            None => Some(None),
+            Some(kernel) => kernel.map(Some),
+        })
+        .collect::<Option<Vec<_>>>();
+    Ok(formed.map(|formed| formed.try_into().unwrap_or_else(|_| unreachable!("a kernel slot per AHEAD"))))
+}
+
 /// The scope of sublayer `sublayer` (0 the mixer, 1 the feed-forward) of
 /// target block `index`.
 fn sublayer_scope(index: usize, sublayer: u32) -> WeightScope {
@@ -204,6 +225,7 @@ impl NativePreparationCache {
             selection_limits,
             graph_demand,
         } = inputs;
+        let began = std::time::Instant::now();
         let recipe_states = ReadoutRecipeStates::default();
         let mut spec = Specializer::new(device);
         let import = imports(&mut spec, plan)?;
@@ -220,6 +242,8 @@ impl NativePreparationCache {
             epsilon,
             &recipe_states,
         )?;
+        let demanded = began.elapsed();
+        let forming = device.programs_formed();
         let (glue, target, head, shared_head, draft, vision, tuned, unprepared, readout_choices) = {
             let mut preparation = Preparation::new(
                 plan,
@@ -264,6 +288,16 @@ impl NativePreparationCache {
                 readout_choices,
             )
         };
+        let formed = device.programs_formed();
+        tracing::info!(
+            "programs walked in {:.2} s: imports and launch demand {:.2} s, serving walk {:.2} s, \
+             forming {} programs in {:.2} s of its threads",
+            began.elapsed().as_secs_f64(),
+            demanded.as_secs_f64(),
+            (began.elapsed() - demanded).as_secs_f64(),
+            formed.programs - forming.programs,
+            formed.seconds - forming.seconds,
+        );
         Ok(Self {
             readout_choices,
             owner,
@@ -318,51 +352,63 @@ impl NativePreparationCache {
             epsilon,
             &recipe_states,
         )?;
-        // The count also collects every entry without tuning parameters:
-        // the mandatory phase forms them with the units' canonical
-        // programs, so a load after the search forms nothing the search
-        // did not.
-        let (counted, untuned) = {
-            let mut count = Preparation::new(
-                plan,
-                tuning.definition,
-                limits,
-                epsilon,
-                recipe_states.clone(),
-                Some(selection_limits),
-                Specializer::count_untuned(device),
-                Tuning::Tuner(
-                    Tuner::count(
-                        device,
-                        tuning,
-                        limits,
-                        TuningWeights::new(device, load, tuning.weights, &import),
-                        invocations,
-                    )
-                    .held_to(room),
-                ),
-            );
-            count.graph_demand = Some(graph_demand.clone());
-            count.walk(plan)?;
-            let Preparation { spec, tuning, .. } = count;
-            (tuning.into_tuner(), spec.into_untuned())
+        let mut tuner = Tuner::count(
+            device,
+            tuning,
+            limits,
+            TuningWeights::new(device, load, tuning.weights, &import),
+            invocations,
+        )
+        .held_to(room);
+        let mut formed = HashSet::new();
+        // The search runs in rounds on one tuning clock and budget. A round
+        // whose search replaced a choice a dependant was counted at
+        // (`Tuner::stale`) is followed by one that counts it at the
+        // replacement and forms and searches it there; nothing else is
+        // counted again.
+        let searched = loop {
+            // The count also collects every entry without tuning
+            // parameters: the mandatory phase forms them with the units'
+            // canonical programs, so a load after the search forms nothing
+            // the search did not.
+            let (counted, untuned) = {
+                let mut count = Preparation::new(
+                    plan,
+                    tuning.definition,
+                    limits,
+                    epsilon,
+                    recipe_states.clone(),
+                    Some(selection_limits),
+                    Specializer::count_untuned(device, formed),
+                    Tuning::Tuner(tuner),
+                );
+                count.graph_demand = Some(graph_demand.clone());
+                count.walk(plan)?;
+                let Preparation { spec, tuning, .. } = count;
+                (tuning.into_tuner(), spec.into_untuned())
+            };
+            formed = untuned.formed();
+            let censused = {
+                let mut census = Preparation::new(
+                    plan,
+                    tuning.definition,
+                    limits,
+                    epsilon,
+                    recipe_states.clone(),
+                    Some(selection_limits),
+                    Specializer::count(device),
+                    Tuning::Tuner(counted.census(untuned)?),
+                );
+                census.graph_demand = Some(graph_demand.clone());
+                census.walk(plan)?;
+                census.tuning.into_tuner()
+            };
+            let searched = censused.search()?;
+            if !searched.stale() {
+                break searched;
+            }
+            tuner = searched.recount();
         };
-        let censused = {
-            let mut census = Preparation::new(
-                plan,
-                tuning.definition,
-                limits,
-                epsilon,
-                recipe_states.clone(),
-                Some(selection_limits),
-                Specializer::count(device),
-                Tuning::Tuner(counted.census(untuned)?),
-            );
-            census.graph_demand = Some(graph_demand.clone());
-            census.walk(plan)?;
-            census.tuning.into_tuner()
-        };
-        let searched = censused.search()?;
         // A development survey measures the units it owns in the search's
         // process, after the search: one more walk that forms nothing and
         // reads every other unit's published choice. Without an installed
@@ -584,6 +630,18 @@ struct Preparation<'a> {
     /// The target's vocabulary: the static dimension of token selection.
     vocabulary: u64,
     target: TargetKernels,
+    /// The tuning case of each fused binding's resident decode route: the
+    /// unit a streamed layer's route follows (`Self::bank_route`).
+    resident_routes: HashMap<RoutedBinding, RoutedRouteSharedTuning>,
+    /// The tuning case of each general binding's resident selection: the
+    /// unit a streamed layer's selection follows.
+    resident_selects: HashMap<GeneralRoutedBinding, RoutedSelectTuning>,
+    /// Each fused binding's resident output, which a streamed layer's
+    /// combine with the CPU site follows.
+    resident_outputs: HashMap<RoutedBinding, RoutedOutputTuning>,
+    /// Each general binding's resident down, which a streamed layer's
+    /// combine with the CPU site follows.
+    resident_downs: HashMap<GeneralRoutedBinding, RoutedDownTuning>,
     head: Option<HeadKernels>,
     shared_head: Option<SharedHeadKernels>,
     draft: Option<DraftKernels>,
@@ -615,6 +673,10 @@ impl<'a> Preparation<'a> {
             hidden: definition.decoder.hidden,
             vocabulary: definition.decoder.vocabulary,
             target: TargetKernels::default(),
+            resident_routes: HashMap::new(),
+            resident_selects: HashMap::new(),
+            resident_outputs: HashMap::new(),
+            resident_downs: HashMap::new(),
             head: plan.head().map(|_| HeadKernels::default()),
             shared_head: plan.shared_head().map(|_| SharedHeadKernels::default()),
             draft: plan.draft().map(|_| DraftKernels::default()),
@@ -816,7 +878,10 @@ impl<'a> Preparation<'a> {
                 });
                 // Cached evidence is consumed as-is. A mismatch falls back;
                 // it never grants a new search or post-budget qualification.
-                if evidence.as_ref() != Some(&specification) {
+                // A pin's choice stands on the pin.
+                if !super::tuning::pinned::tunes_nothing()
+                    && evidence.as_ref() != Some(&specification)
+                {
                     continue;
                 }
                 let needs_formation = state.borrow().progressive.is_none();
@@ -1275,6 +1340,35 @@ impl<'a> Preparation<'a> {
             if ngrams.insert(b) && !self.target.ngram.contains_key(&b) {
                 if let Some(kernels) = self.ngram(b, ngram_layers.scopes(b))? {
                     self.target.ngram.insert(b, kernels);
+                }
+            }
+        }
+        // Each streamed binding's layers, as its bank names them: a block's
+        // feed-forward, or its parallel block's routed branch.
+        let model = self.tuning.model();
+        let streamed = target
+            .blocks()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| Some((block.bank()?, sublayer_scope(index, 1))))
+            .map(|(binding, scope)| {
+                let (_, layer) = model
+                    .load
+                    .expert_bank()
+                    .and_then(|bank| bank.feed_forward(scope))
+                    .ok_or_else(|| CatalogFailure::Preparation {
+                        entry: "routed_bank",
+                        bindings: format!("{binding:?}"),
+                        outcome: format!("the load's bank streams no layer of {scope:?}"),
+                    })?;
+                Ok((binding, layer.scope))
+            })
+            .collect::<Result<Vec<_>, CatalogFailure>>()?;
+        let banks = ordered_layers(streamed);
+        for (binding, layers) in banks {
+            if !self.target.banks.contains_key(&binding) {
+                if let Some(kernels) = self.bank(binding.0, binding.1, &layers)? {
+                    self.target.banks.insert(binding, kernels);
                 }
             }
         }
@@ -2345,14 +2439,13 @@ impl<'a> Preparation<'a> {
         let shape = binding.shape;
         let activation = binding.activation;
         let epsilon = self.epsilon;
-        let select = self.spec.tuned(
-            &mut self.tuning,
-            &RoutedSelectTuning {
-                binding,
-                scopes: scopes.clone(),
-                epsilon,
-            },
-        )?;
+        let resident_select = RoutedSelectTuning {
+            binding,
+            scopes: scopes.clone(),
+            epsilon,
+        };
+        let select = self.spec.tuned(&mut self.tuning, &resident_select)?;
+        self.resident_selects.insert(binding, resident_select);
         let decode = || RoutedExpandDecodeTuning {
             binding,
             scopes: scopes.clone(),
@@ -2382,13 +2475,12 @@ impl<'a> Preparation<'a> {
                 .zip(grouped)
                 .map(|(decode, grouped)| ExpertKernels::Plain { decode, grouped })
         };
-        let down = self.spec.tuned(
-            &mut self.tuning,
-            &RoutedDownTuning {
-                binding,
-                scopes: scopes.clone(),
-            },
-        )?;
+        let resident_down = RoutedDownTuning {
+            binding,
+            scopes: scopes.clone(),
+        };
+        let down = self.spec.tuned(&mut self.tuning, &resident_down)?;
+        self.resident_downs.insert(binding, resident_down);
         let group = self.spec.tuned(
             &mut self.tuning,
             &RoutedGroupTuning {
@@ -2511,6 +2603,320 @@ impl<'a> Preparation<'a> {
         })
     }
 
+    /// The bank entries of a streamed routed layer of feed-forward `slot`
+    /// (either routed form) whose bank is `bank`, over its streamed `layers`.
+    fn bank(
+        &mut self,
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        layers: &[WeightScope],
+    ) -> Result<Option<super::ExpertBankKernels>, CatalogFailure> {
+        use magnitude_kernels::{
+            routed_convert, routed_copy, routed_list_grid, routed_list_stage, routed_move, routed_pass_map, routed_scratch_grids, routed_scratch_request,
+            routed_scratch_wait, routed_seed_commit, routed_step, routed_tier_wait,
+        };
+        let bindings = format!("{slot:?} {bank:?}");
+        let ([experts, selected], route) = self.bank_route(slot, bank, layers, &bindings)?;
+        let spec = &mut self.spec;
+        let crate::planning::RecordTensors { gate, up, down } = bank.record;
+        let tier_wait = spec.fixed(
+            &bindings,
+            &[("K", selected)],
+            routed_tier_wait::native_entry(),
+        )?;
+        let step = spec.fixed(&bindings, &[], routed_step::native_entry())?;
+        let table = bank.words.scratch();
+        let scratch = [("FLIGHT", table.slots()), ("LANES", table.lanes())];
+        // The scratch flags are the widest layer's (`BankPart::ScratchFlags`).
+        let scratch_request = spec.fixed(
+            &bindings,
+            &[&[("K", selected), ("E", bank.widest)], scratch.as_slice()].concat(),
+            routed_scratch_request::native_entry(),
+        )?;
+        // An up-only record's gate conveyor is empty, in its up's stored
+        // element.
+        let scratch_wait = spec.fixed(
+            &bindings,
+            &scratch,
+            routed_scratch_wait::native_entry_with(routed_scratch_wait::Elements {
+                SG: gate.map_or(up.source, |gate| gate.source),
+                SU: up.source,
+                SD: down.source,
+            }),
+        )?;
+        let scratch_grids = spec.fixed(
+            &bindings,
+            &[scratch.as_slice(), &[("R", bank.words.rounds)]].concat(),
+            routed_scratch_grids::native_entry(),
+        )?;
+        let list_stage = spec.fixed(&bindings, &[], routed_list_stage::native_entry())?;
+        let pass_map = spec.fixed(&bindings, &[], routed_pass_map::native_entry())?;
+        // The device's placements, only where it places.
+        let places = bank.placer == crate::planning::Placer::Tier;
+        let seed = places
+            .then(|| {
+                bank.record.try_map(|_, tensor| {
+                    let [n, k] = tensor.matrix;
+                    spec.fixed(
+                        &bindings,
+                        &[("S", experts), ("D", bank.records), ("L", bank.widest), ("N", n), ("K", k)],
+                        routed_copy::native_entry_with(routed_copy::Elements { U: tensor.resident }),
+                    )
+                })
+            })
+            .transpose()?;
+        let convert = bank.record.try_map(|_, tensor| {
+            let [n, k] = tensor.matrix;
+            spec.fixed(
+                &bindings,
+                &[
+                    ("V", bank.conveyor),
+                    ("L", bank.round_records),
+                    ("S", experts),
+                    ("N", n),
+                    ("K", k),
+                ],
+                routed_convert::native_entry_with(routed_convert::Elements {
+                    ST: tensor.source,
+                    U: tensor.resident,
+                }),
+            )
+        })?;
+        let seed_commit = places
+            .then(|| {
+                spec.fixed(
+                    &bindings,
+                    &[&[("X", bank.widest), ("BANK", bank.records)], scratch.as_slice()].concat(),
+                    routed_seed_commit::native_entry(),
+                )
+            })
+            .transpose()?;
+        let list_grid = places.then(|| spec.fixed(&bindings, &[], routed_list_grid::native_entry())).transpose()?;
+        // Each routed tensor's records.
+        let moves = places
+            .then(|| {
+                bank.record.try_map(|_, tensor| {
+                    let [n, k] = tensor.matrix;
+                    spec.fixed(
+                        &bindings,
+                        &[("D", bank.records), ("L", bank.moves), ("N", n), ("K", k)],
+                        routed_move::native_entry_with(routed_move::Elements { U: tensor.resident }),
+                    )
+                })
+            })
+            .transpose()?;
+        let site = self.bank_site(slot, bank, layers, &bindings)?;
+        /// Every tensor's kernel, or none where one is a count or a listing.
+        fn formed<T>(kernels: crate::planning::RecordTensors<Option<T>>) -> Option<crate::planning::RecordTensors<T>> {
+            kernels.try_map(|_, kernel| kernel.ok_or(())).ok()
+        }
+        // `None` anywhere: a count or a listing, which forms nothing.
+        let (
+            Some(route),
+            Some(tier_wait),
+            Some(step),
+            Some(scratch_request),
+            Some(scratch_wait),
+            Some(scratch_grids),
+            Some(list_stage),
+            Some(pass_map),
+        ) = (route, tier_wait, step, scratch_request, scratch_wait, scratch_grids, list_stage, pass_map)
+        else {
+            return Ok(None);
+        };
+        let Some(convert) = formed(convert) else {
+            return Ok(None);
+        };
+        let placement = match (seed, seed_commit, list_grid, moves) {
+            (Some(seed), Some(seed_commit), Some(list_grid), Some(moves)) => {
+                let (Some(seed), Some(seed_commit), Some(list_grid), Some(moves)) =
+                    (formed(seed), seed_commit, list_grid, formed(moves))
+                else {
+                    return Ok(None);
+                };
+                Some(super::DevicePlacement { seed, seed_commit, list_grid, moves: super::BankMoves { records: moves } })
+            }
+            _ => None,
+        };
+        let site = match site {
+            Some(None) => return Ok(None),
+            site => site.flatten(),
+        };
+        Ok(Some(super::ExpertBankKernels {
+            route,
+            tier_wait,
+            step,
+            scratch_request,
+            scratch_wait,
+            scratch_grids,
+            list_stage,
+            pass_map,
+            convert,
+            placement,
+            site,
+        }))
+    }
+
+    /// The CPU site entries of a streamed layer of feed-forward `slot` whose
+    /// bank is `bank`, over its streamed `layers`: none where the bank has
+    /// no host tier or the backend serves none of the site's entries
+    /// (`routed_site_request` and the combine of the layer's form);
+    /// `Some(None)` where one is a count or a listing. The combine's
+    /// projections follow the binding's resident combine
+    /// (`Specializer::tuned_following`), so they keep that combine's bits; its
+    /// sum has no parameter.
+    fn bank_site(
+        &mut self,
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        layers: &[WeightScope],
+        bindings: &str,
+    ) -> Result<Option<Option<super::BankSite>>, CatalogFailure> {
+        use crate::planning::BankedFeedForward;
+        use magnitude_kernels::{routed_down_sited, routed_output_sited, routed_site_request};
+        let failure = |entry: &'static str, outcome: String| CatalogFailure::Preparation {
+            entry,
+            bindings: bindings.to_owned(),
+            outcome,
+        };
+        if !super::BankSite::served(slot, bank, self.spec.backend()).map_err(|outcome| failure("routed_bank_site", outcome))? {
+            return Ok(None);
+        }
+        let form = super::SiteForm::of(slot);
+        let (hidden, combine) = match slot {
+            BankedFeedForward::Routed(b) => {
+                let resident = self.resident_outputs.get(&b).cloned().ok_or_else(|| {
+                    failure("routed_output_project", "a streamed layer's output was not prepared before it".into())
+                })?;
+                let case = RoutedOutputProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
+                let project = self.spec.tuned_following(&mut self.tuning, &case, &resident)?;
+                let (streams, inject) =
+                    self.tuning.model().join(layers).map_err(|outcome| failure("routed_output_sited", outcome))?;
+                let sited = self.spec.fixed(
+                    bindings,
+                    &[("H", b.hidden), ("SN", streams), ("IN", inject), ("K", bank.selected)],
+                    routed_output_sited::native_entry_with(routed_output_sited::Elements { A: b.activation }),
+                )?;
+                let combine = project.zip(sited).map(|(project, sited)| super::BankCombine::Fused { project, sited });
+                (b.hidden, combine)
+            }
+            BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {
+                let resident = self.resident_downs.get(&b).cloned().ok_or_else(|| {
+                    failure("routed_down_project", "a streamed layer's down was not prepared before it".into())
+                })?;
+                let case = RoutedDownProjectTuning { resident: resident.clone(), layers: layers.to_vec() };
+                let project = self.spec.tuned_following(&mut self.tuning, &case, &resident)?;
+                let sited = self.spec.fixed(
+                    bindings,
+                    &[("H", b.shape.expert_hidden), ("K", bank.selected)],
+                    routed_down_sited::native_entry_with(routed_down_sited::Elements {
+                        A: b.activation,
+                        R: crate::operators::routed::graph::sum_element(&b),
+                    }),
+                )?;
+                let combine = project.zip(sited).map(|(project, sited)| super::BankCombine::General { project, sited });
+                (b.shape.expert_hidden, combine)
+            }
+        };
+        let request = self.spec.fixed(
+            bindings,
+            &[("H", hidden), ("K", bank.selected)],
+            routed_site_request::native_entry_with(routed_site_request::Elements { A: form.activation }),
+        )?;
+        Ok(Some(request.zip(combine).map(|(request, combine)| super::BankSite { request, combine, form, admitted: None })))
+    }
+
+    /// The extents of a streamed layer of feed-forward `slot` (H, E, K, F:
+    /// H its records' width, a latent operator's own), and its decode route
+    /// and resolve by `AHEAD` (without hints, the last streamed layer; then
+    /// at each count of leads, `ExpertBankPlan::ahead`) in that form, over
+    /// its streamed `layers`.
+    /// Each is a unit of its own that follows its resident decode entry of
+    /// this binding (`Specializer::tuned_following`): at that entry's
+    /// arithmetic choice, so its bits, and tuned in its launch shape over
+    /// the layers that launch it at its `AHEAD`; none at an `AHEAD` none of
+    /// `layers` launches.
+    fn bank_route(
+        &mut self,
+        slot: crate::planning::BankedFeedForward,
+        bank: crate::BankBinding,
+        layers: &[WeightScope],
+        bindings: &str,
+    ) -> Result<([u64; 2], Option<super::BankRouteKernels>), CatalogFailure> {
+        use crate::planning::BankedFeedForward;
+        let failure = |entry, outcome| CatalogFailure::Preparation {
+            entry,
+            bindings: bindings.to_owned(),
+            outcome,
+        };
+        // The layers of each `AHEAD`: the last streamed layer, at 0, then
+        // each layer at the leads its route has (`ExpertBankPlan::ahead`). A
+        // binding need not hold every one (its layers are those of its
+        // weights' forms): an `AHEAD` none of its layers launches has no
+        // kernel.
+        let model = self.tuning.model();
+        let mut leads: [Vec<WeightScope>; super::LEADS] = Default::default();
+        let plan = model.load.expert_bank().ok_or_else(|| failure("routed_bank", "a streamed layer's load holds no bank".into()))?;
+        for &scope in layers {
+            let (index, _) = plan
+                .layer(scope)
+                .ok_or_else(|| failure("routed_bank", format!("{scope:?} is not a streamed layer")))?;
+            leads[plan.ahead(index) as usize].push(scope);
+        }
+        match slot {
+            BankedFeedForward::Routed(b) => {
+                let entry = "routed_route_streamed";
+                let resident = self.resident_routes.get(&b).cloned().ok_or_else(|| {
+                    failure(entry, "a streamed layer's decode needs the shared-route form".into())
+                })?;
+                let mut ahead = 0;
+                let routes = leads.map(|layers| {
+                    let lead = ahead;
+                    ahead += 1;
+                    (!layers.is_empty()).then(|| {
+                        let case = RoutedRouteStreamedTuning {
+                            resident: resident.clone(),
+                            layers,
+                            bank,
+                            ahead: lead,
+                        };
+                        self.spec.tuned_following(&mut self.tuning, &case, &resident)
+                    })
+                });
+                Ok((
+                    [b.experts, b.selected],
+                    each_lead(routes)?.map(super::BankRouteKernels::Fused),
+                ))
+            }
+            // A parallel block's routed branch is general: its selection is
+            // the branch's.
+            BankedFeedForward::GeneralRouted(b) | BankedFeedForward::Parallel(crate::ParallelBinding { routed: b, .. }) => {
+                let entry = "routed_select_streamed";
+                let resident = self.resident_selects.get(&b).cloned().ok_or_else(|| {
+                    failure(entry, "a streamed layer's selection was not prepared before it".into())
+                })?;
+                let mut ahead = 0;
+                let selects = leads.map(|layers| {
+                    let lead = ahead;
+                    ahead += 1;
+                    (!layers.is_empty()).then(|| {
+                        let case = RoutedSelectStreamedTuning {
+                            resident: resident.clone(),
+                            layers,
+                            bank,
+                            ahead: lead,
+                        };
+                        self.spec.tuned_following(&mut self.tuning, &case, &resident)
+                    })
+                });
+                Ok((
+                    [b.shape.experts, b.shape.selected],
+                    each_lead(selects)?.map(super::BankRouteKernels::General),
+                ))
+            }
+        }
+    }
+
     fn routed(
         &mut self,
         b: RoutedBinding,
@@ -2563,14 +2969,13 @@ impl<'a> Preparation<'a> {
                 )?
                 .map(RoutedDecodeKernels::Expand),
             DecodeForm::SharedRoute => {
-                let route = self.spec.tuned(
-                    &mut self.tuning,
-                    &RoutedRouteSharedTuning {
-                        route: route_tuning,
-                        shared_gate: b.shared_gate,
-                        shared_up: b.shared_up,
-                    },
-                )?;
+                let shared_route = RoutedRouteSharedTuning {
+                    route: route_tuning,
+                    shared_gate: b.shared_gate,
+                    shared_up: b.shared_up,
+                };
+                let route = self.spec.tuned(&mut self.tuning, &shared_route)?;
+                self.resident_routes.insert(b, shared_route);
                 let choices = self.spec.tuned(
                     &mut self.tuning,
                     &RoutedChoicesTuning {
@@ -2586,16 +2991,15 @@ impl<'a> Preparation<'a> {
                     .map(|(route, choices)| RoutedDecodeKernels::SharedRoute { route, choices })
             }
         };
-        let output = self.spec.tuned(
-            &mut self.tuning,
-            &RoutedOutputTuning {
-                expert_down: b.expert_down,
-                shared_down: b.shared_down,
-                activation: b.activation,
-                shape,
-                scopes: scopes.clone(),
-            },
-        )?;
+        let resident_output = RoutedOutputTuning {
+            expert_down: b.expert_down,
+            shared_down: b.shared_down,
+            activation: b.activation,
+            shape,
+            scopes: scopes.clone(),
+        };
+        let output = self.spec.tuned(&mut self.tuning, &resident_output)?;
+        self.resident_outputs.insert(b, resident_output);
         let experts = self.spec.tuned(
             &mut self.tuning,
             &RoutedExpertsTuning {

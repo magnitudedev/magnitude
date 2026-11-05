@@ -4,6 +4,7 @@
 //! separated below; this module only reexports their stable contracts.
 
 mod assessment;
+mod bank;
 mod capabilities;
 mod components;
 mod execution_plan;
@@ -18,33 +19,47 @@ pub use assessment::{
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, CONVERSATION_CHECKPOINTS,
     DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes,
 };
+pub use bank::{
+    BankAllocation, BankBinding, BankTable, BankLayout, BankPart, ConveyorCarrier,
+    Lender,
+    HintWeight, HINT_LEADS, PlacedAllocations, RegionWords,
+    ExpertBankPlan, RecordTensor, RecordTensors, RoutedTensor, StagingPool, StoredStack,
+    growth_target, BankTier, HostTier, LayerSite, Placer,
+};
+pub(crate) use bank::{layer_homes, releasing};
+#[cfg(test)]
+pub(crate) use bank::routed_experts;
 pub use capabilities::{
     CapabilityPlan, DraftWidths, MAX_DRAFT_PROPOSALS, PlannedMethod, draft_ladder,
 };
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
+#[cfg(test)]
+pub(crate) use execution_plan::bank_substrate;
 pub use execution_plan::{
-    BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
+    BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, NoBank, PlannedDevice,
+    ResolvedPolicy,
 };
 pub use programs::{
-    ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
+    BankedFeedForward, ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
     DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
     ImportProgramSlot, MarkovBinding, MixerProgramSlot, ProgramPlan, SelectorBinding,
     SharedHeadProgramPlan, StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot,
     TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    CPU_IMAGE_CELLS, GraphSlots, HistoryStorePlan, LayerHistory, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
+    CPU_IMAGE_CELLS, FlightDepth, GraphSlots, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
     ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
     max_image_cells, reads_decoded_history,
 };
+pub(crate) use resources::serial_upload_regions;
 pub use weights::{
     AttentionBinding, AttentionShape, DenseBinding, DenseBranchBinding, DenseScales,
-    DirectoryForm, EmbeddingBinding, FeaturesBinding, HeadBinding, HostPeak, HostTablePlan,
-    ModelLoadPlan,
+    DirectoryForm, EmbeddingBinding, FeaturesBinding, HeadBinding, Holding, HostPeak,
+    HostTablePlan, ModelLoadPlan,
     NGramBinding, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
     ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoutedBinding, ScalableWeight,
-    SelectionBinding, SelectionShape, SublayerTail, WeightPlan, WeightScalePlan, WeightStorageIdentity,
+    SelectionBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlan, WeightScalePlan, WeightStorageIdentity,
     resident_element, resident_elements, resident_layout, source_element,
 };
 
@@ -56,20 +71,21 @@ use weights::{
 #[cfg(test)]
 use weights::{resident_dtype, validate_unique_roles};
 
+#[cfg(any(test, feature = "fixtures"))]
+pub(crate) mod fixtures;
+
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::fixtures::{
+        fixture_definition, fixture_manifest, hyper_connection_fixture_definition, qwen4exp_fixture_definition,
+        stored_table_manifest,
+    };
     use super::*;
     use magnitude_artifacts::{
-        ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
-        gguf::{Encoding, TensorDescriptor},
+        ArtifactIdentity, ComponentManifest, PackageManifest, gguf::Encoding,
     };
     use magnitude_family_contracts::{
-        ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
-        EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, HeadNorm,
-        HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue, MediaRowAttention,
-        ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer,
-        SublayerIndex, ValueNorm, ValueSource, WeightDescriptor, WeightKind, WeightRole,
-        WeightScope,
+        ModelDefinition, SublayerIndex, WeightDescriptor, WeightKind, WeightRole, WeightScope,
     };
     use magnitude_state::KvCodec;
     use seismic::{DType, Element};
@@ -90,7 +106,7 @@ pub(crate) mod tests {
             resident_bytes: 2,
             scale: None,
             bound: 0,
-            streamed: None,
+            holding: Holding::Whole,
         }
     }
 
@@ -103,13 +119,17 @@ pub(crate) mod tests {
         let mut table = weight(role, "streamed");
         table.shape = vec![1, 1];
         table.descriptor = WeightDescriptor::stored("streamed", [1_000_000, 1]);
-        table.streamed = Some(super::weights::StreamedRows {
-            table_rows: 1_000_000,
-            staging_rows: 1,
-            landing_rows: 0,
-            directory: DirectoryForm::Dense,
-            fill: super::weights::TableFill::Imported,
-        });
+        let rows = |fill| {
+            Holding::Streamed(super::weights::StreamedRows {
+                table_rows: 1_000_000,
+                staging_rows: 1,
+                landing_rows: 0,
+                directory: DirectoryForm::Dense,
+                fill,
+            })
+        };
+        let flights = super::weights::TableFlights { flights: crate::planning::fixtures::LIMITS.flights(), lanes: 1 };
+        table.holding = rows(super::weights::TableFill::Imported(flights));
         let ordinary = weight(
             WeightRole {
                 scope: WeightScope::Target,
@@ -136,7 +156,7 @@ pub(crate) mod tests {
         );
         // Stored tables upload nothing, regardless of their stored extent.
         table.source_bytes = 0;
-        table.streamed.as_mut().unwrap().fill = super::weights::TableFill::Stored;
+        table.holding = rows(super::weights::TableFill::Stored);
         assert_eq!(ImportPlan::new([&table]).peak_bytes().unwrap(), 0);
     }
 
@@ -182,155 +202,6 @@ pub(crate) mod tests {
         }
     }
 
-    fn descriptor(name: &str, shape: &[u64]) -> WeightDescriptor {
-        WeightDescriptor::stored(name, shape)
-    }
-
-    /// The smallest geometry every native kernel admits: hidden and
-    /// feed-forward widths a multiple of 64 (CUDA K1 k-blocks), an attention
-    /// head width a multiple of 32 (attention lanes), and two query heads
-    /// sharing one key-value head (Vulkan prefill needs a query group of at
-    /// least two).
-    pub(crate) fn fixture_definition() -> ModelDefinition {
-        const HIDDEN: u64 = 128;
-        const WIDTH: u64 = 64;
-        const FEATURES: u64 = 128;
-        const VOCABULARY: u64 = 256;
-        let rms = |name: &str, width| RmsNorm {
-            weight: descriptor(name, &[width]),
-            epsilon: 1e-6,
-        };
-        let attention = Attention {
-            heads: 2,
-            kv_heads: 1,
-            width: WIDTH,
-            query: descriptor("qg", &[2 * 2 * WIDTH, HIDDEN]),
-            gate: AttentionGate::Interleaved {
-                function: GateFunction::Sigmoid,
-            },
-            query_norm: HeadNorm::Rms(rms("qn", WIDTH)),
-            key_value: KeyValue::Owned {
-                key: descriptor("k", &[WIDTH, HIDDEN]),
-                value: ValueSource::Projected(descriptor("v", &[WIDTH, HIDDEN])),
-                key_norm: HeadNorm::Rms(rms("kn", WIDTH)),
-                value_norm: ValueNorm::None,
-                domain: HistoryDomain::Token,
-            },
-            rotary: Rotary::Interleaved {
-                width: WIDTH / 2,
-                base: 10_000.0,
-                sections: vec![WIDTH / 4],
-                axis_pattern: vec![0],
-            },
-            scale: 1.0 / (WIDTH as f64).sqrt(),
-            reads: HistoryReads::Visible,
-            media_rows: MediaRowAttention::Causal,
-            sinks: None,
-            output: descriptor("o", &[HIDDEN, 2 * WIDTH]),
-        };
-        let dense = DenseFfn {
-            intermediate: FEATURES,
-            up: FeedForwardUp::Gated {
-                activation: ActivationFunction::Silu,
-                gate: descriptor("gate", &[FEATURES, HIDDEN]),
-                up: descriptor("up", &[FEATURES, HIDDEN]),
-            },
-            down: descriptor("down", &[HIDDEN, FEATURES]),
-        };
-        ModelDefinition {
-            family: magnitude_family_contracts::FamilyId("resource-fixture".into()),
-            artifact_identity: PackageIdentity {
-                target: ArtifactIdentity([7; 32]),
-                projector: None,
-            },
-            inputs: InputSemantics { coordinate_axes: 1 },
-            decoder: Decoder {
-                activation_dtype: ActivationDType::BF16,
-                hidden: HIDDEN,
-                vocabulary: VOCABULARY,
-                context_limit: 128,
-                residual: ResidualForm::Single,
-                entry: EntryForm {
-                    embedding: descriptor("embedding", &[VOCABULARY, HIDDEN]),
-                    scale: EmbeddingScale::Unit,
-                    norm: None,
-                    per_layer: None,
-                    hash_routing: None,
-                },
-                blocks: vec![Block {
-                    sublayers: vec![
-                        Sublayer {
-                            input: InputNorm::Rms(rms("input_norm", HIDDEN)),
-                            op: Operator::Attention(Box::new(attention)),
-                            output: OutputForm::Residual,
-                        },
-                        Sublayer {
-                            input: InputNorm::Rms(rms("ffn_norm", HIDDEN)),
-                            op: Operator::DenseFfn(Box::new(dense)),
-                            output: OutputForm::Residual,
-                        },
-                    ],
-                }],
-                exit: ExitForm {
-                    norm: ExitNorm::Rms(rms("output_norm", HIDDEN)),
-                    output: descriptor("output", &[VOCABULARY, HIDDEN]),
-                    softcap: None,
-                },
-            },
-            head: None,
-            vision: None,
-            draft: None,
-        }
-    }
-
-    pub(crate) fn fixture_manifest(definition: &ModelDefinition) -> PackageManifest {
-        let decoder = &definition.decoder;
-        let head = definition.head.as_ref().map_or_else(Vec::new, |head| {
-            crate::operators::head_weights(head).expect("fixture head block indices fit u32")
-        });
-        let descriptors = std::iter::once(&decoder.entry.embedding)
-            .chain(
-                crate::operators::decoder_weights(decoder)
-                    .into_iter()
-                    .chain(head)
-                    .map(|(_, descriptor)| descriptor),
-            )
-            .chain(
-                crate::operators::exit_weights(decoder)
-                    .into_iter()
-                    .map(|(_, descriptor)| descriptor),
-            )
-            .chain([&decoder.exit.output]);
-        let mut offset = 0;
-        let tensors = descriptors
-            .map(|descriptor| {
-                let nbytes = descriptor.shape.iter().product::<u64>() * 2;
-                let tensor = TensorDescriptor {
-                    name: descriptor.name.clone(),
-                    shape: descriptor.shape.clone(),
-                    encoding: Encoding::F16,
-                    offset,
-                    nbytes,
-                };
-                offset += nbytes;
-                tensor
-            })
-            .collect();
-        PackageManifest {
-            identity: definition.artifact_identity,
-            target: ComponentManifest {
-                files: vec![ComponentFile {
-                    path: "planning-fixture.gguf".into(),
-                    size: offset,
-                }],
-                identity: definition.artifact_identity.target,
-                tensors,
-            },
-            projector: None,
-            draft: None,
-        }
-    }
-
     #[test]
     fn plain_weight_plan_ignores_an_unadmitted_optional_draft() {
         let definition = fixture_definition();
@@ -340,7 +211,7 @@ pub(crate) mod tests {
             vision: false,
         };
         let plain =
-            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32)
+            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
                 .unwrap();
         manifest.draft = Some(ComponentManifest {
             files: Vec::new(),
@@ -348,7 +219,7 @@ pub(crate) mod tests {
             tensors: Vec::new(),
         });
         let fallback =
-            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32)
+            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
                 .unwrap();
         assert_eq!(fallback, plain);
     }
@@ -357,20 +228,17 @@ pub(crate) mod tests {
     /// kernels a load prepares on the selected device.
     #[test]
     fn kernel_inventory_names_every_kernel_a_load_prepares() {
-        let Ok(catalog) = seismic::Devices::discover(&[]) else {
-            return;
-        };
-        let Ok(selected) = crate::platform::select_device(
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let selected = crate::platform::select_device(
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
             &crate::platform::MemoryReserves::standard(),
-        ) else {
-            return;
-        };
+        )
+        .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = catalog
             .open(catalog.resolve(selected.info.selector()).unwrap())
-            .unwrap();
+            .unwrap_or_else(|error| panic!("the selected device opens: {error}"));
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
         let limits = ResourceLimits {
@@ -382,6 +250,8 @@ pub(crate) mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let selection = ComponentSelection {
             head: false,
@@ -459,20 +329,17 @@ pub(crate) mod tests {
                 }
             }
         }
-        let Ok(catalog) = seismic::Devices::discover(&[]) else {
-            return;
-        };
-        let Ok(selected) = crate::platform::select_device(
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let selected = crate::platform::select_device(
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
             &crate::platform::MemoryReserves::standard(),
-        ) else {
-            return;
-        };
+        )
+        .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = catalog
             .open(catalog.resolve(selected.info.selector()).unwrap())
-            .unwrap();
+            .unwrap_or_else(|error| panic!("the selected device opens: {error}"));
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
         let draft = ExecutionPlanner::prepare(
@@ -495,6 +362,8 @@ pub(crate) mod tests {
                 max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
                 max_image_cells: 0,
                 lookahead: false,
+                chain_capacity: std::num::NonZeroUsize::MIN,
+                conversations: std::num::NonZeroUsize::MIN,
             },
         )
         .unwrap();
@@ -532,18 +401,18 @@ pub(crate) mod tests {
 
     /// Build actual checked Seismic graph families. The engine may choose how
     /// many slots to reserve, but no test supplies intermediate tensor shapes.
-    fn prepared_resource_plan() -> Option<ResourcePlan> {
-        let catalog = seismic::Devices::discover(&[]).ok()?;
+    fn prepared_resource_plan() -> ResourcePlan {
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
         let selected = crate::platform::select_device(
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
             &crate::platform::MemoryReserves::standard(),
         )
-        .ok()?;
+        .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = catalog
             .open(catalog.resolve(selected.info.selector()).unwrap())
-            .unwrap();
+            .unwrap_or_else(|error| panic!("the selected device opens: {error}"));
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
         let limits = ResourceLimits {
@@ -555,6 +424,8 @@ pub(crate) mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         let capacity_bytes = ResourceCapacity {
             domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
@@ -684,19 +555,18 @@ pub(crate) mod tests {
             copy.workspace_bytes_max()
         );
         assert_eq!(plan.state_graph().output_bytes, copy.output_bytes_max());
-        Some(plan)
+        plan
     }
 
     #[test]
     fn sealed_graph_footprints_charge_one_request_at_startup() {
-        let Some(plan) = prepared_resource_plan() else {
-            return;
-        };
+        let plan = prepared_resource_plan();
         let target = plan.target_graph();
         let readout = plan.target_readout_graph();
         let state = plan.state_graph();
         // One launch per lane in flight, whatever the request count; the
-        // target's residual pair; one request's retained readout beside it.
+        // target's rotation of a chain of one (its output and the spare);
+        // one request's retained readout beside it.
         // More outputs are elastic.
         assert_eq!((target.activations, target.output_slots), (1, 2));
         assert_eq!((readout.activations, readout.output_slots), (1, 2));
@@ -723,9 +593,7 @@ pub(crate) mod tests {
 
     #[test]
     fn sealed_graph_charge_is_admitted_only_when_startup_peak_fits() {
-        let Some(plan) = prepared_resource_plan() else {
-            return;
-        };
+        let plan = prepared_resource_plan();
         let mut below = plan.clone();
         below.domain_capacity_bytes = plan.startup_peak_bytes() - 1;
         assert!(below.validate().unwrap_err().contains("startup peak"));
@@ -736,205 +604,6 @@ pub(crate) mod tests {
             exact.validate().unwrap().startup_peak_bytes(),
             admitted_bytes
         );
-    }
-
-    /// The planning fixture over four hyper-connection streams: its lone
-    /// attention mixer reads through a mix site and scatters into the
-    /// streams, and its exit is a hyper-connection head, with no output
-    /// norm.
-    pub(crate) fn hyper_connection_fixture_definition() -> ModelDefinition {
-        use magnitude_family_contracts::{HyperConnectionMixing, HyperConnections};
-        let mut definition = fixture_definition();
-        let decoder = &mut definition.decoder;
-        decoder.residual = ResidualForm::HyperConnections(HyperConnections {
-            streams: STREAMS,
-            mixing: HyperConnectionMixing::LowRankGated { rank: RANK },
-        });
-        // A dense feed-forward has no streams form: the block is its mixer.
-        let sublayers = &mut decoder.blocks[0].sublayers;
-        sublayers.truncate(1);
-        sublayers[0].input = InputNorm::HyperConnectionMix(site("attn_hc", true));
-        sublayers[0].output = OutputForm::Scatter;
-        decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output_hc", false));
-        definition
-    }
-
-    /// The streams and low rank of the hyper-connection fixtures.
-    const STREAMS: u64 = 4;
-    const RANK: u64 = 64;
-
-    /// A mix site of the fixture geometry, with inject weights when
-    /// `injected`.
-    fn site(prefix: &str, injected: bool) -> magnitude_family_contracts::HyperConnectionWeights {
-        let wide = STREAMS * fixture_definition().decoder.hidden;
-        magnitude_family_contracts::HyperConnectionWeights {
-            norm: RmsNorm {
-                weight: descriptor(&format!("{prefix}_norm"), &[wide]),
-                epsilon: 1e-6,
-            },
-            down: descriptor(&format!("{prefix}_down"), &[RANK, wide]),
-            up: descriptor(&format!("{prefix}_up"), &[wide, RANK]),
-            inject: injected.then(|| descriptor(&format!("{prefix}_inject"), &[STREAMS, wide])),
-        }
-    }
-
-    /// A qwen4exp-shaped decoder over the hyper-connection fixture's
-    /// streams: a gated delta block whose routed feed-forward is followed by
-    /// an n-gram input, then an attention block with a routed feed-forward,
-    /// every mixer and feed-forward reading through its mix site.
-    pub(crate) fn qwen4exp_fixture_definition() -> ModelDefinition {
-        use magnitude_family_contracts::{
-            ExpertSelection, GatedDelta, NGramHash, NGramInput, RecurrentHeadMapping,
-            RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
-            SharedExpertGate,
-        };
-        // Metal routes over a multiple of 32 experts.
-        const EXPERTS: u64 = 32;
-        const FEATURES: u64 = 64;
-        const STATE: u64 = 128;
-        const NGRAM_WIDTH: u64 = 32;
-        const NGRAM_ROWS: u64 = 64;
-        let mut definition = hyper_connection_fixture_definition();
-        let decoder = &mut definition.decoder;
-        let hidden = decoder.hidden;
-        let wide = STREAMS * hidden;
-        let rms = |name: &str, width| RmsNorm {
-            weight: descriptor(name, &[width]),
-            epsilon: 1e-6,
-        };
-        let silu = |gate: WeightDescriptor, up: WeightDescriptor| FeedForwardUp::Gated {
-            activation: ActivationFunction::Silu,
-            gate,
-            up,
-        };
-        let mixing = |prefix: &str, op: Operator| Sublayer {
-            input: InputNorm::HyperConnectionMix(site(prefix, true)),
-            op,
-            output: OutputForm::Scatter,
-        };
-        let routed = |block: u64| {
-            let name = |part: &str| format!("blk.{block}.{part}");
-            Operator::RoutedFfn(Box::new(RoutedFfn {
-                experts: EXPERTS,
-                selected: 2,
-                intermediate: FEATURES,
-                router: Router {
-                    weight: descriptor(&name("ffn_gate_inp"), &[EXPERTS, hidden]),
-                    input: RouterInput::Operator,
-                    score: ScoreFunction::Softmax,
-                    selection: ExpertSelection::TopK { bias: None },
-                    normalization: RouteNormalization::Sum,
-                    scale: 1.0,
-                },
-                expert_up: silu(
-                    descriptor(&name("ffn_gate_exps"), &[EXPERTS, FEATURES, hidden]),
-                    descriptor(&name("ffn_up_exps"), &[EXPERTS, FEATURES, hidden]),
-                ),
-                expert_down: descriptor(&name("ffn_down_exps"), &[EXPERTS, hidden, FEATURES]),
-                expert_scale: None,
-                latent: None,
-                shared: Some(SharedExpert {
-                    intermediate: FEATURES,
-                    up: silu(
-                        descriptor(&name("ffn_gate_shexp"), &[FEATURES, hidden]),
-                        descriptor(&name("ffn_up_shexp"), &[FEATURES, hidden]),
-                    ),
-                    down: descriptor(&name("ffn_down_shexp"), &[hidden, FEATURES]),
-                    gate: SharedExpertGate::Sigmoid(descriptor(
-                        &name("ffn_gate_inp_shexp"),
-                        &[hidden],
-                    )),
-                }),
-            }))
-        };
-        let (key_heads, value_heads) = (1, 2);
-        let channels = (2 * key_heads + value_heads) * STATE;
-        let gated_delta = Operator::GatedDelta(Box::new(GatedDelta {
-            convolution_width: 4,
-            key_heads,
-            value_heads,
-            width: STATE,
-            head_mapping: RecurrentHeadMapping::Tiled,
-            query_key_value: descriptor("blk.0.attn_qkv", &[channels, hidden]),
-            gate: descriptor("blk.0.attn_gate", &[value_heads * STATE, hidden]),
-            alpha: descriptor("blk.0.ssm_alpha", &[value_heads, hidden]),
-            beta: descriptor("blk.0.ssm_beta", &[value_heads, hidden]),
-            convolution: descriptor("blk.0.ssm_conv1d", &[channels, 4]),
-            decay: descriptor("blk.0.ssm_a", &[value_heads]),
-            time_bias: descriptor("blk.0.ssm_dt", &[value_heads]),
-            norm: rms("blk.0.ssm_norm", STATE),
-            output_gate: GateFunction::Sigmoid,
-            output: descriptor("blk.0.ssm_out", &[hidden, value_heads * STATE]),
-        }));
-        let (context, heads_per_order) = (2, 2);
-        let heads = context * heads_per_order;
-        let ngram = Operator::NGramInput(Box::new(NGramInput {
-            hash: NGramHash {
-                context,
-                heads_per_order,
-                multipliers: vec![1, 7, 13],
-                sizes: vec![NGRAM_ROWS / heads; heads as usize],
-                offsets: (0..heads).map(|head| head * NGRAM_ROWS / heads).collect(),
-                reset: 1,
-            },
-            width: NGRAM_WIDTH,
-            table: descriptor("per_layer_token_embd.weight", &[NGRAM_ROWS, NGRAM_WIDTH]),
-            key: descriptor("blk.0.ngram_k", &[wide, heads * NGRAM_WIDTH]),
-            value: descriptor("blk.0.ngram_v", &[hidden, heads * NGRAM_WIDTH]),
-            key_norm: rms("blk.0.ngram_k_norm", wide),
-            query_norm: rms("blk.0.ngram_q_norm", wide),
-            convolution_norm: rms("blk.0.ngram_conv_norm", wide),
-            convolution: descriptor("blk.0.ngram_conv", &[wide, 4]),
-            kernel: 4,
-            dilation: 1,
-        }));
-        let attention = decoder.blocks[0].sublayers[0].op.clone();
-        decoder.blocks = vec![
-            Block {
-                sublayers: vec![
-                    mixing("blk.0.attn_hc", gated_delta),
-                    mixing("blk.0.ffn_hc", routed(0)),
-                    Sublayer {
-                        input: InputNorm::None,
-                        op: ngram,
-                        output: OutputForm::Residual,
-                    },
-                ],
-            },
-            Block {
-                sublayers: vec![
-                    mixing("blk.1.attn_hc", attention),
-                    mixing("blk.1.ffn_hc", routed(1)),
-                ],
-            },
-        ];
-        definition
-    }
-
-    /// The fixture manifest of `definition`, its n-gram tables stored as
-    /// IQ4_NL blocks (the stored form a streamed table reads).
-    pub(crate) fn stored_table_manifest(definition: &ModelDefinition) -> PackageManifest {
-        let mut manifest = fixture_manifest(definition);
-        let tables = definition
-            .decoder
-            .sublayers()
-            .filter_map(|(_, sublayer)| match &sublayer.op {
-                Operator::NGramInput(input) => Some(input.table.name.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        // Re-lay the tensors with the tables' block bytes.
-        let mut offset = 0;
-        for tensor in &mut manifest.target.tensors {
-            if tables.contains(&tensor.name) {
-                tensor.encoding = Encoding::Iq4Nl;
-                tensor.nbytes = tensor.shape.iter().product::<u64>() / 32 * 18;
-            }
-            tensor.offset = offset;
-            offset += tensor.nbytes;
-        }
-        manifest.target.files[0].size = offset;
-        manifest
     }
 
     /// The qwen4exp fixture without its n-gram input, its tensors encoded
@@ -962,7 +631,7 @@ pub(crate) mod tests {
             vision: false,
         };
         let load =
-            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows8)
+            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows8, crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
                 .unwrap();
         let plan = load.program_plan(&definition, KvCodec::Dense)?;
         Ok((load, plan))
@@ -1046,9 +715,7 @@ pub(crate) mod tests {
     /// at the storage their certification charges.
     #[test]
     fn a_streams_decoder_prepares_and_certifies_on_the_device() {
-        let Ok(catalog) = seismic::Devices::discover(&[]) else {
-            return;
-        };
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
         let attention = hyper_connection_fixture_definition();
         let qwen4exp = qwen4exp_fixture_definition();
         for (definition, manifest) in [
@@ -1073,19 +740,21 @@ pub(crate) mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
-        for backend in [seismic::BackendName::Metal, seismic::BackendName::Cpu] {
-            let Ok(selected) = crate::platform::select_device(
+        let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
+        for backend in backends.into_iter().filter(|&backend| crate::test_support::available(catalog, backend)) {
+            let selected = crate::platform::select_device(
                 catalog,
                 crate::ExecutionPath::Native,
                 crate::platform::DeviceRequest::Backend(backend),
                 &crate::platform::MemoryReserves::standard(),
-            ) else {
-                continue;
-            };
+            )
+            .unwrap_or_else(|error| panic!("an available {backend:?} device is selected: {error}"));
             let device = catalog
                 .open(catalog.resolve(selected.info.selector()).unwrap())
-                .unwrap();
+                .unwrap_or_else(|error| panic!("the selected {backend:?} device opens: {error}"));
             let draft = ExecutionPlanner::prepare(
                 &selected,
                 manifest,

@@ -153,7 +153,7 @@ pub(crate) struct PostNormShape {
 #[cfg(test)]
 mod tests {
     use crate::assessment::demand::tests::demand_on;
-    use crate::planning::tests::{fixture_definition, fixture_manifest};
+    use crate::planning::fixtures::{fixture_definition, fixture_manifest};
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
         ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
@@ -200,6 +200,8 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         for backend in [
             BackendName::Cpu,
@@ -215,6 +217,8 @@ mod tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
@@ -277,6 +281,8 @@ mod tests {
                 vision: false,
             },
             resident_layout(ExecutionPath::Native, BackendName::Cpu),
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap();
         assert!(load.weights().any(|weight| weight.role.kind

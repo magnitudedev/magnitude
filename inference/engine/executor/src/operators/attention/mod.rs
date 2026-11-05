@@ -23,7 +23,7 @@ use seismic::Element;
 /// causally or bidirectionally (`operators::media_rows_bidirectional`). A
 /// history is read whole or selected by an indexer (`HistoryReads`).
 pub(crate) fn admit(attention: &Attention, input_epsilon: f64) -> Result<(), PlanError> {
-    // A Shared layer reads its source's history (`StateStore::history_read`)
+    // A Shared layer reads its source's history (`HistoryReads::read`)
     // and projects no keys or values; its source's domain is admitted with
     // the source.
     if let KeyValue::Owned {
@@ -618,6 +618,8 @@ mod tests {
                 max_images_per_request: 1,
                 max_image_cells: 0,
                 lookahead: false,
+                chain_capacity: std::num::NonZeroUsize::MIN,
+                conversations: std::num::NonZeroUsize::MIN,
             };
             for backend in [
                 BackendName::Cpu,
@@ -634,6 +636,8 @@ mod tests {
                             vision: false,
                         },
                         resident_layout(ExecutionPath::Native, backend),
+                        crate::PlannedMethod::Plain,
+                        crate::planning::fixtures::LIMITS,
                     )
                     .unwrap();
                     let plan = load.program_plan(&definition, codec).unwrap();

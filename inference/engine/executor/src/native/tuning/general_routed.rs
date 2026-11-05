@@ -8,17 +8,19 @@
 
 use super::cases::scale_extent;
 use super::routed::{
-    ExpansionScales, RoutedShape, decode_points, group, grouped_points, routes,
+    BankOperands, ExpansionScales, GroupedTables, RoutedShape, bank_sources, bank_statics,
+    decode_points, group, grouped_points, lead_ports, no_sources, no_tier, routes, streamed_hint,
 };
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
 };
 use crate::GeneralRoutedBinding;
 use crate::operators::routed::fused_graph::TILE_ROWS;
+use crate::planning::BankBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
-    routed_down, routed_experts, routed_experts_up, routed_gate_up, routed_scatter, routed_select,
-    routed_up,
+    routed_down, routed_down_project, routed_experts, routed_experts_up, routed_gate_up, routed_scatter, routed_select,
+    routed_select_streamed, routed_up,
 };
 use seismic::{BuildError, Element, Tensor};
 
@@ -169,6 +171,151 @@ impl EntryTuning for RoutedSelectTuning {
     });
 }
 
+/// `routed_select_streamed`: a streamed layer's decode selection, its
+/// resident selection's (`routed_select`) decode launches and parameters
+/// with the resolve and, at `AHEAD` 1, the next layer's hints. It follows
+/// the resident selection's unit (`Specializer::tuned_following`): SPLIT
+/// (CUDA), which sets the order the logits' partial planes are summed in,
+/// is the resident choice's, so its bits are the resident's; SIMDGROUPS,
+/// which changes no bit, is searched for its own launch, which does more
+/// than the resident's. Its points are the decode points over the layers
+/// that launch it, its operands the resident's over them with the next
+/// layer's hinted weights and a bank's ([`BankOperands`]).
+#[derive(Clone)]
+pub(crate) struct RoutedSelectStreamedTuning {
+    /// The resident selection it follows, over every layer of the binding:
+    /// its static values are the streamed selection's.
+    pub resident: RoutedSelectTuning,
+    /// The streamed layers that launch it.
+    pub layers: Vec<WeightScope>,
+    pub bank: BankBinding,
+    pub ahead: u64,
+}
+
+pub(crate) struct RoutedSelectStreamedCase {
+    select: RoutedSelectCase,
+    /// Each lead's router norm, router and selection bias.
+    leads: [[Tensor; 3]; crate::planning::HINT_LEADS as usize],
+    bank: BankOperands,
+}
+
+impl RoutedSelectStreamedTuning {
+    fn elements(&self) -> routed_select_streamed::Elements {
+        let b = self.resident.binding;
+        routed_select_streamed::Elements {
+            NW: b.norm,
+            RNW: b.router_norm,
+            RW: b.router,
+            A: b.activation,
+        }
+    }
+}
+
+impl EntryTuning for RoutedSelectStreamedTuning {
+    type Entry = routed_select_streamed::Entry;
+    type Case = RoutedSelectStreamedCase;
+
+    fn launches(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn bindings(&self) -> String {
+        self.resident.bindings()
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let mut statics = self.resident.statics(inputs)?;
+        statics.extend(bank_statics(self.bank, self.ahead));
+        Ok(statics)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        let mut over = self.resident.clone();
+        over.scopes = self.layers.clone();
+        // The router's input norm the hints read, as the selection's
+        // (`operators::routed::hint_kinds`).
+        let router_norm = if self.resident.binding.shape.router_norm {
+            WeightKind::RouterInputNorm
+        } else {
+            WeightKind::InputNorm
+        };
+        let scopes = TuningInputs::rotation_scopes(&self.layers, point);
+        over.rotation(inputs, point)?
+            .into_iter()
+            .zip(scopes)
+            .map(|(select, scope)| {
+                let hinted = streamed_hint(inputs, scope)?;
+                Ok(RoutedSelectStreamedCase {
+                    leads: lead_ports(
+                        inputs,
+                        &hinted,
+                        [router_norm, WeightKind::Router, WeightKind::RouterSelectionBias],
+                        [&select.router_norm, &select.router, &select.bias],
+                    )?,
+                    bank: BankOperands::new(inputs, self.bank, self.ahead, point.rows)?,
+                    select,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> routed_select_streamed::Args<'a> {
+        let RoutedSelectStreamedCase {
+            select,
+            leads: [[next_router_norm, next_router, next_bias], [after_router_norm, after_router, after_bias]],
+            bank,
+        } = case;
+        routed_select_streamed::Args {
+            residual: &select.residual,
+            norm: &select.norm,
+            router_norm: &select.router_norm,
+            router: &select.router,
+            bias: &select.bias,
+            expert_scale: &select.expert_scale,
+            routes: select.routes.tensor_mut(),
+            weights: select.weights.tensor_mut(),
+            epsilon: select.epsilon,
+            score: select.shape.score,
+            normalization: select.shape.normalization,
+            normalization_epsilon: f32::from_bits(select.shape.normalization_epsilon),
+            scale: f32::from_bits(select.shape.scale),
+            map: &bank.map,
+            tier: &bank.tier,
+            policy: &bank.policy,
+            sited: bank.sited,
+            step: &bank.step,
+            file: bank.file.tensor_mut(),
+            grids: bank.grids.tensor_mut(),
+            sources: bank.sources.tensor_mut(),
+            next_router_norm,
+            next_router,
+            next_bias,
+            after_router_norm,
+            after_router,
+            after_bias,
+            next_policy: &bank.next_policy,
+            rings: bank.rings.tensor_mut(),
+            routing: bank.routing.tensor_mut(),
+        }
+    }
+
+    fn state(case: &Self::Case) -> Vec<(&'static str, &CaseState)> {
+        let mut states = RoutedSelectTuning::state(&case.select);
+        states.extend(case.bank.states());
+        states
+    }
+
+    generated_entry!(routed_select_streamed, this => this.elements());
+}
+
 /// The decode expansion: `routed_gate_up` (gated experts) or `routed_up`.
 #[derive(Clone)]
 pub(crate) struct RoutedExpandDecodeTuning {
@@ -179,8 +326,13 @@ pub(crate) struct RoutedExpandDecodeTuning {
 pub(crate) struct RoutedExpandDecodeCase {
     normalized: Tensor,
     routes: Tensor,
+    /// No sources: every expert read from the stacks by index.
+    sources: Tensor,
     expert_gate: Option<Tensor>,
     expert_up: Tensor,
+    /// Views of no records of the experts' gate (gated experts) and up.
+    tier_gate: Option<Tensor>,
+    tier_up: Tensor,
     scales: ExpansionScales,
     activation: i32,
 }
@@ -198,6 +350,12 @@ impl RoutedExpandDecodeTuning {
             .into_iter()
             .enumerate()
             .map(|(index, scope)| {
+                let expert_gate = if shape.experts_expansion.gated {
+                    Some(inputs.weight(scope, WeightKind::ExpertGate)?)
+                } else {
+                    None
+                };
+                let expert_up = inputs.weight(scope, WeightKind::ExpertUp)?;
                 Ok(RoutedExpandDecodeCase {
                     normalized: inputs.activation(
                         self.binding.activation,
@@ -205,12 +363,11 @@ impl RoutedExpandDecodeTuning {
                         index as u64 + 1,
                     )?,
                     routes: inputs.i32s(&[rows, shape.selected], &table)?,
-                    expert_gate: if shape.experts_expansion.gated {
-                        Some(inputs.weight(scope, WeightKind::ExpertGate)?)
-                    } else {
-                        None
-                    },
-                    expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
+                    sources: no_sources(inputs, rows, shape.selected)?,
+                    tier_gate: expert_gate.as_ref().map(no_tier).transpose()?,
+                    tier_up: no_tier(&expert_up)?,
+                    expert_gate,
+                    expert_up,
                     scales: ExpansionScales::at(inputs, scope, shape.experts_expansion.gated)?,
                     activation: shape.experts_expansion.activation,
                 })
@@ -272,11 +429,17 @@ impl EntryTuning for RoutedGateUpTuning {
         routed_gate_up::Args {
             normalized: &case.normalized,
             routes: &case.routes,
+            sources: &case.sources,
             expert_gate: case
                 .expert_gate
                 .as_ref()
                 .expect("a gated expansion case binds the gate weight"),
             expert_up: &case.expert_up,
+            tier_gate: case
+                .tier_gate
+                .as_ref()
+                .expect("a gated expansion case binds the gate weight"),
+            tier_up: &case.tier_up,
             activation: case.activation,
             gate_scale: &case.scales.gate,
             up_scale: &case.scales.up,
@@ -323,7 +486,9 @@ impl EntryTuning for RoutedUpTuning {
         routed_up::Args {
             normalized: &case.normalized,
             routes: &case.routes,
+            sources: &case.sources,
             expert_up: &case.expert_up,
+            tier_up: &case.tier_up,
             up_scale: &case.scales.up,
             activation: case.activation,
         }
@@ -347,8 +512,12 @@ pub(crate) struct RoutedDownCase {
     base: Tensor,
     product: Tensor,
     routes: Tensor,
+    /// No sources: every expert read from the stack by index.
+    sources: Tensor,
     weights: Tensor,
     expert_down: Tensor,
+    tier_down: Tensor,
+    policy: Tensor,
 }
 
 impl EntryTuning for RoutedDownTuning {
@@ -390,6 +559,7 @@ impl EntryTuning for RoutedDownTuning {
             .enumerate()
             .map(|(index, scope)| {
                 let seed = 3 * index as u64;
+                let expert_down = inputs.weight(scope, WeightKind::ExpertDown)?;
                 Ok(RoutedDownCase {
                     base: inputs.activation(
                         Element::f32(),
@@ -402,12 +572,18 @@ impl EntryTuning for RoutedDownTuning {
                         seed + 2,
                     )?,
                     routes: inputs.i32s(&[rows, shape.selected], &table)?,
+                    sources: no_sources(inputs, rows, shape.selected)?,
                     weights: inputs.activation(
                         Element::f32(),
                         &[rows, shape.selected],
                         seed + 3,
                     )?,
-                    expert_down: inputs.weight(scope, WeightKind::ExpertDown)?,
+                    tier_down: no_tier(&expert_down)?,
+                    expert_down,
+                    policy: inputs.i32s(
+                        &[magnitude_kernels::constants::POLICY_WORDS],
+                        &[0; magnitude_kernels::constants::POLICY_WORDS as usize],
+                    )?,
                 })
             })
             .collect()
@@ -418,8 +594,11 @@ impl EntryTuning for RoutedDownTuning {
             base: &case.base,
             product: &case.product,
             routes: &case.routes,
+            sources: &case.sources,
             weights: &case.weights,
             expert_down: &case.expert_down,
+            tier_down: &case.tier_down,
+            policy: &case.policy,
         }
     }
 
@@ -427,6 +606,73 @@ impl EntryTuning for RoutedDownTuning {
         EDW: this.binding.expert_down,
         A: this.binding.activation,
         R: sum_element(&this.binding),
+    });
+}
+
+/// `routed_down_project`: the device's projections of a streamed layer's
+/// general combine, its resident down's (`routed_down`) launches and
+/// parameters publishing the projections for `routed_down_sited`, following
+/// the resident down's unit as `RoutedOutputProjectTuning` follows its
+/// output.
+#[derive(Clone)]
+pub(crate) struct RoutedDownProjectTuning {
+    /// The resident down it follows, over every layer of the binding.
+    pub resident: RoutedDownTuning,
+    /// The streamed layers that launch it.
+    pub layers: Vec<WeightScope>,
+}
+
+impl EntryTuning for RoutedDownProjectTuning {
+    type Entry = routed_down_project::Entry;
+    type Case = RoutedDownCase;
+
+    fn launches(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn bindings(&self) -> String {
+        self.resident.bindings()
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        self.resident.statics(inputs)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        let mut over = self.resident.clone();
+        over.scopes = self.layers.clone();
+        let shape = self.resident.binding.shape;
+        let table = routes(point.rows, routing_shape(&self.resident.binding));
+        over.rotation(inputs, point)?
+            .into_iter()
+            .map(|mut down| {
+                down.sources = bank_sources(inputs, point.rows, shape.selected, &table)?;
+                Ok(down)
+            })
+            .collect()
+    }
+
+    fn args<'a>(down: &'a mut Self::Case) -> routed_down_project::Args<'a> {
+        routed_down_project::Args {
+            product: &down.product,
+            routes: &down.routes,
+            sources: &down.sources,
+            expert_down: &down.expert_down,
+            tier_down: &down.tier_down,
+        }
+    }
+
+    generated_entry!(routed_down_project, this => routed_down_project::Elements {
+        EDW: this.resident.binding.expert_down,
+        A: this.resident.binding.activation,
     });
 }
 
@@ -439,6 +685,7 @@ pub(crate) struct RoutedExpertTilesTuning {
 }
 
 pub(crate) struct RoutedExpertTilesCase {
+    tables: GroupedTables,
     normalized: Tensor,
     order: Tensor,
     blocks: Tensor,
@@ -464,6 +711,7 @@ impl RoutedExpertTilesTuning {
             .enumerate()
             .map(|(index, scope)| {
                 Ok(RoutedExpertTilesCase {
+                    tables: GroupedTables::of(inputs, rows, &table)?,
                     normalized: inputs.activation(
                         self.binding.activation,
                         &[rows, shape.expert_hidden],
@@ -545,16 +793,25 @@ impl EntryTuning for RoutedGatedTilesTuning {
     }
 
     fn args<'a>(case: &'a mut Self::Case) -> routed_experts::Args<'a> {
+        let gate = case
+            .expert_gate
+            .as_ref()
+            .expect("a gated tile case binds the gate weight");
         routed_experts::Args {
+            first: &case.tables.first,
+            rows: &case.tables.rows,
             normalized: &case.normalized,
             order: &case.order,
             blocks: &case.blocks,
-            expert_gate: case
-                .expert_gate
-                .as_ref()
-                .expect("a gated tile case binds the gate weight"),
+            used: &case.tables.used,
+            expert_gate: gate,
             expert_up: &case.expert_up,
             expert_down: &case.expert_down,
+            map: &case.tables.map,
+            step: &case.tables.step,
+            records_gate: gate,
+            records_up: &case.expert_up,
+            records_down: &case.expert_down,
             activation: case.activation,
             gate_scale: &case.scales.gate,
             up_scale: &case.scales.up,
@@ -605,11 +862,18 @@ impl EntryTuning for RoutedUpTilesTuning {
 
     fn args<'a>(case: &'a mut Self::Case) -> routed_experts_up::Args<'a> {
         routed_experts_up::Args {
+            first: &case.tables.first,
+            rows: &case.tables.rows,
             normalized: &case.normalized,
             order: &case.order,
             blocks: &case.blocks,
+            used: &case.tables.used,
             expert_up: &case.expert_up,
             expert_down: &case.expert_down,
+            map: &case.tables.map,
+            step: &case.tables.step,
+            records_up: &case.expert_up,
+            records_down: &case.expert_down,
             up_scale: &case.scales.up,
             activation: case.activation,
         }

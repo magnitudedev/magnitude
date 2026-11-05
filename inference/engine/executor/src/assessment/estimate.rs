@@ -45,7 +45,8 @@
 use super::demand::{Bytes, Call, DecodeDemand, Flops, Work};
 use super::executor_costs::ExecutorCosts;
 use super::AssessmentError;
-use seismic::{Element, StorageKind};
+use seismic::Element;
+use super::executor_costs::OperandStorage;
 
 /// The decode speed at one depth.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,16 +84,20 @@ impl Pricing<'_> {
     /// The seconds of `bytes`, each format's at its weight rate in device
     /// storage, `scale` times over.
     fn weights(&self, bytes: &[Bytes], scale: f64) -> f64 {
+        self.weights_in(OperandStorage::Device, bytes, scale)
+    }
+
+    /// The seconds of `bytes` read from `storage`, each format's at its
+    /// weight rate there, `scale` times over.
+    fn weights_in(&self, storage: OperandStorage, bytes: &[Bytes], scale: f64) -> f64 {
         bytes.iter().fold(0.0, |seconds, bytes| {
-            seconds
-                + scale * bytes.bytes as f64
-                    / self.costs.weight_rate(StorageKind::Device, bytes.format)
+            seconds + scale * bytes.bytes as f64 / self.costs.weight_rate(storage, bytes.format)
         })
     }
 
     /// Activation-dtype bytes in `storage`: the slowest rate of its
     /// placement's paths.
-    pub fn activations(&self, storage: StorageKind) -> f64 {
+    pub fn activations(&self, storage: OperandStorage) -> f64 {
         self.costs.weight_rate(storage, Element::bf16())
     }
 
@@ -147,6 +152,86 @@ impl StepSeconds {
     /// The step's time: its calls composed, plus the step cost.
     pub fn total(&self) -> f64 {
         self.composition * self.calls.iter().map(CallSeconds::total).sum::<f64>() + self.step
+    }
+}
+
+/// What a routed pass over a streamed layer's experts costs on this
+/// executor: a pass reads each distinct expert it routes to once and
+/// computes every choice, so it costs, as a call does, the slower of its
+/// experts' weights at their format's rate (each expert one record of its
+/// bank group's three tensors, as resident) and its choices' arithmetic
+/// over their format's throughput. A prompt group's merged pass reads its
+/// steps' union once where alone their passes read each step's own: what
+/// prices a group's compute by its rows (`GroupReads`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpertPass {
+    costs: ExecutorCosts,
+    /// Each streamed layer's expert, in decoder order: its bytes and its
+    /// FLOPs a choice, by format.
+    layers: Vec<(Vec<Bytes>, Vec<Flops>)>,
+}
+
+impl ExpertPass {
+    /// The passes of `bank`'s streamed layers on the executor `costs`
+    /// price.
+    pub fn of_bank(bank: &crate::planning::ExpertBankPlan, costs: ExecutorCosts) -> Result<Self, AssessmentError> {
+        let layers = bank
+            .layers
+            .iter()
+            .map(|layer| {
+                let records = &bank.groups[layer.group].record;
+                let bytes = records
+                    .iter()
+                    .map(|(_, record)| {
+                        let bytes = record.record_bytes().map_err(AssessmentError::Plan)?;
+                        Ok(Bytes { format: record.resident, bytes })
+                    })
+                    .collect::<Result<Vec<_>, AssessmentError>>()?;
+                let flops = records
+                    .iter()
+                    .map(|(_, record)| Flops { format: record.resident, flops: 2 * record.matrix[0] * record.matrix[1] })
+                    .collect();
+                Ok((bytes, flops))
+            })
+            .collect::<Result<_, AssessmentError>>()?;
+        Ok(Self::new(costs, layers))
+    }
+
+    /// The passes of streamed layers whose expert is `layers`' bytes and
+    /// FLOPs a choice, on the executor `costs` price.
+    pub(crate) fn new(costs: ExecutorCosts, layers: Vec<(Vec<Bytes>, Vec<Flops>)>) -> Self {
+        Self { costs, layers }
+    }
+
+    /// The seconds of a pass at streamed layer `layer` reading `experts`
+    /// experts for `choices` choices.
+    pub fn seconds(&self, layer: usize, experts: f64, choices: f64) -> f64 {
+        let pricing = Pricing { costs: &self.costs, lookahead: false };
+        let (bytes, flops) = &self.layers[layer];
+        pricing.weights(bytes, experts).max(pricing.compute(flops, choices))
+    }
+
+    /// Streamed layer `layer`'s expert: its resident record's bytes and its
+    /// FLOPs a choice, every format's together (what a machine's peak
+    /// arithmetic prices it at, `bar`).
+    pub fn expert(&self, layer: usize) -> (u64, u64) {
+        let (bytes, flops) = &self.layers[layer];
+        (bytes.iter().map(|bytes| bytes.bytes).sum(), flops.iter().map(|flops| flops.flops).sum())
+    }
+
+    /// Streamed layer `layer`'s expert on the GPU ([`super::cost::GpuLines`]):
+    /// its record read in place where the host tier lies (host storage,
+    /// `Tensor::shared`: across a discrete GPU's link) and from the GPU's
+    /// memory, each against its arithmetic a row; none until the costs read
+    /// host storage's routes, which no other figure stands in for.
+    pub fn lines(&self, layer: usize) -> Option<Result<super::cost::GpuLines, super::cost::LineError>> {
+        let pricing = Pricing { costs: &self.costs, lookahead: false };
+        let (bytes, flops) = &self.layers[layer];
+        let row = pricing.compute(flops, 1.);
+        let line = |storage| super::cost::PassLine::of(pricing.weights_in(storage, bytes, 1.), row);
+        self.costs
+            .reads_along(OperandStorage::Host)
+            .then(|| Ok(super::cost::GpuLines { link: line(OperandStorage::Host)?, resident: line(OperandStorage::Device)? }))
     }
 }
 
@@ -205,11 +290,11 @@ fn work_seconds(
     }
     let activations = rows_f * work.row_bytes as f64 + sequences * work.sequence_bytes as f64;
     if activations > 0.0 {
-        bytes += activations / pricing.activations(StorageKind::Device);
+        bytes += activations / pricing.activations(OperandStorage::Device);
     }
     let upload = rows_f * work.upload_row_bytes as f64;
     if upload > 0.0 {
-        bytes += upload / pricing.activations(StorageKind::Upload);
+        bytes += upload / pricing.activations(OperandStorage::Upload);
     }
     let mut compute = pricing.compute(&work.row_flops, rows_f);
     if let Some(experts) = &work.experts {
@@ -228,7 +313,7 @@ fn work_seconds(
                 fixed = line.fixed_seconds;
                 read * line.seconds_per_byte
             }
-            None => read / pricing.activations(StorageKind::Device),
+            None => read / pricing.activations(OperandStorage::Device),
         };
         compute += rows_f * history.flops_per_token as f64 * tokens
             / pricing.costs.matrix_flops(Element::bf16());
@@ -270,7 +355,7 @@ pub fn step_seconds(
             .iter()
             .map(|call| call_seconds(call, pricing, sequences, depth))
             .collect::<Result<_, _>>()?,
-        composition: pricing.costs.composition(),
+        composition: pricing.costs.composition()?.value,
         step: pricing.costs.step_seconds(pricing.lookahead),
     })
 }
@@ -302,7 +387,7 @@ mod tests {
     };
     use crate::assessment::launches::{Declarations, Kernel};
     use magnitude_state::KvCodec;
-    use seismic::AccessRoute;
+    use crate::assessment::fixtures::kind;
 
     /// The synthetic costs ([`crate::assessment::fixtures::costs`]), with
     /// lookahead.
@@ -315,8 +400,8 @@ mod tests {
 
     /// One call of the CPU backend's dense expansion doing `work`.
     fn call(work: Work) -> DecodeDemand {
-        let definition = crate::planning::tests::fixture_definition();
-        let manifest = crate::planning::tests::fixture_manifest(&definition);
+        let definition = crate::planning::fixtures::fixture_definition();
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
         let load = crate::ModelLoadPlan::derive(
             &manifest,
             &definition,
@@ -325,6 +410,8 @@ mod tests {
                 vision: false,
             },
             seismic::Layout::Rows8,
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap();
         let declarations: Declarations = crate::assessment::demand::tests::declarations(
@@ -469,8 +556,8 @@ mod tests {
             }),
             formats: Vec::new(),
         };
-        costs.routes.push(route(AccessRoute::Upload, 20e9));
-        costs.placements.upload = Placement::along(AccessRoute::Upload);
+        costs.routes.push(route(kind(1), 20e9));
+        costs.placements.upload = Placement::along(kind(1));
         close(bytes(&costs).bytes, 3e6 / 300e9 + 2e6 / 20e9 + 1e9 / 200e9);
         // Device storage spanning a second, slower route (an integrated
         // GPU's own memory, then a heap of host RAM): weights at the slower
@@ -478,12 +565,12 @@ mod tests {
         let mut spanning = costs.clone();
         spanning
             .routes
-            .push(route(AccessRoute::VulkanHeap(1), 100e9));
+            .push(route(kind(2), 100e9));
         spanning
             .placements
             .device
             .rest
-            .push(AccessRoute::VulkanHeap(1));
+            .push(kind(2));
         close(
             bytes(&spanning).bytes,
             3e6 / 100e9 + 2e6 / 20e9 + 1e9 / (200e9 * (100e9 / 300e9)),
@@ -671,10 +758,9 @@ mod tests {
         assert_eq!(slow.compute, 4e6 / 50e9);
     }
 
-    /// Costs holding the probe alone price every demand from it: weights
-    /// and rows at its rate, arithmetic at its one-row FLOP rate, history at
-    /// its rate with no fixed cost, launches and the step at none, and the
-    /// calls as they run alone.
+    /// Costs holding the probe alone of the figures others price from price
+    /// every demand from it: weights and rows at its rate, arithmetic at its
+    /// one-row FLOP rate, and history at its rate with no fixed cost.
     #[test]
     fn the_probe_alone_prices_every_demand() {
         let mut costs = crate::assessment::fixtures::costs();
@@ -683,10 +769,6 @@ mod tests {
         costs.matrices.clear();
         costs.activation_matrix = None;
         costs.dense = HistoryCosts::new(KvCodec::Dense, Vec::new()).unwrap();
-        costs.composition = None;
-        costs.launch_seconds = None;
-        costs.step_pipelined_seconds = None;
-        costs.step_round_trip_seconds = None;
         let demand = call(Work {
             weights: vec![Bytes {
                 format: Element::f32(),
@@ -705,9 +787,8 @@ mod tests {
             ..Work::default()
         });
         let step = step_seconds(&demand, &pricing(&costs), 1, 1_000).unwrap();
-        assert_eq!((step.composition, step.step), (1., 0.));
         let call = only(step);
-        assert_eq!((call.fixed, call.launch), (0., 0.));
+        assert_eq!(call.fixed, 0.);
         close(call.bytes, (3e6 + 1e6) / 150e9);
         // bf16's 2-byte weights: a FLOP per byte at one row, two per
         // weight.

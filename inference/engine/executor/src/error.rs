@@ -22,22 +22,23 @@ impl fmt::Display for DeviceError {
 
 impl error::Error for DeviceError {}
 
-/// A table's rows a sequence's step named could not be read from the
-/// model's artifact (a stored table, `StoredTable`): the step read other
-/// rows in their place, so the sequence fails. Other sequences of the step
-/// are unaffected.
+/// Weights a sequence's step named could not be read from the model's
+/// artifact: a stored table's rows (`StoredTable`) or a streamed layer's
+/// experts (`ExpertBank`). The step read other values in their place, so
+/// the sequence fails; nothing of a step other than the one that named them
+/// is affected.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TableReadError {
+pub struct WeightReadError {
     pub detail: String,
 }
 
-impl fmt::Display for TableReadError {
+impl fmt::Display for WeightReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "model weights could not be read: {}", self.detail)
     }
 }
 
-impl error::Error for TableReadError {}
+impl error::Error for WeightReadError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanError {
@@ -57,6 +58,99 @@ pub enum PlanError {
     Arithmetic(&'static str),
     ResourcePlanning(String),
     Resource(CapacityError),
+    /// The weight cap is below the weights a load holds with its expert
+    /// bank at its minimum: each group's least records, what its steps need
+    /// resident at once to make progress (`ExpertBankPlan::least_records`).
+    WeightCap { cap: u64, needed: u64 },
+    /// The load's routed experts cannot be streamed.
+    Unstreamed(UnstreamedExperts),
+}
+
+/// Why a load's routed experts cannot be streamed through an expert bank.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnstreamedExperts {
+    /// The backend lacks an entry of the bank of one of the model's routed
+    /// forms, or the shared-route decode form a fused bank-served decode
+    /// takes.
+    Backend(seismic::BackendName),
+    /// The device reserves no address ranges, so a bank cannot resize.
+    Unreserved(seismic::BackendName),
+    /// The device reserves no address ranges where its backend reserves
+    /// on other devices, or discovery could not read how, for `reason`
+    /// (`seismic::Limits::reserving`: a Vulkan device with one queue in its
+    /// compute family, a granule that could not be read).
+    Unreservable { backend: seismic::BackendName, reason: String },
+    /// The device holds no host tier, which every miss lands in
+    /// (`platform::host_tier`), for `reason`.
+    Untiered { backend: seismic::BackendName, reason: String },
+    /// The device's single allocation holds `most` slots of a record
+    /// tensor, fewer than the bank's `floor`.
+    Allocation { floor: u64, most: u64 },
+    /// The model routes no experts.
+    Unrouted,
+    /// A routed layer whose record form (gated or up-only) or selected
+    /// experts differ from the first streamed layer's, which the bank's
+    /// entries and words share.
+    Shape(magnitude_family_contracts::SublayerIndex),
+    /// A routed layer that selects in another order than the first streamed
+    /// layer (form, score function, selection bias, router input, or the
+    /// elements of the weights a route reads of the next layer): a layer's
+    /// hints rank the next layer's choices by its own.
+    SelectionOrder(magnitude_family_contracts::SublayerIndex),
+    /// An expert stack whose experts are not each one range of its stored
+    /// experts' bytes, uploaded as stored, nor contiguous in its resident
+    /// form.
+    Record(WeightRole),
+    /// The expert stacks of a routed layer disagree on their experts.
+    Geometry(WeightRole),
+}
+
+impl fmt::Display for UnstreamedExperts {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Backend(backend) => {
+                write!(formatter, "{} has no expert-streaming entries", backend.as_str())
+            }
+            Self::Unreserved(backend) => write!(
+                formatter,
+                "this {} device reserves no address ranges for an expert bank",
+                backend.as_str()
+            ),
+            Self::Unreservable { backend, reason } => write!(
+                formatter,
+                "this {} device reserves no address ranges for an expert bank: {reason}",
+                backend.as_str()
+            ),
+            Self::Untiered { backend, reason } => write!(
+                formatter,
+                "this {} device holds no host tier for an expert bank's misses to land in: {reason}",
+                backend.as_str()
+            ),
+            Self::Allocation { floor, most } => write!(
+                formatter,
+                "one allocation holds {most} slots of a record tensor, below the floor of {floor}"
+            ),
+            Self::Unrouted => formatter.write_str("the model routes no experts"),
+            Self::Shape(index) => write!(
+                formatter,
+                "routed layer {index:?} differs in record form or selected experts from the first streamed layer"
+            ),
+            Self::SelectionOrder(index) => write!(
+                formatter,
+                "routed layer {index:?} selects in another order than the first streamed layer"
+            ),
+            Self::Record(role) => write!(
+                formatter,
+                "{:?}/{:?} does not hold each expert as one range of its stored bytes",
+                role.scope, role.kind
+            ),
+            Self::Geometry(role) => write!(
+                formatter,
+                "{:?}/{:?} differs from its layer's expert geometry",
+                role.scope, role.kind
+            ),
+        }
+    }
 }
 
 impl fmt::Display for PlanError {
@@ -80,6 +174,12 @@ impl fmt::Display for PlanError {
                 write!(formatter, "resource planning failed: {detail}")
             }
             Self::Resource(source) => source.fmt(formatter),
+            Self::WeightCap { cap, needed } => write!(
+                formatter,
+                "a weight cap of {cap} bytes is below the {needed} the load's weights need with \
+                 its expert bank at its minimum, the records its steps need at once"
+            ),
+            Self::Unstreamed(reason) => write!(formatter, "experts cannot stream: {reason}"),
         }
     }
 }

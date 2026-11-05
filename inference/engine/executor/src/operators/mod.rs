@@ -57,9 +57,8 @@ impl Join {
     }
 
     /// The inject port an output entry over `rows` rows binds: the mix
-    /// site's values, or for one stream an empty `[rows, 0]` constant, made
-    /// only by an entry that binds it (a row-class constant,
-    /// `block::class_constants_of`).
+    /// site's values, or for one stream an empty `[rows, 0]` constant of
+    /// the class's rows, made only by an entry that binds it.
     pub(crate) fn inject<G: crate::programs::graph::draft::GraphDraft>(
         &self,
         graph: &mut G,

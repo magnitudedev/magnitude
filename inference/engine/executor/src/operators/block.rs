@@ -15,6 +15,7 @@ use super::gated_delta::graph::{
     RecurrentStatePorts, recurrent,
 };
 use super::ngram::graph::{NGramBlock, NGramEntries, NGramPorts, ngram as ngram_graph};
+use super::parallel::DenseBesideRouted;
 use super::parallel::graph::{CheckedParallelEntries, ParallelGraphEntries, parallel};
 use super::per_layer::graph::{
     CheckedPerLayerEntries, PerLayerEntries, PerLayerWeights, per_layer as per_layer_graph,
@@ -23,9 +24,11 @@ use super::routed::fused_graph::{
     self as routed_graph, CheckedRoutedEntries, ExpertShape, RoutedGraphEntries,
 };
 use super::routed::graph::{
-    CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum, class_constants,
-    general_routed,
+    CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum,
+    general_pass, general_routed,
 };
+use super::routed::split::{PassPorts, Split};
+use super::routed::streamed::{BankGraph, scratch_fill};
 use super::short_conv::graph::{
     CheckedShortConvEntries, ShortConvBlock, ShortConvGraphEntries, short_conv,
 };
@@ -40,7 +43,10 @@ use super::{
     post_norm_epsilon,
 };
 use crate::native::{AttestedFeedForward, AttestedMixer, OutputScales};
-use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::graph::{
+    GraphError,
+    draft::{ControlSource, GraphDraft},
+};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{
     WeightPort, activation, packed_weight, scaled_weight, weight,
@@ -50,7 +56,7 @@ use crate::{
     PerLayerBinding, ShortConvShape, StateResourcePlan, StateSpaceShape,
 };
 use magnitude_family_contracts::{
-    Decoder, HistoryReads, RecurrentHeadMapping, SublayerIndex, WeightKind, WeightScope,
+    Decoder, RecurrentHeadMapping, SublayerIndex, WeightKind, WeightScope,
 };
 use magnitude_state::LayerRef;
 use seismic::{
@@ -126,6 +132,14 @@ impl<'a> From<&'a AttestedMixer> for MixerEntries<'a, NativeGraph> {
             AttestedMixer::ShortConv(kernels) => Self::ShortConv(kernels.into()),
         }
     }
+}
+
+/// A block's feed-forward as its graph builds it: its entries (none of a
+/// lone mixer block), and the bank of a routed feed-forward whose experts
+/// stream.
+pub(crate) struct FeedForwardGraph<'p, 'a, G: GraphDraft + 'a> {
+    pub entries: Option<FeedForwardEntries<'a, G>>,
+    pub bank: Option<BankGraph<'p, 'a, G>>,
 }
 
 /// The kernel entries of a block's feed-forward.
@@ -285,6 +299,17 @@ pub(crate) struct BlockSublayers<'a> {
 }
 
 impl BlockSublayers<'_> {
+    /// How the block's graph takes its launch's controls: a target block
+    /// is one of the launch's graphs, one a block, so it binds the launch's
+    /// one upload of them; a draft head's blocks are one graph that
+    /// uploads them itself.
+    fn controls(&self) -> ControlSource {
+        match self.lane {
+            BlockLane::Target => ControlSource::Bound,
+            BlockLane::Head { .. } => ControlSource::Uploaded,
+        }
+    }
+
     fn scope(&self, sublayer: u32) -> Result<WeightScope, String> {
         let index = self.index(sublayer)?;
         Ok(match self.lane {
@@ -471,6 +496,7 @@ impl BlockSublayers<'_> {
                             })
                         })
                         .transpose()?,
+                        controls: self.controls(),
                     },
                 )?;
                 (
@@ -511,6 +537,7 @@ impl BlockSublayers<'_> {
                         gate_function: gated_delta::gate_function(shape),
                         epsilon,
                         component_index,
+                        controls: self.controls(),
                     },
                 )?;
                 (mixed, ports.into(), BlockControlPorts::Recurrent(controls))
@@ -536,6 +563,7 @@ impl BlockSublayers<'_> {
                         epsilon,
                         norm_epsilon: operator.norm.epsilon as f32,
                         component_index,
+                        controls: self.controls(),
                     },
                 )?;
                 (mixed, ports.into(), BlockControlPorts::Recurrent(controls))
@@ -563,6 +591,7 @@ impl BlockSublayers<'_> {
                             .unwrap_or_default() as f32,
                         post_norm_scale: output_scales.mixer,
                         component_index,
+                        controls: self.controls(),
                     },
                 )?;
                 (
@@ -575,17 +604,98 @@ impl BlockSublayers<'_> {
         })
     }
 
+    /// A scratch-served step's fill of the block's streamed routed layer
+    /// (`scratch_fill`: every routed form's fill is its group's).
+    pub(crate) fn fill<'e, G: GraphDraft + 'e>(
+        &self,
+        graph: &mut G,
+        feed_forward: FeedForwardGraph<'_, 'e, G>,
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<WorkflowTensor, GraphError> {
+        let scope = match self.paired.feed_forward.map(|sublayer| sublayer.op) {
+            Some(FeedForward::Routed(_) | FeedForward::GeneralRouted(_)) => self.scope(1)?,
+            // A parallel block's routed branch's.
+            Some(FeedForward::Parallel(_)) => DenseBesideRouted::scopes(self.index(1)?)[1],
+            _ => return Err("a fill of a block without a streamed routed layer".into()),
+        };
+        scratch_fill(graph, feed_forward.bank, self.load, scope, weights, constants)
+    }
+
+    /// A merge set's pass over the block's routed layer (`group_pass`,
+    /// `general_pass`) over its `ports`, from its crossed rows into its
+    /// merged ones.
+    pub(crate) fn pass<'e, G: GraphDraft + 'e>(
+        &self,
+        graph: &mut G,
+        feed_forward: FeedForwardGraph<'_, 'e, G>,
+        ports: &mut PassPorts,
+        weights: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<WorkflowTensor, GraphError> {
+        let FeedForwardGraph { entries, bank } = feed_forward;
+        let (load, rows, hidden) = (self.load, self.rows, self.geometry.hidden);
+        let general = |operator| GeneralRoutedShape::of(hidden, operator).map_err(|error| error.to_string());
+        match (self.paired.feed_forward.map(|sublayer| sublayer.op), entries) {
+            (Some(FeedForward::Routed(shape)), Some(FeedForwardEntries::Routed(entries))) => routed_graph::group_pass(
+                graph,
+                entries,
+                bank,
+                load,
+                self.scope(1)?,
+                weights,
+                constants,
+                ports,
+                rows,
+                hidden,
+                &ExpertShape::of_operator(shape)?,
+            ),
+            (Some(FeedForward::GeneralRouted(operator)), Some(FeedForwardEntries::GeneralRouted(entries))) => {
+                general_pass(
+                    graph,
+                    entries,
+                    bank,
+                    load,
+                    self.scope(1)?,
+                    weights,
+                    constants,
+                    ports,
+                    rows,
+                    &general(operator)?,
+                )
+            }
+            (Some(FeedForward::Parallel(branches)), Some(FeedForwardEntries::Parallel(entries))) => general_pass(
+                graph,
+                entries.routed,
+                bank,
+                load,
+                DenseBesideRouted::scopes(self.index(1)?)[1],
+                weights,
+                constants,
+                ports,
+                rows,
+                &general(branches.routed)?,
+            ),
+            _ => Err("a pass of a block without a routed layer".into()),
+        }
+    }
+
     /// The block's feed-forward over the mixer's residual `mixed`; a lone
-    /// mixer block's output is `mixed`.
+    /// mixer block's output is `mixed`. A routed feed-forward whose experts
+    /// stream takes its bank (`FeedForwardGraph::bank`), and returns the
+    /// sequence input a run writes when it reads its sequence; a split one
+    /// is built as its front or its back (`split`).
     pub(crate) fn feed_forward<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
-        entries: Option<FeedForwardEntries<'e, G>>,
+        feed_forward: FeedForwardGraph<'_, 'e, G>,
         site: Option<SiteEntries<'e, G>>,
         mixed: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<WorkflowTensor, GraphError> {
+        split: Option<Split<'_>>,
+    ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
+        let FeedForwardGraph { entries, bank } = feed_forward;
         let Self {
             paired,
             load,
@@ -603,7 +713,7 @@ impl BlockSublayers<'_> {
             let source = source.ok_or("a routed feed-forward without its input source")?;
             self.read(graph, source, site, 1, &mixed, weights)
         };
-        Ok(match (paired.feed_forward, entries) {
+        let output = match (paired.feed_forward, entries) {
             (None, None) => mixed,
             (Some(sublayer), Some(entries)) => match (sublayer.op, entries) {
                 (FeedForward::Dense(operator), FeedForwardEntries::Dense(entries)) => {
@@ -627,9 +737,10 @@ impl BlockSublayers<'_> {
                 }
                 (FeedForward::Routed(shape), FeedForwardEntries::Routed(entries)) => {
                     let (input_rows, form, join) = read(graph, weights, sublayer.input)?;
-                    routed_graph::routed(
+                    return routed_graph::routed(
                         graph,
                         entries,
+                        bank,
                         load,
                         scope,
                         weights,
@@ -644,29 +755,35 @@ impl BlockSublayers<'_> {
                         geometry.hidden,
                         &ExpertShape::of_operator(shape)?,
                         epsilon,
-                    )?
+                        split,
+                    );
                 }
                 (
                     FeedForward::GeneralRouted(operator),
                     FeedForwardEntries::GeneralRouted(entries),
-                ) => general_routed(
-                    graph,
-                    entries,
-                    load,
-                    scope,
-                    weights,
-                    constants,
-                    &mixed,
-                    RoutedSum::Residual,
-                    rows,
-                    &GeneralRoutedShape::of(geometry.hidden, operator)
-                        .map_err(|error| error.to_string())?,
-                    epsilon,
-                )?,
-                (FeedForward::Parallel(branches), FeedForwardEntries::Parallel(entries)) => {
-                    parallel(
+                ) => {
+                    return general_routed(
                         graph,
                         entries,
+                        bank,
+                        load,
+                        scope,
+                        weights,
+                        constants,
+                        &mixed,
+                        RoutedSum::Residual,
+                        rows,
+                        &GeneralRoutedShape::of(geometry.hidden, operator)
+                            .map_err(|error| error.to_string())?,
+                        epsilon,
+                        split,
+                    );
+                }
+                (FeedForward::Parallel(branches), FeedForwardEntries::Parallel(entries)) => {
+                    return parallel(
+                        graph,
+                        entries,
+                        bank,
                         load,
                         self.index(1)?,
                         weights,
@@ -678,12 +795,14 @@ impl BlockSublayers<'_> {
                         epsilon,
                         dense_ffn::activation_code(branches.dense.up.activation()),
                         output_scales.feed_forward,
-                    )?
+                        split,
+                    );
                 }
                 _ => return Err("target block feed-forward and its kernel entries disagree".into()),
             },
             _ => return Err("target block feed-forward and its kernel entries disagree".into()),
-        })
+        };
+        Ok((output, None))
     }
 
     /// The block's per-layer input sublayer over `residual`: the new
@@ -732,7 +851,7 @@ impl BlockSublayers<'_> {
                     0,
                     "M",
                 )?;
-                let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
+                let out_rows = GraphConstant::row_identity(graph, rows, Some("M"))?;
                 let advanced = per_layer_graph(
                     graph,
                     entries,
@@ -763,7 +882,7 @@ impl BlockSublayers<'_> {
         &self,
         graph: &mut G,
         parts: Option<NGramParts<'e, G>>,
-        controls: &BlockControlPorts,
+        controls: Option<&BlockControlPorts>,
         residual: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
@@ -783,8 +902,12 @@ impl BlockSublayers<'_> {
             (Some(sublayer), Some(parts)) => (sublayer, parts),
             _ => return Err("target block n-gram input and its kernel entries disagree".into()),
         };
-        let BlockControlPorts::Recurrent(controls) = controls else {
-            return Err("an n-gram input in a block without recurrent controls".into());
+        // Without the block's mixer (a scratch-served block's back), it takes
+        // the slot tables as its own inputs.
+        let controls = match controls {
+            None => None,
+            Some(BlockControlPorts::Recurrent(controls)) => Some(controls),
+            Some(_) => return Err("an n-gram input in a block without recurrent controls".into()),
         };
         let component_index = bank_component_index(&geometry.blocks, block_index)
             .map_err(|error| error.to_string())?
@@ -807,6 +930,7 @@ impl BlockSublayers<'_> {
                 hash: &sublayer.op.hash,
                 epsilon: sublayer.op.key_norm.epsilon as f32,
                 component_index,
+                controls: self.controls(),
             },
         )?;
         Ok((streams, Some(ports)))
@@ -815,95 +939,33 @@ impl BlockSublayers<'_> {
 
 /// A feed-forward's class dimensions for a `rows`-row launch: a routed
 /// feed-forward's grouped entries size their tile table from the row count
-/// alone.
+/// alone, its combine (the fused combine, the general scatter) from the
+/// rows its experts were grouped over, `grouped` (the launch's, or the
+/// chain's after its group's pass).
 pub(crate) fn feed_forward_class_slice(
     paired: &PairedBlock,
     rows: u64,
+    grouped_rows: u64,
     mut slice: NativeGraphClassSlice,
 ) -> Result<NativeGraphClassSlice, String> {
     let grouped = match paired.feed_forward.map(|sublayer| sublayer.op) {
-        Some(FeedForward::Routed(shape)) => Some((
-            shape,
-            &["routed_group", "routed_experts", "routed_combine"][..],
-        )),
+        Some(FeedForward::Routed(shape)) => Some((shape, &["routed_group", "routed_experts"][..], "routed_combine")),
         Some(
             FeedForward::GeneralRouted(shape)
-            | FeedForward::Parallel(super::parallel::DenseBesideRouted { routed: shape, .. }),
-        ) => Some((
-            shape,
-            &[
-                "routed_group",
-                "routed_experts",
-                "routed_experts_up",
-                "routed_scatter",
-            ][..],
-        )),
+            | FeedForward::Parallel(DenseBesideRouted { routed: shape, .. }),
+        ) => Some((shape, &["routed_group", "routed_experts", "routed_experts_up"][..], "routed_scatter")),
         Some(FeedForward::Dense(_)) | None => None,
     };
-    if let Some((shape, entries)) = grouped {
+    if let Some((shape, entries, combine)) = grouped {
         if !routed_graph::decodes(rows) {
             let blocks = routed_graph::grouped_blocks(rows, shape.experts, shape.selected)?;
             for entry in entries {
                 slice = slice.scoped(entry, "B", [blocks]);
             }
+            let blocks = routed_graph::grouped_blocks(grouped_rows, shape.experts, shape.selected)?;
+            slice = slice.scoped(combine, "B", [blocks]);
         }
     }
     Ok(slice)
 }
 
-/// The row-class constants a block's sublayers bind at `rows` rows (for
-/// resource accounting): the row table of a dense or general routed
-/// feed-forward and of a per-layer input tail, a branch's zero root, a
-/// latent sum's zero base and an attention prefill's empty bitmap.
-pub(crate) fn class_constants_of(
-    paired: &PairedBlock,
-    hidden: u64,
-    rows: u64,
-) -> Result<Vec<GraphConstant>, String> {
-    let mut constants = match paired.feed_forward.map(|sublayer| sublayer.op) {
-        Some(FeedForward::Dense(_)) => vec![GraphConstant::identity_value(rows)?],
-        Some(FeedForward::GeneralRouted(operator)) => class_constants(
-            &GeneralRoutedShape::of(hidden, operator).map_err(|error| error.to_string())?,
-            RoutedSum::Residual,
-            rows,
-        )?,
-        // The dense branch's row table, and the routed branch's.
-        Some(FeedForward::Parallel(branches)) => {
-            let mut constants = vec![GraphConstant::identity_value(rows)?];
-            constants.extend(class_constants(
-                &GeneralRoutedShape::of(hidden, branches.routed)
-                    .map_err(|error| error.to_string())?,
-                RoutedSum::Branch,
-                rows,
-            )?);
-            constants
-        }
-        Some(FeedForward::Routed(_)) | None => Vec::new(),
-    };
-    if paired.per_layer.is_some() {
-        constants.push(GraphConstant::identity_value(rows)?);
-    }
-    // A prefill's empty WorkList bitmap (a Visible read's, and a selected
-    // read's in its classes without scoring); a selected multi-row decode's
-    // disabled fused append (`attention::graph`).
-    if let Mixer::Attention(operator) = paired.mixer {
-        if !super::attention::graph::decodes(rows) {
-            constants.push(GraphConstant::u32_zeros_value(rows, 0)?);
-        } else if rows > 1 && matches!(operator.reads, HistoryReads::Selected { .. }) {
-            constants.push(GraphConstant::i32_value(&vec![-1; rows as usize]));
-        }
-    }
-    // The empty inject of an output entry joining a single stream
-    // (`Join::inject`): a mixer's output projection unless it ends in a
-    // post-norm tail, and the fused routed tail.
-    let mixer_joins = matches!(paired.mixer_input, SublayerSource::Norm(_))
-        && post_norm_epsilon(paired.mixer_output).is_none();
-    let feed_forward_joins = paired.feed_forward.is_some_and(|sublayer| {
-        matches!(sublayer.op, FeedForward::Routed(_))
-            && matches!(sublayer.input, Some(SublayerSource::Norm(_)))
-    });
-    if mixer_joins || feed_forward_joins {
-        constants.push(GraphConstant::zeros_value(rows, 0)?);
-    }
-    Ok(constants)
-}

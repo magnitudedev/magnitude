@@ -10,7 +10,10 @@
 use crate::NGramBinding;
 use crate::native::NGramKernels;
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
-use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::graph::{
+    GraphError,
+    draft::{ControlSource, GraphDraft},
+};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{
     GatheredTable, StoredReadPorts, WeightPort, packed_weight, stored_table_rows, weight,
@@ -99,6 +102,9 @@ pub(crate) struct NGramBlock<'h> {
     /// Index of this layer's window in the store's recurrent components;
     /// its token window follows it.
     pub component_index: usize,
+    /// How the graph takes its launch's slot tables, where the block's
+    /// mixer takes none.
+    pub controls: ControlSource,
 }
 
 /// The fragment's state ports (the window, then the token window) and the
@@ -107,6 +113,9 @@ pub(crate) struct NGramPorts {
     pub window: NativePort,
     pub token_window: NativePort,
     pub step: NGramStepPorts,
+    /// The slot tables it takes as its own inputs, in a graph without its
+    /// block's mixer (a scratch-served block's back).
+    pub controls: Option<RecurrentControlPorts>,
 }
 
 /// What each step binds of an n-gram input: its token rows (the entry's kept
@@ -130,7 +139,7 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     residual: &WorkflowTensor,
-    controls: &RecurrentControlPorts,
+    controls: Option<&RecurrentControlPorts>,
     block: NGramBlock<'_>,
 ) -> Result<(WorkflowTensor, NGramPorts), GraphError> {
     let binding = block.binding;
@@ -175,17 +184,33 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
         GraphConstant::u64(graph, &hash.offsets)?,
     ];
     let reset = i32::try_from(hash.reset).map_err(|_| "the n-gram reset token exceeds i32")?;
+    let table_dimensions = [
+        ("M", rows),
+        ("B", block.slots),
+        ("N", banks),
+        ("C", binding.context),
+        ("P", binding.heads_per_order),
+        ("T", tape),
+    ];
+    let mut made = None;
+    let controls = match controls {
+        Some(controls) => controls,
+        None => {
+            let mut table =
+                |name| graph.control_for(block.controls, entries.rows, name, &table_dimensions);
+            made.insert(RecurrentControlPorts {
+                segments: table("segments")?,
+                stop: table("stop")?,
+                previous_bank: table("previous_bank")?,
+                previous_tape: table("previous_tape")?,
+                following_bank: table("following_bank")?,
+            })
+        }
+    };
     let table_rows = graph
         .enqueue(
             entries.rows,
-            &[
-                ("M", rows),
-                ("B", block.slots),
-                ("N", banks),
-                ("C", binding.context),
-                ("P", binding.heads_per_order),
-                ("T", tape),
-            ],
+            &table_dimensions,
             ngram_rows::WorkflowArgs {
                 tokens: tokens.tensor().into(),
                 multipliers: rule[0].port().tensor().into(),
@@ -303,6 +328,7 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
                 tokens,
                 table: table_ports,
             },
+            controls: made,
         },
     ))
 }

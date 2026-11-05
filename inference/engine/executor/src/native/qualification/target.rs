@@ -2,6 +2,7 @@ use super::super::*;
 use super::*;
 use crate::ReadoutHead;
 use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
+use crate::planning::RecordTensors;
 use magnitude_family_contracts::ProgressivePlane;
 
 impl<'a> QualificationView<'a> {
@@ -30,7 +31,9 @@ impl<'a> QualificationView<'a> {
         SublayerRows::of(self.geometry, source, label)
     }
 
-    pub(super) fn qualify_target(&self, device: &Device) -> Result<(), CatalogFailure> {
+    /// Qualify the target's entries; each sited streamed block's site
+    /// admission, by block index.
+    pub(super) fn qualify_target(&self, device: &Device) -> Result<Vec<(usize, crate::assessment::Priced<()>)>, CatalogFailure> {
         let out_rows = semantic_i32(device, &[1], &[0], "target", "out_rows")?;
         let hidden = self.geometry.hidden;
         let hidden_values = vec![1.0_f32; hidden as usize];
@@ -501,7 +504,7 @@ impl<'a> QualificationView<'a> {
             };
             let rows = self.feed_forward_rows(block, &format!("{binding:?}"))?;
             if qualified.insert((binding, rows)) {
-                qualify_routed(device, binding, kernels, rows)?;
+                qualify_routed(device, binding, kernels, rows, &ExpertReads::routed(device, binding)?)?;
             }
         }
 
@@ -521,7 +524,7 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_general_routed(device, binding, kernels)?;
+                qualify_general_routed(device, binding, kernels, &ExpertReads::general(device, binding)?)?;
             }
         }
 
@@ -544,6 +547,45 @@ impl<'a> QualificationView<'a> {
                 qualify_parallel(device, binding, kernels, &hidden_residual, &hidden_values)?;
             }
         }
+
+        // Each streamed layer's bank entries, and its routed form's shared
+        // entries as the bank serves them; once per binding, each sited
+        // block's stored site verdict.
+        let banks = std::time::Instant::now();
+        let mut qualified = std::collections::HashMap::<_, Option<crate::assessment::Priced<()>>>::new();
+        let mut admitted = Vec::new();
+        for (index, ((slot, attested), block)) in self
+            .plan
+            .target()
+            .blocks()
+            .iter()
+            .zip(&self.programs.target.blocks)
+            .zip(&self.geometry.blocks)
+            .enumerate()
+        {
+            let (Some((banked, binding)), Some(bank), Some(feed_forward)) =
+                (slot.bank(), &attested.bank, &attested.feed_forward)
+            else {
+                continue;
+            };
+            let rows = self.feed_forward_rows(block, &format!("{banked:?}"))?;
+            let admission = match qualified.entry((banked, binding, rows)) {
+                std::collections::hash_map::Entry::Occupied(admission) => admission.get().clone(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let requirement = self.profile.requirement_of(bank.site.as_ref().and_then(|site| site.form.activation.dtype()));
+                    let admission = super::bank::qualify_bank(device, banked, binding, bank, feed_forward, rows, &requirement, self.cache)?;
+                    vacant.insert(admission).clone()
+                }
+            };
+            if let Some(admission) = admission {
+                admitted.push((index, admission));
+            }
+        }
+        tracing::info!(
+            "qualified {} streamed bank bindings in {:.2} s",
+            qualified.len(),
+            banks.elapsed().as_secs_f64()
+        );
 
         // The readout reads the decoder's exit: the final row under the exit
         // norm, or the exit site's partials, unnormalized.
@@ -696,37 +738,132 @@ impl<'a> QualificationView<'a> {
                 .value;
             require_finite_nonzero(&result, "readout_features_rows", &label)?;
         }
-        Ok(())
+        Ok(admitted)
+    }
+}
+
+/// Where the shared routed entries read each choice's expert: the grouped
+/// entries through the map (`[X, MAP_WORDS]`) at the step (`[QS]`), the
+/// records it holds for the step (each expert's by index where it is
+/// empty), the stacks they read an expert from that it holds no record for;
+/// the decode entries (`decode_source`) where the route's sources name,
+/// `decode_record`.
+pub(super) struct ExpertReads {
+    pub map: Tensor,
+    pub step: Tensor,
+    /// The record of `records` every decode choice's sources name
+    /// (SOURCE_RECORD: `XS` SOURCE_ROWS), or none, each
+    /// choice reading its expert's by index (`XS` 0).
+    pub decode_record: Option<i32>,
+    pub records: RecordTensors<Tensor>,
+    pub stacks: RecordTensors<Tensor>,
+    /// The decode entries' host tier records (`TR` of them, as a bank's
+    /// entries are prepared for its tier), which no source names; none:
+    /// views of no records.
+    pub tier: Option<RecordTensors<Tensor>>,
+}
+
+impl ExpertReads {
+    /// The resident shape: zero one-expert stacks of each routed tensor's
+    /// element and matrix `[N, K]`, read by index through an empty slot map.
+    fn resident(
+        device: &Device,
+        record: RecordTensors<(Element, [u64; 2])>,
+        label: &str,
+    ) -> Result<Self, CatalogFailure> {
+        let stacks = record.try_map(|_, (element, [n, k])| {
+            semantic_zeros(device, element, &[1, n, k], "target_routed", label)
+        })?;
+        Ok(Self {
+            map: semantic_zeros(device, Element::i32(), &[0, magnitude_kernels::constants::MAP_WORDS], "target_routed", label)?,
+            step: semantic_zeros(device, Element::i32(), &[0], "target_routed", label)?,
+            decode_record: None,
+            records: stacks.clone(),
+            stacks,
+            tier: None,
+        })
+    }
+
+    /// The decode entries' `sources` of `rows` rows of `selected` choices:
+    /// none (`[0, rows, selected]`) without a decode record, else each
+    /// choice's the decode record as the resolve writes it
+    /// (`magnitude_kernels::source_words`; none the CPU's).
+    fn sources(&self, device: &Device, rows: u64, selected: u64, label: &str) -> Result<Tensor, CatalogFailure> {
+        use magnitude_kernels::constants::SOURCE_ROWS;
+        let entry = "target_routed";
+        let Some(record) = self.decode_record else {
+            return semantic_zeros(device, Element::i32(), &[0, rows, selected], entry, label);
+        };
+        let choices = usize::try_from(rows * selected).map_err(|error| qualification_dynamic(entry, label, error))?;
+        let words = magnitude_kernels::source_words(&vec![record; choices], &vec![-1; choices]);
+        semantic_i32(device, &[SOURCE_ROWS, rows, selected], &words, entry, label)
+    }
+
+    /// The decode entries' host tier records: the bank's (`Self::tier`),
+    /// else none (`TR` 0), views of no records of `records`.
+    fn tier_records(&self, label: &str) -> Result<RecordTensors<Tensor>, CatalogFailure> {
+        if let Some(tier) = &self.tier {
+            return Ok(tier.clone());
+        }
+        self.records.as_ref().try_map(|_, records| {
+            records.slice_leading(0, 0).map_err(|error| qualification_dynamic("target_routed", label, error))
+        })
+    }
+
+    /// A fused routed binding's resident shape.
+    pub(super) fn routed(device: &Device, binding: RoutedBinding) -> Result<Self, CatalogFailure> {
+        let (h, f) = (binding.hidden, binding.features);
+        let record = RecordTensors {
+            gate: Some((binding.expert_gate, [f, h])),
+            up: (binding.expert_up, [f, h]),
+            down: (binding.expert_down, [h, f]),
+        };
+        Self::resident(device, record, &format!("{binding:?}"))
+    }
+
+    /// A general routed binding's resident shape, in the experts' width.
+    pub(super) fn general(
+        device: &Device,
+        binding: crate::GeneralRoutedBinding,
+    ) -> Result<Self, CatalogFailure> {
+        let (f, x) = (binding.shape.intermediate, binding.shape.expert_hidden);
+        let record = RecordTensors {
+            gate: binding.expert_gate.map(|gate| (gate, [f, x])),
+            up: (binding.expert_up, [f, x]),
+            down: (binding.expert_down, [x, f]),
+        };
+        Self::resident(device, record, &format!("{binding:?}"))
     }
 }
 
 /// The routed entries at the model's routed geometry (they fix it
 /// statically) with zero weights, so both forms leave the residual unchanged.
 /// The route runs over the full expert range; the projections read expert 0
-/// of one-expert tensors through all-zero routes.
+/// through all-zero routes where `reads` places it.
 pub(super) fn qualify_routed(
     device: &Device,
     binding: RoutedBinding,
     kernels: &RoutedKernels,
     sublayer: SublayerRows,
+    reads: &ExpertReads,
 ) -> Result<(), CatalogFailure> {
     let label = format!("{binding:?}");
-    let (h, e, k, f, s) = (
-        binding.hidden,
-        binding.experts,
-        binding.selected,
-        binding.features,
-        binding.shared,
-    );
+    let (h, e, k, s) = (binding.hidden, binding.experts, binding.selected, binding.shared);
     let zeros = |element: Element, extents: &[u64]| {
         semantic_zeros(device, element, extents, "target_routed", &label)
     };
+    let gate = |record: &RecordTensors<Tensor>| {
+        record
+            .gate
+            .clone()
+            .ok_or_else(|| qualification_dynamic("target_routed", &label, "a fused routed record has no gate"))
+    };
+    let (records_gate, stacks_gate) = (gate(&reads.records)?, gate(&reads.stacks)?);
+    let tier = reads.tier_records(&label)?;
+    let tier_gate = gate(&tier)?;
     let norm = sublayer.norm(device, binding.norm, h, "target_routed", &label)?;
     let router = zeros(binding.router, &[e, h])?;
     let shared_router = zeros(Element::f32(), &[h])?;
-    let expert_gate = zeros(binding.expert_gate, &[1, f, h])?;
-    let expert_up = zeros(binding.expert_up, &[1, f, h])?;
-    let expert_down = zeros(binding.expert_down, &[1, h, f])?;
     let shared_gate = zeros(binding.shared_gate, &[s, h])?;
     let shared_up = zeros(binding.shared_up, &[s, h])?;
     let shared_down = zeros(binding.shared_down, &[h, s])?;
@@ -756,7 +893,9 @@ pub(super) fn qualify_routed(
                 .map_err(|error| qualification_dynamic("routed_route", &label, error))
         };
         let first = zeros(Element::i32(), &[rows, k])?;
+        let (map, step) = (&reads.map, &reads.step);
         let result = if rows <= DECODE_ROWS {
+            let sources = reads.sources(device, rows, k, &label)?;
             let (expert_product, shared_product, coefficient) = match &kernels.decode {
                 RoutedDecodeKernels::Expand(expand) => {
                     let routed = route(&mut routes, &mut scores)?;
@@ -764,8 +903,8 @@ pub(super) fn qualify_routed(
                         .call(routed_expand::Args {
                             normalized: &routed.r0,
                             routes: &first,
-                            expert_gate: &expert_gate,
-                            expert_up: &expert_up,
+                            expert_gate: &records_gate,
+                            expert_up: &reads.records.up,
                             shared_gate: &shared_gate,
                             shared_up: &shared_up,
                             gate_scale: &unit_scale(device, expand, "GS", "routed_expand", &label)?,
@@ -796,8 +935,11 @@ pub(super) fn qualify_routed(
                         .call(routed_gate_up::Args {
                             normalized: &routed.r0,
                             routes: &first,
-                            expert_gate: &expert_gate,
-                            expert_up: &expert_up,
+                            sources: &sources,
+                            expert_gate: &records_gate,
+                            expert_up: &reads.records.up,
+                            tier_gate: &tier_gate,
+                            tier_up: &tier.up,
                             activation: 0,
                             gate_scale: &unit_scale(device, choices, "GS", "routed_gate_up", &label)?,
                             up_scale: &unit_scale(device, choices, "US", "routed_gate_up", &label)?,
@@ -815,9 +957,11 @@ pub(super) fn qualify_routed(
                     expert_product: &expert_product,
                     shared_product: &shared_product,
                     routes: &first,
+                    sources: &sources,
                     scores: &scores,
                     coefficient: &coefficient,
-                    expert_down: &expert_down,
+                    expert_down: &reads.records.down,
+                    tier_down: &tier.down,
                     shared_down: &shared_down,
                 })
                 .map_err(|error| qualification_dynamic("routed_output", &label, error))?
@@ -826,29 +970,43 @@ pub(super) fn qualify_routed(
             let routed = route(&mut routes, &mut scores)?;
             let blocks = grouped_blocks(rows, e, k)
                 .map_err(|error| qualification_dynamic("routed_group", &label, error))?;
+            let grouped = semantic_i32(device, &[1], &[rows as i32], "routed_group", &label)?;
+            let from_row = semantic_i32(device, &[1], &[0], "routed_group", &label)?;
             let mut counts = zeros(Element::i32(), &[e])?;
             let mut order = zeros(Element::i32(), &[blocks, TILE_ROWS])?;
             let mut inverse = zeros(Element::i32(), &[rows, k])?;
             let mut block_experts = zeros(Element::i32(), &[blocks])?;
+            let mut used = zeros(Element::i32(), &[1])?;
             kernels
                 .group
                 .call(routed_group::Args {
+                    first: &from_row,
+                    rows: &grouped,
                     routes: &first,
                     counts: &mut counts,
                     order: &mut order,
                     inverse: &mut inverse,
                     blocks: &mut block_experts,
+                    used: &mut used,
                 })
                 .map_err(|error| qualification_dynamic("routed_group", &label, error))?;
             let experts = kernels
                 .experts
                 .call(routed_experts::Args {
+                    first: &from_row,
+                    rows: &grouped,
                     normalized: &routed.r0,
                     order: &order,
                     blocks: &block_experts,
-                    expert_gate: &expert_gate,
-                    expert_up: &expert_up,
-                    expert_down: &expert_down,
+                    used: &used,
+                    expert_gate: &stacks_gate,
+                    expert_up: &reads.stacks.up,
+                    expert_down: &reads.stacks.down,
+                    map,
+                    step,
+                    records_gate: &records_gate,
+                    records_up: &reads.records.up,
+                    records_down: &reads.records.down,
                     activation: 0,
                     gate_scale: &unit_scale(device, &kernels.experts, "GS", "routed_experts", &label)?,
                     up_scale: &unit_scale(device, &kernels.experts, "US", "routed_experts", &label)?,
@@ -877,10 +1035,6 @@ pub(super) fn qualify_routed(
     Ok(())
 }
 
-/// A general routed sublayer at the model's geometry with zero weights, at
-/// one decode row and one grouped row class: every choice routes to one
-/// zero expert (expert tensors of one expert), the shared expert and latent
-/// projections are zero, so the residual comes back unchanged.
 /// A parallel sublayer: its routed branch as a general routed sublayer, then
 /// the dense branch over zero weights and `moe_tail` over zero branch
 /// outputs, which leaves the residual unchanged.
@@ -891,7 +1045,12 @@ fn qualify_parallel(
     hidden_residual: &Tensor,
     hidden_values: &[f32],
 ) -> Result<(), CatalogFailure> {
-    qualify_general_routed(device, binding.routed, &kernels.routed)?;
+    qualify_general_routed(
+        device,
+        binding.routed,
+        &kernels.routed,
+        &ExpertReads::general(device, binding.routed)?,
+    )?;
     let label = format!("{binding:?}");
     let hidden = binding.hidden;
     let dense = binding.dense;
@@ -946,10 +1105,15 @@ fn qualify_parallel(
     require_f32_values(&result, hidden_values, "moe_tail", &label)
 }
 
-fn qualify_general_routed(
+/// A general routed sublayer at the model's geometry with zero weights, at
+/// one decode row and one grouped row class: every choice routes to expert
+/// 0, read where `reads` places it, the shared expert and latent
+/// projections are zero, so the residual comes back unchanged.
+pub(super) fn qualify_general_routed(
     device: &Device,
     binding: crate::GeneralRoutedBinding,
     kernels: &GeneralRoutedKernels,
+    reads: &ExpertReads,
 ) -> Result<(), CatalogFailure> {
     let label = format!("{binding:?}");
     let entry = "target_general_routed";
@@ -957,13 +1121,7 @@ fn qualify_general_routed(
     let scale = |extent| semantic_ones(device, Element::f32(), &[extent], entry, &label);
     let scales = binding.scales;
     let shape = binding.shape;
-    let (h, e, k, f, x) = (
-        shape.hidden,
-        shape.experts,
-        shape.selected,
-        shape.intermediate,
-        shape.expert_hidden,
-    );
+    let (h, e, k, x) = (shape.hidden, shape.experts, shape.selected, shape.expert_hidden);
     let zeros =
         |element: Element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
     macro_rules! failed {
@@ -975,12 +1133,12 @@ fn qualify_general_routed(
     let router_norm = zeros(binding.router_norm, &[h])?;
     let router = zeros(binding.router, &[e, h])?;
     let bias = zeros(Element::f32(), &[e])?;
-    let expert_gate = binding
-        .expert_gate
-        .map(|gate| zeros(gate, &[1, f, x]))
-        .transpose()?;
-    let expert_up = zeros(binding.expert_up, &[1, f, x])?;
-    let expert_down = zeros(binding.expert_down, &[1, x, f])?;
+    // A gated entry's gate: the record's, or of an up-only record its up's.
+    let gate = |record: &RecordTensors<Tensor>| record.gate.clone().unwrap_or_else(|| record.up.clone());
+    let (records_gate, stacks_gate) = (gate(&reads.records), gate(&reads.stacks));
+    let tier = reads.tier_records(&label)?;
+    let tier_gate = gate(&tier);
+    let (map, step) = (&reads.map, &reads.step);
     for rows in [1, DECODE_ROWS * 2] {
         let values = vec![1.0_f32; (rows * h) as usize];
         let residual = semantic_f32(device, &[rows, h], &values, entry, &label)?;
@@ -1092,17 +1250,21 @@ fn qualify_general_routed(
             ),
             _ => (normalized, base.clone()),
         };
-        // Every choice routes to the one zero expert.
+        // Every choice routes to expert 0.
         let first = zeros(Element::i32(), &[rows, k])?;
         let routed = if rows <= DECODE_ROWS {
+            let sources = reads.sources(device, rows, k, &label)?;
             let product = match &kernels.experts {
                 ExpertKernels::Gated { decode, .. } => {
                     decode
                         .call(routed_gate_up::Args {
                             normalized: &input,
                             routes: &first,
-                            expert_gate: expert_gate.as_ref().unwrap_or(&expert_up),
-                            expert_up: &expert_up,
+                            sources: &sources,
+                            expert_gate: &records_gate,
+                            expert_up: &reads.records.up,
+                            tier_gate: &tier_gate,
+                            tier_up: &tier.up,
                             activation: shape.experts_expansion.activation,
                             gate_scale: &unit_scale(device, decode, "GS", "routed_gate_up", &label)?,
                             up_scale: &unit_scale(device, decode, "US", "routed_gate_up", &label)?,
@@ -1115,7 +1277,9 @@ fn qualify_general_routed(
                         .call(routed_up::Args {
                             normalized: &input,
                             routes: &first,
-                            expert_up: &expert_up,
+                            sources: &sources,
+                            expert_up: &reads.records.up,
+                            tier_up: &tier.up,
                             up_scale: &unit_scale(device, decode, "US", "routed_up", &label)?,
                             activation: shape.experts_expansion.activation,
                         })
@@ -1129,37 +1293,60 @@ fn qualify_general_routed(
                     base: &sum_base,
                     product: &product,
                     routes: &first,
+                    sources: &sources,
                     weights: &weights,
-                    expert_down: &expert_down,
+                    expert_down: &reads.records.down,
+                    tier_down: &tier.down,
+                    policy: &semantic_i32(
+                        device,
+                        &[magnitude_kernels::constants::POLICY_WORDS],
+                        &[0; magnitude_kernels::constants::POLICY_WORDS as usize],
+                        "routed_down",
+                        &label,
+                    )?,
                 })
                 .map_err(failed!("routed_down"))?
                 .value
         } else {
             let blocks = grouped_blocks(rows, e, k).map_err(failed!("routed_group"))?;
+            let grouped_rows = semantic_i32(device, &[1], &[rows as i32], "routed_group", &label)?;
+            let from_row = semantic_i32(device, &[1], &[0], "routed_group", &label)?;
             let mut counts = zeros(Element::i32(), &[e])?;
             let mut order = zeros(Element::i32(), &[blocks, TILE_ROWS])?;
             let mut inverse = zeros(Element::i32(), &[rows, k])?;
             let mut block_experts = zeros(Element::i32(), &[blocks])?;
+            let mut used = zeros(Element::i32(), &[1])?;
             kernels
                 .group
                 .call(routed_group::Args {
+                    first: &from_row,
+                    rows: &grouped_rows,
                     routes: &first,
                     counts: &mut counts,
                     order: &mut order,
                     inverse: &mut inverse,
                     blocks: &mut block_experts,
+                    used: &mut used,
                 })
                 .map_err(failed!("routed_group"))?;
             let expert_output = match &kernels.experts {
                 ExpertKernels::Gated { grouped, .. } => {
                     grouped
                         .call(routed_experts::Args {
+                            first: &from_row,
+                            rows: &grouped_rows,
                             normalized: &input,
                             order: &order,
                             blocks: &block_experts,
-                            expert_gate: expert_gate.as_ref().unwrap_or(&expert_up),
-                            expert_up: &expert_up,
-                            expert_down: &expert_down,
+                            used: &used,
+                            expert_gate: &stacks_gate,
+                            expert_up: &reads.stacks.up,
+                            expert_down: &reads.stacks.down,
+                            map,
+                            step,
+                            records_gate: &records_gate,
+                            records_up: &reads.records.up,
+                            records_down: &reads.records.down,
                             activation: shape.experts_expansion.activation,
                             gate_scale: &unit_scale(device, grouped, "GS", "routed_experts", &label)?,
                             up_scale: &unit_scale(device, grouped, "US", "routed_experts", &label)?,
@@ -1170,11 +1357,18 @@ fn qualify_general_routed(
                 ExpertKernels::Plain { grouped, .. } => {
                     grouped
                         .call(routed_experts_up::Args {
+                            first: &from_row,
+                            rows: &grouped_rows,
                             normalized: &input,
                             order: &order,
                             blocks: &block_experts,
-                            expert_up: &expert_up,
-                            expert_down: &expert_down,
+                            used: &used,
+                            expert_up: &reads.stacks.up,
+                            expert_down: &reads.stacks.down,
+                            map,
+                            step,
+                            records_up: &reads.records.up,
+                            records_down: &reads.records.down,
                             up_scale: &unit_scale(device, grouped, "US", "routed_experts_up", &label)?,
                             activation: shape.experts_expansion.activation,
                         })

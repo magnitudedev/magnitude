@@ -139,20 +139,20 @@ impl<'a> ReadoutContender<'a> {
     }
 }
 
-/// Resolve the declaration's complete fixed configuration at `entry`'s
-/// element bindings, including tuning parameters. A composed comparison
-/// forms these defaults without searching the component kernels
-/// independently.
+/// Resolve the declaration's complete fixed configuration, including tuning
+/// parameters, at the element bindings `entry` prepares (its `where` may
+/// read them, as `form(OW, MATRIX)` does), as `device` offers it. A
+/// composed comparison forms these defaults without searching the
+/// component kernels independently.
 fn declared_defaults<E: Entry>(
-    backend: BackendName,
+    device: &seismic::Device,
     entry: &BoundEntry<E>,
     statics: &NativeSpecialization,
 ) -> Result<NativeSpecialization, CatalogFailure> {
-    seismic::generated::native_implementation_at::<E>(backend, entry.elements())
+    entry
+        .default_specialization(device, statics)
         .map_err(fail)?
-        .ok_or_else(|| fail("readout recipe has no native implementation"))?
-        .default_specialization(statics)
-        .map_err(fail)
+        .ok_or_else(|| fail("readout recipe kernel admits no default at its statics"))
 }
 
 impl ReadoutRecipe {
@@ -183,43 +183,42 @@ impl ReadoutRecipe {
         entry_statics(backend, entry, "readout_recipe", &self.values())
     }
 
-    fn top(self) -> BoundEntry<readout_top_rows::Entry> {
+    /// The bounded top level's entry.
+    fn top_entry(self) -> BoundEntry<readout_top_rows::Entry> {
         readout_top_rows::native_entry_with(readout_top_rows::Elements {
             NW: self.norm,
             A: self.activation,
         })
     }
 
-    fn refine(self) -> BoundEntry<readout_refine_rows::Entry> {
+    /// The bounded refinement level's entry.
+    fn refine_entry(self) -> BoundEntry<readout_refine_rows::Entry> {
         readout_refine_rows::native_entry_with(readout_refine_rows::Elements { A: self.activation })
     }
 
-    fn exact(self) -> BoundEntry<readout_exact_rows::Entry> {
+    /// The bounded exact level's entry.
+    fn exact_entry(self) -> BoundEntry<readout_exact_rows::Entry> {
         readout_exact_rows::native_entry_with(readout_exact_rows::Elements { A: self.activation })
     }
 
-    fn planes(self) -> BoundEntry<readout_planes_rows::Entry> {
+    /// The bounded planes level's entry.
+    fn planes_entry(self) -> BoundEntry<readout_planes_rows::Entry> {
         readout_planes_rows::native_entry_with(readout_planes_rows::Elements {
             NW: self.norm,
             A: self.activation,
         })
     }
 
-    fn feature_rows(self) -> BoundEntry<readout_features_rows::Entry> {
+    /// The feature preparation's entry.
+    fn features_entry(self) -> BoundEntry<readout_features_rows::Entry> {
         readout_features_rows::native_entry_with(readout_features_rows::Elements {
             NW: self.norm,
             A: self.activation,
         })
     }
 
-    fn project(self) -> BoundEntry<readout_project_rows::Entry> {
-        readout_project_rows::native_entry_with(readout_project_rows::Elements {
-            OW: self.weight,
-            A: self.activation,
-        })
-    }
-
-    fn head(self) -> BoundEntry<readout_head_rows::Entry> {
+    /// The canonical projection's entry over raw hidden rows.
+    fn head_entry(self) -> BoundEntry<readout_head_rows::Entry> {
         readout_head_rows::native_entry_with(readout_head_rows::Elements {
             NW: self.norm,
             OW: self.weight,
@@ -227,61 +226,36 @@ impl ReadoutRecipe {
         })
     }
 
+    /// The canonical projection's entry over prepared features.
+    fn project_entry(self) -> BoundEntry<readout_project_rows::Entry> {
+        readout_project_rows::native_entry_with(readout_project_rows::Elements {
+            OW: self.weight,
+            A: self.activation,
+        })
+    }
+
+    /// The identity of `entry`'s program in this recipe on `device`.
+    fn digest<E: Entry>(
+        self,
+        device: &seismic::Device,
+        entry: &BoundEntry<E>,
+    ) -> Result<String, CatalogFailure> {
+        entry
+            .digest(device, &self.statics(device.backend(), entry)?)
+            .map_err(fail)
+    }
+
     /// The identity of the recipe's programs on `device`: its four bounded
     /// levels and its canonical projection, each at its own statics.
     pub(crate) fn digests(self, device: &seismic::Device) -> Result<[String; 5], CatalogFailure> {
         Ok([
-            readout_top_rows::native_digest_with(
-                device,
-                readout_top_rows::Elements {
-                    NW: self.norm,
-                    A: self.activation,
-                },
-                &self.statics(device.backend(), &self.top())?,
-            )
-            .map_err(fail)?,
-            readout_refine_rows::native_digest_with(
-                device,
-                readout_refine_rows::Elements { A: self.activation },
-                &self.statics(device.backend(), &self.refine())?,
-            )
-            .map_err(fail)?,
-            readout_exact_rows::native_digest_with(
-                device,
-                readout_exact_rows::Elements { A: self.activation },
-                &self.statics(device.backend(), &self.exact())?,
-            )
-            .map_err(fail)?,
-            readout_planes_rows::native_digest_with(
-                device,
-                readout_planes_rows::Elements {
-                    NW: self.norm,
-                    A: self.activation,
-                },
-                &self.statics(device.backend(), &self.planes())?,
-            )
-            .map_err(fail)?,
-            if self.prepared {
-                readout_project_rows::native_digest_with(
-                    device,
-                    readout_project_rows::Elements {
-                        OW: self.weight,
-                        A: self.activation,
-                    },
-                    &self.statics(device.backend(), &self.project())?,
-                )
-                .map_err(fail)?
-            } else {
-                readout_head_rows::native_digest_with(
-                    device,
-                    readout_head_rows::Elements {
-                        NW: self.norm,
-                        OW: self.weight,
-                        A: self.activation,
-                    },
-                    &self.statics(device.backend(), &self.head())?,
-                )
-                .map_err(fail)?
+            self.digest(device, &self.top_entry())?,
+            self.digest(device, &self.refine_entry())?,
+            self.digest(device, &self.exact_entry())?,
+            self.digest(device, &self.planes_entry())?,
+            match self.prepared {
+                true => self.digest(device, &self.project_entry())?,
+                false => self.digest(device, &self.head_entry())?,
             },
         ])
     }
@@ -291,20 +265,9 @@ impl ReadoutRecipe {
         self,
         device: &seismic::Device,
     ) -> Result<NativeKernel<readout_features_rows::Entry>, CatalogFailure> {
-        let entry = self.feature_rows();
+        let entry = self.features_entry();
         let statics = self.statics(device.backend(), &entry)?;
         prepare_program(device, entry, &statics).map_err(fail)
-    }
-
-    /// `entry` formed at its declared defaults in this recipe.
-    fn fixed<E: Entry>(
-        self,
-        device: &seismic::Device,
-        entry: BoundEntry<E>,
-    ) -> Result<NativeKernel<E>, CatalogFailure> {
-        let backend = device.backend();
-        let defaults = declared_defaults(backend, &entry, &self.statics(backend, &entry)?)?;
-        prepare_program(device, entry, &defaults).map_err(fail)
     }
 
     /// Row-independent fixed programs are formed once per exact physical
@@ -325,17 +288,23 @@ impl ReadoutRecipe {
         Ok(formed)
     }
 
+    /// `entry` prepared at its declared defaults at this recipe's statics.
+    fn at_defaults<E: Entry>(
+        self,
+        device: &seismic::Device,
+        entry: BoundEntry<E>,
+    ) -> Result<NativeKernel<E>, CatalogFailure> {
+        let defaults = declared_defaults(device, &entry, &self.statics(device.backend(), &entry)?)?;
+        prepare_program(device, entry, &defaults).map_err(fail)
+    }
+
     /// Form the recipe's four programs, to the end.
     fn form(self, device: &seismic::Device) -> Result<QualifiedRecipe, CatalogFailure> {
-        let top = self.fixed(device, self.top())?;
-        let refine = self.fixed(device, self.refine())?;
-        let exact = self.fixed(device, self.exact())?;
-        let planes = self.fixed(device, self.planes())?;
         let progressive = ProgressiveReadoutKernels {
-            top,
-            refine,
-            exact,
-            planes,
+            top: self.at_defaults(device, self.top_entry())?,
+            refine: self.at_defaults(device, self.refine_entry())?,
+            exact: self.at_defaults(device, self.exact_entry())?,
+            planes: self.at_defaults(device, self.planes_entry())?,
         };
         Ok(QualifiedRecipe {
             progressive: Some(progressive),
@@ -349,11 +318,11 @@ impl ReadoutRecipe {
         specialization: &NativeSpecialization,
     ) -> Result<ProjectionKernels, CatalogFailure> {
         if self.prepared {
-            prepare_program(device, self.project(), specialization)
+            prepare_program(device, self.project_entry(), specialization)
                 .map(ProjectionKernels::PreparedPacked)
                 .map_err(fail)
         } else {
-            prepare_program(device, self.head(), specialization)
+            prepare_program(device, self.head_entry(), specialization)
                 .map(ProjectionKernels::RawPacked)
                 .map_err(fail)
         }
@@ -764,6 +733,9 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
     fn dependencies(&self) -> Vec<TuningKey> {
         vec![self.dependency.clone()]
     }
+    fn pin_identity(&self) -> String {
+        format!("{:?}/rows={}", self.recipe, self.point.rows)
+    }
     fn label(&self) -> &'static str {
         "readout_recipe"
     }
@@ -787,17 +759,11 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         };
         // Census prices the optional recipe with the native default. Admission
         // later compares against the dependency's finalized ordinary choice.
-        let statics = self
-            .dependency
-            .2
-            .iter()
-            .fold(NativeSpecialization::new(), |spec, (name, value)| {
-                spec.with_static(name.clone(), *value)
-            });
+        let statics = self.dependency.2.specialization();
         let default = if self.recipe.prepared {
-            declared_defaults(inputs.device.backend(), &self.recipe.project(), &statics)?
+            declared_defaults(inputs.device, &self.recipe.project_entry(), &statics)?
         } else {
-            declared_defaults(inputs.device.backend(), &self.recipe.head(), &statics)?
+            declared_defaults(inputs.device, &self.recipe.head_entry(), &statics)?
         };
         let packed = self.recipe.canonical(inputs.device, &default)?;
         let mut case = match RecipeCase::new(inputs, self.recipe, self.point.rows, 1) {
@@ -1030,10 +996,13 @@ mod tests {
     #[test]
     fn every_recipe_program_takes_its_own_statics() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        for backend in [BackendName::Metal, BackendName::Cuda] {
-            let Ok(device) = catalog.open_backend(backend) else {
-                continue;
-            };
+        let available = [BackendName::Metal, BackendName::Cuda]
+            .into_iter()
+            .filter(|&backend| crate::test_support::available(&catalog, backend));
+        for backend in available {
+            let device = catalog
+                .open_backend(backend)
+                .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"));
             let weight =
                 Element::stored("q8g32s", resident_layout(ExecutionPath::Native, backend)).unwrap();
             for (parts, norm_extent) in [(1, 2048), (4, 0)] {
@@ -1066,15 +1035,15 @@ mod tests {
                         .features(&device)
                         .unwrap_or_else(|error| panic!("{form}: {error:?}"));
                     let default = if prepared {
-                        let project = recipe.project();
+                        let project = recipe.project_entry();
                         recipe
                             .statics(backend, &project)
-                            .and_then(|statics| declared_defaults(backend, &project, &statics))
+                            .and_then(|statics| declared_defaults(&device, &project, &statics))
                     } else {
-                        let head = recipe.head();
+                        let head = recipe.head_entry();
                         recipe
                             .statics(backend, &head)
-                            .and_then(|statics| declared_defaults(backend, &head, &statics))
+                            .and_then(|statics| declared_defaults(&device, &head, &statics))
                     }
                     .unwrap_or_else(|error| panic!("{form}: {error:?}"));
                     recipe
@@ -1101,9 +1070,13 @@ mod tests {
             entry: BoundEntry<E>,
             form: &str,
         ) {
-            recipe
+            let statics = recipe
                 .statics(backend, &entry)
-                .and_then(|statics| declared_defaults(backend, &entry, &statics))
+                .unwrap_or_else(|error| panic!("{} {form}: {error:?}", E::NAME));
+            seismic::generated::native_implementation_at::<E>(backend, entry.elements())
+                .unwrap_or_else(|error| panic!("{} {form}: {error:?}", E::NAME))
+                .unwrap_or_else(|| panic!("{} {form}: no implementation", E::NAME))
+                .default_specialization(&statics)
                 .unwrap_or_else(|error| panic!("{} {form}: {error:?}", E::NAME));
         }
         for backend in [BackendName::Metal, BackendName::Cuda] {
@@ -1128,15 +1101,15 @@ mod tests {
                         scale_extent: 0,
                     };
                     let form = format!("{backend:?} V={vocabulary} prepared={prepared}");
-                    admitted(recipe, backend, recipe.top(), &form);
-                    admitted(recipe, backend, recipe.refine(), &form);
-                    admitted(recipe, backend, recipe.exact(), &form);
-                    admitted(recipe, backend, recipe.planes(), &form);
-                    admitted(recipe, backend, recipe.feature_rows(), &form);
+                    admitted(recipe, backend, recipe.top_entry(), &form);
+                    admitted(recipe, backend, recipe.refine_entry(), &form);
+                    admitted(recipe, backend, recipe.exact_entry(), &form);
+                    admitted(recipe, backend, recipe.planes_entry(), &form);
+                    admitted(recipe, backend, recipe.features_entry(), &form);
                     if prepared {
-                        admitted(recipe, backend, recipe.project(), &form);
+                        admitted(recipe, backend, recipe.project_entry(), &form);
                     } else {
-                        admitted(recipe, backend, recipe.head(), &form);
+                        admitted(recipe, backend, recipe.head_entry(), &form);
                     }
                 }
             }

@@ -243,24 +243,24 @@ fn sequences(bytes: u64) -> Work {
     }
 }
 
-/// One expert's bytes and FLOPs per row of an expert tensor of `experts`
-/// equal slabs.
-fn slab(weight: &WeightPlan, experts: u64) -> Result<(Bytes, Flops), AssessmentError> {
-    let elements = elements(weight)?;
-    if experts == 0 || weight.resident_bytes % experts != 0 || elements % experts != 0 {
-        return Err(demand_error(format!(
-            "expert tensor {:?} does not split into {experts} slabs",
-            weight.descriptor.name
-        )));
-    }
+/// One expert's bytes and FLOPs per row of an expert tensor `[count, N,
+/// K]`: one `[N, K]` matrix of its resident form, whether the stack is
+/// resident (`count` its experts) or banked (`count` its group's records,
+/// of which it charges its slots).
+fn slab(weight: &WeightPlan) -> Result<(Bytes, Flops), AssessmentError> {
+    let malformed = || demand_error(format!("expert tensor {:?} is no stack of matrices", weight.descriptor.name));
+    let [_, n, k] = weight.shape[..] else {
+        return Err(malformed());
+    };
+    let bytes = weight.resident.canonical_byte_len(&[1, n, k]).map_err(|_| malformed())?;
     Ok((
         Bytes {
             format: weight.resident,
-            bytes: weight.resident_bytes / experts,
+            bytes,
         },
         Flops {
             format: weight.resident,
-            flops: 2 * (elements / experts),
+            flops: 2 * n * k,
         },
     ))
 }
@@ -278,7 +278,7 @@ fn experts(
     }
     let slabs = tensors
         .iter()
-        .map(|tensor| slab(tensor, experts))
+        .map(|tensor| slab(tensor))
         .collect::<Result<Vec<_>, _>>()?;
     let mut slab_bytes = Vec::new();
     let mut slab_flops = Vec::new();
@@ -330,8 +330,9 @@ fn join(parts: impl IntoIterator<Item = Work>) -> Result<Work, AssessmentError> 
 /// The step as it accumulates.
 struct Step<'a> {
     declarations: &'a Declarations,
-    /// Each entry's launches at each operand recipe, resolved once.
-    resolved: HashMap<(&'static str, OperandRecipe), Launches>,
+    /// Each entry's launches at each operand recipe and stated dimensions,
+    /// resolved once.
+    resolved: HashMap<(&'static str, OperandRecipe, Vec<(&'static str, u64)>), Launches>,
     calls: Vec<Call>,
 }
 
@@ -344,17 +345,7 @@ fn work_recipe(work: &Work) -> OperandRecipe {
 impl Step<'_> {
     /// One call of `kernel` doing `work`.
     fn call(&mut self, kernel: Kernel, work: Work) -> Result<(), AssessmentError> {
-        let key = (kernel.name(), work_recipe(&work));
-        let launches = match self.resolved.get(&key) {
-            Some(launches) => launches.clone(),
-            None => {
-                let launches = self.declarations.launches(kernel, key.1, &[])?;
-                self.resolved.insert(key, launches.clone());
-                launches
-            }
-        };
-        self.calls.push(Call { launches, work });
-        Ok(())
+        self.call_with(kernel, &[], work)
     }
 
     /// One call of `kernel` stating `dimensions` its launch clauses read.
@@ -364,7 +355,15 @@ impl Step<'_> {
         dimensions: &[(&'static str, u64)],
         work: Work,
     ) -> Result<(), AssessmentError> {
-        let launches = self.declarations.launches(kernel, work_recipe(&work), dimensions)?;
+        let key = (kernel.name(), work_recipe(&work), dimensions.to_vec());
+        let launches = match self.resolved.get(&key) {
+            Some(launches) => launches.clone(),
+            None => {
+                let launches = self.declarations.launches(kernel, key.1, dimensions)?;
+                self.resolved.insert(key, launches.clone());
+                launches
+            }
+        };
         self.calls.push(Call { launches, work });
         Ok(())
     }
@@ -596,18 +595,14 @@ fn ngram(
         sequences(bank_bytes(layout, component + 1, 1, index)?),
     )?;
     let table = weight(WeightKind::NGramTable, binding.table)?;
-    let slots = table.shape[0];
-    if slots == 0 || table.resident_bytes % slots != 0 {
-        return Err(demand_error(format!(
-            "n-gram table {:?} does not split into its slots",
-            table.descriptor.name
-        )));
-    }
+    let row = table
+        .resident
+        .canonical_byte_len(&[1, table.table_width()])
+        .map_err(|error| demand_error(format!("n-gram table {:?}: {error}", table.descriptor.name)))?;
     step.call(
         Kernel::of::<kernels::stored_rows::Entry>(),
         rows(
-            (table.resident_bytes / slots)
-                .checked_mul(binding.heads())
+            row.checked_mul(binding.heads())
                 .ok_or_else(|| demand_error("n-gram row bytes overflow"))?,
         ),
     )?;
@@ -638,6 +633,19 @@ fn ngram(
             ..Work::default()
         },
     )
+}
+
+/// The rows of the sources by which the decode entries of the routed layer
+/// of `scope` read each choice's weights (`decode_source`), as its graph
+/// states them (`DecodeReads`): of a layer `load`'s bank serves, the step's
+/// source rows; of a resident layer none, each expert read from its stacks
+/// by index.
+fn sources(load: &ModelLoadPlan, scope: WeightScope) -> [(&'static str, u64); 1] {
+    let rows = match load.expert_bank().and_then(|bank| bank.layer(scope)) {
+        Some(_) => kernels::constants::SOURCE_ROWS,
+        None => 0,
+    };
+    [("XS", rows)]
 }
 
 /// `operators::routed::graph` at decode rows in `scope`: the shared
@@ -692,15 +700,18 @@ fn general_routed(
         None => (Kernel::of::<kernels::routed_up::Entry>(), vec![up]),
     };
     let chosen = |tensors: &[&WeightPlan]| experts(tensors, shape.experts, shape.selected);
-    step.call(
+    let sources = sources(load, scope);
+    step.call_with(
         expansion,
+        &sources,
         Work {
             experts: Some(chosen(&tensors)?),
             ..Work::default()
         },
     )?;
-    step.call(
+    step.call_with(
         Kernel::of::<kernels::routed_down::Entry>(),
+        &sources,
         Work {
             experts: Some(chosen(&[weight(
                 WeightKind::ExpertDown,
@@ -1126,6 +1137,7 @@ impl DecodeDemand {
                         )?),
                         ..Work::default()
                     };
+                    let sources = sources(load, scope);
                     match DecodeForm::of(backend).map_err(demand_error)? {
                         DecodeForm::Expand => {
                             step.call(Kernel::of::<kernels::routed_route::Entry>(), router)?;
@@ -1139,7 +1151,11 @@ impl DecodeDemand {
                                 Kernel::of::<kernels::routed_route_shared::Entry>(),
                                 join([router, shared])?,
                             )?;
-                            step.call(Kernel::of::<kernels::routed_gate_up::Entry>(), choices)?;
+                            step.call_with(
+                                Kernel::of::<kernels::routed_gate_up::Entry>(),
+                                &sources,
+                                choices,
+                            )?;
                         }
                     }
                     let down = Work {
@@ -1150,8 +1166,9 @@ impl DecodeDemand {
                         )?),
                         ..Work::default()
                     };
-                    step.call(
+                    step.call_with(
                         Kernel::of::<kernels::routed_output::Entry>(),
+                        &sources,
                         join([
                             down,
                             projection(&[weight(WeightKind::SharedDown, binding.shared_down)?])?,
@@ -1386,8 +1403,8 @@ pub(crate) mod tests {
     }
 
     fn fixture() -> (ModelDefinition, ModelLoadPlan) {
-        let definition = crate::planning::tests::fixture_definition();
-        let manifest = crate::planning::tests::fixture_manifest(&definition);
+        let definition = crate::planning::fixtures::fixture_definition();
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,
@@ -1396,6 +1413,8 @@ pub(crate) mod tests {
                 vision: false,
             },
             Layout::Rows8,
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap();
         (definition, load)
@@ -1472,8 +1491,8 @@ pub(crate) mod tests {
     /// and the exit site precedes the readout, which reads no norm.
     #[test]
     fn a_streams_decode_step_streams_its_mix_sites_and_no_norms() {
-        let definition = crate::planning::tests::hyper_connection_fixture_definition();
-        let manifest = crate::planning::tests::fixture_manifest(&definition);
+        let definition = crate::planning::fixtures::hyper_connection_fixture_definition();
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,
@@ -1482,6 +1501,8 @@ pub(crate) mod tests {
                 vision: false,
             },
             Layout::Rows8,
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap();
         let demand = demand(&definition, &load, KvCodec::Dense).unwrap();
@@ -1540,7 +1561,7 @@ pub(crate) mod tests {
     #[test]
     fn an_ngram_input_streams_its_rows_projections_and_windows() {
         let load_of = |definition: &ModelDefinition| {
-            let manifest = crate::planning::tests::stored_table_manifest(definition);
+            let manifest = crate::planning::fixtures::stored_table_manifest(definition);
             ModelLoadPlan::derive(
                 &manifest,
                 definition,
@@ -1549,10 +1570,12 @@ pub(crate) mod tests {
                     vision: false,
                 },
                 Layout::Rows8,
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap()
         };
-        let definition = crate::planning::tests::qwen4exp_fixture_definition();
+        let definition = crate::planning::fixtures::qwen4exp_fixture_definition();
         let mut plain = definition.clone();
         plain.decoder.blocks[0].sublayers.truncate(2);
         let load = load_of(&definition);
@@ -1583,7 +1606,7 @@ pub(crate) mod tests {
             .iter()
             .map(|component| component.bytes().unwrap() as u64)
             .sum::<u64>();
-        let ngram = heads * table.resident_bytes / table.shape[0]
+        let ngram = heads * table.resident_bytes / table.table_slots()
             + [
                 WeightKind::NGramKey,
                 WeightKind::NGramValue,
@@ -1666,7 +1689,7 @@ pub(crate) mod tests {
                 key_norm: norm("indexer_k_norm"),
             },
         };
-        let manifest = crate::planning::tests::fixture_manifest(&definition);
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,
@@ -1675,6 +1698,8 @@ pub(crate) mod tests {
                 vision: false,
             },
             Layout::Rows8,
+            crate::PlannedMethod::Plain,
+            crate::planning::fixtures::LIMITS,
         )
         .unwrap();
         let (plain_definition, plain_load) = fixture();
@@ -1733,7 +1758,12 @@ pub(crate) mod tests {
                 }],
             }
         );
-        assert!(experts(&[&tensor], 3, 1).is_err());
         assert!(experts(&[&tensor], 8, 9).is_err());
+        // A banked stack (its group's 20 records, charged its 3 slots)
+        // reads one record a slab, as resident.
+        let mut banked = tensor.clone();
+        banked.shape[0] = 20;
+        banked.resident_bytes = 3 * 32 * 64 * 2;
+        assert_eq!(experts(&[&banked], 8, 2).unwrap(), experts(&[&tensor], 8, 2).unwrap());
     }
 }

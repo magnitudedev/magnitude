@@ -24,13 +24,18 @@ const TOMBSTONE: i32 = -2;
 /// for `row`: murmur3's 32-bit finalizer, as `gathered_bucket`
 /// (target.seismic) computes it.
 pub(crate) fn bucket(row: i32, buckets: usize) -> usize {
+    hash(row) as usize & (buckets - 1)
+}
+
+/// Murmur3's 32-bit finalizer of `row`.
+pub(crate) fn hash(row: i32) -> u32 {
     let mut h = row as u32;
     h ^= h >> 16;
     h = h.wrapping_mul(0x85eb_ca6b);
     h ^= h >> 13;
     h = h.wrapping_mul(0xc2b2_ae35);
     h ^= h >> 16;
-    h as usize & (buckets - 1)
+    h
 }
 
 /// Every held row's slot, as the device reads it.
@@ -133,9 +138,11 @@ pub(crate) struct SlotDirectory {
     /// passed it.
     used: Vec<bool>,
     /// The tile of slots the clock looks at next. The clock turns from the
-    /// last tile of slots toward the first, so that of slots filled in order
-    /// of value, first to last, it reaches the least valuable first.
+    /// last tile of slots in use toward the first, so that of slots filled in
+    /// order of value, first to last, it reaches the least valuable first.
     hand: usize,
+    /// The leading tiles of slots in use; the others hold nothing.
+    active: usize,
 }
 
 impl SlotDirectory {
@@ -162,7 +169,19 @@ impl SlotDirectory {
             tile: vec![None; slot_tiles],
             used: vec![false; slot_tiles],
             hand: slot_tiles.saturating_sub(1),
+            active: slot_tiles,
         }
+    }
+
+    /// Use the leading `tiles` tiles of slots, at most every one: a tile
+    /// past them is released.
+    pub fn limit(&mut self, tiles: usize) {
+        let tiles = tiles.min(self.tile.len());
+        for tile in tiles..self.active {
+            self.release(tile);
+        }
+        self.active = tiles;
+        self.hand = tiles.saturating_sub(1);
     }
 
     pub fn tile_rows(&self) -> u64 {
@@ -329,25 +348,35 @@ impl SlotDirectory {
     /// neither used since it last passed nor `kept`, released, and the first
     /// row of the tile it held. The clock passes every tile of slots at most
     /// twice, the first time taking from each its use; `None` when it finds
-    /// none, as of a directory without slots.
+    /// none, as of a directory without slots. Only the tiles in use are
+    /// taken ([`Self::limit`]).
     pub fn free(&mut self, kept: impl Fn(usize) -> bool) -> Option<(usize, Option<u64>)> {
-        let tiles = self.tile.len();
+        match self.try_free(|slot_tile| Ok::<_, std::convert::Infallible>(kept(slot_tile))) {
+            Ok(free) => free,
+            Err(never) => match never {},
+        }
+    }
+
+    /// [`Self::free`] by a predicate that may fail to say whether a tile is
+    /// kept: its first error ends the search, nothing released.
+    pub fn try_free<E>(&mut self, kept: impl Fn(usize) -> Result<bool, E>) -> Result<Option<(usize, Option<u64>)>, E> {
+        let tiles = self.active;
         for _ in 0..2 * tiles {
             let slot_tile = self.hand;
             self.hand = (self.hand + tiles - 1) % tiles;
-            if kept(slot_tile) || std::mem::take(&mut self.used[slot_tile]) {
+            if kept(slot_tile)? || std::mem::take(&mut self.used[slot_tile]) {
                 continue;
             }
-            return Some((slot_tile, self.release(slot_tile)));
+            return Ok(Some((slot_tile, self.release(slot_tile))));
         }
-        None
+        Ok(None)
     }
 
     /// The first of `count` adjacent tiles of slots, each released: the
     /// clock's next ones, the tiles that end at the hand. `None` of a
     /// directory with fewer.
     pub fn free_adjacent(&mut self, count: usize) -> Option<usize> {
-        let tiles = self.tile.len();
+        let tiles = self.active;
         if count > tiles {
             return None;
         }

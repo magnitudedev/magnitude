@@ -217,6 +217,85 @@ pub struct HistorySource {
     pub layer: LayerRef,
 }
 
+/// A store's history reads: what a launch row holds one control set of
+/// each of. Every stored domain in plan order, then every stored domain a
+/// Shared layer reads, ascending: a Shared layer appends nothing, so it
+/// reads its source domain's accepted rows and the rows its source appended
+/// for the advance, one read beyond the stored domains per such domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryReads {
+    /// The store's stored domains.
+    stored: usize,
+    /// The stored domains Shared layers read, ascending.
+    sources: Vec<HistoryDomainId>,
+    /// Each layer with history and its read: a stored layer's first domain
+    /// holding it, a Shared layer's source domain's shared read.
+    layers: Vec<(LayerRef, usize)>,
+}
+
+impl HistoryReads {
+    /// The reads of a store of `plans`, as [`crate::StateStore::new`] takes
+    /// them with its `context` and largest advance.
+    pub fn of(plans: &[HistoryDomainPlan], context: usize, max_advance: usize) -> Result<Self, Error> {
+        let (stored, shared) = validate_domains(plans.to_vec(), context, max_advance)?;
+        Ok(Self::new(&stored, &shared))
+    }
+
+    /// The reads of `stored` domains and `shared` layers, as
+    /// [`validate_domains`] resolved them.
+    pub(crate) fn new(stored: &[StoredDomain], shared: &[(LayerRef, HistorySource)]) -> Self {
+        let mut layers = Vec::new();
+        for (domain, plan) in stored.iter().enumerate() {
+            for component in &plan.components {
+                if !layers.iter().any(|(layer, _)| *layer == component.layer) {
+                    layers.push((component.layer, domain));
+                }
+            }
+        }
+        let mut sources = shared
+            .iter()
+            .map(|(_, source)| source.domain)
+            .collect::<Vec<_>>();
+        sources.sort_unstable();
+        sources.dedup();
+        layers.extend(shared.iter().map(|(layer, source)| {
+            (
+                *layer,
+                stored.len() + sources.partition_point(|of| *of < source.domain),
+            )
+        }));
+        Self {
+            stored: stored.len(),
+            sources,
+            layers,
+        }
+    }
+
+    /// The reads of a launch row.
+    pub fn len(&self) -> usize {
+        self.stored + self.sources.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The read `layer`'s attention takes (an index below [`Self::len`]).
+    /// `None` for a layer without history in the store.
+    pub fn read(&self, layer: LayerRef) -> Option<usize> {
+        self.layers
+            .iter()
+            .find(|(of, _)| *of == layer)
+            .map(|&(_, read)| read)
+    }
+
+    /// The stored domains Shared layers read, ascending: the reads after
+    /// the stored domains'.
+    pub fn shared_sources(&self) -> &[HistoryDomainId] {
+        &self.sources
+    }
+}
+
 /// Validate a store's domains: stored domains own nonempty, distinct layers
 /// and reserve at least their row limit; every Shared layer is distinct and
 /// reads a stored layer. Returns the stored domains in plan order and the

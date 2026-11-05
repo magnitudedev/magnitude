@@ -10,7 +10,7 @@ use magnitude_state::{
     ModelStateLayout, StateStore, StoreBindings,
 };
 use seismic::{BackendName, Device, Element, SlabLayout, SlabRegion};
-use std::rc::Rc;
+use std::{num::NonZeroUsize, rc::Rc};
 
 /// The service's bounds a load plans for. None is a request-count batch
 /// width: a launch is bounded by its token budget (rows and request slots
@@ -38,6 +38,19 @@ pub struct ResourceLimits {
     /// completes (cross-step pipelining): one more target launch in flight
     /// and one more successor bank per live request.
     pub lookahead: bool,
+    /// The most launches one chain runs (`TargetProgram::submit`): a
+    /// prompt's consecutive chunks run layer-major as one chain, each with
+    /// its own region of the launch-row buffers and its own output slot of
+    /// the chain's rotation. Every chunk of a whole-context prompt; a group
+    /// holds the places of the class granted when it opens
+    /// (`ExecutorDomain::grant_group`).
+    pub chain_capacity: NonZeroUsize,
+    /// Conversations the load holds at once at the fit depth: the workload
+    /// whose history and recurrent banks the plan charges and opportunistic
+    /// growth leaves room for (`StateCapacityPlan::workload_state_bytes`).
+    /// One for a served load, whose further requests wait for memory; a
+    /// diagnostic that holds several sequences at once declares them.
+    pub conversations: NonZeroUsize,
 }
 
 /// The most merged cells one image encodes, whatever its model declares and
@@ -102,28 +115,117 @@ pub fn image_cell_limit(
     Ok(limit)
 }
 
-impl ResourceLimits {
-    /// Target launches in flight at once: a step and, with lookahead, its
-    /// queued successor. The owner submits one launch at a time.
-    pub fn target_launches(&self) -> usize {
-        1 + usize::from(self.lookahead)
+/// The submitter's in-flight depth: the one authority on how many copies of
+/// a per-step device resource the host keeps, so that it never rewrites one
+/// the device still reads. Every copy count derives from it; only
+/// [`ResourceLimits::flights`] forms one.
+///
+/// The target step groups begun and not ended at once are the submitted
+/// step's and, with lookahead, its queued successor's (`domain::queue`): a
+/// further group is queued only once the owner has taken the submitted
+/// one's outcome, which ends its group, and the rest of a chain runs in the
+/// chain's group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FlightDepth {
+    groups: NonZeroUsize,
+}
+
+impl FlightDepth {
+    /// A depth of one group in flight, no lookahead: a host-only routing
+    /// replay's, which takes its reads one at a time (`experts::replay`).
+    pub(crate) const SERIAL: Self = Self { groups: NonZeroUsize::MIN };
+
+    /// Whether a continuable step's successor is queued behind it
+    /// (cross-step pipelining).
+    pub fn pipelines(self) -> bool {
+        self.groups.get() > 1
     }
 
-    /// The graph slots a load commits at startup: what one request needs to
-    /// run. Activations cover the launches in flight at once, whatever the
-    /// request count; each holds its own upload regions, and every one binds
-    /// the device's one workspace arena. The target's outputs are its
-    /// residual pair: each block graph reads one and writes the other, and
-    /// the device's submission order lets every launch reuse the same pair.
+    /// Target step groups begun and not ended at once.
+    pub fn groups(self) -> usize {
+        self.groups.get()
+    }
+
+    /// Target launches in flight at once with prompt groups of `places`
+    /// launches: a step and, with lookahead, its queued successor, or a
+    /// group's launches, each at a place of its own.
+    pub fn launches(self, places: usize) -> usize {
+        self.groups().max(places)
+    }
+
+    /// The in-flight capacity of a per-launch resource with a held class of
+    /// `places` places: what `lanes` lanes, each launch of which uses the
+    /// resource `uses` times, can have in flight at once. Each lane keeps
+    /// its [`Self::launches`] in flight, a launch holding its lease until
+    /// its completion is observed; one launch more is being built or having
+    /// its completion observed. A ring of this many entries reuses each only
+    /// after the work that last used it has completed: the one sizing rule
+    /// of every per-launch ring (`seismic::FlightRing`).
+    pub fn capacity(self, places: usize, lanes: usize, uses: usize) -> usize {
+        (lanes * self.launches(places) + 1) * uses
+    }
+
+    /// Steps begun and not ended at once on a load of `places` chain places:
+    /// each group in flight of at most `places` steps, each at a place of
+    /// its own (`BankPart::placed`). The routed kernels' `FLIGHT`: step `q`'s
+    /// records are its sequence modulo these.
+    pub const fn steps(self, places: u64) -> u64 {
+        self.groups.get() as u64 * places
+    }
+}
+
+#[cfg(test)]
+impl FlightDepth {
+    /// A depth of a step and its lookahead successor: a served load's.
+    pub(crate) const PIPELINED: Self = Self { groups: NonZeroUsize::new(2).unwrap() };
+}
+
+impl ResourceLimits {
+    /// The in-flight depth these limits plan for: the one authority every
+    /// per-step copy count reads.
+    pub const fn flights(&self) -> FlightDepth {
+        // The submitted step's group, and its queued successor's.
+        FlightDepth {
+            groups: NonZeroUsize::MIN.saturating_add(self.lookahead as usize),
+        }
+    }
+
+    /// Successor banks a request holds in flight at once: one for each
+    /// group in flight ([`FlightDepth::groups`]), its step's and its queued
+    /// successor's; a chain's launches alternate two
+    /// (`magnitude_state::OwnedChainedAdvance`), whatever its length. So
+    /// they do not follow a group's class: every class of two places or
+    /// more takes two, and a request's banks are granted when it opens
+    /// (`ExecutorDomain::provision_open`), before any group's class is.
+    pub fn target_successor_banks(&self) -> usize {
+        self.flights().groups().max(self.chain_capacity.get().min(2))
+    }
+
+    /// The graph slots a load commits at startup: its prompt groups' floor
+    /// of one place (`class_slots`). Nothing below it is ever released, so
+    /// a group always runs, in Reclaim too, without allocating.
+    pub fn startup_slots(&self) -> StartupSlots {
+        self.class_slots(1)
+    }
+
+    /// The graph slots prompt groups of `places` launches hold: what one
+    /// request needs to run them. Activations cover the launches in flight
+    /// at once, whatever the request count; each holds its own upload
+    /// regions, and every one binds the device's one workspace arena. The
+    /// target's outputs are a chain's rotation (`TargetProgram::submit`):
+    /// each graph reads its launch's latest output and writes the free slot,
+    /// so a chain of `n` launches holds `n + 1`. A chain's slots return at
+    /// its submission and the device's submission order runs the next chain
+    /// after it, so the longest chain's rotation serves every launch.
     /// Outputs a request retains after its launch completes (readout
     /// features, head drafts, encoded images) start at one request's need
     /// and grow one slot at a time under a heap claim.
-    pub fn startup_slots(&self) -> StartupSlots {
-        let launches = self.target_launches();
+    pub fn class_slots(&self, places: usize) -> StartupSlots {
+        let launches = self.flights().launches(places);
         StartupSlots {
             target: GraphSlots {
                 activations: launches,
-                output: 2,
+                output: places + 1,
             },
             readout: GraphSlots {
                 activations: launches,
@@ -300,31 +402,41 @@ pub struct ResourceBytes {
 
 /// A Seismic-derived physical family charge at startup. The engine chooses
 /// the slot counts; Seismic supplies every byte and every tensor layout
-/// within each slot. Each activation holds `upload_regions` upload regions
-/// of `upload_bytes`, allocated with it: one per graph run its lease keeps
-/// in flight at once. Output slots beyond `output_slots` are elastic
-/// run-time claims of `output_bytes` each. `workspace_bytes` is not part of
-/// `committed_bytes`: every family binds the device's one workspace arena,
-/// which the plan charges once at the largest family's workspace.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// within each slot. Each activation holds the upload regions of
+/// `upload_regions` bytes each, allocated with it: one per graph run its
+/// lease keeps in flight at once, holding what that run writes. Output
+/// slots beyond `output_slots` are elastic run-time claims of
+/// `output_bytes` each. `workspace_bytes` is not part of `committed_bytes`:
+/// every family binds the device's one workspace arena, which the plan
+/// charges once at the largest family's workspace. Each activation holds
+/// `graphs` of the device's graph budget, what one slot of the family holds
+/// (`seismic::NativeGraphFamily::slot_graphs`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NativeGraphCharge {
     pub workspace_bytes: u64,
     pub output_bytes: u64,
-    pub upload_bytes: u64,
-    pub upload_regions: usize,
+    pub upload_regions: Vec<u64>,
     pub activations: usize,
     pub output_slots: usize,
     pub committed_bytes: u64,
+    pub graphs: seismic::GraphCensus,
 }
 
-/// A family's per-slot storage: scratch, output arena and upload region
-/// bytes, and the runs one workspace lease keeps in flight.
-#[derive(Clone, Copy, Debug)]
+/// A family's per-slot storage: scratch and output arena bytes, the bytes
+/// of each upload region of an activation, and what one slot's graphs
+/// hold.
+#[derive(Clone, Debug)]
 struct FamilyFootprint {
     workspace_bytes: u64,
     output_bytes: u64,
-    upload_bytes: u64,
-    runs_in_flight: usize,
+    upload_regions: Vec<u64>,
+    graphs: seismic::GraphCensus,
+}
+
+/// The upload regions of a family whose lease runs one graph at a time to
+/// completion: one that holds any of its runs' input.
+pub(crate) fn serial_upload_regions(upload_bytes: u64) -> Vec<u64> {
+    vec![upload_bytes]
 }
 
 impl FamilyFootprint {
@@ -333,24 +445,37 @@ impl FamilyFootprint {
         Self {
             workspace_bytes: family.workspace_bytes(),
             output_bytes: family.output_bytes(),
-            upload_bytes: family.upload_bytes(),
-            runs_in_flight: 1,
+            upload_regions: serial_upload_regions(family.upload_bytes()),
+            graphs: family.slot_graphs(),
         }
     }
 }
 
 impl NativeGraphCharge {
+    /// The charge of a family whose lease runs one graph at a time to
+    /// completion: a launch is one run, in a submission of its own
+    /// (`seismic::NativeGraphFamily::new`), of the graphs its storage
+    /// records.
+    pub(crate) fn serial(
+        storage: seismic::NativeGraphStorageBytes,
+        slots: GraphSlots,
+    ) -> Result<Self, String> {
+        Self::from_checked(storage, serial_upload_regions(storage.upload), slots, storage.recorded)
+    }
+
+    /// The charge of a checked family a slot of which holds `graphs`.
     pub(crate) fn from_checked(
         storage: seismic::NativeGraphStorageBytes,
-        runs_in_flight: usize,
+        upload_regions: Vec<u64>,
         slots: GraphSlots,
+        graphs: seismic::GraphCensus,
     ) -> Result<Self, String> {
         Self::from_footprint(
             FamilyFootprint {
                 workspace_bytes: storage.workspace,
                 output_bytes: storage.output,
-                upload_bytes: storage.upload,
-                runs_in_flight,
+                upload_regions,
+                graphs,
             },
             slots,
         )
@@ -361,11 +486,16 @@ impl NativeGraphCharge {
             FamilyFootprint {
                 workspace_bytes: graphs.workspace_bytes(),
                 output_bytes: graphs.output_bytes(),
-                upload_bytes: graphs.family().upload_bytes(),
-                runs_in_flight: graphs.runs_per_step(),
+                upload_regions: graphs.upload_regions().to_vec(),
+                graphs: graphs.family().slot_graphs(),
             },
             slots,
         )
+    }
+
+    /// Bytes of one activation's upload regions.
+    pub fn activation_bytes(&self) -> u64 {
+        self.upload_regions.iter().sum()
     }
 
     fn from_footprint(footprint: FamilyFootprint, slots: GraphSlots) -> Result<Self, String> {
@@ -375,8 +505,9 @@ impl NativeGraphCharge {
         } = slots;
         let count = |value: usize| u64::try_from(value).map_err(|_| "slot count exceeds u64");
         let per_activation = footprint
-            .upload_bytes
-            .checked_mul(count(footprint.runs_in_flight)?)
+            .upload_regions
+            .iter()
+            .try_fold(0u64, |bytes, region| bytes.checked_add(*region))
             .ok_or("graph activation byte count overflows")?;
         let committed_bytes = per_activation
             .checked_mul(count(activations)?)
@@ -390,13 +521,27 @@ impl NativeGraphCharge {
         Ok(Self {
             workspace_bytes: footprint.workspace_bytes,
             output_bytes: footprint.output_bytes,
-            upload_bytes: footprint.upload_bytes,
-            upload_regions: footprint.runs_in_flight,
+            upload_regions: footprint.upload_regions,
             activations,
             output_slots,
             committed_bytes,
+            graphs: footprint.graphs,
         })
     }
+}
+
+/// What the startup activations of `charges` hold of their device's graph
+/// budget: each activation's slot its family's graphs
+/// (`NativeGraphCharge::graphs`), whatever places or classes it runs,
+/// which all replay those graphs.
+pub(crate) fn startup_graphs(charges: &[&NativeGraphCharge]) -> Result<seismic::GraphCensus, String> {
+    charges.iter().try_fold(seismic::GraphCensus::default(), |census, charge| {
+        u64::try_from(charge.activations)
+            .ok()
+            .and_then(|activations| charge.graphs.times(activations))
+            .and_then(|held| census.plus(held))
+            .ok_or_else(|| "the startup graphs' census overflows".to_owned())
+    })
 }
 
 /// The device's one workspace arena: the largest workspace of the `charges`
@@ -562,6 +707,13 @@ impl StateStorePlan {
         })
     }
 
+    /// The history reads of a launch row of the store this plans
+    /// (`StateStore::history_reads`).
+    pub fn history_reads(&self) -> Result<magnitude_state::HistoryReads, String> {
+        magnitude_state::HistoryReads::of(&self.history, self.context_rows, self.max_advance)
+            .map_err(|error| error.to_string())
+    }
+
     /// The raw keys' (Window) and block keys' (Block) domains of target
     /// block `block`'s indexer (`LayerRef::Indexer`). `None` for a block
     /// without one.
@@ -642,10 +794,12 @@ impl StateStorePlan {
         })
     }
 
-    /// One request's history at `depth` tokens: a Token domain holds `depth`
-    /// rows, a Window domain its steady footprint of `n` plus one advance,
-    /// independent of the depth; each rounded to whole slabs of its domain.
-    pub fn history_bytes_at_depth(&self, depth: u64) -> Result<u64, String> {
+    /// The histories of `conversations` requests at `depth` tokens each: a
+    /// Token domain holds `depth` rows of each, a Window domain its steady
+    /// footprint of `n` plus one advance, independent of the depth; each
+    /// request's rows in whole pages of its own, all of them rounded to
+    /// whole slabs of its domain.
+    pub fn history_bytes_at_depth(&self, depth: u64, conversations: u64) -> Result<u64, String> {
         self.domains.iter().try_fold(0u64, |total, domain| {
             let layout = domain.slab_layout()?;
             let rows = match domain.kind {
@@ -663,7 +817,9 @@ impl StateStorePlan {
             // window releases the rows before it, its last page always may.
             let page = u64::from(domain.page_rows);
             let front = u64::from(matches!(domain.kind, HistoryDomainKind::Window { .. }));
-            let pages = rows.max(1).div_ceil(page) + front;
+            let pages = (rows.max(1).div_ceil(page) + front)
+                .checked_mul(conversations)
+                .ok_or("history page fit count overflows")?;
             let slabs = (pages * page).div_ceil(u64::from(domain.slab_rows));
             layout
                 .slab_bytes
@@ -757,6 +913,7 @@ pub struct ResourcePlan {
     pub(super) qualification_peak_bytes: u64,
     target_graph: NativeGraphCharge,
     target_readout_graph: NativeGraphCharge,
+    target_readout_chunk_graph: NativeGraphCharge,
     head_graph: Option<NativeGraphCharge>,
     vision_graph: Option<NativeGraphCharge>,
     state_graph: NativeGraphCharge,
@@ -789,6 +946,7 @@ impl ResourcePlan {
         [
             Some(&self.target_graph),
             Some(&self.target_readout_graph),
+            Some(&self.target_readout_chunk_graph),
             self.head_graph.as_ref(),
             self.vision_graph.as_ref(),
             Some(&self.state_graph),
@@ -823,20 +981,24 @@ impl ResourcePlan {
         Ok(self)
     }
 
-    pub fn target_graph(&self) -> NativeGraphCharge {
-        self.target_graph
+    pub fn target_graph(&self) -> &NativeGraphCharge {
+        &self.target_graph
     }
-    pub fn target_readout_graph(&self) -> NativeGraphCharge {
-        self.target_readout_graph
+    pub fn target_readout_graph(&self) -> &NativeGraphCharge {
+        &self.target_readout_graph
     }
-    pub fn head_graph(&self) -> Option<NativeGraphCharge> {
-        self.head_graph
+    /// The chunk readout family's charge (`PreparedTargetReadoutGraphs::chunk_family`).
+    pub fn target_readout_chunk_graph(&self) -> &NativeGraphCharge {
+        &self.target_readout_chunk_graph
     }
-    pub fn vision_graph(&self) -> Option<NativeGraphCharge> {
-        self.vision_graph
+    pub fn head_graph(&self) -> Option<&NativeGraphCharge> {
+        self.head_graph.as_ref()
     }
-    pub fn state_graph(&self) -> NativeGraphCharge {
-        self.state_graph
+    pub fn vision_graph(&self) -> Option<&NativeGraphCharge> {
+        self.vision_graph.as_ref()
+    }
+    pub fn state_graph(&self) -> &NativeGraphCharge {
+        &self.state_graph
     }
     pub fn steady_committed_bytes(&self) -> u64 {
         self.steady_committed_bytes
@@ -877,16 +1039,18 @@ pub struct StateResourcePlan {
     recurrent_banks_bytes: u64,
 }
 
-/// The state slabs `depth` history rows and `banks` recurrent banks occupy.
+/// The state slabs `conversations` histories of `depth` rows and `banks`
+/// recurrent banks occupy.
 fn fit_state_bytes(
     target: &StateStorePlan,
     head: Option<&StateStorePlan>,
     depth: u64,
+    conversations: u64,
     banks: u64,
 ) -> Result<u64, String> {
-    let target_history = target.history_bytes_at_depth(depth)?;
+    let target_history = target.history_bytes_at_depth(depth, conversations)?;
     let head_history = head
-        .map(|state| state.history_bytes_at_depth(depth))
+        .map(|state| state.history_bytes_at_depth(depth, conversations))
         .transpose()?
         .unwrap_or(0);
     let target_banks = target.bank_bytes_at_count(banks)?;
@@ -935,8 +1099,16 @@ impl StateResourcePlan {
         self.capacity
     }
 
-    pub fn fit_state_bytes(&self, depth: u64, banks: u64) -> Result<u64, String> {
-        fit_state_bytes(&self.target_state, self.head_state.as_ref(), depth, banks)
+    /// What a graph derivation reads of the plan beside the definition,
+    /// load, codec and limits it is given, as key material: the stores and
+    /// which graph classes the device forms. The capacity figures outside
+    /// the stores reach no graph, so a capacity that moves within a store's
+    /// whole pages keeps the key.
+    pub(crate) fn graph_material(&self) -> String {
+        format!(
+            "{:?}\n{:?}\n{:?}",
+            self.target_state, self.head_state, self.capacity_bytes.tensor_operations
+        )
     }
 
     /// The state slabs a load commits at startup, before any request.
@@ -944,6 +1116,21 @@ impl StateResourcePlan {
         self.history_bytes
             .checked_add(self.recurrent_banks_bytes)
             .ok_or_else(|| "startup state bytes overflow".into())
+    }
+
+    /// The state slabs a loaded model holds before its first request: the
+    /// startup slabs and what the load's warm-up forward grows
+    /// (`magnitude_engine::execution::warm_up`: one request, one token). Its
+    /// row lands in each history domain's first slab, which holds at least
+    /// one page; its forward writes one successor bank beside the pristine
+    /// seed. Releasing the request leaves the slabs held (the stores keep a
+    /// spare at idle).
+    pub fn loaded_state_bytes(&self) -> Result<u64, String> {
+        /// The pristine seed and the warm-up forward's successor.
+        const WARM_UP_BANKS: u64 = 2;
+        self.history_bytes
+            .checked_add(self.target_state.bank_bytes_at_count(WARM_UP_BANKS)?)
+            .ok_or_else(|| "loaded state bytes overflow".into())
     }
 
     pub fn target_state(&self) -> &StateStorePlan {
@@ -1058,7 +1245,7 @@ impl ResourcePlanner {
         let bank_capacity = BankCapacity {
             active: possible_requests,
             in_flight: possible_requests
-                .checked_mul(limits.target_launches())
+                .checked_mul(limits.target_successor_banks())
                 .ok_or("in-flight bank count overflow")?,
             retained: possible_requests
                 .checked_add(retention_entries)
@@ -1130,7 +1317,8 @@ impl ResourcePlanner {
             &target_state,
             head_state.as_ref(),
             assessment::fit_depth(definition),
-            assessment::conversation_banks(limits.lookahead)?,
+            limits.conversations.get() as u64,
+            assessment::conversation_banks(limits)?,
         )?;
         let capacity = StateCapacityPlan {
             live_requests: possible_requests,
@@ -1174,6 +1362,15 @@ impl ResourcePlanner {
             FamilyFootprint::serial(target_readout_graphs.family()),
             slots.readout,
         )?;
+        // A prompt chunk's readout slots beyond the floor's: none until a
+        // group's class grants places (`ExecutorDomain::grant_group`).
+        let target_readout_chunk_graph = NativeGraphCharge::from_footprint(
+            FamilyFootprint::serial(target_readout_graphs.chunk_family()),
+            GraphSlots {
+                activations: 0,
+                output: 0,
+            },
+        )?;
         let head_graph = head_graphs
             .map(|graphs| {
                 NativeGraphCharge::from_footprint(
@@ -1197,6 +1394,7 @@ impl ResourcePlanner {
         let charges = [
             Some(&target_graph),
             Some(&target_readout_graph),
+            Some(&target_readout_chunk_graph),
             head_graph.as_ref(),
             vision_graph.as_ref(),
             Some(&state_graph),
@@ -1231,8 +1429,8 @@ impl ResourcePlanner {
                 bytes.scratch,
                 target_graph.committed_bytes,
                 target_readout_graph.committed_bytes,
-                head_graph.map_or(0, |graph| graph.committed_bytes),
-                vision_graph.map_or(0, |graph| graph.committed_bytes),
+                head_graph.as_ref().map_or(0, |graph| graph.committed_bytes),
+                vision_graph.as_ref().map_or(0, |graph| graph.committed_bytes),
                 state_graph.committed_bytes,
             );
             // Each family's placed workspace against its liveness floor: a
@@ -1270,6 +1468,7 @@ impl ResourcePlanner {
             qualification_peak_bytes,
             target_graph,
             target_readout_graph,
+            target_readout_chunk_graph,
             head_graph,
             vision_graph,
             state_graph,
@@ -1424,6 +1623,44 @@ mod slab_plan_tests {
         }
     }
 
+    /// A class's launches are in flight at once and rotate one output slot
+    /// each and a spare; a class of one leaves a step and its lookahead
+    /// successor sharing those two. A load starts at the floor of one,
+    /// whatever its chain capacity.
+    #[test]
+    fn a_class_sizes_launches_and_output_rotation() {
+        let limits = |lookahead, capacity| ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 8,
+            max_selected_rows: 8,
+            max_drafting_slots: 8,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead,
+            chain_capacity: NonZeroUsize::new(capacity).unwrap(),
+            conversations: NonZeroUsize::MIN,
+        };
+        let slots = |lookahead, places| {
+            let slots = limits(lookahead, 128).class_slots(places);
+            (slots.target, slots.readout.activations)
+        };
+        assert_eq!(limits(true, 128).startup_slots(), limits(true, 128).class_slots(1));
+        let target = |activations, output| GraphSlots {
+            activations,
+            output,
+        };
+        assert_eq!(slots(false, 1), (target(1, 2), 1));
+        assert_eq!(slots(true, 1), (target(2, 2), 2));
+        assert_eq!(slots(true, 4), (target(4, 5), 4));
+        // A chain's launches alternate two successor banks.
+        let banks = |lookahead, capacity| limits(lookahead, capacity).target_successor_banks();
+        assert_eq!(
+            (banks(false, 1), banks(true, 1), banks(false, 4), banks(true, 116)),
+            (1, 2, 2, 2)
+        );
+    }
+
     /// The form a backend's device has declares its listing classes: no
     /// graph is sealed for a class its form does nothing different at.
     #[test]
@@ -1493,12 +1730,20 @@ mod slab_plan_tests {
 
         let history_depth = u64::from(plan.domains[0].slab_rows) + 1;
         assert_eq!(
-            plan.history_bytes_at_depth(0).unwrap(),
+            plan.history_bytes_at_depth(0, 1).unwrap(),
             history.address_table_bytes + history.slab_bytes
         );
         assert_eq!(
-            plan.history_bytes_at_depth(history_depth).unwrap(),
+            plan.history_bytes_at_depth(history_depth, 1).unwrap(),
             history.address_table_bytes + 2 * history.slab_bytes
+        );
+        // Each conversation's rows in pages of its own, slabs over them all.
+        let page = u64::from(plan.domains[0].page_rows);
+        let slab = u64::from(plan.domains[0].slab_rows);
+        assert_eq!(
+            plan.history_bytes_at_depth(history_depth, 3).unwrap(),
+            history.address_table_bytes
+                + (3 * history_depth.div_ceil(page) * page).div_ceil(slab) * history.slab_bytes
         );
         assert_eq!(
             plan.bank_bytes_at_count(5).unwrap(),

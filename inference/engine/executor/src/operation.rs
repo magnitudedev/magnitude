@@ -644,8 +644,18 @@ pub enum Outcome {
     Encode {
         features: FeatureRef,
     },
-    /// A forward whose sequence's table rows could not be read, in this
-    /// step or an earlier one (the sequence is poisoned): its outputs were
+    /// A forward whose sequence's weights (table rows or experts) could not
+    /// be read, in this step or an earlier one (the sequence is poisoned):
+    /// its outputs were
     /// discarded, and reconciling it fails the sequence.
-    TableReadFailed(crate::TableReadError),
+    WeightReadFailed(crate::WeightReadError),
+    /// A forward its step's expert bank interrupted (a late beat of its
+    /// load's pulse: a wait of the step may have ended before its answer),
+    /// for `reason`. Its outputs are not to be used, its inputs are whole,
+    /// and nothing of it is poisoned: aborting it returns the sequence's
+    /// accepted state, from which its round is re-run where it stays
+    /// `resident`; where it does not (a chunk of a chain, released with its
+    /// holder's state), the sequence re-prefills, as an evicted one.
+    /// Reconciling it is an invariant violation.
+    Interrupted { reason: String, resident: bool },
 }

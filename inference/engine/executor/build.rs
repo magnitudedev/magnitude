@@ -1,5 +1,6 @@
 //! Derives the engine build identity from the workspace sources that implement
-//! its worker protocol, execution, and native kernel bundle.
+//! its worker protocol, execution, and native kernel bundle
+//! (`magnitude_executor::ENGINE_BUILD`).
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -46,11 +47,12 @@ fn collect(directory: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn main() {
-    let engine_root =
+    let executor_root =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
-    let root = engine_root
+    let root = executor_root
         .parent()
-        .expect("engine is in the inference workspace");
+        .and_then(Path::parent)
+        .expect("the executor is in the engine, in the inference workspace");
     let mut files = Vec::new();
     for directory in ["engine", "seismic", "seismic-std", "solver"] {
         let path = root.join(directory);

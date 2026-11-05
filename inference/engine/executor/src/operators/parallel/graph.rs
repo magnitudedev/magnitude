@@ -12,6 +12,7 @@ use crate::operators::dense_ffn::graph::dimensions as dense_dimensions;
 use crate::operators::routed::graph::{
     CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum, general_routed,
 };
+use crate::operators::routed::{split::Split, streamed::BankGraph};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{WeightPort, packed_weight, weight};
@@ -76,13 +77,16 @@ impl CheckedParallelEntries {
     }
 }
 
-/// The parallel sublayer `sublayer` over `residual` (`[rows, D]` F32);
-/// returns the new residual. `activation` is the dense branch's activation
-/// code, `scale` the tail's layer scale.
+/// The parallel sublayer `sublayer` over `residual` (`[rows, D]` F32): the
+/// new residual, and the sequence input a run of a streamed routed branch
+/// writes (its `bank`, `general_routed`). `activation` is the dense
+/// branch's activation code, `scale` the tail's layer scale. A split
+/// sublayer's front is its routed branch's, and its back the rest.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: ParallelGraphEntries<'a, G>,
+    bank: Option<BankGraph<'_, 'a, G>>,
     load: &ModelLoadPlan,
     sublayer: SublayerIndex,
     weights: &mut Vec<(WeightPort, NativePort)>,
@@ -93,8 +97,28 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     epsilon: f32,
     activation: i32,
     scale: f32,
-) -> Result<WorkflowTensor, GraphError> {
+    split: Option<Split<'_>>,
+) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
     let [dense_scope, routed_scope] = DenseBesideRouted::scopes(sublayer);
+    let front = matches!(split, Some(Split::Front(_)));
+    let (routed, sequence) = general_routed(
+        graph,
+        entries.routed,
+        bank,
+        load,
+        routed_scope,
+        weights,
+        constants,
+        residual,
+        RoutedSum::Branch,
+        rows,
+        routed_shape,
+        epsilon,
+        split,
+    )?;
+    if front {
+        return Ok((routed, sequence));
+    }
     let dimensions = dense_dimensions(load, dense_scope, rows)?;
     let [_, _, (_, hidden), (_, features)] = dimensions;
     let norm = weight(graph, load, dense_scope, WeightKind::InputNorm, weights)?;
@@ -107,7 +131,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
         WeightKind::PostNorm,
         weights,
     )?;
-    let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
+    let out_rows = GraphConstant::row_identity(graph, rows, Some("M"))?;
     let mut packed =
         |graph: &mut G, kind| packed_weight(graph, load, dense_scope, kind, weights, constants);
     let gate = packed(graph, WeightKind::DenseGate)?;
@@ -160,20 +184,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
         )?
         .value;
     constants.push(out_rows);
-    let routed = general_routed(
-        graph,
-        entries.routed,
-        load,
-        routed_scope,
-        weights,
-        constants,
-        residual,
-        RoutedSum::Branch,
-        rows,
-        routed_shape,
-        epsilon,
-    )?;
-    Ok(graph
+    let output = graph
         .enqueue(
             entries.tail,
             &[("M", rows), ("D", hidden)],
@@ -186,6 +197,8 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                 norm: (&tail_norm).into(),
                 epsilon,
                 scale,
-            },        )?
-        .value)
+            },
+        )?
+        .value;
+    Ok((output, sequence))
 }

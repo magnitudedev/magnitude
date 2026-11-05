@@ -32,7 +32,7 @@
 
 use seismic::{
     AccessPathId, DISPLACEMENT_HISTORY, DeviceTopology, DisplacementWindow, Executor, ExecutorId,
-    HostStatus, KernelPressure, LimitError, ObservationError, Status, StorageKind, Store, StoreId,
+    Contract, HostStatus, KernelPressure, LimitError, ObservationError, Status, Store, StoreId,
     StoreKind,
 };
 use std::{collections::BTreeMap, fmt, time::Duration};
@@ -59,6 +59,32 @@ impl fmt::Display for HostDistress {
             Self::Swapping => "the system is swapping",
             Self::Thrashing => "the system is thrashing compressed memory",
             Self::KernelCritical => "the kernel reports critical memory pressure",
+        })
+    }
+}
+
+/// Host RAM about to run out: the hosting service kills its worker on the
+/// first reading that shows it. Where the OS reports its own pressure level
+/// (macOS `kern.memorystatus_vm_pressure_level`, the level `memorystatus`
+/// acts on before it kills processes), only critical pressure is; elsewhere,
+/// obtainable headroom at or below the emergency reserve. Headroom alone is
+/// no emergency where the OS reports a level: what can be taken without
+/// displacing other programs' data runs low long before memory is
+/// exhausted, while the OS can still compress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostEmergency {
+    /// The kernel classifies system memory pressure as critical.
+    KernelCritical,
+    /// On a host that reports no pressure level, obtainable headroom at or
+    /// below the emergency reserve.
+    EmergencyReserve,
+}
+
+impl fmt::Display for HostEmergency {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::KernelCritical => "the kernel reports critical memory pressure",
+            Self::EmergencyReserve => "system memory headroom reached the emergency reserve",
         })
     }
 }
@@ -108,7 +134,9 @@ fn thrashed(window: &DisplacementWindow) -> bool {
 /// Whether windows showing displacement by `displaced` cover at least
 /// [`DISPLACED_WITHIN_SPAN`] of the last [`DISPLACEMENT_SPAN`]. Windows are
 /// contiguous, most recent first; time before the first window counts as
-/// not displaced.
+/// not displaced. They are the host sampler's, each about
+/// [`seismic::DISPLACEMENT_CADENCE`] long whoever reads the host and however
+/// often, the cadence of the traces these rules were judged on.
 fn sustained(windows: &[DisplacementWindow], displaced: fn(&DisplacementWindow) -> bool) -> bool {
     let mut span = Duration::ZERO;
     let mut covered = Duration::ZERO;
@@ -146,8 +174,9 @@ fn host_distress(host: &HostStatus) -> Option<HostDistress> {
 }
 
 /// Host RAM's fit as `host` reads it: its capacity within the process
-/// limits `host` reports, and the headroom and distress `host` reports.
-fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves) -> StoreFit {
+/// limits `host` reports, its `room` as headroom, and the distress `host`
+/// reports.
+fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, room: HostRoom) -> StoreFit {
     let capacity_bytes = host
         .limits
         .iter()
@@ -158,7 +187,13 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves) -> 
         store,
         reserves,
         capacity_bytes,
-        host.available(),
+        match room {
+            HostRoom::Allocatable => host.allocatable_bytes(),
+            HostRoom::Obtainable => host.obtainable_bytes(),
+            HostRoom::Served { displaced } => host
+                .allocatable_bytes()
+                .saturating_sub(host.displaced_bytes.map_or(0, |now| now.saturating_sub(displaced))),
+        },
         host_distress(host),
         MemoryConstraint::HostRam,
     )
@@ -232,8 +267,8 @@ impl Reserve {
 }
 
 /// One domain's thresholds. Stable fit and every engine claim keep headroom
-/// above `planning_bytes`; the hosting service kills the worker at or below
-/// `emergency_bytes`.
+/// above `planning_bytes`; on a host that reports no pressure level, host
+/// RAM at or below `emergency_bytes` is an emergency ([`HostEmergency`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DomainThresholds {
     pub planning_bytes: u64,
@@ -334,7 +369,7 @@ pub enum MemoryPolicyError {
     /// unavailable executor.
     Unplaced {
         executor: ExecutorId,
-        kind: StorageKind,
+        kind: Contract,
     },
 }
 
@@ -354,6 +389,36 @@ impl fmt::Display for MemoryPolicyError {
 }
 
 impl std::error::Error for MemoryPolicyError {}
+
+/// How long memory must stay free (headroom above the planning reserve, no
+/// distress) to count as recovered.
+pub const RECOVERY_STABLE_TIME: Duration = Duration::from_secs(5);
+
+/// Whether memory has recovered (stayed free): free at every reading
+/// for [`RECOVERY_STABLE_TIME`]. What a service closed by memory pressure
+/// reopens load admission on, and an elastic expert bank grows on. `T` is
+/// the caller's clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Recovery<T> {
+    free_since: Option<T>,
+}
+
+impl<T: Copy> Recovery<T> {
+    pub const fn new() -> Self {
+        Self { free_since: None }
+    }
+
+    /// A reading at `now`, memory `free` or not; `elapsed(since, now)` the
+    /// clock's time between two readings. Whether memory has recovered.
+    pub fn observe(&mut self, free: bool, now: T, elapsed: impl FnOnce(T, T) -> Duration) -> bool {
+        if !free {
+            self.free_since = None;
+            return false;
+        }
+        let since = *self.free_since.get_or_insert(now);
+        elapsed(since, now) >= RECOVERY_STABLE_TIME
+    }
+}
 
 /// The band of one observed store. No engine claim takes headroom to the
 /// planning reserve; other programs can, and on a host that reports
@@ -380,7 +445,7 @@ impl DomainRole {
     /// A store `executor`'s device storage is placed on holds its
     /// allocations; any other store it charges holds host-side work.
     pub fn of(topology: &DeviceTopology, executor: &Executor, store: StoreId) -> Self {
-        let allocates = executor.placement(StorageKind::Device).iter().any(|id| {
+        let allocates = executor.paths(seismic::Placing::Fixed(Contract::DeviceOnly)).iter().any(|id| {
             topology
                 .access_path(*id)
                 .expect("placement belongs to its topology")
@@ -471,7 +536,7 @@ pub struct StorageDemand {
     /// The executor whose placement the bytes go along.
     pub executor: ExecutorId,
     /// The storage kind, whose placement it is.
-    pub kind: StorageKind,
+    pub kind: Contract,
     pub bytes: u64,
 }
 
@@ -504,31 +569,53 @@ impl DemandFit {
     }
 }
 
+/// Which of host RAM's room a fit question reads ([`HostStatus`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRoom {
+    /// What can be taken without the OS displacing another program's data
+    /// ([`HostStatus::allocatable`]): what a load that grows and gives back
+    /// while others run, its Reclaim band and its claims, read.
+    Allocatable,
+    /// What the OS can make available, displacing other programs' data if
+    /// it must ([`HostStatus::obtainable`]): what an explicit load's
+    /// admission reads.
+    Obtainable,
+    /// What a serving load may take without displacing any more of other
+    /// programs' data than the OS held displaced as it began to serve
+    /// (`displaced` bytes, [`HostStatus::displaced_bytes`]): `Allocatable`
+    /// less the displacement since, which made free RAM that is free only
+    /// while another program's data stays out.
+    Served { displaced: u64 },
+}
+
 /// The sole interpretation of stores and grants for engine fit questions.
 pub struct Fit<'a> {
     topology: &'a DeviceTopology,
     status: &'a Status,
     reserves: &'a MemoryReserves,
+    room: HostRoom,
 }
 
 impl<'a> Fit<'a> {
     /// Fit over `topology`'s stores and grants as `status` reads them, with
-    /// `reserves`.
+    /// `reserves`, host RAM's room `room`.
     pub fn new(
         topology: &'a DeviceTopology,
         status: &'a Status,
         reserves: &'a MemoryReserves,
+        room: HostRoom,
     ) -> Self {
         Self {
             topology,
             status,
             reserves,
+            room,
         }
     }
 
     /// Store `id`'s fit: its capacity within process limits (host RAM's)
-    /// and its headroom ([`Status::headroom`]), each less its planning
-    /// reserve, in the Reclaim band at or below the reserve or while the
+    /// and its headroom ([`Status::headroom`], within what is left of every
+    /// grant on it), each less its planning reserve, in the Reclaim band at or below the reserve or while the
     /// host is in distress.
     pub fn store(&self, id: StoreId) -> Result<StoreFit, MemoryPolicyError> {
         let store = self
@@ -543,7 +630,7 @@ impl<'a> Fit<'a> {
                     .host_ram
                     .as_ref()
                     .map_err(|error| MemoryPolicyError::Observation(error.clone()))?;
-                return Ok(host_ram_fit(store, host, self.reserves));
+                return Ok(host_ram_fit(store, host, self.reserves, self.room));
             }
             StoreKind::DeviceMemory(_) => MemoryConstraint::DeviceLocal,
             StoreKind::Volume(_) => MemoryConstraint::Volume,
@@ -552,6 +639,18 @@ impl<'a> Fit<'a> {
             .status
             .headroom(store)
             .map_err(MemoryPolicyError::Observation)?;
+        // A store's own figure knows only this process; what is left of a
+        // grant on it is the driver's, which other processes' memory lowers.
+        let headroom_bytes = self
+            .topology
+            .access_paths()
+            .iter()
+            .filter(|path| path.store() == id && self.status.sample.executors.contains(&path.executor()))
+            .filter_map(|path| self.status.grant_left(path))
+            .try_fold(headroom_bytes, |least, left| match left {
+                Ok(left) => Ok(least.min(left.value)),
+                Err(error) => Err(MemoryPolicyError::Observation(error.clone())),
+            })?;
         Ok(store_fit(
             store,
             self.reserves,
@@ -569,8 +668,29 @@ impl<'a> Fit<'a> {
         topology: &DeviceTopology,
         host: &HostStatus,
         reserves: &MemoryReserves,
+        room: HostRoom,
     ) -> StoreFit {
-        host_ram_fit(topology.host_ram(), host, reserves)
+        host_ram_fit(topology.host_ram(), host, reserves, room)
+    }
+
+    /// Whether host RAM is about to run out as `host` reads it, and why
+    /// ([`HostEmergency`]): for the residency supervisor, which has only
+    /// `host`.
+    pub fn host_emergency(
+        topology: &DeviceTopology,
+        host: &HostStatus,
+        reserves: &MemoryReserves,
+    ) -> Option<HostEmergency> {
+        match host.kernel_pressure {
+            Some(KernelPressure::Critical) => Some(HostEmergency::KernelCritical),
+            Some(KernelPressure::Normal | KernelPressure::Warning) => None,
+            None => {
+                let store = topology.host_ram();
+                let thresholds = reserves.for_domain(store.kind(), store.capacity().value);
+                (host.obtainable_bytes() <= thresholds.emergency_bytes)
+                    .then_some(HostEmergency::EmergencyReserve)
+            }
+        }
     }
 
     /// What access path `id`'s grant leaves a claim: the reported grant,
@@ -606,7 +726,7 @@ impl<'a> Fit<'a> {
     pub fn placement(
         &self,
         executor: &Executor,
-        kind: StorageKind,
+        kind: Contract,
     ) -> Result<PlacementFit, MemoryPolicyError> {
         self.storage_beside(executor, &[kind], &[])
     }
@@ -617,7 +737,7 @@ impl<'a> Fit<'a> {
     pub fn storage_beside(
         &self,
         executor: &Executor,
-        kinds: &[StorageKind],
+        kinds: &[Contract],
         direct: &[(StoreId, u64)],
     ) -> Result<PlacementFit, MemoryPolicyError> {
         let demands: Vec<_> = kinds
@@ -702,7 +822,7 @@ impl<'a> Fit<'a> {
                 .ok_or(MemoryPolicyError::ForeignIdentifier)?;
             let mut left = demand.bytes;
             let mut last = None;
-            for &id in executor.placement(demand.kind) {
+            for &id in executor.paths(seismic::Placing::Fixed(demand.kind)) {
                 let path = self
                     .topology
                     .access_path(id)
@@ -766,7 +886,32 @@ pub struct DomainReading {
     pub ceiling_bytes: u64,
     /// The host's distress, for host RAM; a device's own memory has none.
     pub distress: Option<HostDistress>,
+    /// What the OS held outside headroom, for host RAM on a platform that
+    /// counts it.
+    pub held: Option<seismic::HostHeld>,
+    /// The displacement windows `distress` was judged on, for host RAM on a
+    /// platform that counts displacement.
+    pub displacement: Option<seismic::HostDisplacement>,
     pub band: MemoryBand,
+}
+
+impl fmt::Display for DomainReading {
+    /// The reading a band was judged on.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} headroom {} bytes against a planning reserve of {}",
+            self.constraint, self.headroom_bytes, self.thresholds.planning_bytes
+        )?;
+        if let Some(held) = self.held {
+            write!(
+                f,
+                "; the host holds {} bytes wired and {} compressed",
+                held.wired_bytes, held.compressed_bytes
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Fresh store readings for the executor's placements and host-side work.
@@ -778,20 +923,22 @@ pub fn observe_domains(
     reserves: &MemoryReserves,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
     let status = devices.status(device.topology(), device.info().id());
-    domain_readings(device, &status, reserves)
+    domain_readings(device, &status, reserves, HostRoom::Allocatable)
 }
 
-/// The readings of every store `device` places storage on, and host RAM.
+/// The readings of every store `device` places storage on, and host RAM,
+/// host RAM's room `room`.
 fn domain_readings(
     device: &seismic::Device,
     status: &Status,
     reserves: &MemoryReserves,
+    room: HostRoom,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
     let topology = device.topology();
-    let fit = Fit::new(topology, status, reserves);
-    let stores: std::collections::BTreeSet<_> = StorageKind::ALL
+    let fit = Fit::new(topology, status, reserves, room);
+    let stores: std::collections::BTreeSet<_> = crate::memory::CLAIMED
         .iter()
-        .flat_map(|kind| device.info().placement(*kind))
+        .flat_map(|kind| device.info().paths(seismic::Placing::Fixed(*kind)))
         .map(|id| {
             topology
                 .access_path(*id)
@@ -804,6 +951,14 @@ fn domain_readings(
         .into_iter()
         .map(|store| {
             let reading = fit.store(store)?;
+            // Host RAM's fit read the host sample; other stores have none.
+            let host = (reading.constraint == MemoryConstraint::HostRam).then(|| {
+                status
+                    .sample
+                    .host_ram
+                    .as_ref()
+                    .expect("host RAM's fit read its sample")
+            });
             Ok(DomainReading {
                 role: DomainRole::of(topology, device.info(), store),
                 domain: store,
@@ -815,6 +970,8 @@ fn domain_readings(
                 thresholds: reading.thresholds,
                 ceiling_bytes: reading.ceiling_bytes,
                 distress: reading.distress,
+                held: host.and_then(|host| host.held),
+                displacement: host.and_then(|host| host.displacement.clone()),
                 band: reading.band,
             })
         })
@@ -828,64 +985,64 @@ fn domain_readings(
              readings={readings:?}",
             std::process::id(),
             device.info().selector(),
-            device.store_charges(),
+            device.ledgers().own_claims(),
         );
     }
     readings
 }
 
-/// Set `device`'s enforced store, path and storage limits from the status
-/// sample `status`: what each has charged plus its live room. A failed
-/// reading holds every storage kind to what it has charged: missing
-/// observations never authorize allocation.
+/// Bound `device`'s stores and paths from the status sample `status`: what
+/// each has charged plus its live room. A failed reading holds the device's
+/// own ledger on every store it reaches to what it claims: missing
+/// observations never authorize allocation. Host RAM's room is `room`, the
+/// one the claims checked against these bounds read.
 pub(crate) fn refresh_device_ceiling(
     device: &seismic::Device,
     status: &Status,
     reserves: &MemoryReserves,
+    room: HostRoom,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let result = set_device_ceiling(device, status, reserves);
+    let result = set_device_ceiling(device, status, reserves, room);
     if result.is_err() {
-        for kind in StorageKind::ALL {
-            device.set_storage_limit(kind, Some(device.storage_usage(kind).charged));
+        for (store, ledger) in device.ledgers().own {
+            device
+                .bound(seismic::Ledger::Own(store), Some(ledger.claim))
+                .expect("a device bounds its own ledgers");
         }
     }
     result
 }
 
-/// Set `device`'s store, path and storage limits from `status`: what each
-/// has charged plus its live room. The readings it set them from.
+/// Bound `device`'s stores and paths from `status`: what each has charged
+/// plus its live room. The readings it bound them from.
 fn set_device_ceiling(
     device: &seismic::Device,
     status: &Status,
     reserves: &MemoryReserves,
+    room: HostRoom,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let fit = Fit::new(device.topology(), status, reserves);
-    let readings = domain_readings(device, status, reserves)?;
+    let fit = Fit::new(device.topology(), status, reserves, room);
+    let readings = domain_readings(device, status, reserves, room)?;
     for reading in &readings {
         let limit = status
             .charged(reading.domain)
             .saturating_add(reading.ceiling_bytes);
         device
-            .set_store_limit(reading.domain, Some(limit))
+            .bound(seismic::Ledger::Store(reading.domain), Some(limit))
             .map_err(MemoryPolicyError::Limit)?;
     }
-    let charges: BTreeMap<_, _> = device.path_charges().into_iter().collect();
-    let paths: std::collections::BTreeSet<_> = StorageKind::ALL
+    let charges: BTreeMap<_, _> = device.ledgers().paths.into_iter().map(|path| (path.path, path.claim)).collect();
+    let paths: std::collections::BTreeSet<_> = crate::memory::CLAIMED
         .iter()
-        .flat_map(|kind| device.info().placement(*kind))
+        .flat_map(|kind| device.info().paths(seismic::Placing::Fixed(*kind)))
         .copied()
         .collect();
     for path in paths {
         let left = fit.grant(path, FitMode::Live)?;
         let charged = charges.get(&path).copied().unwrap_or(0);
         device
-            .set_path_limit(path, Some(charged.saturating_add(left)))
+            .bound(seismic::Ledger::Path(path), Some(charged.saturating_add(left)))
             .map_err(MemoryPolicyError::Limit)?;
-    }
-    for kind in StorageKind::ALL {
-        let room = fit.placement(device.info(), kind)?;
-        let charged = device.storage_usage(kind).charged;
-        device.set_storage_limit(kind, Some(charged.saturating_add(room.ceiling_bytes)));
     }
     Ok(readings)
 }
@@ -906,17 +1063,34 @@ mod tests {
 
     const LINUX: ReportedBy = ReportedBy::LinuxMemAvailable;
     const MACOS: ReportedBy = ReportedBy::MachMovablePages;
+
+    /// Memory recovers once free for the stable time at every reading; one
+    /// reading that is not free starts it over.
+    #[test]
+    fn memory_recovers_once_it_stays_free() {
+        let stable = RECOVERY_STABLE_TIME.as_secs();
+        let elapsed = |since: u64, now: u64| Duration::from_secs(now - since);
+        let mut recovery = Recovery::new();
+        assert!(!recovery.observe(true, 0, elapsed));
+        assert!(!recovery.observe(false, stable, elapsed));
+        assert!(!recovery.observe(true, stable + 1, elapsed));
+        assert!(!recovery.observe(true, 2 * stable, elapsed));
+        assert!(recovery.observe(true, 2 * stable + 1, elapsed));
+    }
     const WINDOWS: ReportedBy = ReportedBy::WindowsPhysicalAndCommit;
 
     /// Host RAM with `headroom` bytes this process can take, as `by`
     /// reports it, without limits, displacement counters or kernel pressure.
     fn host(by: ReportedBy, headroom: u64) -> HostStatus {
         HostStatus {
-            headroom: Reported::new(headroom, by),
+            allocatable: Reported::new(headroom, by),
+            obtainable: Reported::new(headroom, by),
             limits: Vec::new(),
             limit_visibility: LimitVisibility::Complete,
             displacement: None,
             kernel_pressure: None,
+            held: None,
+            displaced_bytes: None,
         }
     }
 
@@ -976,11 +1150,11 @@ mod tests {
     fn grant_room(
         topology: &DeviceTopology,
         executor: &Executor,
-        kind: StorageKind,
+        kind: Contract,
         index: usize,
     ) -> u64 {
         let path = topology
-            .access_path(executor.placement(kind)[index])
+            .access_path(executor.paths(seismic::Placing::Fixed(kind))[index])
             .unwrap();
         let store = topology.store(path.store()).unwrap();
         let reserve = MemoryReserves::standard()
@@ -989,7 +1163,7 @@ mod tests {
         path.grant().unwrap().value - reserve
     }
 
-    fn demand(executor: &Executor, kind: StorageKind, bytes: u64) -> StorageDemand {
+    fn demand(executor: &Executor, kind: Contract, bytes: u64) -> StorageDemand {
         StorageDemand {
             executor: executor.id(),
             kind,
@@ -1167,6 +1341,10 @@ mod tests {
         );
         let burst = within_span(window(500, 0, 0, 40), DISPLACED_WITHIN_SPAN - HALF_SECOND);
         assert_eq!(host_distress(&displaced(burst)), None);
+        // One swap-out in a span of the sampler's windows marks only its own.
+        let mut stray = lasting(window(1_000, 0, 0, 0), DISPLACEMENT_SPAN);
+        stray[7].swapped_out_pages = 1;
+        assert_eq!(host_distress(&displaced(stray)), None);
     }
 
     /// Critical kernel pressure is distress on its first observation;
@@ -1185,6 +1363,55 @@ mod tests {
         assert_eq!(host_distress(&warning), None);
     }
 
+    /// Where the OS reports its pressure level, only critical pressure is an
+    /// emergency, whatever the headroom; where it reports none, obtainable
+    /// headroom at or below the emergency reserve is.
+    #[test]
+    fn host_emergency_is_critical_pressure_where_reported_and_the_emergency_reserve_elsewhere() {
+        let topology = recorded::rtx3090();
+        let reserves = MemoryReserves::standard();
+        let store = topology.host_ram();
+        let emergency_bytes = reserves
+            .for_domain(store.kind(), store.capacity().value)
+            .emergency_bytes;
+        let emergency = |headroom, kernel_pressure| {
+            let host = HostStatus {
+                kernel_pressure,
+                ..host(LINUX, headroom)
+            };
+            Fit::host_emergency(&topology, &host, &reserves)
+        };
+        assert_eq!(emergency(emergency_bytes + 1, None), None);
+        assert_eq!(
+            emergency(emergency_bytes, None),
+            Some(HostEmergency::EmergencyReserve)
+        );
+        assert_eq!(emergency(0, Some(KernelPressure::Normal)), None);
+        assert_eq!(emergency(0, Some(KernelPressure::Warning)), None);
+        assert_eq!(
+            emergency(64 * GIB, Some(KernelPressure::Critical)),
+            Some(HostEmergency::KernelCritical)
+        );
+    }
+
+    /// Another process's memory on a discrete device reaches its store's
+    /// fit through what the driver says is left of the grant, which the
+    /// process's own charges cannot show.
+    #[test]
+    fn a_stores_headroom_follows_what_is_left_of_its_grants() {
+        let reserves = MemoryReserves::standard();
+        let rtx3090 = recorded::rtx3090();
+        let cuda = executor(&rtx3090, BackendName::Cuda);
+        let path = rtx3090.access_path(cuda.paths(seismic::Placing::Fixed(Contract::DeviceOnly))[0]).unwrap();
+        let mut opened = sampled(&rtx3090, host(LINUX, 40 * GIB));
+        let store = path.store();
+        let room = |status: &Status| Fit::new(&rtx3090, status, &reserves, HostRoom::Allocatable).store(store).unwrap().headroom_bytes;
+        let capacity = room(&opened);
+        opened.runtime.grants = vec![(path.id(), Ok(Reported::new(GIB, ReportedBy::CudaFree)))];
+        assert!(capacity > GIB);
+        assert_eq!(room(&opened), GIB);
+    }
+
     /// A host in distress puts host RAM in Reclaim whatever its headroom,
     /// which fit still reports as observed; distress is host RAM's, so a
     /// device memory store never carries it.
@@ -1193,7 +1420,7 @@ mod tests {
         let reserves = MemoryReserves::standard();
         let swapping = status(displaced(lasting(window(500, 0, 0, 1), DISPLACEMENT_SPAN)));
         let m4_pro = recorded::m4_pro();
-        let host_ram = Fit::new(&m4_pro, &swapping, &reserves)
+        let host_ram = Fit::new(&m4_pro, &swapping, &reserves, HostRoom::Allocatable)
             .store(m4_pro.host_ram().id())
             .unwrap();
         assert_eq!(host_ram.band, MemoryBand::Reclaim);
@@ -1202,7 +1429,7 @@ mod tests {
         assert_eq!(host_ram.ceiling_bytes, 32 * GIB - host_ram.thresholds.planning_bytes);
 
         let rtx3090 = recorded::rtx3090();
-        let fit = Fit::new(&rtx3090, &swapping, &reserves);
+        let fit = Fit::new(&rtx3090, &swapping, &reserves, HostRoom::Allocatable);
         let own = fit.store(device_memory(&rtx3090)).unwrap();
         assert_eq!(own.distress, None);
         assert_eq!(own.band, MemoryBand::Normal);
@@ -1214,11 +1441,32 @@ mod tests {
         // Thrashing for less than the span leaves the band to headroom.
         let burst = within_span(thrashing_window(), DISPLACED_WITHIN_SPAN - HALF_SECOND);
         let absorbed = status(displaced(burst));
-        let host_ram = Fit::new(&m4_pro, &absorbed, &reserves)
+        let host_ram = Fit::new(&m4_pro, &absorbed, &reserves, HostRoom::Allocatable)
             .store(m4_pro.host_ram().id())
             .unwrap();
         assert_eq!(host_ram.distress, None);
         assert_eq!(host_ram.band, MemoryBand::Normal);
+    }
+
+    /// A serving load's room leaves out what the OS displaced from other
+    /// programs since it began serving: 32 GiB free of which 6 GiB exist
+    /// because 6 GiB more of another program's data went to swap or the
+    /// compressor is 26 GiB; displacement it began beside, or that came back,
+    /// takes nothing.
+    #[test]
+    fn a_serving_load_reads_no_room_made_by_displacing_another_program() {
+        let reserves = MemoryReserves::standard();
+        let m4_pro = recorded::m4_pro();
+        let headroom = |displaced_bytes, room| {
+            let host = HostStatus { displaced_bytes, ..host(ReportedBy::MachAllocatablePages, 32 * GIB) };
+            Fit::new(&m4_pro, &status(host), &reserves, room).store(m4_pro.host_ram().id()).unwrap().headroom_bytes
+        };
+        let served = HostRoom::Served { displaced: 4 * GIB };
+        assert_eq!(headroom(Some(10 * GIB), served), 26 * GIB);
+        assert_eq!(headroom(Some(4 * GIB), served), 32 * GIB);
+        assert_eq!(headroom(Some(GIB), served), 32 * GIB);
+        assert_eq!(headroom(None, served), 32 * GIB, "a platform that counts no displacement");
+        assert_eq!(headroom(Some(10 * GIB), HostRoom::Allocatable), 32 * GIB);
     }
 
     /// Each reserve is the larger of its fraction of the store's capacity
@@ -1301,7 +1549,7 @@ mod tests {
         let capacity = topology.host_ram().capacity().value;
         let reserves = MemoryReserves::standard();
         let reading = |headroom| {
-            Fit::new(&topology, &status(host(LINUX, headroom)), &reserves)
+            Fit::new(&topology, &status(host(LINUX, headroom)), &reserves, HostRoom::Allocatable)
                 .store(id)
                 .unwrap()
         };
@@ -1332,14 +1580,14 @@ mod tests {
         let error = ObservationError::Failed("sample failed".into());
         unobserved.sample.host_ram = Err(error.clone());
         let reserves = MemoryReserves::standard();
-        let fit = Fit::new(&topology, &unobserved, &reserves);
+        let fit = Fit::new(&topology, &unobserved, &reserves, HostRoom::Allocatable);
         assert_eq!(
             fit.store(topology.host_ram().id()),
             Err(MemoryPolicyError::Observation(error.clone()))
         );
         let cpu = executor(&topology, BackendName::Cpu);
         assert_eq!(
-            fit.placement(cpu, StorageKind::Device),
+            fit.placement(cpu, Contract::DeviceOnly),
             Err(MemoryPolicyError::Observation(error))
         );
     }
@@ -1394,12 +1642,12 @@ mod tests {
         let topology = recorded::m4_pro();
         let reserves = MemoryReserves::standard();
         let metal = executor(&topology, BackendName::Metal);
-        let working_set = grant_room(&topology, metal, StorageKind::Device, 0);
+        let working_set = grant_room(&topology, metal, Contract::DeviceOnly, 0);
         let unlimited = sampled(&topology, host(MACOS, 16 * GIB));
-        let fit = Fit::new(&topology, &unlimited, &reserves);
+        let fit = Fit::new(&topology, &unlimited, &reserves, HostRoom::Allocatable);
         let host_fit = fit.store(topology.host_ram().id()).unwrap().stable_bytes;
         assert!(working_set < host_fit);
-        for kind in StorageKind::ALL {
+        for kind in crate::memory::CLAIMED {
             assert_eq!(
                 fit.placement(metal, kind).unwrap().stable_bytes,
                 working_set
@@ -1408,7 +1656,7 @@ mod tests {
         // The CPU's host RAM is ungranted: host RAM's fit.
         let cpu = executor(&topology, BackendName::Cpu);
         assert_eq!(
-            fit.placement(cpu, StorageKind::Device)
+            fit.placement(cpu, Contract::DeviceOnly)
                 .unwrap()
                 .stable_bytes,
             host_fit
@@ -1422,11 +1670,11 @@ mod tests {
             reclaimable_bytes: 0,
         }];
         let limited = sampled(&topology, limited);
-        let fit = Fit::new(&topology, &limited, &reserves);
+        let fit = Fit::new(&topology, &limited, &reserves, HostRoom::Allocatable);
         let host_fit = fit.store(topology.host_ram().id()).unwrap().stable_bytes;
         assert!(host_fit < working_set);
         assert_eq!(
-            fit.placement(metal, StorageKind::Device)
+            fit.placement(metal, Contract::DeviceOnly)
                 .unwrap()
                 .stable_bytes,
             host_fit
@@ -1442,7 +1690,7 @@ mod tests {
         let topology = recorded::m4_pro();
         let reserves = MemoryReserves::standard();
         let metal = executor(&topology, BackendName::Metal);
-        let path = metal.placement(StorageKind::Device)[0];
+        let path = metal.paths(seismic::Placing::Fixed(Contract::DeviceOnly))[0];
         let host_ram = topology.host_ram().id();
         let mut sampled = sampled(&topology, host(MACOS, 20 * GIB));
         let with_left = |sampled: &mut Status, left| {
@@ -1453,26 +1701,26 @@ mod tests {
         };
         // Working set left 4 GiB above host RAM's planning reserve, which
         // stays inside it, is tighter than host RAM's ceiling.
-        let reserve = Fit::new(&topology, &sampled, &reserves)
+        let reserve = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable)
             .store(host_ram)
             .unwrap()
             .thresholds
             .planning_bytes;
         with_left(&mut sampled, 4 * GIB + reserve);
-        let fit = Fit::new(&topology, &sampled, &reserves);
+        let fit = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable);
         let host_ceiling = fit.store(host_ram).unwrap().ceiling_bytes;
         assert!(4 * GIB < host_ceiling);
         assert_eq!(fit.store(host_ram).unwrap().band, MemoryBand::Normal);
-        let room = fit.placement(metal, StorageKind::Device).unwrap();
+        let room = fit.placement(metal, Contract::DeviceOnly).unwrap();
         assert_eq!(room.ceiling_bytes, 4 * GIB);
         // The sample bounds the ceiling, not stable fit.
         assert_eq!(
             room.stable_bytes,
-            grant_room(&topology, metal, StorageKind::Device, 0)
+            grant_room(&topology, metal, Contract::DeviceOnly, 0)
         );
         let over = fit
             .demand(
-                &[demand(metal, StorageKind::Device, 5 * GIB)],
+                &[demand(metal, Contract::DeviceOnly, 5 * GIB)],
                 &[],
                 FitMode::Live,
             )
@@ -1488,12 +1736,12 @@ mod tests {
         );
         // Host RAM's ceiling is tighter than the working set left.
         with_left(&mut sampled, 30 * GIB);
-        let fit = Fit::new(&topology, &sampled, &reserves);
-        let room = fit.placement(metal, StorageKind::Device).unwrap();
+        let fit = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable);
+        let room = fit.placement(metal, Contract::DeviceOnly).unwrap();
         assert_eq!(room.ceiling_bytes, host_ceiling);
         let over = fit
             .demand(
-                &[demand(metal, StorageKind::Device, host_ceiling + 1)],
+                &[demand(metal, Contract::DeviceOnly, host_ceiling + 1)],
                 &[],
                 FitMode::Live,
             )
@@ -1501,9 +1749,9 @@ mod tests {
         assert_eq!(over.refused[0].constraint, MemoryConstraint::HostRam);
         // A spent working set grants nothing but leaves host RAM Normal.
         with_left(&mut sampled, 0);
-        let fit = Fit::new(&topology, &sampled, &reserves);
+        let fit = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable);
         assert_eq!(
-            fit.placement(metal, StorageKind::Device)
+            fit.placement(metal, Contract::DeviceOnly)
                 .unwrap()
                 .ceiling_bytes,
             0
@@ -1524,16 +1772,16 @@ mod tests {
             (recorded::lunar_lake(), BackendName::Vulkan),
         ] {
             let unopened = sampled(&topology, host(LINUX, 8 * GIB));
-            let fit = Fit::new(&topology, &unopened, &reserves);
+            let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
             let host_fit = fit.store(topology.host_ram().id()).unwrap().stable_bytes;
             let executor = executor(&topology, backend);
-            let grant = grant_room(&topology, executor, StorageKind::Device, 0);
-            let room = fit.placement(executor, StorageKind::Device).unwrap();
+            let grant = grant_room(&topology, executor, Contract::DeviceOnly, 0);
+            let room = fit.placement(executor, Contract::DeviceOnly).unwrap();
             let label = format!("{backend:?} on {}", executor.name());
             assert_eq!(room.stable_bytes, grant.min(host_fit), "{label}");
             let over = fit
                 .demand(
-                    &[demand(executor, StorageKind::Device, room.stable_bytes + 1)],
+                    &[demand(executor, Contract::DeviceOnly, room.stable_bytes + 1)],
                     &[],
                     FitMode::Stable,
                 )
@@ -1554,7 +1802,7 @@ mod tests {
         let topology = recorded::gb10();
         let reserves = MemoryReserves::standard();
         let unopened = status(host(LINUX, 8 * GIB));
-        let fit = Fit::new(&topology, &unopened, &reserves);
+        let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         let host_ram = topology.host_ram().id();
         let host_fit = fit.store(host_ram).unwrap().stable_bytes;
         let cuda = executor(&topology, BackendName::Cuda);
@@ -1563,8 +1811,8 @@ mod tests {
         let result = fit
             .demand(
                 &[
-                    demand(cuda, StorageKind::Device, half),
-                    demand(vulkan, StorageKind::Device, host_fit - work - half + 1),
+                    demand(cuda, Contract::DeviceOnly, half),
+                    demand(vulkan, Contract::DeviceOnly, host_fit - work - half + 1),
                 ],
                 &[(host_ram, work)],
                 FitMode::Stable,
@@ -1590,7 +1838,7 @@ mod tests {
         let topology = recorded::gb10();
         let reserves = MemoryReserves::standard();
         let cuda = executor(&topology, BackendName::Cuda);
-        let path = cuda.placement(StorageKind::Device)[0];
+        let path = cuda.paths(seismic::Placing::Fixed(Contract::DeviceOnly))[0];
         let total = topology.access_path(path).unwrap().grant().unwrap().value;
         let mut opened = sampled(&topology, host(LINUX, 40 * GIB));
         let holding = |opened: &mut Status, held| {
@@ -1600,10 +1848,10 @@ mod tests {
             )];
         };
         holding(&mut opened, 0);
-        let fit = Fit::new(&topology, &opened, &reserves);
+        let fit = Fit::new(&topology, &opened, &reserves, HostRoom::Allocatable);
         let host_ceiling = fit.store(topology.host_ram().id()).unwrap().ceiling_bytes;
         assert_eq!(
-            fit.placement(cuda, StorageKind::Device)
+            fit.placement(cuda, Contract::DeviceOnly)
                 .unwrap()
                 .ceiling_bytes,
             host_ceiling
@@ -1616,10 +1864,10 @@ mod tests {
             .thresholds
             .planning_bytes;
         holding(&mut opened, total - 8 * GIB - reserve);
-        let fit = Fit::new(&topology, &opened, &reserves);
+        let fit = Fit::new(&topology, &opened, &reserves, HostRoom::Allocatable);
         assert!(8 * GIB < host_ceiling);
         assert_eq!(
-            fit.placement(cuda, StorageKind::Device)
+            fit.placement(cuda, Contract::DeviceOnly)
                 .unwrap()
                 .ceiling_bytes,
             8 * GIB
@@ -1637,16 +1885,16 @@ mod tests {
         let gpu = device_memory(&topology);
         let capacity = topology.store(gpu).unwrap().capacity().value;
         let mut sampled = sampled(&topology, host(LINUX, 16 * GIB));
-        let fit = Fit::new(&topology, &sampled, &reserves);
+        let fit = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable);
         let own = fit.store(gpu).unwrap();
         assert_eq!(own.constraint, MemoryConstraint::DeviceLocal);
         assert_eq!(own.stable_bytes, capacity - own.thresholds.planning_bytes);
         let cuda = executor(&topology, BackendName::Cuda);
         let vulkan = executor(&topology, BackendName::Vulkan);
         for executor in [cuda, vulkan] {
-            let grant = grant_room(&topology, executor, StorageKind::Device, 0);
+            let grant = grant_room(&topology, executor, Contract::DeviceOnly, 0);
             assert_eq!(
-                fit.placement(executor, StorageKind::Device)
+                fit.placement(executor, Contract::DeviceOnly)
                     .unwrap()
                     .stable_bytes,
                 grant.min(own.stable_bytes)
@@ -1656,8 +1904,8 @@ mod tests {
         let split = fit
             .demand(
                 &[
-                    demand(cuda, StorageKind::Device, half),
-                    demand(vulkan, StorageKind::Device, own.stable_bytes - half + 1),
+                    demand(cuda, Contract::DeviceOnly, half),
+                    demand(vulkan, Contract::DeviceOnly, own.stable_bytes - half + 1),
                 ],
                 &[],
                 FitMode::Stable,
@@ -1675,10 +1923,10 @@ mod tests {
         );
         // 8 GiB charged by either executor is the store's ledger.
         sampled.runtime.charges = vec![(gpu, 8 * GIB)];
-        let fit = Fit::new(&topology, &sampled, &reserves);
+        let fit = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable);
         for executor in [cuda, vulkan] {
             assert_eq!(
-                fit.placement(executor, StorageKind::Device)
+                fit.placement(executor, Contract::DeviceOnly)
                     .unwrap()
                     .ceiling_bytes,
                 capacity - 8 * GIB - own.thresholds.planning_bytes
@@ -1696,36 +1944,36 @@ mod tests {
         let slice = device_memory(&topology);
         let capacity = topology.store(slice).unwrap().capacity().value;
         let mut sampled = sampled(&topology, host(LINUX, 16 * GIB));
-        let fit = Fit::new(&topology, &sampled, &reserves);
+        let fit = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable);
         let own = fit.store(slice).unwrap();
         assert_eq!(own.thresholds.planning_bytes, 512 * MIB);
         assert_eq!(own.stable_bytes, capacity - 512 * MIB);
         // CUDA's usable memory is below the slice's fit; Vulkan's heap, the
         // slice's capacity, is above it.
         let cuda = executor(&topology, BackendName::Cuda);
-        let usable = grant_room(&topology, cuda, StorageKind::Device, 0);
+        let usable = grant_room(&topology, cuda, Contract::DeviceOnly, 0);
         assert!(usable < own.stable_bytes);
         assert_eq!(
-            fit.placement(cuda, StorageKind::Device)
+            fit.placement(cuda, Contract::DeviceOnly)
                 .unwrap()
                 .stable_bytes,
             usable
         );
         let vulkan = executor(&topology, BackendName::Vulkan);
         assert_eq!(
-            fit.placement(vulkan, StorageKind::Device)
+            fit.placement(vulkan, Contract::DeviceOnly)
                 .unwrap()
                 .stable_bytes,
             own.stable_bytes
         );
         sampled.runtime.charges = vec![(slice, capacity - 2 * GIB)];
-        let charged = Fit::new(&topology, &sampled, &reserves)
+        let charged = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable)
             .store(slice)
             .unwrap();
         assert_eq!(charged.ceiling_bytes, 2 * GIB - 512 * MIB);
         assert_eq!(charged.band, MemoryBand::Normal);
         sampled.runtime.charges = vec![(slice, capacity - 512 * MIB)];
-        let at_line = Fit::new(&topology, &sampled, &reserves)
+        let at_line = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable)
             .store(slice)
             .unwrap();
         assert_eq!(at_line.ceiling_bytes, 0);
@@ -1740,11 +1988,11 @@ mod tests {
         let topology = recorded::rtx3090();
         let reserves = MemoryReserves::standard();
         let vulkan = executor(&topology, BackendName::Vulkan);
-        let path = vulkan.placement(StorageKind::Device)[0];
-        assert_eq!(vulkan.placement(StorageKind::Upload), [path]);
+        let path = vulkan.paths(seismic::Placing::Fixed(Contract::DeviceOnly))[0];
+        assert_eq!(vulkan.paths(seismic::Placing::Fixed(Contract::Upload)), [path]);
         let mut sampled = sampled(&topology, host(LINUX, 16 * GIB));
         let gpu = device_memory(&topology);
-        let reserve = Fit::new(&topology, &sampled, &reserves)
+        let reserve = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable)
             .store(gpu)
             .unwrap()
             .thresholds
@@ -1754,13 +2002,13 @@ mod tests {
             path,
             Ok(Reported::new(10 * GIB + reserve, ReportedBy::VulkanHeapBudget)),
         )];
-        let fit = Fit::new(&topology, &sampled, &reserves);
-        assert!(fit.store(gpu).unwrap().ceiling_bytes > 10 * GIB);
+        let fit = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable);
+        assert_eq!(fit.store(gpu).unwrap().ceiling_bytes, 10 * GIB);
         let result = fit
             .demand(
                 &[
-                    demand(vulkan, StorageKind::Device, 7 * GIB),
-                    demand(vulkan, StorageKind::Upload, 4 * GIB),
+                    demand(vulkan, Contract::DeviceOnly, 7 * GIB),
+                    demand(vulkan, Contract::Upload, 4 * GIB),
                 ],
                 &[],
                 FitMode::Live,
@@ -1773,7 +2021,7 @@ mod tests {
                 store: gpu,
                 required_bytes: 4 * GIB,
                 missing_bytes: GIB,
-                constraint: MemoryConstraint::Grant,
+                constraint: MemoryConstraint::DeviceLocal,
             }]
         );
     }
@@ -1789,22 +2037,22 @@ mod tests {
         let topology = recorded::strix_halo_windows();
         let reserves = MemoryReserves::standard();
         let unopened = sampled(&topology, host(WINDOWS, 16 * GIB));
-        let fit = Fit::new(&topology, &unopened, &reserves);
+        let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         let (radeon, host_ram) = (device_memory(&topology), topology.host_ram().id());
         let own_fit = fit.store(radeon).unwrap().stable_bytes;
         let host_fit = fit.store(host_ram).unwrap().stable_bytes;
         let vulkan = executor(&topology, BackendName::Vulkan);
         // The own-memory path's grant is its store's capacity, whose room is
         // its fit; the host path's room is below host RAM's fit.
-        assert_eq!(grant_room(&topology, vulkan, StorageKind::Device, 0), own_fit);
-        let beyond = grant_room(&topology, vulkan, StorageKind::Device, 1);
+        assert_eq!(grant_room(&topology, vulkan, Contract::DeviceOnly, 0), own_fit);
+        let beyond = grant_room(&topology, vulkan, Contract::DeviceOnly, 1);
         assert!(beyond < host_fit);
-        let room = fit.placement(vulkan, StorageKind::Device).unwrap();
+        let room = fit.placement(vulkan, Contract::DeviceOnly).unwrap();
         assert_eq!(room.stable_bytes, own_fit + beyond);
 
         let spilled = fit
             .demand(
-                &[demand(vulkan, StorageKind::Device, own_fit + GIB)],
+                &[demand(vulkan, Contract::DeviceOnly, own_fit + GIB)],
                 &[],
                 FitMode::Stable,
             )
@@ -1817,7 +2065,7 @@ mod tests {
 
         let over = fit
             .demand(
-                &[demand(vulkan, StorageKind::Device, own_fit + beyond + 1)],
+                &[demand(vulkan, Contract::DeviceOnly, own_fit + beyond + 1)],
                 &[],
                 FitMode::Stable,
             )
@@ -1835,7 +2083,7 @@ mod tests {
         // Host work leaving 1 GiB of host RAM's fit.
         let crowded = fit
             .demand(
-                &[demand(vulkan, StorageKind::Device, own_fit + 2 * GIB)],
+                &[demand(vulkan, Contract::DeviceOnly, own_fit + 2 * GIB)],
                 &[(host_ram, host_fit - GIB)],
                 FitMode::Stable,
             )
@@ -1874,12 +2122,12 @@ mod tests {
             reclaimable_bytes: 0,
         }];
         let limited = status(limited);
-        let reading = Fit::new(&topology, &limited, &reserves).store(host_ram.id()).unwrap();
+        let reading = Fit::new(&topology, &limited, &reserves, HostRoom::Allocatable).store(host_ram.id()).unwrap();
         assert_eq!(reading.capacity_bytes, 4 * GIB);
         assert_eq!(reading.thresholds, reserves.for_domain(host_ram.kind(), 4 * GIB));
         assert_eq!(reading.stable_bytes, 2 * GIB);
         assert_eq!(
-            Fit::host_ram(&topology, &limited.sample.host_ram.clone().unwrap(), &reserves).thresholds,
+            Fit::host_ram(&topology, &limited.sample.host_ram.clone().unwrap(), &reserves, HostRoom::Allocatable).thresholds,
             reading.thresholds
         );
     }
@@ -1901,7 +2149,7 @@ mod tests {
             reclaimable_bytes: 0,
         }];
         let limited_status = status(limited.clone());
-        let fit = Fit::new(&topology, &limited_status, &reserves);
+        let fit = Fit::new(&topology, &limited_status, &reserves, HostRoom::Allocatable);
         let reading = fit.store(host_ram).unwrap();
         assert_eq!(reading.capacity_bytes, 32 * GIB);
         assert_eq!(reading.stable_bytes, 32 * GIB - reading.thresholds.planning_bytes);
@@ -1909,7 +2157,7 @@ mod tests {
         assert_eq!(reading.ceiling_bytes, 16 * GIB - reading.thresholds.planning_bytes);
         let cpu = executor(&topology, BackendName::Cpu);
         let cuda = executor(&topology, BackendName::Cuda);
-        for (executor, kind) in [(cpu, StorageKind::Device), (cuda, StorageKind::Upload)] {
+        for (executor, kind) in [(cpu, Contract::DeviceOnly), (cuda, Contract::Upload)] {
             let room = fit.placement(executor, kind).unwrap();
             assert_eq!(
                 (room.stable_bytes, room.ceiling_bytes),
@@ -1921,7 +2169,7 @@ mod tests {
         contained.limit_visibility = LimitVisibility::CgroupAncestorsHidden;
         let contained = status(contained);
         assert_eq!(
-            Fit::new(&topology, &contained, &reserves)
+            Fit::new(&topology, &contained, &reserves, HostRoom::Allocatable)
                 .store(host_ram)
                 .unwrap(),
             reading
@@ -1945,7 +2193,7 @@ mod tests {
                 used_bytes: 30 * GIB,
                 reclaimable_bytes,
             }];
-            Fit::new(&topology, &status(sampled), &reserves)
+            Fit::new(&topology, &status(sampled), &reserves, HostRoom::Allocatable)
                 .store(host_ram)
                 .unwrap()
         };
@@ -1966,15 +2214,15 @@ mod tests {
         let topology = recorded::m4_pro();
         let reserves = MemoryReserves::standard();
         let unopened = status(host(MACOS, 16 * GIB));
-        let fit = Fit::new(&topology, &unopened, &reserves);
+        let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         let host_ram = topology.host_ram().id();
         let room = fit.store(host_ram).unwrap().stable_bytes;
         let cpu = executor(&topology, BackendName::Cpu);
         let result = fit
             .demand(
                 &[
-                    demand(cpu, StorageKind::Device, room - 20),
-                    demand(cpu, StorageKind::Upload, 20),
+                    demand(cpu, Contract::DeviceOnly, room - 20),
+                    demand(cpu, Contract::Upload, 20),
                 ],
                 &[(host_ram, 7)],
                 FitMode::Stable,
@@ -2000,21 +2248,21 @@ mod tests {
         let topology = recorded::m4_pro_without_unified_memory();
         let reserves = MemoryReserves::standard();
         let unopened = status(host(MACOS, 16 * GIB));
-        let fit = Fit::new(&topology, &unopened, &reserves);
+        let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         let metal = executor(&topology, BackendName::Metal);
         let unplaced = MemoryPolicyError::Unplaced {
             executor: metal.id(),
-            kind: StorageKind::Device,
+            kind: Contract::DeviceOnly,
         };
         assert_eq!(
             fit.demand(
-                &[demand(metal, StorageKind::Device, 1)],
+                &[demand(metal, Contract::DeviceOnly, 1)],
                 &[],
                 FitMode::Stable
             ),
             Err(unplaced.clone())
         );
-        assert_eq!(fit.placement(metal, StorageKind::Device), Err(unplaced));
+        assert_eq!(fit.placement(metal, Contract::DeviceOnly), Err(unplaced));
     }
 
     /// Fit answers only for nodes of its own topology revision.
@@ -2023,14 +2271,14 @@ mod tests {
         let (topology, other) = (recorded::m4_pro(), recorded::m4_pro());
         let reserves = MemoryReserves::standard();
         let unopened = status(host(MACOS, 16 * GIB));
-        let fit = Fit::new(&topology, &unopened, &reserves);
+        let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         assert_eq!(
             fit.store(other.host_ram().id()),
             Err(MemoryPolicyError::ForeignIdentifier)
         );
         let cpu = executor(&other, BackendName::Cpu);
         assert_eq!(
-            fit.demand(&[demand(cpu, StorageKind::Device, 1)], &[], FitMode::Stable),
+            fit.demand(&[demand(cpu, Contract::DeviceOnly, 1)], &[], FitMode::Stable),
             Err(MemoryPolicyError::ForeignIdentifier)
         );
     }

@@ -1,5 +1,6 @@
 //! Target submission, completion, and row construction.
 
+use super::queue::Behind;
 use super::*;
 use crate::programs::SubmittedTarget;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,18 +78,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Submit one target group with state advances already reserved, or
-    /// claim the queued lookahead step it equals. A continuable group queues
-    /// its own lookahead behind it, in the bindings the flight holds until
-    /// `finish_target` returns them.
+    /// claim the queued step it equals. The steps that run behind it
+    /// (`behind`) queue in the domain (`queue`); the flight holds the
+    /// bindings until `finish_target` returns them.
     pub fn submit_target(
         &mut self,
-        mut bindings: StateBindings<F>,
+        bindings: StateBindings,
         operations: &[Operation],
         reservation: TargetGraphReservation,
-    ) -> Result<TargetFlight<F>, SubmitFailure<F>> {
+    ) -> Result<TargetFlight<F>, SubmitFailure> {
         let work = match reservation {
             TargetGraphReservation::Claim(slots) => self
-                .claim_lookahead(&mut bindings, operations, slots)
+                .claim_queued(operations, slots)
                 .map_err(SubmitFailure::Failed)?,
             TargetGraphReservation::Launch(reservation) => {
                 match self.launch_target(operations, reservation) {
@@ -102,29 +103,105 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // sequences' accepted ones.
         self.feed_tokens(operations)
             .map_err(|error| SubmitFailure::Failed(DomainError::invariant(error)))?;
-        self.queue_lookahead(&mut bindings, &work, operations)
+        self.queue_successor(&work, operations)
             .map_err(SubmitFailure::Failed)?;
         Ok(TargetFlight { work, bindings })
     }
 
-    /// Launch the group's target step, then a primed prompt chunk's drafter
-    /// entry behind it.
+    /// Launch the group's target step as the first of a chain: alone, or with
+    /// the rest of the chain it opens (`behind`), queued behind it. Then each
+    /// primed chunk's drafter entry behind its own step. A refused chain
+    /// restores the step's accepted states and drafter entry.
     fn launch_target(
         &mut self,
         operations: &[Operation],
         mut reservation: TargetLaunchReservation,
     ) -> Result<TargetWork<F>, Unsubmitted> {
         let priming = reservation.priming.take();
-        let work = match self.launch_target_graph(operations, reservation) {
-            Ok(work) => work,
+        let abort = |domain: &mut Self, priming: Option<PrimingReservation>| {
+            if let (Some(priming), [operation]) = (priming, operations) {
+                domain
+                    .head
+                    .insert(operation.request(), priming.advance.abort());
+            }
+        };
+        let (first, requests, spare) = match self.build_target_launch(operations, reservation) {
+            Ok(built) => built,
             Err(failure) => {
-                if let (Some(priming), [operation]) = (priming, operations) {
-                    self.head
-                        .insert(operation.request(), priming.advance.abort());
-                }
+                abort(self, priming);
                 return Err(failure);
             }
         };
+        let rest = match self.behind(operations) {
+            Behind::Chain { chunks } => {
+                self.build_chain(operations, &first, priming.as_ref(), chunks)
+            }
+            Behind::Nothing | Behind::Continuation { .. } | Behind::NextChunk { .. } => Ok((Vec::new(), Vec::new())),
+        };
+        let (launches, pending) = match rest {
+            Ok(rest) => rest,
+            Err(error) => {
+                let (core, _) = first.into_submission_parts();
+                let (_, advances, _, _) = core.into_parts();
+                self.restore_advances(requests, advances);
+                abort(self, priming);
+                return Err(Unsubmitted::Failed(error));
+            }
+        };
+        let mut chain = Chain::one(first);
+        for launch in launches {
+            chain.push(launch);
+        }
+        let launch_trace = self.trace_target_submission(operations);
+        let started = Instant::now();
+        let epoch = self.launch_epoch();
+        let (submission, queued) = match self.family.submit_target(chain, spare) {
+            Ok(submissions) => submissions.split_first(),
+            Err(crate::programs::ChainRefusal { error, chain, misses }) => {
+                super::publish_misses(self.experts.as_ref(), misses);
+                // The rest of the chain follows the first launch's advances
+                // and returns its rows and banks as it drops.
+                let (core, _) = chain.split_first().0.into_submission_parts();
+                let (_, advances, _, _) = core.into_parts();
+                self.restore_advances(requests, advances);
+                abort(self, priming);
+                return Err(Unsubmitted::Failed(error.into()));
+            }
+        };
+        let flight_requests = requests.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
+        let work = TargetWork {
+            runnable: self.service_start(&flight_requests, started),
+            requests,
+            submission,
+            priming: None,
+            launch_trace,
+            started,
+            epoch,
+            previous_selection: self.selection_read.take(),
+            id: self.flight_id(),
+            continuation: None,
+        };
+        let work = self.attach_priming(work, operations, priming)?;
+        if !pending.is_empty() {
+            self.queue_chain(
+                &work,
+                pending.into_iter().zip(queued),
+                started,
+                epoch,
+            )
+            .map_err(Unsubmitted::Failed)?;
+        }
+        Ok(work)
+    }
+
+    /// The group's drafter entry behind its launched step, when its prompt
+    /// chunk primes one.
+    fn attach_priming(
+        &mut self,
+        work: TargetWork<F>,
+        operations: &[Operation],
+        priming: Option<PrimingReservation>,
+    ) -> Result<TargetWork<F>, Unsubmitted> {
         let Some(PrimingReservation {
             advance,
             graph_workspace,
@@ -247,15 +324,28 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(work)
     }
 
-    fn launch_target_graph(
+    /// The group's target launch over its reserved advances and leases,
+    /// with each operation's request, rows, conditioning, kind and
+    /// committed rows, and the spare output slot of the chain it heads. A
+    /// refused launch restores the accepted states.
+    #[allow(clippy::type_complexity)]
+    fn build_target_launch(
         &mut self,
         operations: &[Operation],
         reservation: TargetLaunchReservation,
-    ) -> Result<TargetWork<F>, Unsubmitted> {
+    ) -> Result<
+        (
+            ValidatedTargetLaunch,
+            Vec<(RequestId, usize, Option<crate::ConditioningRef>, WorkKind, usize)>,
+            NativeGraphOutputLease,
+        ),
+        Unsubmitted,
+    > {
         let TargetLaunchReservation {
             advances,
             graph_workspace,
-            graph_outputs,
+            graph_output,
+            spare_output,
             readout_workspace,
             readout_output,
             priming: _,
@@ -323,7 +413,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let class_limits = self.target_class_limits();
         let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
             .map_err(|error| broken(error.to_string()))?;
-        let preceding = self.target_preceding(operations).map_err(broken)?;
+        let preceding = self.target_preceding(operations, &[]).map_err(broken)?;
         let mut metadata = Vec::with_capacity(operations.len());
         for operation in operations {
             let request = operation.request();
@@ -386,64 +476,44 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             conditioning,
             conditioning_slices,
             graph_workspace,
-            graph_outputs,
+            graph_output,
             readout_workspace,
             readout_output,
         )
         .with_boundary(boundary)
         .with_preceding(preceding);
-        let launch = match ValidatedTargetLaunch::new(
+        match ValidatedTargetLaunch::new(
             inputs,
             &self.target_store,
             self.domain.id(),
             self.definition.decoder.hidden as usize,
             self.definition.head.as_ref().map_or(self.definition.decoder.hidden, |head| head.conditioning_width(&self.definition.decoder)) as usize,
         ) {
-            Ok(launch) => launch,
+            Ok(launch) => Ok((launch, metadata, spare_output)),
             Err((inputs, error)) => {
                 let (_, advances, _, _) = inputs.into_parts();
                 self.restore_advances(metadata, advances);
-                return Err(Unsubmitted::Failed(DomainError::Invariant(error)));
+                Err(Unsubmitted::Failed(DomainError::Invariant(error)))
             }
-        };
-        let launch_trace = self.trace_target_submission(operations);
-        let started = Instant::now();
-        let recorded_graphs = self.family.recorded_graphs();
-        let submission = match self.family.submit_target(launch) {
-            Ok(submission) => submission,
-            Err((error, launch)) => {
-                let (core, _) = launch.into_submission_parts();
-                let (_, advances, _, _) = core.into_parts();
-                self.restore_advances(metadata, advances);
-                return Err(Unsubmitted::Failed(error.into()));
-            }
-        };
-        let requests = metadata.iter().map(|(request, ..)| *request).collect::<Vec<_>>();
-        let runnable = self.service_start(&requests, started);
-        Ok(TargetWork {
-            requests: metadata,
-            submission,
-            priming: None,
-            runnable,
-            launch_trace,
-            started,
-            recorded_graphs,
-            previous_selection: self.selection_read.take(),
-            id: self.flight_id(),
-            continuation: None,
-        })
+        }
     }
 
     /// Completion exposes immutable outcomes while every owned advance stays
     /// suspended. The caller can stage grammar and method changes from these
     /// views before choosing physical prefixes. Returns the bindings the
-    /// flight held, with the lookahead it queued; an error consumes them, as
+    /// flight held, with the steps queued behind it; an error consumes them, as
     /// the domain cannot continue.
-    /// Per operation of a target group, the accepted tokens its sequence
-    /// holds before the operation's first row, as many as the model's row
-    /// rules read (`TargetLaunchCore::preceding`); none of a model without
-    /// one.
-    pub(super) fn target_preceding(&self, operations: &[Operation]) -> Result<Vec<Vec<u64>>, String> {
+    /// Per operation of a target group, the tokens its sequence holds before
+    /// the operation's first row, as many as the model's row rules read
+    /// (`TargetLaunchCore::preceding`); none of a model without one. They
+    /// are the sequence's fed tokens followed by those of its operations in
+    /// `ahead`, the launches of its chain queued before the group, which
+    /// feed theirs only once the chain is on the device.
+    pub(super) fn target_preceding(
+        &self,
+        operations: &[Operation],
+        ahead: &[Operation],
+    ) -> Result<Vec<Vec<u64>>, String> {
         let context = crate::operators::row_rule_context(&self.definition.decoder);
         if context == 0 {
             return Ok(Vec::new());
@@ -457,8 +527,29 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 else {
                     return Err("target group contains another operation kind".to_owned());
                 };
-                Ok(self
-                    .preceding_tokens(*request, *position, context)?
+                let ahead = ahead
+                    .iter()
+                    .filter(|ahead| ahead.request() == *request)
+                    .map(|ahead| match ahead {
+                        Operation::Forward {
+                            position, tokens, ..
+                        } => Ok((*position, tokens)),
+                        _ => Err("a chain holds another operation kind".to_owned()),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut end = ahead.first().map_or(*position, |(start, _)| *start);
+                let mut tokens = self.preceding_tokens(*request, end, context)?.to_vec();
+                for (at, fed) in ahead {
+                    if at != end {
+                        return Err("a chain's launches do not follow each other".into());
+                    }
+                    tokens.extend_from_slice(fed);
+                    end += fed.len();
+                }
+                if end != *position {
+                    return Err("a chained launch does not follow the launches before it".into());
+                }
+                Ok(tokens[tokens.len().saturating_sub(context)..]
                     .iter()
                     .map(|token| u64::from(token.0))
                     .collect())
@@ -469,15 +560,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn finish_target(
         &mut self,
         flight: TargetFlight<F>,
-    ) -> Result<(Vec<PendingOperationOutcome>, StateBindings<F>), DomainError> {
-        let TargetFlight { work, mut bindings } = flight;
-        let pending = self.finish_target_work(&mut bindings, work)?;
+    ) -> Result<(Vec<PendingOperationOutcome>, StateBindings), DomainError> {
+        let TargetFlight { work, bindings } = flight;
+        let pending = self.finish_target_work(work)?;
         Ok((pending, bindings))
     }
 
     fn finish_target_work(
         &mut self,
-        bindings: &mut StateBindings<F>,
         flight: TargetWork<F>,
     ) -> Result<Vec<PendingOperationOutcome>, DomainError> {
         let completed = match flight.submission.finish() {
@@ -486,8 +576,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(DomainError::Device(error));
             }
         };
+        // The expert bank's moves the device ran before this flight, which
+        // it read: their failure is this flight's.
+        if let Some(bank) = self.family.expert_bank() {
+            bank.carried()?;
+        }
         // The drafter entry follows its chunk on the device; its advance
-        // commits with the chunk. A claimed lookahead's entry attaches to the
+        // commits with the chunk. A claimed queued step's entry attaches to the
         // accepted drafter state; an unclaimed one's rows are discarded.
         let mut primed = flight
             .priming
@@ -547,7 +642,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let finish_started = Instant::now();
         let physical_duration = finish_started.saturating_duration_since(flight.runnable);
-        let replayed = self.family.recorded_graphs() == flight.recorded_graphs;
+        let timed = self.timed(flight.epoch);
         if std::env::var_os("MAGNITUDE_TRACE_FLIGHTS").is_some() {
             eprintln!(
                 "flight target duration_ms={:.3} requests={:?}",
@@ -559,28 +654,35 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .collect::<Vec<_>>()
             );
         }
-        let (core, mut output) = completed.into_parts();
-        // A sequence whose stored-table rows could not be read in this step
-        // read other rows: it is poisoned, and this outcome and every later
-        // one of it fail. The step's other sequences are unaffected. A
-        // landed read that could not land its rows fails every sequence.
-        let landing = output.complete_landed_reads();
-        for (slot, (request, ..)) in flight.requests.iter().enumerate() {
-            if let Some(error) = output.table_read_failure(slot).or_else(|| landing.clone()) {
-                self.poisoned.entry(*request).or_insert(error);
-            }
-        }
-        output.retire_stored_reads();
-        let crate::TargetOutput {
-            readout: output,
-            commits,
-            boundary,
-            landed_reads: _,
-            stored_reads: _,
-        } = output;
+        let (core, output) = completed.into_parts();
         let batch = core.batch();
         if batch.actual_slots() != flight.requests.len() {
             return Err("completed target slot count differs from submitted requests".into());
+        }
+        // A sequence whose weights (stored-table rows, landed rows or a
+        // streamed layer's experts) could not be read in this step read
+        // others: it is poisoned, and this outcome and every later one of
+        // it fail. The step's other sequences are unaffected. A step the
+        // expert bank interrupted (a late beat of its load's pulse) poisons
+        // nothing: every request of it is interrupted, to be re-run (below).
+        let crate::programs::native_target::CompletedTargetOutput {
+            readout: output,
+            commits,
+            boundary,
+            failures,
+            experts,
+        } = output.complete(batch, super::recording(self.experts.as_ref())).map_err(DomainError::Invariant)?;
+        let interrupted = match experts {
+            crate::programs::native_target::ExpertStepEnd::Ran(record) => {
+                super::publish_misses(self.experts.as_ref(), record);
+                None
+            }
+            crate::programs::native_target::ExpertStepEnd::Interrupted(reason) => Some(reason),
+        };
+        for ((request, ..), failure) in flight.requests.iter().zip(failures) {
+            if let Some(error) = failure {
+                self.poisoned.entry(*request).or_insert(error);
+            }
         }
         let upload = batch.upload();
         let selected = if upload.select_rows.is_empty() {
@@ -699,6 +801,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut pending = Vec::with_capacity(flight.requests.len());
         let mut offset = 0usize;
         let mut continuation = flight.continuation;
+        // A flight the rest of a chain is queued behind opens that chain.
+        let opens_chain = self.queue.opens_chain(flight.id);
+        // The chain an interrupted chunk releases, once every outcome is in.
+        let mut released_chain = None;
         for (index, ((request, rows, _, kind, committed_rows), advance)) in
             flight.requests.into_iter().zip(advances).enumerate()
         {
@@ -712,14 +818,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             offset = end;
             let source = continuation.as_mut().map(|sources| sources[index].take());
             let advance = match (advance, source) {
-                (TentativeAdvance::Accepted(advance), None) => advance,
+                (TentativeAdvance::Accepted(advance), None) if opens_chain => {
+                    self.open_chain(request, advance)?
+                }
+                (TentativeAdvance::Accepted(advance), None) => Advance::Step(advance),
+                // A claimed chunk of the chain its holder's state is in.
+                (TentativeAdvance::Chained(chunk), Some(None)) => {
+                    self.join_chain(request, chunk)?
+                }
                 (TentativeAdvance::Successor(successor), Some(Some(state))) => {
                     match successor.attach(state.into_state()) {
-                        Ok(advance) => advance,
+                        Ok(advance) => Advance::Step(advance),
                         Err((state, error)) => {
                             self.target.insert(request, state);
                             return Err(DomainError::invariant(format!(
-                                "claimed lookahead slot no longer follows its state: {error}"
+                                "claimed queued slot no longer follows its state: {error}"
                             )));
                         }
                     }
@@ -732,22 +845,44 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     ));
                 }
             };
-            let outcome = match self.poisoned.get(&request) {
-                Some(error) => Outcome::TableReadFailed(error.clone()),
-                None => Outcome::Forward { rows: result },
+            let mut primed_here = primed.take_if(|(primed, _)| *primed == request).map(|(_, advance)| advance);
+            let (outcome, advance) = match (self.poisoned.get(&request), &interrupted) {
+                (Some(error), _) => (Outcome::WeightReadFailed(error.clone()), Some(advance)),
+                (None, None) => (Outcome::Forward { rows: result }, Some(advance)),
+                // Its accepted state returns as its outcome is aborted: it is
+                // re-run from there.
+                (None, Some(reason)) if matches!(advance, Advance::Step(_)) => {
+                    (Outcome::Interrupted { reason: reason.clone(), resident: true }, Some(advance))
+                }
+                // A chunk of a chain: the chain held what its earlier chunks
+                // computed, which their rounds already reconciled, and holds
+                // this chunk's now. It is released whole, and its holder's
+                // state with it: the request re-prefills, as an evicted one.
+                (None, Some(reason)) => {
+                    match advance {
+                        Advance::Chain(chain) => {
+                            self.target.insert(request, chain.abort());
+                            released_chain = Some(Released::Whole(request));
+                        }
+                        Advance::Chained => released_chain = Some(Released::Held),
+                        Advance::Step(_) => unreachable!("matched above"),
+                    }
+                    if let Some(primed) = primed_here.take() {
+                        self.head.insert(request, primed.abort());
+                    }
+                    (Outcome::Interrupted { reason: reason.clone(), resident: false }, None)
+                }
             };
             pending.push(PendingOperationOutcome {
                 request,
                 outcome,
-                advance: Some(advance),
-                primed: primed
-                    .take_if(|(primed, _)| *primed == request)
-                    .map(|(_, advance)| advance),
+                advance,
+                primed: primed_here,
                 rows,
                 committed_rows,
                 kind,
                 physical_duration,
-                replayed,
+                timed,
                 image: None,
             });
         }
@@ -755,6 +890,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Err(DomainError::invariant(
                 "a drafter entry's chunk is absent from its flight",
             ));
+        }
+        match released_chain {
+            Some(Released::Held) => self.release_chain()?,
+            Some(Released::Whole(holder)) => {
+                self.release_state(&[holder]).map_err(DomainError::invariant)?;
+            }
+            None => {}
         }
         let finished = Instant::now();
         let timing = TargetHostTiming {
@@ -785,7 +927,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // The queued step's service starts where this flight's ends, so the
         // finish is charged once: a backend whose reads queue behind the
         // queued step waits in it for that step's device work.
-        bindings.predecessor_selected(flight.id, &selected, finished);
+        self.predecessor_selected(flight.id, &selected, finished);
         self.target_timing = Some(timing);
         self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok(pending)
@@ -850,7 +992,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn finish_priming(
         &mut self,
         flight: PrimingCompletionFlight<F>,
-    ) -> Result<(RequestId, Duration, StateBindings<F>), DomainError> {
+    ) -> Result<(RequestId, Duration, StateBindings), DomainError> {
         let request = flight.work.request;
         if let Some((_, advance)) = self.finish_priming_work(flight.work)? {
             if self.head.contains_key(&request) {
@@ -895,9 +1037,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 TentativeAdvance::Accepted(advance) => {
                     self.target.insert(request, advance.abort());
                 }
-                // A successor's source state stays with its predecessor;
-                // dropping it releases its rows and bank.
+                // A successor's or chained chunk's source state stays with
+                // its predecessor; dropping it releases its rows and bank.
                 TentativeAdvance::Successor(successor) => drop(successor),
+                TentativeAdvance::Chained(chunk) => drop(chunk),
             }
         }
     }
@@ -906,16 +1049,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// whether its layers attend media rows bidirectionally
     /// (`operators::attention::admit_media`).
     fn bidirectional_reads(&self) -> Result<Vec<bool>, String> {
-        let mut reads = vec![false; self.target_store.history_reads()];
+        let store_reads = self.target_store.history_reads();
+        let mut reads = vec![false; store_reads.len()];
         for (index, sublayer) in self.definition.decoder.sublayers() {
             let magnitude_family_contracts::Operator::Attention(attention) = &sublayer.op else {
                 continue;
             };
             if attention.media_rows == magnitude_family_contracts::MediaRowAttention::Bidirectional
             {
-                let read = self
-                    .target_store
-                    .history_read(magnitude_state::LayerRef::Target(index.block))
+                let read = store_reads
+                    .read(magnitude_state::LayerRef::Target(index.block))
                     .ok_or("an attention layer has no history read")?;
                 reads[read] = true;
             }
@@ -1360,7 +1503,7 @@ impl AppendedRuns {
 /// The appended runs the rows of one advance read, formed once for its slot:
 /// of each compressed causal stored domain (`cached_causal_domain`) and each
 /// indexer domain (`indexer_domain`), by domain, and of each Shared source
-/// domain, in `shared_source_domains` order.
+/// domain, in `HistoryReads::shared_sources` order.
 pub(super) struct SlotAppends {
     causal: Vec<Option<AppendedRuns>>,
     shared: Vec<(magnitude_state::HistoryDomainId, AppendedRuns)>,
@@ -1379,9 +1522,10 @@ impl SlotAppends {
                 })
                 .collect(),
             shared: store
-                .shared_source_domains()
-                .into_iter()
-                .map(|domain| (domain, AppendedRuns::of(store, advance, domain)))
+                .history_reads()
+                .shared_sources()
+                .iter()
+                .map(|&domain| (domain, AppendedRuns::of(store, advance, domain)))
                 .collect(),
         }
     }
@@ -1397,8 +1541,10 @@ pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -
     // `magnitude_state::history_geometry`).
     spans
         + store
-            .shared_source_domains()
-            .into_iter()
+            .history_reads()
+            .shared_sources()
+            .iter()
+            .copied()
             .chain(store.history_domains().filter(|&domain| {
                 rows > 1 && (cached_causal_domain(store, domain) || indexer_domain(store, domain))
             }))
@@ -1524,12 +1670,8 @@ mod causal_cache_tests {
 
     #[test]
     fn compressed_causal_rows_read_prepared_prior_but_media_keeps_dense_block() {
-        let Ok(catalog) = seismic::Devices::discover(&[]) else {
-            return;
-        };
-        let Ok(device) = catalog.open_backend(seismic::BackendName::Cpu) else {
-            return;
-        };
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let device = catalog.open_backend(seismic::BackendName::Cpu).expect("the CPU backend opens");
         let device = Rc::new(device);
         for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
             let (store, mut bindings) = StateStore::new(
@@ -1713,4 +1855,12 @@ mod appended_runs_tests {
             }
         }
     }
+}
+
+/// The chain an interrupted chunk releases, with its holder's state: one
+/// still held behind queued chunks (`release_chain`), or one its last chunk
+/// completed, whose state is the holder's again.
+enum Released {
+    Held,
+    Whole(RequestId),
 }

@@ -9,7 +9,10 @@
 use crate::operators::Join;
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
 use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
-use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::graph::{
+    GraphError,
+    draft::{ControlSource, GraphDraft},
+};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{WeightPort, packed_weight, scaled_weight, weight};
 use crate::{
@@ -93,6 +96,8 @@ pub(crate) struct ShortConvBlock {
     pub post_norm_scale: f32,
     /// Index of this layer's window in the store's recurrent components.
     pub component_index: usize,
+    /// How the graph takes its launch's slot tables.
+    pub controls: ControlSource,
 }
 
 pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
@@ -174,7 +179,9 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
         )?
         .value;
     let dimensions = shape.rows_dimensions(block.rows, block.slots, banks, tape_rows);
-    let input = |graph: &mut G, name: &str| graph.input_for(kernels.rows, name, &dimensions);
+    let input = |graph: &mut G, name: &str| {
+        graph.control_for(block.controls, kernels.rows, name, &dimensions)
+    };
     let controls = RecurrentControlPorts {
         segments: input(graph, "segments")?,
         stop: input(graph, "stop")?,
@@ -228,7 +235,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
         }
         TailEntries::PostNorm(entries) => {
             let norm = weight(graph, WeightKind::PostNorm)?;
-            let out_rows = GraphConstant::identity_for_class(graph, block.rows, Some("M"))?;
+            let out_rows = GraphConstant::row_identity(graph, block.rows, Some("M"))?;
             let mixed = post_norm(
                 graph,
                 entries,
@@ -510,6 +517,8 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
         };
         for backend in [
             BackendName::Cpu,
@@ -525,6 +534,8 @@ mod tests {
                     vision: false,
                 },
                 resident_layout(ExecutionPath::Native, backend),
+                crate::PlannedMethod::Plain,
+                crate::planning::fixtures::LIMITS,
             )
             .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();

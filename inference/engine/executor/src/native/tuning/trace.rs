@@ -645,7 +645,6 @@ impl Serialize for Finished<'_> {
         record.serialize_entry("points", &receipt.points)?;
         record.serialize_entry("requirement", &receipt.requirement)?;
         record.serialize_entry("reselection", &receipt.reselection)?;
-        record.serialize_entry("measurement_identity", &receipt.measurement_identity)?;
         record.serialize_entry("observations", &receipt.observations)?;
         record.serialize_entry("served", &receipt.served)?;
         record.serialize_entry("candidates", &Candidates(receipt))?;
