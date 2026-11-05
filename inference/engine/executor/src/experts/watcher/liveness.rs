@@ -37,7 +37,8 @@ impl Answers {
     /// records: a landing reads and writes each byte once in host memory),
     /// beside the CPU's longest request and the longest rest of a serving
     /// thread before it looks again. `landings` are each layer's landing
-    /// lines now, and `priced` its lines: the CPU's longest request is, per
+    /// lines now, and `priced` its lines as the load refines them
+    /// (`Telemetry::refined`): the CPU's longest request is, per
     /// sited layer with lines, its distinct experts at most each cold over
     /// every row, and the handshake.
     pub(super) fn longest(&self, line: crate::assessment::ReadLine, landings: &[Option<FileLine>], priced: Option<&[crate::assessment::ExpertLines]>) -> Bound {
@@ -97,7 +98,8 @@ pub(super) fn watch(
         Box::new(move || {
             match shared.telemetry.line() {
                 Some(line) => {
-                    let lane = answers.longest(line, &shared.telemetry.landing_lines(), shared.priced().as_deref());
+                    let priced = shared.priced().map(|lines| shared.telemetry.refined(&lines));
+                    let lane = answers.longest(line, &shared.telemetry.landing_lines(), priced.as_deref());
                     Bounds { lane, pieces: PieceBound(Some(line)) }
                 }
                 None => Bounds::unpriced(),

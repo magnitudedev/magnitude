@@ -49,7 +49,9 @@ pub(in crate::experts) struct Layer {
     /// Its routing records, one for each step in flight
     /// (`RegionWords::flight`), ring words each.
     pub routing: Words,
-    /// Its policy words (`BankPart::Policy`), written between flights.
+    /// Its policy words (`BankPart::Policy`): those a run's encoding reads
+    /// written between flights (`Residency::publish_policy`), its line words
+    /// at any turn (`Residency::publish_lines`).
     pub policy: Words,
     /// Its CPU site's table of the exchange, where it has a site.
     pub site: Option<ExchangeTable>,

@@ -511,10 +511,11 @@ impl Compute {
     }
 
     /// The experts streamed layer `layer`'s CPU site served for step `step`,
-    /// once it has completed (`Site::sited`): none of a layer without one.
-    pub(crate) fn sited(&self, layer: usize, step: u64) -> (u64, std::time::Duration) {
+    /// their rows and its path's time, once it has completed
+    /// (`Site::sited`): none of a layer without one.
+    pub(crate) fn sited(&self, layer: usize, step: u64) -> (u64, u64, std::time::Duration) {
         let site = &self.inner.site;
-        site.layers().iter().position(|site| site.layer() == layer).map_or((0, std::time::Duration::ZERO), |index| site.sited(index, step))
+        site.layers().iter().position(|site| site.layer() == layer).map_or((0, 0, std::time::Duration::ZERO), |index| site.sited(index, step))
     }
 
     /// The site's state as the exchange's watchdog reports it: each request

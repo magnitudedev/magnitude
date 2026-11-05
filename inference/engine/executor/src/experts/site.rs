@@ -773,10 +773,11 @@ struct Cell {
     /// (`NOTICED`..`MARKS`), in nanoseconds since the site began: each
     /// written once per issue, before the next point's.
     marks: [AtomicU64; MARKS],
-    /// The experts its latest request served and its path's time (ns,
-    /// taken to answered): none until it is answered whole, its answer's
-    /// store after these.
+    /// The experts its latest request served, their rows (each row that
+    /// names one) and its path's time (ns, taken to answered): none until
+    /// it is answered whole, its answer's store after these.
     served: AtomicU64,
+    rows: AtomicU64,
     took: AtomicU64,
 }
 
@@ -797,6 +798,7 @@ impl Cell {
             shares: (0..workers).map(|_| Share::new()).collect(),
             marks: std::array::from_fn(|_| AtomicU64::new(0)),
             served: AtomicU64::new(0),
+            rows: AtomicU64::new(0),
             took: AtomicU64::new(0),
         }
     }
@@ -1425,6 +1427,7 @@ impl Site {
             self.mark(&self.cells[cell], NOTICED);
             // It serves none until answered whole ([`Self::publish`]).
             self.cells[cell].served.store(0, Ordering::Relaxed);
+            self.cells[cell].rows.store(0, Ordering::Relaxed);
             self.cells[cell].took.store(0, Ordering::Relaxed);
             self.cells[cell].taken.store(step, Ordering::Release);
             took = true;
@@ -1568,6 +1571,7 @@ impl Site {
         // slot is not requested again before then.
         if why.is_none() {
             cell.served.store(work.experts.len() as u64, Ordering::Relaxed);
+            cell.rows.store(work.experts.iter().map(|expert| expert.rows.len() as u64).sum(), Ordering::Relaxed);
             cell.took.store((self.began.elapsed().as_nanos() as u64).saturating_sub(marks[NOTICED]), Ordering::Relaxed);
         }
         // Nothing of the request is read once it is answered: the device may
@@ -1600,15 +1604,20 @@ impl Site {
         self.served.requests.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The experts site layer `index`'s request of step `step` served and
-    /// its path's time, once the step has completed (the slot is not
-    /// requested again before); none where the step requested none there.
-    pub(super) fn sited(&self, index: usize, step: u64) -> (u64, std::time::Duration) {
+    /// The experts site layer `index`'s request of step `step` served, their
+    /// rows and its path's time, once the step has completed (the slot is
+    /// not requested again before); none where the step requested none
+    /// there.
+    pub(super) fn sited(&self, index: usize, step: u64) -> (u64, u64, std::time::Duration) {
         let base = self.layers[..index].iter().map(|layer| layer.shape.flight()).sum::<usize>();
         let cell = &self.cells[base + (step % self.layers[index].shape.flight() as u64) as usize];
         match cell.taken.load(Ordering::Acquire) == step {
-            true => (cell.served.load(Ordering::Acquire), std::time::Duration::from_nanos(cell.took.load(Ordering::Relaxed))),
-            false => (0, std::time::Duration::ZERO),
+            true => (
+                cell.served.load(Ordering::Acquire),
+                cell.rows.load(Ordering::Relaxed),
+                std::time::Duration::from_nanos(cell.took.load(Ordering::Relaxed)),
+            ),
+            false => (0, 0, std::time::Duration::ZERO),
         }
     }
 

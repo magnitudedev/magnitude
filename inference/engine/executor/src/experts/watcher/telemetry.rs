@@ -560,6 +560,9 @@ struct Costs {
     /// Each bank group's landing line, observed from its requests' landings
     /// ([`Telemetry::landings_ended`]).
     landings: Vec<seismic::measure::Line<2>>,
+    /// Each streamed layer's CPU site requests, observed as they took
+    /// (`Telemetry::complete_step`).
+    sites: Vec<SiteRequests>,
     /// Each bank group's convert in a decode barrier, once the job measured
     /// it ([`Telemetry::device_convert`]).
     convert: Vec<Option<crate::assessment::RecordLine>>,
@@ -791,6 +794,38 @@ impl Costs {
     fn landing(&self, group: usize) -> Option<FileLine> {
         self.landings[group].state().expect("landings' counts and clock seconds make a line").line().map(FileLine::of)
     }
+
+    /// Streamed layer `layer`'s CPU site line as its requests took
+    /// ([`SiteRequests::line`]).
+    fn site(&self, layer: usize) -> Option<[f64; 2]> {
+        self.sites[layer].line()
+    }
+}
+
+/// A streamed layer's CPU site requests as they took, each observed at its
+/// experts against its path's time less its rows past each expert's first
+/// at the job's row cost: the site's line of a row an expert
+/// (`ExpertLines::sited`).
+#[derive(Clone, Copy, Debug, Default)]
+struct SiteRequests(seismic::measure::Line<2>);
+
+impl SiteRequests {
+    /// A request that served `experts` experts of `rows` rows in `seconds`,
+    /// a row past an expert's first at `row` seconds.
+    fn observe(&mut self, experts: u64, rows: u64, seconds: f64, row: f64) {
+        let extra = rows.checked_sub(experts).expect("every expert a request serves names a row");
+        self.0.observe([1., experts as f64], seconds - row * extra as f64);
+    }
+
+    /// The `[fixed, per expert]` seconds of a request whose experts each
+    /// take one row; none before the requests tell the two apart.
+    fn line(&self) -> Option<[f64; 2]> {
+        match self.0.state().expect("site requests' experts and clock seconds make a line") {
+            seismic::measure::LineState::Pending => None,
+            seismic::measure::LineState::Observed(terms) => Some(terms.costs()),
+            seismic::measure::LineState::Seeded(_) => unreachable!("a site's requests seed nothing"),
+        }
+    }
 }
 
 impl Telemetry {
@@ -828,6 +863,7 @@ impl Telemetry {
                     reads: RequestReads::default(),
                     line: None,
                     landings: vec![seismic::measure::Line::new(); groups],
+                    sites: vec![SiteRequests::default(); layers.len()],
                     convert: vec![None; groups],
                     hints: HintCost::default(),
                     hinted: BTreeMap::new(),
@@ -904,10 +940,24 @@ impl Telemetry {
         self.routing.maps.iter().map(|&(group, _)| recorded.costs.landing(group)).collect()
     }
 
-    /// `lines` with each layer's landing line now, which the load observes
-    /// beside the lines it was priced on.
-    fn with_landings(&self, costs: &Costs, lines: &[ExpertLines]) -> Arc<[ExpertLines]> {
-        lines.iter().zip(&self.routing.maps).map(|(lines, &(group, _))| lines.landing(costs.landing(group), costs.convert.get(group).copied().flatten())).collect()
+    /// `lines` refined by the load's real work now ([`Self::with_observed`]):
+    /// what the route's policy words are written from.
+    pub(super) fn refined(&self, lines: &[ExpertLines]) -> Arc<[ExpertLines]> {
+        self.with_observed(&self.lock().costs, lines)
+    }
+
+    /// `lines` with each layer's landing line and CPU site line now, which
+    /// the load observes beside the lines it was priced on.
+    fn with_observed(&self, costs: &Costs, lines: &[ExpertLines]) -> Arc<[ExpertLines]> {
+        lines
+            .iter()
+            .zip(&self.routing.maps)
+            .enumerate()
+            .map(|(layer, (lines, &(group, _)))| {
+                let site = costs.site(layer);
+                lines.landing(costs.landing(group), costs.convert.get(group).copied().flatten()).sited(site)
+            })
+            .collect()
     }
 
     /// The slots the bank commits.
@@ -929,7 +979,7 @@ impl Telemetry {
     /// has measured every layer's compute.
     pub(super) fn group_size(&self, lines: Option<&[ExpertLines]>, notice: Notice, capacity: usize) -> usize {
         let recorded = self.lock();
-        let lines = lines.map(|lines| self.with_landings(&recorded.costs, lines));
+        let lines = lines.map(|lines| self.with_observed(&recorded.costs, lines));
         recorded.facts.group_size(lines.as_deref(), recorded.costs.line, notice, capacity)
     }
 
@@ -940,7 +990,7 @@ impl Telemetry {
     /// the passes' price `pass`.
     pub(super) fn merge_sets(&self, lines: Option<&[ExpertLines]>, pass: Option<&ExpertPass>, notice: Notice, steps: usize) -> Vec<usize> {
         let recorded = self.lock();
-        let lines = lines.map(|lines| self.with_landings(&recorded.costs, lines));
+        let lines = lines.map(|lines| self.with_observed(&recorded.costs, lines));
         recorded.facts.merge_sets(lines.as_deref(), recorded.costs.line, pass, notice, steps)
     }
 
@@ -1051,7 +1101,7 @@ impl Telemetry {
         GroupReads::new(
             recorded.facts.terms()?,
             unions,
-            self.with_landings(&recorded.costs, &lines?),
+            self.with_observed(&recorded.costs, &lines?),
             curve,
             recorded.costs.line?,
             recorded.facts.resident.is_some(),
@@ -1092,7 +1142,8 @@ impl Telemetry {
         &self,
         sequence: Step,
         completion: CompletedStep,
-        sited: &dyn Fn(usize) -> (u64, Duration),
+        sited: &dyn Fn(usize) -> (u64, u64, Duration),
+        priced: Option<&[ExpertLines]>,
     ) -> Result<(), ReadLineError> {
         // A decode step's routing at each streamed layer, read from its
         // records before anything is recorded.
@@ -1148,7 +1199,14 @@ impl Telemetry {
                 // resolved to a tier record, and those resolved absent and
                 // landed from the file during the step), those the CPU
                 // site served; the device read the rest over the link.
-                let (cpu, path) = sited(layer);
+                // Its rows past each expert's first at the priced row cost: a
+                // site serves only a priced layer, and a request whose lines
+                // were unpriced since has no row cost to place it by.
+                let (cpu, rows, path) = sited(layer);
+                let row = priced.and_then(|lines| lines[layer].host.cpu).map(|cpu| cpu.expert.row.bound().get() * 1e-9);
+                if let Some(row) = row.filter(|_| cpu > 0) {
+                    costs.sites[layer].observe(cpu, rows, path.as_secs_f64(), row);
+                }
                 served_within(cpu, hosted, absent[layer], layer, sequence);
                 total.sited += cpu;
                 (cost.experts[layer].sited, cost.experts[layer].site_path) = (cpu, path);
@@ -1222,7 +1280,7 @@ impl Telemetry {
         // misses' exposure.
         if let Some((mut decoded, routed, ..)) = decoded {
             if let Some(Recording { lines: Some(lines) }) = &mut decoded.recording {
-                *lines = self.with_landings(costs, lines);
+                *lines = self.with_observed(costs, lines);
             }
             feed_decode(feed, &mut cost, routed, decoded, ended, costs.line);
         }
@@ -1690,6 +1748,21 @@ mod tests {
         assert!(saves(Use::of(7, Placer::Bank)), "unified: the one store, landed");
         assert!(saves(Use::of(-2 - 7, Placer::Tier)), "a host tier record, landed");
         assert!(!saves(Use::of(7, Placer::Tier)), "a discrete bank record no landing writes");
+    }
+
+    /// A site's line is its requests' time less their rows past each
+    /// expert's first at the row cost: requests of 5 µs and 40 µs an expert,
+    /// some experts of several rows at 2 µs a row, fit 5 and 40 alone; none
+    /// before two expert counts.
+    #[test]
+    fn a_site_line_leaves_out_the_rows_its_row_cost_prices() {
+        let mut requests = SiteRequests::default();
+        requests.observe(2, 2, 85e-6, 2e-6);
+        assert_eq!(requests.line(), None);
+        requests.observe(4, 8, 165e-6 + 4. * 2e-6, 2e-6);
+        requests.observe(3, 5, 125e-6 + 2. * 2e-6, 2e-6);
+        let [fixed, expert] = requests.line().unwrap();
+        assert!((fixed - 5e-6).abs() < 1e-12 && (expert - 40e-6).abs() < 1e-12, "{fixed} {expert}");
     }
 
     /// Recall counts a hint that landed before its route (a hit it made,

@@ -462,6 +462,7 @@ impl Residency {
         self.refill_tier();
         let steps = self.shared.steps.clone();
         steps.while_idle(|| self.publish_policy());
+        self.publish_lines();
         Published(())
     }
 

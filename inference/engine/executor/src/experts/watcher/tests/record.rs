@@ -121,7 +121,7 @@ fn a_groups_acknowledgement_goes_with_its_group() {
     // Group B of steps 3 and 4 counted, then A's last step completes.
     let next = Point { group: 3, layer: 0, sequence: 3 };
     telemetry.group(next, 4, GroupLayer::default());
-    telemetry.complete_step(2, CompletedStep::Prompt, &|_| (0, Duration::ZERO)).expect("no reads, no line");
+    telemetry.complete_step(2, CompletedStep::Prompt, &|_| (0, 0, Duration::ZERO), None).expect("no reads, no line");
     telemetry.served_whole(Some((next, Instant::now())));
     telemetry.arrived(3, Instant::now());
     let group = harness.watcher.shared().costs().group.expect("group B is counted");

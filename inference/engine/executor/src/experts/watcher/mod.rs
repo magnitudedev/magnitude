@@ -44,7 +44,8 @@
 //!   promotions and the policy words, behind one lock no holder waits
 //!   under. Its own thread retires, settles landings, promotes, clears a
 //!   prompt group's conveyor, fills the tier, joins growths, serves resizes
-//!   and writes the policy words in a gap, on the load's events alone.
+//!   and writes the policy words (those a run's encoding reads in a gap,
+//!   the line words wherever they changed), on the load's events alone.
 //! - **Request service** (`requests`): the one owner of noticing the
 //!   device's requests and answering them, each request waiting on its own
 //!   slot of the exchange. It keeps the one poll of serving, where kernels
@@ -179,8 +180,8 @@ pub(super) struct Shared {
     /// run's parks register with and every answer settles.
     pub(crate) parks: Arc<Parks>,
     /// Each streamed layer's lines once the executor's costs priced the
-    /// GPU's (`Shared::price`), which the route's policy words are written
-    /// from between flights; none before.
+    /// GPU's (`Shared::price`), which the route's line words are written
+    /// from (`Residency::publish_lines`); none before.
     priced: Mutex<Option<Arc<[ExpertLines]>>>,
     /// The promotions asked since the load, the directory's count
     /// (`Directory::asked`) as residency last published it.
@@ -300,8 +301,8 @@ impl Shared {
     }
 
     /// Each streamed layer's lines and its pass's price from now on, the
-    /// GPU's priced, or none where they are not: the route's policy words
-    /// follow at the next gap (`Residency::publish_policy`), this an event.
+    /// GPU's priced, or none where they are not: the route's line words
+    /// follow at the next turn (`Residency::publish_lines`), this an event.
     pub fn price(&self, lines: Option<Arc<[ExpertLines]>>, passes: Option<crate::assessment::ExpertPass>) {
         *self.priced.lock().expect("the priced lines") = lines;
         *self.passes.lock().expect("the priced passes") = passes.map(Arc::new);
@@ -681,10 +682,13 @@ impl Watcher {
             asked: None,
             opened: Instant::now(),
             complete: false,
-            site_opened: shared.compute.site_served().terms.iter().sum(),
+            site_opened: shared.compute.site_served(),
+            site_share: Default::default(),
+            lines: None,
         };
         residency.publish_held();
         residency.publish_policy();
+        residency.publish_lines();
         let residency = Arc::new(Mutex::new(residency));
         // From here a thread that cannot start drops the watcher, which
         // stops and joins those that did.

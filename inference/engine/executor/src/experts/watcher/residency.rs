@@ -54,9 +54,14 @@ pub(super) struct Residency {
     /// (`Directory::tier_complete`), as last published.
     pub(super) opened: Instant,
     pub(super) complete: bool,
-    /// The CPU site's answered requests' path time when residency opened
-    /// ([`Self::site_share`]).
-    pub(super) site_opened: std::time::Duration,
+    /// The CPU site's answered requests and their path time when residency
+    /// opened, and the site's share of the time over the load as its last
+    /// answered request left it ([`Self::site_share`]).
+    pub(super) site_opened: crate::experts::SiteServed,
+    pub(super) site_share: SiteShare,
+    /// Each layer's line words as last published ([`Self::publish_lines`]);
+    /// none before the first.
+    pub(super) lines: Option<Vec<Vec<(usize, i32)>>>,
 }
 
 /// Residency's lock. A panic while it is held is caught inside it, and
@@ -115,7 +120,8 @@ impl Residency {
     /// promotions and landings in flight end (until then nothing new is
     /// promoted or read ahead); else the promotions asked and carried, a
     /// prompt group past cleared, what each layer holds published, the tier
-    /// filled ahead of the steps, and in a gap the policy words written. A
+    /// filled ahead of the steps, the line words written where they
+    /// changed, and in a gap the policy words a run's encoding reads. A
     /// turn that changed what a request is served by (a retirement, a
     /// landing learned, a promotion, a group cleared, a growth joined) is
     /// an event: the request service looks again.
@@ -159,7 +165,10 @@ impl Residency {
             self.shared.events().notify();
         }
         let steps = self.shared.steps.clone();
+        // The words a run's encoding reads only while no step runs; the
+        // lines at every turn.
         steps.while_idle(|| self.publish_policy());
+        self.publish_lines();
         if joined || retired || landed || promoted || cleared {
             self.shared.events().notify();
         }
@@ -302,31 +311,29 @@ impl Residency {
         }
     }
 
-    /// The share of the time since residency opened that the CPU site spent
-    /// serving requests: its answered requests' path time over the time
-    /// elapsed, at most all of it (requests of several layers overlap). Over
-    /// the whole load, so it settles as the load runs rather than following
-    /// each flight's requests.
-    fn site_share(&self) -> f64 {
-        let path = self.shared.compute.site_served().terms.iter().sum::<std::time::Duration>();
-        let elapsed = self.opened.elapsed().as_secs_f64();
-        match elapsed > 0. {
-            true => {
-                let served = path.checked_sub(self.site_opened).expect("the site's path time only grows since the load opened");
-                (served.as_secs_f64() / elapsed).min(1.)
-            }
-            false => 0.,
+    /// The CPU site's share of the time over the load: its answered
+    /// requests' path time since residency opened over the time from then
+    /// to the turn that reads them, at most all of it (requests of several
+    /// layers overlap); none of it before any is answered. It moves only as
+    /// requests are answered, so a turn with none answered since prices the
+    /// copies as the turn before did and asks no promotions again. No time
+    /// since residency opened holds no share: the share stands as it was,
+    /// and the first turn after reads the requests.
+    fn site_share(&mut self) -> f64 {
+        let served = self.shared.compute.site_served().since(&self.site_opened);
+        let elapsed = self.opened.elapsed();
+        if served.requests != self.site_share.requests && !elapsed.is_zero() {
+            let path = served.terms.iter().sum::<std::time::Duration>();
+            self.site_share = SiteShare { requests: served.requests, share: (path.as_secs_f64() / elapsed.as_secs_f64()).min(1.) };
         }
+        self.site_share.share
     }
 
-    /// Between flights, write each layer's policy words (`BankPart::Policy`,
-    /// this the one writer): its home (`Directory::home`, the same every
+    /// Between flights, write each layer's policy words a run's encoding
+    /// reads (`BankPart::Policy`, this their one writer; its line words are
+    /// [`Self::publish_lines`]'): its home (`Directory::home`, the same every
     /// flight, which a graph shared by blocks reads through each block's
-    /// own policy port), the lines its route assigns its misses between the
-    /// CPU and the link by (`ExpertLines::policy`: its CPU site's lines as
-    /// the load measured them, and the GPU's once priced, `Shared::price`;
-    /// a line no measurement gave is never written, its absence a policy
-    /// state the route handles), and its whole word, set
+    /// own policy port), its whole word, set
     /// while its group is whole and at home, no expert of it able to miss
     /// (`Directory::group_whole`: on the one store, its records the bank's,
     /// while it keeps every expert, as a bank imported whole there does) and
@@ -354,14 +361,6 @@ impl Residency {
         let full = (0..self.core.groups.len()).map(|group| directory.group_whole(group) && directory.group_at_home(group)).collect::<Vec<_>>();
         let every = full.iter().all(|&full| full);
         let lender = self.scratch.conveyor.lending().group;
-        let priced = self.shared.priced();
-        let site_share = self.site_share();
-        let copy = self.shared.copy.lock().expect("a copy's price").clone();
-        if let (Some(lines), Some(copy)) = (&priced, copy) {
-            for (layer, lines) in lines.iter().enumerate() {
-                self.core.directory.price_copies(layer, lines.copy_hits(&copy, site_share));
-            }
-        }
         let served = self.core.layers.iter().any(|layer| layer.site.is_some() && !(full[layer.group] && (every || lender != layer.group)));
         self.shared.sites_served.store(served, std::sync::atomic::Ordering::Release);
         for (index, layer) in self.core.layers.iter().enumerate() {
@@ -372,18 +371,64 @@ impl Residency {
             let resolved = whole || self.core.directory.group_tier_complete(layer.group);
             layer.policy.store(constants::POLICY_RESOLVED as usize, i32::from(resolved));
             layer.policy.store(constants::POLICY_HOME as usize, self.homes[index]);
-            // A priced line holds a site's CPU lines once its verdict
-            // admits it (`ExpertMeasures::lines`).
-            let cpu = priced.as_ref().and_then(|lines| lines[index].host.cpu);
-            let site = match (&layer.site, &cpu) {
-                (None, _) => SiteLines::Unsited,
-                (Some(_), None) => SiteLines::Pending,
-                (Some(_), Some(cpu)) => SiteLines::Measured(cpu),
-            };
-            for (word, value) in ExpertLines::policy(site, priced.as_ref().map(|lines| &lines[index])) {
-                layer.policy.store(word, value);
+        }
+    }
+
+    /// Write each layer's line words (`ExpertLines::policy`, this the one
+    /// writer) from its lines as the load's own work refines them (its
+    /// landings and what its CPU site's requests take,
+    /// `Telemetry::refined`), and price the promotions' copies on the same
+    /// lines at the site's share of the time now (`Directory::price_copies`
+    /// asks them again only where a price moved). The words are stored only
+    /// where they differ from those last published, so a turn that moved
+    /// none of them takes no steps' lock. Unlike the words a run's encoding
+    /// reads (whole, resolved, home: [`Self::publish_policy`]), the lines decide
+    /// only the route's choice of a miss's site, and any value of each word
+    /// is a valid one for any step: so they are stored under the lock every
+    /// step begins under (`Steps::unbegun`), as a map entry is
+    /// (`experts::map`), at any turn, the lock held for the stores alone.
+    /// Every step from the first not yet begun reads them, and one begun
+    /// that has not routed the layer yet may, as a mapping may take effect
+    /// from such a step: word by word, some of a layer's words old and
+    /// some new. A decode that never idles is repriced so.
+    pub(super) fn publish_lines(&mut self) {
+        let priced = self.shared.priced().map(|lines| self.shared.telemetry.refined(&lines));
+        let copy = self.shared.copy.lock().expect("a copy's price").clone();
+        if let (Some(lines), Some(copy)) = (&priced, &copy) {
+            let site_share = self.site_share();
+            for (layer, lines) in lines.iter().enumerate() {
+                self.core.directory.price_copies(layer, lines.copy_hits(copy, site_share));
             }
         }
+        let words = self
+            .core
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                // A priced line holds a site's CPU lines once its verdict
+                // admits it (`ExpertMeasures::lines`).
+                let cpu = priced.as_ref().and_then(|lines| lines[index].host.cpu);
+                let site = match (&layer.site, &cpu) {
+                    (None, _) => SiteLines::Unsited,
+                    (Some(_), None) => SiteLines::Pending,
+                    (Some(_), Some(cpu)) => SiteLines::Measured(cpu),
+                };
+                ExpertLines::policy(site, priced.as_ref().map(|lines| &lines[index]))
+            })
+            .collect::<Vec<_>>();
+        if self.lines.as_ref() == Some(&words) {
+            return;
+        }
+        let layers = &self.core.layers;
+        self.shared.steps.unbegun(|_| {
+            for (layer, words) in layers.iter().zip(&words) {
+                for &(word, value) in words {
+                    layer.policy.store(word, value);
+                }
+            }
+        });
+        self.lines = Some(words);
     }
 
     /// What residency holds and moves, for the exchange's watchdog:
@@ -449,4 +494,12 @@ impl Residency {
     pub(super) fn serving(&mut self) -> decode::Serving<'_> {
         decode::Serving { core: &mut self.core, prefetch: &mut self.prefetch, shared: &self.shared }
     }
+}
+
+/// The CPU site's share of the time over the load ([`Residency::site_share`]),
+/// as of its answered requests since residency opened.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SiteShare {
+    requests: u64,
+    share: f64,
 }

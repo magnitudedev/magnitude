@@ -92,6 +92,15 @@ impl Nanoseconds {
         }
     }
 
+    /// The whole nanoseconds nearest `seconds`, a line's term (finite and
+    /// not negative, which a fit's terms are by construction), at most a
+    /// policy word's: a term past a word is priced at the most a word says,
+    /// the dearest the route weighs.
+    pub fn saturating(seconds: f64) -> Self {
+        assert!(seconds.is_finite() && seconds >= 0., "a line's term of {seconds} s");
+        Self((seconds * 1e9).round().min(i32::MAX as f64) as u32)
+    }
+
     /// As a float, in nanoseconds: exact.
     pub fn get(self) -> f64 {
         f64::from(self.0)
@@ -577,6 +586,22 @@ impl ExpertLines {
         Self { host: HostLines { file, convert, ..self.host }, ..self }
     }
 
+    /// The lines with the CPU site's line as the load observes its
+    /// requests take (`[fixed, per expert]` seconds, an expert of one row,
+    /// its rows past the first at the job's row cost, which it keeps), in
+    /// place of the line the job measured on an idle machine, where a site
+    /// serves: what its requests take beside the machine's other work,
+    /// which the route then weighs against the link. A term past a policy
+    /// word is priced at a word's most ([`Nanoseconds::saturating`]).
+    pub fn sited(self, observed: Option<[f64; 2]>) -> Self {
+        let (Some(cpu), Some([fixed, expert])) = (self.host.cpu, observed) else {
+            return self;
+        };
+        let (handshake, one) = (Nanoseconds::saturating(fixed), Nanoseconds::saturating(expert));
+        let cpu = CpuLines { handshake, expert: RowLine { one, ..cpu.expert } };
+        Self { host: HostLines { cpu: Some(cpu), ..self.host }, ..self }
+    }
+
     /// What `count` file misses of the layer add past their reads' end, at
     /// the site that lands them sooner: the host's, or the device's convert
     /// in their barrier (none measured yet: nothing to price).
@@ -834,6 +859,23 @@ mod tests {
         assert!((ready - (200e-6 + 1_930_000. / 6e9)).abs() < 1e-12);
         let served = lines.serve(Pass::Decode, &hits(9.), &[Miss { rows: 1., ready_seconds: ready }]);
         assert!((served.end_seconds - (ready + 44e-6)).abs() < 1e-9, "{served:?}");
+    }
+
+    /// The CPU site's line as its requests took replaces the job's where a
+    /// site serves, its row cost kept, a term past a policy word at a word's
+    /// most; a layer without a site, or none observed, keeps its lines.
+    #[test]
+    fn the_site_line_is_what_its_requests_took() {
+        let lines = lines();
+        let sited = lines.sited(Some([30e-6, 400e-6]));
+        let cpu = sited.host.cpu.unwrap();
+        assert_eq!((cpu.handshake.get(), cpu.expert.one.get()), (30_000., 400_000.));
+        assert_eq!(cpu.expert.row, lines.host.cpu.unwrap().expert.row);
+        let slow = lines.sited(Some([30e-6, 5.])).host.cpu.unwrap();
+        assert_eq!(slow.expert.one.word(), i32::MAX);
+        assert_eq!(lines.sited(None), lines);
+        let unsited = ExpertLines { host: HostLines { cpu: None, ..lines.host }, ..lines };
+        assert_eq!(unsited.sited(Some([30e-6, 400e-6])), unsited);
     }
 
     /// A copy is priced in the reads it must save: its record over the

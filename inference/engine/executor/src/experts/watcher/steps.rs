@@ -847,6 +847,7 @@ impl ExpertStep {
             sequence,
             completion,
             &|layer| shared.compute.sited(layer, sequence),
+            shared.priced().as_deref(),
         ) {
             shared.lost_read_line(error);
         }
