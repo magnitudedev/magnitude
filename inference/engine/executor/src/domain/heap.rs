@@ -259,6 +259,14 @@ impl DeviceHeap {
     ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
         let readings =
             crate::platform::refresh_device_ceiling(&self.device, status, &self.reserves, self.room);
+        self.account();
+        readings
+    }
+
+    /// Refresh the heap's view of Seismic's charge alone, reading no store:
+    /// what the process's own claims and releases changed since. The stores
+    /// and Seismic's ceiling stand as the last [`Self::refresh`] read them.
+    pub fn account(&mut self) {
         let charged_bytes = self.device.ledgers().own.iter().map(|(_, ledger)| ledger.charged).sum();
         self.heap
             .observe(MemoryObservation {
@@ -266,7 +274,6 @@ impl DeviceHeap {
                 charged_bytes,
             })
             .expect("a Seismic reading of the device's storage is a valid observation");
-        readings
     }
 
     /// The free space of the blocks the device holds for `kind` storage

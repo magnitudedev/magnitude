@@ -1152,7 +1152,7 @@ impl<F: ProgramFamily> Owner<F> {
             readings: self
                 .service
                 .domain
-                .refresh_memory()
+                .observe_memory()
                 .map_err(|error| error.to_string())?,
             reconciliation: self.reconcile_memory_charge()?,
             serving: self.serving_census()?,
@@ -1907,7 +1907,7 @@ trait MemoryStep: MemoryHost + Sized {
         if self.memory().deficits.is_empty() {
             return Ok(());
         }
-        let readings = match self.domain().refresh_memory() {
+        let readings = match self.domain().observe_memory() {
             Ok(readings) => readings,
             // A failed reading says nothing about the deficit; the next
             // periodic observation looks again.

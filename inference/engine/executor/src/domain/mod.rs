@@ -1465,29 +1465,49 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    /// Observe every domain the device uses, set Seismic's allocation
-    /// ceiling from the readings, and refresh the heap's view from the same
-    /// readings. Seismic remains the physical charge authority; the heap only
-    /// classifies ownership and issues claims. A failed observation revokes
-    /// unspent grants and leaves the heap Blind.
-    ///
-    /// The static holding is classified only here, against the observation
-    /// just made, its live charges read after the charge while the expert
-    /// bank holds every rise of its charge off this thread
-    /// (`ElasticBank::hold_rises`): what remains off this thread is a
-    /// release (an expert bank shrink's, once the device work before it
-    /// completes; a released slab an outside view retained), which only
-    /// ever lowers its charge, so the holding is never classified above
-    /// the charge it is read against.
-    pub fn refresh_memory(&self) -> Result<Vec<DomainReading>, DomainError> {
+    /// Observe every domain the device uses from a reading taken now, set
+    /// Seismic's allocation ceiling from the readings, and refresh the
+    /// heap's view of the charge ([`Self::refresh_memory`]): a memory
+    /// probe's, and what waits on memory another process frees. Seismic
+    /// remains the physical charge authority; the heap only classifies
+    /// ownership and issues claims. A failed observation revokes unspent
+    /// grants and leaves the heap Blind.
+    pub fn observe_memory(&self) -> Result<Vec<DomainReading>, DomainError> {
         let _rises = self.family.expert_bank().map(|bank| bank.hold_rises());
         let readings = self
             .memory
             .borrow_mut()
             .refresh()
             .map_err(|error| DomainError::Blind(error.to_string()))?;
-        // A running growth's bytes are counted once: what it backed is in the charge just read,
-        // so its claim holds only the rest, read under the same hold of the bank's rises.
+        self.classify_memory()?;
+        Ok(readings)
+    }
+
+    /// Refresh the heap's view of Seismic's charge after the process's own
+    /// claims and releases, reading no store: the stores and Seismic's
+    /// ceiling stand as the last observation ([`Self::observe_memory`]) or
+    /// claim read them, so the decode's own steps read nothing of the OS.
+    pub fn refresh_memory(&self) -> Result<(), DomainError> {
+        let _rises = self.family.expert_bank().map(|bank| bank.hold_rises());
+        self.memory.borrow_mut().account();
+        self.classify_memory()
+    }
+
+    /// Classify the charge just read by the growth's claim and the static
+    /// holding.
+    ///
+    /// The static holding is classified only here, against the charge just
+    /// read, its live charges read after the charge while the expert bank
+    /// holds every rise of its charge off this thread
+    /// (`ElasticBank::hold_rises`): what remains off this thread is a
+    /// release (an expert bank shrink's, once the device work before it
+    /// completes; a released slab an outside view retained), which only
+    /// ever lowers its charge, so the holding is never classified above
+    /// the charge it is read against.
+    fn classify_memory(&self) -> Result<(), DomainError> {
+        // In the heap a running growth's bytes are counted once: what it backed is in the
+        // charge just read, so its claim holds only the rest, read under the same hold of the
+        // bank's rises.
         if let (Some(claim), Some(bank)) = (&self.bank_claim, self.family.expert_bank()) {
             let rest = claim.bytes.saturating_sub(bank.growth_backed(claim.kind)?);
             self.memory
@@ -1505,7 +1525,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     DomainError::Input(format!("static memory holding update rejected: {error:?}"))
                 })?;
         }
-        Ok(readings)
+        Ok(())
     }
 
     pub fn memory(&self) -> std::cell::Ref<'_, MemoryHeap> {

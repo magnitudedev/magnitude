@@ -737,7 +737,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 growth_failure(error, bytes, "vision growth")
             }
         })?;
-        self.refresh_memory().map(drop)
+        self.refresh_memory()
     }
 
     /// Grow `lane`'s retained-output pool by one slot when none is free, so
@@ -763,7 +763,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .grow_output();
         self.release_claim(claim);
         grown.map_err(|error| growth_failure(error, bytes, "graph output growth"))?;
-        self.refresh_memory().map(drop)
+        self.refresh_memory()
     }
 
     /// Grant elastic state growth of the target or `head` store from a fresh
@@ -850,7 +850,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`MemoryPace`): the owner probes every `reading_interval`, and again
     /// after each release while memory is short.
     pub fn probe_memory(&mut self, reading_interval: std::time::Duration) -> Result<(), DomainError> {
-        let readings = self.refresh_memory()?;
+        let readings = self.observe_memory()?;
         self.pace.borrow_mut().observe(
             &readings,
             &self.domain.device().ledgers().own_claims(),
