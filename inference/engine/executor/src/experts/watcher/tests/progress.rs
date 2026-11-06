@@ -176,7 +176,7 @@ fn a_bank_at_its_minimum_makes_progress() {
             Placer::Bank => (1, request.max(EXPERTS as u32) + staging),
         };
         assert!(tier < (EXPERTS * LAYERS) as u32, "the minimum lacks experts, so misses land");
-        let conveying = Conveying { conveyed: 4, lent: 4, bytes: RECORD };
+        let conveying = Conveying::of(4);
         let harness = lending("minimum", EXPERTS, records, LAYERS, staging, conveying, tier, placer, placer == Placer::Tier);
         // Each round's request misses half of each layer's experts, the
         // other half the round before.

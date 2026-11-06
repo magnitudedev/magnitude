@@ -3,8 +3,9 @@
 // list's sequence is this step's, entry i below its count converts record
 // `from` into scratch slot `to` (below S) by windows
 // (lib/streaming/window.glsl), `repack_weight`'s placement, or a dense record
-// by rows, `import_dense`'s: `from` is a conveyor record, below V. The
-// conveyor and the destination are record ports (views of lent records, the
+// by rows, `import_dense`'s: `from` is a conveyor record, below V, or,
+// negative, scratch slot -1 - from, which holds the stored bytes the host
+// read there. The conveyor and the destination are record ports (views of lent records, the
 // destination the scratch lender's), each record read or written at its own
 // base. Workgroups stride over the listed records' items, so a launch costs
 // what its list holds.
@@ -33,6 +34,10 @@ void routed_convert() {
         const int from = streaming_list_from(0u), to = streaming_list_to(0u);
         const uint64_t item = uint64_t(at % per_record);
         const uint64_t destination = slab_region(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION), uint64_t(to));
-        conveyed_convert(slab_region(SEISMIC_PTR(SEISMIC_BUFFER_CONVEYOR), uint64_t(from)), destination, item);
+        // A negative `from` names scratch slot -1 - from, which holds the
+        // stored bytes the host read there.
+        const uint64_t source = from >= 0 ? slab_region(SEISMIC_PTR(SEISMIC_BUFFER_CONVEYOR), uint64_t(from))
+                                          : slab_region(SEISMIC_PTR(SEISMIC_BUFFER_DESTINATION), uint64_t(-1 - from));
+        conveyed_convert(source, destination, item);
     }
 }

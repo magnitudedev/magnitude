@@ -2474,17 +2474,22 @@ fn routed_scratch_wait[FLIGHT, LANES, LW, V, F, H, E, EL, GV](step: &tensor[STEP
 # the host writes and answers before it answers round 0; none where it
 # failed the request), round r converts
 # n_r = clamp(count - r L, 0, L) records (L = `round_records`), so its park
-# grid holds one threadgroup while n_r > 0 (round 0's is never read) and its
-# convert grids n_r rows of `rows_groups` and `columns_groups` threadgroups,
-# ceil(N / CONVERT_TILE_ROWS) of the convert's over records of N = F and
-# N = H rows (its threadgroups stride over a record's items, so any grid
-# converts every one). The rounds after the
-# last with records neither park nor convert, and the host serves none of
-# them. A request neither answered nor failed here had round 0's wait end
-# on its still pulse (`streaming_await_slot`), before the count was final:
-# every round parks and none converts, so the device still arrives, in
-# order, at every round the host serves (the step is interrupted, its
-# outputs unused).
+# grid holds one threadgroup while n_r > 0 or, unfollowed, n_{r-1} > 0
+# (round 0's is never read) and its convert grids n_r rows of `rows_groups` and
+# `columns_groups` threadgroups, ceil(N / CONVERT_TILE_ROWS) of the
+# convert's over records of N = F and N = H rows (its threadgroups stride
+# over a record's items, so any grid converts every one). The round after
+# the last with records parks and converts nothing: its arrival, which its
+# wait orders after the last round's converts by the conveyor it binds, is
+# the device's word that they have read their records, which frees them,
+# and its host answers it before the last round; but not where the request
+# is followed (SCRATCH_FOLLOWED: a sibling fill's round 0 arrives next and
+# proves as much). The rounds after it neither park nor convert, and the
+# host serves none of them. A request
+# neither answered nor failed here had round 0's wait end on its still
+# pulse (`streaming_await_slot`), before the count was final: every round
+# parks and none converts, so the device still arrives, in order, at every
+# round the host serves (the step is interrupted, its outputs unused).
 fn routed_scratch_grids[FLIGHT, LANES, R](step: &tensor[STEP_WORDS] i32,
     scratch: &tensor[FLIGHT, SCRATCH_SLOT * LANES] i32,
     grids: &mut tensor[R, ROUND_GRIDS, 3] i32, round_records: i32, rows_groups: i32, columns_groups: i32)
@@ -2496,13 +2501,17 @@ fn routed_scratch_grids[FLIGHT, LANES, R](step: &tensor[STEP_WORDS] i32,
     let failed = q | (u64(u32(SLOT_FAILED)) << u64(32))
     let mut count = i32(0)
     let mut unanswered = i32(1)
+    let mut after = i32(1)
     if answer == q:
         count = scratch[slot, ask + SCRATCH_STAGED]
+        if scratch[slot, ask + SCRATCH_FOLLOWED] != 0:
+            after = i32(0)
     if answer == q or answer == failed:
         unanswered = i32(0)
     for round in 0..R:
         let records = min(max(count - i32(round) * round_records, 0), round_records)
-        let parks = max(min(records, 1), unanswered)
+        let before = min(max(count - max(i32(round) - 1, 0) * round_records, 0), 1) * after
+        let parks = max(max(min(records, 1), before), unanswered)
         grids[round, PARK_GRID, 0] = parks
         grids[round, ROWS_GRID, 0] = rows_groups
         grids[round, COLUMNS_GRID, 0] = columns_groups
@@ -2615,8 +2624,14 @@ fn routed_move[D, L, N, K](records: &mut tensor[D, N, K] U,
 # store's on unified memory, the host tier's on a discrete device), which
 # the host read into and the convert reads in place (over the link on a
 # discrete device). `destination` is the layer's scratch tier, a view of the
-# scratch lender's bank records (slot e holds expert e). A list written for
-# another step converts nothing.
+# scratch lender's bank records (slot e holds expert e). A negative `from`
+# names scratch slot -1 - from instead, one no pass reads until this round's
+# converts are done, which the host read the stored bytes into at the slot's
+# base (where the host addresses the scratch: on unified memory); the
+# natives read it there as they read a conveyor record. This body states
+# the conveyor's case only: a slot holds the stored form in bytes its view
+# types as the resident one. A list written for another step converts
+# nothing.
 fn routed_convert[V, L, S, N, K](
     conveyor: &tensor[V, N, K] ST, list: &tensor[LIST_ENTRIES + LIST_ENTRY_WORDS * L] i32, step: &tensor[STEP_WORDS] i32,
     destination: &mut tensor[S, N, K] U, grid: &tensor[3] i32)
@@ -2625,7 +2640,7 @@ fn routed_convert[V, L, S, N, K](
         for entry in 0..L:
             let from = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_FROM]
             let to = list[LIST_ENTRIES + LIST_ENTRY_WORDS * entry + LIST_TO]
-            if entry < list[LIST_COUNT]:
+            if entry < list[LIST_COUNT] and from >= 0:
                 destination[to, :, :] = repack[U = U](conveyor[from, :, :])
 
 

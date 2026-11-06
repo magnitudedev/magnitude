@@ -58,6 +58,15 @@ pub(in crate::experts) struct Layer {
     pub site: Option<ExchangeTable>,
     /// Each routed tensor of its record, in record order.
     pub stored: Vec<StoredTensor>,
+    /// Its scratch view of each routed tensor, in record order, as the host
+    /// addresses it, where it does (on unified memory): a slot no pass
+    /// reads may carry a stored expert, read into its base
+    /// (`Conveyor::take`).
+    pub slots: Option<Vec<Records>>,
+    /// Its scratch form of each routed tensor, in record order
+    /// (`ExpertBankPlan::layer_scratch_forms`): layers of one form lay each
+    /// slot in the same bytes.
+    pub scratch_form: Vec<usize>,
     /// Its barrier's convert's words, where the host places and so the
     /// device may land its misses.
     pub landing: Option<std::sync::Arc<crate::experts::landing::DeviceWords>>,
@@ -201,11 +210,18 @@ pub(in crate::experts) struct Extents {
     pub placer: crate::planning::Placer,
 }
 
-/// Records taken for reads that have ended: free once the device is past
-/// `until`.
+/// The records a scratch round of the request at `until` listed: free once
+/// its converts have read them, which the device's arrival at the round
+/// after proves (its lane `after`, of the request's slot of the layer's
+/// scratch table: that round's wait binds the conveyor as the host's, so
+/// it follows the converts that read it), or, where no round follows the
+/// slot's last or the fill is followed (`ExpertBank::fill_followed`: the
+/// device never arrives at the round after, but at the sibling's round 0,
+/// which advances progress past `until`), once the device is past `until`.
 pub(super) struct Taken {
     pub(super) records: Vec<Listed>,
     pub(super) until: Point,
+    pub(super) after: Option<u64>,
 }
 
 /// A record a scratch round listed: the conveyor record expert `expert` of
@@ -298,6 +314,18 @@ impl Core {
         let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.taken)
             .into_iter()
             .partition(|taken| taken.until < progress);
+        self.taken = kept;
+        done.into_iter().flat_map(|taken| taken.records).collect()
+    }
+
+    /// The records taken whose converts the device has run: it arrived at
+    /// the round after theirs.
+    pub(super) fn take_converted(&mut self) -> Vec<Listed> {
+        let layers = &self.layers;
+        let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.taken).into_iter().partition(|taken| {
+            let Point { layer, sequence, .. } = taken.until;
+            taken.after.is_some_and(|lane| layers[layer].scratch.requested(sequence, lane))
+        });
         self.taken = kept;
         done.into_iter().flat_map(|taken| taken.records).collect()
     }
@@ -395,6 +423,27 @@ impl Core {
                     .staging
                     .copy_record(u64::from(record), &conveyor[stored.pool], u64::from(conveyed), stored.bytes)
             };
+        }
+    }
+
+    /// The reads that bring expert `expert` of `layer` into conveyor
+    /// record `record` (`Conveyor::target`): of each of its pools, or the
+    /// base of a slot of its scratch.
+    pub(super) fn reads_to(&self, layer: usize, expert: usize, conveyor: &Conveyor, record: u32) -> Vec<Read> {
+        match conveyor.slot_of(record) {
+            None => self.reads_into(layer, expert, |pool| (&conveyor.pools()[pool], u64::from(record))),
+            Some(slot) => {
+                let slots = self.layers[layer].slots.as_ref().expect("a slot carries an expert only where the host addresses the scratch");
+                self.layers[layer]
+                    .stored
+                    .iter()
+                    .zip(slots)
+                    .map(|(stored, records)| {
+                        let offset = stored.base + expert as u64 * stored.pitch;
+                        Read::new(stored.file, offset, stored.bytes, records, u64::from(slot))
+                    })
+                    .collect()
+            }
         }
     }
 

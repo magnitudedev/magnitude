@@ -4,8 +4,9 @@
 // record `from` into scratch slot `to` by windows
 // (lib/streaming/window.cuh), `repack_weight`'s conversion, or a dense
 // record by rows, `import_dense`'s: `from` is a conveyor record, below V
-// (any view of stored-form records). It is the body of one block of
-// its round's written grid (`routed_scratch_grids`: CONVERT_TILE_ROWS-row
+// (any view of stored-form records), or, negative, scratch slot -1 - from,
+// which holds the stored bytes the host read there (`listed_source`). It is
+// the body of one block of its round's written grid (`routed_scratch_grids`: CONVERT_TILE_ROWS-row
 // tiles by the round's records), and blocks stride over the listed records'
 // row tiles (a dense record's rows), so a launch costs what its list holds.
 
@@ -45,8 +46,9 @@ __device__ void routed_convert_block(SEISMIC_KERNEL_PARAMS) {
             streaming_list_pair(list, stride, at, per_record, entries, shared.words.group, threadIdx.x, blockDim.x);
             const int from = streaming_list_from(shared.words.group), to = streaming_list_to(shared.words.group);
             __syncthreads();
-            streaming::convert_row<ConveyorBinding>(conveyor, destination, seismic_words_value, (u64)from, (u64)to,
-                                                    at % per_record);
+            streaming::convert_row<ConveyorBinding>(
+                streaming::listed_source<ConveyorBinding>(conveyor, destination, seismic_words_value, from), destination,
+                seismic_words_value, 0, (u64)to, at % per_record);
             __syncthreads();
         }
     } else {

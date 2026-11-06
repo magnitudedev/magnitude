@@ -111,6 +111,16 @@ impl BankRun {
         Ok(())
     }
 
+    /// This step's fill, `graph`'s run as block `index`, is `followed`
+    /// directly by a sibling fill on its queue
+    /// (`ExpertBank::fill_followed`), at block `index`'s streamed layer.
+    pub(crate) fn fill_followed<P>(&self, graph: &PreparedTargetBlockGraph<P>, index: usize, followed: bool) -> Result<(), String> {
+        let [_, routed] = super::prepared::block_scopes(graph.block)?;
+        let layer = self.bank.streamed_layer(block_scope(routed, graph.block, index)?)?;
+        self.bank.fill_followed(self.sequence, layer, followed);
+        Ok(())
+    }
+
     /// Register the parks and publications of `graph`'s run as block
     /// `index` of this step that took a value when it was queued
     /// (`outputs`, its outputs), each at block `index`'s streamed layer,

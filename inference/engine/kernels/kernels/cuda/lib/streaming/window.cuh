@@ -153,6 +153,17 @@ __device__ __forceinline__ void convert_row(const u8 *source, u8 *destination,
                                   Source::load(__ldcs(from + k * B::source_stride_2(seismic_words_value))));
 }
 
+// The stored record a list entry's `from` names: conveyor record `from` of
+// `conveyor`, or, negative, scratch slot -1 - from of `destination`, a slot
+// no pass reads, which the host read the stored bytes into at its base
+// (`routed_convert` in routed.seismic). Either is at record 0 of the base returned.
+template <class B>
+__device__ __forceinline__ const u8 *listed_source(const u8 *conveyor, const u8 *destination,
+                                                   const seismic_words_t &seismic_words_value, int from) {
+    return from >= 0 ? conveyor + (u64)from * B::source_matrix_bytes(seismic_words_value)
+                     : destination + (u64)(-1 - from) * B::out_matrix_bytes(seismic_words_value);
+}
+
 // Where item `item` of a packed record lies: its window's first row and
 // rows below N, its first packet and packets below the row's, and the
 // record's source and destination.
@@ -331,9 +342,10 @@ template <class B> struct Prefetched {
 // tiles' windows in turn: each window loaded into registers (`Prefetched`)
 // while the one before it converts, each row tile placed in the mirror and
 // written whole (`write_tile`), or, larger than the mirror, placed in the
-// record. `pair(at)`, called by every thread, gives item `at`'s (from, to).
-// A launch of WINDOW_THREADS threads over a conveyor whose records keep
-// `Prefetched`'s unit (a view of whole records of a 16-byte aligned tensor).
+// record. `pair(at)`, called by every thread, gives item `at`'s (from, to),
+// `from` as `listed_source` reads it. A launch of WINDOW_THREADS threads over
+// records that keep `Prefetched`'s unit (views of whole records of 16-byte
+// aligned tensors), each listed one checked.
 template <class B, class Sh, class Pair>
 __device__ __forceinline__ void convert_records(const u8 *source, u8 *destination,
                                                 const seismic_words_t &seismic_words_value, u64 end, u64 first,
@@ -348,7 +360,11 @@ __device__ __forceinline__ void convert_records(const u8 *source, u8 *destinatio
     const auto next = [&](u64 at) { return (at + 1) % windows != 0 ? at + 1 : at + 1 - windows + step * windows; };
     const auto place = [&](u64 at) {
         const int2 fromto = pair(at);
-        return Placed<B>(source, destination, seismic_words_value, (u64)fromto.x, (u64)fromto.y, at % per_record);
+        const u8 *from = listed_source<B>(source, destination, seismic_words_value, fromto.x);
+        // A scratch slot keeps the unit only where its records do.
+        if (reinterpret_cast<u64>(from) % Prefetched<B>::UNIT != 0u)
+            __trap();
+        return Placed<B>(from, destination, seismic_words_value, 0, (u64)fromto.y, at % per_record);
     };
     Prefetched<B> prefetched;
     u64 at = first * windows;

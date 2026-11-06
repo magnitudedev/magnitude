@@ -1769,8 +1769,13 @@ impl NativeTargetProgram {
         while start < count {
             let set = start..if start + merged < count { start + 1 } else { count.min(start + most) };
             if let Some(at) = block {
-                for (_, run) in runs.iter_mut().enumerate().filter(|(place, run)| set.contains(place) && run.unfilled == Some(at)) {
-                    self.run_fill(run, at, submitter)?;
+                // Where fills share the compute queue, the set's fills run
+                // back to back, each but the last directly followed by a
+                // sibling's (`ExpertBank::fill_followed`).
+                let unfilled = |(place, run): &(usize, &mut TargetRun<'_>)| set.contains(place) && run.unfilled == Some(at);
+                let fills = runs.iter_mut().enumerate().filter(unfilled).count();
+                for (filled, (_, run)) in runs.iter_mut().enumerate().filter(unfilled).enumerate() {
+                    self.run_fill(run, at, !early && filled + 1 < fills, submitter)?;
                 }
                 self.run_pass(runs, at, set.clone(), reads, submitter)?;
             }
@@ -1779,7 +1784,7 @@ impl NativeTargetProgram {
             let passed = early && (block.is_none() || set.end == count);
             if passed {
                 for (_, run) in runs.iter_mut().enumerate().filter(|(place, run)| first(*place) && run.unfilled == Some(index)) {
-                    self.run_fill(run, index, submitter)?;
+                    self.run_fill(run, index, false, submitter)?;
                 }
             }
             for (place, run) in runs.iter_mut().enumerate().filter(|(place, _)| set.contains(place)) {
@@ -1791,7 +1796,7 @@ impl NativeTargetProgram {
                     if filled(index) && run.back.as_ref().is_some_and(|&(at, _)| at == index) {
                         run.unfilled = Some(index);
                         if passed && first(place) {
-                            self.run_fill(run, index, submitter)?;
+                            self.run_fill(run, index, false, submitter)?;
                         }
                     }
                 }
@@ -1812,13 +1817,15 @@ impl NativeTargetProgram {
     /// holds compute, and where they share its queue a park holds only what
     /// follows it. It runs in its run's workspace, the graphs' shared arena,
     /// which it touches, and so orders against, only where its graph places
-    /// something there.
-    fn run_fill(&self, run: &mut TargetRun<'_>, index: usize, submitter: &mut StepSubmitter) -> Result<(), SubmitError> {
+    /// something there. `followed`: the next launch on its queue is a
+    /// sibling's fill, which waits on nothing queued after this one.
+    fn run_fill(&self, run: &mut TargetRun<'_>, index: usize, followed: bool, submitter: &mut StepSubmitter) -> Result<(), SubmitError> {
         run.unfilled = None;
         let (graph, bound) = self.graphs.fill(index).map_err(invalid)?;
         let mut bindings = bound.bindings();
         if let Some(bank) = &run.bank {
             bank.bind(graph, index, run.region.place, &mut bindings).map_err(invalid)?;
+            bank.fill_followed(graph, index, followed).map_err(invalid)?;
         }
         let mut active = run.launch.graph_workspace.slot_mut().activate(&graph.plan).map_err(device)?;
         let ready = active

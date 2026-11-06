@@ -806,7 +806,7 @@ impl ExpertBank {
                 .map_err(|error| failed(&error))?;
             // The records every one of the group's record tensors holds.
             let records = group.records.iter().map(|(_, tensor)| tensor.extents()[0]).min().expect("a group has record tensors");
-            list.write_list(&pairs, crate::experts::ListBounds { from: records, to: records });
+            list.write_list(&pairs, crate::experts::ListBounds { from: records, to: records, lent: 0 });
             let batch = batch.get_or_insert_with(|| NativeTensorBatch::new(&group.moves.device()));
             for ((_, tensor), (_, kernel)) in group.records.iter().zip(kernels.records.iter()) {
                 let mut tensor = tensor.clone();

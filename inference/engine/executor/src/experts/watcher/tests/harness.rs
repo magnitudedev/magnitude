@@ -261,12 +261,20 @@ pub(super) struct Conveying {
     pub(super) conveyed: u64,
     pub(super) lent: usize,
     pub(super) bytes: u64,
+    /// Whether the host addresses the scratch, as on unified memory: its
+    /// slots no pass reads carry experts too (`Scratch::lendable_slot`).
+    pub(super) scratch: bool,
 }
 
 impl Conveying {
     /// A conveyor record on each lent record.
     pub(super) const fn of(conveyed: u64) -> Self {
-        Self { conveyed, lent: conveyed as usize, bytes: RECORD }
+        Self { conveyed, lent: conveyed as usize, bytes: RECORD, scratch: false }
+    }
+
+    /// The conveyor, the host addressing the scratch.
+    pub(super) const fn lending_scratch(self) -> Self {
+        Self { scratch: true, ..self }
     }
 }
 
@@ -275,7 +283,7 @@ pub(super) const WHOLE: Conveying = Conveying::of(EXPERTS as u64);
 
 /// What a harness that serves no prompt group holds: no lent record, so its
 /// tier is exactly what the test sizes.
-pub(super) const DECODE: Conveying = Conveying { conveyed: 1, lent: 0, bytes: RECORD };
+pub(super) const DECODE: Conveying = Conveying { conveyed: 1, lent: 0, bytes: RECORD, scratch: false };
 
 /// The CPU device the harness's words and records live on.
 pub(super) fn cpu() -> seismic::Device {
@@ -376,7 +384,7 @@ pub(super) fn lending_bank(
     // The records the conveyor's lending lends it, the host tier's (or the
     // one store's) bottom ones beneath the `tier` the test sizes: conveyor
     // record `e` lies on lent record `e · RECORD / bytes`.
-    let Conveying { conveyed: conveyor_records, lent, bytes } = conveying;
+    let Conveying { conveyed: conveyor_records, lent, bytes, scratch: addressed } = conveying;
     let tier = tier + lent as u32;
     // The slots the test sizes: the bank's records (its scratch lies apart,
     // the fixture's scratch tier).
@@ -458,6 +466,7 @@ pub(super) fn lending_bank(
     let conveyors = conveyed();
     let carrier = Carrier {
         records: conveyor_records as usize,
+        slots: if addressed { EXPERTS } else { 0 },
         lending: lending(lent, bytes, &conveyors),
         pools: conveyors,
     };
@@ -488,7 +497,7 @@ pub(super) fn lending_bank(
                     grids: words(constants::ROUND_GRIDS * 3, 0),
                     rows_groups: 3,
                     columns_groups: 4,
-                    bounds: crate::experts::ListBounds { from: u64::from(staging_records), to: bank_records },
+                    bounds: crate::experts::ListBounds { from: u64::from(staging_records), to: bank_records, lent: 0 },
                 })
             })
         })
@@ -512,6 +521,8 @@ pub(super) fn lending_bank(
                 policy: layer.5.clone(),
                 site: None,
                 stored: (0..3).map(stored_tensor).collect(),
+                slots: addressed.then(|| scratch.iter().map(|slots| Records::new(slots.clone(), RECORD, EXPERTS as u64).unwrap()).collect()),
+                scratch_form: vec![0; 3],
                 landing: device_words[index].clone(),
                 lists: ListRecords {
                     bank: bank_records,
@@ -998,9 +1009,34 @@ impl Harness {
     /// carries gives records (`routed_scratch_grids`). The lists
     /// [`Self::scratch`] returns, one a round with records.
     pub(super) fn rounds(&self, step: &ExpertStep, layer: usize) -> Vec<Vec<(i32, i32)>> {
+        self.rounds_arriving(step, layer, true)
+    }
+
+    /// [`Self::rounds`], each round's experts checked whole where it
+    /// converts them from ([`Self::from_conveyor`]) as it is answered,
+    /// before the device arrives at the next, whose arrival frees them for
+    /// other reads: where records or slots cycle within a request.
+    pub(super) fn rounds_checked(&self, step: &ExpertStep, layer: usize) -> Vec<Vec<(i32, i32)>> {
         let sequence = low_word(step.sequence());
         let (_, lists, _) = &self.load;
-        let converting = self.park(step, layer);
+        let mut rounds = Vec::new();
+        self.park_answering(step, layer, true, |index| {
+            let list = &lists[index as usize];
+            assert_eq!(list.load(constants::LIST_SEQUENCE as usize), sequence);
+            let pairs = listed(list);
+            self.from_conveyor(&pairs);
+            rounds.push(pairs);
+        });
+        rounds
+    }
+
+    /// [`Self::rounds`], the device arriving at the round after the last
+    /// with records only where `after` says; else it arrives there later
+    /// ([`Self::arrive_after`]).
+    pub(super) fn rounds_arriving(&self, step: &ExpertStep, layer: usize, after: bool) -> Vec<Vec<(i32, i32)>> {
+        let sequence = low_word(step.sequence());
+        let (_, lists, _) = &self.load;
+        let converting = self.park_arriving(step, layer, after);
         let pairs = |list: &Words| {
             assert_eq!(list.load(constants::LIST_SEQUENCE as usize), sequence);
             listed(list)
@@ -1020,22 +1056,51 @@ impl Harness {
         scratch.answer_of(sequence, last_round()).expect("every round is answered")
     }
 
-    /// Play the parks of [`Self::rounds`]: the rounds with records.
+    /// Play the parks of [`Self::rounds`]: the rounds with records, then
+    /// the round after them, its slot's next, which its host answered
+    /// before the last (its arrival frees the last round's records).
     pub(super) fn park(&self, step: &ExpertStep, layer: usize) -> usize {
+        self.park_arriving(step, layer, true)
+    }
+
+    /// [`Self::park`], arriving at the round after the last with records
+    /// only where `after` says.
+    fn park_arriving(&self, step: &ExpertStep, layer: usize, after: bool) -> usize {
+        self.park_answering(step, layer, after, |_| {})
+    }
+
+    /// [`Self::park_arriving`], `answered` called with each round with
+    /// records as it is answered, before the device arrives at the next.
+    fn park_answering(&self, step: &ExpertStep, layer: usize, after: bool, mut answered: impl FnMut(u64)) -> usize {
         let (scratch, sequence) = (&self.layers[layer].2, step.sequence());
         let (mut converting, mut index) = (1, 0);
-        while index < converting.max(1) {
+        while index < (converting + u64::from(after)).min(WORDS.rounds) {
             scratch.request(sequence, round(index));
             assert_eq!(until_answered(scratch, sequence, round(index)), Answer::Answered);
             if index == 0 {
                 self.tier_copy(sequence);
                 converting = (scratch.load(sequence, constants::SCRATCH_ASK, constants::SCRATCH_STAGED) as u64)
                     .div_ceil(ROUND_RECORDS);
+                if converting == 0 {
+                    break;
+                }
+            }
+            if index < converting {
+                answered(index);
             }
             index += 1;
         }
         assert_eq!(scratch.answer_of(sequence, last_round()), Some(Answer::Answered));
         converting as usize
+    }
+
+    /// Play the device arriving at round `round` of `step`'s request at
+    /// `layer`, the round after its last with records, which its host
+    /// answered before the last.
+    pub(super) fn arrive_after(&self, step: &ExpertStep, layer: usize, round_index: u64) {
+        let (scratch, sequence) = (&self.layers[layer].2, step.sequence());
+        scratch.request(sequence, round(round_index));
+        assert_eq!(until_answered(scratch, sequence, round(round_index)), Answer::Answered);
     }
 
     /// Play the device's tier copy after `sequence`'s round 0: each
@@ -1094,21 +1159,46 @@ impl Harness {
         byte[0]
     }
 
-    /// Each listed `(record, expert)` converts from a conveyor record
-    /// holding the expert whole; the experts, ascending.
+    /// The first byte of scratch slot `slot` of tensor `kind`.
+    fn slotted(&self, kind: u64, slot: i32) -> u8 {
+        let mut byte = [0u8];
+        unsafe { self.scratch[kind as usize].read_shared(slot as u64 * RECORD, &mut byte) }.unwrap();
+        byte[0]
+    }
+
+    /// Each listed `(from, expert)` converts from a conveyor record or, a
+    /// negative `from`, scratch slot -1 - `from`, holding the expert whole;
+    /// the experts, ascending.
     pub(super) fn from_conveyor(&self, listed: &[(i32, i32)]) -> Vec<i32> {
         let mut experts = listed
             .iter()
             .map(|&(from, expert)| {
-                assert!((0..self.conveyor_records as i32).contains(&from), "expert {expert} converted from record {from}");
+                assert!(from < self.conveyor_records as i32, "expert {expert} converted from record {from}");
                 for kind in 0..3 {
-                    assert_eq!(self.conveyed(kind, from), (100 * kind + expert as u64) as u8, "expert {expert}");
+                    let held = match from {
+                        0.. => self.conveyed(kind, from),
+                        _ => self.slotted(kind, -1 - from),
+                    };
+                    assert_eq!(held, (100 * kind + expert as u64) as u8, "expert {expert} from {from}");
                 }
                 expert
             })
             .collect::<Vec<_>>();
         experts.sort_unstable();
         experts
+    }
+
+    /// The experts of listed `(from, expert)`, ascending.
+    pub(super) fn experts(listed: &[(i32, i32)]) -> Vec<i32> {
+        let mut experts = listed.iter().map(|&(_, expert)| expert).collect::<Vec<_>>();
+        experts.sort_unstable();
+        experts
+    }
+
+    /// Of listed `(from, expert)`, each expert converted from a scratch
+    /// slot, with the slot.
+    pub(super) fn from_slots(listed: &[(i32, i32)]) -> Vec<(i32, i32)> {
+        listed.iter().filter(|&&(from, _)| from < 0).map(|&(from, expert)| (expert, -1 - from)).collect()
     }
 
     /// Play a decode step whose second layer's route requests `expert`, read

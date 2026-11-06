@@ -87,16 +87,23 @@ use magnitude_kernels::{constants, list_extent};
 /// The records a list's entries may name: each entry's from record below
 /// `from` and its to record below `to`, the leading extents of the tensors
 /// its device reader binds (`routed_copy`'s S and D, `routed_convert`'s V
-/// and S, `routed_move`'s D, `routed_seed_commit`'s BANK).
+/// and S, `routed_move`'s D, `routed_seed_commit`'s BANK); or, negative,
+/// one of `lent` slots of the to tensor, -1 - from (`routed_convert`'s
+/// scratch slots the host read stored bytes into; none for another list).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ListBounds {
     pub from: u64,
     pub to: u64,
+    pub lent: u64,
 }
 
 impl ListBounds {
     fn admits(self, from: i32, to: i32) -> bool {
-        u64::try_from(from).is_ok_and(|from| from < self.from) && u64::try_from(to).is_ok_and(|to| to < self.to)
+        let from = match u64::try_from(from) {
+            Ok(from) => from < self.from,
+            Err(_) => u64::try_from(-1 - from).is_ok_and(|slot| slot < self.lent),
+        };
+        from && u64::try_from(to).is_ok_and(|to| to < self.to)
     }
 }
 

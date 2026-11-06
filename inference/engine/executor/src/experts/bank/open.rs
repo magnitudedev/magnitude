@@ -167,8 +167,8 @@ impl ExpertBank {
             .map_err(|error| format!("expert bank allocation failed: {error}"))?;
         // The slots the bank commits, which its watcher's telemetry reads.
         let slots = Arc::new(AtomicU64::new(plan.slots));
-        let (watcher, lines) =
-            watch(plan, &counts, artifact, &layout, &slot_maps, &floor, &pool_of, &conveyors, sites, lines, cpu, slots.clone())?;
+        let (watcher, lines, scratch_tables) =
+            watch(plan, &counts, artifact, &layout, &slot_maps, &floor, &pool_of, &conveyors, &scratch, sites, lines, cpu, slots.clone())?;
         let move_lists = layout
             .groups
             .iter()
@@ -191,6 +191,7 @@ impl ExpertBank {
             slot_maps,
             watcher,
             lines,
+            scratch_tables,
             move_lists,
             commitment: Mutex::new(Commitment {
                 slots,
@@ -230,11 +231,12 @@ fn watch(
     floor: &PlacedAllocations<Tensor>,
     pool_of: &[RecordTensors<usize>],
     conveyors: &[PoolConveyor],
+    scratch: &[RecordTensors<Tensor>],
     sites: &[Option<crate::native::BankSite>],
     lines: std::sync::Arc<[crate::assessment::BankLines]>,
     cpu: &crate::assessment::StoredCpuSite,
     slots: Arc<AtomicU64>,
-) -> Result<(Watcher, std::sync::Arc<[crate::assessment::BankLines]>), String> {
+) -> Result<(Watcher, std::sync::Arc<[crate::assessment::BankLines]>, Vec<ExchangeTable>), String> {
     let words = |tensor: &Tensor, initial| Words::new(tensor.clone(), tensor.byte_len() / 4, initial);
     let binding = plan.binding(0)?;
     // The steps the watcher serves, under whose lock the host writes every
@@ -288,6 +290,10 @@ fn watch(
     let mut bank_maps = Vec::new();
     let mut landing_maps = Vec::new();
     let stacks = plan.stored_stacks(artifact)?;
+    let scratch_forms = plan.layer_scratch_forms();
+    // Where the host addresses the scratch (the one store's on unified
+    // memory, beside the conveyor), its slots carry experts too.
+    let addressed = matches!(plan.conveyor().carrier, ConveyorCarrier::Bank(_));
     for (index, layer) in layout.layers.iter().enumerate() {
         let group = plan.layers[index].group;
         let stored = plan.groups[group]
@@ -312,6 +318,23 @@ fn watch(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let experts = plan.layers[index].experts;
+        let slots = addressed
+            .then(|| {
+                plan.groups[group]
+                    .record
+                    .iter()
+                    .map(|(kind, _)| {
+                        let view = scratch[index].get(kind).ok_or("a scratch view of a tensor the record lacks")?;
+                        let bytes = view.record_placement().ok_or("a scratch slot lies whole in no chunk")?.record();
+                        Records::new(view.clone(), bytes, experts).map_err(|error| format!("the scratch: {error}"))
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?
+            // A layer whose stored expert outgrows its slot lends none.
+            .filter(|slots: &Vec<Records>| stored.iter().zip(slots).all(|(stored, records)| stored.bytes <= records.bytes()));
+        let scratch_form = scratch_forms[index].iter().map(|(_, &form)| form).collect();
         // Every entry unmapped, its one writer the bank's records beside a
         // host tier (`experts::records`), where the host places the one
         // store's host records through their landing map
@@ -339,6 +362,8 @@ fn watch(
             policy: words(&layer.policy, 0)?,
             site: site_layers.iter().find(|site| site.layer() == index).map(|site| site.slots().clone()),
             stored,
+            slots,
+            scratch_form,
             landing: layer
                 .landing
                 .grids
@@ -351,7 +376,7 @@ fn watch(
                         grids: words(grids, 0)?,
                         rows_groups: groups(binding.record.up.matrix[0])?,
                         columns_groups: groups(binding.record.down.matrix[0])?,
-                        bounds: crate::experts::ListBounds { from: binding.staging, to: binding.records },
+                        bounds: crate::experts::ListBounds { from: binding.staging, to: binding.records, lent: 0 },
                     }))
                 })
                 .transpose()?,
@@ -437,6 +462,11 @@ fn watch(
         .transpose()?;
     let carrier = Carrier {
         records: usize::try_from(conveyor.conveyor.records).map_err(|_| "conveyor records exceed the host")?,
+        slots: if addressed {
+            usize::try_from(plan.layers.iter().map(|layer| layer.experts).max().unwrap_or(0)).map_err(|_| "scratch slots exceed the host")?
+        } else {
+            0
+        },
         lending: lending(&conveyor.carrier.lender())?,
         pools: staging_pools
             .iter()
@@ -499,6 +529,7 @@ fn watch(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let compute = super::HostCompute::serving(site_layers, &threads)?;
+    let tables = watched.iter().map(|layer| layer.scratch.clone()).collect();
     Watcher::start(WatcherParts {
         layers: watched,
         group_reads,
@@ -536,5 +567,5 @@ fn watch(
         steps,
         spans: device.backend().times_spans() && device.backend().parks_in_kernels(),
     })
-    .map(|watcher| (watcher, lines))
+    .map(|watcher| (watcher, lines, tables))
 }

@@ -381,6 +381,66 @@ fn a_wavefront_reads_the_next_layers_experts_as_their_records_free() {
     }
 }
 
+/// A round's records free as the device arrives at the round after, the
+/// last round's too: the step a layer serves last leaves its records to the
+/// next layer's reads before the device reaches that layer's rounds. Step
+/// 0's front at layer 1 proves the device past step 0 at layer 0, not
+/// past step 1 there; a conveyor of one round's records reads layer 1's
+/// experts 4 and 5 only once step 1's records free.
+#[test]
+fn a_last_rounds_records_free_as_the_device_arrives_after_it() {
+    let harness = lending("last-round", EXPERTS, 12, 2, STAGING, Conveying::of(ROUND_RECORDS), TIER, Placer::Tier, false);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
+    harness.publish(&steps[0], 0, &[0, 1]);
+    harness.publish(&steps[1], 0, &[2, 3]);
+    assert_eq!(harness.from_conveyor(&harness.rounds(&steps[0], 0).concat()), [0, 1]);
+    assert_eq!(harness.from_conveyor(&harness.rounds(&steps[1], 0).concat()), [2, 3]);
+    harness.publish(&steps[0], 1, &[4, 5]);
+    harness.conveying(4);
+    harness.conveying(5);
+    assert_eq!(harness.from_conveyor(&harness.rounds(&steps[0], 1).concat()), [4, 5]);
+    harness.scratch(&steps[1], 1, &[4, 5]);
+    for step in steps {
+        step.complete().unwrap();
+    }
+}
+
+/// A round's records free at whichever proof of its converts comes first,
+/// once: the device's arrival at the round after, or its progress past the
+/// step (its next step's round 0). In either order, until one comes, no
+/// read takes a record a convert may still read; then the next step's
+/// experts are read into them, and the later proof frees nothing again. A
+/// conveyor of one round's records: step 1's experts 2 and 3 wait on step
+/// 0's records.
+#[test]
+fn a_rounds_records_free_once_whichever_proof_of_its_converts_comes_first() {
+    for arrival_first in [true, false] {
+        let name = if arrival_first { "arrival-first" } else { "progress-first" };
+        let harness = lending(name, EXPERTS, 12, 1, STAGING, Conveying::of(ROUND_RECORDS), TIER, Placer::Tier, false);
+        let steps = harness.group(&[StepRoute::Grouped; 2]);
+        harness.publish(&steps[0], 0, &[0, 1]);
+        harness.publish(&steps[1], 0, &[2, 3]);
+        assert_eq!(harness.from_conveyor(&harness.rounds_arriving(&steps[0], 0, false).concat()), [0, 1]);
+        // The device has neither arrived after step 0's round nor passed
+        // the step: its records still hold what the convert reads.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!((harness.holding(2), harness.holding(3)), (None, None), "{name}: a record freed before its convert was proven done");
+        assert_eq!((harness.holding(0).is_some(), harness.holding(1).is_some()), (true, true), "{name}: step 0's records overwritten");
+        if arrival_first {
+            harness.arrive_after(&steps[0], 0, 1);
+            harness.conveying(2);
+            harness.conveying(3);
+            assert_eq!(harness.from_conveyor(&harness.rounds(&steps[1], 0).concat()), [2, 3]);
+        } else {
+            assert_eq!(harness.from_conveyor(&harness.rounds(&steps[1], 0).concat()), [2, 3]);
+            harness.arrive_after(&steps[0], 0, 1);
+        }
+        for step in steps {
+            step.complete().unwrap();
+        }
+    }
+}
+
 /// A group's last step lists its seeds at every layer: the most recently
 /// routed experts (then the higher expert, as placement ranks a tie),
 /// into free records; a step before it lists none, so its seed list
@@ -776,7 +836,7 @@ fn the_one_stores_conveyor_reads_the_next_layer_ahead_of_its_rounds() {
 /// there arrives, though layer 0's round still holds its records.
 #[test]
 fn the_one_stores_two_round_conveyor_reads_the_next_layer_ahead() {
-    let conveying = Conveying { conveyed: 2 * ROUND_RECORDS, lent: 2 * ROUND_RECORDS as usize, bytes: RECORD };
+    let conveying = Conveying::of(2 * ROUND_RECORDS);
     let harness = lending("ahead-rounds", EXPERTS, 2 * EXPERTS as u64, 2, STAGING, conveying, 2 * EXPERTS as u32, Placer::Bank, false);
     let steps = harness.group(&[StepRoute::Grouped; 2]);
     harness.publish(&steps[0], 0, &[0, 1]);
@@ -844,7 +904,7 @@ fn conveys_the_next_layer_ahead(harness: &Harness) {
 /// again.
 #[test]
 fn a_group_claims_its_lent_records_and_returns_them_empty() {
-    let conveying = Conveying { conveyed: 4, lent: 4, bytes: RECORD };
+    let conveying = Conveying::of(4);
     let harness = lending("lender", EXPERTS, 12, 1, STAGING, conveying, 0, Placer::Tier, false);
     harness.request(&[0, 1]).complete().unwrap();
     // Residency maps a landing into the tier as it learns it, which may
@@ -869,7 +929,7 @@ fn a_group_claims_its_lent_records_and_returns_them_empty() {
 /// the store still keeps every expert, none read from storage again.
 #[test]
 fn a_whole_banks_prompt_group_reads_nothing_and_claims_no_lent_record() {
-    let conveying = Conveying { conveyed: 4, lent: 4, bytes: RECORD };
+    let conveying = Conveying::of(4);
     let harness = lending_bank("whole-store", EXPERTS, 2 * EXPERTS as u64, 2, STAGING, conveying, 2 * EXPERTS as u32, Placer::Bank, false, 0, true);
     let whole = (0..2).all(|layer| harness.layers[layer].5.load(constants::POLICY_WHOLE as usize) == 1);
     assert!(whole, "a bank imported whole into the one store is whole");

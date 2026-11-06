@@ -40,20 +40,21 @@ pub fn source_words(records: &[i32], sites: &[i32]) -> Vec<i32> {
 }
 
 // Each kind's payload begins at SLOT_PAYLOAD with its count (the scratch
-// kind's, SCRATCH_STAGED), and a scratch lane is SCRATCH_SLOT words: the
-// slot's words and its payload, even.
+// kind's, SCRATCH_STAGED, then SCRATCH_FOLLOWED), and a scratch lane is
+// SCRATCH_SLOT words: the slot's words and its payload, even.
 const _: () = {
     assert!(constants::SITE_COUNT == constants::SLOT_PAYLOAD, "a site request's count is its payload's first word");
     assert!(constants::FILE_COUNT == constants::SLOT_PAYLOAD, "a file request's count is its payload's first word");
     assert!(constants::SCRATCH_STAGED == constants::SLOT_PAYLOAD, "a scratch answer's count is its payload's first word");
+    assert!(constants::SCRATCH_FOLLOWED == constants::SCRATCH_STAGED + 1, "a scratch request's fill order follows its count");
     assert!(
         (constants::SLOT_PAYLOAD + SCRATCH_PAYLOAD).next_multiple_of(2) == constants::SCRATCH_SLOT,
         "a scratch lane is SCRATCH_SLOT words"
     );
 };
 
-/// A scratch lane's payload: SCRATCH_STAGED.
-const SCRATCH_PAYLOAD: u64 = constants::SCRATCH_STAGED + 1 - constants::SLOT_PAYLOAD;
+/// A scratch lane's payload: SCRATCH_STAGED and SCRATCH_FOLLOWED.
+const SCRATCH_PAYLOAD: u64 = constants::SCRATCH_FOLLOWED + 1 - constants::SLOT_PAYLOAD;
 
 /// The layout of one table of the exchange (streaming_words.seismic's
 /// SLOT_*), the one statement of it the host and every graph read: `slots`

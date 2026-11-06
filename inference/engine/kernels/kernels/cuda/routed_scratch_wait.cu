@@ -1,9 +1,10 @@
 // Expert streaming, one round of a scratch fill (`routed_scratch_wait` in
 // routed.seismic); the CUDA form of `metal/routed_scratch_wait.metal`, the
 // body of one block of its written park grid (`_block`, one block while the
-// round has records to convert, none otherwise): thread 0 requests the
-// round's lane of the step's slot of the layer's scratch table, then spins
-// until it is answered (streaming/round.hpp).
+// round, or unfollowed the round before, has records to convert, none
+// otherwise): thread 0 requests the round's lane of the step's slot of the
+// layer's scratch table, then spins until it is answered
+// (streaming/round.hpp).
 
 #include "lib/streaming/control.cuh"
 #include "../streaming/round.hpp"

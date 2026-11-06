@@ -177,7 +177,7 @@ native routed_scratch_request for vulkan from "vulkan/routed_scratch_request.com
         shared_bytes (4 * E)
 
 # A round parks on its written grid (`routed_scratch_grids`): one workgroup
-# while it has records to convert.
+# while it, or unfollowed the round before, has records to convert.
 native routed_scratch_wait for vulkan from "vulkan/routed_scratch_wait.comp":
     launch routed_scratch_wait:
         threadgroups (1, 1, 1)

@@ -165,6 +165,37 @@ impl Tier {
     }
 }
 
+/// A request's cold experts, `cold` in the order they are ready, composed
+/// into rounds of `round_records` in that order, but that an expert whose
+/// slot carries another of them (`borrowers`, by `cold`'s place:
+/// `Scratch::lendable_slot`) goes in a round after that borrower's, which
+/// converts it out of the slot first. Only where a round cannot be filled
+/// otherwise does such an expert join its borrower's round, whose answer
+/// then has the borrower yield the slot (`Scratch::reclaim_slots`).
+fn compose_rounds(cold: &[usize], borrowers: &[Option<usize>], round_records: usize) -> Vec<usize> {
+    let mut placed = vec![false; cold.iter().max().map_or(0, |&expert| expert + 1)];
+    let mut composed = Vec::with_capacity(cold.len());
+    let mut rest = cold.iter().copied().zip(borrowers.iter().copied()).collect::<Vec<_>>();
+    while !rest.is_empty() {
+        let size = round_records.min(rest.len());
+        let (mut round, mut blocked) = (Vec::with_capacity(size), Vec::new());
+        for &(expert, borrower) in &rest {
+            match borrower.is_none_or(|other| placed[other]) {
+                true if round.len() < size => round.push(expert),
+                true => {}
+                false => blocked.push(expert),
+            }
+        }
+        round.extend(blocked.iter().take(size - round.len()));
+        for &expert in &round {
+            placed[expert] = true;
+        }
+        rest.retain(|&(expert, _)| !placed[expert]);
+        composed.extend(round);
+    }
+    composed
+}
+
 /// `items` by `rank`, each ranked once. The ranking is shared and its feed moves it as this reads
 /// it, so a key read at each comparison would make no consistent order, which a sort panics on.
 fn ranked_once<T, K: Ord>(items: &mut [T], rank: impl FnMut(&T) -> K) {
@@ -313,8 +344,7 @@ struct Opened {
 /// A request's rounds ([`RequestStage::Rounds`]): its cold experts read from the
 /// file, a round's records at a time; those the host tier keeps whole,
 /// which the tier copy after round 0 reads; the round served now, since
-/// `waited`; the rounds listed whose records free as the device passes
-/// them; and what it counts.
+/// `waited`; and what it counts.
 struct Rounds {
     hits: Vec<(usize, usize)>,
     cold: Vec<usize>,
@@ -322,7 +352,6 @@ struct Rounds {
     rounds: u64,
     round: u64,
     waited: Instant,
-    converting: Vec<(u64, Vec<Listed>)>,
     served: RequestCost,
     took: GroupLayer,
     seeded: u64,
@@ -664,8 +693,10 @@ impl Scratch {
     /// Carry every tier's cold experts as far as records allow, in the
     /// device's order (the `Conveyor`'s rule): by tier, then by the step
     /// that reads each expert, then by the round that lists it
-    /// (`Tier::order`). Settle the reads that ended, landing each into the
-    /// host tier where there is one (`Self::land_conveyed`); and read each
+    /// (`Tier::order`). Free the records of the rounds the device has
+    /// converted (`Core::take_converted`); settle the reads that ended,
+    /// landing each into the host tier where there is one
+    /// (`Self::land_conveyed`); and read each
     /// deferred expert into a free conveyor record of its form whose lent
     /// records it may claim. An expert takes a record only while those free exceed
     /// what the experts before it in that order still lack, so no record
@@ -678,22 +709,30 @@ impl Scratch {
     /// with why, and stays its tier's (`Tier::failed`) until a later step
     /// takes it over. Deferred experts the host tier keeps whole take no
     /// record: the fill copies them from the tier in place. Whether a read
-    /// or landing it settled had ended: completed progress.
+    /// or landing it settled had ended, or a round's records freed as the
+    /// device converted them: completed progress.
     pub(super) fn convey(&mut self, core: &mut Core, shared: &Shared) -> bool {
         // A group past carries nothing more: what of it runs ends, and the
         // conveyor clears (`Self::clear_past`).
         if !self.conveyor.serving.is_some_and(|serving| !serving.past) {
             return false;
         }
+        // The records of the rounds the device has converted free first.
+        let converted = core.take_converted();
+        let freed = !converted.is_empty();
+        for listed in converted {
+            listed.release(&mut self.conveyor);
+        }
         let settled = self.conveyor.settle(|ticket| ticket.wait_until(Instant::now()));
         for &(layer, ..) in &settled.landed {
             self.mark(shared, layer, Mark::Landed);
         }
         let landed = self.settle_landings(core);
-        let ended = settled.ended + landed > 0;
+        let ended = freed || settled.ended + landed > 0;
         self.land_conveyed(core, shared, settled.landed);
         let mut failed = settled.failed;
         self.claim_lent(core);
+        let window = core.source.window();
         for index in 0..self.tiers.len() {
             let layer = self.tiers[index].layer;
             // What the earlier tiers of the layer's form still lack: their
@@ -726,21 +765,35 @@ impl Scratch {
                     kept.push(expert);
                     continue;
                 }
-                let mut records = free_conveyor(&self.conveyor, core);
-                if records.is_empty() && lack_read == 0 {
-                    let holds = |state: &State| matches!(*state, State::Held { record } if admits(&self.conveyor, core, record));
-                    if let Some((at, other)) = self.latest_after(index, expert, holds) {
-                        self.yield_record(at, other);
-                        records = free_conveyor(&self.conveyor, core);
+                // A scratch slot no step uses before the expert's round
+                // converts it carries it first, at no conveyor record, while
+                // the drive lacks a window of work: past that a read only
+                // queues, ahead of whatever the device turns out to need
+                // sooner.
+                let short_of_work = self.conveyor.reads_in_flight() as u64 * core.layers[layer].expert_bytes() < window;
+                let lent = if short_of_work { self.lendable_slot(core, index, expert) } else { None };
+                let record = match lent {
+                    Some(slot) => self.conveyor.slot_record(slot),
+                    None => {
+                        let mut records = free_conveyor(&self.conveyor, core);
+                        if records.is_empty() && lack_read == 0 {
+                            let holds = |state: &State| {
+                                matches!(*state, State::Held { record } if self.conveyor.slot_of(record).is_none() && admits(&self.conveyor, core, record))
+                            };
+                            if let Some((at, other)) = self.latest_after(index, expert, holds) {
+                                self.yield_record(at, other);
+                                records = free_conveyor(&self.conveyor, core);
+                            }
+                        }
+                        let Some(&record) = records.get(lack_read) else {
+                            blocked = true;
+                            kept.push(expert);
+                            continue;
+                        };
+                        record
                     }
-                }
-                let Some(&record) = records.get(lack_read) else {
-                    blocked = true;
-                    kept.push(expert);
-                    continue;
                 };
-                let pools = self.conveyor.pools();
-                let reads = core.reads_into(layer, expert, |pool| (&pools[pool], u64::from(record)));
+                let reads = core.reads_to(layer, expert, &self.conveyor, record);
                 match core.source.submit(reads, Priority::Demand) {
                     Ok(ticket) => {
                         // Its end is an event: a round may await it.
@@ -767,6 +820,96 @@ impl Scratch {
             }
         }
         ended
+    }
+
+    /// The scratch slot that may carry deferred expert `expert` of tier
+    /// `index` until its round converts it out, if one may: where the host
+    /// addresses the scratch, once the group holds it, a slot no expert
+    /// carries that nothing writes or reads before that round.
+    /// - The layers before this one still served must lay their slots in
+    ///   its bytes (one scratch form) and have every step's request taken,
+    ///   so their use is known: a slot of one of their cold experts is
+    ///   converted into and read by their passes until the device is past
+    ///   their layer.
+    /// - This layer converts into a slot only in its own expert's round,
+    ///   where that expert is cold, which must follow the borrower's: a
+    ///   later step's does; of the borrower's own step, a later round once
+    ///   the rounds are fixed, or, before, the round [`compose_rounds`]
+    ///   gives an expert no record carries yet, after its slot's borrower.
+    ///   That last is taken only where no slot is free outright, for a step
+    ///   of more than one round, and by a borrower whose own slot no expert
+    ///   of its step borrows, so composing binds one way only.
+    /// - A later layer converts only after this layer's pass.
+    ///
+    /// [`Self::reclaim_slots`] holds a round whose slot's borrower could not
+    /// be ordered first.
+    fn lendable_slot(&self, core: &Core, index: usize, expert: usize) -> Option<usize> {
+        let tier = &self.tiers[index];
+        let reader = tier.reader[expert]?;
+        let serving = self.conveyor.serving?;
+        if core.layers[tier.layer].slots.is_none() || !self.scratch_claimed(core) {
+            return None;
+        }
+        let steps = (serving.last - serving.group + 1) as usize;
+        let form = &core.layers[tier.layer].scratch_form;
+        let before = || self.tiers.iter().filter(|other| (other.group, other.layer) < (tier.group, tier.layer));
+        if before().any(|other| other.taken < steps || core.layers[other.layer].scratch_form != *form) {
+            return None;
+        }
+        let read_before = |slot: usize| {
+            before().any(|other| other.scratch.get(slot).is_some_and(|&held| held) || other.reader.get(slot).is_some_and(Option::is_some))
+        };
+        // Whether its rounds may still be composed to put its slot's
+        // expert after it: they are not yet fixed, they are more than one,
+        // and no expert of them borrows its own slot (so none is both a
+        // borrower and a slot's expert, and composing binds only one way).
+        let composable = tier.round[expert].is_none()
+            && tier.reader.iter().filter(|&&other| other == Some(reader)).count() > core.extents.round_records
+            && !self.conveyor.borrower(expert).is_some_and(|(layer, other)| layer == tier.layer && tier.reader[other] == Some(reader));
+        // Whether this layer converts into `slot` only after the expert's
+        // round: outright, or once its rounds are composed (the slot taken
+        // only where none is free outright).
+        let after = |slot: usize| match (tier.reader[slot], tier.round[slot]) {
+            _ if slot == expert => None,
+            (None, _) => (!tier.scratch[slot]).then_some(false),
+            (Some(step), _) if step != reader => (step > reader).then_some(false),
+            (Some(_), Some(round)) => tier.round[expert].is_some_and(|own| own < round).then_some(false),
+            (Some(_), None) => (composable && self.conveyor.state(tier.layer, slot).is_none()).then_some(true),
+        };
+        (0..core.layers[tier.layer].experts.min(self.conveyor.slots()))
+            .filter(|&slot| self.conveyor.borrower(slot).is_none() && !read_before(slot))
+            .filter_map(|slot| Some((after(slot)?, slot)))
+            .min()
+            .map(|(_, slot)| slot)
+    }
+
+    /// Whether round experts `chunk` of `layer` may be converted into their
+    /// slots now: none's slot carries stored bytes a convert after it would
+    /// read. A slot an expert listed already carries is read by a round the
+    /// device runs before (a layer's rounds are answered in device order);
+    /// one an expert holds unlisted yields it (it is read again elsewhere);
+    /// one being read holds the round until its read ends. A slot is lent
+    /// and its rounds composed to need none of this
+    /// ([`Self::lendable_slot`], [`compose_rounds`]), but for a round
+    /// that could not be filled otherwise, or a failed step's experts moved
+    /// to later steps.
+    fn reclaim_slots(&mut self, chunk: &[usize]) -> bool {
+        let mut free = true;
+        for &slot in chunk {
+            let Some((layer, expert)) = self.conveyor.borrower(slot) else {
+                continue;
+            };
+            match self.conveyor.state(layer, expert) {
+                Some(State::Listed { .. }) => {}
+                Some(State::Held { .. }) => {
+                    let index = self.tiers.iter().position(|tier| tier.layer == layer).expect("a carried expert's tier");
+                    self.yield_record(index, expert);
+                }
+                Some(State::Reading { .. }) => free = false,
+                None => unreachable!("scratch slot {slot} carries expert {expert} of layer {layer}, which the conveyor does not"),
+            }
+        }
+        free
     }
 
     /// Whether deferred expert `expert` of `tier` comes from the host tier,
@@ -1081,15 +1224,19 @@ impl Scratch {
         // Those the host tier keeps whole, each its tier record held until
         // the device is past the group, which the tier copy after round 0
         // reads into its scratch slot; the rest the rounds convert, every one
-        // on the one store ([`copies_from_tier`]).
+        // on the one store ([`copies_from_tier`]). One whose slot carries a
+        // borrower's stored bytes is converted by a round, which
+        // `compose_rounds` puts after the borrower's (or `Self::reclaim_slots`
+        // holds), as the copy would overwrite them.
         let mut tiered = Vec::new();
         let mut listed = Vec::new();
         let mut cold = cold
             .into_iter()
             .filter(|&expert| {
-                let record = (copies_from_tier(core) && self.conveyor.state(layer, expert).is_none())
-                    .then(|| core.directory.hold_tier(layer, expert))
-                    .flatten();
+                let copied = copies_from_tier(core)
+                    && self.conveyor.state(layer, expert).is_none()
+                    && self.conveyor.borrower(expert).is_none();
+                let record = copied.then(|| core.directory.hold_tier(layer, expert)).flatten();
                 if let Some(record) = record {
                     tiered.push(expert);
                     listed.push((record.0 as i32, scratch(&self.tiers[index], expert) as i32));
@@ -1099,6 +1246,14 @@ impl Scratch {
             })
             .collect::<Vec<_>>();
         cold.sort_by_cached_key(|&expert| readiness(self.conveyor.state(layer, expert)));
+        let borrowers = cold
+            .iter()
+            .map(|&expert| match self.conveyor.borrower(expert) {
+                Some((of, other)) if of == layer && cold.contains(&other) => Some(other),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let cold = compose_rounds(&cold, &borrowers, round_records);
         let rounds = cold.len().div_ceil(round_records) as u64;
         // Beside a host tier the group's last step seeds its bank group with
         // what the group routed here, the most reused of it and of what the
@@ -1143,7 +1298,7 @@ impl Scratch {
                     (expert as i32, i32::try_from(named).expect("bank records fit i32"))
                 })
                 .collect::<Vec<_>>();
-            let seeds = ListBounds { from: core.layers[layer].experts as u64, to: core.layers[layer].lists.bank - first as u64 };
+            let seeds = ListBounds { from: core.layers[layer].experts as u64, to: core.layers[layer].lists.bank - first as u64, lent: 0 };
             self.words.seeds.publish_list(sequence, &pairs, seeds);
             seeded = pairs.len() as u64;
         }
@@ -1157,7 +1312,7 @@ impl Scratch {
         }
         // The tier list, which the tier copy reads after round 0's answer.
         self.tiers[index].deferred.retain(|expert| !tiered.contains(expert));
-        let tier = ListBounds { from: core.layers[layer].lists.tier, to: core.layers[layer].experts as u64 };
+        let tier = ListBounds { from: core.layers[layer].lists.tier, to: core.layers[layer].experts as u64, lent: 0 };
         self.words.tiered.publish_list(sequence, &listed, tier);
         // The request's answer: the count its rounds convert, final now,
         // before round 0's.
@@ -1171,7 +1326,6 @@ impl Scratch {
             rounds,
             round: 0,
             waited: Instant::now(),
-            converting: Vec::new(),
             served: RequestCost::default(),
             took: GroupLayer::default(),
             seeded,
@@ -1201,20 +1355,15 @@ impl Scratch {
         while rounds.failure.is_none() && rounds.round < rounds.rounds {
             let round = rounds.round;
             let chunk = rounds.cold.chunks(round_records).nth(round as usize).unwrap_or_default().to_vec();
-            let (past, still): (Vec<_>, Vec<_>) = std::mem::take(&mut rounds.converting)
-                .into_iter()
-                .partition(|(converted, _)| table.requested(sequence, round_lane(converted + 1)));
-            rounds.converting = still;
-            for listed in past.into_iter().flat_map(|(_, records)| records) {
-                listed.release(&mut self.conveyor);
-            }
-            // Reads into staging that ended free their records too.
+            // Reads into staging that ended free their records, as the
+            // rounds the device has converted free theirs (`convey`).
             prefetch.settle(&mut core.directory);
             self.convey(core, shared);
             let tier = self.tiers.iter().find(|tier| (tier.group, tier.layer) == (group, layer)).expect("a served request's tier");
-            if let Some((_, reason)) = tier.failed.iter().find(|(expert, _)| chunk.contains(expert)) {
-                rounds.failure = Some(reason.clone());
-            } else if !chunk.iter().all(|&expert| self.conveyor.whole(layer, expert)) {
+            let failed = tier.failed.iter().find(|(expert, _)| chunk.contains(expert)).map(|(_, reason)| reason.clone());
+            if let Some(reason) = failed {
+                rounds.failure = Some(reason);
+            } else if !self.reclaim_slots(&chunk) || !chunk.iter().all(|&expert| self.conveyor.whole(layer, expert)) {
                 // A step that ended without the device arriving (a device
                 // error) leaves nothing to arrive.
                 if !shared.steps.ended(sequence) {
@@ -1232,10 +1381,22 @@ impl Scratch {
             assert!(chunk.iter().all(|&expert| tier.scratch[expert]), "a listed expert holds its scratch slot");
             let pairs = chunk
                 .iter()
-                .map(|&expert| (self.conveyor.list(layer, expert) as i32, expert as i32))
+                .map(|&expert| {
+                    let record = self.conveyor.list(layer, expert);
+                    (self.conveyor.listed_from(record), expert as i32)
+                })
                 .collect::<Vec<_>>();
-            rounds.converting.push((round, chunk.iter().map(|&expert| Listed { layer, expert }).collect()));
-            let conveyed = ListBounds { from: core.layers[layer].lists.conveyor, to: core.layers[layer].experts as u64 };
+            // Its records free as the device arrives at the round after
+            // (parked there by `routed_scratch_grids`), whose lane its
+            // slot has unless this is the slot's last.
+            core.taken.push(Taken {
+                records: chunk.iter().map(|&expert| Listed { layer, expert }).collect(),
+                until: at.point,
+                after: (round + 1 < core.extents.words.rounds).then(|| round_lane(round + 1)),
+            });
+            let experts = core.layers[layer].experts as u64;
+            let lent = if core.layers[layer].slots.is_some() { experts } else { 0 };
+            let conveyed = ListBounds { from: core.layers[layer].lists.conveyor, to: experts, lent };
             self.words.lists[round as usize].publish_list(sequence, &pairs, conveyed);
             rounds.served.misses += chunk.len() as u64;
             // A prompt group's experts are its own reads, none a hint's.
@@ -1253,14 +1414,13 @@ impl Scratch {
     }
 
     /// The rounds of the request `at` its point from chain place `place`,
-    /// arrived at `arrived`, of tier `index`, are over: count it, keep the
-    /// records its rounds listed until the device is past its layer, and
-    /// answer its last round, or fail it.
+    /// arrived at `arrived`, of tier `index`, are over: count it and answer
+    /// its last round, or fail it.
     #[allow(clippy::too_many_arguments)]
     fn finish(&mut self, at: At, place: usize, arrived: Instant, index: usize, rounds: Rounds, core: &mut Core, shared: &Shared) {
         let point = at.point;
         let Point { layer, sequence, .. } = point;
-        let Rounds { hits, cold, tiered, rounds, converting, mut served, mut took, seeded, failure, .. } = rounds;
+        let Rounds { hits, cold, tiered, rounds, mut served, mut took, seeded, failure, .. } = rounds;
         let last_round = rounds.max(1) - 1;
         let expert_bytes = core.layers[layer].expert_bytes();
         // The misses the fill copies from the host tier, served as a decode
@@ -1271,13 +1431,6 @@ impl Scratch {
             served.bytes += tiered.len() as u64 * expert_bytes;
             took.pulled += tiered.len() as u64;
         }
-        // The device may read what it has not passed until it is past the
-        // layer.
-        core.taken
-            .extend(converting.into_iter().map(|(_, records)| Taken {
-                records,
-                until: point,
-            }));
         served.parked = arrived.elapsed();
         took.parked = served.parked;
         shared.telemetry.serve(layer, sequence, served);
@@ -1300,7 +1453,9 @@ impl Scratch {
                 // The rounds past the last with records are answered before
                 // it (its answer releases the device to complete the step):
                 // where kernels wait in place they do not wait (their park
-                // grid is empty, `routed_scratch_grids`) but after a round
+                // grid is empty, `routed_scratch_grids`, but for the round
+                // after the last, which an unfollowed fill parks at, its
+                // arrival freeing the last round's records) but after a round
                 // 0 whose wait expired, whose step's every round parks and
                 // so finds its answer, and where a park
                 // is a submission boundary (`Parks`) each still waits for
@@ -1385,7 +1540,26 @@ impl Request {
 
 #[cfg(test)]
 mod tests {
-    use super::ranked_once;
+    use super::{compose_rounds, ranked_once};
+
+    /// A slot's expert converts in a round after its borrower's, which
+    /// converts the borrower out of it, the rest in the order they are
+    /// ready; where no other expert fills a round, it joins its
+    /// borrower's.
+    #[test]
+    fn a_slots_expert_converts_after_its_borrower() {
+        // Expert 3 borrows 1's slot, 5 borrows 0's: 1 and 0 wait a round.
+        let cold = [1, 3, 0, 5, 2, 4];
+        let borrowers = [Some(3), None, Some(5), None, None, None];
+        assert_eq!(compose_rounds(&cold, &borrowers, 2), [3, 5, 1, 0, 2, 4]);
+        // One round: the slot's expert joins its borrower's.
+        assert_eq!(compose_rounds(&[1, 3], &[Some(3), None], 2), [3, 1]);
+        // Another expert fills round 0: 1 waits for round 1.
+        assert_eq!(compose_rounds(&[1, 3, 0], &[Some(3), None, None], 2), [3, 0, 1]);
+        // Its borrower ready last, in the last full round, which nothing
+        // else fills: 1 joins it.
+        assert_eq!(compose_rounds(&[2, 4, 3, 1], &[None, None, None, Some(3)], 2), [2, 4, 3, 1]);
+    }
 
     /// A ranking moving under a sort orders what was read of it, whatever it reads next.
     #[test]

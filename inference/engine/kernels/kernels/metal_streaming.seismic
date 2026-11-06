@@ -175,9 +175,11 @@ native routed_scratch_request for metal from "metal/routed_scratch_request.metal
         unless (resident)
         threads_per_threadgroup (REQUEST_THREADS, 1, 1)
 
-# A round parks only while it has records to convert: round 0 always (hit
-# against cold is final only as the request is served), a later round on its
-# park grid (`routed_scratch_grids`), as its converts convert only on theirs.
+# A round parks only while it, or unfollowed the round before, has records
+# to convert:
+# round 0 always (hit against cold is final only as the request is served),
+# a later round on its park grid (`routed_scratch_grids`), as its converts
+# convert only on theirs.
 native routed_scratch_wait for metal from "metal/routed_scratch_wait.metal":
     launch routed_scratch_wait:
         threadgroups (1, 1, 1)

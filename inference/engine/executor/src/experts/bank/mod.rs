@@ -126,6 +126,9 @@ pub(crate) struct ExpertBank {
     /// (`BankPart::SlotMap`).
     slot_maps: Vec<Tensor>,
     watcher: Watcher,
+    /// Each streamed layer's scratch table as the host addresses it, which
+    /// a step's fill is marked followed in ([`Self::fill_followed`]).
+    scratch_tables: Vec<super::exchange::ExchangeTable>,
     /// Each streamed layer's lines as the load measured them
     /// (`assessment::BankLines::of_bank`), each sited layer's CPU lines and
     /// each layer's landing line among them where the bank measured them.
@@ -492,6 +495,18 @@ impl ExpertBank {
             };
             place_words(&self.plan, index, part, tensor, instance as u64)
         })
+    }
+
+    /// Step `sequence`'s fill of streamed layer `layer` is directly followed
+    /// on the device's queue by a sibling fill (`followed`), which waits on
+    /// nothing queued after it: that fill's arrival proves this one's
+    /// converts done as soon as an arrival after its last round would, so
+    /// its round after the last parks only where it is not
+    /// (`routed_scratch_grids`). Stored before the fill is queued, while
+    /// the step owns its slot (a slot's last step ended before this one
+    /// began); the device reads it after round 0's answer.
+    pub(crate) fn fill_followed(&self, sequence: u64, layer: usize, followed: bool) {
+        self.scratch_tables[layer].store(sequence, magnitude_kernels::constants::SCRATCH_ASK, magnitude_kernels::constants::SCRATCH_FOLLOWED, i32::from(followed));
     }
 
     /// The streamed entries' parks, which each run binds and registers with

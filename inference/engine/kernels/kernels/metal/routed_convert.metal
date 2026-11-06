@@ -1,7 +1,10 @@
 // Expert streaming, a scratch round's stored records (`routed_convert`
 // in routed.seismic): when the list's sequence is this step's, entry i below
-// its count converts conveyor record `from` (below V) into scratch slot `to`
-// (below S) by windows (lib/streaming/window.h), `repack_weight`'s
+// its count converts conveyor record `from` (below V), or, for a negative
+// `from`, the stored bytes the host read into scratch slot -1 - from (a slot
+// no pass reads, read through the same coherent pointer as a conveyor
+// record), into scratch slot `to` (below S) by windows
+// (lib/streaming/window.h), `repack_weight`'s
 // conversion. The conveyor and the destination are record ports (views of
 // lent records, the destination the scratch lender's), each record read or
 // written at its own base. Threadgroups stride over the listed records'
@@ -37,7 +40,9 @@ kernel void routed_convert(
         streaming_list_pair(list, stride, at, per_record, entries, words, tid, shape.x);
         const int from = streaming_list_from(words), to = streaming_list_to(words);
         const ulong item = at % per_record;
-        streaming::convert_item<ConveyorBinding>(streaming::source_record(conveyor, ulong(from)),
+        STAGED *source = from >= 0 ? streaming::source_record(conveyor, ulong(from))
+                                   : streaming::source_record(destination, ulong(-1 - from));
+        streaming::convert_item<ConveyorBinding>(source,
                 slab::region<uchar>(destination, ulong(to)),
                 seismic_words, item, window, tid, 32 * simdgroups, simd, simdgroups, lane);
     }

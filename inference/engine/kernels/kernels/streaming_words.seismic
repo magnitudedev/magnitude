@@ -245,7 +245,11 @@ const DECODE_GRIDS = 1
 # - lane SCRATCH_ASK, the request (`routed_scratch_request`, its experts in
 #   its chain place's flags). The answer's payload, the count of records its
 #   rounds convert (SCRATCH_STAGED), is the host's before it answers round
-#   0; its answer is the step once that count is final.
+#   0; its answer is the step once that count is final. SCRATCH_FOLLOWED,
+#   which the host stores before it queues the step's fill, is nonzero
+#   where the next launch on the fill's queue is a sibling fill, whose
+#   arrival proves this fill's converts done as an arrival after its last
+#   round would (`routed_scratch_grids`).
 # - lane SCRATCH_ROUND + r, round r's (`routed_scratch_wait`): its request
 #   is the device's arrival at the round, which its wait stores as it
 #   begins; its answer, the round's records ready to convert. The host
@@ -259,6 +263,7 @@ const DECODE_GRIDS = 1
 const SCRATCH_ASK = 0
 const SCRATCH_ROUND = 1
 const SCRATCH_STAGED = 8
+const SCRATCH_FOLLOWED = 9
 const SCRATCH_SLOT = 10
 
 # ---------------------------------------------------------------------------

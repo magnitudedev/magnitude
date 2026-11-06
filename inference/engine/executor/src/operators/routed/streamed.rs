@@ -888,8 +888,10 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         // Round 0 always parks (hit against cold is final only as the request
         // is served); its park's return carries the count of records the
         // rounds convert, from which `routed_scratch_grids` writes every
-        // round's grids: a later round parks, and a round converts, only
-        // the records it has.
+        // round's grids: a round converts only the records it has, and a
+        // later round parks while it has records, or the round before has
+        // and no sibling fill follows (the arrival after the last round's
+        // converts frees their records, `ExpertBank::fill_followed`).
         let mut grids = self.part(graph, BankPart::ScratchGrids)?;
         let always = GraphConstant::i32(graph, &[1, 1, 1])?;
         let grid = |grids: &WorkflowTensor, round: u64, grid: u64| {

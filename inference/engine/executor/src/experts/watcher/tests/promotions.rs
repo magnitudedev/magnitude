@@ -121,7 +121,7 @@ fn a_group_beginning_beside_promotions_into_its_lent_records_reads_no_hit_there(
 /// records the promotions fill.
 #[test]
 fn after_a_prefill_decode_keeps_the_rankings_top_share() {
-    let conveying = Conveying { conveyed: 2, lent: 2, bytes: RECORD };
+    let conveying = Conveying::of(2);
     decode_keeps_the_rankings_top_share(&lending("freeze", EXPERTS, EXPERTS as u64, 1, STAGING, conveying, 5, Placer::Bank, false));
     decode_keeps_the_rankings_top_share(&lending("freeze-tier", EXPERTS, 4, 1, STAGING, WHOLE, TIER, Placer::Tier, true));
 }

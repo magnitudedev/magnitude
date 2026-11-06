@@ -369,6 +369,12 @@ impl ExpertSource {
         }
     }
 
+    /// The bytes in flight that keep its widest volume at full rate
+    /// (`Reader::window`).
+    pub fn window(&self) -> u64 {
+        self.files.iter().map(Reader::window).max().expect("a model has a file")
+    }
+
     /// Queue `reads` on the read engine at `priority`: [`Priority::Demand`]
     /// for a request's misses, [`Priority::Prefetch`] for the next layer's
     /// hints. Fails only when the engine takes no job.

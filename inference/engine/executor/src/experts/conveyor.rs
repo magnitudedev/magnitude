@@ -41,6 +41,14 @@
 //! round converts it (`Scratch::fix_rounds`). A cold expert read into the
 //! conveyor lands into the tier too, from its conveyor record
 //! ([`ConveyorLanding`]), which takes no read until that landing ends.
+//!
+//! Where the host addresses the scratch (unified memory), its slots carry
+//! experts too, at no memory: an expert may be read into the base of a
+//! scratch slot no step reads or converts into until the expert's round
+//! has converted it ([`Self::take`], `Scratch::lendable_slot`), and
+//! its round converts it from there (`routed_convert`'s negative `from`).
+//! A slot's record is `records + slot`, past the conveyor's own; it frees
+//! as a conveyor record does, and holds no bytes kept past the group.
 
 use super::source::{Outcome, Records, Ticket};
 use super::watcher::Step;
@@ -129,6 +137,9 @@ pub(super) struct ConveyorLanding {
 /// the host addresses them, which reads land in.
 pub(super) struct Carrier {
     pub records: usize,
+    /// The scratch slots that may carry experts: the widest layer's where
+    /// the host addresses the scratch, else none.
+    pub slots: usize,
     pub lending: Lending,
     pub pools: Vec<Records>,
 }
@@ -158,6 +169,9 @@ pub(super) struct Conveyor {
     occupant: Vec<Vec<Option<(usize, usize)>>>,
     /// Per form, whose bytes each conveyor record holds.
     bytes: Vec<Vec<Option<Bytes>>>,
+    /// Per scratch slot, the expert (layer, expert) whose stored bytes it
+    /// carries, from its read's start until its round's converts are past.
+    slots: Vec<Option<(usize, usize)>>,
     /// The landings into the host tier from conveyor records in flight.
     landings: Vec<ConveyorLanding>,
     /// The group served, from its first scratch request until the device is
@@ -187,6 +201,7 @@ impl Conveyor {
             reading: Vec::new(),
             occupant: vec![vec![None; carrier.records]; forms],
             bytes: vec![vec![None; carrier.records]; forms],
+            slots: vec![None; carrier.slots],
             landings: Vec::new(),
             form_of,
             serving: None,
@@ -199,6 +214,47 @@ impl Conveyor {
         &self.carrier.lending
     }
 
+
+    /// The scratch slot record `record` names, if it names one (past the
+    /// conveyor's own records).
+    pub fn slot_of(&self, record: u32) -> Option<u32> {
+        (record as usize >= self.carrier.records).then(|| record - self.carrier.records as u32)
+    }
+
+    /// The `from` a round's list names record `record` by
+    /// (`routed_convert`): a conveyor record, or -1 - slot.
+    pub fn listed_from(&self, record: u32) -> i32 {
+        match self.slot_of(record) {
+            Some(slot) => -1 - slot as i32,
+            None => record as i32,
+        }
+    }
+
+    /// The scratch slots that may carry an expert.
+    pub fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The expert whose stored bytes scratch slot `slot` carries, if any.
+    pub fn borrower(&self, slot: usize) -> Option<(usize, usize)> {
+        self.slots.get(slot).copied().flatten()
+    }
+
+    /// The record that names scratch slot `slot`.
+    pub fn slot_record(&self, slot: usize) -> u32 {
+        assert!(slot < self.slots.len(), "scratch slot {slot} of {}", self.slots.len());
+        (self.carrier.records + slot) as u32
+    }
+
+    /// Free record `record` of `layer`'s form for another read, a conveyor
+    /// record or a slot; a conveyor record keeps its bytes for staging
+    /// once the group is past (a slot keeps none).
+    fn unoccupy(&mut self, layer: usize, record: u32) {
+        match self.slot_of(record) {
+            Some(slot) => self.slots[slot as usize] = None,
+            None => self.occupant[self.form_of[layer]][record as usize] = None,
+        }
+    }
 
     /// Where expert `expert` of `layer` is, if carried.
     pub fn state(&self, layer: usize, expert: usize) -> Option<&State> {
@@ -251,9 +307,17 @@ impl Conveyor {
         self.form_of[a] == self.form_of[b]
     }
 
-    /// Expert `expert` of `layer` takes conveyor record `record` for its
-    /// read.
+    /// Expert `expert` of `layer` takes record `record` for its read: a
+    /// conveyor record, or a scratch slot (one `Scratch::lendable_slot`
+    /// found free of every step's use until the expert's round converts
+    /// it).
     pub fn take(&mut self, layer: usize, expert: usize, record: u32) {
+        if let Some(slot) = self.slot_of(record) {
+            let borrower = &mut self.slots[slot as usize];
+            assert!(borrower.is_none(), "a scratch slot carries two experts");
+            *borrower = Some((layer, expert));
+            return;
+        }
         let form = self.form_of[layer];
         let slot = &mut self.occupant[form][record as usize];
         assert!(slot.is_none(), "a conveyor record carries two experts");
@@ -261,12 +325,13 @@ impl Conveyor {
         self.bytes[form][record as usize] = Some(Bytes { layer, expert, landed: false, recency: None });
     }
 
-    /// Give back conveyor record `record`, which a layer of `layer`'s form
-    /// took and no read lands in.
+    /// Give back record `record`, which a layer of `layer`'s form took, its
+    /// bytes forgotten.
     pub fn untake(&mut self, layer: usize, record: u32) {
-        let form = self.form_of[layer];
-        self.occupant[form][record as usize] = None;
-        self.bytes[form][record as usize] = None;
+        self.unoccupy(layer, record);
+        if self.slot_of(record).is_none() {
+            self.bytes[self.form_of[layer]][record as usize] = None;
+        }
     }
 
     /// Expert `expert` of `layer` is being read into conveyor record
@@ -304,6 +369,11 @@ impl Conveyor {
             .collect()
     }
 
+    /// How many experts are being read now.
+    pub fn reads_in_flight(&self) -> usize {
+        self.reading.len()
+    }
+
     /// Settle the reads that ended (`outcome`, none while one runs): one
     /// that landed holds its expert whole; one that failed carries nothing,
     /// its record free. The reads that ended, the experts landed whole, and
@@ -323,7 +393,11 @@ impl Conveyor {
             match ended {
                 Outcome::Read => {
                     self.carried[layer][expert] = Some(State::Held { record });
-                    if let Some(bytes) = self.bytes[self.form_of[layer]][record as usize].as_mut() {
+                    let bytes = match self.slot_of(record) {
+                        Some(_) => None,
+                        None => self.bytes[self.form_of[layer]][record as usize].as_mut(),
+                    };
+                    if let Some(bytes) = bytes {
                         bytes.landed = true;
                     }
                     settled.landed.push((layer, expert, record));
@@ -357,12 +431,8 @@ impl Conveyor {
     /// lists, yields that record to an expert the device needs before it:
     /// it is forgotten, to be read again.
     pub fn yield_record(&mut self, layer: usize, expert: usize) {
-        let form = self.form_of[layer];
         match self.carried[layer][expert].take() {
-            Some(State::Held { record }) => {
-                self.occupant[form][record as usize] = None;
-                self.bytes[form][record as usize] = None;
-            }
+            Some(State::Held { record }) => self.untake(layer, record),
             _ => panic!("expert {expert} of layer {layer} yields no record it holds unlisted"),
         }
     }
@@ -376,7 +446,7 @@ impl Conveyor {
         };
         self.carried[layer][expert] = match lists {
             1 => {
-                self.occupant[self.form_of[layer]][record as usize] = None;
+                self.unoccupy(layer, record);
                 None
             }
             _ => Some(State::Listed { record, lists: lists - 1 }),
@@ -388,13 +458,12 @@ impl Conveyor {
     /// keeps its bytes for staging once the group is past.
     pub fn release_past(&mut self, past: impl Fn(usize) -> bool) {
         for layer in (0..self.carried.len()).filter(|&layer| past(layer)) {
-            let form = self.form_of[layer];
             for expert in 0..self.carried[layer].len() {
                 match self.carried[layer][expert] {
                     // A listed record frees as its rounds pass.
                     Some(State::Held { record }) => {
                         self.carried[layer][expert] = None;
-                        self.occupant[form][record as usize] = None;
+                        self.unoccupy(layer, record);
                     }
 
                     _ => {}
@@ -423,5 +492,6 @@ impl Conveyor {
         for records in &mut self.occupant {
             records.iter_mut().for_each(|record| *record = None);
         }
+        self.slots.iter_mut().for_each(|slot| *slot = None);
     }
 }

@@ -75,7 +75,7 @@ native routed_scratch_request for cuda from "cuda/routed_scratch_request.cu":
         threads_per_threadgroup (REQUEST_THREADS, 1, 1)
 
 # A round parks on its written grid (`routed_scratch_grids`): one block while
-# it has records to convert.
+# it, or unfollowed the round before, has records to convert.
 native routed_scratch_wait for cuda from "cuda/routed_scratch_wait.cu":
     launch routed_scratch_wait:
         threadgroups (1, 1, 1)
