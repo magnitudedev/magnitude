@@ -284,18 +284,24 @@ fn banked_shared_graphs_score_as_resident(
     std::fs::remove_dir_all(&directory).ok();
 }
 
-/// On CUDA, a partial bank of the fixture of 128 experts a layer beside a
-/// host tier the plan sizes at load to every expert: the tier fills from
-/// the bank's open on, so once it keeps every expert (nothing left only
-/// on disk) the steps read nothing from the file, every miss the tier's,
-/// and they score as the resident load does ([`Scores::assert_as_resident`]).
+/// On a discrete CUDA device, a partial bank of the fixture of 128 experts
+/// a layer beside a host tier the plan sizes at load to every expert: the
+/// tier fills from the bank's open on, so once it keeps every expert
+/// (nothing left only on disk) the steps read nothing from the file, every
+/// miss the tier's, and they score as the resident load does
+/// ([`Scores::assert_as_resident`]).
 #[test]
 fn a_partial_banks_tier_fills_at_load_and_serves_every_miss() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let backend = seismic::BackendName::Cuda;
-    // Only a host with CUDA runs it.
-    if !available(&catalog, backend) {
+    // Only a CUDA device across a link has a host tier: on unified memory
+    // (GB10's) the bank is the one store, and there is no tier to fill.
+    let topology = catalog.topology();
+    let linked = seismic::testing::selected(&topology, backend).is_some_and(|executor| {
+        matches!(crate::platform::host_tier(&topology, executor), Ok(Some(crate::planning::HostTier::Linked(_))))
+    });
+    if !linked {
         return;
     }
     let definition = qwen4exp_fixture_definition_of(3, 128);
