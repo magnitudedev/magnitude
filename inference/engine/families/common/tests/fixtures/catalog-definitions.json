@@ -2,12 +2,6 @@
   "bonsai-8b-q1:gguf:q1-qat": {
     "target": "unrecognized"
   },
-  "deepseek-v4-flash:gguf:q4": {
-    "target": "unrecognized"
-  },
-  "deepseek-v4-flash:gguf:q8": {
-    "target": "unrecognized"
-  },
   "gemma-4-12b-it-qat:gguf:q4": {
     "target": "fd64cc87aa0f4b632c77082257af2b60617d5f1e3d1804ae5d5bd5e2a2706c2e",
     "draft": "rejected"

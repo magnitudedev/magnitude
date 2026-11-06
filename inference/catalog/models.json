@@ -884,31 +884,6 @@
       }
     },
     {
-      "id": "deepseek-v4-flash",
-      "displayName": "DeepSeek V4 Flash 284B-A13B",
-      "description": "Frontier MoE model with a very large weight footprint and low active compute.",
-      "releaseDate": "2026-07-31",
-      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 284000000000, "activeParameters": 13000000000 },
-      "support": { "level": "disabled", "reason": "DeepSeek V4 Flash hyper-connections and compressed attention are not implemented yet." },
-      "sources": [
-        {
-          "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF",
-          "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
-          "license": "mit"
-        }
-      ],
-      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "unsloth/DeepSeek-V4-Flash-0731-GGUF", "path": "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf" } },
-      "artificialAnalysis": {
-        "score": 34.3,
-        "provenance": {
-          "kind": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "url": "https://artificialanalysis.ai/models/deepseek-v4-flash"
-        }
-      }
-    },
-    {
       "id": "nemotron-3-ultra-550b-a55b",
       "displayName": "NVIDIA Nemotron 3 Ultra 550B-A55B",
       "description": "Frontier workstation/server MoE model for exceptionally high-memory systems.",
