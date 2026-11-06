@@ -73,6 +73,50 @@ void attention_decode_k8v4_merge() { prefill_decode_merge(); }
 
 #define DECODE_KEYWISE (SEISMIC_TUNE_KEYWISE != 0)
 
+// The keywise batch calls of a row's keys [first, last): one per
+// ATTENTION_KEYS keys of each slab's part of each historical span.
+uint decode_keywise_batches(
+    uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans, uint slab_rows, uint first, uint last) {
+    uint batches = 0u;
+    uint offset = 0u;
+    for (uint64_t span = 0ul; span < spans && offset < last; ++span) {
+        int lo, hi;
+        attention_span(visible, fresh, row, spans, span, lo, hi);
+        const uint length = uint(max(hi - lo, 0));
+        const uint end = min(last, offset + length);
+        for (uint part_start = max(first, offset); part_start < end;) {
+            const uint token = uint(lo) + part_start - offset;
+            const uint part_end = min(end, part_start + slab_rows - token % slab_rows);
+            batches += (part_end - part_start + ATTENTION_KEYS - 1u) / ATTENTION_KEYS;
+            part_start = part_end;
+        }
+        offset += length;
+    }
+    return batches;
+}
+
+// A slab's part of a historical span from the part's first key `token`: its
+// planes' rows, resolved once per part (position p of the part is row p of
+// them), and the keys the slab holds from there.
+struct decode_part {
+    uint64_t key_rows;
+    uint64_t value_rows;
+    uint64_t key_pairs;
+    uint64_t value_pairs;
+    uint slab_keys;
+};
+
+decode_part decode_part_at(
+    attention_history h, uint token, uint slab_rows, uint kv_head, uint64_t key_bytes, uint64_t value_bytes,
+    uint64_t pair_bytes) {
+    const uint64_t slab = uint64_t(token / slab_rows);
+    const uint64_t first_vector = uint64_t(token % slab_rows) * ATTENTION_KV + kv_head;
+    return decode_part(slab_region(h.key, slab) + first_vector * key_bytes,
+        slab_region(h.value, slab) + first_vector * value_bytes,
+        slab_region(h.key_coefficients, slab) + first_vector * pair_bytes,
+        slab_region(h.value_coefficients, slab) + first_vector * pair_bytes, slab_rows - token % slab_rows);
+}
+
 void attention_decode_k8v4_partial() {
     const uint64_t amplitudes = ATTENTION_AMPLITUDE_BUFFER;
     const uint64_t key = SEISMIC_PTR(SEISMIC_BUFFER_KEY);
@@ -97,8 +141,9 @@ void attention_decode_k8v4_partial() {
     const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     const uint64_t row_coordinates = coordinates + row * 16ul;
-    const uint key_words = history_row_words(HISTORY_KEY_BITS);
-    const uint value_words = history_row_words(HISTORY_VALUE_BITS);
+    const uint64_t key_bytes = uint64_t(history_row_words(HISTORY_KEY_BITS)) * 4ul;
+    const uint64_t value_bytes = uint64_t(history_row_words(HISTORY_VALUE_BITS)) * 4ul;
+    const uint64_t pair_bytes = uint64_t(HISTORY_PAIRS) * 4ul;
 
     // Plane 0 (the key) and plane 1 (the value) append from subgroups 0 and 1,
     // or both from a workgroup's one subgroup.
@@ -205,48 +250,66 @@ void attention_decode_k8v4_partial() {
         bias[g] = 0.0;
     }
 
-    const uint groups = attention_key_groups();
-    const uint sub = (partition_hi - partition_lo + groups - 1u) / groups;
-    const uint first = partition_lo + attention_key_group(sg) * sub;
-    const uint last = min(first + sub, partition_hi);
+    // Each key group walks its contiguous sub-range of the partition.
+    const uint slab_rows = uint(h.slab_rows);
+    const uvec2 range = attention_key_range(partition_lo, partition_hi, attention_key_group(sg));
+    if (DECODE_KEYWISE) {
+        // One loop of the busiest group's number of batch calls. The subgroup
+        // carries a cursor through its keys (span, slab part, position), moved
+        // between calls; out of keys, it stays on its last part with empty
+        // batches. A group with no historical keys stays on the partition's
+        // first, which is one whenever any group has batches.
+        uint busiest = 0u;
+        for (uint group = 0u; group < attention_key_groups(); ++group) {
+            const uvec2 keys = attention_key_range(partition_lo, partition_hi, group);
+            busiest = max(busiest, decode_keywise_batches(visible, fresh, row, spans, slab_rows, keys.x, keys.y));
+        }
+        const uint batches = decode_keywise_batches(visible, fresh, row, spans, slab_rows, range.x, range.y);
+        uint position = batches > 0u ? range.x : partition_lo;
+        uint64_t span = 0ul;
+        uint offset = 0u;
+        uint length = 0u;
+        int lo, hi;
+        uint part_start = position;
+        uint part_end = position;
+        decode_part rows;
+        for (uint batch = 0u; batch < busiest; ++batch) {
+            if (batch == 0u || (batch < batches && position == part_end)) {
+                while (position >= offset + length) {
+                    offset += length;
+                    attention_span(visible, fresh, row, spans, span, lo, hi);
+                    length = uint(max(hi - lo, 0));
+                    ++span;
+                }
+                part_start = position;
+                rows = decode_part_at(
+                    h, uint(lo) + (position - offset), slab_rows, kv_head, key_bytes, value_bytes, pair_bytes);
+                part_end = min(min(range.y, offset + length), part_start + rows.slab_keys);
+            }
+            const uint n = batch < batches ? min(ATTENTION_KEYS, part_end - position) : 0u;
+            // An empty batch reads the part's first key and absorbs nothing.
+            const uint64_t step = uint64_t(n > 0u ? position - part_start : 0u) * KV;
+            history_keywise_absorb(n, rows.key_rows + step * key_bytes, rows.key_pairs + step * pair_bytes,
+                uint64_t(KV) * key_bytes, rows.value_rows + step * value_bytes, rows.value_pairs + step * pair_bytes,
+                uint64_t(KV) * value_bytes, uint64_t(KV) * pair_bytes, staging, prepared, sums, head0, weights, maximum,
+                denominator, result);
+            position += n;
+        }
+    }
     uint offset = 0u;
-    for (uint64_t span = 0ul; span <= spans && offset < last; ++span) {
+    for (uint64_t span = 0ul; span <= spans && offset < range.y; ++span) {
         const bool historical = span < spans;
         int lo, hi;
         attention_span(visible, fresh, row, spans, span, lo, hi);
         const uint length = uint(max(hi - lo, 0));
-        const uint begin = max(first, offset);
-        const uint end = min(last, offset + length);
-        uint position = begin;
+        const uint begin = max(range.x, offset);
+        const uint end = min(range.y, offset + length);
         if (historical) {
-            // Each slab's part of the span: its planes' rows address from the
-            // slab's regions, resolved once per part; part position p is slab
-            // row (part token - slab start) + p - part start.
-            const uint64_t key_bytes = uint64_t(key_words) * 4ul;
-            const uint64_t value_bytes = uint64_t(value_words) * 4ul;
-            const uint64_t pair_bytes = uint64_t(HISTORY_PAIRS) * 4ul;
-            const uint slab_rows = uint(h.slab_rows);
-            while (position < end) {
-                const uint token = uint(lo) + (position - offset);
-                const uint slab = token / slab_rows;
-                const uint part_end = min(end, (slab + 1u) * slab_rows - uint(lo) + offset);
-                const uint part_start = position;
-                const uint64_t first_vector = uint64_t(token - slab * slab_rows) * KV + kv_head;
-                const uint64_t key_rows = slab_region(h.key, uint64_t(slab)) + first_vector * key_bytes;
-                const uint64_t value_rows = slab_region(h.value, uint64_t(slab)) + first_vector * value_bytes;
-                const uint64_t key_pairs = slab_region(h.key_coefficients, uint64_t(slab)) + first_vector * pair_bytes;
-                const uint64_t value_pairs =
-                    slab_region(h.value_coefficients, uint64_t(slab)) + first_vector * pair_bytes;
-                while (DECODE_KEYWISE && position < part_end) {
-                    const uint n = min(ATTENTION_KEYS, part_end - position);
-                    const uint64_t step = uint64_t(position - part_start) * KV;
-                    history_keywise_absorb(n, key_rows + step * key_bytes, key_pairs + step * pair_bytes,
-                        uint64_t(KV) * key_bytes, value_rows + step * value_bytes, value_pairs + step * pair_bytes,
-                        uint64_t(KV) * value_bytes, uint64_t(KV) * pair_bytes, staging, prepared, sums, head0,
-                        weights, maximum, denominator, result);
-                    position += n;
-                }
-                while (!DECODE_KEYWISE && position < part_end) {
+            for (uint part_start = begin; !DECODE_KEYWISE && part_start < end;) {
+                const decode_part rows = decode_part_at(
+                    h, uint(lo) + (part_start - offset), slab_rows, kv_head, key_bytes, value_bytes, pair_bytes);
+                const uint part_end = min(end, part_start + rows.slab_keys);
+                for (uint position = part_start; position < part_end;) {
                     const uint n = min(HISTORY_BATCH, part_end - position);
                     uint k[HISTORY_BATCH][HISTORY_LANE_WORDS];
                     uint v[HISTORY_BATCH][HISTORY_LANE_WORDS];
@@ -255,10 +318,10 @@ void attention_decode_k8v4_partial() {
                     [[unroll]] for (uint j = 0u; j < HISTORY_BATCH; ++j) {
                         if (j < n) {
                             const uint64_t step = uint64_t(position + j - part_start) * KV;
-                            const uint64_t key_code = key_rows + step * key_bytes;
-                            const uint64_t value_code = value_rows + step * value_bytes;
-                            const uint64_t key_pair = key_pairs + step * pair_bytes;
-                            const uint64_t value_pair = value_pairs + step * pair_bytes;
+                            const uint64_t key_code = rows.key_rows + step * key_bytes;
+                            const uint64_t value_code = rows.value_rows + step * value_bytes;
+                            const uint64_t key_pair = rows.key_pairs + step * pair_bytes;
+                            const uint64_t value_pair = rows.value_pairs + step * pair_bytes;
                             history_lane_load(HISTORY_KEY_BITS, key_code, lane, k[j]);
                             history_lane_load(HISTORY_VALUE_BITS, value_code, lane, v[j]);
                             kc[j] = unpackHalf2x16(
@@ -270,6 +333,7 @@ void attention_decode_k8v4_partial() {
                     history_absorb_affine(n, q, qsum, k, kc, v, vc, maximum, denominator, result, bias);
                     position += n;
                 }
+                part_start = part_end;
             }
         } else {
             // The dense absorb carries only the output: fold the bias in first.
@@ -281,7 +345,7 @@ void attention_decode_k8v4_partial() {
             if (DECODE_KEYWISE)
                 [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g)
                     attention_keywise_columns(prepared, head0 + g, lane, q[g]);
-            for (; position < end; ++position) {
+            for (uint position = begin; position < end; ++position) {
                 const uint64_t token = uint64_t(lo) + (position - offset);
                 const uint64_t at = (token * KV + kv_head) * W;
                 float k[4][ATTENTION_E];

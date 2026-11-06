@@ -457,9 +457,9 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint lane_row = block_row + lane % 16u;
     const uint64_t token = tile_first + lane_row / G;
     const bool valid = lane_row < PREFILL_QT * G && token < rows;
-    // A block of padding rows only (the tile's last rows, or with decode rows
-    // most blocks) takes part in the staging and the barriers, not the
-    // products: its subgroup is uniform in this.
+    // A block of padding rows only (the batch's last, partial tile, or with
+    // decode rows most blocks) skips the matrix products and stores nothing;
+    // it runs every other step.
     const bool computes = block_row < PREFILL_QT * G && tile_first + block_row / G < rows;
 #ifndef PREFILL_DECODE
     const uint64_t block_queries = scratch_planes.queries
@@ -501,21 +501,18 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 if (computes)
                     flash_scores_add(block_queries + uint64_t(column) * 2ul, uint64_t(W), chunk, 0u, scores);
             }
-            uint p_half = 0u;
-            if (computes) {
-                flash_scores_publish(scores, scratch);
-                float s[16];
-                prefill_lane_scores(scratch, scale, first, false, row_lo, row_hi, s);
-                const uint lane_half = SEISMIC_LANE / 16u;
-                [[unroll]] for (uint j = 0u; j < 16u; ++j) {
-                    const int t = first + int(16u * lane_half + j);
-                    if (valid && t >= row_lo && t < row_hi && !prefill_reads(token, row_base, t, row_lo))
-                        s[j] = -ATTENTION_INF;
-                }
-                const float alpha = flash_online(softmax, s);
-                p_half = flash_publish_probabilities(scratch, s);
-                flash_rescale(scratch, alpha, W, PREFILL_WINDOW, o);
+            flash_scores_publish(scores, scratch);
+            float s[16];
+            prefill_lane_scores(scratch, scale, first, false, row_lo, row_hi, s);
+            const uint lane_half = SEISMIC_LANE / 16u;
+            [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                const int t = first + int(16u * lane_half + j);
+                if (valid && t >= row_lo && t < row_hi && !prefill_reads(token, row_base, t, row_lo))
+                    s[j] = -ATTENTION_INF;
             }
+            const float alpha = flash_online(softmax, s);
+            const uint p_half = flash_publish_probabilities(scratch, s);
+            flash_rescale(scratch, alpha, W, PREFILL_WINDOW, o);
             barrier();
             prefill_stage(h, scratch_planes, false, historical, first, interval.y, kv_head, column0, width);
             barrier();
@@ -553,16 +550,13 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
 #endif
                     }
                 }
-                uint p_half = 0u;
-                if (computes) {
-                    flash_scores_publish(scores, scratch);
-                    const bool inside = first >= interval.z && first + int(PREFILL_KEYS) <= interval.w;
-                    float s[16];
-                    prefill_lane_scores(scratch, scale, first, inside, row_lo, row_hi, s);
-                    const float alpha = flash_online(softmax, s);
-                    p_half = flash_publish_probabilities(scratch, s);
-                    flash_rescale(scratch, alpha, W, PREFILL_WINDOW, o);
-                }
+                flash_scores_publish(scores, scratch);
+                const bool inside = first >= interval.z && first + int(PREFILL_KEYS) <= interval.w;
+                float s[16];
+                prefill_lane_scores(scratch, scale, first, inside, row_lo, row_hi, s);
+                const float alpha = flash_online(softmax, s);
+                const uint p_half = flash_publish_probabilities(scratch, s);
+                flash_rescale(scratch, alpha, W, PREFILL_WINDOW, o);
                 barrier();
                 prefill_stage(h, scratch_planes, false, historical, first, interval.y, kv_head, column0, width);
                 barrier();
@@ -577,7 +571,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
         barrier();
         // Unrolled, so every fragment index is a constant.
         [[unroll]] for (uint q = 0u; q < PREFILL_WINDOW / 2u; ++q) {
-            if (!computes || q >= flash_window(W, PREFILL_WINDOW) / 2u)
+            if (q >= flash_window(W, PREFILL_WINDOW) / 2u)
                 break;
             const float value = flash_output_value(o, scratch, q);
             const uint r = block_row + flash_output_row(q);

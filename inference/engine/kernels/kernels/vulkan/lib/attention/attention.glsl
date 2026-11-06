@@ -246,10 +246,10 @@ void attention_keywise_softmax(const uint n, float score[ATTENTION_HEADS], uint 
     // The previous batch's weights are read.
     subgroupBarrier();
     [[unroll]] for (uint g = 0u; g < ATTENTION_HEADS; ++g) {
-        const float s = lane < n ? score[g] : -ATTENTION_INF;
-        const float next = max(maximum[g], seismic_subgroup_max_f32(s));
-        const float carry = exp2(maximum[g] - next);
-        const float probability = exp2(s - next);
+        const float next = max(maximum[g], seismic_subgroup_max_f32(lane < n ? score[g] : -ATTENTION_INF));
+        // An empty batch leaves the state as it is, an empty state too.
+        const float carry = next == maximum[g] ? 1.0 : exp2(maximum[g] - next);
+        const float probability = lane < n ? exp2(score[g] - next) : 0.0;
         denominator[g] = seismic_fma_rn(denominator[g], carry, seismic_subgroup_sum_f32(probability));
         maximum[g] = next;
         [[unroll]] for (uint i = 0u; i < ATTENTION_E; ++i)
@@ -327,11 +327,20 @@ float attention_merge(uint64_t partials, uint64_t statistics, uint64_t first, ui
 // Decode subgroups: subgroup sg holds the ATTENTION_HEADS query heads of
 // slice sg % slices (heads slice * ATTENTION_HEADS ..) over key group
 // sg / slices, one of subgroups / slices contiguous sub-ranges of the
-// partition. Every key is read by one subgroup per slice.
+// partition (`attention_key_range`). Every key is read by one subgroup per
+// slice.
 uint attention_slices() { return ATTENTION_G / ATTENTION_HEADS; }
 uint attention_slice(uint sg) { return sg % attention_slices(); }
 uint attention_key_group(uint sg) { return sg / attention_slices(); }
 uint attention_key_groups() { return SEISMIC_SUBGROUPS / attention_slices(); }
+
+// Key group `group`'s sub-range of the partition [lo, hi): its first and end
+// key, of ceil((hi - lo) / groups) keys, the last shorter or empty.
+uvec2 attention_key_range(uint lo, uint hi, uint group) {
+    const uint sub = (hi - lo + attention_key_groups() - 1u) / attention_key_groups();
+    const uint first = min(lo + group * sub, hi);
+    return uvec2(first, min(first + sub, hi));
+}
 
 // The maximum over the key groups of one slice of its local head h's states.
 float attention_slice_maximum(uint states, uint slice, uint h) {

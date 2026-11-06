@@ -152,10 +152,8 @@ void attention_decode_partial() {
         denominator[g] = 0.0;
     }
 
-    const uint groups = attention_key_groups();
-    const uint sub = (partition_hi - partition_lo + groups - 1u) / groups;
-    const uint first = partition_lo + attention_key_group(sg) * sub;
-    const uint last = min(first + sub, partition_hi);
+    const uvec2 range = attention_key_range(partition_lo, partition_hi, attention_key_group(sg));
+    const uint first = range.x, last = range.y;
     uint offset = 0u;
     for (uint64_t span = 0ul; span <= spans && offset < last; ++span) {
         const bool historical = span < spans;

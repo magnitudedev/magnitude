@@ -17,6 +17,8 @@
 // Lane layout of the scalar softmax: lane l owns row l % 16 and keys
 // 16 (l / 16) .. + 15 of the tile.
 //
+// The whole workgroup reaches every barrier.
+//
 // This file is independent of any entry ABI.
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
@@ -289,29 +291,33 @@ void flash_output_clear(const uint w, const uint window, inout flash_output o) {
 }
 
 // O <- diag(alpha) O for the lane rows' factors `alpha` (from
-// `flash_online`). Skipped when no row's maximum grew. Every lane of the
-// subgroup calls it, after `flash_publish_probabilities`.
+// `flash_online`). The product is skipped when no row's maximum grew, the
+// barriers never: every subgroup passes them whatever its rows' maxima did.
+// Every lane of the subgroup calls it, after `flash_publish_probabilities`.
 void flash_rescale(uint scratch, float alpha, const uint w, const uint window, inout flash_output o) {
-    if (seismic_subgroup_all(alpha == 1.0))
-        return;
+    const bool grew = !seismic_subgroup_all(alpha == 1.0);
 #if SEISMIC_HAS_MATRIX
     // The factors as a 16 x 16 accumulator fragment, row r all alpha_r: each
     // lane writes half of its row.
     const uint lane = SEISMIC_LANE;
-    [[unroll]] for (uint i = 0u; i < 8u; ++i)
-        seismic_shared_f32[scratch + FLASH_FACTORS + (lane % 16u) * 16u + 8u * (lane / 16u) + i] = alpha;
+    if (grew)
+        [[unroll]] for (uint i = 0u; i < 8u; ++i)
+            seismic_shared_f32[scratch + FLASH_FACTORS + (lane % 16u) * 16u + 8u * (lane / 16u) + i] = alpha;
     subgroupMemoryBarrierShared();
     subgroupBarrier();
-    MATRIX_FRAGMENT_C factors;
-    coopMatLoad(factors, seismic_shared_f32, scratch + FLASH_FACTORS, 16u, gl_CooperativeMatrixLayoutRowMajor);
-    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
-        if (d < flash_window(w, window) / 16u)
-            o.c[d] = o.c[d] * factors;
+    if (grew) {
+        MATRIX_FRAGMENT_C factors;
+        coopMatLoad(factors, seismic_shared_f32, scratch + FLASH_FACTORS, 16u, gl_CooperativeMatrixLayoutRowMajor);
+        [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
+            if (d < flash_window(w, window) / 16u)
+                o.c[d] = o.c[d] * factors;
+    }
     subgroupBarrier();
 #else
-    [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 2u; ++d)
-        if (d < flash_window(w, window) / 2u)
-            o.c[d] *= alpha;
+    if (grew)
+        [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 2u; ++d)
+            if (d < flash_window(w, window) / 2u)
+                o.c[d] *= alpha;
 #endif
 }
 
