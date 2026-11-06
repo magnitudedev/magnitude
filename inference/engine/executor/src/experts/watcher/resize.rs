@@ -5,12 +5,14 @@
 //! bank's shrink is planned with its evictions published at once
 //! (always safe: the bank only loses experts), and answered with a plan the
 //! owner commits once its moves are queued on the device ahead of every
-//! later step, or drops. A growth asks nothing: each of its slots joins as
-//! soon as every record tensor backs it ([`Shared::join`]), beside running
-//! steps, which reach a record only once the host maps it. Each
+//! later step, or drops. The one store is also cut beside a running chain
+//! ([`Shared::cut_running`]), moving nothing, when memory runs short while
+//! a long chain is encoded. A growth asks nothing: each of its slots joins
+//! as soon as every record tensor backs it ([`Shared::join`]), beside
+//! running steps, which reach a record only once the host maps it. Each
 //! carries the bank's slots, which the watcher's telemetry reads.
 
-use super::Shared;
+use super::{Shared, Step};
 use super::core::{Core, PlacedWords};
 use super::residency::Residency;
 use super::telemetry::GroupReadWords;
@@ -263,10 +265,38 @@ enum Resize {
     Answered(Answer),
 }
 
+/// A cut of the one store beside a running chain ([`Shared::cut_running`]),
+/// which the owner never waits for: asked, then taken by residency, then
+/// answered, each read by the owner as it encodes the chain or at a later
+/// boundary.
+enum Running {
+    /// None asked, or residency serving one.
+    None,
+    /// Asked at that instant beside the chain whose steps run from `first`
+    /// through `last`, at the deepest of `candidates` it may cut.
+    Asked { first: Step, last: Step, candidates: Candidates, at: Instant },
+    Answered(Result<Option<RunningCut>, String>),
+}
+
+/// A cut of the one store beside a running chain, answered
+/// ([`Shared::cut_running`]): the slots it commits the store to, the
+/// highest streamed layer whose hits the chain's steps had decided at the
+/// cut (none where they had decided none), and its trip through the
+/// watcher. No run the chain submits after every pass of that layer
+/// resolves a record at or past the cut.
+pub(crate) struct RunningCut {
+    pub slots: usize,
+    pub decided: Option<usize>,
+    pub trip: Trip,
+}
+
 /// The resize the owner and the watcher exchange.
 pub(super) struct ResizeHandoff {
     resize: Mutex<Resize>,
     resized: Condvar,
+    /// The cut beside a running chain, apart from the resizes asked
+    /// between flights, which wait on it never.
+    running: Mutex<Running>,
     /// Whether a plan was dropped uncommitted since residency last looked
     /// ([`ShrinkPlan`]'s drop): its records return.
     abandoned: std::sync::atomic::AtomicBool,
@@ -277,7 +307,24 @@ impl ResizeHandoff {
         Self {
             resize: Mutex::new(Resize::None),
             resized: Condvar::new(),
+            running: Mutex::new(Running::None),
             abandoned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn running(&self) -> std::sync::MutexGuard<'_, Running> {
+        self.running.lock().expect("watcher running cut")
+    }
+
+    /// The cut beside a running chain asked, taken.
+    fn running_asked(&self) -> Option<(Step, Step, Candidates, Instant)> {
+        let mut running = self.running();
+        match std::mem::replace(&mut *running, Running::None) {
+            Running::Asked { first, last, candidates, at } => Some((first, last, candidates, at)),
+            other => {
+                *running = other;
+                None
+            }
         }
     }
 
@@ -401,6 +448,38 @@ impl Shared {
         self.ask(Ask::Place(words)).map(drop)
     }
 
+    /// Ask residency to cut the one store (where the host places) beside
+    /// the running chain whose steps run from `first` through `last`, at its
+    /// next turn, at the deepest of `candidates` whose cut keeps every
+    /// record in flight below it ([`Residency::serve_running`]); the owner
+    /// reads the answer as it comes ([`Self::running_cut`]) and never waits
+    /// for it. One at a time.
+    pub(in crate::experts) fn cut_running(&self, (first, last): (Step, Step), candidates: Candidates) {
+        let mut running = self.resizing.running();
+        assert!(matches!(*running, Running::None), "a cut beside running steps asked beside another");
+        *running = Running::Asked { first, last, candidates, at: Instant::now() };
+        drop(running);
+        self.events().notify();
+    }
+
+    /// The cut asked beside a running chain ([`Self::cut_running`]), once
+    /// residency answered it: cut, none where it cuts nothing (every
+    /// candidate below a record in flight, a whole layer, or a group begun
+    /// after the chain), or why serving ended. None while it is not
+    /// answered yet.
+    pub(in crate::experts) fn running_cut(&self) -> Option<Result<Option<RunningCut>, String>> {
+        let mut running = self.resizing.running();
+        match std::mem::replace(&mut *running, Running::None) {
+            Running::Answered(answer) => Some(answer),
+            asked => {
+                *running = asked;
+                let reason = self.life.ended()?;
+                *running = Running::None;
+                Some(Err(format!("the expert watcher stopped serving: {reason}")))
+            }
+        }
+    }
+
     fn ask(&self, ask: Ask) -> Result<Answer, String> {
         let resizing = &self.resizing;
         self.steps.between_flights(|| {
@@ -450,6 +529,7 @@ struct Published(());
 #[derive(Default)]
 pub(super) struct Owed {
     answer: Option<(Answer, Published)>,
+    running: Option<Result<Option<RunningCut>, String>>,
     joined: usize,
 }
 
@@ -458,6 +538,9 @@ impl Owed {
     pub(super) fn settle(&mut self, shared: &Shared) {
         if let Some((answer, published)) = self.answer.take() {
             shared.resizing.answer(answer, published);
+        }
+        if let Some(cut) = self.running.take() {
+            *shared.resizing.running() = Running::Answered(cut);
         }
         if self.joined > 0 {
             shared.joins.applied(std::mem::take(&mut self.joined));
@@ -551,6 +634,20 @@ impl Residency {
         None
     }
 
+    /// Serve the cut asked beside a running chain, if one is
+    /// ([`Self::serve_running`]), answered as residency is released.
+    /// Whether one was.
+    pub(super) fn cut_running(&mut self) -> bool {
+        let Some((first, last, candidates, at)) = self.shared.resizing.running_asked() else {
+            return false;
+        };
+        let taken = Instant::now();
+        let trip = || Trip { picked: taken - at, served: taken.elapsed() };
+        let cut = self.serve_running((first, last), &candidates, trip);
+        assert!(self.owed.running.replace(cut).is_none(), "a running cut is answered before residency is released");
+        true
+    }
+
     /// Still between flights, before the owner begins a step, publish what a
     /// resize changed: the maps of every record it moved or released (a
     /// shrink's moves within the host's records name new records, its drops
@@ -616,15 +713,7 @@ impl Residency {
     /// are formed first, so a refusal changes nothing.
     fn serve_cut(&mut self, candidates: &Candidates, keeping: Keeping, trip: impl Fn() -> Trip) -> Result<Option<Cut>, String> {
         let floors = (0..self.core.groups.len()).map(|group| self.core.directory.host_floor(group)).collect::<Vec<_>>();
-        let cut = (0..candidates.count()).rev().map(|index| candidates.slots(index)).find_map(|slots| {
-            let records = (candidates.records)(slots)
-                .into_iter()
-                .map(|records| u32::try_from(records).expect("the records the host lands into fit u32"))
-                .collect::<Vec<_>>();
-            let keeps = records.iter().zip(&floors).all(|(records, floor)| records >= floor);
-            keeps.then_some((slots, records))
-        });
-        let Some((slots, records)) = cut else {
+        let Some((slots, records)) = deepest(candidates, &floors) else {
             return Ok(None);
         };
         let views = self.core.tier_views(&records)?;
@@ -656,6 +745,64 @@ impl Residency {
             Keeping::Device => Cut::Kept(cut, moves.into_iter().map(|moves| moves.into_iter().map(|(from, to)| (from.0, to.0)).collect()).collect()),
         }))
     }
+}
+
+impl Residency {
+    /// Cut the one store's records beside the running chain whose steps run
+    /// from `first` through `last`, at the deepest of `candidates` whose
+    /// records lie at or above each group's running floor
+    /// (`Directory::running_floor`), moving nothing. Each expert kept at or
+    /// past the cut is unmapped where its entry still names that record
+    /// (`Directory::cut_running`): from the chain's first step where none
+    /// of its requests taken so far routed it at its layer, so every step of
+    /// the chain still to decide the layer's hits resolves it a miss and its
+    /// rounds read it, as any cold expert; else from the first step not yet
+    /// begun, so the chain's later passes there, which resolve it as the
+    /// pass whose hit it was, still read it, the decided layers' passes
+    /// being submitted before the cut's storage installs (`RunningCut`).
+    /// Each later chain begins after the stores and resolves none of them.
+    /// The views of the records below the cut are formed first, so a
+    /// refusal changes nothing.
+    ///
+    /// None where a layer is whole, whose steps read their experts at their
+    /// homes without the map (`POLICY_WHOLE`), or once a group began after
+    /// the chain, whose steps decided their hits by the map before the cut;
+    /// nor where even the shallowest candidate cuts below a record in
+    /// flight.
+    fn serve_running(&mut self, (first, last): (Step, Step), candidates: &Candidates, trip: impl Fn() -> Trip) -> Result<Option<RunningCut>, String> {
+        if self.whole.iter().any(|&whole| whole) || !self.shared.steps.latest(last) {
+            return Ok(None);
+        }
+        let floors = (0..self.core.groups.len()).map(|group| self.core.directory.running_floor(group)).collect::<Vec<_>>();
+        let Some((slots, records)) = deepest(candidates, &floors) else {
+            return Ok(None);
+        };
+        let views = self.core.tier_views(&records)?;
+        let decided = self.scratch.decided(first);
+        let (scratch, directory) = (&self.scratch, &mut self.core.directory);
+        for (group, &records) in records.iter().enumerate() {
+            directory.cut_running(group, records, |(layer, expert)| match scratch.routed(first, layer, expert) {
+                true => Step::MAX,
+                false => first,
+            });
+        }
+        self.address_tier(views);
+        self.shared.telemetry.resized(self.core.bank_records());
+        Ok(Some(RunningCut { slots, decided, trip: trip() }))
+    }
+}
+
+/// The deepest of `candidates` whose records (each group's, fitting u32)
+/// lie at or above each group's floor in `floors`: its slots and records.
+fn deepest(candidates: &Candidates, floors: &[u32]) -> Option<(usize, Vec<u32>)> {
+    (0..candidates.count()).rev().map(|index| candidates.slots(index)).find_map(|slots| {
+        let records = (candidates.records)(slots)
+            .into_iter()
+            .map(|records| u32::try_from(records).expect("the records the host lands into fit u32"))
+            .collect::<Vec<_>>();
+        let keeps = records.iter().zip(floors).all(|(records, floor)| records >= floor);
+        keeps.then_some((slots, records))
+    })
 }
 
 /// Each group's shrink to `records`, every placement ended, its evictions

@@ -1139,6 +1139,11 @@ impl ElasticBank for FakeBank {
         FakeBank::in_gap(self)
     }
 
+    /// Its chains' encoding never cuts it.
+    fn running_begun(&self) -> Option<crate::domain::RunningBegun> {
+        None
+    }
+
     fn residency(&self) -> Result<crate::ExpertResidency, DomainError> {
         let experts = self.tensor.extents()[0];
         Ok(crate::ExpertResidency {
@@ -1238,6 +1243,7 @@ impl ProgramFamily for TestFamily {
         &mut self,
         chain: Chain<ValidatedTargetLaunch>,
         _spare: crate::TargetGraphOutputLease,
+        _pressure: &dyn Fn(&dyn ElasticBank) -> Option<crate::domain::RunningPressure>,
     ) -> Result<Chain<Self::TargetSubmission>, crate::programs::ChainRefusal>
     {
         if REJECTED.with(|rejected| rejected.get()) == Some(0) {

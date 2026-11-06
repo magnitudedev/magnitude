@@ -49,7 +49,7 @@ mod domain_tests;
 pub use family::{
     BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, Growth, GrowthDecided, GrowthOffer, HostResidency,
     NativeFamily,
-    ProgramFamily, ResizeTimes, TableResidency, ShrinkCause, TierFill, TrafficHold, Trip,
+    ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, ShrinkCause, TierFill, TrafficHold, Trip,
 };
 pub use heap::{ClaimRefusal, DeviceHeap, Reclaimed, StatusReading, require_normal};
 pub use in_flight::{
@@ -620,6 +620,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The readings of the heap's charge taken ([`Self::refresh_memory`]).
     #[cfg(test)]
     refreshes: std::cell::Cell<usize>,
+    /// A cut of the expert bank begun beside a running chain, until the
+    /// owner takes it ([`Self::take_running_release`]): the storage it
+    /// resizes and what the process held as it was decided.
+    running_release: Option<(crate::planning::BankTier, MemoryMoment)>,
 }
 
 impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
@@ -880,6 +884,171 @@ struct GrowthClaim {
     bytes: u64,
 }
 
+/// What reads memory for the domain: the device's stores and ledgers, its
+/// heap, the memory pace, the heap claim of the bank's running growth, and
+/// whether a bank resize runs. None of the program family's, which each
+/// reading is handed its expert bank from: a chain's encoding reads memory
+/// through it while it holds the family
+/// ([`ExecutorDomain::submit_chain`]).
+struct MemoryProbe<'d> {
+    domain: &'d ResourceDomain,
+    memory: &'d RefCell<DeviceHeap>,
+    pace: &'d RefCell<MemoryPace>,
+    bank_claim: Option<&'d GrowthClaim>,
+    resizing: bool,
+}
+
+impl<'d> MemoryProbe<'d> {
+    /// The domain's probe, of its parts apart from the program family.
+    fn of(
+        domain: &'d ResourceDomain,
+        memory: &'d RefCell<DeviceHeap>,
+        pace: &'d RefCell<MemoryPace>,
+        bank_claim: Option<&'d GrowthClaim>,
+        held: &ResizeHeld,
+    ) -> Self {
+        Self { domain, memory, pace, bank_claim, resizing: held.runs() }
+    }
+
+    /// [`ExecutorDomain::observe_memory`], beside `bank`.
+    fn observe(&self, bank: Option<&dyn ElasticBank>) -> Result<Vec<DomainReading>, DomainError> {
+        let _rises = bank.map(|bank| bank.hold_rises());
+        let readings = self
+            .memory
+            .borrow_mut()
+            .refresh()
+            .map_err(|error| DomainError::Blind(error.to_string()))?;
+        self.settle_growth_claim(bank)?;
+        Ok(readings)
+    }
+
+    /// [`ExecutorDomain::refresh_memory`], beside `bank`.
+    fn account(&self, bank: Option<&dyn ElasticBank>) -> Result<(), DomainError> {
+        let _rises = bank.map(|bank| bank.hold_rises());
+        self.memory.borrow_mut().account();
+        self.settle_growth_claim(bank)
+    }
+
+    /// Take what `bank`'s running growth backed out of its claim: the
+    /// charge just read holds those bytes, so the claim holds only the rest,
+    /// read under the same hold of the bank's rises
+    /// ([`ElasticBank::hold_rises`]), so a growth's bytes are counted once.
+    /// The load's holding itself is the device's charge, which Seismic
+    /// keeps; nothing here counts it again.
+    fn settle_growth_claim(&self, bank: Option<&dyn ElasticBank>) -> Result<(), DomainError> {
+        if let (Some(claim), Some(bank)) = (self.bank_claim, bank) {
+            let rest = claim.bytes.saturating_sub(bank.growth_backed(claim.kind)?);
+            self.memory
+                .borrow_mut()
+                .reduce_reserved(claim.id, claim.kind, rest)
+                .map_err(|error| DomainError::invariant(format!("a growth's claim: {error:?}")))?;
+        }
+        Ok(())
+    }
+
+    /// [`ExecutorDomain::probe_memory`], beside `bank`: the readings the
+    /// memory pace is measured from, taken while no bank resize runs are
+    /// settled ones.
+    fn probe(&self, bank: Option<&dyn ElasticBank>, reading_interval: Duration) -> Result<(), DomainError> {
+        let readings = self.observe(bank)?;
+        let host = self.host_witness(&readings);
+        self.pace.borrow_mut().observe(&readings, &self.domain.device().ledgers().own_claims(), host, !self.resizing, reading_interval);
+        match readings.into_iter().find(|reading| reading.band == MemoryBand::Reclaim) {
+            Some(reading) => Err(DomainError::Reclaim(reading)),
+            None => Ok(()),
+        }
+    }
+
+    /// Host RAM's witness of the process's releases at a probe that read
+    /// `readings` (`MemoryPace`): what the system counts the process holding
+    /// out of free memory, which falls by a release as free memory rises by
+    /// it. A Metal device's allocations are wired through its residency set,
+    /// so the host's wired pages (`seismic::HostHeld`): a released buffer
+    /// leaves the footprint at once, but its pages are free only once the
+    /// driver unwires them at its next tick (on an M4 Pro, 0.47 s after a
+    /// 138 MB slot's release free and wired memory moved together; the
+    /// first slot a reserved buffer released was not unwired within 3 s).
+    /// The count is the host's, the process's own wired size counting none
+    /// of the residency set's: another program wiring memory in the span
+    /// holds a release unseen, credited until the host takes more than it,
+    /// and one unwiring shows it early. Any other device's allocations are
+    /// pages of the process, so its footprint (`seismic::ProcessMemory`), which the
+    /// system frees as they leave it (a GB10's fell by each bank slot within
+    /// its release). None where the system reports neither.
+    fn host_witness(&self, readings: &[DomainReading]) -> Option<u64> {
+        match self.domain.device().backend() {
+            seismic::BackendName::Metal => readings
+                .iter()
+                .find(|reading| reading.identity == seismic::StoreIdentity::HostRam)
+                .and_then(|reading| reading.held)
+                .map(|held| held.wired_bytes),
+            _ => self.memory.borrow().footprint(),
+        }
+    }
+
+    /// The store `kind` storage lies in.
+    fn store_of(&self, kind: seismic::Contract) -> Option<seismic::StoreId> {
+        let device = self.domain.device();
+        state::storage_store(device.topology(), device.info(), kind)
+    }
+
+    /// What `store` is short of now (`MemoryPace::shortfall`), against the
+    /// process's charge of it now.
+    fn shortfall(&self, store: seismic::StoreId) -> Shortfall {
+        let charged = self
+            .domain
+            .device()
+            .ledgers()
+            .own_claims()
+            .into_iter()
+            .filter(|(of, _)| *of == store)
+            .map(|(_, bytes)| bytes)
+            .sum();
+        self.pace.borrow().shortfall(store, charged)
+    }
+
+    /// What the process holds now (`MemoryMoment`).
+    fn moment(&self) -> MemoryMoment {
+        let ledger = self.domain.device().device_ledger();
+        MemoryMoment {
+            charged: ledger.charged,
+            claimed: ledger.claim,
+            footprint: seismic::ProcessMemory::read().footprint_bytes,
+        }
+    }
+
+    /// What the expert bank's storage is short of now, read between a
+    /// chain's submissions (`ExpertBank::release_running`): a probe as the
+    /// owner's ([`ExecutorDomain::probe_memory`]) at most every reading
+    /// interval, and the shortfall it leaves the bank's store
+    /// (`MemoryPace::shortfall`), with what the process held then. None
+    /// while a bank resize runs (its advance is a boundary's, and the bank
+    /// begins no cut beside it), between readings, where the reading is
+    /// blind (the heap holds it so, and the owner's next probe reads again),
+    /// or where nothing is short.
+    fn running_pressure(&self, bank: &dyn ElasticBank) -> Option<RunningPressure> {
+        if self.resizing {
+            return None;
+        }
+        let interval = {
+            let pace = self.pace.borrow();
+            if !pace.due(Instant::now()) {
+                return None;
+            }
+            pace.reading_interval
+        };
+        if let Err(DomainError::Blind(_)) = self.probe(Some(bank), interval) {
+            return None;
+        }
+        let kind = bank.holding_storage(BankHolding::Experts).expect("an expert bank holds its experts");
+        let store = self.store_of(kind.storage())?;
+        match self.shortfall(store) {
+            Shortfall::Short(bytes) => Some(RunningPressure { bytes, held: self.moment() }),
+            Shortfall::Above | Shortfall::Covered => None,
+        }
+    }
+}
+
 /// The time expert bank resizes held the submitting thread at flight
 /// boundaries: each store's running resize's so far (none while none of it
 /// runs), and each holding's last finished one's in all, which is what its
@@ -943,9 +1112,16 @@ enum HeldSource {
 impl ResizeHeld {
     /// A resize of `tier` storage began, holding the thread since `started`.
     fn begin(&mut self, tier: crate::planning::BankTier, started: Instant) {
-        let begun = started.elapsed().as_secs_f64();
+        self.begin_held(tier, started, started.elapsed());
+    }
+
+    /// A resize of `tier` storage began, its call starting at `started` and
+    /// holding the thread `held`: a cut begun beside a running chain, whose
+    /// asking held it only that while the chain was encoded.
+    fn begin_held(&mut self, tier: crate::planning::BankTier, started: Instant, held: Duration) {
+        assert!(self.running[tier.index()].is_none(), "a {tier:?} resize began beside a running one");
         let (advances, decisions) = Default::default();
-        self.running[tier.index()] = Some(ThreadHeld { started, begun, advances, decisions });
+        self.running[tier.index()] = Some(ThreadHeld { started, begun: held.as_secs_f64(), advances, decisions });
         self.begun += 1;
     }
 
@@ -1035,6 +1211,8 @@ struct MemoryPace {
     domains: BTreeMap<seismic::StoreId, DomainPace>,
     /// The interval the owner reads memory at, as its probes say.
     reading_interval: Duration,
+    /// When memory was last read; none before the first probe.
+    read: Option<Instant>,
     /// The last finished release's latency; zero before the first.
     latency: Duration,
 }
@@ -1136,8 +1314,15 @@ impl MemoryPace {
         Self {
             domains: BTreeMap::new(),
             reading_interval: Duration::ZERO,
+            read: None,
             latency: Duration::ZERO,
         }
+    }
+
+    /// Whether memory is due a reading at `now`: a reading interval since
+    /// the last, or none read yet.
+    fn due(&self, now: Instant) -> bool {
+        self.read.is_none_or(|read| now.duration_since(read) >= self.reading_interval)
     }
 
     /// Fold in a probe of every domain, the process charging each store as
@@ -1154,6 +1339,7 @@ impl MemoryPace {
     ) {
         let at = Instant::now();
         self.reading_interval = reading_interval;
+        self.read = Some(at);
         for reading in readings {
             let charged = charges
                 .iter()
@@ -1268,9 +1454,11 @@ impl MemoryPace {
     }
 
     /// The wait bound: how long pressure that arrives as a prompt group
-    /// starts may wait for a release, in seconds. Nothing is released while
-    /// a group runs (the owner defers releases while a chain is held), so
-    /// from the planning line `P` the rest of the host may take what lies
+    /// starts may wait for a release, in seconds. The owner's ladder
+    /// releases nothing while a group runs (it defers releases while a
+    /// chain is held), and only the one store's bank is cut beside it
+    /// (`ExpertBank::release_running`), down to its floor at most, so from
+    /// the planning line `P` the rest of the host may take what lies
     /// above the domain's emergency reserve `E`
     /// (`DomainThresholds::emergency_bytes`), at the fastest rate `r`
     /// measured of it since the load's first probe: `W = (P − E) / r`, the
@@ -1422,14 +1610,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// claims. A failed observation revokes unspent
     /// grants and leaves the heap Blind.
     pub fn observe_memory(&self) -> Result<Vec<DomainReading>, DomainError> {
-        let _rises = self.family.expert_bank().map(|bank| bank.hold_rises());
-        let readings = self
-            .memory
-            .borrow_mut()
-            .refresh()
-            .map_err(|error| DomainError::Blind(error.to_string()))?;
-        self.settle_growth_claim()?;
-        Ok(readings)
+        self.memory_probe().observe(self.family.expert_bank())
     }
 
     /// Refresh the heap's view of Seismic's charge after the process's own
@@ -1439,25 +1620,58 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn refresh_memory(&self) -> Result<(), DomainError> {
         #[cfg(test)]
         self.refreshes.set(self.refreshes.get() + 1);
-        let _rises = self.family.expert_bank().map(|bank| bank.hold_rises());
-        self.memory.borrow_mut().account();
-        self.settle_growth_claim()
+        self.memory_probe().account(self.family.expert_bank())
     }
 
-    /// Take what a running growth backed out of its claim: the charge just
-    /// read holds those bytes, so the claim holds only the rest, read under
-    /// the same hold of the bank's rises ([`ElasticBank::hold_rises`]), so a
-    /// growth's bytes are counted once. The load's holding itself is the
-    /// device's charge, which Seismic keeps; nothing here counts it again.
-    fn settle_growth_claim(&self) -> Result<(), DomainError> {
-        if let (Some(claim), Some(bank)) = (&self.bank_claim, self.family.expert_bank()) {
-            let rest = claim.bytes.saturating_sub(bank.growth_backed(claim.kind)?);
-            self.memory
-                .borrow_mut()
-                .reduce_reserved(claim.id, claim.kind, rest)
-                .map_err(|error| DomainError::invariant(format!("a growth's claim: {error:?}")))?;
-        }
-        Ok(())
+    /// What reads memory for the domain ([`MemoryProbe`]).
+    fn memory_probe(&self) -> MemoryProbe<'_> {
+        MemoryProbe::of(&self.domain, &self.memory, &self.pace, self.bank_claim.as_ref(), &self.resize_held)
+    }
+
+    /// Submit a chain of target launches and its spare output slot
+    /// (`ProgramFamily::submit_target`). Its encoding reads memory between
+    /// its submissions ([`MemoryProbe::running_pressure`]), so memory
+    /// another program takes while a long chain runs is answered by a cut
+    /// of the expert bank's one store beside it
+    /// (`ExpertBank::release_running`), not at the chain's end; a cut it
+    /// began is a resize begun ([`Self::note_running_cut`]).
+    fn submit_chain(
+        &mut self,
+        chain: Chain<crate::ValidatedTargetLaunch>,
+        spare: crate::TargetGraphOutputLease,
+    ) -> Result<Chain<F::TargetSubmission>, crate::programs::ChainRefusal> {
+        // The family is lent to the chain, so the probe borrows the rest.
+        let probe = MemoryProbe::of(&self.domain, &self.memory, &self.pace, self.bank_claim.as_ref(), &self.resize_held);
+        let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank));
+        self.note_running_cut();
+        submitted
+    }
+
+    /// Take a cut of the expert bank begun beside a running chain since
+    /// (`ElasticBank::running_begun`): a resize of the experts' storage
+    /// begun, which held the submitting thread what its asking did, and
+    /// which the owner takes ([`Self::take_running_release`]) before the
+    /// advance that finishes it. None begins while another resize runs:
+    /// the probe that begins one reads no memory then.
+    fn note_running_cut(&mut self) {
+        let Some(bank) = self.family.expert_bank() else {
+            return;
+        };
+        let Some(RunningBegun { decided, held, moment }) = bank.running_begun() else {
+            return;
+        };
+        let tier = bank.holding_storage(BankHolding::Experts).expect("an expert bank holds its experts");
+        self.resize_held.begin_held(tier, decided, held);
+        assert!(self.running_release.replace((tier, moment)).is_none(), "the owner takes a running cut before the next begins");
+    }
+
+    /// The cut of the expert bank begun beside a running chain since the
+    /// owner last asked, taken: the storage it resizes and what the process
+    /// held as it was decided. The owner holds it as a Reclaim shrink it
+    /// began, which a later advance finishes
+    /// ([`Self::advance_expert_bank`]).
+    pub fn take_running_release(&mut self) -> Option<(crate::planning::BankTier, MemoryMoment)> {
+        self.running_release.take()
     }
 
     pub fn memory(&self) -> std::cell::Ref<'_, MemoryHeap> {
@@ -2273,6 +2487,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             pace: RefCell::new(MemoryPace::new()),
             #[cfg(test)]
             refreshes: std::cell::Cell::new(0),
+            running_release: None,
         };
         let bindings = StateBindings {
             target: target_state,

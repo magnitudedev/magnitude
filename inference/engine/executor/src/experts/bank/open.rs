@@ -197,6 +197,7 @@ impl ExpertBank {
                 slots,
                 resize: Resize::Idle(resizers.into_iter().flatten().collect()),
                 moves: None,
+                running: None,
             }),
             last_resize: Mutex::new(None),
             resize_thread,

@@ -696,6 +696,10 @@ impl ElasticBank for ServedBank {
         Ok(self.finished.lock().expect("table resize outcome").pop_front())
     }
 
+    fn running_begun(&self) -> Option<crate::domain::RunningBegun> {
+        self.bank.take_running_begun()
+    }
+
     fn in_gap(&self) -> bool {
         self.bank.watcher.shared().in_gap()
     }

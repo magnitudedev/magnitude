@@ -13,8 +13,8 @@
 //! frontier passed, learns the landings that ended, keeps the tier's
 //! map and reserve, carries the promotions, clears a prompt group's
 //! conveyor once nothing of it runs, fills the tier ahead of every step,
-//! joins a growth's slots, serves a resize and writes the policy words in
-//! a gap. Each turn of it runs on the load's events (`events`): a step's
+//! joins a growth's slots, serves a resize (a cut of the one store beside
+//! a running chain among them) and writes the policy words in a gap. Each turn of it runs on the load's events (`events`): a step's
 //! end (the frontier), a landing's or a read's end, a copy's completion, a
 //! growth joined, a resize asked, the request service's progress. It never
 //! waits on a time, and no job it does waits for another. It holds the lock
@@ -257,8 +257,9 @@ impl Residency {
     pub(super) const TURN: [Job<'static>; 5] = [&Self::learn, &Self::promote, &Self::clear, &Self::fill, &Self::publish_turn];
 
     /// A growth's slots joined, the steps the frontier passed retired, the
-    /// landings that ended learned and the tier's reserve kept; then a
-    /// resize asked served, which ends the turn. A fault of the executor's
+    /// landings that ended learned and the tier's reserve kept, and a cut
+    /// asked beside a running chain served; then a resize asked served,
+    /// which ends the turn. A fault of the executor's
     /// work, or the device lost under the parks, ends serving, as
     /// residency's own panic does, and the turn.
     fn learn(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
@@ -270,7 +271,9 @@ impl Residency {
         let retired = self.retire();
         let landed = self.prefetch.settle(&mut self.core.directory);
         self.refill_tier();
-        turn.changed = joined || retired || landed;
+        // A cut beside a running chain waits on nothing: served at once.
+        let cut = self.cut_running();
+        turn.changed = joined || retired || landed || cut;
         if let Some(asked) = self.asked.take().or_else(|| self.shared.resizing.asked().map(Asked::taken)) {
             self.asked = self.resize(asked, copier);
             return false;
@@ -499,7 +502,8 @@ impl Residency {
     /// while its group is whole and at home, no expert of it able to miss
     /// (`Directory::group_whole`: on the one store, its records the bank's,
     /// while it keeps every expert, as a bank imported whole there does) and
-    /// each at its home record (`Directory::group_at_home`): its route then
+    /// each at its home record (`Directory::group_at_home`), its records
+    /// every one its reservation holds (`Core::group_resident`): its route then
     /// writes no routing record, so the ranking is fed nothing of it and
     /// starts blank after a shrink,
     /// so a prompt group of whole layers is resident and lends nothing; and
@@ -522,8 +526,7 @@ impl Residency {
     /// which a settled tier keeps none in; otherwise only in a shrink
     /// between flights, after which this publishes.
     pub(super) fn publish_policy(&mut self) {
-        let directory = &self.core.directory;
-        let full = (0..self.core.groups.len()).map(|group| directory.group_whole(group) && directory.group_at_home(group)).collect::<Vec<_>>();
+        let full = (0..self.core.groups.len()).map(|group| self.core.group_resident(group)).collect::<Vec<_>>();
         let every = full.iter().all(|&full| full);
         let lender = self.scratch.conveyor.lending().group;
         let served = self.core.layers.iter().any(|layer| layer.site.is_some() && !(full[layer.group] && (every || lender != layer.group)));

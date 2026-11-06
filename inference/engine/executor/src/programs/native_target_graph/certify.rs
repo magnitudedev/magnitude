@@ -1,5 +1,5 @@
 use super::{
-    GroupExtents,
+    GroupRows,
     block::{BlockGraphInputs, checked_block_graph_draft},
     classes::{
         BlockOutputScales, BlockServed, FamilyOutline, Passes, StagedClass, Topology, UnreadScales,
@@ -9,13 +9,13 @@ use super::{
     },
     entry::{
         EntryTokens, TARGET_TABLE, embedding_weight, entry_graph_topology, keeps_token_rows,
-        notice_bytes, notice_rows, notifies_selection, target_weight, token_rows_extents,
+        notice_bytes, notice_rows, notifies_selection, target_weight,
     },
     heap::{
         GraphCounts, PlannedHeap, PlannedSealedGraphs, SealedGraphsHeap, block_binding_storage,
         block_graph_storage,
     },
-    prepared::{BlockGraphShape, block_scopes, per_layer_rows},
+    prepared::{BlockGraphShape, block_scopes},
     weights::{CheckedLandingEntries, activation},
 };
 use crate::{
@@ -58,11 +58,9 @@ pub(crate) fn checked_target_family_storage(
         .map(|certificate| certificate.resources)
 }
 
-/// The family's storage with the graphs a load of it seals and the host
-/// heap they hold, the upload regions of a workspace slot
-/// (`PreparedTargetGraphs::upload_regions`) and what its graphs are made of
-/// (`TargetFamilyCertificate::graphs`): what the load's assessment
-/// charges, from the one enumeration the sealer follows.
+/// The target family a load of `plan` prepares, as its assessment charges
+/// it ([`CheckedTargetFamily`]), from the one enumeration the sealer
+/// follows.
 pub(crate) fn checked_target_family(
     backend: BackendName,
     load: &ModelLoadPlan,
@@ -71,7 +69,7 @@ pub(crate) fn checked_target_family(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
 ) -> Result<CheckedTargetFamily, GraphError> {
-    certify_target_family(backend, load, geometry, state, plan, limits).map(TargetFamilyCertificate::checked)
+    certify_target_family(backend, load, geometry, state, plan, limits)?.checked(limits)
 }
 
 /// [`checked_target_family`] of `plan`'s family and of the same target's
@@ -84,19 +82,34 @@ pub(crate) fn checked_target_and_undrafted(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
 ) -> Result<[CheckedTargetFamily; 2], GraphError> {
-    certify_target_and_undrafted(backend, load, geometry, state, plan, limits)
-        .map(|families| families.map(TargetFamilyCertificate::checked))
+    let [target, undrafted] = certify_target_and_undrafted(backend, load, geometry, state, plan, limits)?;
+    Ok([target.checked(limits)?, undrafted.checked(limits)?])
 }
 
-/// A target family's storage, the graphs a load of it seals and their host
-/// heap, a workspace slot's upload regions and what its graphs are made of
-/// ([`checked_target_family`]).
-pub(crate) type CheckedTargetFamily = (CheckedGraphResources, PlannedSealedGraphs, Vec<u64>, LaunchGraphs);
+/// What the load's assessment charges of the target family, from the one
+/// enumeration the sealer follows ([`checked_target_family`]).
+pub(crate) struct CheckedTargetFamily {
+    /// The family's storage.
+    pub resources: CheckedGraphResources,
+    /// The graphs a load of it seals and the host heap they hold.
+    pub sealed: PlannedSealedGraphs,
+    /// The upload regions of a workspace slot
+    /// (`PreparedTargetGraphs::upload_regions`).
+    pub upload_regions: Vec<u64>,
+    /// What its graphs are made of (`TargetFamilyCertificate::graphs`).
+    pub graphs: LaunchGraphs,
+    /// The bytes the own buffers of a prompt group of the plan's chain
+    /// places hold beside the floor's (`GroupRows::group_bytes`), granted
+    /// when a group opens.
+    pub group_bytes: u64,
+}
 
 pub(super) struct TargetFamilyCertificate {
     pub(super) outline: FamilyOutline,
     /// How each block is served (`block_served`).
     pub(super) served: Vec<BlockServed>,
+    /// What its prompt groups' buffers span.
+    pub(super) group: GroupRows,
     pub(super) resources: CheckedGraphResources,
     /// What the family's decode and largest launches replay
     /// (`seismic::NativeGraphFamily::graphs`), bounded from the layouts the
@@ -123,8 +136,17 @@ pub(super) struct TargetFamilyCertificate {
 }
 
 impl TargetFamilyCertificate {
-    fn checked(self) -> CheckedTargetFamily {
-        (self.resources, self.sealed, self.upload_regions, self.graphs)
+    /// What the assessment charges of it, its prompt groups of `limits`'
+    /// chain places.
+    fn checked(self, limits: ResourceLimits) -> Result<CheckedTargetFamily, GraphError> {
+        let group_bytes = self.group.group_bytes(&self.served, limits.chain_capacity.get())?;
+        Ok(CheckedTargetFamily {
+            resources: self.resources,
+            sealed: self.sealed,
+            upload_regions: self.upload_regions,
+            graphs: self.graphs,
+            group_bytes,
+        })
     }
 }
 
@@ -560,13 +582,8 @@ impl FamilyLayouts {
         // (`PreparedTargetGraphs::binding_constant_bytes`).
         let mut resources = family.finish()?;
         let notice = notice_bytes(notice_rows(load, largest_rows))?;
-        let floor = GroupExtents::of(
-            tap_width.map(|width| (activation(geometry), [largest_rows, width])),
-            per_layer_rows(plan, largest_rows),
-            token_rows_extents(load, largest_rows),
-            &served,
-            largest_rows,
-        );
+        let group_rows = GroupRows::of(load, geometry, plan, tap_width, largest_rows);
+        let floor = group_rows.extents(&served, 1);
         let (group, pass) = (floor.bytes()?, floor.pass_bytes()?);
         resources.binding_constant_bytes = resources
             .binding_constant_bytes
@@ -700,6 +717,7 @@ impl FamilyLayouts {
         Ok(TargetFamilyCertificate {
             outline,
             served,
+            group: group_rows,
             resources,
             graphs,
             sealed,

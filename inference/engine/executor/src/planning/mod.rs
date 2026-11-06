@@ -53,7 +53,7 @@ pub use resources::{
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
     max_image_cells, reads_decoded_history,
 };
-pub(crate) use resources::serial_upload_regions;
+pub(crate) use resources::{class_bytes, graph_demand, serial_upload_regions};
 pub use weights::{
     AttentionBinding, AttentionShape, DenseBinding, DenseBranchBinding, DenseScales,
     DirectoryForm, EmbeddingBinding, FeaturesBinding, HeadBinding, Holding, HostPeak,
@@ -694,7 +694,9 @@ pub(crate) mod tests {
     /// entries (attention, gated delta, routed, the streams' and the n-gram
     /// input's) qualify in the forms their block graphs read and join, their
     /// target graphs seal, and their readout graphs, which read no norm, seal
-    /// at the storage their certification charges.
+    /// at the storage their certification charges; a prompt group's class
+    /// of three places holds the target buffers and chunk slots the plan
+    /// prices for it.
     #[test]
     fn a_streams_decoder_prepares_and_certifies_on_the_device() {
         let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
@@ -722,7 +724,8 @@ pub(crate) mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             max_image_cells: 0,
             lookahead: false,
-            chain_capacity: std::num::NonZeroUsize::MIN,
+            // A chain of three places: a group's class beyond the floor's.
+            chain_capacity: std::num::NonZeroUsize::new(3).unwrap(),
             conversations: std::num::NonZeroUsize::MIN,
         };
         let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
@@ -779,7 +782,7 @@ pub(crate) mod tests {
                 crate::UnpreparedUnits::ServeDefaults,
             )
             .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-            programs
+            let target = programs
                 .prepare_target_graphs(
                     &device,
                     draft.load(),
@@ -793,13 +796,31 @@ pub(crate) mod tests {
             let readout = programs
                 .prepare_target_readout_graphs(&device, draft.load(), &definition.decoder, limits)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-            let assessed = crate::programs::graph::readout::checked_readout_family_storage(
+            // The plan prices the class of its chain places as the load holds
+            // it: the target's group buffers and the chunk family's slots.
+            let checked = crate::programs::native_target_graph::checked_target_family(
+                backend,
+                draft.load(),
+                &definition.decoder,
+                &state,
+                draft.programs().target(),
+                limits,
+            )
+            .unwrap();
+            assert_eq!(target.group_bytes(3).unwrap(), checked.group_bytes, "{backend:?}");
+            let (assessed, chunk) = crate::programs::graph::readout::checked_readout_storage(
                 backend,
                 draft.load(),
                 &definition.decoder,
                 limits,
             )
             .unwrap();
+            let chunk = chunk.expect("a served readout has a prompt chunk's classes");
+            assert_eq!(
+                (readout.chunk_family().workspace_bytes(), readout.chunk_family().output_bytes(), readout.chunk_family().upload_bytes()),
+                (chunk.workspace, chunk.output, chunk.upload),
+                "{backend:?}"
+            );
             assert_eq!(
                 readout.family().workspace_bytes(),
                 assessed.workspace,

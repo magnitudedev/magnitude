@@ -1801,7 +1801,7 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
     // here, so no more than the startup slabs.
     assert_eq!(state.loaded_state_bytes().unwrap(), startup_state);
     let charge = terms
-        .charge(bounds, state_bytes, startup_state, startup_state)
+        .charge(bounds, state_bytes, startup_state, startup_state, ClaimDemand::default())
         .unwrap();
     assert_eq!(
         charge.allocation_bytes,
@@ -1844,6 +1844,21 @@ const NO_DEVICE_PROCESS: DeviceProcessBytes = DeviceProcessBytes {
     slack: 0,
 };
 
+/// A bank beyond its floor is confirmed beside its prompt groups' class:
+/// the class's device-side bytes join the serving and allocation figures,
+/// its host-reserved bytes (none a class holds, but a demand may name) do
+/// not, and nothing else moves.
+#[test]
+fn a_group_class_joins_what_a_bank_beyond_its_floor_is_confirmed_at() {
+    let charge = AssessmentMemoryCharge {
+        group_class: ClaimDemand { device: 3 * GIB, upload: GIB, host: 5 * GIB, ..ClaimDemand::default() },
+        ..fixture_charge(10 * GIB, 0)
+    };
+    let with = charge.clone().with_group_class().unwrap();
+    assert_eq!((with.serving_bytes, with.allocation_bytes), (14 * GIB, 14 * GIB));
+    assert_eq!(AssessmentMemoryCharge { serving_bytes: charge.serving_bytes, allocation_bytes: charge.allocation_bytes, ..with }, charge);
+}
+
 fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemoryCharge {
     AssessmentMemoryCharge {
         exact_resident_bytes: allocation_bytes,
@@ -1870,6 +1885,7 @@ fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemory
         staging_bytes,
         host_table_bytes: 0,
         weight_demand: ClaimDemand::default(),
+        group_class: ClaimDemand::default(),
     }
 }
 
@@ -1906,22 +1922,22 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
     };
     // The workload's state outgrows the load's startup state and peak:
     // the peak is not charged on top of it.
-    let charge = terms.charge(bounds, 90, 10, 15).unwrap();
+    let charge = terms.charge(bounds, 90, 10, 15, ClaimDemand::default()).unwrap();
     assert_eq!(charge.exact_resident_bytes, 100 + 20 + 5 + 90);
     assert_eq!(charge.allocation_bytes, 125 + 40 + 90);
     assert_eq!(charge.serving_bytes, 125 + 40 + 90);
     assert_eq!(charge.staging_bytes, 7);
     // The load's startup state and peak exceed the workload's state:
     // serving holds the workload's state, not the load's peak.
-    let loading = terms.charge(bounds, 50, 10, 15).unwrap();
+    let loading = terms.charge(bounds, 50, 10, 15, ClaimDemand::default()).unwrap();
     assert_eq!(loading.allocation_bytes, 125 + 40 + (10 + 60));
     assert_eq!(loading.serving_bytes, 125 + 40 + 50);
     // The loaded state follows the startup peak, so it bounds the load
     // only where it is the larger.
-    let warmed = terms.charge(bounds, 50, 10, 80).unwrap();
+    let warmed = terms.charge(bounds, 50, 10, 80, ClaimDemand::default()).unwrap();
     assert_eq!(warmed.allocation_bytes, 125 + 40 + 80);
-    assert!(terms.charge(bounds, u64::MAX, 10, 15).is_err());
-    assert!(terms.charge(bounds, 50, u64::MAX, 15).is_err());
+    assert!(terms.charge(bounds, u64::MAX, 10, 15, ClaimDemand::default()).is_err());
+    assert!(terms.charge(bounds, 50, u64::MAX, 15, ClaimDemand::default()).is_err());
     // An optional component a request loads at the fit depth claims its
     // import window beside the workload's state: serving's peak, and a
     // dedicated device stages the larger of the two windows.
@@ -1929,12 +1945,12 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
         component_upload_bytes: 30,
         ..bounds
     };
-    let loaded = terms.charge(component, 90, 10, 15).unwrap();
+    let loaded = terms.charge(component, 90, 10, 15, ClaimDemand::default()).unwrap();
     assert_eq!(loaded.allocation_bytes, 125 + 40 + 90 + 30);
     assert_eq!(loaded.serving_bytes, 125 + 40 + 90);
     assert_eq!(loaded.staging_bytes, 30);
     // The load's own peak still bounds it where it is the larger.
-    let early = terms.charge(component, 20, 10, 15).unwrap();
+    let early = terms.charge(component, 20, 10, 15, ClaimDemand::default()).unwrap();
     assert_eq!(early.allocation_bytes, 125 + 40 + (10 + 60));
     assert!(
         AssessmentMemoryTerms {

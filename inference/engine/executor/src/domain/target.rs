@@ -158,7 +158,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let decodes = operations.iter().all(|operation| matches!(operation, Operation::Forward { kind: WorkKind::Decode, .. }));
         // A bank shrink's step is the first decode launch after it began.
         let shrink_step = (decodes && std::mem::take(&mut self.shrink_step)).then(|| self.family.graph_replays().recorded);
-        let submitted = self.family.submit_target(chain, spare);
+        let submitted = self.submit_chain(chain, spare);
         if let Some(before) = shrink_step {
             assert_eq!(
                 self.family.graph_replays().recorded,

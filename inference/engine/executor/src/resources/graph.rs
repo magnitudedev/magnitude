@@ -1,6 +1,6 @@
 //! Bounded Seismic graph storage owned by the executor resource plan.
 
-use crate::{CapacityError, GraphSlots, InvariantError, ResourceDomainId, ResourceKind};
+use crate::{CapacityError, GraphSlots, InvariantError, ResourceDomainId, ResourceKind, planning::class_bytes};
 use seismic::{
     NativeExecutionArena, NativeGraphFamily, NativeGraphFamilyOutputSlot, NativeGraphFamilySlot,
     NativeGraphOutputs, NativeGraphPlan, Tensor, WorkflowTensor,
@@ -449,15 +449,6 @@ impl IdleSlots {
     }
 }
 
-/// The bytes of `activations` activations of `activation_bytes` and
-/// `outputs` output slots of `output_bytes`.
-fn class_bytes(activation_bytes: u64, activations: usize, output_bytes: u64, outputs: usize) -> Result<u64, &'static str> {
-    let slots = |bytes: u64, slots: usize| u64::try_from(slots).ok().and_then(|slots| bytes.checked_mul(slots));
-    slots(activation_bytes, activations)
-        .zip(slots(output_bytes, outputs))
-        .and_then(|(activations, outputs)| activations.checked_add(outputs))
-        .ok_or(OVERFLOW)
-}
 
 /// A failed vision slot growth: a class the load did not prepare, or the
 /// device's refusal.

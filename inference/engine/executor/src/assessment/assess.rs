@@ -12,6 +12,7 @@ use super::executor_costs::ExecutorCosts;
 use super::launches::Declarations;
 use super::misses::HeldSlots;
 use super::AssessmentError;
+use crate::memory::ClaimDemand;
 use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
@@ -445,10 +446,40 @@ impl StructuralCharge {
                 )
             })
             .and_then(|bounds| {
-                terms.charge(bounds, self.workload_state_bytes, self.startup_state_bytes, self.loaded_state_bytes)
+                terms.charge(
+                    bounds,
+                    self.workload_state_bytes,
+                    self.startup_state_bytes,
+                    self.loaded_state_bytes,
+                    group_class(draft, &self.graph)?,
+                )
             })
             .map_err(AssessmentError::Memory)
     }
+}
+
+/// What a prompt group's class of `draft`'s chain places holds beyond the
+/// floor's (`AssessmentMemoryCharge::group_class`), as a group opening
+/// grants it (`ExecutorDomain::grant_group`, `ExecutorFamily::group_demand`):
+/// the graph pools', graphs' and target buffers' (`graph`), the bank's
+/// placed words of its places and each streamed table's stagings beyond
+/// the floor's.
+fn group_class(draft: &ExecutionPlanDraft, graph: &crate::AssessmentGraphResourceBounds) -> Result<ClaimDemand, String> {
+    let limits = draft.policy().limits();
+    let places = limits.chain_capacity;
+    let pools = graph.group_class(limits, draft.device().graph_cost())?;
+    let bank = match (draft.load().expert_bank(), places.get()) {
+        (Some(bank), 2..) => bank.placed_demand(std::num::NonZeroU64::try_from(places).map_err(|_| "chain places exceed u64")?)?,
+        _ => ClaimDemand::default(),
+    };
+    let stagings = draft.load().weights().try_fold(0u64, |bytes, weight| {
+        let grown = weight.staging_bytes(places.get())?.checked_sub(weight.staging_bytes(1)?);
+        grown.and_then(|grown| bytes.checked_add(grown)).ok_or_else(|| "a group's stagings overflow".to_owned())
+    })?;
+    pools
+        .checked_plus(bank)
+        .and_then(|demand| demand.checked_plus(ClaimDemand { device: stagings, ..Default::default() }))
+        .ok_or_else(|| "a prompt group's class overflows".to_owned())
 }
 
 /// The plain decode step's demand of `definition` planned as `draft`,
@@ -521,8 +552,13 @@ pub fn assess_execution_fit(
         .find(|domain| domain.role == DomainRole::Allocation)
         .ok_or_else(|| AssessmentError::Memory("the fit reaches no allocation domain".into()))?;
     let bound = allocation.capacity_bytes - allocation.reserve_bytes;
-    let confirm = |_: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge| {
-        let fit = fit_of(charge)?;
+    let confirm = |candidate: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge| {
+        // A bank beyond its floor leaves its prompt groups' class room, as
+        // a load's plan does (`ExecutionPlanDraft::with_bank`).
+        let fit = match candidate.beyond_floor() {
+            true => fit_of(&charge.clone().with_group_class().map_err(AssessmentError::Memory)?)?,
+            false => fit_of(charge)?,
+        };
         Ok::<_, AssessmentError>(match fit.verdict {
             AssessmentFitVerdict::Fits => Ok((prepared.fit_context_tokens, fit.domains)),
             AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),

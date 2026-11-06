@@ -278,11 +278,15 @@ pub trait TargetProgram {
     /// chain's graphs rotate its launches' output slots and `spare`, each
     /// writing the one free slot and freeing the one it read. A rejected
     /// chain returns its still-owned launches so the domain can terminate
-    /// their groups without losing state ownership.
+    /// their groups without losing state ownership. A streamed load's chain
+    /// reads memory by `pressure` between its submissions, and cuts the
+    /// expert bank's one store beside its running steps where memory runs
+    /// short (`ExpertBank::release_running`).
     fn submit(
         &mut self,
         chain: Chain<ValidatedTargetLaunch>,
         spare: crate::TargetGraphOutputLease,
+        pressure: &dyn Fn() -> Option<crate::domain::RunningPressure>,
     ) -> Result<Chain<Self::Submission>, ChainRefusal>;
 }
 

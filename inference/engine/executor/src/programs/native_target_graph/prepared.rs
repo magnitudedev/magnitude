@@ -1,5 +1,5 @@
 use super::{
-    GroupExtents,
+    GroupExtents, GroupRows,
     block::{BlockGraphInputs, BlockGraphs, SealedBlockGraph},
     bound::{
         BlockBindings, BoundPerLayerEntry, BoundTargetGraphs, GroupBuffers, PassBuffers, TokenRows,
@@ -14,10 +14,8 @@ use super::{
     entry::{
         EntryTokens, PerLayerEntryGraphSource, PreparedPerLayerEntryGraph,
         PreparedTargetEntryGraph, notice_bytes, notice_rows, notifies_selection,
-        token_rows_extents,
     },
     heap::{GraphCounts, PlannedSealedGraphs, SealedGraphsHeap, SealedHeap, block_graph_storage},
-    weights::activation,
 };
 use crate::{
     ModelLoadPlan, ResidentTarget, ResourceLimits, StateResourcePlan, TargetProgramPlan,
@@ -64,27 +62,17 @@ pub struct PreparedTargetGraphs {
     selections: Vec<Option<crate::SelectionShape>>,
     family: NativeGraphFamily,
     max_output_bytes: u64,
-    /// The element and `[rows, taps · hidden]` extents of one region of the
-    /// draft input rows, when a separate draft taps the target.
-    tap_buffer: Option<(Element, [u64; 2])>,
     /// Per block, the tap indices its graph writes.
     taps: Vec<BlockTaps>,
     /// The first block of the stateless tail (`stateless_tail`).
     stateless_tail: usize,
     /// The per-layer entry graph per row class, of a per-layer entry.
     pub(super) per_layer_entries: BTreeMap<u64, PreparedPerLayerEntryGraph>,
-    /// The `[rows, L·P]` F32 extents of one region of the per-layer rows
-    /// every per-layer input sublayer reads.
-    per_layer_rows: Option<[u64; 2]>,
-    /// The `[rows, 2]` I32 extents of one region of the token rows a model
-    /// whose blocks read them keeps (`keeps_token_rows`).
-    token_rows: Option<[u64; 2]>,
     /// The rows of each copy of the selection notice a load with stored
     /// tables binds (`notice_rows`).
     notice_rows: Option<u64>,
-    /// The rows of one chain region of the launch-row buffers: the largest
-    /// row class.
-    region_rows: u64,
+    /// What its prompt groups' buffers span (`GroupRows`).
+    group: GroupRows,
     /// How each block is served, which decides its stages, with its routed
     /// layer's values (`block_served`), whose crossing and merged positions
     /// a group holds over its rows (`group_split`).
@@ -465,13 +453,13 @@ impl PreparedTargetGraphs {
 
     /// The buffers a prompt group of `places` places holds.
     pub(super) fn group_extents(&self, places: usize) -> GroupExtents {
-        GroupExtents::of(self.tap_buffer, self.per_layer_rows, self.token_rows, &self.served, self.region_start(places))
+        self.group.extents(&self.served, places)
     }
 
-    /// The bytes a prompt group of `places` places holds
-    /// (`BoundTargetGraphs::hold_group`).
-    pub(super) fn group_bytes(&self, places: usize) -> Result<u64, String> {
-        self.group_extents(places).bytes()
+    /// The bytes a prompt group of `places` places' own buffers hold beside
+    /// the floor's (`GroupRows::group_bytes`).
+    pub(crate) fn group_bytes(&self, places: usize) -> Result<u64, String> {
+        self.group.group_bytes(&self.served, places)
     }
 
     /// `notice`: the selection notice of a load that has one; `landing`: the
@@ -511,7 +499,7 @@ impl PreparedTargetGraphs {
         let certificate =
             certify_target_family(device.backend(), load, geometry, state, plan, limits)
                 .map_err(|error| error.to_string())?;
-        let TargetFamilyCertificate { outline, served, passes, .. } = certificate;
+        let TargetFamilyCertificate { outline, served, passes, group: certificate_group, .. } = certificate;
         let largest_rows = outline.largest_rows;
         let tap_width = outline.tap_width;
         let stateless_tail = stateless_tail(state, &outline.mixers, &outline.tapped);
@@ -843,14 +831,11 @@ impl PreparedTargetGraphs {
             selections: plan.blocks().iter().copied().map(slot_selection).collect(),
             family,
             max_output_bytes,
-            tap_buffer: tap_width.map(|width| (activation(geometry), [largest_rows, width])),
             taps: outline.tapped,
             stateless_tail,
             per_layer_entries,
-            per_layer_rows: per_layer_rows(plan, largest_rows),
-            token_rows: token_rows_extents(load, largest_rows),
             notice_rows: notice_rows(load, largest_rows),
-            region_rows: largest_rows,
+            group: certificate_group,
             served,
             passes,
             seal,
@@ -905,7 +890,7 @@ impl PreparedTargetGraphs {
     /// (`chain_rows`): the region the `region`th launch of a chain writes
     /// and reads.
     pub(crate) fn region_start(&self, region: usize) -> u64 {
-        self.region_rows * region as u64
+        self.group.region_start(region)
     }
 
     /// The tap indices block `index` writes.
@@ -1035,7 +1020,7 @@ impl PreparedTargetGraphs {
             }
         };
         let floor = Rc::new(GroupBuffers::new(self, &device, 1, pass.as_ref()).map_err(|error| error.to_string())?);
-        let per_layer = match (&resident.per_layer, self.per_layer_rows) {
+        let per_layer = match (&resident.per_layer, self.group.per_layer) {
             (None, None) => None,
             (Some(weights), Some(extents)) => Some(BoundPerLayerEntry {
                 bound: self

@@ -207,6 +207,12 @@ pub trait ElasticBank {
     /// ended. The resize finished here, if one did.
     fn advance(&self, wake: crate::CompletionWake) -> Result<Option<BankResized>, super::DomainError>;
 
+    /// The cut of the expert bank a chain's encoding began beside its
+    /// running steps since this was last asked (`ExpertBank::release_running`),
+    /// taken: a resize begun off the domain's decisions, which a later
+    /// advance finishes as any shrink.
+    fn running_begun(&self) -> Option<RunningBegun>;
+
     /// Whether no step runs: a gap between flights, where a shrink may ask
     /// the watcher. Steps begin and end on the owner's thread, so a gap it
     /// sees holds until it begins one.
@@ -285,6 +291,27 @@ pub struct HostResidency {
 pub enum BankResize {
     Shrank { cause: ShrinkCause, to: u64, by: std::num::NonZeroU64, at_unix_ms: u64 },
     Grew { from: u64, by: std::num::NonZeroU64, at_unix_ms: u64 },
+}
+
+/// What a chain's encoding finds memory short of between its submissions
+/// (`ExecutorDomain::submit_chain`'s probe): the bytes the expert bank's
+/// storage is short of now (`MemoryPace::shortfall`), and what the process
+/// held as it read them.
+#[derive(Clone, Copy, Debug)]
+pub struct RunningPressure {
+    pub bytes: u64,
+    pub held: super::MemoryMoment,
+}
+
+/// A cut of the expert bank begun beside a running chain
+/// ([`ElasticBank::running_begun`]): when it was decided, how long beginning
+/// it held the submitting thread, and what the process held as it was
+/// decided.
+#[derive(Clone, Copy, Debug)]
+pub struct RunningBegun {
+    pub decided: std::time::Instant,
+    pub held: std::time::Duration,
+    pub moment: super::MemoryMoment,
 }
 
 /// Why the owner shrank the expert bank.
@@ -563,11 +590,14 @@ pub trait ProgramFamily: 'static {
     fn waiting_group(&self, capacity: usize) -> usize;
 
     /// Submit a chain of target launches and its spare output slot
-    /// (`TargetProgram::submit`).
+    /// (`TargetProgram::submit`), its encoding reading memory between its
+    /// submissions by `pressure`, handed the family's expert bank
+    /// (`ExpertBank::release_running`).
     fn submit_target(
         &mut self,
         chain: Chain<ValidatedTargetLaunch>,
         spare: crate::TargetGraphOutputLease,
+        pressure: &dyn Fn(&dyn ElasticBank) -> Option<RunningPressure>,
     ) -> Result<Chain<Self::TargetSubmission>, crate::programs::ChainRefusal>;
     fn submit_head(
         &mut self,
@@ -904,8 +934,10 @@ impl ProgramFamily for NativeFamily {
         &mut self,
         chain: Chain<ValidatedTargetLaunch>,
         spare: crate::TargetGraphOutputLease,
+        pressure: &dyn Fn(&dyn ElasticBank) -> Option<RunningPressure>,
     ) -> Result<Chain<Self::TargetSubmission>, crate::programs::ChainRefusal> {
-        self.target.submit(chain, spare)
+        let bank = self.bank.as_ref().map(|bank| bank as &dyn ElasticBank);
+        self.target.submit(chain, spare, &|| bank.and_then(pressure))
     }
     fn submit_head(
         &mut self,

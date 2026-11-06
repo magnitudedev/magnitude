@@ -1825,6 +1825,20 @@ pub(crate) fn checked_readout_family_storage(
     geometry: &Decoder,
     limits: ResourceLimits,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
+    let (family, _) = checked_readout_storage(backend, load, geometry, limits)?;
+    Ok(family)
+}
+
+/// The readout family's storage ([`checked_readout_family_storage`]) and
+/// its chunk family's: the most of a prompt chunk's classes
+/// ([`chunk_holds`]), whose slots a prompt group's class grows; none of a
+/// load whose readout has no such class.
+pub(crate) fn checked_readout_storage(
+    backend: BackendName,
+    load: &ModelLoadPlan,
+    geometry: &Decoder,
+    limits: ResourceLimits,
+) -> Result<(NativeGraphStorageBytes, Option<NativeGraphStorageBytes>), GraphError> {
     let norm = target_readout_norm(load, geometry)?;
     let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
     let regimes = certify_readout_regimes(
@@ -1835,11 +1849,12 @@ pub(crate) fn checked_readout_family_storage(
         FeatureSource::of(load),
         limits,
     )?;
-    regimes
-        .values()
-        .map(NativeGraphLayout::storage_bytes)
-        .reduce(NativeGraphStorageBytes::most)
-        .ok_or_else(|| "readout graph family has no classes".into())
+    let most = |layouts: &mut dyn Iterator<Item = &NativeGraphLayout>| {
+        layouts.map(NativeGraphLayout::storage_bytes).reduce(NativeGraphStorageBytes::most)
+    };
+    let family = most(&mut regimes.values()).ok_or("readout graph family has no classes")?;
+    let chunk = most(&mut regimes.iter().filter(|((_, _, chunk), _)| *chunk).map(|(_, layout)| layout));
+    Ok((family, chunk))
 }
 
 /// The structure a readout class selects: its kind; for a selection, the

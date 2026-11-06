@@ -1061,6 +1061,22 @@ impl Directory {
         self.host[group].shrink(records, rank).into_iter().map(|(from, to)| (HostRecord(from), HostRecord(to))).collect()
     }
 
+    /// The fewest records group `group`'s one store may be cut to beside
+    /// running steps ([`HostRecords::running_floor`]).
+    pub fn running_floor(&self, group: usize) -> u32 {
+        self.host[group].running_floor()
+    }
+
+    /// Cut group `group`'s one store to `records` records beside running
+    /// steps, at least [`Self::running_floor`], nothing moved: each expert
+    /// kept at or past the cut unmapped from `until` of it on
+    /// ([`HostRecords::cut_running`]). The ranking's shares shrink too.
+    pub fn cut_running(&mut self, group: usize, records: u32, until: impl Fn(Staged) -> Step) {
+        assert!(self.placer == crate::planning::Placer::Bank, "only the one store is cut beside running steps");
+        self.resized(group, records as usize);
+        self.host[group].cut_running(records, until);
+    }
+
     /// The bank no longer holds `layer`'s `expert`, last read at `read`: its
     /// host tier holds it alone where a record keeps its copy, ranked beside
     /// that read, and otherwise only the file holds it. Nothing is written

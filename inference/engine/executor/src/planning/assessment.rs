@@ -10,7 +10,7 @@
 //! physical representations and codec planes; the platform policy owns each
 //! domain's stable capacity and reserve.
 
-use super::resources::{NativeGraphCharge, history_row_bytes, recurrent_bank_bytes};
+use super::resources::{GraphSlots, NativeGraphCharge, history_row_bytes, recurrent_bank_bytes};
 use super::{
     ComponentSelection, ModelLoadPlan, PlannedMethod, ResourceLimits,
 };
@@ -409,6 +409,11 @@ pub struct AssessmentMemoryCharge {
     /// Complete physical weight demand, part of `allocation_bytes`: each
     /// allocation in the storage it lies in (`assess_fit`).
     pub weight_demand: ClaimDemand,
+    /// What a prompt group's class of the plan's chain places holds beyond
+    /// the floor's, granted as a group opens (`ExecutorDomain::grant_group`)
+    /// and so part of no other figure: a bank planned beyond its floor
+    /// leaves room for it (`ExecutionPlanDraft::with_bank`).
+    pub group_class: ClaimDemand,
 }
 
 /// A complete fit result: every domain the load touches, and whether the
@@ -442,17 +447,21 @@ pub struct TargetGraphBounds {
     pub sealed: crate::PlannedSealedGraphs,
     /// The constants and floor buffers its binding allocates.
     pub binding_constant_bytes: u64,
+    /// The bytes its own buffers of a prompt group of the plan's chain
+    /// places hold beyond the floor's (`CheckedTargetFamily::group_bytes`).
+    pub group_bytes: u64,
 }
 
 impl TargetGraphBounds {
     fn of(
-        (resources, sealed, upload_regions, graphs): crate::programs::native_target_graph::CheckedTargetFamily,
+        family: crate::programs::native_target_graph::CheckedTargetFamily,
         slots: super::GraphSlots,
     ) -> Result<Self, String> {
         Ok(Self {
-            charge: NativeGraphCharge::from_checked(resources.storage, upload_regions, slots, graphs)?,
-            sealed,
-            binding_constant_bytes: resources.binding_constant_bytes,
+            charge: NativeGraphCharge::from_checked(family.resources.storage, family.upload_regions, slots, family.graphs)?,
+            sealed: family.sealed,
+            binding_constant_bytes: family.resources.binding_constant_bytes,
+            group_bytes: family.group_bytes,
         })
     }
 }
@@ -488,6 +497,9 @@ pub struct UndraftedBounds {
 pub struct AssessmentGraphResourceBounds {
     pub target: TargetGraphBounds,
     pub readout: NativeGraphCharge,
+    /// A prompt chunk's readout family, at no slots: a group's class grows
+    /// it; none of a readout without a chunk's classes.
+    pub chunk_readout: Option<NativeGraphCharge>,
     pub head: Option<NativeGraphCharge>,
     pub vision: Option<NativeGraphCharge>,
     pub state: NativeGraphCharge,
@@ -511,6 +523,40 @@ pub struct AssessmentGraphResourceBounds {
 }
 
 impl AssessmentGraphResourceBounds {
+    /// What a prompt group's class of `limits`' chain places holds beyond
+    /// the floor's of one place, as a group opening grants it
+    /// (`ExecutorDomain::grant_group`): its pools' slots
+    /// (`ResourceLimits::class_slots`; the target's and the head's beyond
+    /// their floor's, a chunk's readout slots beyond the floor's readout
+    /// slots), the graphs they record priced by `cost` beyond the startup
+    /// graphs', and the target's own group buffers.
+    pub fn group_class(&self, limits: ResourceLimits, cost: seismic::GraphCost) -> Result<ClaimDemand, String> {
+        let (floor, class) = (limits.class_slots(1), limits.class_slots(limits.chain_capacity.get()));
+        let chunks = GraphSlots {
+            activations: class.readout.activations.saturating_sub(floor.readout.activations),
+            output: class.readout.output.saturating_sub(floor.readout.output),
+        };
+        let none = GraphSlots { activations: 0, output: 0 };
+        let grown = [
+            Some((&self.target.charge, floor.target, class.target)),
+            self.chunk_readout.as_ref().map(|chunk| (chunk, none, chunks)),
+            self.head.as_ref().map(|head| (head, floor.head, class.head)),
+        ];
+        let (pools, graphs) = grown.into_iter().flatten().try_fold(
+            (self.target.group_bytes, seismic::GraphCensus::default()),
+            |(bytes, census), (charge, from, to)| {
+                let (more, graphs) = charge.growth(from, to)?;
+                bytes
+                    .checked_add(more)
+                    .zip(census.plus(graphs))
+                    .ok_or_else(|| "a prompt group's class overflows".to_owned())
+            },
+        )?;
+        super::graph_demand(cost, self.recorded_graphs, graphs)?
+            .checked_plus(ClaimDemand { device: pools, ..Default::default() })
+            .ok_or_else(|| "a prompt group's class overflows".to_owned())
+    }
+
     pub fn derive(
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
@@ -624,15 +670,14 @@ impl AssessmentGraphResourceBounds {
     ) -> Result<Self, GraphError> {
         // The same startup slots a load commits: one request's need.
         let slots = limits.startup_slots();
-        let readout = NativeGraphCharge::serial(
-            crate::programs::graph::readout::checked_readout_family_storage(
-                backend,
-                load,
-                &definition.decoder,
-                limits,
-            )?,
-            slots.readout,
-        )?;
+        let (readout_storage, chunk_storage) =
+            crate::programs::graph::readout::checked_readout_storage(backend, load, &definition.decoder, limits)?;
+        let readout = NativeGraphCharge::serial(readout_storage, slots.readout)?;
+        // A prompt chunk's readout slots: none until a group's class grants
+        // places (`ResourcePlanner::plan_with_state`).
+        let chunk_readout = chunk_storage
+            .map(|storage| NativeGraphCharge::serial(storage, GraphSlots { activations: 0, output: 0 }))
+            .transpose()?;
         let (head, head_constant_bytes, drafter_graph_host_bytes) =
             match (plan.head(), plan.draft(), state.head_state()) {
                 // A head reading target history keeps no state of its own.
@@ -763,6 +808,7 @@ impl AssessmentGraphResourceBounds {
         Ok(Self {
             target,
             readout,
+            chunk_readout,
             head,
             vision,
             state,
@@ -964,13 +1010,15 @@ impl AssessmentMemoryTerms {
     /// an optional component a request loads there; and the load itself,
     /// its startup state with the qualification/import peak, then its state
     /// once loaded. A dedicated device's staging domain holds the larger
-    /// upload window.
+    /// upload window. A prompt group's class beyond the floor's,
+    /// `group_class`, is carried beside them, in none of them.
     pub fn charge(
         self,
         bounds: AssessmentMemoryBounds,
         state_slab_bytes: u64,
         startup_state_bytes: u64,
         loaded_state_bytes: u64,
+        group_class: ClaimDemand,
     ) -> Result<AssessmentMemoryCharge, String> {
         AssessmentMemoryCharge::compose(
             self.exact_resident_bytes(0)?,
@@ -980,6 +1028,7 @@ impl AssessmentMemoryTerms {
             startup_state_bytes,
             loaded_state_bytes,
             self.host_table_bytes,
+            group_class,
         )
     }
 }
@@ -997,6 +1046,7 @@ impl AssessmentMemoryCharge {
         startup_state_bytes: u64,
         loaded_state_bytes: u64,
         host_table_bytes: u64,
+        group_class: ClaimDemand,
     ) -> Result<Self, String> {
         let exact_resident_bytes = weight_bytes
             .checked_add(state_slab_bytes)
@@ -1030,6 +1080,7 @@ impl AssessmentMemoryCharge {
                 .max(bounds.component_upload_bytes),
             host_table_bytes,
             weight_demand,
+            group_class,
         })
     }
 
@@ -1055,6 +1106,7 @@ impl AssessmentMemoryCharge {
             self.startup_state_bytes,
             self.loaded_state_bytes,
             self.host_table_bytes,
+            self.group_class,
         )
     }
 
@@ -1071,6 +1123,25 @@ impl AssessmentMemoryCharge {
             serving_bytes: grown(self.serving_bytes)?,
             allocation_bytes: grown(self.allocation_bytes)?,
             weight_demand: self.weight_demand.checked_plus(more).ok_or("weight demand overflows")?,
+            ..self
+        })
+    }
+
+    /// The charge of a load whose prompt groups hold their class of the
+    /// plan's chain places beside the rest ([`Self::group_class`]): what a
+    /// bank planned beyond its floor is confirmed at, so the bank leaves the
+    /// room a group's places take. Its device-side bytes, as
+    /// `ExecutionPlanDraft::allocated` reads the weights'.
+    pub fn with_group_class(self) -> Result<Self, String> {
+        let bytes = self
+            .group_class
+            .checked_bytes()
+            .and_then(|bytes| bytes.checked_sub(self.group_class.host))
+            .ok_or("a prompt group's class overflows")?;
+        let grown = |figure: u64| figure.checked_add(bytes).ok_or("assessment charge overflows");
+        Ok(Self {
+            serving_bytes: grown(self.serving_bytes)?,
+            allocation_bytes: grown(self.allocation_bytes)?,
             ..self
         })
     }

@@ -282,18 +282,25 @@ impl WeightPlan {
             return Ok([0; 4]);
         };
         let rows = |rows| self.table_rows_shape(rows);
-        let stagings = match streamed.fill {
-            TableFill::Imported(flights) => flights.stagings(1) as u64,
-            TableFill::Stored => 0,
-        };
         Ok([
             representation_bytes(Element::i32(), &self.directory_shape())?,
-            representation_bytes(self.upload, &rows(streamed.staging_rows))?
-                .checked_mul(stagings)
-                .ok_or("a streamed table's stagings overflow")?,
+            self.staging_bytes(1)?,
             representation_bytes(self.upload, &rows(streamed.landing_rows))?,
             representation_bytes(Element::i32(), &[streamed.landing_rows, 2])?,
         ])
+    }
+
+    /// The stagings a streamed table's tiles pass through, as stored, that a
+    /// held class of `places` places has in flight (`TableFlights::stagings`,
+    /// `DeviceTable::hold_places`); none of a weight held whole or a stored
+    /// table.
+    pub fn staging_bytes(&self, places: usize) -> Result<u64, String> {
+        let Some(StreamedRows { fill: TableFill::Imported(flights), staging_rows, .. }) = self.streamed() else {
+            return Ok(0);
+        };
+        representation_bytes(self.upload, &self.table_rows_shape(staging_rows))?
+            .checked_mul(flights.stagings(places) as u64)
+            .ok_or_else(|| "a streamed table's stagings overflow".to_owned())
     }
 
     /// Every resident byte of the weight: its representation, its scale, its

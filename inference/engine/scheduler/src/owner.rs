@@ -1775,6 +1775,15 @@ trait MemoryStep: MemoryHost + Sized {
                 self.memory().ladder.owed = true;
             }
         }
+        // A cut of the expert bank a chain's encoding began beside its
+        // running steps, memory found short between its submissions
+        // (`ExecutorDomain::take_running_release`), is a Reclaim shrink this
+        // owner holds as begun: the advance that finishes it reports it as
+        // any.
+        if let Some((tier, held)) = self.domain().take_running_release() {
+            let begun = BankBegun { held, cause: BankBegunFor::Shrink(ShrinkCause::Reclaim) };
+            self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
+        }
         let mut bindings = bindings;
         // A flight boundary: newly stored costs price the experts first, so
         // every decision past it is made on them; the expert bank's resize

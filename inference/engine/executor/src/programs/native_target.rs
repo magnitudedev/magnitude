@@ -133,9 +133,12 @@ fn wait_all(completions: Vec<NativeGraphCompletion>) -> Result<(), SubmitError> 
 /// of N runs has about log2(N) submission boundaries instead of N. Every
 /// run replays one of the graphs its family's slots hold
 /// (`seismic::NativeGraphFamily::launch`), so a sequence of any length and
-/// mix of places and classes records nothing once each shape has run.
-struct StepSubmitter {
+/// mix of places and classes records nothing once each shape has run. A
+/// scratch-served chain's submissions are its release's boundaries
+/// ([`RunningRelease`]).
+struct StepSubmitter<'p> {
     device: Device,
+    release: Option<RunningRelease<'p>>,
     sequence: NativeGraphSequence,
     queued: usize,
     limit: usize,
@@ -154,6 +157,25 @@ struct StepSubmitter {
     landed: Vec<SubmittedRead>,
 }
 
+/// A scratch-served chain's release of its load's expert bank beside its
+/// running steps (`ExpertBank::release_running`), taken at each submission
+/// of its runs: the bank, the chain's first and last steps, what reads
+/// memory, the last block every pass of which is queued and the last
+/// submitted, and the block a cut's install awaits the submission of. A
+/// chain's encoding is throttled by the device, so its submissions come at
+/// the device's pace (a 16k prompt's chain of 31 chunks, 43 s on an M4 Pro,
+/// about every 29 ms): memory another program takes while it runs is
+/// answered within the passes the watcher decided ahead of them, not at
+/// the chain's end.
+struct RunningRelease<'p> {
+    bank: Arc<crate::experts::ExpertBank>,
+    chain: (u64, u64),
+    pressure: &'p dyn Fn() -> Option<crate::domain::RunningPressure>,
+    queued: Option<usize>,
+    submitted: Option<usize>,
+    awaits: Option<usize>,
+}
+
 /// A run's read of a stored table: the table and the step it queued there.
 #[derive(Clone)]
 pub struct StoredRead {
@@ -168,10 +190,11 @@ impl StoredRead {
     }
 }
 
-impl StepSubmitter {
-    fn new(device: &Device) -> Self {
+impl<'p> StepSubmitter<'p> {
+    fn new(device: &Device, release: Option<RunningRelease<'p>>) -> Self {
         Self {
             device: device.clone(),
+            release,
             sequence: device.native_sequence(NativeQueue::Compute),
             queued: 0,
             limit: 1,
@@ -263,7 +286,8 @@ impl StepSubmitter {
     }
 
     /// Submit what is queued, with the reads its runs make; those of the
-    /// run about to be queued stay pending.
+    /// run about to be queued stay pending. A submission is a boundary of
+    /// the chain's release: every pass queued is submitted.
     fn flush(&mut self) -> Result<(), SubmitError> {
         self.queued = 0;
         let sequence = std::mem::replace(&mut self.sequence, self.device.native_sequence(NativeQueue::Compute));
@@ -272,9 +296,27 @@ impl StepSubmitter {
             self.reads.extend(self.pending_reads.drain(..self.queued_reads));
             self.landed
                 .extend(self.pending_landed.drain(..self.queued_landed).map(SelectedRead::submitted));
+            if let Some(release) = &mut self.release {
+                release.submitted = release.queued;
+                release.awaits = release.bank.release_running(release.chain, release.submitted, release.pressure);
+            }
         }
         (self.queued_reads, self.queued_landed) = (0, 0);
         Ok(())
+    }
+
+    /// Every pass of the chain's blocks through `through` is queued (none
+    /// where no block's is): submitted at once where a cut's install awaits
+    /// them, so it installs at this boundary.
+    fn passed(&mut self, through: Option<usize>) -> Result<(), SubmitError> {
+        let Some(release) = &mut self.release else {
+            return Ok(());
+        };
+        release.queued = through;
+        match release.awaits.zip(through) {
+            Some((block, through)) if through >= block => self.flush(),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -1247,6 +1289,7 @@ impl NativeTargetProgram {
         &self,
         chain: Chain<ValidatedTargetLaunch>,
         spare: &mut TargetGraphOutputLease,
+        pressure: &dyn Fn() -> Option<crate::domain::RunningPressure>,
     ) -> Result<Chain<(ValidatedTargetLaunch, DeviceStep)>, super::ChainRefusal> {
         let refused = |error, chain| super::ChainRefusal { error, chain };
         // A streamed load's steps, in chain order, one group: the watcher
@@ -1295,8 +1338,19 @@ impl NativeTargetProgram {
             }
             None => (chain.map(|launch| (launch, None)), None),
         };
+        // A scratch-served chain is a prompt group's, whose steps run long
+        // (a 16k prompt's 31 chunks one chain of 43 s): memory is read and
+        // the bank released between its submissions.
+        let release = match (&self.graphs.bank, serving) {
+            (Some(bank), Some(serving)) if serving.scratch() => {
+                let sequences = steps.iter().filter_map(|(_, banked)| banked.as_ref().map(|(_, step)| step.sequence()));
+                let (first, last) = sequences.fold((u64::MAX, 0), |(first, last), sequence| (first.min(sequence), last.max(sequence)));
+                Some(RunningRelease { bank: bank.clone(), chain: (first, last), pressure, queued: None, submitted: None, awaits: None })
+            }
+            _ => None,
+        };
         let (mut submitter, queued) = steps.scoped(
-            StepSubmitter::new(&self.device),
+            StepSubmitter::new(&self.device, release),
             |steps, submitter| self.queue_runs(steps, spare, &sets, serving, submitter),
         );
         match queued {
@@ -1415,6 +1469,9 @@ impl NativeTargetProgram {
         // block's reads its earlier fronts requested.
         for index in 0..=self.geometry.blocks.len() {
             self.run_sets(&mut runs, index, sets, scratch, reads, &mut rotation, submitter)?;
+            // Every pass of the block before is queued: a pass runs at the
+            // set's next block (`run_sets`).
+            submitter.passed(index.checked_sub(1))?;
         }
         runs.try_map(|run| {
             let (readout, commits) = self.finish_run(run, &mut rotation, submitter)?;
@@ -2452,8 +2509,9 @@ impl TargetProgram for NativeTargetProgram {
         &mut self,
         chain: Chain<ValidatedTargetLaunch>,
         mut spare: TargetGraphOutputLease,
+        pressure: &dyn Fn() -> Option<crate::domain::RunningPressure>,
     ) -> Result<Chain<Self::Submission>, super::ChainRefusal> {
-        Ok(self.queue_chain(chain, &mut spare)?.map(|(launch, queued)| {
+        Ok(self.queue_chain(chain, &mut spare, pressure)?.map(|(launch, queued)| {
             let (core, workspace) = launch.into_submission_parts();
             let boundary = core.boundary().cloned();
             DeviceSubmission::new(

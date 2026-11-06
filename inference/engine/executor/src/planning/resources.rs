@@ -530,6 +530,55 @@ impl NativeGraphCharge {
     }
 }
 
+impl NativeGraphCharge {
+    /// What growing the family's slots from `from` to `to` allocates
+    /// ([`class_bytes`] of the slots beyond `from`) and adds to the device's
+    /// graph budget: its hold at `to`'s activations beyond its hold at
+    /// `from`'s, each a launch in flight (`seismic::LaunchGraphs::held`).
+    /// What a pool of it allocates and records as it grows
+    /// (`NativeGraphPool::hold_bytes`, `hold_graphs`).
+    pub(crate) fn growth(&self, from: GraphSlots, to: GraphSlots) -> Result<(u64, seismic::GraphCensus), String> {
+        let bytes = class_bytes(
+            self.activation_bytes(),
+            to.activations.saturating_sub(from.activations),
+            self.output_bytes,
+            to.output.saturating_sub(from.output),
+        )?;
+        let held = |activations: usize| u64::try_from(activations).ok().and_then(|activations| self.graphs.held(activations));
+        let graphs = held(to.activations.max(from.activations))
+            .zip(held(from.activations))
+            .and_then(|(grown, held)| grown.minus(held))
+            .ok_or("a graph family's hold overflows")?;
+        Ok((bytes, graphs))
+    }
+}
+
+/// The bytes of `activations` activations of `activation_bytes` and
+/// `outputs` output slots of `output_bytes`.
+pub(crate) fn class_bytes(activation_bytes: u64, activations: usize, output_bytes: u64, outputs: usize) -> Result<u64, &'static str> {
+    let slots = |bytes: u64, slots: usize| u64::try_from(slots).ok().and_then(|slots| bytes.checked_mul(slots));
+    slots(activation_bytes, activations)
+        .zip(slots(output_bytes, outputs))
+        .and_then(|(activations, outputs)| activations.checked_add(outputs))
+        .ok_or("a graph pool's bytes overflow")
+}
+
+/// What recording the graphs of `more` takes on a device of `cost` whose
+/// graph budget is `budget` (`seismic::Device::graph_budget`): the memory
+/// the budget with them costs beyond what it costs now, in the storage the
+/// graphs hold it in. A device's graphs are priced as a whole, so the
+/// difference counts the granules `more` adds.
+pub(crate) fn graph_demand(
+    cost: seismic::GraphCost,
+    budget: seismic::GraphCensus,
+    more: seismic::GraphCensus,
+) -> Result<crate::memory::ClaimDemand, String> {
+    let priced = |census| cost.bytes(census).ok_or_else(|| "a graph budget's memory overflows".to_owned());
+    let grown = budget.plus(more).ok_or("a graph budget overflows")?;
+    let bytes = priced(grown)?.beyond(priced(budget)?);
+    Ok(crate::memory::ClaimDemand { device: bytes.device, upload: bytes.upload, ..Default::default() })
+}
+
 /// What the startup activations of `charges` hold of their device's graph
 /// budget: each family's graphs at its activations, each a launch in
 /// flight (`NativeGraphCharge::graphs`), whatever places or classes they

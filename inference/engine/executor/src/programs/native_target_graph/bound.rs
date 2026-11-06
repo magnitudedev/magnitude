@@ -288,10 +288,7 @@ impl BoundTargetGraphs {
     /// The bytes a group of `places` places' buffers hold beside the floor's
     /// (`hold_group`): none of one place, which the floor serves.
     pub(crate) fn group_bytes(&self, places: usize) -> Result<u64, String> {
-        match places {
-            1 => Ok(0),
-            _ => self.prepared.group_bytes(places),
-        }
+        self.prepared.group_bytes(places)
     }
 
     /// Hold a group of `places` places' buffers in place of any held now

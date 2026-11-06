@@ -90,6 +90,67 @@ impl GroupExtents {
     }
 }
 
+/// What a load's prompt-group buffers span (`GroupExtents`): a region of
+/// the largest row class per place, of the draft input rows of a tapped
+/// target, the per-layer rows and the kept token rows. The one derivation
+/// the certificate (what a plan charges) and the prepared family (what a
+/// load holds) read.
+#[derive(Clone, Copy, Debug)]
+struct GroupRows {
+    /// The element and `[rows, taps · hidden]` extents of one region of the
+    /// draft input rows, when a separate draft taps the target.
+    taps: Option<(Element, [u64; 2])>,
+    /// The `[rows, L·P]` F32 extents of one region of the per-layer rows
+    /// every per-layer input sublayer reads.
+    per_layer: Option<[u64; 2]>,
+    /// The `[rows, 2]` I32 extents of one region of the token rows a model
+    /// whose blocks read them keeps (`keeps_token_rows`).
+    tokens: Option<[u64; 2]>,
+    /// The rows of one chain region of the launch-row buffers: the largest
+    /// row class.
+    region_rows: u64,
+}
+
+impl GroupRows {
+    fn of(
+        load: &crate::ModelLoadPlan,
+        geometry: &magnitude_family_contracts::Decoder,
+        plan: &crate::TargetProgramPlan,
+        tap_width: Option<u64>,
+        largest_rows: u64,
+    ) -> Self {
+        Self {
+            taps: tap_width.map(|width| (activation(geometry), [largest_rows, width])),
+            per_layer: prepared::per_layer_rows(plan, largest_rows),
+            tokens: entry::token_rows_extents(load, largest_rows),
+            region_rows: largest_rows,
+        }
+    }
+
+    /// The first row of chain region `region` of the launch-row buffers
+    /// (`chain_rows`): the region the `region`th launch of a chain writes
+    /// and reads.
+    fn region_start(&self, region: usize) -> u64 {
+        self.region_rows * region as u64
+    }
+
+    /// The buffers a prompt group of `places` places holds over the blocks
+    /// `served`.
+    fn extents(&self, served: &[BlockServed], places: usize) -> GroupExtents {
+        GroupExtents::of(self.taps, self.per_layer, self.tokens, served, self.region_start(places))
+    }
+
+    /// The bytes a group of `places` places' own buffers hold beside the
+    /// floor's (`BoundTargetGraphs::hold_group`): none of one place, which
+    /// the floor serves.
+    fn group_bytes(&self, served: &[BlockServed], places: usize) -> Result<u64, String> {
+        match places {
+            1 => Ok(0),
+            _ => self.extents(served, places).bytes(),
+        }
+    }
+}
+
 /// The split values of a load's routed layers (`BlockServed::split`), of a
 /// load whose blocks split: never empty.
 #[derive(Clone)]

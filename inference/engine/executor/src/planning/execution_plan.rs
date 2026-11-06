@@ -366,13 +366,21 @@ impl ExecutionPlanDraft {
     ) -> Result<ChargedDraft<C>, PlanError> {
         let mut held = HeldCharges::default();
         let capacity = self.device.assessment_capacity_bytes;
+        // A bank beyond its floor is admitted beside its prompt groups' class
+        // of the planned places (`AssessmentMemoryCharge::with_group_class`);
+        // at its floor, which the load needs to run, as the rest of the load
+        // is.
         let confirm = |draft: &Self, charge: &AssessmentMemoryCharge| {
             // An uncapped load's experts that cannot stream are held whole
             // whatever that needs.
             if cap.is_none() && draft.load.bank.is_none() {
                 return Ok(Ok(()));
             }
-            let excess = Self::allocated(charge)?.saturating_sub(capacity);
+            let needed = match draft.beyond_floor() {
+                true => Self::allocated(&charge.clone().with_group_class().map_err(PlanError::ResourcePlanning)?)?,
+                false => Self::allocated(charge)?,
+            };
+            let excess = needed.saturating_sub(capacity);
             Ok::<_, PlanError>(NonZeroU64::new(excess).map_or(Ok(()), Err))
         };
         match (self.with_held_experts(definition, cap.unwrap_or(u64::MAX), &mut held, confirm)?, cap) {
@@ -612,6 +620,13 @@ impl ExecutionPlanDraft {
             .decoder
             .context_limit
             .div_ceil(self.policy.limits.max_launch_rows as u64)
+    }
+
+    /// Whether the draft holds a bank beyond its floor: one whose slots past
+    /// the floor leave room for its prompt groups' class
+    /// (`AssessmentMemoryCharge::with_group_class`).
+    pub fn beyond_floor(&self) -> bool {
+        self.load.bank.as_ref().is_some_and(|bank| bank.slots > bank.floor())
     }
 
     /// The bank of a draft that streams its experts.

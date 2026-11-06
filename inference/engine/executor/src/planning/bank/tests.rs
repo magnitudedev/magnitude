@@ -964,7 +964,7 @@ fn banked_target_graphs_build_on_metal() {
         },
     )
     .unwrap();
-    let (_, _, upload_regions, _) = crate::programs::native_target_graph::checked_target_family(
+    let upload_regions = crate::programs::native_target_graph::checked_target_family(
         backend,
         &load,
         &definition.decoder,
@@ -972,7 +972,8 @@ fn banked_target_graphs_build_on_metal() {
         plan.target(),
         limits,
     )
-    .unwrap_or_else(|error| panic!("{error}"));
+    .unwrap_or_else(|error| panic!("{error}"))
+    .upload_regions;
     // A step's runs that hold an upload region: its entry, the launch's
     // controls, which every block binds (the mixers' and the n-gram
     // input's tables), and block 0's front, which writes its sequence.

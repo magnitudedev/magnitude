@@ -1580,6 +1580,22 @@ fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
     assert_eq!(pace.horizon(), ms(400));
 }
 
+/// A chain's encoding reads memory between its submissions at most every
+/// reading interval, as the owner probes it (`MemoryProbe::running_pressure`):
+/// due before any reading, then once the interval since the last has passed,
+/// whoever read it.
+#[test]
+fn memory_is_due_a_reading_once_an_interval_has_passed() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let interval = Duration::from_millis(100);
+    let mut pace = MemoryPace::new();
+    assert!(pace.due(Instant::now()), "before any reading");
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    let read = pace.read.expect("a reading is timed");
+    assert!(!pace.due(read + Duration::from_millis(99)));
+    assert!(pace.due(read + interval));
+}
+
 /// The wait bound is what the host may take from the planning line to the
 /// emergency reserve at the fastest rate it was measured taking: 8 GB at
 /// 1 GB/s is 8 s. None in a domain seen taking nothing, nor in one that

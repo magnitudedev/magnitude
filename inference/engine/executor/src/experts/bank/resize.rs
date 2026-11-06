@@ -1,7 +1,7 @@
 use super::{ExpertBank, host_views};
 use crate::planning::{BankTier, ExpertBankPlan, Placer};
 use crate::experts::watcher::{Candidates, MoveBudget};
-use crate::domain::{BankHolding, BankResized, BankStep, DomainError, ResizeTimes, Trip};
+use crate::domain::{BankHolding, BankResized, BankStep, DomainError, MemoryMoment, ResizeTimes, RunningBegun, RunningPressure, Trip};
 use crate::CompletionWake;
 use std::time::{Duration, Instant};
 use crate::native::BankMoves;
@@ -23,6 +23,9 @@ pub(super) struct Commitment {
     /// The last shrink's moves, submitted and not yet observed: the
     /// flights queued behind them read what they wrote.
     pub(super) moves: Option<NativeTensorBatchCompletion>,
+    /// A cut begun beside a running chain the domain has not yet taken
+    /// ([`ExpertBank::take_running_begun`]).
+    pub(super) running: Option<RunningBegun>,
 }
 
 /// A host tier's host slots committed (`ExpertBankPlan::host_records`),
@@ -268,13 +271,17 @@ impl Growing {
 pub(super) enum Resize {
     /// No resize runs: each record tensor's resizer.
     Idle(Vec<Resizer>),
+    /// A cut of the one store asked of the watcher beside a running chain
+    /// (`watcher::Shared::cut_running`), not yet answered.
+    Cutting(Cutting),
     /// A shrink from `from` slots to the commitment's, its storage prepared
     /// off the submitting thread, the records charged `charged` before it,
-    /// which installs at the next boundary.
+    /// which installs where `install` says.
     Preparing {
         from: u64,
         charged: u64,
         begun: Begun,
+        install: Install,
         done: Done<Result<Vec<PreparedRecommit>, (Vec<Resizer>, TensorError)>>,
     },
     /// A shrink installed (`refusal` where a tensor refused its install,
@@ -295,6 +302,35 @@ pub(super) enum Resize {
     /// with it: no resize of the records runs again, and each asked fails
     /// with why.
     Broken(String),
+}
+
+/// A cut of the one store asked beside the running chain whose last step
+/// is `last` ([`ExpertBank::release_running`]): from `from` slots, the
+/// records charged `charged` then, decided at `decided` with the process
+/// holding `moment`, its asking having held the submitting thread `held`;
+/// the resizers held until it is answered.
+pub(super) struct Cutting {
+    from: u64,
+    charged: u64,
+    last: u64,
+    decided: Instant,
+    held: Duration,
+    moment: MemoryMoment,
+    resizers: Vec<Resizer>,
+}
+
+/// Where a shrink's prepared storage installs: at a boundary between
+/// flights; or, a cut beside the running chain whose last step is `last`,
+/// also at a submission boundary of that chain once every pass of block
+/// `after` is submitted (at once where none: its steps had decided no hit
+/// at the cut), and at any boundary of a later chain. Every run that may
+/// read a record past the cut is then submitted before the install, whose
+/// release waits for it (`PreparedRecommit::install`), and every run
+/// submitted after resolves only records below it.
+#[derive(Clone, Copy)]
+pub(super) enum Install {
+    Between,
+    Running { last: u64, after: Option<usize> },
 }
 
 /// How a resize began on the submitting thread (`ResizeTimes`).
@@ -713,7 +749,7 @@ impl ExpertBank {
         let moves = moving.elapsed();
         commitment.slots.store(to, Ordering::Release);
         let begun = Begun { decided, queued, planned, trips: [cut.trip, Trip::default()], moves };
-        commitment.resize = self.prepare_off_thread(resizers, (from, to), before, begun, wake);
+        commitment.resize = self.prepare_off_thread(resizers, (from, to), before, begun, Install::Between, wake);
         Ok(Shrinking::Begun(()))
     }
 
@@ -774,11 +810,11 @@ impl ExpertBank {
 
     /// Begin a shrink from `from` to `to` slots, the records charged
     /// `charged` now: each record tensor's storage at `to` prepared off this
-    /// thread.
-    fn prepare_off_thread(&self, resizers: Vec<Resizer>, (from, to): (u64, u64), charged: u64, begun: Begun, wake: CompletionWake) -> Resize {
+    /// thread, installed where `install` says.
+    fn prepare_off_thread(&self, resizers: Vec<Resizer>, (from, to): (u64, u64), charged: u64, begun: Begun, install: Install, wake: CompletionWake) -> Resize {
         let rows = self.rows_at(to);
         let done = self.resize_thread.run(wake, move || prepare(resizers, rows));
-        Resize::Preparing { from, charged, begun, done }
+        Resize::Preparing { from, charged, begun, install, done }
     }
 
     /// Submit a shrink's `moves`, each group's (from, to), to the device in a
@@ -906,7 +942,7 @@ impl ExpertBank {
             }
         };
         commitment.slots.store(to, Ordering::Release);
-        commitment.resize = self.prepare_off_thread(resizers, (from, to), charged, begun, wake);
+        commitment.resize = self.prepare_off_thread(resizers, (from, to), charged, begun, Install::Between, wake);
         Ok(BankStep::Begun(BankTier::Bank))
     }
 
@@ -952,8 +988,11 @@ impl ExpertBank {
             Err(DomainError::invariant(reason))
         };
         let (resize, finished) = match std::mem::replace(&mut commitment.resize, Resize::Idle(Vec::new())) {
-            Resize::Preparing { from, charged, begun, done } => match take(&done) {
-                None => (Resize::Preparing { from, charged, begun, done }, None),
+            // Between flights every run of a chain a cut was asked beside is
+            // submitted: its answer is read, and its storage installs.
+            Resize::Cutting(cutting) => (self.cut_answered(cutting, &mut commitment, wake), None),
+            Resize::Preparing { from, charged, begun, install, done } => match take(&done) {
+                None => (Resize::Preparing { from, charged, begun, install, done }, None),
                 Some((Err(panicked), _)) => return broken(&mut commitment, panicked),
                 Some((Ok(Err((_, refusal))), _)) => return broken(&mut commitment, shrink_refused(refusal)),
                 Some((Ok(Ok(prepared)), at)) => (self.install(prepared, (from, charged), (begun, at), wake), None),
@@ -991,9 +1030,9 @@ impl ExpertBank {
         Ok(finished)
     }
 
-    /// Install a shrink's `prepared` storage at a boundary between flights
-    /// and release its surplus off this thread, once the device work before
-    /// the install completes.
+    /// Install a shrink's `prepared` storage at a boundary its
+    /// [`Install`] allows and release its surplus off this thread, once the
+    /// device work before the install completes.
     fn install(
         &self,
         recommits: Vec<PreparedRecommit>,
@@ -1021,6 +1060,138 @@ impl ExpertBank {
     /// run none: a resize asked of them fails with why).
     pub(super) fn resizing(&self) -> bool {
         !matches!(self.commitment().resize, Resize::Idle(_) | Resize::Broken(_))
+    }
+
+    /// At a submission boundary of the scratch-served chain whose steps run
+    /// from `first` through `last`, every pass of its blocks through
+    /// `submitted` submitted (none where no block's is), the one store's
+    /// release beside it, a step at a time:
+    /// - no resize running, where `pressure` finds the bank's storage short
+    ///   (it reads memory at most every reading interval), ask the watcher
+    ///   to cut the store beside the chain, from the nearest slots that
+    ///   release storage toward those releasing what it is short of
+    ///   (`watcher::Shared::cut_running`), the resizers held;
+    /// - that cut answered, its storage prepared off this thread
+    ///   ([`Self::cut_answered`]);
+    /// - prepared, installed once its [`Install`] allows, its surplus
+    ///   released off this thread (`Resize::Releasing`): the next advance
+    ///   reports it as any shrink.
+    ///
+    /// The block whose passes' submission an install awaits, where one
+    /// does. Only where the host places (`Placer::Bank`): a host tier's
+    /// shrink copies its kept records first, and a device bank's moves
+    /// them, between flights alone.
+    pub(crate) fn release_running(&self, (first, last): (u64, u64), submitted: Option<usize>, pressure: &dyn Fn() -> Option<RunningPressure>) -> Option<usize> {
+        if self.plan.placer() != Placer::Bank {
+            return None;
+        }
+        let started = Instant::now();
+        // The release reports to the advance that takes it: no wake.
+        let wake = || CompletionWake::new(|| {});
+        // Memory is read outside the commitment's lock, which a reading's
+        // settling of a growth's claim takes (`ElasticBank::growth_backed`);
+        // only this thread leaves the resizers idle.
+        let short = {
+            let commitment = self.commitment();
+            matches!(commitment.resize, Resize::Idle(_)) && commitment.slots.load(Ordering::Acquire) > self.counts.floor()
+        };
+        let short = short.then(pressure).flatten().filter(|pressure| pressure.bytes > 0);
+        let mut commitment = self.commitment();
+        let (resize, awaits) = match std::mem::replace(&mut commitment.resize, Resize::Idle(Vec::new())) {
+            Resize::Idle(resizers) => match short {
+                Some(short) => {
+                    let from = commitment.slots.load(Ordering::Acquire);
+                    (self.cut_beside(resizers, from, (first, last), short, started), None)
+                }
+                None => (Resize::Idle(resizers), None),
+            },
+            Resize::Cutting(cutting) => (self.cut_answered(cutting, &mut commitment, wake()), None),
+            Resize::Preparing { from, charged, begun, install, done } => {
+                // A shrink decided between flights installs between flights
+                // alone, as it always has.
+                let (due, after) = match install {
+                    Install::Between => (false, None),
+                    Install::Running { last: of, after } if of == last => {
+                        match after.filter(|&block| submitted.is_none_or(|through| through < block)) {
+                            Some(block) => (false, Some(block)),
+                            None => (true, None),
+                        }
+                    }
+                    Install::Running { .. } => (true, None),
+                };
+                let prepared = match due {
+                    false => None,
+                    true => done.lock().expect("bank resize outcome").take(),
+                };
+                match prepared {
+                    None => (Resize::Preparing { from, charged, begun, install, done }, after),
+                    Some((Err(panicked), _)) => (Resize::Broken(panicked), None),
+                    Some((Ok(Err((_, refusal))), _)) => (Resize::Broken(shrink_refused(refusal)), None),
+                    Some((Ok(Ok(prepared)), at)) => (self.install(prepared, (from, charged), (begun, at), wake()), None),
+                }
+            }
+            other => (other, None),
+        };
+        commitment.resize = resize;
+        awaits
+    }
+
+    /// Ask the watcher to cut the one store beside the running chain whose
+    /// steps run from `first` through `last`, from `from` slots, its storage
+    /// `short` as read at `started`: from the nearest slots that release
+    /// storage toward those releasing what it is short of, the resizers
+    /// held until it answers. Resizers idle as they were where no slots
+    /// above the floor release storage, and broken records where the cut
+    /// cannot be formed (the charge unread, the records past u32).
+    fn cut_beside(&self, resizers: Vec<Resizer>, from: u64, (first, last): (u64, u64), short: RunningPressure, started: Instant) -> Resize {
+        let RunningPressure { bytes, held: moment } = short;
+        let floor = self.counts.floor();
+        let decided = Instant::now();
+        let charge = |at| Ok::<_, std::convert::Infallible>(self.counts.resident_charge(at));
+        let releasing = |bytes| crate::planning::releasing(from, floor, bytes, charge).unwrap_or_else(|never| match never {});
+        let (Some(shallowest), Some(deepest)) = (releasing(0), releasing(bytes)) else {
+            return Resize::Idle(resizers);
+        };
+        let asked = self.charged().and_then(|charged| Ok((charged, self.landed_cuts((shallowest, deepest))?)));
+        let (charged, candidates) = match asked {
+            Ok(asked) => asked,
+            Err(error) => return Resize::Broken(format!("a cut beside a running chain: {error}")),
+        };
+        self.watcher.shared().cut_running((first, last), candidates);
+        tracing::info!(from, shallowest, deepest, short = bytes, "the expert bank is cut beside a running chain");
+        Resize::Cutting(Cutting { from, charged, last, decided, held: started.elapsed(), moment, resizers })
+    }
+
+    /// A cut asked beside a running chain, its answer read now: where it
+    /// cut, the commitment's slots follow at once (no step from then on
+    /// resolves a record past them), the domain is owed its beginning
+    /// ([`Self::take_running_begun`]), and each record tensor's storage at
+    /// the cut is prepared off this thread, installed where its
+    /// [`Install`] allows; where it cut nothing, the resizers idle as they
+    /// were; where serving ended, the records broken with why (the next
+    /// advance fails with it); unanswered, it waits.
+    fn cut_answered(&self, cutting: Cutting, commitment: &mut Commitment, wake: CompletionWake) -> Resize {
+        let Some(answer) = self.watcher.shared().running_cut() else {
+            return Resize::Cutting(cutting);
+        };
+        let Cutting { from, charged, last, decided, held, moment, resizers } = cutting;
+        let cut = match answer {
+            Ok(Some(cut)) => cut,
+            Ok(None) => return Resize::Idle(resizers),
+            Err(reason) => return Resize::Broken(reason),
+        };
+        let to = cut.slots as u64;
+        commitment.slots.store(to, Ordering::Release);
+        assert!(commitment.running.replace(RunningBegun { decided, held, moment }).is_none(), "a running cut's beginning is taken before the next begins");
+        let after = cut.decided.map(|layer| self.plan.layers()[layer].sublayer().block as usize);
+        let zero = Duration::ZERO;
+        let begun = Begun { decided, queued: zero, planned: cut.trip.picked + cut.trip.served, trips: [cut.trip, Trip::default()], moves: zero };
+        self.prepare_off_thread(resizers, (from, to), charged, begun, Install::Running { last, after }, wake)
+    }
+
+    /// [`ElasticBank::running_begun`](crate::domain::ElasticBank::running_begun).
+    pub(super) fn take_running_begun(&self) -> Option<RunningBegun> {
+        self.commitment().running.take()
     }
 }
 

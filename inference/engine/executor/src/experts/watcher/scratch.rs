@@ -422,6 +422,23 @@ impl Scratch {
         format!("conveyor serving {:?}; scratch tiers [{}]", self.conveyor.serving, tiers.join("; "))
     }
 
+    /// The highest layer a request of group `group` (its first step) was
+    /// taken at, whose hits are decided; none before its first. No later
+    /// group may have begun: its requests would count as the group's.
+    pub(super) fn decided(&self, group: Step) -> Option<usize> {
+        self.published.iter().rposition(|&sequence| sequence >= group)
+    }
+
+    /// Whether a request of group `group` taken at `layer` routed `expert`:
+    /// its later steps' passes then resolve it as the first one's did,
+    /// reading a hit where that one's was, whose record must hold it for
+    /// every step of the group. Only while the device is not past the layer
+    /// (its tier kept, `Self::advance`): past it, none of the group's passes
+    /// reads the layer again.
+    pub(super) fn routed(&self, group: Step, layer: usize, expert: usize) -> bool {
+        self.tiers.iter().any(|tier| (tier.group, tier.layer) == (group, layer) && tier.routed[expert] > 0)
+    }
+
     /// Whether the conveyor still clears the group the device is past: no
     /// later group's request is taken before ([`Self::clear_past`]).
     pub(super) fn clearing(&self) -> bool {

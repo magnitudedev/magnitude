@@ -67,7 +67,7 @@ pub use domain::{
     ExpertMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, ShrinkCause, TierFill, ResidentStep,
     HeadFlight, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
-    ReservedResources, ResumeState, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
+    ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
     TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight, require_normal,
 };
 pub use error::{

@@ -682,7 +682,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let started = Instant::now();
         let epoch = self.launch_epoch();
-        let (submission, _) = match self.family.submit_target(Chain::one(launch), spare) {
+        let (submission, _) = match self.submit_chain(Chain::one(launch), spare) {
             Ok(submitted) => submitted.split_first(),
             Err(refusal) => return Err(DomainError::from(refusal.error)),
         };

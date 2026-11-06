@@ -344,6 +344,23 @@ pub(super) struct Core {
 }
 
 impl Core {
+    /// Whether group `group`'s layers run their resident forms: whole and
+    /// at home (`Directory::group_whole`, `Directory::group_at_home`), and
+    /// its records every record its reservation holds
+    /// (`ExpertBankPlan::records`, the span its commits words cover), which
+    /// a resident form binds directly, so only while every granule is
+    /// backed. A shrink that cuts only records keeping no expert (the
+    /// tier's reserve above the homes, where the host places) leaves the
+    /// group whole and at home, but releases granules no step may bind.
+    pub(super) fn group_resident(&self, group: usize) -> bool {
+        let directory = &self.directory;
+        let records = match self.extents.placer {
+            crate::planning::Placer::Tier => directory.records()[group],
+            crate::planning::Placer::Bank => directory.host(group).records() as usize,
+        };
+        directory.group_whole(group) && directory.group_at_home(group) && records == self.groups[group].commits.len()
+    }
+
     /// Each group's records that hold the bank's experts: its own where the
     /// device places into the bank from a tier, the landed records it keeps
     /// where the bank is the one store (unified memory), less the reserve

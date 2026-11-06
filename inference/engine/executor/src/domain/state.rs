@@ -3,12 +3,13 @@
 use super::*;
 use crate::assessment::{DecodeWaiting, Places};
 use crate::memory::{ClaimId, HoldingClass};
+use crate::planning::graph_demand;
 use magnitude_state::{
     GrowthChoice, Holder, RowDemand, ShrinkPolicy, StateHoldingCensus, StoreCopy,
 };
 
 /// The storage of `kind` this executor places first: its store.
-fn storage_store(topology: &seismic::DeviceTopology, executor: &seismic::Executor, kind: seismic::Contract) -> Option<seismic::StoreId> {
+pub(super) fn storage_store(topology: &seismic::DeviceTopology, executor: &seismic::Executor, kind: seismic::Contract) -> Option<seismic::StoreId> {
     executor.paths(seismic::Placing::Fixed(kind)).first().and_then(|path| topology.access_path(*path)).map(|path| path.store())
 }
 
@@ -29,21 +30,6 @@ fn beside_bank_bytes(topology: &seismic::DeviceTopology, executor: &seismic::Exe
     Ok(bytes)
 }
 
-/// What recording the graphs of `more` takes on a device of `cost` whose
-/// graph budget is `budget` (`seismic::Device::graph_budget`): the memory
-/// the budget with them costs beyond what it costs now, in the storage the
-/// graphs hold it in. A device's graphs are priced as a whole, so the
-/// difference counts the granules `more` adds.
-pub(crate) fn graph_demand(
-    cost: seismic::GraphCost,
-    budget: seismic::GraphCensus,
-    more: seismic::GraphCensus,
-) -> Result<crate::memory::ClaimDemand, DomainError> {
-    let priced = |census| cost.bytes(census).ok_or_else(|| DomainError::invariant("a graph budget's memory overflows"));
-    let grown = budget.plus(more).ok_or_else(|| DomainError::invariant("a graph budget overflows"))?;
-    let bytes = priced(grown)?.beyond(priced(budget)?);
-    Ok(crate::memory::ClaimDemand { device: bytes.device, upload: bytes.upload, ..Default::default() })
-}
 
 /// What a prompt's places are worth beyond what memory gave its group
 /// (`ExecutorDomain::grant_group`): `places` for `request`'s chunks in hand,
@@ -697,7 +683,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let device = self.domain.device();
         let activation = (pool.available_workspace(patch_rows) == 0)
             .then(|| {
-                let graphs = graph_demand(device.graph_cost(), device.graph_budget(), pool.activation_graphs(patch_rows)?)?;
+                let graphs = graph_demand(device.graph_cost(), device.graph_budget(), pool.activation_graphs(patch_rows)?).map_err(DomainError::invariant)?;
                 crate::memory::ClaimDemand { device: pool.activation_bytes(patch_rows)?, ..Default::default() }
                     .checked_plus(graphs)
                     .ok_or_else(|| DomainError::invariant("a vision activation's demand overflows"))
@@ -850,49 +836,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`MemoryPace`): the owner probes every `reading_interval`, and again
     /// after each release while memory is short.
     pub fn probe_memory(&mut self, reading_interval: std::time::Duration) -> Result<(), DomainError> {
-        let readings = self.observe_memory()?;
-        let host = self.host_witness(&readings);
-        self.pace.borrow_mut().observe(
-            &readings,
-            &self.domain.device().ledgers().own_claims(),
-            host,
-            !self.resize_held.runs(),
-            reading_interval,
-        );
-        match readings
-            .into_iter()
-            .find(|reading| reading.band == crate::platform::MemoryBand::Reclaim)
-        {
-            Some(reading) => Err(DomainError::Reclaim(reading)),
-            None => Ok(()),
-        }
-    }
-
-    /// Host RAM's witness of the process's releases at a probe that read
-    /// `readings` (`MemoryPace`): what the system counts the process holding
-    /// out of free memory, which falls by a release as free memory rises by
-    /// it. A Metal device's allocations are wired through its residency set,
-    /// so the host's wired pages (`seismic::HostHeld`): a released buffer
-    /// leaves the footprint at once, but its pages are free only once the
-    /// driver unwires them at its next tick (on an M4 Pro, 0.47 s after a
-    /// 138 MB slot's release free and wired memory moved together; the
-    /// first slot a reserved buffer released was not unwired within 3 s).
-    /// The count is the host's, the process's own wired size counting none
-    /// of the residency set's: another program wiring memory in the span
-    /// holds a release unseen, credited until the host takes more than it,
-    /// and one unwiring shows it early. Any other device's allocations are
-    /// pages of the process, so its footprint (`seismic::ProcessMemory`), which the
-    /// system frees as they leave it (a GB10's fell by each bank slot within
-    /// its release). None where the system reports neither.
-    fn host_witness(&self, readings: &[crate::platform::DomainReading]) -> Option<u64> {
-        match self.domain.device().backend() {
-            seismic::BackendName::Metal => readings
-                .iter()
-                .find(|reading| reading.identity == seismic::StoreIdentity::HostRam)
-                .and_then(|reading| reading.held)
-                .map(|held| held.wired_bytes),
-            _ => self.memory.borrow().footprint(),
-        }
+        self.memory_probe().probe(self.family.expert_bank(), reading_interval)
     }
 
     /// Claim the peak new charge of one physical operation from the heap:
@@ -1112,7 +1056,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let slots = limits.class_slots(places);
                 let pools = self.resources.class_bytes(slots).map_err(DomainError::invariant)?;
                 let graphs = self.resources.class_graphs(slots).map_err(DomainError::invariant)?;
-                let graphs = graph_demand(device.graph_cost(), device.graph_budget(), graphs)?;
+                let graphs = graph_demand(device.graph_cost(), device.graph_budget(), graphs).map_err(DomainError::invariant)?;
                 self.family.group_demand(places).map_err(DomainError::Input)?
                     .checked_plus(crate::memory::ClaimDemand { device: pools, ..Default::default() })
                     .and_then(|demand| demand.checked_plus(graphs))
@@ -1430,16 +1374,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// What `store` is short of now (`MemoryPace::shortfall`).
     fn shortfall(&self, store: seismic::StoreId) -> super::Shortfall {
-        let charged = self
-            .domain
-            .device()
-            .ledgers()
-            .own_claims()
-            .into_iter()
-            .filter(|(of, _)| *of == store)
-            .map(|(_, bytes)| bytes)
-            .sum();
-        self.pace.borrow().shortfall(store, charged)
+        self.memory_probe().shortfall(store)
     }
 
     /// Whether all the bank's stores are short of is released already, and
@@ -1455,8 +1390,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The store `kind` storage is placed in first; none where the
     /// executor places none.
     pub(super) fn store_of(&self, kind: seismic::Contract) -> Option<seismic::StoreId> {
-        let device = self.domain.device();
-        storage_store(device.topology(), device.info(), kind)
+        self.memory_probe().store_of(kind)
     }
 
     /// Whether `kind` storage lies in device storage's store, beside the
@@ -1467,12 +1401,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// What the process holds now (`MemoryMoment`).
     pub fn memory_moment(&self) -> MemoryMoment {
-        let ledger = self.domain.device().device_ledger();
-        MemoryMoment {
-            charged: ledger.charged,
-            claimed: ledger.claim,
-            footprint: seismic::ProcessMemory::read().footprint_bytes,
-        }
+        self.memory_probe().moment()
     }
 
     /// The places of the prompt-group class held now (`grant_group`).
@@ -1683,13 +1612,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         wake: crate::CompletionWake,
     ) -> Result<Option<(super::BankResized, super::ThreadHeld)>, DomainError> {
         let started = std::time::Instant::now();
-        let Some(bank) = self.family.expert_bank() else {
+        let Some(finished) = self.family.expert_bank().map(|bank| bank.advance(wake)).transpose()? else {
             return Ok(None);
         };
-        let Some(finished) = bank.advance(wake)? else {
+        // A cut asked beside a chain may be answered here, beginning.
+        self.note_running_cut();
+        let Some(finished) = finished else {
             self.resize_held.hold(started, super::HeldSource::Advance);
             return Ok(None);
         };
+        let bank = self.family.expert_bank().expect("a resize finished of the load's expert bank");
         let holding = finished.holding();
         let tier = bank.holding_storage(holding)?;
         let held = self.resize_held.finish(started, tier, holding);

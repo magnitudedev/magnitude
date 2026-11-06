@@ -65,12 +65,31 @@ its chunks, a slot the re-reads of decode steps and of this prompt's groups that
 miss it. Places that win memory from slots leave a want the bank's next shrink
 serves (`PlacesWant`); until then the group holds the most places that fit what a
 growth may take now (`Places::admitted`) and the heap grants. No group runs longer
-than the wait bound `W = (P − E) / r`: nothing is released while a chain runs, so
-from the planning line `P` the host may take what lies above the emergency reserve
-`E` at the fastest rate `r` the memory probes measured it taking
-(`MemoryPace::wait_bound`). Before a load has measured its groups' reads, and on a
+than the wait bound `W = (P − E) / r`: the ladder releases nothing while a chain
+runs, and only the one store's expert bank is cut beside it (below), so from the
+planning line `P` the host may take what lies above the emergency reserve `E` at
+the fastest rate `r` the memory probes measured it taking
+(`MemoryPace::wait_bound`).
+
+A prompt group's chain is encoded at the device's pace, and memory is read between
+its submissions at the probes' interval (`ExecutorDomain::submit_chain`). Where the
+expert bank lies in the one store (unified memory) and that reading is short, the
+store is cut beside the running chain (`ExpertBank::release_running`): the watcher
+drops the records past the cut, moving nothing, and unmaps their experts from the
+chain's first step, except those its requests already routed at a layer whose hits
+it decided, which stay readable to the chain's later passes there. The storage
+installs once those passes are submitted, so every run submitted after resolves only
+records below the cut, and its release waits on the device work before it. So
+another program's ask that lands mid-chain is answered within the passes the watcher
+decided ahead of the encoding, not at the chain's end, and the next boundary reports
+it as any bank shrink. A host tier's shrink and a device bank's moves still run
+between flights alone. Before a load has measured its groups' reads, and on a
 load without a bank, no measure prices a group's places or its time: it groups
-every planned chunk that fits.
+every planned chunk that fits. So a plan sizes the two together: a bank beyond its
+floor leaves room for the class of every chunk of a whole-context prompt, priced as a
+group opening holds it (its graph slots and graphs, the target's group buffers, the
+bank's placed words and the tables' stagings; `AssessmentMemoryCharge::group_class`),
+and only the floor is admitted without it.
 
 A class's slots are each launch's activation with its upload regions, its output in
 the chain's rotation of `n + 1` slots, and its readout and drafter slots

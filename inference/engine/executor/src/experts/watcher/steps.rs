@@ -440,6 +440,11 @@ impl Steps {
         write(state.frontier, &Unbegun(state.last + 1))
     }
 
+    /// Whether step `last` is the last begun: no group began after its own.
+    pub(super) fn latest(&self, last: Step) -> bool {
+        self.lock().last == last
+    }
+
     /// Whether a running group is a prompt group's, however it is served
     /// (scratch or resident): its steps run many at once.
     pub(super) fn prompt_running(&self) -> bool {

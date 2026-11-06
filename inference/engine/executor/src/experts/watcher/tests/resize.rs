@@ -325,3 +325,113 @@ fn a_host_tier_grows_by_its_records_alone() {
     assert!(harness.in_tier(0, 0).is_some(), "expert 0 kept");
     step.complete().unwrap();
 }
+
+/// The cut beside a running chain asked of `shared` (`Shared::cut_running`),
+/// once residency answers it.
+fn running_cut(shared: &Shared) -> Option<super::super::resize::RunningCut> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(answer) = shared.running_cut() {
+            return answer.expect("the cut is served");
+        }
+        assert!(Instant::now() < deadline, "residency answers a cut beside a running chain at its next turn");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A cut of the one store beside a running prompt group is answered at
+/// once and moves nothing: the records past the cut are dropped, and each
+/// expert they kept is unmapped from the group's first step, but one a
+/// request of the group already routed at a layer whose hits it decided,
+/// which its later passes there still resolve as that request's hit did,
+/// until the first step not yet begun. The answer names that layer, whose
+/// passes the store's storage installs after. The group's later requests
+/// read the dropped experts as cold ones, from its conveyor, and nothing
+/// lands past the cut. Asked once a later group began, whose steps decided
+/// their hits by the map before it, it cuts nothing. Two layers of eight
+/// experts in a store of fifteen records, its bottom eight lent, the fill
+/// keeping seven in records 8 to 14, one short of every expert (a store
+/// with a record for each keeps them all, `HostRecords::takes`); the cut
+/// at 12.
+#[test]
+fn a_cut_beside_a_running_group_drops_all_it_has_not_decided() {
+    const CUT: usize = 12;
+    let harness = lending("running-cut", EXPERTS, 8, 2, 8, WHOLE, 7, Placer::Bank, false);
+    let shared = harness.watcher.shared().clone();
+    let layers = &harness.layers;
+    let kept = || {
+        (0..2)
+            .flat_map(|layer| (0..EXPERTS).filter_map(move |expert| Some((layer, expert, layers[layer].0.held(expert)?))))
+            .collect::<Vec<_>>()
+    };
+    eventually("the fill never filled beyond the reserve", || kept().len() == 7);
+    let past = kept().into_iter().filter(|&(.., record)| record >= CUT).collect::<Vec<_>>();
+    let &(_, routed, at) = past.iter().find(|&&(layer, ..)| layer == 0).expect("the fill keeps a layer 0 expert past the cut");
+    // A step before the group, which reads the store as the fill left it.
+    let before = begin(&shared, &[StepRoute::Decode], false).unwrap().pop().unwrap();
+    let earlier = before.sequence();
+    drop(before);
+    let steps = harness.group(&[StepRoute::Grouped; 2]);
+    let (first, last) = (steps[0].sequence(), steps[1].sequence());
+    // Step 0 routes `routed` at layer 0, a hit its pass reads in place.
+    assert!(harness.scratch(&steps[0], 0, &[routed]).concat().is_empty(), "a hit is read in place");
+    shared.cut_running((first, last), Candidates { shallowest: 15, deepest: CUT, records: Box::new(|slots| vec![slots]) });
+    let cut = running_cut(&shared).expect("the cut keeps every record in flight");
+    assert_eq!((cut.slots, cut.decided), (CUT, Some(0)), "the deepest candidate, its hits decided at layer 0");
+    assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), CUT as u32);
+    let map = |layer: usize| &layers[layer].0;
+    assert_eq!(map(0).resolve(routed, last), Some(at), "the group's later passes read its decided hit");
+    assert_eq!(map(0).held(routed), None, "no step begun after the group reads it");
+    for &(layer, expert, record) in past.iter().filter(|&&(layer, expert, _)| (layer, expert) != (0, routed)) {
+        assert_eq!(map(layer).resolve(expert, earlier), Some(record), "a step before the group still reads it");
+        assert_eq!(map(layer).resolve(expert, first), None, "no step of the group reads it");
+    }
+    // Step 1 reads a dropped layer 0 expert as a cold one, and both steps
+    // every dropped one of layer 1.
+    let dropped = |of: usize| past.iter().filter(|&&(layer, expert, _)| layer == of && expert != routed).map(|&(_, expert, _)| expert).collect::<Vec<_>>();
+    let cold = |experts: &[usize]| experts.iter().map(|&expert| expert as i32).collect::<Vec<_>>();
+    let (zero, one) = (dropped(0), dropped(1));
+    assert_eq!(Harness::experts(&harness.scratch(&steps[1], 0, &[&[routed][..], &zero].concat()).concat()), cold(&zero));
+    assert_eq!(Harness::experts(&harness.scratch(&steps[0], 1, &one).concat()), cold(&one));
+    harness.scratch(&steps[1], 1, &[]);
+    for step in steps {
+        step.complete().unwrap();
+    }
+    assert!(kept().iter().all(|&(.., record)| record < CUT), "nothing lands past the cut");
+    // A later group begun beside the chain: nothing is cut.
+    let chain = harness.group(&[StepRoute::Grouped; 2]);
+    let later = begin(&shared, &[StepRoute::Decode], false).unwrap();
+    shared.cut_running((chain[0].sequence(), chain[1].sequence()), Candidates { shallowest: CUT, deepest: 8, records: Box::new(|slots| vec![slots]) });
+    assert!(running_cut(&shared).is_none(), "a group began after the chain");
+    assert_eq!(residency::lock(&harness.watcher.state).core.directory.host(0).records(), CUT as u32);
+    drop((later, chain));
+    assert_eq!(shared.life.ended(), None, "the watcher serves on");
+}
+
+/// A bank imported whole into the one store whose shrink cuts only the
+/// tier's reserve above its homes keeps every expert at its home, but its
+/// records' reservation no longer has every granule backed: no layer's
+/// whole word stays set, so no step after the shrink binds the records
+/// directly in a resident form. Two layers of eight experts at their homes
+/// in records 0 to 15, the conveyor lent the bottom four, and a reserve of
+/// eight above them; the cut to twenty records keeps every expert.
+#[test]
+fn a_cut_of_a_whole_banks_reserve_alone_ends_its_resident_form() {
+    const RESERVE: u32 = 8;
+    let conveying = Conveying::of(4);
+    let tier = 2 * EXPERTS as u32 + RESERVE;
+    let harness = lending_bank("whole-reserve-cut", EXPERTS, 2 * EXPERTS as u64, 2, STAGING, conveying, tier, Placer::Bank, false, 0, true);
+    let whole = |layer: usize| harness.layers[layer].5.load(constants::POLICY_WHOLE as usize);
+    assert!((0..2).all(|layer| whole(layer) == 1), "a bank imported whole is resident");
+    let shared = harness.watcher.shared().clone();
+    let candidates = Candidates { shallowest: 20, deepest: 20, records: Box::new(|slots| vec![slots]) };
+    let (cut, _) = shared.shrink_store(candidates).expect("the shrink is served").expect("the cut answers, not deferred");
+    assert_eq!(cut.slots, 20);
+    {
+        let state = residency::lock(&harness.watcher.state);
+        let directory = &state.core.directory;
+        assert!(directory.group_whole(0) && directory.group_at_home(0), "the cut kept every expert at its home");
+    }
+    eventually("a layer stayed resident beside released granules", || (0..2).all(|layer| whole(layer) == 0));
+    assert_eq!(shared.life.ended(), None, "the watcher serves on");
+}

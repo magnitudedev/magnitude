@@ -1164,6 +1164,43 @@ impl HostRecords {
         self.prepared = None;
         moves
     }
+
+    /// The fewest records a cut beside running steps may leave
+    /// ([`Self::cut_running`]): [`Self::shrink_floor`], and every graced
+    /// record still read as a request's outstanding answer, which the host
+    /// reads as well as the device.
+    pub fn running_floor(&self) -> u32 {
+        let answered = (0..self.records())
+            .rev()
+            .find(|&record| matches!(self.records[record as usize], Host::Graced { answer: Some(_), .. }));
+        answered.map_or(self.shrink_floor(), |record| self.shrink_floor().max(record + 1))
+    }
+
+    /// Cut to `records` records, at least [`Self::running_floor`], beside
+    /// running steps: every record at or past the cut is dropped, nothing
+    /// moved, and the expert each keeps or was graced from is unmapped from
+    /// step `until(staged)` on where its entry still names that record
+    /// ([`LandingMap::unmap_from`]): the first step that may no longer read
+    /// it, which no later than the first step not yet begun. Each dropped
+    /// expert is lacked from now, landed again as any miss is.
+    pub fn cut_running(&mut self, records: u32, until: impl Fn(Staged) -> Step) {
+        let count = self.records();
+        assert!(records <= count, "a host tier of {count} records is cut to {records}");
+        let floor = self.running_floor();
+        assert!(records >= floor, "a host tier is cut to {records} records beside running steps, below its floor of {floor}");
+        for record in records..count {
+            match self.records[record as usize] {
+                Host::Ready => {}
+                Host::Kept(Whole { staged, holds: 0, .. }) | Host::Graced { staged, answer: None, .. } => {
+                    self.unmap_from(staged, record, until(staged));
+                    self.set(record, Host::Ready);
+                }
+                other => unreachable!("record {record} past the running floor {floor} holds {other:?}"),
+            }
+        }
+        self.records.truncate(records as usize);
+        self.ready.retain(|&record| record < records);
+    }
 }
 
 #[cfg(test)]
@@ -1699,6 +1736,42 @@ mod tests {
         tier.unhold(3);
         assert_eq!(maps.held((0, 12)), Some(2));
         assert_eq!(tier.shrink_floor(), 0, "nothing in flight");
+    }
+
+    /// A cut beside running steps keeps every record in flight below it and
+    /// drops every record past it, moving nothing: each expert they kept is
+    /// lacked from then on and unmapped where its entry still names that
+    /// record, from the step `until` gives it, the running chain's first
+    /// step (900, steps begun through 1,000) or, for one the chain routed,
+    /// the first step not yet begun. Steps before then still read it; none
+    /// from then on does, and no landing takes a record past the cut.
+    #[test]
+    fn a_cut_beside_running_steps_drops_what_lies_past_it_from_the_step_each_expert_needs() {
+        let (mut tier, maps) = mapped(6, 1, ONE, Resolution::BeforeStamp);
+        let grants = [9, 10, 11, 12, 13, 14].map(|expert| tier.grant_of((0, expert), 0).unwrap());
+        assert_eq!(grants.each_ref().map(Grant::record), [0, 1, 2, 3, 4, 5], "each the lowest ready");
+        for (grant, expert) in grants.iter().zip([9, 10, 11, 12, 13, 14]) {
+            if expert != 11 {
+                grant.map(Some(0));
+                tier.landed(grant.record(), (0, expert), None, Kept::Alone);
+            }
+        }
+        // Expert 11 lands into record 2, in flight: no cut lies below it.
+        assert_eq!(tier.running_floor(), 3, "every record in flight lies below the floor");
+        grants[2].map(Some(0));
+        tier.landed(2, (0, 11), None, Kept::Alone);
+        assert_eq!(tier.running_floor(), 0, "nothing in flight");
+        // Expert 13 the chain routed; 12 and 14 it did not.
+        let (first, unbegun) = (900, 1001);
+        tier.cut_running(3, |(_, expert)| if expert == 13 { Step::MAX } else { first });
+        assert_eq!(tier.records(), 3);
+        assert_eq!([9, 10, 11].map(|expert| maps.held((0, expert))), [Some(0), Some(1), Some(2)], "below the cut, kept");
+        for (expert, until) in [(12, first), (13, unbegun), (14, first)] {
+            assert!(tier.kept_record((0, expert)).is_none(), "{expert} is lacked");
+            assert!(maps.resolve((0, expert), until - 1).is_some(), "{expert} is read before step {until}");
+            assert_eq!(maps.resolve((0, expert), until), None, "{expert} is read from no record from step {until}");
+        }
+        assert_eq!(tier.take((0, 12), 0), None, "no record past the cut is ready");
     }
 
     /// The interleaving of `a_parked_requests_answered_record_is_never_taken_by_its_other_miss`
