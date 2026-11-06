@@ -128,10 +128,10 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
         ServingDevice::select(&catalog)?,
         Some(kernels.as_path()),
     )?);
-    let stored = structure.stored_measurements(&kernels, inventory.root());
+    let stored = structure.stored(&kernels, inventory.root());
     let environment = Arc::new(AssessmentEnvironment::new(
-        Arc::clone(&structure),
-        stored.clone(),
+        Arc::clone(&stored.structure),
+        stored.measurements.clone(),
     )?);
     let environment_established = started.elapsed();
     let assessor = Arc::new(ModelAssessor::new(

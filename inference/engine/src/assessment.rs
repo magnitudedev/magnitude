@@ -70,8 +70,9 @@ pub struct ModelPackagePaths {
 
 /// The structural part of the configuration every model is assessed on:
 /// the device a native load selects, the topology, one status sample and
-/// the serving policy. Discovery establishes it and nothing in it is
-/// measured, so the service has it at once.
+/// the serving policy. Discovery establishes it measuring nothing, so the
+/// service has it at once; what of it the measurement job records (its
+/// graphs' cost) is read again as the records land ([`Self::stored`]).
 pub struct AssessmentStructure {
     pub topology: Arc<DeviceTopology>,
     pub status: Status,
@@ -107,6 +108,40 @@ impl AssessmentStructure {
             policy,
             service,
         })
+    }
+
+    /// What this machine's stored records give assessment now: this
+    /// structure with what it reads of the records priced from them as they
+    /// stand (its graphs, [`platform::graph_pricing`]; itself while they
+    /// price them as it does), under its measurements
+    /// ([`Self::stored_measurements`]). A record the job stores after
+    /// discovery so revises every input of assessment it enters.
+    pub fn stored(self: &Arc<Self>, kernels: &Path, storage: &Path) -> AssessmentSetup {
+        let structure = match platform::graph_pricing(&self.topology, &self.selected.info, Some(kernels)) {
+            Ok(pricing) if pricing == self.selected.graph_cost => Arc::clone(self),
+            Ok(pricing) => Arc::new(Self {
+                topology: Arc::clone(&self.topology),
+                status: self.status.clone(),
+                device: self.device,
+                selected: SelectedDevice {
+                    graph_cost: pricing,
+                    ..self.selected.clone()
+                },
+                reserves: self.reserves,
+                policy: self.policy.clone(),
+                service: self.service.clone(),
+            }),
+            Err(error) => {
+                return AssessmentSetup {
+                    structure: Arc::clone(self),
+                    measurements: Measurements::Unavailable {
+                        reason: format!("the graph memory records: {error}"),
+                    },
+                };
+            }
+        };
+        let measurements = structure.stored_measurements(kernels, storage);
+        AssessmentSetup { structure, measurements }
     }
 
     /// What this machine's stored records give assessment now: the selected
@@ -192,7 +227,8 @@ pub enum Measurements {
 }
 
 /// The configuration every model is assessed on: its structure, and what
-/// is measured of this machine. New measurements keep the structure.
+/// is measured of this machine.
+#[derive(Clone)]
 pub struct AssessmentSetup {
     pub structure: Arc<AssessmentStructure>,
     pub measurements: Measurements,

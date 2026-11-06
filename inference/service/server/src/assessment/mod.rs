@@ -48,12 +48,14 @@ struct AssessmentTarget {
     work: Option<AssessmentWork>,
 }
 
-/// One preparation per bundle, shared by every profile and source slice that names it.
+/// One preparation per bundle on one structure, shared by every profile, source slice and
+/// environment that names it: a preparation reads only the structure, so the records that price
+/// an input of the structure anew prepare every bundle again.
 #[derive(Default)]
 struct PreparationCoordinator {
     cells: Mutex<
         std::collections::BTreeMap<
-            ServableModelBundleKey,
+            (Arc<str>, ServableModelBundleKey),
             Weak<tokio::sync::OnceCell<PreparationResult>>,
         >,
     >,
@@ -62,9 +64,13 @@ struct PreparationCoordinator {
 impl PreparationCoordinator {
     fn prepare(
         &self,
+        environment: &AssessmentEnvironment,
         configuration: &ModelServingConfiguration,
     ) -> Arc<tokio::sync::OnceCell<PreparationResult>> {
-        let key = servable_model_bundle_key_for_bundle(&configuration.bundle);
+        let key = (
+            Arc::clone(&environment.structure_id),
+            servable_model_bundle_key_for_bundle(&configuration.bundle),
+        );
         let mut cells = self.cells.lock().expect("preparation cells lock poisoned");
         cells.retain(|_, cell| cell.strong_count() > 0);
         if let Some(cell) = cells.get(&key).and_then(Weak::upgrade) {
@@ -683,7 +689,7 @@ impl ManagedModelAssessments {
             .assessor
             .configuration_for(&subject)
             .map(|configuration| {
-                let preparation = self.preparations.prepare(&configuration);
+                let preparation = self.preparations.prepare(&environment, &configuration);
                 ModelAssessor::work_for(&environment, configuration, profile, preparation)
             });
         match work {
@@ -860,7 +866,8 @@ impl ManagedModelAssessments {
     }
 
     /// Move the pool to `environment`: work not yet assessed moves at once, and every assessed
-    /// model is finished again in it (arithmetic over its prepared demand, [`Self::refinish`]).
+    /// model is finished again in it ([`Self::refinish`]): arithmetic over its prepared demand
+    /// while the structure is the same, prepared again on a structure the records priced anew.
     fn adopt_environment(
         self: &Arc<Self>,
         environment: Arc<AssessmentEnvironment>,
@@ -876,7 +883,7 @@ impl ManagedModelAssessments {
                         &environment,
                         work.configuration.clone(),
                         work.profile.profile.clone(),
-                        Arc::clone(&work.preparation),
+                        self.preparations.prepare(&environment, &work.configuration),
                     );
                     (key.clone(), next)
                 })

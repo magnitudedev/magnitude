@@ -1026,6 +1026,7 @@ fn hub() -> StubHub {
 struct Fixture {
     _directory: tempfile::TempDir,
     hub: Arc<StubHub>,
+    assessor: Arc<ModelAssessor>,
     models: Arc<ManagedModelStore>,
     lineage: Arc<CatalogLineage>,
     candidates: Arc<ManagedModelCandidates>,
@@ -1228,7 +1229,7 @@ async fn fixture_from(
         environment,
     ));
     let candidates = ManagedModelCandidates::new(
-        assessor,
+        Arc::clone(&assessor),
         Arc::clone(&lineage),
         super::engine_architectures(),
         Arc::new(StubCatalog),
@@ -1238,6 +1239,7 @@ async fn fixture_from(
     Fixture {
         _directory: directory,
         hub,
+        assessor,
         models,
         lineage,
         candidates,
@@ -5868,5 +5870,229 @@ async fn a_repository_declaring_another_generation_never_makes_the_shape_matched
             false,
         )],
         "{candidates:#?}"
+    );
+}
+
+/// The catalog the pool reads: `model`, not installed, at its desired profile.
+struct ListedCatalog(ModelId);
+
+impl CatalogModels for ListedCatalog {
+    fn list_catalog(&self) -> BoxFuture<'_, Result<CatalogModelsResponse, InventoryError>> {
+        let model = magnitude_service_contracts::models::CatalogModel {
+            id: self.0.clone(),
+            desired: magnitude_service_contracts::models::ReadyModel {
+                metadata: magnitude_service_contracts::models::ModelMetadata {
+                    format: "gguf".to_owned(),
+                    architecture: "llama".to_owned(),
+                    quantization: "q8_0".to_owned(),
+                    quantization_name: "Q8_0".to_owned(),
+                    storage_bytes: 0,
+                    maximum_context_length: None,
+                },
+                profile: ServingProfile {
+                    context_length: 8192,
+                },
+                speculative_method: None,
+            },
+            drafter_withheld: false,
+            display_name: "Llama Test".to_owned(),
+            variant_label: "Q8".to_owned(),
+            description: "A test model".to_owned(),
+            release_date: ModelReleaseDate::new("2026-01-01").unwrap(),
+            license: "apache-2.0".to_owned(),
+            source_urls: Vec::new(),
+            parameterization: ModelParameterization::Dense {
+                total_parameters: 1,
+            },
+            support: CatalogSupport::Supported { intelligence: 1 },
+            fidelity_rank: 1,
+            quantization_aware: false,
+            local_state: magnitude_service_contracts::models::CatalogModelState::NotInstalled,
+            aliases: Vec::new(),
+        };
+        Box::pin(async move {
+            Ok(CatalogModelsResponse {
+                revision: 1,
+                reconciliation_complete: true,
+                models: vec![model],
+            })
+        })
+    }
+
+    fn install_catalog_model(
+        &self,
+        model_id: &ModelId,
+    ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>> {
+        StubCatalog.install_catalog_model(model_id)
+    }
+
+    fn install_catalog_component(
+        &self,
+        model_id: &ModelId,
+        component: magnitude_service_contracts::models::CatalogComponent,
+    ) -> BoxFuture<'_, Result<CatalogInstallationAdmission, InventoryError>> {
+        StubCatalog.install_catalog_component(model_id, component)
+    }
+
+    fn remove_catalog_model_installation(
+        &self,
+        model_id: &ModelId,
+    ) -> BoxFuture<'_, Result<CatalogInstallationRemoval, InventoryError>> {
+        StubCatalog.remove_catalog_model_installation(model_id)
+    }
+
+    /// A live source's changes: the pool stops once a source's stream ends.
+    fn watch_catalog(&self) -> BoxStream<'static, ModelDomainInvalidation> {
+        Box::pin(futures_util::stream::pending())
+    }
+}
+
+/// No custom models, as a live source: its changes never end.
+struct NoLocal(StubLocal);
+
+impl LocalModels for NoLocal {
+    fn configuration(&self) -> BoxFuture<'_, Result<LocalModelsConfiguration, InventoryError>> {
+        self.0.configuration()
+    }
+
+    fn configure(
+        &self,
+        configuration: LocalModelsConfiguration,
+    ) -> BoxFuture<'_, Result<LocalModelsConfiguration, InventoryError>> {
+        self.0.configure(configuration)
+    }
+
+    fn list_local(&self) -> BoxFuture<'_, Result<LocalModelsResponse, InventoryError>> {
+        self.0.list_local()
+    }
+
+    fn refresh_local(&self) -> BoxFuture<'_, Result<LocalModelsResponse, InventoryError>> {
+        self.0.refresh_local()
+    }
+
+    fn remove_local(
+        &self,
+        model_id: &ModelId,
+    ) -> BoxFuture<'_, Result<LocalModelRemoval, InventoryError>> {
+        self.0.remove_local(model_id)
+    }
+
+    fn prune_drafters(
+        &self,
+    ) -> BoxFuture<'_, Result<magnitude_service_contracts::models::DrafterPruning, InventoryError>>
+    {
+        self.0.prune_drafters()
+    }
+
+    fn watch_local(&self) -> BoxStream<'static, ModelDomainInvalidation> {
+        Box::pin(futures_util::stream::pending())
+    }
+}
+
+/// The catalog's only model as the pool has assessed it in `environment`.
+async fn assessed_in(
+    assessments: &crate::assessment::ManagedModelAssessments,
+    environment: &magnitude_service_contracts::models::AssessmentEnvironmentId,
+) -> Vec<ModelAssessment> {
+    use magnitude_service_contracts::models::{
+        ModelAssessmentDomainSnapshot, ModelAssessmentEntryState, ModelAssessments,
+    };
+    loop {
+        let snapshot = assessments.snapshot().await.expect("the pool's snapshot");
+        if let ModelAssessmentDomainSnapshot::Available { entries, .. } = &snapshot.catalog
+            && let [entry] = entries.as_slice()
+            && &snapshot.environment_id == environment
+        {
+            match &entry.state {
+                ModelAssessmentEntryState::Assessed { profiles, .. } => return profiles.clone(),
+                ModelAssessmentEntryState::Dropped => panic!("the catalog model was dropped"),
+                ModelAssessmentEntryState::Assessing => {}
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// QA: a first catalog after install is assessed before the measurement job has recorded the
+/// device's graph memory, its graphs priced at the backend's bound, and a model that fit only
+/// under the device's own cost stayed refused until the service restarted: the pool kept the
+/// structure it started with and finished its models again over their first preparation. Once
+/// the record lands, the pool prepares the model again on the structure the records give, and
+/// offers it, with no restart.
+#[tokio::test]
+async fn a_model_refused_at_the_graph_bound_is_offered_once_its_graph_cost_lands() {
+    use crate::assessment::measurement::MeasurementStatus;
+    use magnitude_engine::assessment::{AssessmentSetup, AssessmentStructure, Measurements};
+    use magnitude_executor::platform::GraphPricing;
+    let records = tempfile::tempdir().expect("kernel cache");
+    let devices = seismic::Devices::discover(&[]).expect("device catalog");
+    let mut structure = AssessmentStructure::discover(
+        &devices,
+        magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+        Some(records.path()),
+        magnitude_executor::platform::MemoryReserves::standard(),
+        crate::assessment::environment::serving_policy(),
+        magnitude_engine::options::standard_service_limits(),
+    )
+    .expect("the CPU backend is selectable");
+    // The CPU records nothing of its graphs, so its records price them at none from the start.
+    // An unrecorded device's bound stands in for them: one no model fits beside.
+    let recorded = GraphPricing::Measured(seismic::GraphCost::None);
+    assert_eq!(structure.selected.graph_cost, recorded);
+    structure.selected.graph_cost = GraphPricing::Bound(seismic::GraphCost::Pooled {
+        graph: 0,
+        launch: 1 << 40,
+        granule: 1,
+    });
+    let structure = Arc::new(structure);
+    let environment = Arc::new(
+        AssessmentEnvironment::new(Arc::clone(&structure), Measurements::Pending)
+            .expect("the CPU environment"),
+    );
+    let bound = environment.id.clone();
+    let fixture = fixture_from(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::new(),
+        false,
+        environment,
+    )
+    .await;
+    let (status, measurement) = tokio::sync::watch::channel(MeasurementStatus::stored(AssessmentSetup {
+        structure: Arc::clone(&structure),
+        measurements: Measurements::Pending,
+    }));
+    let assessments = crate::assessment::ManagedModelAssessments::start(
+        Arc::clone(&fixture.assessor),
+        Arc::new(ListedCatalog(fixture.catalog_id.clone())),
+        Arc::new(NoLocal(StubLocal(Vec::new(), LocalModelsConfiguration::default()))),
+        measurement,
+        crate::assessment::HostDevice::new(&crate::device_lock::DeviceLock::default(), false),
+    );
+    let within = std::time::Duration::from_secs(120);
+    let refused = tokio::time::timeout(within, assessed_in(&assessments, &bound))
+        .await
+        .expect("the model is assessed at the bound");
+    assert!(
+        matches!(refused.as_slice(), [ModelAssessment::DoesNotFit { .. }]),
+        "{refused:?}"
+    );
+
+    // The record lands: the job's next read of the records prices the graphs at the device's
+    // own cost.
+    let stored = structure.stored(records.path(), records.path());
+    assert_eq!(stored.structure.selected.graph_cost, recorded);
+    let measured = AssessmentEnvironment::new(Arc::clone(&stored.structure), stored.measurements.clone())
+        .expect("the recorded environment")
+        .id;
+    assert_ne!(measured, bound);
+    status.send(MeasurementStatus::stored(stored)).expect("the pool watches");
+    let offered = tokio::time::timeout(within, assessed_in(&assessments, &measured))
+        .await
+        .expect("the model is assessed again once the record lands");
+    assert!(
+        matches!(offered.as_slice(), [ModelAssessment::Fits { .. }]),
+        "{offered:?}"
     );
 }

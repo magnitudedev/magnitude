@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use magnitude_engine::assessment::{AssessmentStructure, Measurements};
+use magnitude_engine::assessment::{AssessmentSetup, AssessmentStructure, Measurements};
 use magnitude_engine::error::RequestError;
 use magnitude_engine::worker::protocol::{RoomAnswer, RoomRefusal};
 use magnitude_engine::worker::measure::{
@@ -48,7 +48,7 @@ const LONGEST_JOB: u32 = 8;
 /// What the measurement job reports: its state, and what is stored of the machine for
 /// assessment.
 #[derive(Clone)]
-pub struct MeasurementStatus<S = Measurements> {
+pub struct MeasurementStatus<S = AssessmentSetup> {
     pub state: MeasurementState,
     pub measurements: S,
 }
@@ -84,12 +84,12 @@ pub trait StoredRecords: Clone + Send + Sync + 'static {
     fn stage(&self) -> Stage;
 }
 
-impl StoredRecords for Measurements {
+impl StoredRecords for AssessmentSetup {
     fn stage(&self) -> Stage {
-        match self {
-            Self::Pending => Stage::Unmeasured,
-            Self::Measured { pending: true, .. } => Stage::Refining,
-            Self::Measured { pending: false, .. } | Self::Unavailable { .. } => Stage::Settled,
+        match &self.measurements {
+            Measurements::Pending => Stage::Unmeasured,
+            Measurements::Measured { pending: true, .. } => Stage::Refining,
+            Measurements::Measured { pending: false, .. } | Measurements::Unavailable { .. } => Stage::Settled,
         }
     }
 }
@@ -183,10 +183,10 @@ fn next_job() -> MeasureJob {
 }
 
 impl MeasuredMachine for ServiceMachine {
-    type Stored = Measurements;
+    type Stored = AssessmentSetup;
 
-    fn stored(&self) -> Measurements {
-        self.structure.stored_measurements(&self.kernels, &self.storage)
+    fn stored(&self) -> AssessmentSetup {
+        self.structure.stored(&self.kernels, &self.storage)
     }
 
     fn start(&self, time: Duration) -> anyhow::Result<StartedJob> {

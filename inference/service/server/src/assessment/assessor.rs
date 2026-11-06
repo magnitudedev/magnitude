@@ -9,7 +9,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use magnitude_engine::assessment::{
-    DrafterVerdict as EngineDrafterVerdict, HeaderExtent as EngineHeaderExtent, Measurements,
+    AssessmentSetup, AssessmentStructure, DrafterVerdict as EngineDrafterVerdict,
+    HeaderExtent as EngineHeaderExtent,
     ModelAssessment as EngineAssessment, ModelAssessmentError,
     ModelCapabilities as EngineCapabilities, ModelExecution, ModelPackagePaths,
     ModelResidency as EngineResidency, Performance, PreparedModelAssessment,
@@ -140,15 +141,15 @@ impl ModelAssessor {
         )
     }
 
-    /// Assess new work under `measurements` of the same structure. The new environment when its
-    /// identity differs from the current one's; `None` when the measurements change nothing of
-    /// it.
-    pub fn adopt(&self, measurements: Measurements) -> Option<Arc<AssessmentEnvironment>> {
+    /// Assess new work under `stored`, what the stored records give assessment now
+    /// ([`AssessmentEnvironment::stored`]). The new environment when its identity differs from
+    /// the current one's; `None` when the records change nothing of it.
+    pub fn adopt(&self, stored: AssessmentSetup) -> Option<Arc<AssessmentEnvironment>> {
         let mut current = self
             .environment
             .write()
             .expect("assessment environment lock poisoned");
-        let next = current.measured(measurements);
+        let next = current.stored(stored);
         let moved = next.id != current.id;
         *current = Arc::new(next);
         moved.then(|| Arc::clone(&current))
@@ -200,13 +201,13 @@ impl ModelAssessor {
         }
     }
 
-    /// Resolve and prepare one bundle from its headers. A preparation reads only the
-    /// environment's structure, which every environment of this assessor shares.
+    /// Resolve and prepare one bundle from its headers on `structure`, all a preparation reads
+    /// of its environment.
     pub async fn prepare_bundle(
         &self,
+        structure: Arc<AssessmentStructure>,
         configuration: ModelServingConfiguration,
     ) -> PreparationResult {
-        let structure = Arc::clone(&self.environment().setup.structure);
         let bundle_key = servable_model_bundle_key_for_bundle(&configuration.bundle);
         let resolved = self
             .resolve(&bundle_key, configuration.bundle)
@@ -255,7 +256,7 @@ impl ModelAssessor {
             });
         }
         let prepared = match preparation
-            .get_or_init(|| self.prepare_bundle(configuration))
+            .get_or_init(|| self.prepare_bundle(Arc::clone(&environment.setup.structure), configuration))
             .await
         {
             Ok(prepared) => Arc::clone(prepared),

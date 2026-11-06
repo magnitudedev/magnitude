@@ -200,15 +200,15 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 let (kernels, storage) = (kernels.clone(), storage.clone());
                 magnitude_service_utils::blocking::run(move || {
                     let serving = ServingDevice::select(&catalog)?;
-                    let structure = assessment_structure(&catalog, serving, Some(kernels.as_path()))?;
-                    let stored = structure.stored_measurements(&kernels, &storage);
-                    anyhow::Ok((serving, Arc::new(structure), stored))
+                    let structure = Arc::new(assessment_structure(&catalog, serving, Some(kernels.as_path()))?);
+                    let stored = structure.stored(&kernels, &storage);
+                    anyhow::Ok((serving, structure, stored))
                 })
                 .await
                 .context("failed to establish the assessment structure")?
             };
             let assessment_environment = Arc::new(
-                AssessmentEnvironment::new(Arc::clone(&structure), stored.clone())
+                AssessmentEnvironment::new(Arc::clone(&stored.structure), stored.measurements.clone())
                     .context("failed to establish the assessment environment")?,
             );
             let device = DeviceLock::default();

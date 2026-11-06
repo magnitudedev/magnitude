@@ -86,8 +86,9 @@ pub fn assessment_structure(
 pub struct AssessmentEnvironment {
     pub id: AssessmentEnvironmentId,
     pub setup: AssessmentSetup,
-    /// What of the structure enters every identity on it, derived once with it.
-    structure_identity: Arc<serde_json::Value>,
+    /// The identity of the structure alone, derived once with it: what a model's preparation,
+    /// which reads only the structure, is keyed by.
+    pub structure_id: Arc<str>,
 }
 
 impl AssessmentEnvironment {
@@ -97,17 +98,22 @@ impl AssessmentEnvironment {
         structure: Arc<AssessmentStructure>,
         measurements: Measurements,
     ) -> anyhow::Result<Self> {
-        let structure_identity = Arc::new(structure_identity(&structure)?);
-        Ok(Self::of(structure, structure_identity, measurements))
+        let structure_id = structure_id(&structure)?;
+        Ok(Self::of(structure, structure_id, measurements))
     }
 
-    /// This environment's structure under `measurements`.
-    pub fn measured(&self, measurements: Measurements) -> Self {
-        Self::of(
-            Arc::clone(&self.setup.structure),
-            Arc::clone(&self.structure_identity),
-            measurements,
-        )
+    /// The environment of what the stored records give assessment now (`stored`,
+    /// [`AssessmentStructure::stored`]): this one's structure identity while its structure is
+    /// this one's, a new one when the records priced an input of it anew.
+    pub fn stored(&self, stored: AssessmentSetup) -> Self {
+        let structure_id = if Arc::ptr_eq(&stored.structure, &self.setup.structure) {
+            Arc::clone(&self.structure_id)
+        } else {
+            // The records price the same structure anew: its host sample is the one this
+            // identity was derived from.
+            structure_id(&stored.structure).expect("a stored structure keeps its host sample")
+        };
+        Self::of(stored.structure, structure_id, stored.measurements)
     }
 
     /// Only stable evidence enters identity: the structure's, and the executor costs once
@@ -116,10 +122,10 @@ impl AssessmentEnvironment {
     /// structure's identity includes the engine build, which derives costs from records). No
     /// model's own measurement enters it. The identity keys every assessment's work, cache entry and contract
     /// identity, the candidates' cache, and the snapshot's `environment_id`, and a new one is
-    /// what moves the pool to new measurements ([`super::assessor::ModelAssessor::adopt`]).
+    /// what moves the pool to new records ([`super::assessor::ModelAssessor::adopt`]).
     fn of(
         structure: Arc<AssessmentStructure>,
-        structure_identity: Arc<serde_json::Value>,
+        structure_id: Arc<str>,
         measurements: Measurements,
     ) -> Self {
         let measured = match &measurements {
@@ -128,7 +134,7 @@ impl AssessmentEnvironment {
             Measurements::Measured { records, .. } => json!({ "records": records.as_ref() }),
         };
         let material = json!({
-            "structure": &*structure_identity,
+            "structure": &*structure_id,
             "measurements": measured,
         });
         Self {
@@ -140,9 +146,15 @@ impl AssessmentEnvironment {
                 structure,
                 measurements,
             },
-            structure_identity,
+            structure_id,
         }
     }
+}
+
+/// The identity of `structure`'s [`structure_identity`].
+fn structure_id(structure: &AssessmentStructure) -> anyhow::Result<Arc<str>> {
+    let identity = structure_identity(structure)?;
+    Ok(format!("structure_{:x}", Sha256::digest(identity.to_string().as_bytes())).into())
 }
 
 /// What of `structure` enters identity: the engine build, the selected device and what its graphs

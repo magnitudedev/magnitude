@@ -202,18 +202,29 @@ pub fn select_recorded(
     let topology = catalog.topology();
     let info = select(&topology, path, request).map_err(PlatformError::Selection)?;
     let status = catalog.status(&topology, info.id());
+    let graph_cost = graph_pricing(&topology, &info, root)?;
+    selected(&topology, &status, reserves, info, graph_cost).map_err(PlatformError::Memory)
+}
+
+/// What `info`'s graphs are priced at from the kernel cache at `root`: the
+/// device's own cost once the measurement job recorded it there, its
+/// backend's bound until then and without a cache.
+pub fn graph_pricing(
+    topology: &seismic::DeviceTopology,
+    info: &Executor,
+    root: Option<&std::path::Path>,
+) -> Result<GraphPricing, PlatformError> {
     let recorded = match root {
         Some(root) => {
             let records = crate::KernelCache::measurement_records(root);
-            crate::assessment::GraphMemory::stored(&topology, &info, &records).map_err(PlatformError::Records)?
+            crate::assessment::GraphMemory::stored(topology, info, &records).map_err(PlatformError::Records)?
         }
         None => None,
     };
-    let graph_cost = match recorded {
+    Ok(match recorded {
         Some(recorded) => GraphPricing::Measured(recorded),
         None => GraphPricing::Bound(seismic::unmeasured_graph_cost(info.backend())),
-    };
-    selected(&topology, &status, reserves, info, graph_cost).map_err(PlatformError::Memory)
+    })
 }
 
 /// `info`, of `topology`, as selected under `status` and `reserves`: its

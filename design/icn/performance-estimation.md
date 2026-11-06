@@ -122,6 +122,11 @@ records of every figure an estimate reads (the executor's costs, the store's rea
 reference convert and the host memory's line). Measurement timestamps, live usage and what loads record do not enter identity. A warm exact-cache hit performs no
 estimation.
 
+Every record that enters the identity revises the service's assessments as the measurement job
+stores it, with no restart. A record that prices the structure anew (the device's graph memory,
+priced at its backend's bound until recorded) prepares every model again on the new structure; a
+figure an estimate reads finishes each model again over the demand it was prepared with.
+
 ## Conformance
 
 - Estimation reads no tensor payload, opens no device and runs no model decode.
