@@ -1368,13 +1368,17 @@ impl Interpretation {
     }
 
     /// The axis values of a decoder's value codes: their interpretation's,
-    /// or a grid's.
+    /// a grid's, or E4M3 bytes' (their kind alone).
     fn of_values(codes: &registry::ValueCodes) -> Self {
         match codes {
             registry::ValueCodes::Fields(code) => Self::of(code),
             registry::ValueCodes::Grid(grid) => Self {
                 codes: Some(registry::CodeKind::Grid),
                 grid: Some(grid),
+                ..Self::none()
+            },
+            registry::ValueCodes::E4m3 => Self {
+                codes: Some(registry::CodeKind::E4m3),
                 ..Self::none()
             },
         }

@@ -3994,6 +3994,86 @@ impl<C: Codes, K: Coefficients, const STORAGE: usize> Format for PackedRows<C, K
     }
 }
 
+/// A packet's 32 floating codes as exact `f32`s: a floating code component
+/// (`registry::ValueCodes::E4m3`), whose values no signed byte holds.
+pub trait FloatCodes: Copy + Send + Sync + 'static {
+    /// The values of packet `at`, in element order, a NaN code NaN.
+    ///
+    /// # Safety
+    /// `at` is a packet of a row.
+    unsafe fn values(at: At) -> [f32; PACKET];
+}
+
+/// E4M3 bytes: code `c` is `2^9` times its value (an integer, under the
+/// coefficients' code exponent -9), its sign kept on a zero, a NaN code
+/// (`S.1111.111`) NaN.
+#[derive(Clone, Copy, Debug)]
+pub struct E4m3;
+
+impl E4m3 {
+    const VALUES: [f32; 256] = {
+        let mut values = [0.0f32; 256];
+        let mut raw = 0;
+        while raw < 256 {
+            let (exponent, mantissa) = ((raw >> 3) & 15, raw & 7);
+            // (8 + m) 2^(e - 1) for a normal code, m for a subnormal one.
+            let magnitude = match (exponent, mantissa) {
+                (15, 7) => f32::NAN,
+                (0, _) => mantissa as f32,
+                _ => ((8 + mantissa) << (exponent - 1)) as f32,
+            };
+            values[raw] = if raw >= 128 { -magnitude } else { magnitude };
+            raw += 1;
+        }
+        values
+    };
+}
+
+impl FloatCodes for E4m3 {
+    #[inline(always)]
+    unsafe fn values(at: At) -> [f32; PACKET] {
+        let codes: [u8; PACKET] = match at.code(RowPlaneRole::Codes) {
+            CodeBytes::Packet(bytes) => unsafe { read(bytes) },
+            CodeBytes::Lanes(lanes) => unsafe { lane_codes(lanes, 8) },
+        };
+        codes.map(|code| Self::VALUES[usize::from(code)])
+    }
+}
+
+/// Packed rows of `STORAGE`-value storage groups whose packets' values are
+/// floating codes `C` scaled by coefficients `K`.
+#[derive(Clone, Copy, Debug)]
+pub struct FloatRows<C, K, const STORAGE: usize>(PhantomData<(C, K)>);
+
+impl<C: FloatCodes, K: Coefficients, const STORAGE: usize> Format for FloatRows<C, K, STORAGE> {
+    #[inline(always)]
+    unsafe fn decode<V: Vectors>(row: &Row, p: usize, _k: usize, out: &mut [f32; PACKET]) {
+        const { assert!(STORAGE % PACKET == 0, "storage groups of whole packets") };
+        let at = At::of::<STORAGE>(row, p);
+        let coefficients = unsafe { K::decode::<STORAGE>(at) };
+        let values = unsafe { C::values(at) };
+        for half in 0..2 {
+            let (scale, bias) = coefficients[half];
+            for i in 16 * half..16 * half + 16 {
+                out[i] = if K::BIASED {
+                    scale.mul_add(values[i], bias)
+                } else {
+                    scale * values[i]
+                };
+            }
+        }
+    }
+
+    unsafe fn dot_q8<const R: usize, const M: usize, V: Vectors>(
+        _rows: &[Row; R],
+        _b: usize,
+        _k: usize,
+        _x: [&Q8Block; M],
+    ) -> [[f32; M]; R] {
+        unreachable!("floating codes take no int8 form (`forms::cpu_int8`)")
+    }
+}
+
 /// Register-resident packet dots for targets whose baseline includes the
 /// dot-product instructions (every Apple silicon target). A packet's values
 /// are formed in two vectors in element order and never leave registers.
@@ -5187,11 +5267,12 @@ mod tests {
                             &mut out,
                         )
                     };
+                    // A NaN code (E4M3's) decodes to NaN.
                     for (i, value) in out.iter().enumerate() {
-                        assert_eq!(
-                            f64::from(*value),
-                            reference[row * k + i],
-                            "{name} k {k} row {row} value {i}"
+                        let expected = reference[row * k + i];
+                        assert!(
+                            f64::from(*value) == expected || value.is_nan() && expected.is_nan(),
+                            "{name} k {k} row {row} value {i}: {value} is not {expected}"
                         );
                     }
                 }

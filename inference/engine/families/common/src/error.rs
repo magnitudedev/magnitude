@@ -23,10 +23,11 @@ pub enum HeaderError {
     },
     /// A weight read as a matrix is not one.
     NotMatrix { name: String, shape: Vec<u64> },
-    /// A stored second-level scale that is not one F32 value per matrix.
+    /// A stored companion scale `<stem>.scale` (or `<stem>.input_scale`)
+    /// not of the form its weight takes.
     CompanionScale {
         name: String,
-        matrices: u64,
+        expected: CompanionForm,
         encoding: Encoding,
         shape: Vec<u64>,
     },
@@ -61,12 +62,12 @@ impl fmt::Display for HeaderError {
             ),
             Self::CompanionScale {
                 name,
-                matrices,
+                expected,
                 encoding,
                 shape,
             } => write!(
                 formatter,
-                "scale {name:?}: expected F32 [{matrices}], received {encoding:?} {shape:?}"
+                "scale {name:?}: expected {expected}, received {encoding:?} {shape:?}"
             ),
             Self::UnboundWeights(names) => {
                 write!(formatter, "artifact contains unbound weight roles {names:?}")
@@ -132,6 +133,34 @@ impl HeaderError {
 /// The output projection a GGUF stores apart from the embedding unless the
 /// two are tied.
 const OUTPUT_HEAD: &str = "output.weight";
+
+/// The companion scale a weight takes (`Tensors::companion_scale`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompanionForm {
+    /// One F32 value per matrix (of `matrices`).
+    PerMatrix { matrices: u64 },
+    /// An F8_E4M3 `[rows, columns]` matrix's grid of UE8M0 block scales:
+    /// I8 `[rows / r, columns / c]` for whole tiles `[r, c]` of whole
+    /// `ImportTransform::GRID_BLOCK`-value row blocks, the file declaring
+    /// `magnitude.scale_encoding = "ue8m0"`.
+    Ue8m0Grid { rows: u64, columns: u64 },
+}
+
+impl fmt::Display for CompanionForm {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PerMatrix { matrices } => write!(formatter, "F32 [{matrices}]"),
+            Self::Ue8m0Grid { rows, columns } => write!(
+                formatter,
+                "an I8 grid of whole tiles of whole {}-value row blocks of [{rows}, {columns}], \
+                 declared `{}` = {:?}",
+                magnitude_family_contracts::ImportTransform::GRID_BLOCK,
+                crate::tensors::SCALE_ENCODING,
+                crate::tensors::UE8M0,
+            ),
+        }
+    }
+}
 
 impl From<HeaderError> for FamilyError {
     fn from(error: HeaderError) -> Self {

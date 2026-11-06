@@ -13,8 +13,8 @@
 use crate::isa::Tier;
 use crate::quant::Q8Block;
 use crate::weights::{
-    self, codes, scales, Carried, Delta, DenseRows, Direct, Format, Grid, Hier, Minimum, NoDelta,
-    PackedRows, Planes, RowGeometry, Scales, SignedBias, Unbiased,
+    self, codes, scales, Carried, Delta, DenseRows, Direct, E4m3, FloatRows, Format, Grid, Hier,
+    Minimum, NoDelta, PackedRows, Planes, RowGeometry, Scales, SignedBias, Unbiased,
 };
 use seismic_lang::ids::RepresentationId;
 #[cfg(test)]
@@ -351,6 +351,16 @@ mod tests {
     };
     use seismic_lang::types::DType;
 
+    /// The elements whose products take int8 activations
+    /// (`forms::cpu_int8`), whose components' `dot_q8` the runtime calls.
+    fn int8_elements() -> impl Iterator<Item = &'static str> {
+        elements().filter(|name| int8(name))
+    }
+
+    fn int8(name: &str) -> bool {
+        seismic_lang::forms::cpu_int8_of(registry::representation(name).unwrap())
+    }
+
     /// A cross-check of build.rs's deduplication: the components it emits
     /// are as many as the distinct decodes (a dense element's dtype, a
     /// packed storage's decode axes and storage group) of the elements that
@@ -536,7 +546,7 @@ mod tests {
                         let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
                         assert_eq!(bits(&values), bits(&expected), "{name} {tier:?} k {k} row {row}");
                     }
-                    for block in ROW_BLOCKS {
+                    for block in ROW_BLOCKS.into_iter().filter(|_| int8(name)) {
                         for first in (0..rows - block + 1).step_by(block) {
                             let (mut out, mut expected) = (vec![0.0f32; block], vec![0.0f32; block]);
                             unsafe {
@@ -575,7 +585,8 @@ mod tests {
                                 &mut expected,
                             );
                         }
-                        assert_eq!(values, expected, "{name} k {k} columns {start}..{end} row {row}");
+                        let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+                        assert_eq!(bits(&values), bits(&expected), "{name} k {k} columns {start}..{end} row {row}");
                     }
                 }
                 compared += 1;
@@ -759,7 +770,7 @@ mod tests {
                 &mut quantized[m * blocks..(m + 1) * blocks],
             );
         }
-        for representation in elements() {
+        for representation in int8_elements() {
             let (data, geometry) = rows(representation, 16, k, 31);
             let kernels = kernels_of(tier, representation);
             for block in ROW_BLOCKS {
@@ -1100,7 +1111,7 @@ mod tests {
         let mut xq = vec![Q8Block::ZERO; blocks(k)];
         quantize(&x, &mut xq);
         let detected = Tier::detected().unwrap();
-        for representation in elements() {
+        for representation in int8_elements() {
             let (data, geometry) = rows(representation, BLOCK_ROWS, k, 11);
             let reference = kernels_of(detected, representation);
             let mut first_tier = [0.0f32; BLOCK_ROWS];
@@ -1178,7 +1189,7 @@ mod tests {
             let x = bytes(5, k).iter().map(|byte| (*byte as f32 - 128.0) / 90.0).collect::<Vec<_>>();
             let mut xq = vec![Q8Block::ZERO; blocks(k)];
             quantize(&x, &mut xq);
-            for representation in elements() {
+            for representation in int8_elements() {
                 let (data, geometry) = rows(representation, 16 * tiles, k, 13);
                 // Eight rows a call: never a whole tile.
                 let block = 8;
@@ -1231,7 +1242,7 @@ mod tests {
                 }
                 quantize(&x, &mut quantized[m * blocks..(m + 1) * blocks]);
             }
-            for representation in elements() {
+            for representation in int8_elements() {
                 let (data, geometry) = rows(representation, BLOCK_ROWS, k, 17 + k as u64);
                 let reference = kernels_of(lowest, representation);
                 let mut expected = [[0.0f32; BLOCK_ROWS]; 4];

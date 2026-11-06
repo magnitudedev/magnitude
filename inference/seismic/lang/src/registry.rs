@@ -1962,12 +1962,44 @@ pub fn representation_conversion_info(
 pub fn representation_conversions() -> &'static [RepresentationConversion] {
     internals::representation_conversions()
 }
-/// A GGUF source the registry converts from: its ggml type, its storage
-/// name, and the resident representation its conversion writes. A source
-/// packet is one block of the type (`magnitude_ggml` geometry).
+/// Where the scales of a GGUF source's values are: in its stored tensor's
+/// own blocks, or in a companion grid of E8M0 block scales.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GgufScales {
+    /// In the tensor's blocks (`magnitude_ggml` geometry), or none.
+    Own,
+    /// A companion grid of E8M0 codes, one per tile of whole
+    /// [`GgufScales::GRID_BLOCK`]-value row blocks, over a tensor of
+    /// single-value blocks. The importer assembles each block of a row as
+    /// its tile's scale code, then its values' blocks: the source's packet.
+    E8m0Grid,
+}
+
+impl GgufScales {
+    /// The values of a row an assembled grid block scales (OCP MX's block).
+    pub const GRID_BLOCK: u64 = 32;
+
+    /// The bytes and the values of one source packet of `encoding`.
+    const fn packet(self, encoding: Encoding) -> (u64, u64) {
+        match self {
+            Self::Own => (encoding.block_bytes(), encoding.block_elements()),
+            Self::E8m0Grid => {
+                assert!(encoding.block_elements() == 1, "a scale grid scales single values");
+                (1 + Self::GRID_BLOCK * encoding.block_bytes(), Self::GRID_BLOCK)
+            }
+        }
+    }
+}
+
+/// A GGUF source the registry converts from: its ggml type, where its
+/// scales are, its storage name, and the resident representation its
+/// conversion writes. A source packet is one block of the type
+/// (`magnitude_ggml` geometry), or one assembled grid block
+/// (`GgufScales::E8m0Grid`).
 #[derive(Clone, Copy, Debug)]
 struct GgufSource {
     encoding: Encoding,
+    scales: GgufScales,
     name: &'static str,
     resident: &'static str,
 }
@@ -1979,12 +2011,13 @@ const fn gguf_source_spec(
 ) -> GgufSource {
     GgufSource {
         encoding,
+        scales: GgufScales::Own,
         name,
         resident,
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 24] = [
+const GGUF_SOURCES: [GgufSource; 25] = [
     gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
     gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "iq3s"),
     gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
@@ -2013,17 +2046,27 @@ const GGUF_SOURCES: [GgufSource; 24] = [
     // more to decode than a bit field, and no backend's product is bound by
     // the 18% of bytes they save (spec 26-10-30 §13).
     gguf_source_spec(Encoding::Tq1_0, "gguf_tq1_0", "q2g256"),
+    // E4M3 codes under their companion E8M0 grid (OCP MXFP8's block: the
+    // scale, then 32 codes), moved bit for bit.
+    GgufSource {
+        encoding: Encoding::F8E4M3,
+        scales: GgufScales::E8m0Grid,
+        name: "gguf_f8_e4m3_e8m0",
+        resident: "mxfp8g32",
+    },
 ];
 
-/// The external storage rows of `width` stored values of `encoding` are
-/// read as: the registered source of the encoding, whose block divides the
-/// row (a GGUF row is whole blocks); `None` when the registry converts from
-/// none.
-pub fn gguf_source(encoding: Encoding, width: u64) -> Option<RepresentationId> {
+/// The external storage rows of `width` stored values of `encoding`,
+/// scaled as `scales` says, are read as: the registered source of the
+/// pair, whose packet divides the row (a GGUF row is whole blocks); `None`
+/// when the registry converts from none.
+pub fn gguf_source(encoding: Encoding, scales: GgufScales, width: u64) -> Option<RepresentationId> {
     GGUF_SOURCES
         .iter()
         .find(|source| {
-            source.encoding == encoding && width.is_multiple_of(encoding.block_elements())
+            source.encoding == encoding
+                && source.scales == scales
+                && width.is_multiple_of(scales.packet(encoding).1)
         })
         .and_then(|source| representation(source.name))
 }
@@ -2438,10 +2481,10 @@ pub(crate) mod internals {
         // (IQ2_XS's and IQ3_XXS's factors widened exactly, TQ1_0's digits
         // looked up as 2-bit codes).
         let external_specs = GGUF_SOURCES.map(|source| {
-            let packet_size = u32::try_from(source.encoding.block_bytes())
-                .expect("a GGUF source packet fits u32 bytes");
-            let logical_group = u32::try_from(source.encoding.block_elements())
-                .expect("a GGUF source packet fits u32 values");
+            let (bytes, values) = source.scales.packet(source.encoding);
+            let packet_size = u32::try_from(bytes).expect("a GGUF source packet fits u32 bytes");
+            let logical_group =
+                u32::try_from(values).expect("a GGUF source packet fits u32 values");
             (source.name, packet_size, logical_group, source.resident)
         });
         // A GGUF packet is declared aligned to the largest power of two, to
@@ -3482,6 +3525,15 @@ pub(crate) mod internals {
                             .collect(),
                     ),
                 ));
+                push(plane(
+                    "block_scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 1)),
+                ));
+            }
+            "gguf_f8_e4m3_e8m0" => {
+                // The assembled block: e (E8M0) | qs[32] (E4M3), value p
+                // qs[p]; every byte moves bit for bit.
+                push(plane("words", PlaneRepackRecipe::BitRoutes(direct_bits(1, 32))));
                 push(plane(
                     "block_scale",
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 1)),
@@ -4883,6 +4935,32 @@ mod tests {
                 .map(|canonical| canonical.len()),
             Ok(4 * 36)
         );
+    }
+
+    /// F8_E4M3 has a source only under its grid of E8M0 block scales: an
+    /// assembled block, the scale byte then 32 codes, converting into
+    /// mxfp8g32, whose decoders read E4M3 bytes 2^9 times their value; no
+    /// other encoding is read under a grid.
+    #[test]
+    fn f8_e4m3_is_sourced_by_its_scale_grid_as_mxfp8g32() {
+        use crate::repr::ValueCodes;
+        assert_eq!(gguf_source(Encoding::F8E4M3, GgufScales::Own, 256), None);
+        assert_eq!(gguf_source(Encoding::F8E4M3, GgufScales::E8m0Grid, 48), None);
+        assert_eq!(gguf_source(Encoding::Q8_0, GgufScales::E8m0Grid, 256), None);
+        let source = gguf_source(Encoding::F8E4M3, GgufScales::E8m0Grid, 256).unwrap();
+        assert_eq!(representation_info(source).name, "gguf_f8_e4m3_e8m0");
+        assert_eq!(GgufScales::E8m0Grid.packet(Encoding::F8E4M3), (33, 32));
+        for layout in Layout::ALL {
+            let resident = conversion_destination(source, layout, OperandRecipe::Rounded).unwrap();
+            assert_eq!(representation_info(resident).representation, "mxfp8g32");
+            if let Some(axes) = decode_axes(resident) {
+                assert_eq!(axes.code_exponent, -9);
+                let CodingAxes::Direct { codes, .. } = axes.coding else {
+                    panic!("mxfp8g32 is direct");
+                };
+                assert_eq!(codes, ValueCodes::E4m3);
+            }
+        }
     }
 }
 

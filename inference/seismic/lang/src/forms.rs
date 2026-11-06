@@ -230,6 +230,8 @@ fn cuda_gemm_fold(axes: &registry::DecodeAxes) -> bool {
         ValueMap::Linear | ValueMap::Table => {
             matches!(profile.local.scale, LocalScale::Stored(_)) && axes.low != 8
         }
+        // Floating codes are no operand integers of 8 bits.
+        ValueMap::Float => false,
     };
     admitted && chosen
 }
@@ -395,6 +397,8 @@ fn metal_lanes(axes: &registry::DecodeAxes) -> Option<MetalLanes> {
         registry::ValueCodes::Grid(_) => {
             return axes.profile().codes.fits_i8().then_some(MetalLanes::Grid);
         }
+        // Floating codes enter no lane as integers.
+        registry::ValueCodes::E4m3 => return None,
     };
     // Every split `code_planes` makes of up to 8 bits; a plane of bytes is
     // the one without a high plane at 8.
@@ -700,7 +704,9 @@ mod tests {
     /// CUDA's int8 GEMM admission of every representation it imports: main's
     /// library took the INT8 path for every packed weight whose products do
     /// not take NVFP4 operand rows (`projection::quantizable`), and so does
-    /// the admission, of every packed-rows representation of the registry.
+    /// the admission, of every packed-rows representation of the registry
+    /// but mxfp8g32, which main did not have and whose E4M3 codes are no
+    /// integers of `i8`.
     #[test]
     fn cuda_int8_is_mains() {
         let admitted = [
@@ -708,7 +714,7 @@ mod tests {
             "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs", "q4g32", "q2k", "q2g256", "q1g128", "iq2s",
             "iq1s", "iq1m", "q3k", "iq4xs", "iq3s",
         ];
-        let excluded = ["nvfp4g16a4"];
+        let excluded = ["nvfp4g16a4", "mxfp8g32"];
         let int8 = Form::named(BackendName::Cuda, "INT8").unwrap();
         let expected = admitted.map(|storage| (storage, 1)).into_iter().chain(excluded.map(|storage| (storage, 0)));
         for (storage, value) in expected {
@@ -717,7 +723,9 @@ mod tests {
         }
         for info in registry::representations() {
             let main = match info.kind {
-                registry::RepresentationKind::PackedRows(_) => u32::from(info.operands != OperandRecipe::Nvfp4Rows),
+                registry::RepresentationKind::PackedRows(_) => {
+                    u32::from(info.operands != OperandRecipe::Nvfp4Rows && info.representation != "mxfp8g32")
+                }
                 _ => 0,
             };
             assert_eq!(int8.of(info.id), main, "{}", info.name);
@@ -743,7 +751,9 @@ mod tests {
     /// projections quantized their activations for every weight with a CPU
     /// component, the floating dense elements and every packed-rows decode,
     /// except one whose products take NVFP4 operand rows, whose quantized
-    /// rows they dropped for the F32 dot (`projection::project_arithmetic`).
+    /// rows they dropped for the F32 dot (`projection::project_arithmetic`);
+    /// and mxfp8g32, which main did not have and whose E4M3 codes are no
+    /// integers of `i8`, takes the F32 dot.
     #[test]
     fn cpu_int8_is_mains() {
         let admitted = [
@@ -775,7 +785,7 @@ mod tests {
             "iq3s@rows16",
             "q4k@rows8",
         ];
-        let excluded = ["nvfp4g16a4@rows16"];
+        let excluded = ["nvfp4g16a4@rows16", "mxfp8g32@rows16"];
         let int8 = Form::named(BackendName::Cpu, "INT8").unwrap();
         let expected = admitted.map(|name| (name, 1)).into_iter().chain(excluded.map(|name| (name, 0)));
         for (name, value) in expected {
@@ -785,7 +795,9 @@ mod tests {
         for info in registry::representations() {
             let main = match info.kind {
                 registry::RepresentationKind::Dense(dtype) => matches!(dtype, DType::F32 | DType::BF16 | DType::F16),
-                registry::RepresentationKind::PackedRows(_) => info.operands != OperandRecipe::Nvfp4Rows,
+                registry::RepresentationKind::PackedRows(_) => {
+                    info.operands != OperandRecipe::Nvfp4Rows && info.representation != "mxfp8g32"
+                }
                 _ => false,
             };
             assert_eq!(int8.of(info.id), u32::from(main), "{}", info.name);

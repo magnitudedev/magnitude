@@ -198,7 +198,9 @@ pub use seismic_compiler::graph_cost::{GraphBytes, GraphCensus, GraphCost, Launc
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
-pub use seismic_lang::registry::{f16_bits, f16_to_f32, record_table_bytes, BackendName, Layout, OperandRecipe};
+pub use seismic_lang::registry::{
+    f16_bits, f16_to_f32, record_table_bytes, BackendName, GgufScales, Layout, OperandRecipe,
+};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
@@ -573,10 +575,15 @@ impl Element {
     pub fn stored(storage: &str, layout: Layout) -> Option<Element> {
         seismic_lang::registry::storage(storage, layout).map(Element)
     }
-    /// The external storage rows of `width` stored values of `encoding`
-    /// are read as, when the registry converts from it.
-    pub fn gguf_source(encoding: magnitude_ggml::Encoding, width: u64) -> Option<Element> {
-        seismic_lang::registry::gguf_source(encoding, width).map(Element)
+    /// The external storage rows of `width` stored values of `encoding`,
+    /// scaled as `scales` says, are read as, when the registry converts
+    /// from it.
+    pub fn gguf_source(
+        encoding: magnitude_ggml::Encoding,
+        scales: GgufScales,
+        width: u64,
+    ) -> Option<Element> {
+        seismic_lang::registry::gguf_source(encoding, scales, width).map(Element)
     }
     /// Every external (artifact-format) storage the registry converts from.
     pub fn external_sources() -> impl Iterator<Item = Element> {

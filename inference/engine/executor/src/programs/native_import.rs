@@ -106,7 +106,7 @@ pub(crate) fn fill_staged_source(
     };
     if plan.host_prepared() {
         let bytes = read_stored(&mut range, length)?;
-        let bytes = crate::import_transforms::upload_bytes(plan, stored.shape(), bytes)
+        let bytes = crate::import_transforms::upload_bytes(plan, stored, bytes)
             .map_err(transfer)?;
         if upload.byte_len() != bytes.len() as u64 {
             return Err(transfer(

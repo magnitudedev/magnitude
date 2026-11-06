@@ -12,11 +12,11 @@ use magnitude_artifacts::{
 };
 use magnitude_family_contracts::{
     ActivationDType, HeadComponent, ImportTransform, ModelDefinition, ProgressiveCodeDepth,
-    ProgressivePlane, ScaledActivations, VisionDescription, WeightDescriptor, WeightKind,
-    WeightRole, WeightScope,
+    ProgressivePlane, ScaleCodes, ScaledActivations, VisionDescription, WeightDescriptor,
+    WeightKind, WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
-use seismic::{BackendName, DType, Element, Layout, MetalPacking, OperandRecipe};
+use seismic::{BackendName, DType, Element, GgufScales, Layout, MetalPacking, OperandRecipe};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2089,8 +2089,13 @@ fn push_weight(
             )
         })?;
     let width = stored.shape.last().copied().unwrap_or(1);
-    let source = source_element(stored.encoding, width)
-        .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
+    let scales = crate::import_transforms::stored_scales(descriptor);
+    let source = scaled_source_element(stored.encoding, scales, width).ok_or_else(|| {
+        format!(
+            "weight {:?}: unsupported source encoding {:?} with {scales:?} scales",
+            descriptor.name, stored.encoding
+        )
+    })?;
     // The logical shape the importer's exact transforms make of the stored
     // tensor (the stored shape when there are none).
     let logical = crate::import_transforms::admit(descriptor, &stored.shape, source)?;
@@ -2116,23 +2121,33 @@ fn push_weight(
         (WeightKind::Vision(_), None) => (Element::f32(), Element::dense(form.activation)),
         _ => (
             source,
-            resident_element(
-                stored.encoding,
+            resident_storage(
+                source,
                 crate::import_transforms::scaled_activations(descriptor),
-                width,
                 dense_resident,
                 form.layout,
             )
             .ok_or_else(|| {
                 format!(
                     "{:?} has no resident form in the `{}` layout",
-                    stored.encoding,
+                    source.name(),
                     form.layout.as_str()
                 )
             })?,
         ),
     };
-    let source_bytes = representation_bytes(source, &stored.shape)?;
+    // The bytes the tensor stores: its source's, or under a grid of block
+    // scales its codes', one block of its encoding a value (`block_grid`
+    // checks the grid's).
+    let source_bytes = match scales {
+        GgufScales::Own => representation_bytes(source, &stored.shape)?,
+        GgufScales::E8m0Grid => {
+            block_grid(inventory, descriptor, &stored.shape)?;
+            elements(&stored.shape)
+                .and_then(|values| values.checked_mul(stored.encoding.block_bytes()))
+                .ok_or("a weight's byte count overflows")?
+        }
+    };
     if source_bytes != stored.nbytes {
         return Err(format!(
             "weight {:?} ({role:?}) stores {} bytes, but its {:?} shape {:?} is {source_bytes}",
@@ -2227,6 +2242,39 @@ fn weight_scale(
         extent: matrices,
         resident_bytes: representation_bytes(Element::f32(), &[matrices])?,
     }))
+}
+
+/// Checks the grid of block scales a weight's transforms name
+/// (`import_transforms::grid`, admitted by `import_transforms::admit`)
+/// against its component: one I8 byte a tile of the weight's stored
+/// `[rows, columns]`, UE8M0 codes by its descriptor's word.
+fn block_grid(
+    inventory: &[TensorDescriptor],
+    descriptor: &WeightDescriptor,
+    stored: &[u64],
+) -> Result<(), String> {
+    let (tensor, tile, ScaleCodes::Ue8m0) = crate::import_transforms::grid(descriptor)
+        .ok_or_else(|| format!("weight {:?} names no scale grid", descriptor.name))?;
+    let grid = inventory
+        .iter()
+        .find(|grid| grid.name == tensor)
+        .ok_or_else(|| {
+            format!(
+                "scale grid {tensor:?} of {:?} is absent from its component",
+                descriptor.name
+            )
+        })?;
+    let &[rows, columns] = stored else {
+        return Err(format!("scale grid {tensor:?} scales {stored:?}, which is not a matrix"));
+    };
+    let shape = [rows / tile[0], columns / tile[1]];
+    if grid.encoding != Encoding::I8 || grid.shape != shape || elements(&shape) != Some(grid.nbytes) {
+        return Err(format!(
+            "scale grid {tensor:?} of {:?} is {:?} {:?} of {} bytes, not I8 {shape:?}",
+            descriptor.name, grid.encoding, grid.shape, grid.nbytes
+        ));
+    }
+    Ok(())
 }
 
 /// The resident dense element of a role (`operators::resident_dtype`).
@@ -2361,19 +2409,29 @@ pub fn resident_layout(path: ExecutionPath, backend: BackendName) -> Layout {
 }
 
 /// The external storage of an artifact encoding whose rows hold `width`
-/// values (the stored last axis): its dense element, or the registry's
-/// source of such rows (`None` when the registry has none).
+/// values (the stored last axis), with its own scales
+/// ([`scaled_source_element`]).
 pub fn source_element(encoding: Encoding, width: u64) -> Option<Element> {
+    scaled_source_element(encoding, GgufScales::Own, width)
+}
+
+/// The external storage of an artifact encoding whose rows hold `width`
+/// values, its scales where `scales` says: its dense element, or the
+/// registry's source of such rows (`None` when the registry has none, and
+/// of a dense encoding under a scale grid).
+pub fn scaled_source_element(encoding: Encoding, scales: GgufScales, width: u64) -> Option<Element> {
+    let dense = |dtype| (scales == GgufScales::Own).then(|| Element::dense(dtype));
     match encoding {
-        Encoding::F32 => Some(Element::dense(DType::F32)),
-        Encoding::F16 => Some(Element::dense(DType::F16)),
-        Encoding::BF16 => Some(Element::dense(DType::BF16)),
-        _ => Element::gguf_source(encoding, width),
+        Encoding::F32 => dense(DType::F32),
+        Encoding::F16 => dense(DType::F16),
+        Encoding::BF16 => dense(DType::BF16),
+        _ => Element::gguf_source(encoding, scales, width),
     }
 }
 
-/// The resident storage of an artifact encoding: that of its source
-/// (`source_element`, of rows of `width` values) by [`resident_storage`].
+/// The resident storage of an artifact encoding with its own scales: that
+/// of its source (`source_element`, of rows of `width` values) by
+/// [`resident_storage`].
 pub fn resident_element(
     encoding: Encoding,
     activations: ScaledActivations,
@@ -2403,7 +2461,7 @@ pub(crate) fn value_packets(source: Element) -> Option<Element> {
 /// for the activations the weight's producer calibrated it for
 /// (`ScaledActivations`). NVFP4's per-tensor F32 `.scale` is a separate
 /// tensor; its W4A4 storage alone takes NVFP4 operands.
-fn resident_storage(
+pub(crate) fn resident_storage(
     source: Element,
     activations: ScaledActivations,
     dense: DType,
@@ -2419,10 +2477,12 @@ fn resident_storage(
     source.converted(layout, operands)
 }
 
-/// Every element a weight can be resident as in `layout`: the image of
-/// [`resident_element`] over every encoding, activations and dense dtype,
-/// and both IQ4_NL sources (rows whose width is a multiple of 256, and rows
-/// whose width is not), each once, in a fixed order.
+/// Every element a weight of an encoding with its own scales can be
+/// resident as in `layout`: the image of [`resident_element`] over every
+/// encoding, activations and dense dtype, and both IQ4_NL sources (rows
+/// whose width is a multiple of 256, and rows whose width is not), each
+/// once, in a fixed order. A weight under a grid of block scales
+/// (`mxfp8g32`) is not among them.
 pub fn resident_elements(layout: Layout) -> Vec<Element> {
     let mut elements = Vec::new();
     for dense in [DType::BF16, DType::F16, DType::F32] {
@@ -2511,45 +2571,42 @@ mod representation_byte_tests {
     }
 
     /// The registry owns the encoding map: every GGUF source it converts
-    /// from is an artifact encoding's, and every encoding with a source is
-    /// resident in every layout, a dense one in the activation dtype and a
-    /// packed one as its conversion writes it, in W4A4's NVFP4-operand
-    /// element only where the conversion has one (sharing its storage).
+    /// from is an artifact encoding's, its scales its own or a grid's, and
+    /// every encoding with a source is resident in every layout, a dense one
+    /// in the activation dtype and a packed one as its conversion writes it,
+    /// in W4A4's NVFP4-operand element only where the conversion has one
+    /// (sharing its storage).
     #[test]
     fn the_registry_owns_the_encoding_map() {
-        let widths = [256, 32];
-        let reached: HashSet<Element> = Encoding::ALL
-            .into_iter()
-            .flat_map(|encoding| widths.map(|width| source_element(encoding, width)))
-            .flatten()
-            .collect();
+        let sources = || {
+            Encoding::ALL.into_iter().flat_map(|encoding| {
+                [GgufScales::Own, GgufScales::E8m0Grid].into_iter().flat_map(move |scales| {
+                    [256, 32].map(|width| scaled_source_element(encoding, scales, width))
+                })
+            })
+        };
+        let reached: HashSet<Element> = sources().flatten().collect();
         for source in Element::external_sources() {
             assert!(reached.contains(&source), "{} is no encoding's source", source.name());
         }
-        for encoding in Encoding::ALL {
-            for width in widths {
-                let Some(source) = source_element(encoding, width) else {
+        for source in sources().flatten() {
+            for layout in Layout::ALL {
+                let resident =
+                    |activations| resident_storage(source, activations, DType::BF16, layout);
+                let rounded = resident(ScaledActivations::Rounded).unwrap();
+                let w4a4 = resident(ScaledActivations::Nvfp4);
+                if source.dtype().is_some() {
+                    assert_eq!((rounded, w4a4), (Element::bf16(), None));
                     continue;
-                };
-                for layout in Layout::ALL {
-                    let resident = |activations| {
-                        resident_element(encoding, activations, width, DType::BF16, layout)
-                    };
-                    let rounded = resident(ScaledActivations::Rounded).unwrap();
-                    let w4a4 = resident(ScaledActivations::Nvfp4);
-                    if source.dtype().is_some() {
-                        assert_eq!((rounded, w4a4), (Element::bf16(), None));
-                        continue;
-                    }
-                    assert_eq!(rounded.layout(), layout);
-                    assert_eq!(rounded.operand_recipe(), OperandRecipe::Rounded);
-                    if let Some(w4a4) = w4a4 {
-                        assert_eq!(w4a4.operand_recipe(), OperandRecipe::Nvfp4Rows);
-                        assert_eq!(
-                            (w4a4.representation(), w4a4.layout()),
-                            (rounded.representation(), layout)
-                        );
-                    }
+                }
+                assert_eq!(rounded.layout(), layout);
+                assert_eq!(rounded.operand_recipe(), OperandRecipe::Rounded);
+                if let Some(w4a4) = w4a4 {
+                    assert_eq!(w4a4.operand_recipe(), OperandRecipe::Nvfp4Rows);
+                    assert_eq!(
+                        (w4a4.representation(), w4a4.layout()),
+                        (rounded.representation(), layout)
+                    );
                 }
             }
         }
@@ -2780,5 +2837,162 @@ mod stored_table_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod scale_grid_tests {
+    use super::*;
+    use crate::residency::Stored;
+    use magnitude_artifacts::gguf::{
+        GgufArtifact, Metadata, Scalar, StoredHeader, StoredMetadata, StoredType, Value, ValueType,
+    };
+
+    const WEIGHT: &str = "blk.0.attn_q_b.weight";
+    const SCALE: &str = "blk.0.attn_q_b.scale";
+    /// Two 32×32 tiles of rows, eight of columns: every row holds every
+    /// E4M3 code once.
+    const SHAPE: [u64; 2] = [64, 256];
+    /// The tiles' UE8M0 scales: the smallest, 2^0, 2^127, NaN, and between.
+    const SCALES: [u8; 16] = [0, 1, 2, 64, 100, 120, 126, 127, 128, 134, 140, 200, 250, 253, 254, 255];
+
+    /// A GGUF of one F8_E4M3 `SHAPE` matrix, code `row * 256 + column`
+    /// (as a byte), under its I8 32×32 grid of [`SCALES`] declared UE8M0.
+    fn file() -> std::path::PathBuf {
+        let declared = StoredMetadata {
+            metadata: Metadata {
+                name: magnitude_family_common::SCALE_ENCODING.into(),
+                value: Value::Scalar(Scalar::String(magnitude_family_common::UE8M0.into())),
+            },
+            stored: StoredType::Scalar(ValueType::String),
+        };
+        let header = StoredHeader::new(
+            3,
+            vec![declared],
+            [
+                (WEIGHT.to_owned(), SHAPE.to_vec(), Encoding::F8E4M3),
+                (SCALE.to_owned(), vec![SHAPE[0] / 32, SHAPE[1] / 32], Encoding::I8),
+            ],
+        )
+        .unwrap();
+        let mut bytes = header.encode().unwrap();
+        let data = bytes.len();
+        let codes = (0..SHAPE[0] * SHAPE[1]).map(|at| at as u8).collect::<Vec<_>>();
+        for (tensor, payload) in header.tensors.iter().zip([&codes[..], &SCALES[..]]) {
+            bytes.resize(data + tensor.offset as usize, 0);
+            bytes.extend_from_slice(payload);
+        }
+        let path = std::env::temp_dir().join(format!(
+            "magnitude-scale-grid-{}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        path
+    }
+
+    /// The E4M3 value of `code` (S.EEEE.MMM, bias 7, NaN at S.1111.111,
+    /// no infinities), decoded independently of the registry.
+    fn e4m3(code: u8) -> f64 {
+        let (exponent, mantissa) = ((code >> 3) & 15, code & 7);
+        let magnitude = match (exponent, mantissa) {
+            (15, 7) => f64::NAN,
+            (0, _) => f64::from(mantissa) * 2f64.powi(-9),
+            _ => (1.0 + f64::from(mantissa) / 8.0) * 2f64.powi(i32::from(exponent) - 7),
+        };
+        if code & 0x80 != 0 { -magnitude } else { magnitude }
+    }
+
+    fn plan(inventory: &[TensorDescriptor], descriptor: &WeightDescriptor) -> Result<WeightPlan, String> {
+        let mut out = Vec::new();
+        push_weight(
+            &mut out,
+            inventory,
+            ArtifactComponent {
+                kind: ArtifactComponentKind::Target,
+                identity: ArtifactIdentity([0; 32]),
+            },
+            WeightScope::Target,
+            WeightKind::Query,
+            descriptor,
+            ResidentForm {
+                activation: DType::F16,
+                layout: Layout::Rows8,
+            },
+        )?;
+        Ok(out.remove(0))
+    }
+
+    /// The pair imports as mxfp8g32, and its values are exactly code ×
+    /// 2^(scale − 127): E4M3 subnormals and −0 kept, NaN codes and the NaN
+    /// scale (255) NaN, a product past F32's range infinite.
+    #[test]
+    fn an_f8_e4m3_weight_under_its_ue8m0_grid_imports_its_exact_values() {
+        let path = file();
+        let artifact = GgufArtifact::open(&path).unwrap();
+        let descriptor = magnitude_family_common::Tensors::new(artifact.directory())
+            .bind_scaled(WEIGHT, &SHAPE)
+            .unwrap();
+        let plan = plan(&artifact.directory().tensors, &descriptor).unwrap();
+        assert_eq!(plan.source, Element::gguf_source(Encoding::F8E4M3, GgufScales::E8m0Grid, 32).unwrap());
+        assert_eq!(plan.upload, plan.source);
+        assert_eq!(plan.resident, Element::stored("mxfp8g32", Layout::Rows8).unwrap());
+        // The upload: one 33-byte block (scale, 32 codes) a row's 32 values.
+        assert_eq!(plan.source_bytes, SHAPE[0] * SHAPE[1] / 32 * 33);
+
+        let stored = Stored::from_gguf(&artifact, &descriptor).unwrap();
+        let (source, offset, nbytes) = stored.file_range();
+        let codes = source.read(offset, nbytes as usize).unwrap();
+        let blocks = crate::import_transforms::upload_bytes(&plan, &stored, codes.clone()).unwrap();
+        let values = crate::import_transforms::dequantize(plan.source, &SHAPE, &blocks).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let columns = SHAPE[1] as usize;
+        let tiles = columns / 32;
+        for (at, value) in values.chunks_exact(4).enumerate() {
+            let value = f32::from_le_bytes(value.try_into().unwrap());
+            let scale = SCALES[at / columns / 32 * tiles + at % columns / 32];
+            let expected = match scale {
+                255 => f32::NAN,
+                _ => (e4m3(codes[at]) * 2f64.powi(i32::from(scale) - 127)) as f32,
+            };
+            assert!(
+                value.to_bits() == expected.to_bits() || value.is_nan() && expected.is_nan(),
+                "value {at}: code {:#04x} scale {scale}: {value:e}, not {expected:e}",
+                codes[at]
+            );
+        }
+    }
+
+    /// A grid the inventory does not store as its I8 `[rows / 32, columns /
+    /// 32]` bytes is refused, naming it.
+    #[test]
+    fn a_grid_not_stored_as_its_tiles_bytes_is_refused() {
+        let descriptor = WeightDescriptor {
+            name: WEIGHT.into(),
+            shape: SHAPE.to_vec(),
+            transforms: vec![ImportTransform::ScaleBlocks {
+                tensor: SCALE.into(),
+                tile: [32, 32],
+                codes: ScaleCodes::Ue8m0,
+            }],
+        };
+        let weight = TensorDescriptor {
+            name: WEIGHT.into(),
+            shape: SHAPE.to_vec(),
+            encoding: Encoding::F8E4M3,
+            offset: 0,
+            nbytes: SHAPE[0] * SHAPE[1],
+        };
+        for (encoding, shape, nbytes) in [
+            (Encoding::F32, vec![2, 8], 64),
+            (Encoding::I8, vec![2, 4], 8),
+            (Encoding::I8, vec![2, 8], 15),
+        ] {
+            let grid = TensorDescriptor { name: SCALE.into(), shape, encoding, offset: 0, nbytes };
+            let error = plan(&[weight.clone(), grid], &descriptor).unwrap_err();
+            assert!(error.contains(SCALE), "{error}");
+        }
+        let error = plan(std::slice::from_ref(&weight), &descriptor).unwrap_err();
+        assert!(error.contains(SCALE), "{error}");
     }
 }

@@ -541,6 +541,35 @@ struct Table {
     }
 };
 
+// E4M3 bytes (`registry::ValueCodes::E4m3`) in a plane of bytes
+// (`Planes<8, 0>`): each code 2^9 times its value, an exact float built
+// from its bits (a normal code's (1 + m/8) 2^(e + 2), a subnormal one's m),
+// its sign kept on a zero, a NaN code (S.1111.111) NaN.
+struct E4M3Codes {
+    static constant constexpr int zero = 0;
+    // The two codes of `two` (bits 0.. and 16.., `Planes<8, 0>::pair`).
+    static float2 pair_of(uint two) {
+        const uint2 raw = uint2(two & 0xffu, (two >> 16) & 0xffu);
+        const uint2 e = (raw >> 3) & 15u, m = raw & 7u;
+        float2 magnitude = metal::select(as_type<float2>(((e + 129u) << 23) | (m << 20)), float2(m), e == 0u);
+        magnitude = metal::select(magnitude, float2(as_type<float>(0x7fc00000u)), (raw & 0x7fu) == 0x7fu);
+        return as_type<float2>(as_type<uint2>(magnitude) | ((raw & 0x80u) << 24));
+    }
+    template <typename P>
+    static void codes(thread const typename P::words &w, uint step, thread float4 &even, thread float4 &odd) {
+        static_assert(metal::is_same_v<P, Planes<8, 0>>, "E4M3 codes are a plane of bytes");
+        for (uint j = 0; j < 4u; ++j) {
+            const float2 two = pair_of(P::template pair<0u>(w, step, j));
+            even[j] = two.x;
+            odd[j] = two.y;
+        }
+    }
+    template <typename P>
+    static float2 pair(thread const typename P::words &w, uint step, uint j) {
+        return pair_of(P::template pair<0u>(w, step, j));
+    }
+};
+
 // Grid codes (`registry::GridCodes`): an entry's LANES-value grid points
 // (`grids::table<GRID>`, its first INDEX_BITS-bit index lowest) and, past its
 // indices, its signs (SIGNS, `registry::GridSigns`, from entry bit
@@ -1322,6 +1351,13 @@ struct InterpretationOf<SEISMIC_CODES_TABLE, BITS, OFFSET, TABLE, GRID, INDEX_BI
     DELTA_EXPONENT, SIGN_BIT, SIGN_BITS, DELTA_BIT> {
     static_assert(BITS == 4, "codebook codes are nibbles");
     typedef Table<TABLE> type;
+};
+template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, bool DELTA,
+    uint DELTA_EXPONENT, uint SIGN_BIT, uint SIGN_BITS, uint DELTA_BIT>
+struct InterpretationOf<SEISMIC_CODES_E4M3, BITS, OFFSET, TABLE, GRID, INDEX_BITS, LANES, SIGNS, DELTA,
+    DELTA_EXPONENT, SIGN_BIT, SIGN_BITS, DELTA_BIT> {
+    static_assert(BITS == 8, "E4M3 codes are bytes");
+    typedef E4M3Codes type;
 };
 template <uint BITS, int OFFSET, uint TABLE, uint GRID, uint INDEX_BITS, uint LANES, uint SIGNS, bool DELTA,
     uint DELTA_EXPONENT, uint SIGN_BIT, uint SIGN_BITS, uint DELTA_BIT>

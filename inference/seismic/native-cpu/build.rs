@@ -50,8 +50,11 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
     let axes = registry::decode_axes(id).expect("packed storage has decode axes");
     // The code domain's ends, which every code component takes from here.
     let registry::profile::Domain { least, greatest } = axes.profile().codes;
-    let codes = match &axes.coding.codes() {
-        ValueCodes::Grid(grid) => format!(
+    // The row component: integer codes are `PackedRows`', floating codes
+    // `FloatRows`'.
+    let (rows, codes) = match &axes.coding.codes() {
+        ValueCodes::E4m3 => ("FloatRows", "E4m3".to_owned()),
+        ValueCodes::Grid(grid) => ("PackedRows", format!(
             "Grid<{}, {}, {}, {}, {}, {}, {least}, {greatest}>",
             magnitude_ggml::tables::GRIDS
                 .iter()
@@ -68,13 +71,13 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
                 None => "NoDelta".to_owned(),
                 Some(exponent) => format!("Delta<{exponent}>"),
             }
-        ),
-        ValueCodes::Fields(code) => format!(
+        )),
+        ValueCodes::Fields(code) => ("PackedRows", format!(
             "Planes<{}, {}, {}, {least}, {greatest}>",
             axes.low,
             axes.high,
             interpretation(code)
-        ),
+        )),
     };
     let coefficients = match &axes.coding {
         CodingAxes::Direct {
@@ -131,7 +134,7 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
             )
         }
     };
-    format!("PackedRows<{codes}, {coefficients}, {storage}>")
+    format!("{rows}<{codes}, {coefficients}, {storage}>")
 }
 
 fn main() {

@@ -51,27 +51,66 @@ fn reference_vectors(encoding: magnitude_ggml::Encoding) -> (Vec<u8>, Vec<f32>) 
     (file[4..4 + bytes].to_vec(), values)
 }
 
+/// Assembled blocks of every E4M3 code under E8M0 scales across their range
+/// (0, the F32 subnormal 2^-127; 254, where the largest codes overflow; 255,
+/// NaN), and each value as OCP MX defines it: the code's value
+/// (`S.EEEE.MMM`: (1 + M/8) 2^(E - 7), or M 2^-9 where E is 0, S.1111.111
+/// NaN) times 2^(scale - 127), one F32 product.
+fn e8m0_grid_vectors() -> (Vec<u8>, Vec<f32>) {
+    let e4m3 = |code: u8| {
+        let (exponent, mantissa) = (i32::from(code >> 3 & 15), f32::from(code & 7));
+        let magnitude = match (exponent, code & 7) {
+            (15, 7) => f32::NAN,
+            (0, _) => mantissa * 2f32.powi(-9),
+            _ => (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7),
+        };
+        if code & 0x80 != 0 { -magnitude } else { magnitude }
+    };
+    let e8m0 = |scale: u8| match scale {
+        255 => f32::NAN,
+        0 => f32::from_bits(0x0040_0000),
+        scale => f32::from_bits(u32::from(scale) << 23),
+    };
+    let (mut bytes, mut values) = (Vec::new(), Vec::new());
+    for scale in [0u8, 1, 100, 120, 127, 140, 254, 255] {
+        for codes in (0..=u8::MAX).collect::<Vec<_>>().chunks_exact(32) {
+            bytes.push(scale);
+            bytes.extend_from_slice(codes);
+            values.extend(codes.iter().map(|code| e4m3(*code) * e8m0(scale)));
+        }
+    }
+    (bytes, values)
+}
+
 /// Every GGUF source the registry converts from imports, in every layout and
 /// for every operand recipe, to exactly the reference dequantization of its
 /// type's vectors, in rows of 128 values (of one source packet, when
-/// wider).
+/// wider): a GGUF type's gguf-py's, and a scale grid's assembled blocks'
+/// as OCP MX defines them (`e8m0_grid_vectors`), NaN where it is NaN.
 #[test]
 fn every_gguf_source_imports_as_the_reference_dequantizes() {
+    use seismic::GgufScales;
     for (source, operands) in conversions() {
         let width = source.logical_group().unwrap().max(128);
-        let encoding = magnitude_ggml::Encoding::ALL
-            .into_iter()
-            .find(|encoding| seismic::Element::gguf_source(*encoding, width) == Some(source))
-            .unwrap_or_else(|| panic!("{} is no encoding's source", source.name()));
-        let (bytes, reference) = reference_vectors(encoding);
+        let encoding = |scales| {
+            magnitude_ggml::Encoding::ALL
+                .into_iter()
+                .find(|encoding| seismic::Element::gguf_source(*encoding, scales, width) == Some(source))
+        };
+        let (bytes, reference) = match (encoding(GgufScales::Own), encoding(GgufScales::E8m0Grid)) {
+            (Some(encoding), None) => reference_vectors(encoding),
+            (None, Some(_)) => e8m0_grid_vectors(),
+            _ => panic!("{} is no one encoding's source", source.name()),
+        };
         let shape = [reference.len() as u64 / width, width];
+        let bits = |value: f32| if value.is_nan() { f32::NAN.to_bits() } else { value.to_bits() };
         for layout in seismic::Layout::ALL {
             let element = source.converted(layout, operands).unwrap();
             let stored = element.repack_host(source, &shape, &bytes).unwrap();
             let values = element.decode_host(&shape, &stored).unwrap();
             assert_eq!(
-                values.iter().map(|value| (*value as f32).to_bits()).collect::<Vec<_>>(),
-                reference.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                values.iter().map(|value| bits(*value as f32)).collect::<Vec<_>>(),
+                reference.iter().map(|value| bits(*value)).collect::<Vec<_>>(),
                 "{} -> {}",
                 source.name(),
                 element.name()
@@ -102,7 +141,7 @@ fn real_gguf_tensors_import_as_the_reference_dequantizes() {
             .into_iter()
             .find(|encoding| encoding.ggml_name() == *type_name)
             .unwrap_or_else(|| panic!("type `{type_name}`"));
-        let source = seismic::Element::gguf_source(encoding, shape[1]).unwrap();
+        let source = seismic::Element::gguf_source(encoding, seismic::GgufScales::Own, shape[1]).unwrap();
         for layout in seismic::Layout::ALL {
             let element = source
                 .converted(layout, seismic::OperandRecipe::Rounded)
@@ -399,7 +438,8 @@ fn cuda_repack_into_mma16_matches_the_host_at_a_real_shape() {
         Encoding::Q1_0,
         Encoding::Iq3S,
     ] {
-        let source_element = seismic::Element::gguf_source(encoding, shape[2]).unwrap();
+        let source_element =
+            seismic::Element::gguf_source(encoding, seismic::GgufScales::Own, shape[2]).unwrap();
         let destination = source_element
             .converted(seismic::Layout::Mma16, seismic::OperandRecipe::Rounded)
             .unwrap();

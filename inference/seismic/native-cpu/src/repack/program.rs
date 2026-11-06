@@ -2335,9 +2335,12 @@ mod tests {
 
     /// Every registered conversion's program writes the interpreter's bytes
     /// for the reference blocks of its GGUF type
-    /// (`engine/kernels/tests/support/gguf_vectors`).
+    /// (`engine/kernels/tests/support/gguf_vectors`), and for arbitrary
+    /// assembled blocks of a GGUF type under a companion scale grid, which
+    /// no ggml type's vectors hold.
     #[test]
     fn programs_repack_reference_blocks_as_the_interpreter() {
+        use registry::GgufScales;
         let vectors = std::path::Path::new(
             &std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"),
         )
@@ -2345,10 +2348,21 @@ mod tests {
         for conversion in registry::representation_conversions() {
             let layout = conversion.source_layout;
             let group = u64::from(layout.logical_group);
-            let encoding = Encoding::ALL
-                .into_iter()
-                .find(|encoding| registry::gguf_source(*encoding, group) == Some(conversion.source))
-                .expect("a conversion's source is a GGUF type's");
+            let source = |scales| {
+                Encoding::ALL
+                    .into_iter()
+                    .find(|encoding| registry::gguf_source(*encoding, scales, group) == Some(conversion.source))
+            };
+            let Some(encoding) = source(GgufScales::Own) else {
+                assert!(source(GgufScales::E8m0Grid).is_some(), "a conversion's source is a GGUF type's");
+                let packets = 64;
+                let blocks = registry::pseudo_random_bytes(
+                    conversion.id.position() as u64,
+                    (packets * u64::from(layout.packet_size)) as usize,
+                );
+                assert_matches_the_interpreter(conversion, &[packets, group], &blocks, "assembled");
+                continue;
+            };
             let path = vectors.join(format!("{}.bin", encoding.ggml_name()));
             let file =
                 std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));

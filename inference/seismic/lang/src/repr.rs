@@ -359,8 +359,9 @@ pub enum CodeInterpretation {
 }
 
 /// How a decoder's value codes read, without their parameters: a code
-/// interpretation's kind (`CodeInterpretation::kind`), or grid entries
-/// (`ValueCodes::Grid`). The native `CODES` axis takes its values.
+/// interpretation's kind (`CodeInterpretation::kind`), grid entries
+/// (`ValueCodes::Grid`) or E4M3 bytes (`ValueCodes::E4m3`). The native
+/// `CODES` axis takes its values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CodeKind {
     Unsigned,
@@ -369,16 +370,18 @@ pub enum CodeKind {
     Odd,
     Table,
     Grid,
+    E4m3,
 }
 
 impl CodeKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Unsigned,
         Self::TwosComplement,
         Self::Offset,
         Self::Odd,
         Self::Table,
         Self::Grid,
+        Self::E4m3,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -389,6 +392,7 @@ impl CodeKind {
             Self::Odd => "ODD",
             Self::Table => "TABLE",
             Self::Grid => "GRID",
+            Self::E4m3 => "E4M3",
         }
     }
 }
@@ -1486,6 +1490,21 @@ pub(crate) const REPRS: &[Repr] = &[
             },
         },
     },
+    // OCP MXFP8: E4M3 codes, one E8M0 power-of-two scale per 32. A GGUF
+    // F8_E4M3 weight imports as it under its companion grid of E8M0 block
+    // scales, each tile's scale on every 32 values of its rows.
+    Repr {
+        name: "mxfp8g32",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        coding: Coding::Direct {
+            codes: CodeStorage::Float(FloatCodeFormat::E4M3),
+            scales: Scales::BlockFloat {
+                format: FloatCodeFormat::E8M0,
+                packet_group: 32,
+            },
+        },
+    },
     // GGUF NVFP4: E2M1 codes, one UE4M3 scale per 16, packets of 64 values
     // (the GGUF block).
     Repr {
@@ -1920,11 +1939,29 @@ pub struct DecodeAxes {
 }
 
 /// What a decoder's code planes hold: fields read through an
-/// interpretation, or grid entries each coding `GRID_VALUES` values.
+/// interpretation, grid entries each coding `GRID_VALUES` values, or E4M3
+/// bytes, each code `2^9` times its value (an integer for every finite
+/// code, under `code_exponent` -9) and a NaN code NaN, which a decoder keeps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValueCodes {
     Fields(CodeInterpretation),
     Grid(&'static GridCodes),
+    E4m3,
+}
+
+impl ValueCodes {
+    /// The integer of every finite E4M3 code (`ValueCodes::E4m3`),
+    /// ascending: its value times `2^9`.
+    fn e4m3_integers() -> Vec<i32> {
+        let mut codes = (0..=u8::MAX)
+            .map(|raw| FloatCodeFormat::E4M3.decode(u32::from(raw)))
+            .filter(|value| !value.is_nan())
+            .map(|value| (value * 512.0) as i32)
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    }
 }
 
 impl From<&'static GridCodes> for ValueCodes {
@@ -1980,6 +2017,7 @@ impl DecodeAxes {
         let codes = match &values {
             ValueCodes::Fields(interpretation) => interpretation.codes(self.low + self.high),
             ValueCodes::Grid(grid) => grid.codes(),
+            ValueCodes::E4m3 => ValueCodes::e4m3_integers(),
         };
         Profile {
             codes: Domain::of(&codes),
@@ -1988,6 +2026,7 @@ impl DecodeAxes {
                 ValueCodes::Grid(_) => ValueMap::Grid,
                 ValueCodes::Fields(CodeInterpretation::Table(_)) => ValueMap::Table,
                 ValueCodes::Fields(_) => ValueMap::Linear,
+                ValueCodes::E4m3 => ValueMap::Float,
             },
             local,
             upper,
@@ -2040,13 +2079,14 @@ impl Domain {
 }
 
 /// How a code becomes its integer `q`: read linearly (unsigned, two's
-/// complement, offset or odd), as an entry of a codebook, or as a lane of a
-/// vector grid's entry.
+/// complement, offset or odd), as an entry of a codebook, as a lane of a
+/// vector grid's entry, or decoded as a floating code (`ValueCodes::E4m3`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueMap {
     Linear,
     Table,
     Grid,
+    Float,
 }
 
 /// A weight's local level: a scale per `group` values, stored, or an
@@ -2274,16 +2314,19 @@ impl Repr {
                 crate::registry::code_planes(*bits).expect("a packed code width"),
             ),
             CodeStorage::Float(format) => {
-                let (codebook, exponent) = format
-                    .codebook()
-                    .expect("a value floating code has a codebook");
                 let planes =
                     crate::registry::code_planes(format.bits()).expect("a packed code width");
-                (
-                    ValueCodes::Fields(CodeInterpretation::Table(codebook)),
-                    exponent,
-                    planes,
-                )
+                match (format, format.codebook()) {
+                    (_, Some((codebook, exponent))) => (
+                        ValueCodes::Fields(CodeInterpretation::Table(codebook)),
+                        exponent,
+                        planes,
+                    ),
+                    // An E4M3 value is 2^-9 times an integer (its smallest
+                    // subnormal is 2^-9).
+                    (FloatCodeFormat::E4M3, None) => (ValueCodes::E4m3, -9, planes),
+                    (_, None) => panic!("{format:?} codes are scale codes, not value codes"),
+                }
             }
             CodeStorage::Grid(grid) => {
                 let bits = grid.entry_bits();

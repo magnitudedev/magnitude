@@ -6,7 +6,7 @@
 #![allow(dead_code, unused_macros)]
 
 use magnitude_ggml::Encoding;
-use seismic::{Element, Layout, OperandRecipe};
+use seismic::{Element, GgufScales, Layout, OperandRecipe};
 use seismic_lang::registry::f16_bits;
 
 include!("widths.rs");
@@ -18,11 +18,13 @@ pub(crate) use gguf_format_tests;
 mod random;
 pub use random::Rng;
 
-/// A GGUF-imported element: weights stored as `encoding`, converted by the
-/// registry into the element whose products take `operands`.
+/// A GGUF-imported element: weights stored as `encoding`, their scales
+/// where `scales` says, converted by the registry into the element whose
+/// products take `operands`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Format {
     pub encoding: Encoding,
+    pub scales: GgufScales,
     pub operands: OperandRecipe,
 }
 
@@ -43,13 +45,22 @@ impl Format {
     /// NVFP4 operands.
     pub const NVFP4_A4: Format = Format {
         encoding: Encoding::Nvfp4,
+        scales: GgufScales::Own,
         operands: OperandRecipe::Nvfp4Rows,
     };
+    /// GGUF F8_E4M3 under its grid of E8M0 block scales: mxfp8g32.
+    pub const F8_E4M3: Format = Format {
+        encoding: Encoding::F8E4M3,
+        scales: GgufScales::E8m0Grid,
+        operands: OperandRecipe::Rounded,
+    };
 
-    /// The element of `encoding` products take rounded activations into.
+    /// The element of `encoding`, with its own scales, products take
+    /// rounded activations into.
     pub const fn rounded(encoding: Encoding) -> Self {
         Self {
             encoding,
+            scales: GgufScales::Own,
             operands: OperandRecipe::Rounded,
         }
     }
@@ -59,10 +70,19 @@ impl Format {
             .filter(|format| format.converted(layout).is_some())
             .collect()
     }
-    /// The registry's source of this format's GGUF blocks.
+    /// The registry's source of this format's GGUF blocks (assembled
+    /// blocks, under a scale grid).
     pub fn source(self) -> Element {
-        Element::gguf_source(self.encoding, self.encoding.block_elements())
-            .unwrap_or_else(|| panic!("{:?}: no registered GGUF source", self.encoding))
+        Element::gguf_source(self.encoding, self.scales, self.packet_values())
+            .unwrap_or_else(|| panic!("{:?} {:?}: no registered GGUF source", self.encoding, self.scales))
+    }
+    /// The values of one source packet: a block of the type, or an
+    /// assembled grid block.
+    fn packet_values(self) -> u64 {
+        match self.scales {
+            GgufScales::Own => self.encoding.block_elements(),
+            GgufScales::E8m0Grid => GgufScales::GRID_BLOCK,
+        }
     }
     /// This format's element in `layout`.
     pub fn element(self, layout: Layout) -> Element {
@@ -85,10 +105,12 @@ impl Format {
         partial_block_widths(self.block_values()).collect()
     }
     pub fn block_values(self) -> usize {
-        self.encoding.block_elements() as usize
+        self.packet_values() as usize
     }
     pub fn block_bytes(self) -> usize {
-        self.encoding.block_bytes() as usize
+        self.source()
+            .canonical_byte_len(&[1, self.packet_values()])
+            .expect("a source packet's bytes") as usize
     }
     /// One random GGUF block whose values reach about `scale`: random codes
     /// and sub-scales, with the scale fields set so the values reach a
@@ -172,20 +194,38 @@ impl Format {
                     *field = (exponent << 3) | (rng.next() % 8) as u8;
                 }
             }
+            // An assembled block: E8M0, the power of two nearest
+            // factor / 448 (the E4M3 range), then 32 random finite E4M3
+            // codes (a NaN code, S.1111.111, loses its exponent's top bit).
+            Encoding::F8E4M3 => {
+                block[0] = (127.0 + (factor / 448.0).log2().round()) as u8;
+                for code in &mut block[1..] {
+                    if *code & 0x7f == 0x7f {
+                        *code &= !0x40;
+                    }
+                }
+            }
             other => panic!("{other:?}: no GGUF block fixture"),
         }
         block
     }
-    /// Every encoding under every operand recipe, in ggml id order.
+    /// Every encoding, its scales wherever they are, under every operand
+    /// recipe, in ggml id order.
     fn pairs() -> impl Iterator<Item = Format> {
         Encoding::ALL.into_iter().flat_map(|encoding| {
-            OperandRecipe::ALL
+            [GgufScales::Own, GgufScales::E8m0Grid]
                 .into_iter()
-                .map(move |operands| Format { encoding, operands })
+                .flat_map(move |scales| {
+                    OperandRecipe::ALL.into_iter().map(move |operands| Format {
+                        encoding,
+                        scales,
+                        operands,
+                    })
+                })
         })
     }
     fn converted(self, layout: Layout) -> Option<Element> {
-        Element::gguf_source(self.encoding, self.encoding.block_elements())?
+        Element::gguf_source(self.encoding, self.scales, self.packet_values())?
             .converted(layout, self.operands)
     }
     /// This format's element in a layout the registry converts it into.

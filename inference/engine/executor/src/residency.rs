@@ -18,13 +18,14 @@ use crate::{
     ResidentWeightSlot, ResourceAllocator, ResourceDomainId, SubmitError, ValidatedImportLaunch,
     WeightPlan, WeightStorageIdentity,
 };
-use crate::{resident_element, source_element};
 use magnitude_artifacts::{
     Error as ArtifactError, FileSource,
     gguf::{Encoding, GgufArtifact},
 };
-use magnitude_family_contracts::{WeightDescriptor, WeightRole};
-use seismic::{DType, Device, Element, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission};
+use magnitude_family_contracts::{ScaleCodes, WeightDescriptor, WeightRole};
+use seismic::{
+    DType, Device, Element, GgufScales, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission,
+};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
@@ -117,16 +118,36 @@ impl StoredTensor {
     }
 }
 
+/// A validated byte range of a stored grid of block scales
+/// (`ImportTransform::ScaleBlocks`), one byte a tile.
+#[derive(Clone, Debug)]
+pub struct StoredGrid {
+    pub source: Arc<FileSource>,
+    pub offset: u64,
+    pub nbytes: u64,
+}
+
+impl StoredGrid {
+    pub fn read(&self) -> Result<Vec<u8>, WeightImportError> {
+        let length = usize::try_from(self.nbytes)
+            .map_err(|_| invalid("scale grid exceeds the host address range"))?;
+        self.source.read(self.offset, length).map_err(Into::into)
+    }
+}
+
 /// Storage representation of one semantic model weight.
 #[derive(Clone, Debug)]
 pub enum Stored {
     Dense(StoredTensor),
+    /// Blocks of `encoding`, scaled by their own scales or, with a `grid`,
+    /// by its block scales (`seismic::GgufScales`).
     GgmlBlocks {
         source: Arc<FileSource>,
         offset: u64,
         nbytes: u64,
         shape: Vec<u64>,
         encoding: Encoding,
+        grid: Option<StoredGrid>,
     },
 }
 
@@ -184,21 +205,62 @@ impl Stored {
         }
     }
 
+    /// The grid of block scales the stored blocks are read under.
+    pub fn grid(&self) -> Option<&StoredGrid> {
+        match self {
+            Self::Dense(_) => None,
+            Self::GgmlBlocks { grid, .. } => grid.as_ref(),
+        }
+    }
+
+    /// Where the stored values' scales are.
+    pub fn scales(&self) -> GgufScales {
+        match self.grid() {
+            Some(_) => GgufScales::E8m0Grid,
+            None => GgufScales::Own,
+        }
+    }
+
     pub fn source_element(&self) -> Option<Element> {
         match self {
             Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
             Self::GgmlBlocks {
                 encoding, shape, ..
-            } => source_element(*encoding, shape.last().copied().unwrap_or(1)),
+            } => crate::planning::scaled_source_element(
+                *encoding,
+                self.scales(),
+                shape.last().copied().unwrap_or(1),
+            ),
         }
     }
 
+    /// The stored tensor `descriptor` names, with its grid of block scales
+    /// where it names one: UE8M0 bytes, stored as I8.
     pub fn from_gguf(
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
     ) -> Result<Self, WeightImportError> {
+        let grid = crate::import_transforms::grid(descriptor)
+            .map(|(name, _, ScaleCodes::Ue8m0)| {
+                let grid = artifact.tensor(name)?;
+                if grid.encoding != Encoding::I8 {
+                    return Err(invalid(format!(
+                        "scale grid {name:?} of {:?} is {:?}, not UE8M0 bytes",
+                        descriptor.name, grid.encoding
+                    )));
+                }
+                Ok(StoredGrid {
+                    source: grid.source,
+                    offset: grid.offset,
+                    nbytes: grid.nbytes,
+                })
+            })
+            .transpose()?;
         let tensor = artifact.tensor(&descriptor.name)?;
         match tensor.encoding {
+            Encoding::F32 | Encoding::F16 | Encoding::BF16 if grid.is_some() => Err(invalid(
+                format!("dense weight {:?} has no scale grid", descriptor.name),
+            )),
             Encoding::F32 | Encoding::F16 | Encoding::BF16 => Ok(Self::Dense(StoredTensor {
                 source: tensor.source,
                 offset: tensor.offset,
@@ -217,6 +279,7 @@ impl Stored {
                 nbytes: tensor.nbytes,
                 shape: tensor.shape,
                 encoding,
+                grid,
             }),
         }
     }
@@ -994,7 +1057,7 @@ impl ResidencyStore {
         let stored = source.stored();
         let bytes = crate::programs::native_import::stored_source_bytes(stored)
             .map_err(|error| invalid(error.to_string()))?;
-        let bytes = crate::import_transforms::upload_bytes(&planned, stored.shape(), bytes)
+        let bytes = crate::import_transforms::upload_bytes(&planned, stored, bytes)
             .map_err(invalid)?;
         let tensor = Tensor::from_host(&self.device, planned.resident, &planned.shape, &bytes)
             .map_err(|error| WeightImportError::Device(error.to_string()))?;
@@ -1114,14 +1177,11 @@ impl ResidencyStore {
         let (upload, actual_resident) = match stored {
             Stored::Dense(_) => (actual_source, Element::dense(target)),
             Stored::GgmlBlocks { .. } if dequantized => (Element::f32(), Element::dense(target)),
-            Stored::GgmlBlocks {
-                encoding, shape, ..
-            } => (
+            Stored::GgmlBlocks { .. } => (
                 actual_source,
-                resident_element(
-                    *encoding,
+                crate::planning::resident_storage(
+                    actual_source,
                     crate::import_transforms::scaled_activations(descriptor),
-                    shape.last().copied().unwrap_or(1),
                     target,
                     layout,
                 )
@@ -1709,7 +1769,7 @@ fn validate_request(
             if *nbytes != expected {
                 return Err(invalid("packed weight byte count mismatch"));
             }
-            if source_element(*encoding, shape.last().copied().unwrap_or(1)).is_none() {
+            if stored.source_element().is_none() {
                 return Err(invalid(format!(
                     "GGUF encoding {encoding:?} has no qualified native import"
                 )));

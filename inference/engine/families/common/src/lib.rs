@@ -12,8 +12,8 @@ mod projector;
 pub mod rotary;
 mod tensors;
 
-pub use error::HeaderError;
+pub use error::{CompanionForm, HeaderError};
 pub use inputs::TextInput;
 pub use metadata::{Metadata, architecture_keys};
 pub use projector::{ProjectorIdentityError, projector_type};
-pub use tensors::Tensors;
+pub use tensors::{SCALE_ENCODING, Tensors, UE8M0};

@@ -5618,6 +5618,55 @@ gguf_format_tests! {
     ];
 }
 
+/// An F8_E4M3 weight under its UE8M0 grid (mxfp8g32) at DeepSeek V4.1
+/// Flash's attention shapes, `wq_b` `[32768, 1280]` and `wo_b` `[5120,
+/// 8192]`, projects a decode row (GEMV) and a verify block (GEMM) within
+/// the reassociation bound of the F32 host reference. The weight's rows
+/// repeat a host-built 509 (prime, so no tile or row block repeats with
+/// them), which the host decodes in seconds rather than the whole matrix's
+/// tens of minutes.
+#[test]
+fn mxfp8_projections_at_deepseek_v41_shapes_match_the_host_reference() {
+    const BASE: usize = 509;
+    let act = Act::Bf16;
+    let repr = Repr::Gguf(Format::F8_E4M3);
+    let mapping = gemm_mapping(64, 64, 1);
+    for (h, f, seed) in [(32768, 1280, 81), (5120, 8192, 82)] {
+        let base = weight(repr, BASE, f, seed, 1.0);
+        let stride = base.bytes.len() / BASE;
+        assert_eq!(stride * BASE, base.bytes.len(), "rows16 rows are whole strides");
+        let down = Weight {
+            repr,
+            rows: h,
+            k: f,
+            bytes: (0..h).flat_map(|row| &base.bytes[row % BASE * stride..][..stride]).copied().collect(),
+            values: (0..h).flat_map(|row| base.row(row % BASE)).copied().collect(),
+        };
+        for rows in [1usize, 17] {
+            let mut rng = Rng::new(seed + rows as u64);
+            let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
+            let out_rows = (0..rows as i32).collect::<Vec<_>>();
+            let product = (0..rows * f)
+                .map(|_| act.round(rng.symmetric()))
+                .collect::<Vec<_>>();
+            let (expected, bound) = under(rows, || {
+                dense_output_reference(act, &down, &residual, &product, &out_rows)
+            });
+            for device in devices() {
+                let native = dense_output_native(
+                    &device, act, &down, &residual, rows, &product, &out_rows, mapping,
+                );
+                assert_within(
+                    &format!("mxfp8g32 [{h}, {f}] M {rows} on {:?}", device.backend()),
+                    &native,
+                    &expected,
+                    &bound,
+                );
+            }
+        }
+    }
+}
+
 /// Matrix column gathering preserves the rounded projection, convolution,
 /// and every window bank for partial fragments and taped, split slots.
 #[test]

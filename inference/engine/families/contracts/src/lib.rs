@@ -114,7 +114,7 @@ impl WeightDescriptor {
     /// shape.
     pub fn transformed_shape(&self, stored: &[u64]) -> Result<Vec<u64>, DefinitionError> {
         let mut shape = stored.to_vec();
-        for transform in &self.transforms {
+        for (index, transform) in self.transforms.iter().enumerate() {
             let axis = row_axis(&shape).ok_or_else(|| {
                 DefinitionError::new(format!("{:?} has no row axis to transform", self.name))
             })?;
@@ -170,6 +170,38 @@ impl WeightDescriptor {
                         return Err(DefinitionError::new(format!(
                             "scale tensor of {:?} must name another stored tensor",
                             self.name
+                        )));
+                    }
+                }
+                ImportTransform::ScaleBlocks { tensor, tile, .. } => {
+                    if tensor.is_empty() || *tensor == self.name {
+                        return Err(DefinitionError::new(format!(
+                            "scale grid of {:?} must name another stored tensor",
+                            self.name
+                        )));
+                    }
+                    if index != 0 {
+                        return Err(DefinitionError::new(format!(
+                            "the scale grid of {:?} scales it as stored: its first transform",
+                            self.name
+                        )));
+                    }
+                    let tiled = match shape[..] {
+                        [rows, columns] => {
+                            tile[0] != 0
+                                && tile[1].is_multiple_of(ImportTransform::GRID_BLOCK)
+                                && tile[1] != 0
+                                && rows.is_multiple_of(tile[0])
+                                && columns.is_multiple_of(tile[1])
+                        }
+                        _ => false,
+                    };
+                    if !tiled {
+                        return Err(DefinitionError::new(format!(
+                            "{:?} {shape:?} is no matrix of whole {tile:?} tiles of whole \
+                             {}-value row blocks",
+                            self.name,
+                            ImportTransform::GRID_BLOCK
                         )));
                     }
                 }
@@ -231,12 +263,38 @@ pub enum ImportTransform {
         tensor: String,
         activations: ScaledActivations,
     },
+    /// Read the stored matrix (of single-value blocks) under the stored
+    /// grid `tensor` of block scales: one scale of `codes` per `tile`
+    /// (`[rows, columns]`, columns a multiple of [`Self::GRID_BLOCK`]) of
+    /// the matrix, the grid shaped `[rows / tile[0], columns / tile[1]]`.
+    /// The importer places each tile's scale beside each
+    /// [`Self::GRID_BLOCK`] values of its rows, which replicates it exactly,
+    /// so the transform scales the tensor as stored: its descriptor's first.
+    ScaleBlocks {
+        tensor: String,
+        tile: [u64; 2],
+        codes: ScaleCodes,
+    },
     /// One plane of a symmetric 32-value code matrix (the last
     /// transform; `ProgressivePlane`).
     Progressive {
         plane: ProgressivePlane,
         depth: ProgressiveCodeDepth,
     },
+}
+
+impl ImportTransform {
+    /// The values of a row one placed block scale scales (OCP MX's block).
+    pub const GRID_BLOCK: u64 = 32;
+}
+
+/// The codes of a stored block-scale grid (`ImportTransform::ScaleBlocks`),
+/// as its file declares them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ScaleCodes {
+    /// UE8M0 bytes, `2^(b - 127)`, 0xff NaN (OCP E8M0), stored as I8
+    /// (`magnitude.scale_encoding = "ue8m0"`).
+    Ue8m0,
 }
 
 /// The exact symmetric 32-value code representation a progressive placement
@@ -341,6 +399,15 @@ impl std::hash::Hash for ImportTransform {
             } => {
                 tensor.hash(state);
                 activations.hash(state);
+            }
+            Self::ScaleBlocks {
+                tensor,
+                tile,
+                codes,
+            } => {
+                tensor.hash(state);
+                tile.hash(state);
+                codes.hash(state);
             }
             Self::Progressive { plane, depth } => {
                 plane.hash(state);

@@ -302,7 +302,8 @@ vec4 packets_unsigned_bytes(uint word) { return vec4(unpack8(word)); }
 // offset of at most 128, so that the difference is a signed byte), two's
 // complement codes (bytes) the signed bytes, odd codes `2 (c - k) + 1`
 // (`CODES_OFFSET` k), and a codebook's codes (nibbles) the codebook's values
-// (`CODEBOOKS_TABLE_<ID>`, `PACKETS_CODEBOOK`). A product
+// (`CODEBOOKS_TABLE_<ID>`, `PACKETS_CODEBOOK`), and E4M3 bytes
+// (`registry::ValueCodes::E4m3`) the registry's integers 2^9 v. A product
 // operand takes an offset off as the exact bias -(offset scale)
 // (`packets_values`): the offset is a power of two, without a stored bias.
 
@@ -319,6 +320,8 @@ vec4 packets_unsigned_bytes(uint word) { return vec4(unpack8(word)); }
         && AXES(SEISMIC_AXIS_CODE_LOW_BITS) + AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 4) \
     || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_ODD \
         && AXES(SEISMIC_AXIS_CODE_LOW_BITS) + AXES(SEISMIC_AXIS_CODE_HIGH_BITS) <= 8) \
+    || (AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_E4M3 \
+        && AXES(SEISMIC_AXIS_CODE_LOW_BITS) == 8 && AXES(SEISMIC_AXIS_CODE_HIGH_BITS) == 0) \
     || AXES(SEISMIC_AXIS_CODES) == SEISMIC_CODES_GRID)
 #if !PACKETS_ALL(PACKETS_READS_CODES)
 #error "packets: a weight slot's codes are of an interpretation this file does not read"
@@ -349,6 +352,19 @@ float packets_codebook(const int kind, uint code) {
 }
 #endif
 
+#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_E4M3)
+// Four E4M3 bytes as 2^9 times their values, exact floats built from their
+// bits: a normal code's (1 + m/8) 2^(e + 2), a subnormal one's m, its sign
+// kept on a zero, a NaN code (S.1111.111) NaN.
+vec4 packets_e4m3(uint bytes) {
+    const uvec4 raw = uvec4(bytes, bytes >> 8, bytes >> 16, bytes >> 24) & 0xffu;
+    const uvec4 e = (raw >> 3) & 15u, m = raw & 7u;
+    uvec4 magnitude = mix(((e + 129u) << 23) | (m << 20), floatBitsToUint(vec4(m)), equal(e, uvec4(0u)));
+    magnitude = mix(magnitude, uvec4(0x7fc00000u), equal(raw & 0x7fu, uvec4(0x7fu)));
+    return uintBitsToFloat(magnitude | ((raw & 0x80u) << 24));
+}
+#endif
+
 // Four codes, a byte each, as exact values, offset codes less their offset
 // where `centred` (per byte: 128 + code - offset, without borrows, with its
 // top bit flipped: code - offset as a signed byte).
@@ -371,6 +387,10 @@ vec4 packets_interpret(const int kind, uint bytes, const bool centred) {
 #if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_ODD)
     if (interpretation == SEISMIC_CODES_ODD)
         return 2.0 * packets_unsigned_bytes(bytes) + float(1 - 2 * PACKETS_AXIS(kind, SEISMIC_AXIS_CODES_OFFSET));
+#endif
+#if PACKETS_ANY(SEISMIC_AXIS_CODES, SEISMIC_CODES_E4M3)
+    if (interpretation == SEISMIC_CODES_E4M3)
+        return packets_e4m3(bytes);
 #endif
     return packets_unsigned_bytes(bytes);
 }
