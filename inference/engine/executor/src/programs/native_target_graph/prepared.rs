@@ -8,7 +8,7 @@ use super::{
     certify::{TargetFamilyCertificate, certify_target_family},
     classes::{
         BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, LaunchControlLayout,
-        Passes, StagedClass, block_sealed_stages, block_stages, chained_once_runs, class_topology, enumerate_block_graphs, launch_runs, once_class,
+        Passes, StagedClass, block_sealed_stages, block_stages, chained_once_runs, class_topology, enumerate_block_graphs, LaunchRuns, once_class,
         slot_selection,
     },
     entry::{
@@ -743,30 +743,29 @@ impl PreparedTargetGraphs {
         // them, `certify_target_family`): both entries' and the per-layer
         // entry's of its rows, and at every block its class's runs and, where
         // the class splits there, the graphs the block runs once a group.
+        let launch_runs = LaunchRuns::of(
+            &served,
+            blocks_by_class.iter().enumerate().flat_map(|(index, graphs)| {
+                let runs = graphs.runs.iter().map(move |(staged, block)| (index, *staged, &block.plan));
+                let passes = graphs
+                    .passes
+                    .iter()
+                    .map(move |(pass_rows, block)| (index, once_class(*pass_rows, OnceStage::Pass), &block.plan));
+                runs.chain(passes)
+            }),
+        );
         let launches = launch_classes
             .iter()
             .map(|&class| {
                 let rows = class.0;
-                let mut runs = [EntryTokens::Uploaded, EntryTokens::Selected]
+                [EntryTokens::Uploaded, EntryTokens::Selected]
                     .iter()
                     .filter_map(|&source| entries.get(&(rows, source)))
-                    .map(|entry| entry.plan.clone())
-                    .chain(per_layer_entries.get(&rows).map(|entry| entry.plan.clone()))
-                    .collect::<Vec<_>>();
-                for (index, graphs) in blocks_by_class.iter().enumerate() {
-                    let made = |staged| launch_runs(&served, index, class, staged);
-                    runs.extend(
-                        graphs.runs.iter().filter(|(staged, _)| made(*staged)).map(|(_, block)| block.plan.clone()),
-                    );
-                    runs.extend(
-                        graphs
-                            .passes
-                            .iter()
-                            .filter(|(pass_rows, _)| made(once_class(*pass_rows, OnceStage::Pass)))
-                            .map(|(_, block)| block.plan.clone()),
-                    );
-                }
-                runs
+                    .map(|entry| &entry.plan)
+                    .chain(per_layer_entries.get(&rows).map(|entry| &entry.plan))
+                    .chain(launch_runs.of_class(class).copied())
+                    .cloned()
+                    .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         // What a chain of each length beyond one launch further runs of

@@ -1,5 +1,5 @@
-use super::{ExpertBankPlan, HostTier, Placer, RecordTensor, RecordTensors, RoutedTensor};
-use super::records::record_bytes;
+use super::{BankGroup, BankLayers, ExpertBankPlan, HostTier, Placer, RecordForm, RecordTensor, RecordTensors, RoutedTensor};
+use super::records::{decode_choices, record_bytes, reserved_record};
 use seismic::Element;
 
 /// A staging pool: records of one routed tensor in one stored form, which
@@ -64,7 +64,7 @@ impl ConveyorCarrier {
 /// form at `offsets[pool]` bytes into the lender's records of its routed
 /// tensor's carrier (`RecordForm::carrier`), the pools one tensor carries
 /// laid end to end, the conveyors in each reaching `bytes` of it
-/// (`ExpertBankPlan::conveyor_layout`).
+/// (`BankStructure::conveyor_layout`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConveyorLayout {
     pub records: u64,
@@ -117,23 +117,45 @@ pub struct ConveyorPlan {
     pub conveyor: ConveyorLayout,
 }
 
+/// What a bank lends a prompt group, derived once from its structure as its
+/// plan is made ([`BankStructure::lending`]): where its conveyor lies
+/// ([`ExpertBankPlan::conveyor`]) and where its scratch does
+/// ([`ExpertBankPlan::scratch`]). A bank whose conveyor or scratch no record
+/// of its lender holds whole has no plan, so every sizing and binding past
+/// planning reads them here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Lending {
+    conveyor: ConveyorPlan,
+    scratch: ScratchPlan,
+}
+
+/// The part of a bank's plan its lending derives from: its groups and
+/// layers, the experts a row selects, its record reservation and its host
+/// tier, none of which changes once the plan is made.
+#[derive(Clone, Copy)]
+pub(super) struct BankStructure<'a> {
+    pub(super) groups: &'a [BankGroup],
+    pub(super) layers: &'a BankLayers,
+    pub(super) selected: u64,
+    pub(super) reservation: seismic::Reservation,
+    pub(super) host: HostTier,
+}
+
 impl ExpertBankPlan {
-    /// Records of each stored form's conveyor (`V` of `routed_convert`,
-    /// [`Self::conveyor`]): beside a host tier, a whole layer's experts,
-    /// record `e` holding expert `e` of a layer, so every cold expert of a
-    /// layer is read at once (the tier's records are plentiful host RAM);
-    /// on the one store, whose records are the bank's slots, two rounds'
-    /// records, all that is converted or landing at once, so a round's reads
-    /// land while the device converts the round before and a record frees
-    /// once its round is past (Metal's 4k prefill rose from 424 to 448
-    /// tok/s at 6.89 GB with it, its records the bank's); at most the widest
-    /// layer's experts, all a layer ever reads.
-    pub fn conveyor_records(&self) -> u64 {
-        let widest = self.widest().get();
-        match self.host {
-            HostTier::Linked(_) => widest,
-            HostTier::Unified => (2 * self.round_records()).min(widest),
+    /// The structure its lending derives from ([`BankStructure`]).
+    pub(super) fn structure(&self) -> BankStructure<'_> {
+        BankStructure {
+            groups: &self.groups,
+            layers: &self.layers,
+            selected: self.selected,
+            reservation: self.reservation,
+            host: self.host,
         }
+    }
+
+    /// [`BankStructure::conveyor_records`].
+    pub fn conveyor_records(&self) -> u64 {
+        self.structure().conveyor_records()
     }
 
     /// Where the conveyor lies (`ConveyorPlan`): read for a prompt group's
@@ -147,56 +169,25 @@ impl ExpertBankPlan {
     /// beside a discrete device the host tier's
     /// ([`ConveyorCarrier::HostTier`]), as the device's own memory is no
     /// memory the host reads into. The records lent are every one the lent
-    /// layout ([`Self::conveyor_layout`]) reaches, its packing waste
+    /// layout ([`BankStructure::conveyor_layout`]) reaches, its packing waste
     /// included; a conveyor record lies whole in one native allocation of
-    /// the lender's (a chunk of chunked storage), or the bank is refused.
+    /// the lender's (a chunk of chunked storage), or the bank has no plan.
     /// On the one store the lender lends the conveyor and the scratch
     /// together, from its bottom records ([`Self::scratch`]), so its lent
-    /// records are both's. The plan refused a bank whose conveyor or scratch
-    /// lies in no lender ([`Self::check_lending`]).
-    pub fn conveyor(&self) -> ConveyorPlan {
-        self.try_conveyor().expect("a planned bank's conveyor lies in its lender")
+    /// records are both's.
+    pub fn conveyor(&self) -> &ConveyorPlan {
+        &self.lending.conveyor
     }
 
-    /// Where the scratch lies ([`Self::try_scratch`]), which the plan
-    /// checked ([`Self::check_lending`]).
-    pub fn scratch(&self) -> ScratchPlan {
-        self.try_scratch().expect("a planned bank's scratch lies in its lender")
+    /// Where the scratch lies ([`BankStructure::scratch`]).
+    pub fn scratch(&self) -> &ScratchPlan {
+        &self.lending.scratch
     }
 
-    /// Refuse a bank whose conveyor or scratch no record of its lender holds
-    /// whole, so every derivation past planning may rely on them.
-    pub(super) fn check_lending(&self) -> Result<(), String> {
-        self.try_conveyor()?;
-        self.try_scratch().map(drop)
-    }
-
-    /// The conveyor ([`Self::conveyor`]), or why no lender holds it.
-    fn try_conveyor(&self) -> Result<ConveyorPlan, String> {
-        let group = self.lender_group();
-        let conveyor = self.conveyor_alone()?;
-        Ok(match self.host {
-            HostTier::Unified => ConveyorPlan { carrier: ConveyorCarrier::Bank(self.try_scratch()?.lender), conveyor },
-            HostTier::Linked(_) => {
-                let records = lent_records(self.groups[group].record, &conveyor.bytes)?;
-                ConveyorPlan { carrier: ConveyorCarrier::HostTier(Lender { group, records }), conveyor }
-            }
-        })
-    }
-
-    /// The conveyor's layout in the lender's records of the store the host
-    /// reads files into ([`Self::conveyor`]).
-    pub(super) fn conveyor_alone(&self) -> Result<ConveyorLayout, String> {
-        let pools = self.staging_pools().0;
-        let group = self.lender_group();
-        let (store, reservation) = match self.host {
-            HostTier::Unified => (crate::planning::BankTier::Bank, self.reservation),
-            HostTier::Linked(tier) => (crate::planning::BankTier::Host, tier),
-        };
-        let carriers = self.groups[group].record.try_map(|kind, tensor| {
-            Ok::<_, String>(reservation.of_records(self.reserved_records(group, kind, tensor, store)?))
-        })?;
-        self.conveyor_layout(&pools, &carriers, self.conveyor_records())
+    /// The group whose records carry the conveyor and the scratch
+    /// ([`BankStructure::lender_group`]).
+    pub(super) fn lender_group(&self) -> usize {
+        self.lending.scratch.lender.group
     }
 
     /// The first record of group `group` a prompt group's seeds take, and
@@ -213,7 +204,137 @@ impl ExpertBankPlan {
         }
     }
 
-    /// Where the scratch lies (`ScratchPlan`): one widest layer of every
+    /// [`BankStructure::reserved_records`].
+    pub(super) fn reserved_records(&self, group: usize, kind: RoutedTensor, tensor: RecordTensor, store: crate::planning::BankTier) -> Result<seismic::ReservedRecords, String> {
+        self.structure().reserved_records(group, kind, tensor, store)
+    }
+
+    /// Each layer's scratch form of each routed tensor
+    /// ([`Self::scratch`]).
+    pub fn layer_scratch_forms(&self) -> Vec<RecordTensors<usize>> {
+        self.structure().layer_forms(|kind, tensor| ScratchForm { kind, resident: tensor.resident, matrix: tensor.matrix }).1
+    }
+
+    /// [`BankStructure::staging_pools`].
+    pub fn staging_pools(&self) -> (Vec<StagingPool>, Vec<RecordTensors<usize>>) {
+        self.structure().staging_pools()
+    }
+}
+
+impl BankStructure<'_> {
+    /// The most experts of any streamed layer ([`ExpertBankPlan::widest`]).
+    pub(super) fn widest(self) -> u64 {
+        self.layers.widest().get()
+    }
+
+    /// [`ExpertBankPlan::choices`].
+    pub(super) fn choices(self) -> u64 {
+        decode_choices(self.selected)
+    }
+
+    /// [`ExpertBankPlan::round_records`].
+    pub(super) fn round_records(self) -> u64 {
+        self.choices() / 2
+    }
+
+    /// [`ExpertBankPlan::form`].
+    pub(super) fn form(self) -> RecordForm {
+        self.groups[0].record.form()
+    }
+
+    /// The group whose records carry the conveyor (`Lender`): the one of the
+    /// most experts, the first of those.
+    fn lender_group(self) -> usize {
+        (0..self.groups.len())
+            .max_by_key(|&group| {
+                let experts = self.groups[group].layers.iter().map(|&layer| self.layers[layer].experts).sum::<u64>();
+                (experts, std::cmp::Reverse(group))
+            })
+            .expect("a bank holds a group")
+    }
+
+    /// Records of each stored form's conveyor (`V` of `routed_convert`,
+    /// [`ExpertBankPlan::conveyor`]): beside a host tier, a whole layer's
+    /// experts, record `e` holding expert `e` of a layer, so every cold
+    /// expert of a layer is read at once (the tier's records are plentiful
+    /// host RAM); on the one store, whose records are the bank's slots, two
+    /// rounds' records, all that is converted or landing at once, so a
+    /// round's reads land while the device converts the round before and a
+    /// record frees once its round is past (Metal's 4k prefill rose from 424
+    /// to 448 tok/s at 6.89 GB with it, its records the bank's); at most the
+    /// widest layer's experts, all a layer ever reads.
+    pub(super) fn conveyor_records(self) -> u64 {
+        let widest = self.widest();
+        match self.host {
+            HostTier::Linked(_) => widest,
+            HostTier::Unified => (2 * self.round_records()).min(widest),
+        }
+    }
+
+    /// The bank's lending ([`Lending`]), or why no lender holds its
+    /// conveyor or its scratch whole.
+    pub(super) fn lending(self) -> Result<Lending, String> {
+        let conveyor = self.conveyor_alone()?;
+        let scratch = self.scratch(&conveyor)?;
+        let carrier = match self.host {
+            HostTier::Unified => ConveyorCarrier::Bank(scratch.lender),
+            HostTier::Linked(_) => {
+                let group = self.lender_group();
+                let records = lent_records(self.groups[group].record, &conveyor.bytes)?;
+                ConveyorCarrier::HostTier(Lender { group, records })
+            }
+        };
+        Ok(Lending { conveyor: ConveyorPlan { carrier, conveyor }, scratch })
+    }
+
+    /// What group `group`'s records of routed tensor `kind` (`tensor`) in
+    /// `store` are: its records, and, where they carry the conveyor (the
+    /// lender's, in the store the host reads files into,
+    /// [`ExpertBankPlan::conveyor`]), the largest stored record of the pools
+    /// whose conveyor they carry (`RecordForm::carrier`), so each lies whole
+    /// in one chunk of chunked storage.
+    pub(super) fn reserved_records(self, group: usize, kind: RoutedTensor, tensor: RecordTensor, store: crate::planning::BankTier) -> Result<seismic::ReservedRecords, String> {
+        let held = seismic::ReservedRecords::of(reserved_record(tensor.record_bytes()?)?);
+        if group != self.lender_group() {
+            return Ok(held);
+        }
+        let conveyor_store = match self.host {
+            HostTier::Unified => crate::planning::BankTier::Bank,
+            HostTier::Linked(_) => crate::planning::BankTier::Host,
+        };
+        let form = self.form();
+        let mut carried = held;
+        if store == conveyor_store {
+            for pool in self.staging_pools().0.iter().filter(|pool| form.carrier(pool.kind) == kind) {
+                carried = carried.carrying(reserved_record(pool.record_bytes()?)?);
+            }
+        }
+        // The scratch lies in the bank's records, device memory.
+        if store == crate::planning::BankTier::Bank {
+            for scratch in self.scratch_forms().0.iter().filter(|scratch| scratch.kind == kind) {
+                carried = carried.carrying(reserved_record(record_bytes(scratch.resident, scratch.matrix)?)?);
+            }
+        }
+        Ok(carried)
+    }
+
+    /// The conveyor's layout in the lender's records of the store the host
+    /// reads files into ([`ExpertBankPlan::conveyor`]).
+    pub(super) fn conveyor_alone(self) -> Result<ConveyorLayout, String> {
+        let pools = self.staging_pools().0;
+        let group = self.lender_group();
+        let (store, reservation) = match self.host {
+            HostTier::Unified => (crate::planning::BankTier::Bank, self.reservation),
+            HostTier::Linked(tier) => (crate::planning::BankTier::Host, tier),
+        };
+        let carriers = self.groups[group].record.try_map(|kind, tensor| {
+            Ok::<_, String>(reservation.of_records(self.reserved_records(group, kind, tensor, store)?))
+        })?;
+        self.conveyor_layout(&pools, &carriers, self.conveyor_records())
+    }
+
+    /// Where the scratch lies (`ScratchPlan`) beside the conveyor laid out
+    /// as `conveyor`: one widest layer of every
     /// routed tensor's every resident form, which a prompt group's rounds
     /// convert each layer's cold experts into (slot `e` holding expert `e`)
     /// and its pass reads them from, each layer through the view of its own
@@ -225,11 +346,11 @@ impl ExpertBankPlan {
     /// life and returns them empty, so it evicts no other layer's expert. A
     /// scratch record lies whole in one chunk of the lender's chunked
     /// storage ([`Self::reserved_records`]). Or why no lender holds it.
-    fn try_scratch(&self) -> Result<ScratchPlan, String> {
+    fn scratch(self, conveyor: &ConveyorLayout) -> Result<ScratchPlan, String> {
         let group = self.lender_group();
         let (forms, experts) = self.scratch_forms();
         let start = match self.host {
-            HostTier::Unified => self.conveyor_alone()?.bytes,
+            HostTier::Unified => conveyor.bytes,
             HostTier::Linked(_) => self.form().each(|_| Ok::<_, String>(0))?,
         };
         let carriers = self.groups[group].record.try_map(|kind, tensor| {
@@ -263,7 +384,7 @@ impl ExpertBankPlan {
 
     /// The scratch's forms ([`ScratchForm`]), each with the most experts of
     /// the layers of that form, its view's slots.
-    pub(super) fn scratch_forms(&self) -> (Vec<ScratchForm>, Vec<u64>) {
+    pub(super) fn scratch_forms(self) -> (Vec<ScratchForm>, Vec<u64>) {
         let (forms, layers) = self.layer_forms(|kind, tensor| ScratchForm { kind, resident: tensor.resident, matrix: tensor.matrix });
         let mut experts = vec![0u64; forms.len()];
         for (layer, of) in self.layers.iter().zip(&layers) {
@@ -272,12 +393,6 @@ impl ExpertBankPlan {
             }
         }
         (forms, experts)
-    }
-
-    /// Each layer's scratch form of each routed tensor
-    /// ([`Self::scratch`]).
-    pub fn layer_scratch_forms(&self) -> Vec<RecordTensors<usize>> {
-        self.layer_forms(|kind, tensor| ScratchForm { kind, resident: tensor.resident, matrix: tensor.matrix }).1
     }
 
     /// Where each staging pool's conveyor of `records` records lies in the
@@ -292,7 +407,7 @@ impl ExpertBankPlan {
     /// than one record past its last whole one, and the lending takes it
     /// with the records around it.
     pub(super) fn conveyor_layout(
-        &self,
+        self,
         pools: &[StagingPool],
         lent: &RecordTensors<seismic::Reservation>,
         records: u64,
@@ -322,7 +437,7 @@ impl ExpertBankPlan {
 
     /// The staging pools, and each layer's pool of each routed tensor: one
     /// per stored form, each with its conveyor.
-    pub fn staging_pools(&self) -> (Vec<StagingPool>, Vec<RecordTensors<usize>>) {
+    pub(super) fn staging_pools(self) -> (Vec<StagingPool>, Vec<RecordTensors<usize>>) {
         self.layer_forms(StagingPool::of)
     }
 
@@ -330,7 +445,7 @@ impl ExpertBankPlan {
     /// routed tensor, in order of first use, and each layer's index of its
     /// own of each.
     fn layer_forms<F: PartialEq>(
-        &self,
+        self,
         form: impl Fn(RoutedTensor, RecordTensor) -> F,
     ) -> (Vec<F>, Vec<RecordTensors<usize>>) {
         let mut forms: Vec<F> = Vec::new();

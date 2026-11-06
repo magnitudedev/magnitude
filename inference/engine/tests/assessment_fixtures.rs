@@ -17,8 +17,8 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentFitVerdict, ConveyorCarrier, PlanError,
-    assessment::{AssessmentError, ColdSource, Residency, execution_memory_charge, prepare_execution_assessment},
+    AssessmentFitVerdict, ConveyorCarrier, HeldStructures, PlanError,
+    assessment::{AssessmentError, ColdSource, Residency, execution_memory_charge},
     platform::{DeviceRequest, DomainRole, MemoryReserves},
 };
 use magnitude_scheduler::ServiceLimits;
@@ -621,16 +621,15 @@ fn a_capped_streamed_load_fits_with_its_graphs_priced() {
     for backend in [BackendName::Cuda, BackendName::Vulkan] {
         let policy = ModelPolicy { weight_cap: Some(6_890_894_474), ..ModelPolicy::default() };
         let setup = rtx3090_setup(backend, MemoryReserves::standard(), policy, standard_service_limits());
-        let (definition, draft) = match prepare_model_assessment(&package, &setup.structure) {
-            Ok(PreparedModelAssessment::Planned { definition, draft, .. }) => (definition, draft),
+        let (draft, execution) = match prepare_model_assessment(&package, &setup.structure) {
+            Ok(PreparedModelAssessment::Planned { draft, execution, .. }) => (draft, execution),
             Ok(PreparedModelAssessment::Unsupported { unsupported, .. }) => {
                 panic!("{backend:?}: Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}")
             }
             Err(error) => panic!("{backend:?}: Qwen3.6 35B is planned on the RTX 3090 under the cap: {error}"),
         };
         assert!(draft.load().expert_bank().is_some(), "{backend:?}: a capped load streams");
-        let context = u32::try_from(definition.decoder.context_limit).unwrap();
-        let charge = *prepare_execution_assessment(&definition, &draft, context).unwrap().memory_charge();
+        let charge = *execution.memory_charge();
         let graphs = charge.bounds.recorded_graph_bytes;
         assert!(0 < graphs && graphs < charge.allocation_bytes / 8, "{backend:?}: startup graphs {graphs} bytes");
     }
@@ -671,11 +670,11 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     let Err(PlanError::WeightCap {
         needed: floor_weights,
         ..
-    }) = draft.clone().with_bank(&definition, Some(0), None)
+    }) = draft.clone().with_bank(&definition, Some(0))
     else {
         panic!("no bank holds no weights");
     };
-    let floor = draft.clone().with_bank(&definition, Some(floor_weights), None).unwrap();
+    let floor = draft.clone().with_bank(&definition, Some(floor_weights)).unwrap().into_draft();
     let bank = floor.load().expert_bank().unwrap().clone();
     assert_eq!(bank.slots, bank.floor());
     // A bank's weights at `slots`, its record tensors reserved as the
@@ -772,13 +771,13 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     // A draft re-planned as an assessment's fallback does keeps its tier,
     // which is then what its fit reports the cold experts lie in.
     let (replanned, ()) = draft
-        .with_held_experts(&definition, u64::MAX, |candidate| {
-            Ok::<_, AssessmentError>(Ok((execution_memory_charge(&definition, candidate, None)?, ())))
+        .with_held_experts(&definition, u64::MAX, &mut HeldStructures::default(), |_, _| {
+            Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
         .unwrap();
-    assert_eq!(replanned.load().expert_bank().unwrap().host_slots, ceiling);
-    let Residency::Streamed(shares) = Residency::of(&replanned) else {
+    assert_eq!(replanned.draft().load().expert_bank().unwrap().host_slots, ceiling);
+    let Residency::Streamed(shares) = Residency::of(replanned.draft()) else {
         panic!("a capped load streams");
     };
     assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling });
@@ -786,7 +785,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     // The host RAM the load holds beside the tier's floor.
     let structure = &setup.structure;
     let device = structure.topology.resolve(draft.device().selector()).unwrap();
-    let fit = execution_memory_charge(&definition, &draft, None)
+    let fit = execution_memory_charge(&definition, &draft)
         .unwrap()
         .assess_fit(&structure.topology, device, &structure.status, &structure.reserves)
         .unwrap();
@@ -905,7 +904,6 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     // domain's stable room) and at their weights, and the largest that fit:
     // one more does not.
     let PreparedModelAssessment::Planned {
-        facts,
         definition,
         draft,
         ..
@@ -914,11 +912,11 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
         unreachable!("the model was assessed");
     };
     let Err(PlanError::WeightCap { needed: floor_weights, .. }) =
-        draft.clone().with_bank(definition, Some(0), None)
+        draft.clone().with_bank(definition, Some(0))
     else {
         panic!("no bank holds no weights");
     };
-    let floor = draft.clone().with_bank(definition, Some(floor_weights), None).unwrap();
+    let floor = draft.clone().with_bank(definition, Some(floor_weights)).unwrap().into_draft();
     let bank = floor.load().expert_bank().unwrap();
     assert_eq!(bank.slots, shares.floor());
     // A bank's weights at `slots`, its record tensors reserved as the
@@ -942,22 +940,35 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
         allocation.capacity_bytes - allocation.reserve_bytes,
         weights(shares.slots()),
     ] {
-        let capped = draft.clone().with_bank(definition, Some(cap), None).unwrap();
+        let capped = draft.clone().with_bank(definition, Some(cap)).unwrap().into_draft();
         assert_eq!(capped.load().expert_bank().unwrap().slots, shares.slots(), "a cap of {cap}");
     }
     // The plan of one slot more, whatever its fit.
     let (beyond, ()) = draft
-        .with_held_experts(definition, weights(shares.slots() + 1), |candidate| {
-            Ok::<_, AssessmentError>(Ok((execution_memory_charge(definition, candidate, None)?, ())))
+        .with_held_experts(definition, weights(shares.slots() + 1), &mut HeldStructures::default(), |_, _| {
+            Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
         .unwrap();
-    assert_eq!(beyond.load().expert_bank().unwrap().slots, shares.slots() + 1);
-    let structure = &setup.structure;
-    let charge = *prepare_execution_assessment(definition, &beyond, facts.context_limit)
+    assert_eq!(beyond.draft().load().expert_bank().unwrap().slots, shares.slots() + 1);
+    // A search charges every size from the structures its plans first
+    // derived: the plan it holds has that size's own charge.
+    let (fewer, ()) = beyond
+        .draft()
+        .with_held_experts(definition, u64::MAX, &mut beyond.structures().clone(), |candidate, _| {
+            let slots = candidate.load().expert_bank().map_or(0, |bank| bank.slots);
+            Ok::<_, AssessmentError>(match slots <= shares.slots() {
+                true => Ok(()),
+                false => Err(std::num::NonZeroU64::MIN),
+            })
+        })
         .unwrap()
-        .memory_charge();
-    let device = structure.topology.resolve(beyond.device().selector()).unwrap();
+        .unwrap();
+    assert!(fewer.draft().load().expert_bank().unwrap().slots <= shares.slots());
+    assert_eq!(*fewer.charge(), execution_memory_charge(definition, fewer.draft()).unwrap());
+    let structure = &setup.structure;
+    let charge = *beyond.charge();
+    let device = structure.topology.resolve(beyond.draft().device().selector()).unwrap();
     assert!(matches!(
         charge
             .assess_fit(&structure.topology, device, &structure.status, &structure.reserves)

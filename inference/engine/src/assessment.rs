@@ -909,8 +909,8 @@ fn prepare_plan(
         PlanOutcome::WeightCap(error) => Refusal::Failed(ModelAssessmentError::WeightCap(error)),
         PlanOutcome::Internal(reason) => Refusal::Failed(ModelAssessmentError::Planning(reason)),
     };
-    let draft = match plan_execution(&manifest, selected) {
-        Ok(draft) => draft,
+    let planned = match plan_execution(&manifest, selected) {
+        Ok(planned) => planned,
         Err(ExecutionPlanningError::Plan(error)) => {
             return Err(refused(classify_plan(error, selected.info.backend())));
         }
@@ -920,8 +920,8 @@ fn prepare_plan(
             )));
         }
     };
-    match prepare_execution_assessment(&manifest.definition, &draft, context_limit) {
-        Ok(execution) => Ok((manifest.definition, draft, execution)),
+    match prepare_execution_assessment(&manifest.definition, &planned, context_limit) {
+        Ok(execution) => Ok((manifest.definition, planned.into_draft(), execution)),
         Err(AssessmentError::Graph(error)) => Err(refused(classify_graph(error))),
         Err(error) => Err(Refusal::Failed(ModelAssessmentError::Assessment(error))),
     }

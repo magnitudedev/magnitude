@@ -4,13 +4,10 @@
 //! device, reads no weight payload and allocates nothing; a load repeats
 //! device resolution and makes live claims.
 
-use crate::error::{classify_graph, classify_plan, classify_platform, PlanOutcome, PreviewError};
+use crate::error::{classify_plan, classify_platform, PlanOutcome, PreviewError};
 use crate::options::ExecutionManifest;
 use crate::planning::{plan_execution, ExecutionPlanningError};
-use magnitude_executor::{
-    AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryTerms,
-    DeviceProcessBytes, HostProcessBytes, ResourceCapacity, ResourcePlanner,
-};
+use magnitude_executor::{AssessmentMemoryTerms, ResourceCapacity, ResourcePlanner};
 use seismic::{BackendName, Devices, ExecutorSelector};
 use serde::{Deserialize, Serialize};
 
@@ -42,10 +39,13 @@ impl ExecutionManifest {
         let selected = crate::planning::select_load_device(catalog, manifest)
             .map_err(|error| PreviewError::from(classify_platform(error)))?;
         let backend = selected.info.backend();
-        let draft = plan_execution(manifest, &selected).map_err(|error| match error {
+        // The bounds planning charged the draft with: its graphs are
+        // certified once, there.
+        let planned = plan_execution(manifest, &selected).map_err(|error| match error {
             ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
             error => PreviewError::from(PlanOutcome::Internal(error.to_string())),
         })?;
+        let (draft, bounds) = (planned.draft(), planned.charge().bounds);
         let definition = &manifest.definition;
         let policy = draft.policy();
         let terms = AssessmentMemoryTerms::derive(
@@ -71,31 +71,6 @@ impl ExecutionManifest {
             },
         )
         .map_err(|error| internal(error.to_string()))?;
-        let graph = AssessmentGraphResourceBounds::derive(
-            definition,
-            draft.load(),
-            &state,
-            policy.method(),
-            policy.codec(),
-            policy.limits(),
-            backend,
-        )
-        .map_err(|error| PreviewError::from(classify_graph(error)))?;
-        let host_process = HostProcessBytes::derive(
-            definition,
-            draft.load(),
-            draft.programs(),
-            policy.limits(),
-            backend,
-        )
-        .map_err(internal)?;
-        let device_process =
-            DeviceProcessBytes::derive(backend, host_process.kernels).map_err(internal)?;
-        let bounds = AssessmentHeaderBounds::derive(draft.load())
-            .and_then(|header| {
-                header.with_graph_resource_bound(&graph, selected.graph_cost.cost(), host_process, device_process)
-            })
-            .map_err(internal)?;
         let initial_state = state
             .target_state()
             .initial_committed_bytes()

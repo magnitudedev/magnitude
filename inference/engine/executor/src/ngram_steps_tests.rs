@@ -1331,15 +1331,16 @@ fn load(
         Banked::Streamed { numerator, denominator } => {
             let resident = draft.allocation_bytes(definition).unwrap();
             draft
-                .with_bank(definition, Some(resident * numerator / denominator), None)
+                .with_bank(definition, Some(resident * numerator / denominator))
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
+                .into_draft()
         }
-        Banked::Whole => draft.with_bank(definition, None, None).unwrap_or_else(|error| panic!("{backend:?}: {error}")),
+        Banked::Whole => draft.with_bank(definition, None).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft(),
         Banked::Half => {
-            let whole = draft.clone().with_bank(definition, None, None).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+            let whole = draft.clone().with_bank(definition, None).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft();
             let bank = whole.load().expert_bank().unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
             let cap = whole.load().weight_bytes().unwrap() - bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
-            draft.with_bank(definition, Some(cap), None).unwrap_or_else(|error| panic!("{backend:?}: {error}"))
+            draft.with_bank(definition, Some(cap)).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
         }
     };
     let state = ResourcePlanner::state_plan(
@@ -1368,7 +1369,7 @@ fn load(
     // As a load finalizes it (`execution`): its readout, and the CPU sites
     // its qualification admitted, which its graphs encode.
     let draft = draft
-        .finalize_readout(definition, programs.readout_choices(), None)
+        .finalize_readout(definition, programs.readout_choices())
         .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
         .unwrap();
     let target_graphs = programs

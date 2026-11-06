@@ -165,7 +165,9 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice) 
         .map(|root| KernelCache::open(root, DEFAULT_KERNEL_CACHE_BYTES).map(Arc::new))
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
-    let draft = crate::planning::plan_banked(manifest, resident.clone(), kernel_cache.as_deref()).map_err(planned)?;
+    let draft = crate::planning::plan_banked(manifest, resident.clone())
+        .map_err(planned)?
+        .into_draft();
     Ok(LoadPlans { resident, draft, kernel_cache })
 }
 
@@ -472,7 +474,7 @@ fn prepare(
         Err(error) => return Err(LoadError::from(classify_catalog(error))),
     };
     let draft = draft
-        .finalize_readout(&manifest.definition, programs.readout_choices(), kernel_cache.as_deref())
+        .finalize_readout(&manifest.definition, programs.readout_choices())
         .and_then(|draft| draft.finalize_sites(|bank| programs.sited_layers(bank)))
         .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
     if draft.load().readout_choices() != programs.readout_choices() {

@@ -3850,8 +3850,9 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             },
         )
         .unwrap()
-        .with_bank(&definition, None, None)
-        .unwrap();
+        .with_bank(&definition, None)
+        .unwrap()
+        .into_draft();
         assert!(draft.load().expert_bank().is_some(), "{streamed}: the load streams its experts");
         let observer = Finished(RefCell::new(Vec::new()));
         crate::AttestedPrograms::search_draft(

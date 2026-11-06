@@ -15,7 +15,7 @@ use super::AssessmentError;
 use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, DeviceProcessBytes, ExecutionPlanDraft,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, ChargedDraft, DeviceProcessBytes, ExecutionPlanDraft, HeldStructures,
     HostProcessBytes, ResourceCapacity, ResourcePlanner,
 };
 use magnitude_family_contracts::ModelDefinition;
@@ -208,6 +208,9 @@ pub struct PreparedExecutionAssessment {
     demand: DecodeDemand,
     fit_context_tokens: u32,
     charge: AssessmentMemoryCharge,
+    /// What planning's search charged the draft from, which a fit's search
+    /// of it charges from again ([`assess_execution_fit`]).
+    structures: HeldStructures,
 }
 
 impl PreparedExecutionAssessment {
@@ -223,11 +226,11 @@ impl PreparedExecutionAssessment {
 }
 
 /// Perform model-specific arithmetic while the fixed generic basis is
-/// measured: the memory charge ([`execution_memory_charge`]) and the plain
-/// decode step's demand ([`decode_demand`]).
+/// measured: the plain decode step's demand ([`decode_demand`]) beside the
+/// memory charge planning confirmed of the draft ([`ChargedDraft`]).
 pub fn prepare_execution_assessment(
     definition: &ModelDefinition,
-    draft: &ExecutionPlanDraft,
+    planned: &ChargedDraft,
     context_limit: u32,
 ) -> Result<PreparedExecutionAssessment, AssessmentError> {
     if definition.decoder.context_limit != u64::from(context_limit) {
@@ -236,94 +239,120 @@ pub fn prepare_execution_assessment(
             context_limit, definition.decoder.context_limit
         )));
     }
-    let (charge, fit_context_tokens) = charged(definition, draft, None)?;
+    let fit_context_tokens = u32::try_from(crate::planning::fit_depth(definition))
+        .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
     Ok(PreparedExecutionAssessment {
-        demand: decode_demand(definition, draft)?,
+        demand: decode_demand(definition, planned.draft())?,
         fit_context_tokens,
-        charge,
+        charge: *planned.charge(),
+        structures: planned.structures().clone(),
     })
 }
 
 /// The standard workload's checked memory charge of `definition` planned
-/// as `draft`, at the model's context. It builds every graph a load
-/// prepares, so this fails with `AssessmentError::Graph` exactly when the
-/// model's program cannot be built on the planned backend. What that
-/// derives is kept in `cache`, where one is given
-/// ([`AssessmentGraphResourceBounds::kept`]).
+/// as `draft`, at the model's context ([`StructuralCharge`] of the draft,
+/// charged at its own bank). It builds every graph a load prepares, so this
+/// fails with `AssessmentError::Graph` exactly when the model's program
+/// cannot be built on the planned backend.
 pub fn execution_memory_charge(
     definition: &ModelDefinition,
     draft: &ExecutionPlanDraft,
-    cache: Option<&crate::KernelCache>,
 ) -> Result<AssessmentMemoryCharge, AssessmentError> {
-    charged(definition, draft, cache).map(|(charge, _)| charge)
+    StructuralCharge::of(definition, draft)?.charge(definition, draft)
 }
 
-/// [`execution_memory_charge`] and the workload's fit depth in tokens.
-fn charged(
-    definition: &ModelDefinition,
-    draft: &ExecutionPlanDraft,
-    cache: Option<&crate::KernelCache>,
-) -> Result<(AssessmentMemoryCharge, u32), AssessmentError> {
-    let policy = draft.policy();
-    let backend = draft.device().backend();
-    let terms = AssessmentMemoryTerms::derive(
-        definition,
-        draft.load(),
-        policy.selection(),
-        policy.codec(),
-        policy.method(),
-        policy.limits(),
-    )
-    .map_err(AssessmentError::Memory)?;
-    let fit_context_tokens = u32::try_from(terms.fit_depth)
-        .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
-    let header = AssessmentHeaderBounds::derive(draft.load()).map_err(AssessmentError::Memory)?;
-    let state = ResourcePlanner::state_plan(
-        definition,
-        draft.load(),
-        policy.method(),
-        policy.codec(),
-        policy.limits(),
-        ResourceCapacity {
-            domain_bytes: draft.device().assessment_capacity_bytes(),
-            tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
-        },
-    )
-    .map_err(AssessmentError::Plan)?;
-    let graph = AssessmentGraphResourceBounds::kept(
-        cache,
-        definition,
-        draft.load(),
-        &state,
-        policy.method(),
-        policy.codec(),
-        policy.limits(),
-        backend,
-    )
-    .map_err(AssessmentError::Graph)?;
-    let host_process = HostProcessBytes::derive(
-        definition,
-        draft.load(),
-        draft.programs(),
-        policy.limits(),
-        draft.device().backend(),
-    )
-    .map_err(AssessmentError::Memory)?;
-    let device_process =
-        DeviceProcessBytes::derive(draft.device().backend(), host_process.kernels)
-            .map_err(AssessmentError::Memory)?;
-    let charge = header
-        .with_graph_resource_bound(&graph, draft.device().graph_cost(), host_process, device_process)
-        .and_then(|bounds| {
-            terms.charge(
-                bounds,
-                state.capacity().workload_state_bytes,
-                state.startup_state_bytes()?,
-                state.loaded_state_bytes()?,
-            )
-        })
+/// The terms of a draft's charge that its expert bank's slots leave as they
+/// are: its state plan's bytes, its graph resource bound, which builds and
+/// certifies every graph a load prepares, and its process bytes. A bank's
+/// slots size only its record tensors' committed records
+/// (`ExpertBankPlan::records_at`) and the banked stacks' resident bytes; its
+/// records' extents, binding, conveyor, scratch and host tier, which the
+/// program plan, the graphs and the kernels read, are of its structure
+/// alone (`BankStructure`). So the charge of any draft that differs from
+/// this one's only in its bank's slots is this structure with that draft's
+/// weights and header bounds ([`Self::charge`]), and is derived once for
+/// every size a bank search confirms.
+#[derive(Debug)]
+pub struct StructuralCharge {
+    graph: AssessmentGraphResourceBounds,
+    host_process: HostProcessBytes,
+    device_process: DeviceProcessBytes,
+    workload_state_bytes: u64,
+    startup_state_bytes: u64,
+    loaded_state_bytes: u64,
+}
+
+impl StructuralCharge {
+    /// The structure of `draft`'s charge.
+    pub fn of(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<Self, AssessmentError> {
+        let policy = draft.policy();
+        let backend = draft.device().backend();
+        let state = ResourcePlanner::state_plan(
+            definition,
+            draft.load(),
+            policy.method(),
+            policy.codec(),
+            policy.limits(),
+            ResourceCapacity {
+                domain_bytes: draft.device().assessment_capacity_bytes(),
+                tensor_operations: crate::TensorOperations::of(draft.device().tensor_operations()),
+            },
+        )
+        .map_err(AssessmentError::Plan)?;
+        let graph = AssessmentGraphResourceBounds::derive(
+            definition,
+            draft.load(),
+            &state,
+            policy.method(),
+            policy.codec(),
+            policy.limits(),
+            backend,
+        )
+        .map_err(AssessmentError::Graph)?;
+        let host_process =
+            HostProcessBytes::derive(definition, draft.load(), draft.programs(), policy.limits(), backend)
+                .map_err(AssessmentError::Memory)?;
+        let device_process =
+            DeviceProcessBytes::derive(backend, host_process.kernels).map_err(AssessmentError::Memory)?;
+        let state_bytes = || -> Result<_, String> {
+            Ok((state.capacity().workload_state_bytes, state.startup_state_bytes()?, state.loaded_state_bytes()?))
+        };
+        let (workload_state_bytes, startup_state_bytes, loaded_state_bytes) =
+            state_bytes().map_err(AssessmentError::Memory)?;
+        Ok(Self { graph, host_process, device_process, workload_state_bytes, startup_state_bytes, loaded_state_bytes })
+    }
+
+    /// The charge of `draft`, a draft of this structure: its weights'
+    /// terms and header bounds beside the structure's.
+    pub fn charge(
+        &self,
+        definition: &ModelDefinition,
+        draft: &ExecutionPlanDraft,
+    ) -> Result<AssessmentMemoryCharge, AssessmentError> {
+        let policy = draft.policy();
+        let terms = AssessmentMemoryTerms::derive(
+            definition,
+            draft.load(),
+            policy.selection(),
+            policy.codec(),
+            policy.method(),
+            policy.limits(),
+        )
         .map_err(AssessmentError::Memory)?;
-    Ok((charge, fit_context_tokens))
+        AssessmentHeaderBounds::derive(draft.load())
+            .and_then(|header| {
+                header.with_graph_resource_bound(
+                    &self.graph,
+                    draft.device().graph_cost(),
+                    self.host_process,
+                    self.device_process,
+                )
+            })
+            .and_then(|bounds| {
+                terms.charge(bounds, self.workload_state_bytes, self.startup_state_bytes, self.loaded_state_bytes)
+            })
+            .map_err(AssessmentError::Memory)
+    }
 }
 
 /// The plain decode step's demand of `definition` planned as `draft`,
@@ -359,7 +388,9 @@ fn planned_executor<'a>(
 /// stable capacity. A plan that does not fit holds its experts as a load
 /// does ([`ExecutionPlanDraft::with_held_experts`]) within the allocation
 /// domain's stable capacity, and fits so; otherwise the plan's own shortfall
-/// is the verdict. No graph or model material is constructed here.
+/// is the verdict. Its plans are charged from the structures planning
+/// charged the draft from ([`HeldStructures`]), so a structure planning
+/// derived is never derived again.
 pub fn assess_execution_fit(
     definition: &ModelDefinition,
     prepared: &PreparedExecutionAssessment,
@@ -394,19 +425,19 @@ pub fn assess_execution_fit(
         .find(|domain| domain.role == DomainRole::Allocation)
         .ok_or_else(|| AssessmentError::Memory("the fit reaches no allocation domain".into()))?;
     let bound = allocation.capacity_bytes - allocation.reserve_bytes;
-    let confirm = |candidate: &ExecutionPlanDraft| {
-        let charge = execution_memory_charge(definition, candidate, None)?;
-        let fit = fit_of(&charge)?;
+    let confirm = |_: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge| {
+        let fit = fit_of(charge)?;
         Ok::<_, AssessmentError>(match fit.verdict {
-            AssessmentFitVerdict::Fits => Ok((charge, (prepared.fit_context_tokens, fit.domains))),
+            AssessmentFitVerdict::Fits => Ok((prepared.fit_context_tokens, fit.domains)),
             AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
         })
     };
-    Ok(match draft.with_held_experts(definition, bound, confirm)? {
+    let mut structures = prepared.structures.clone();
+    Ok(match draft.with_held_experts(definition, bound, &mut structures, confirm)? {
         Ok((held, (fit_context_tokens, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains,
-            residency: Residency::of(&held),
+            residency: Residency::of(held.draft()),
         }),
         Err(_) => ExecutionAssessment::DoesNotFit(ExecutionShortfall {
             fit_context_tokens: prepared.fit_context_tokens,
@@ -458,6 +489,13 @@ pub(crate) mod tests {
         status: Status,
         draft: ExecutionPlanDraft,
         definition: ModelDefinition,
+    }
+
+    impl Environment {
+        /// The draft with its charge, as planning gives it.
+        fn planned(&self) -> ChargedDraft {
+            ChargedDraft::of(&self.definition, self.draft.clone()).unwrap()
+        }
     }
 
     fn environment(context_limit: u64) -> Environment {
@@ -514,7 +552,7 @@ pub(crate) mod tests {
     fn assess(environment: &Environment, request: &AssessmentRequest) -> ExecutionAssessment {
         let prepared = prepare_execution_assessment(
             &environment.definition,
-            &environment.draft,
+            &environment.planned(),
             request.context_limit,
         )
         .unwrap();
@@ -583,7 +621,7 @@ pub(crate) mod tests {
         let environment = environment(150_000);
         let request = request(150_000, &[25_000, 50_000, 50_000, 200_000]);
         let prepared =
-            prepare_execution_assessment(&environment.definition, &environment.draft, 150_000)
+            prepare_execution_assessment(&environment.definition, &environment.planned(), 150_000)
                 .unwrap();
         let costs = crate::assessment::fixtures::costs();
         let estimates =
@@ -613,7 +651,7 @@ pub(crate) mod tests {
         let environment = environment_within(150_000, 16 << 20);
         let request = request(150_000, &[25_000]);
         let prepared =
-            prepare_execution_assessment(&environment.definition, &environment.draft, 150_000)
+            prepare_execution_assessment(&environment.definition, &environment.planned(), 150_000)
                 .expect("a context the domain cannot back is not a planning failure");
         assert_eq!(prepared.fit_context_tokens, 100_000);
         assert!(assess_execution_fit(
@@ -631,7 +669,7 @@ pub(crate) mod tests {
     fn a_mismatched_context_limit_is_an_error() {
         let environment = environment(128);
         assert!(matches!(
-            prepare_execution_assessment(&environment.definition, &environment.draft, 256),
+            prepare_execution_assessment(&environment.definition, &environment.planned(), 256),
             Err(AssessmentError::Plan(_))
         ));
     }

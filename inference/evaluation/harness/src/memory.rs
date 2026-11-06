@@ -115,12 +115,13 @@ pub fn load(load: Load) -> Result<(), String> {
         hold,
     } = load;
     let mut pressure = pressure.map(|pressing| Pressure::new(backend, pressing));
-    let Planned { host, manifest, devices, structure, draft } = plan(backend, &target, kernel_cache.clone(), numerical_profile, context_tokens, weight_cap)?;
+    let Planned { host, manifest, devices, structure, planned } = plan(backend, &target, kernel_cache.clone(), numerical_profile, context_tokens, weight_cap)?;
     let definition = &manifest.definition;
     let context = u32::try_from(definition.decoder.context_limit)
         .map_err(|_| "the context exceeds the assessment domain")?;
     let execution =
-        prepare_execution_assessment(definition, &draft, context).map_err(|error| error.to_string())?;
+        prepare_execution_assessment(definition, &planned, context).map_err(|error| error.to_string())?;
+    let draft = planned.into_draft();
     // Where a streamed load's experts are stored, none of whose pages the
     // file cache may hold.
     let expert_ranges = crate::engine::expert_ranges(draft.load().expert_bank(), host.package().target())?;
@@ -293,7 +294,7 @@ struct Planned {
     manifest: magnitude_engine::options::ExecutionManifest,
     devices: Devices,
     structure: AssessmentStructure,
-    draft: magnitude_executor::ExecutionPlanDraft,
+    planned: magnitude_executor::ChargedDraft,
 }
 
 /// Plan `target` on `backend`'s device ([`Planned`]): plain, without its
@@ -342,8 +343,8 @@ fn plan(
         standard_service_limits(),
     )
     .map_err(|error| error.to_string())?;
-    let draft = plan_execution(&manifest, &structure.selected).map_err(|error| error.to_string())?;
-    Ok(Planned { host, manifest, devices, structure, draft })
+    let planned = plan_execution(&manifest, &structure.selected).map_err(|error| error.to_string())?;
+    Ok(Planned { host, manifest, devices, structure, planned })
 }
 
 /// What an in-place recommit costs on `backend`'s device at each of

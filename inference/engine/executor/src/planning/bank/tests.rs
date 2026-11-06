@@ -1,4 +1,5 @@
 use super::*;
+use super::records::record_bytes;
 use super::table::gcd;
 use crate::error::{PlanError, UnstreamedExperts};
 use crate::operators::routed::fused_graph::DECODE_ROWS;
@@ -145,7 +146,7 @@ fn bank(groups: &[usize], slots: u64) -> ExpertBankPlan {
 /// experts, records of `form`.
 fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: RecordForm) -> ExpertBankPlan {
     let mut layers = Vec::new();
-    let groups = groups
+    let groups: Vec<BankGroup> = groups
         .iter()
         .enumerate()
         .map(|(index, &members)| {
@@ -174,20 +175,29 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
             }
         })
         .collect();
+    let layers = BankLayers::new(layers).unwrap();
+    let (reservation, host) = (RESERVATION, HostTier::Linked(RESERVATION));
+    let lending = conveyor::BankStructure { groups: &groups, layers: &layers, selected: 8, reservation, host }.lending().unwrap();
     ExpertBankPlan {
         selected: 8,
         slots,
         ceiling: slots,
-        reservation: RESERVATION,
-        host: HostTier::Linked(RESERVATION),
+        reservation,
+        host,
         host_slots: 0,
         places: 1,
         flights: FlightDepth::PIPELINED,
         groups,
-        layers: BankLayers::new(layers).unwrap(),
+        layers,
         tables: Vec::new(),
         sites: BankSites::Unadmitted,
+        lending,
     }
+}
+
+/// `plan` lending as its structure, which a test changed, now lends.
+fn lent(plan: ExpertBankPlan) -> ExpertBankPlan {
+    ExpertBankPlan { lending: plan.structure().lending().unwrap(), ..plan }
 }
 
 /// The bank's minimum is its derivation (`least_records`), on groups of
@@ -202,8 +212,8 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
 /// for it.
 #[test]
 fn the_minimum_is_what_progress_holds_at_once() {
-    let linked = ExpertBankPlan { host: HostTier::Linked(BYTES), ..bank(&[37, 3], 0) };
-    let unified = ExpertBankPlan { host: HostTier::Unified, ..bank(&[37, 3], 1) };
+    let linked = lent(ExpertBankPlan { host: HostTier::Linked(BYTES), ..bank(&[37, 3], 0) });
+    let unified = lent(ExpertBankPlan { host: HostTier::Unified, ..bank(&[37, 3], 1) });
     let request = (DECODE_ROWS * 8).min(256);
     // The tier's reserve: the reads ahead's, a record per hint staging
     // record (a demand reclaims at its park).
@@ -223,7 +233,7 @@ fn the_minimum_is_what_progress_holds_at_once() {
     // form, 256 Q6_K down records, in the lender's 589,824-byte Q4_K
     // records; on the one store it lies past the conveyor's two rounds.
     let (q4, q6) = (tensor("gguf_q4_k", "q4k").record_bytes().unwrap(), tensor("gguf_q6_k", "q6k").record_bytes().unwrap());
-    let conveyor = unified.conveyor_alone().unwrap().bytes;
+    let conveyor = unified.conveyor().conveyor.bytes;
     let (scratch, lent) = ((256 * q6).div_ceil(q4), (conveyor.down + 256 * q6).div_ceil(q4));
     assert_eq!((scratch, lent), (374, 438));
     assert_eq!((linked.scratch().lender.records, unified.scratch().lender.records), (scratch, lent));
@@ -279,10 +289,11 @@ fn a_chunked_lender_packs_conveyor_records_into_its_chunks() {
     // The lender stores down in Q5_K and holds it in Q4_K, so its Q5_K
     // conveyor ends inside a chunk and the next pool packs on from there.
     plan.groups[0].record.down = tensor("gguf_q5_k", "q4k");
+    let plan = lent(plan);
     let pools = plan.staging_pools().0;
     let form = plan.form();
     let carriers = plan.groups[0].record.map(|kind, tensor| plan.reservation.of_records(plan.reserved_records(0, kind, tensor, crate::planning::BankTier::Bank).unwrap()));
-    let conveyor = plan.conveyor_layout(&pools, &carriers, plan.widest().get()).unwrap();
+    let conveyor = plan.structure().conveyor_layout(&pools, &carriers, plan.widest().get()).unwrap();
     let mut end = [0u64; 3];
     for (pool, &offset) in pools.iter().zip(&conveyor.offsets) {
         let carrier = *carriers.get(form.carrier(pool.kind)).unwrap();
@@ -314,8 +325,8 @@ fn a_chunked_lender_packs_conveyor_records_into_its_chunks() {
 /// without a tier grows none, nor a whole one or one out of room.
 #[test]
 fn a_host_tier_grows_toward_every_expert_within_its_room() {
-    let without = ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) };
-    let plan = ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() };
+    let without = lent(ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) });
+    let plan = lent(ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() });
     let all = u64::MAX;
     let counts = plan.counts().unwrap();
     assert_eq!(counts.host_growth(0, 26, all), Some(256), "every expert");
@@ -340,8 +351,8 @@ fn a_host_tier_grows_toward_every_expert_within_its_room() {
 /// lands into, and the floor.
 #[test]
 fn a_banks_counts_are_its_plans_derivations_at_every_count() {
-    let unified = ExpertBankPlan { host: HostTier::Unified, ..bank(&[37, 3], 1) };
-    let linked = ExpertBankPlan { host: HostTier::Linked(BYTES), ..bank(&[37, 3], 0) };
+    let unified = lent(ExpertBankPlan { host: HostTier::Unified, ..bank(&[37, 3], 1) });
+    let linked = lent(ExpertBankPlan { host: HostTier::Linked(BYTES), ..bank(&[37, 3], 0) });
     for plan in [unified, linked] {
         // Growth reaches every expert.
         let plan = ExpertBankPlan { ceiling: plan.widest().get(), ..plan };
@@ -408,8 +419,8 @@ fn a_tiered_records_host_held_misses_are_priced_as_served() {
 /// with or without it, and a bank without a tier binds none.
 #[test]
 fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
-    let without = ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) };
-    let plan = ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() };
+    let without = lent(ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) });
+    let plan = lent(ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() });
     assert_eq!((plan.host_ceiling(), without.host_ceiling()), (NonZeroU64::new(256), None));
     let lent = plan.conveyor().carrier.lender().records;
     assert_eq!((plan.host_extent(0), plan.host_extent(1), without.host_extent(0)), (3 * 256 + lent, 256, 0));
@@ -486,9 +497,9 @@ fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
 /// own.
 #[test]
 fn a_unified_bank_is_one_store_the_host_places_into() {
-    let without = ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) };
-    let linked = ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() };
-    let unified = ExpertBankPlan { host: HostTier::Unified, ..without.clone() };
+    let without = lent(ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) });
+    let linked = lent(ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() });
+    let unified = lent(ExpertBankPlan { host: HostTier::Unified, ..without.clone() });
     assert_eq!((linked.placer(), unified.placer()), (Placer::Tier, Placer::Bank));
     assert_eq!((linked.tier_reservation(), unified.tier_reservation()), (Some(BYTES), None));
     assert_eq!((unified.host_ceiling(), unified.host_extent(0), unified.host_records(0, 30)), (None, 0, 0));
@@ -523,17 +534,17 @@ fn the_scratch_lender_holds_one_widest_layer_across_forms() {
         .flat_map(|(groups, host)| [RESERVATION, chunked].map(|reservation| (groups, host, reservation)))
     {
         {
-            let plan = ExpertBankPlan { host, reservation, ..bank(groups, 26) };
+            let plan = lent(ExpertBankPlan { host, reservation, ..bank(groups, 26) });
             let scratch = plan.scratch();
             assert_eq!(scratch.lender.group, 0, "the group of the most experts lends");
             // Each tensor's region is its largest form's experts from
             // where the region starts (past the conveyor on the one
             // store), packed whole into chunks where storage is chunked.
             let start = match host {
-                HostTier::Unified => plan.conveyor_alone().unwrap().bytes,
+                HostTier::Unified => plan.conveyor().conveyor.bytes,
                 HostTier::Linked(_) => plan.form().each(|_| Ok::<_, String>(0)).unwrap(),
             };
-            let (forms, experts) = plan.scratch_forms();
+            let (forms, experts) = plan.structure().scratch_forms();
             for (kind, &bytes) in scratch.layout.bytes.iter() {
                 let from = *start.get(kind).unwrap();
                 let largest = forms
@@ -1000,7 +1011,7 @@ fn a_discrete_vulkan_conveyor_lies_in_its_host_tier() {
 #[test]
 fn the_conveyor_lies_in_the_store_the_host_reads_into() {
     let discrete = bank(&[37, 3], 64);
-    let unified = ExpertBankPlan { host: HostTier::Unified, ..discrete.clone() };
+    let unified = lent(ExpertBankPlan { host: HostTier::Unified, ..discrete.clone() });
     // Gate and up have one stored form, down two: Q4_K then Q6_K.
     let q4 = tensor("gguf_q4_k", "q4k").stored_bytes().unwrap();
     let q6 = tensor("gguf_q6_k", "q6k").stored_bytes().unwrap();
@@ -1147,8 +1158,8 @@ fn a_banked_stack_is_its_stored_experts_or_a_row_range_of_each() {
 /// to its demand, with a host tier or without.
 #[test]
 fn every_byte_the_bank_demands_has_its_owner() {
-    let without = ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) };
-    let with = ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() };
+    let without = lent(ExpertBankPlan { host: HostTier::Unified, ..bank(&[3, 1], 26) });
+    let with = lent(ExpertBankPlan { host: HostTier::Linked(BYTES), ..without.clone() });
     for plan in [without, with] {
         let charges = plan.charges().unwrap();
         let total = charges.iter().try_fold(ClaimDemand::default(), |total, &(_, demand)| total.checked_plus(demand)).unwrap();

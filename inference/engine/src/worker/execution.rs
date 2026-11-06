@@ -271,7 +271,7 @@ mod tests {
             fixtures::limits(2, 1, false),
         )
         .unwrap();
-        let bank = resident.clone().with_bank(&definition, None, None).unwrap().load().expert_bank().cloned();
+        let bank = resident.clone().with_bank(&definition, None).unwrap().draft().load().expert_bank().cloned();
         let bank = bank.expect("the streamed fixture plans an expert bank");
         let cache = tempfile::tempdir().unwrap();
         let pricing = ExpertPricing::unmeasured(cache.path().to_owned(), definition, resident, device.clone(), bank);

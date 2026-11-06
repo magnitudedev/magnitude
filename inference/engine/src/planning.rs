@@ -14,7 +14,7 @@ use magnitude_executor::{
     platform::{self, PlatformError, SelectedDevice},
     BackendPlan, ComponentSelection,
     DraftWidths,
-    ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
+    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
 use seismic::Devices;
@@ -63,12 +63,13 @@ pub(crate) fn select_load_device(
 /// planned method, KV codec and resource limits resolved from the manifest,
 /// then `ExecutionPlanner::prepare`, then its expert bank under the model
 /// policy's weight cap, if any (`ExecutionPlanDraft::with_bank`). Opens no
-/// device and reads no payload.
+/// device and reads no payload. The draft comes with the memory charge its
+/// planning confirmed.
 pub fn plan_execution(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
-) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
-    plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, resident, None))
+) -> Result<ChargedDraft, ExecutionPlanningError> {
+    plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, resident))
 }
 
 /// [`plan_execution`]'s plan before its expert bank: every expert resident.
@@ -91,15 +92,13 @@ pub fn plan_resident(
 }
 
 /// [`plan_execution`]'s plan from its `resident` plan: its expert bank,
-/// under the model policy's weight cap, if any, what its charges derive
-/// kept in `cache`.
+/// under the model policy's weight cap, if any, with its charge.
 pub fn plan_banked(
     manifest: &ExecutionManifest,
     resident: ExecutionPlanDraft,
-    cache: Option<&magnitude_executor::KernelCache>,
-) -> Result<ExecutionPlanDraft, ExecutionPlanningError> {
+) -> Result<ChargedDraft, ExecutionPlanningError> {
     resident
-        .with_bank(&manifest.definition, manifest.model.weight_cap, cache)
+        .with_bank(&manifest.definition, manifest.model.weight_cap)
         .map_err(ExecutionPlanningError::Plan)
 }
 

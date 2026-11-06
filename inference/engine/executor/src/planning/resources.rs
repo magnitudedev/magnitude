@@ -1085,18 +1085,6 @@ impl StateResourcePlan {
         self.capacity
     }
 
-    /// What a graph derivation reads of the plan beside the definition,
-    /// load, codec and limits it is given, as key material: the stores and
-    /// which graph classes the device forms. The capacity figures outside
-    /// the stores reach no graph, so a capacity that moves within a store's
-    /// whole pages keeps the key.
-    pub(crate) fn graph_material(&self) -> String {
-        format!(
-            "{:?}\n{:?}\n{:?}",
-            self.target_state, self.head_state, self.capacity_bytes.tensor_operations
-        )
-    }
-
     /// The state slabs a load commits at startup, before any request.
     pub fn startup_state_bytes(&self) -> Result<u64, String> {
         self.history_bytes

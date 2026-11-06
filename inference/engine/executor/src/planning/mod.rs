@@ -19,6 +19,7 @@ pub use assessment::{
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, CONVERSATION_CHECKPOINTS,
     DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, measurement_process_bytes,
 };
+pub(crate) use assessment::fit_depth;
 pub use bank::{
     BankAllocation, BankBinding, BankCounts, BankLayers, BankTable, BankLayout, BankPart, ConveyorCarrier,
     Lender,
@@ -36,7 +37,7 @@ pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, Co
 #[cfg(test)]
 pub(crate) use execution_plan::bank_substrate;
 pub use execution_plan::{
-    BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, NoBank, PlannedDevice,
+    BackendPlan, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, HeldStructures, NoBank, PlannedDevice,
     ResolvedPolicy,
 };
 pub use programs::{

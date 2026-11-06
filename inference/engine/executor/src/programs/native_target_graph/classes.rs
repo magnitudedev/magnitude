@@ -119,22 +119,48 @@ fn block_splits(served: &[BlockServed], index: usize, rows: u64) -> bool {
     block_stages(served, index, rows).contains(&RunStage::Front)
 }
 
-/// Whether a launch of `class` runs block `index`'s graph of `staged`: a
-/// run (`Stage::Run`) only where its class is the launch's, and a graph the
-/// block runs once a group (`Stage::Once`, its fill and its passes) only
-/// where the launch splits at the block: a class served whole, as decode
-/// is, runs none. A decode launch of a bank that can be whole runs either
-/// form of a streamed block, as its bank is whole or not as it begins
-/// (`RunStage::Resident`): it counts both, so what is held for it
-/// (`LaunchGraphs::held`, and on CUDA the graphs
+/// The graphs each launch class runs, of a family's staged block graphs,
+/// each held as a `T`: a run (`Stage::Run`) only where its class is the
+/// launch's, and a graph the block runs once a group (`Stage::Once`, its
+/// fill and its passes) only where the launch splits at the block
+/// (`block_splits`): a class served whole, as decode is, runs none. A decode
+/// launch of a bank that can be whole runs either form of a streamed block,
+/// as its bank is whole or not as it begins (`RunStage::Resident`): it counts
+/// both, so what is held for it (`LaunchGraphs::held`, and on CUDA the graphs
 /// `seismic::NativeGraphFamily::record_decode` records ahead) holds either
 /// form's, and a step that switches records none. The plan's census
 /// (`certify_target_family`) and the sealed family (`PreparedTargetGraphs`)
 /// both count a launch's graphs by it.
-pub(super) fn launch_runs(served: &[BlockServed], index: usize, class: BlockClass, (sealed, stage): StagedClass) -> bool {
-    match stage {
-        Stage::Run(_) => sealed == class,
-        Stage::Once(_) => block_splits(served, index, class.0),
+pub(super) struct LaunchRuns<'s, T> {
+    served: &'s [BlockServed],
+    /// The runs, by their class.
+    runs: std::collections::BTreeMap<BlockClass, Vec<T>>,
+    /// The graphs run once a group, by their block.
+    once: std::collections::BTreeMap<usize, Vec<T>>,
+}
+
+impl<'s, T> LaunchRuns<'s, T> {
+    /// The index of `graphs`, each its block, its staged class and what it
+    /// holds, of blocks served as `served` (`block_served`).
+    pub(super) fn of(served: &'s [BlockServed], graphs: impl IntoIterator<Item = (usize, StagedClass, T)>) -> Self {
+        let mut index = Self { served, runs: Default::default(), once: Default::default() };
+        for (block, (class, stage), graph) in graphs {
+            match stage {
+                Stage::Run(_) => index.runs.entry(class).or_default().push(graph),
+                Stage::Once(_) => index.once.entry(block).or_default().push(graph),
+            }
+        }
+        index
+    }
+
+    /// The graphs a launch of `class` runs.
+    pub(super) fn of_class(&self, class: BlockClass) -> impl Iterator<Item = &T> {
+        let once = self
+            .once
+            .iter()
+            .filter(move |&(&block, _)| block_splits(self.served, block, class.0))
+            .flat_map(|(_, graphs)| graphs);
+        self.runs.get(&class).into_iter().flatten().chain(once)
     }
 }
 
@@ -663,6 +689,8 @@ pub(super) struct FamilyOutline {
     pub(super) mixers: Vec<MixerKind>,
     pub(super) tapped: Vec<BlockTaps>,
     pub(super) shapes: Vec<BlockGraphShape>,
+    /// Per block, the first block of its shape ([`Self::first_of_shape`]).
+    pub(super) firsts: Vec<usize>,
     pub(super) tap_width: Option<u64>,
 }
 
@@ -687,6 +715,9 @@ impl FamilyOutline {
         })?;
         let (tap_width, tapped) = block_taps(plan, geometry)?;
         let shapes = block_graph_shapes(load, geometry, state, &tapped)?;
+        let firsts = (0..shapes.len())
+            .map(|index| (0..index).find(|&first| shapes[first] == shapes[index]).unwrap_or(index))
+            .collect();
         Ok(Self {
             backend,
             row_classes,
@@ -705,15 +736,14 @@ impl FamilyOutline {
             mixers: block_mixers(geometry)?,
             tapped,
             shapes,
+            firsts,
             tap_width,
         })
     }
 
     /// The first block of `index`'s shape, whose layouts it holds.
     pub(super) fn first_of_shape(&self, index: usize) -> usize {
-        (0..index)
-            .find(|&first| self.shapes[first] == self.shapes[index])
-            .unwrap_or(index)
+        self.firsts[index]
     }
 }
 

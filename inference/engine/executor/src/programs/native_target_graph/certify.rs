@@ -4,7 +4,7 @@ use super::{
     classes::{
         BlockOutputScales, BlockServed, FamilyOutline, Passes, StagedClass, Topology, UnreadScales,
         block_class_slice, block_listings, block_routed, block_served, block_split, block_stages,
-        block_upload_regions, chained_once_runs, class_topology, enumerate_block_graphs, launch_runs, once_class, once_graphs,
+        block_upload_regions, chained_once_runs, class_topology, enumerate_block_graphs, LaunchRuns, once_class, once_graphs,
         slot_scores,
     },
     entry::{
@@ -475,6 +475,12 @@ pub(super) fn certify_target_family(
         .copied()
         .chain(enumeration.sharing.iter().map(|&(index, class, _)| (index, class)))
         .collect::<Vec<_>>();
+    let launch_runs = LaunchRuns::of(
+        &served,
+        staged
+            .iter()
+            .map(|&(index, staged)| (index, staged, Graphed::Block(outline.first_of_shape(index), class_topology(staged)))),
+    );
     // Each launch's runs of each layout, the first launch class's (the
     // fewest rows, decode's) its decode, and of each layout the most any
     // launch makes its union.
@@ -488,11 +494,8 @@ pub(super) fn certify_target_family(
         if per_layer.is_some() {
             *runs.entry(Graphed::PerLayer).or_default() += 1;
         }
-        for &(index, staged) in &staged {
-            if !launch_runs(&served, index, class, staged) {
-                continue;
-            }
-            *runs.entry(Graphed::Block(outline.first_of_shape(index), class_topology(staged))).or_default() += 1;
+        for &graphed in launch_runs.of_class(class) {
+            *runs.entry(graphed).or_default() += 1;
         }
         for (&graphed, &count) in &runs {
             let most = most.entry(graphed).or_default();

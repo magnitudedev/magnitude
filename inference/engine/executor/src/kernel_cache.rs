@@ -26,9 +26,6 @@
 //! <root>/prepared/<key>                a Prepare of the load this key names ran to
 //!                                      its end: a load asked to report unprepared
 //!                                      units finds none before it opens a device
-//! <root>/graph-bounds/<key>.json        a load's checked graph resource bounds, for
-//!                                      the plan and build its key names: what
-//!                                      certifying every graph family derives
 //! <root>/records/<digest>.json         Seismic's measurement records, one outcome
 //!                                      per point key (its timing, or why it is
 //!                                      unobtainable)
@@ -105,7 +102,6 @@ const TUNING: &str = "tuning";
 const EVIDENCE: &str = "evidence";
 const READOUT: &str = "readout";
 const PREPARED: &str = "prepared";
-const GRAPH_BOUNDS: &str = "graph-bounds";
 const RECORDS: &str = "records";
 const MEASUREMENT_ATTEMPTS: &str = "measurement-attempts";
 const MISSES: &str = "misses";
@@ -205,7 +201,7 @@ impl KernelCache {
     /// Open the cache at `root`, creating it, and evict the least recently
     /// used entries beyond `capacity` bytes.
     pub fn open(root: PathBuf, capacity: u64) -> Result<Self, KernelCacheError> {
-        for directory in [ARTIFACTS, TUNING, EVIDENCE, READOUT, PREPARED, GRAPH_BOUNDS] {
+        for directory in [ARTIFACTS, TUNING, EVIDENCE, READOUT, PREPARED] {
             let path = root.join(directory);
             fs::create_dir_all(&path).map_err(|error| KernelCacheError::Create { path, error })?;
         }
@@ -365,23 +361,6 @@ impl KernelCache {
     /// Record that a Prepare of the load `key` names ran to its end.
     pub fn store_prepared(&self, key: &TuningCacheKey) {
         self.write(&self.entry(PREPARED, key.as_str(), "json"), b"{}");
-    }
-
-    /// The graph resource bounds of the plan `key` names, none where none
-    /// is stored. Its key names the build that wrote it, so an entry that
-    /// does not parse is a store that broke that, not a miss.
-    pub(crate) fn graph_bounds(&self, key: &TuningCacheKey) -> Result<Option<crate::AssessmentGraphResourceBounds>, String> {
-        let path = self.entry(GRAPH_BOUNDS, key.as_str(), "json");
-        let Some(bytes) = self.read(&path) else { return Ok(None) };
-        serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-            format!("kernel cache invariant broken: graph bounds {} do not parse: {error}", path.display())
-        })
-    }
-
-    /// Store the graph resource bounds of the plan `key` names.
-    pub(crate) fn store_graph_bounds(&self, key: &TuningCacheKey, bounds: &crate::AssessmentGraphResourceBounds) {
-        let bytes = serde_json::to_vec(bounds).expect("graph bounds serialize");
-        self.write(&self.entry(GRAPH_BOUNDS, key.as_str(), "json"), &bytes);
     }
 
     /// Completed composed-recipe choice; false is a permanent canonical

@@ -28,13 +28,12 @@ use magnitude_kernels::{SlotTable, constants, list_extent};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use seismic::Element;
 use std::num::NonZeroU64;
-use records::{record_bytes, reserved_record};
 use table::stored_rows;
 pub use conveyor::{ConveyorCarrier, Lender, StagingPool};
 pub use counts::BankCounts;
 pub use layout::{BankAllocation, BankLayout, BankPart, BankTier, HostTier, PlacedAllocations, Placer};
 pub use records::{RecordForm, RecordTensor, RecordTensors, RoutedTensor, routed_experts};
-pub(crate) use records::{decode_choices, layer_homes};
+pub(crate) use records::layer_homes;
 pub use sizing::growth_target;
 pub(crate) use sizing::releasing;
 pub use table::BankTable;
@@ -196,6 +195,9 @@ pub struct ExpertBankPlan {
     pub tables: Vec<BankTable>,
     /// Which layers hold a CPU site's words and buffers ([`Self::sited`]).
     pub sites: BankSites,
+    /// Its conveyor and scratch, derived from its structure as the plan is
+    /// made ([`Self::conveyor`], [`Self::scratch`]).
+    lending: conveyor::Lending,
 }
 
 impl BankLayer {
@@ -524,7 +526,7 @@ impl ExpertBankPlan {
         // Every lead binds a layer routing over the next layer's experts
         // (`routed_route_streamed`'s EN); the last layer names its own.
         let next = &self.layers[self.lead_layer(layer, 0)];
-        let conveyor = self.conveyor().conveyor;
+        let conveyor = &self.conveyor().conveyor;
         Ok(BankBinding {
             record: self.groups[group].record,
             records: self.records(group),
@@ -594,14 +596,14 @@ impl ExpertBankPlan {
 
     /// The record form every streamed layer shares (`with_expert_bank`).
     pub fn form(&self) -> RecordForm {
-        self.groups[0].record.form()
+        self.structure().form()
     }
 
     /// The choices of the decode form's widest launch (`decode_choices`): the
     /// most a decode request names, so the answers' extent (`P`) and the host
     /// tier's landing reserve ([`Self::landing_records`]).
     pub fn choices(&self) -> u64 {
-        decode_choices(self.selected)
+        self.structure().choices()
     }
 
     /// The layer `layer`'s route predicts at lead `lead`, where that lead
@@ -739,7 +741,7 @@ impl ExpertBankPlan {
     /// Records a scratch round converts: half a request's choices, so a
     /// round's reads land while the device converts the round before.
     pub fn round_records(&self) -> u64 {
-        self.choices() / 2
+        self.structure().round_records()
     }
 
     /// Rounds of a scratch-served layer: enough to convert every expert of
@@ -847,45 +849,6 @@ impl ExpertBankPlan {
         record.iter().try_fold(0u64, |sum, (_, tensor)| {
             sum.checked_add(bytes(tensor)?).ok_or_else(|| "a record's bytes overflow".to_owned())
         })
-    }
-
-    /// The group whose records carry the conveyor (`Lender`): the one of the
-    /// most experts, the first of those.
-    fn lender_group(&self) -> usize {
-        (0..self.groups.len())
-            .max_by_key(|&group| (self.member_experts(group).sum::<u64>(), std::cmp::Reverse(group)))
-            .expect("a bank holds a group")
-    }
-
-    /// What group `group`'s records of routed tensor `kind` (`tensor`) in
-    /// `store` are: its records, and, where they carry the conveyor (the
-    /// lender's, in the store the host reads files into,
-    /// [`Self::conveyor`]), the largest stored record of the pools whose
-    /// conveyor they carry (`RecordForm::carrier`), so each lies whole in
-    /// one chunk of chunked storage.
-    fn reserved_records(&self, group: usize, kind: RoutedTensor, tensor: RecordTensor, store: crate::planning::BankTier) -> Result<seismic::ReservedRecords, String> {
-        let held = seismic::ReservedRecords::of(reserved_record(tensor.record_bytes()?)?);
-        if group != self.lender_group() {
-            return Ok(held);
-        }
-        let conveyor_store = match self.host {
-            HostTier::Unified => crate::planning::BankTier::Bank,
-            HostTier::Linked(_) => crate::planning::BankTier::Host,
-        };
-        let form = self.form();
-        let mut carried = held;
-        if store == conveyor_store {
-            for pool in self.staging_pools().0.iter().filter(|pool| form.carrier(pool.kind) == kind) {
-                carried = carried.carrying(reserved_record(pool.record_bytes()?)?);
-            }
-        }
-        // The scratch lies in the bank's records, device memory.
-        if store == crate::planning::BankTier::Bank {
-            for scratch in self.scratch_forms().0.iter().filter(|scratch| scratch.kind == kind) {
-                carried = carried.carrying(reserved_record(record_bytes(scratch.resident, scratch.matrix)?)?);
-            }
-        }
-        Ok(carried)
     }
 
     /// Every record tensor: its group, its routed tensor, and its record

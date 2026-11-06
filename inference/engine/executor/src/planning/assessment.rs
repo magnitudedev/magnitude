@@ -468,37 +468,6 @@ pub struct AssessmentGraphResourceBounds {
 }
 
 impl AssessmentGraphResourceBounds {
-    /// [`Self::derive`], kept in `cache`. Deriving builds and certifies
-    /// every graph in metadata alone, opening no device: its result is a
-    /// function of its inputs and the executor build, stored under them and
-    /// read by every later plan of the same load. A refusal is not kept.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn kept(
-        cache: Option<&crate::KernelCache>,
-        definition: &ModelDefinition,
-        load: &ModelLoadPlan,
-        state: &super::StateResourcePlan,
-        method: PlannedMethod,
-        codec: KvCodec,
-        limits: super::ResourceLimits,
-        backend: BackendName,
-    ) -> Result<Self, GraphError> {
-        let derive = || Self::derive(definition, load, state, method, codec, limits, backend);
-        let Some(cache) = cache else { return derive() };
-        let key = crate::kernel_cache::TuningCacheKey::of(&format!(
-            "graph bounds\nbuild {}\nbackend {backend:?}\nmethod {method:?}\ncodec {codec:?}\nlimits {limits:?}\n\
-             definition {definition:?}\nload {load:?}\nstate {}",
-            crate::EXECUTOR_BUILD,
-            state.graph_material(),
-        ));
-        if let Some(bounds) = cache.graph_bounds(&key)? {
-            return Ok(bounds);
-        }
-        let bounds = derive()?;
-        cache.store_graph_bounds(&key, &bounds);
-        Ok(bounds)
-    }
-
     pub fn derive(
         definition: &ModelDefinition,
         load: &ModelLoadPlan,
@@ -777,7 +746,7 @@ pub const CONVERSATION_CHECKPOINTS: usize = 3;
 
 /// The depth of each of the workload's conversations: the lesser of the
 /// supported context and 100,000 tokens.
-pub(super) fn fit_depth(definition: &ModelDefinition) -> u64 {
+pub(crate) fn fit_depth(definition: &ModelDefinition) -> u64 {
     definition.decoder.context_limit.min(100_000)
 }
 

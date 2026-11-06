@@ -252,30 +252,6 @@ fn checked_decoder_family_bounds_every_prepared_class_axis() {
     assert_eq!(pools.target.output_bytes, family.storage.output);
     assert_eq!(pools.binding_constant_bytes, family.binding_constant_bytes);
     assert!(pools.binding_constant_bytes > 0);
-    // The cache keeps what deriving gives, under what it derives from:
-    // a load it doesn't hold is derived, one it holds is read as stored.
-    let root = std::env::temp_dir().join(format!("graph-bounds-{}", std::process::id()));
-    let cache = crate::KernelCache::open(root.clone(), 1 << 20).unwrap();
-    let kept = |limits| {
-        AssessmentGraphResourceBounds::kept(
-            Some(&cache),
-            &definition,
-            &load,
-            &state,
-            PlannedMethod::Plain,
-            KvCodec::Dense,
-            limits,
-            BackendName::Cpu,
-        )
-        .unwrap()
-    };
-    assert_eq!(kept(limits), pools);
-    assert_eq!(std::fs::read_dir(root.join("graph-bounds")).unwrap().count(), 1);
-    let path = std::fs::read_dir(root.join("graph-bounds")).unwrap().next().unwrap().unwrap().path();
-    let stored = AssessmentGraphResourceBounds { binding_constant_bytes: 7, ..pools.clone() };
-    std::fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
-    assert_eq!(kept(limits), stored);
-    std::fs::remove_dir_all(&root).unwrap();
     // The entry's tokens and the launch's controls, which its blocks
     // bind: a block of a plain load writes no input of its own.
     assert_eq!(pools.target.upload_regions.len(), 2);

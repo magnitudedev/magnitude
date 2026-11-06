@@ -192,7 +192,6 @@ impl ExecutionPlanDraft {
         mut self,
         definition: &ModelDefinition,
         choices: &[ReadoutClassChoice],
-        cache: Option<&crate::KernelCache>,
     ) -> Result<Self, PlanError> {
         let canonical = self.clone();
         self.load = self
@@ -201,9 +200,9 @@ impl ExecutionPlanDraft {
             .map_err(PlanError::InvalidDefinition)?;
         self.programs = self.load.program_plan(definition, self.policy.codec)?;
         if !choices.is_empty()
-            && Self::allocated(&self.memory_charge(definition, cache)?)? > self.device.assessment_capacity_bytes
+            && Self::allocated(&self.memory_charge(definition)?)? > self.device.assessment_capacity_bytes
         {
-            return canonical.finalize_readout(definition, &[], cache);
+            return canonical.finalize_readout(definition, &[]);
         }
         Ok(self)
     }
@@ -262,23 +261,14 @@ impl ExecutionPlanDraft {
     }
 
     /// The draft's assessment charge at the model's context.
-    fn memory_charge(
-        &self,
-        definition: &ModelDefinition,
-        cache: Option<&crate::KernelCache>,
-    ) -> Result<AssessmentMemoryCharge, PlanError> {
-        crate::assessment::execution_memory_charge(definition, self, cache).map_err(|error| match error {
-            crate::assessment::AssessmentError::Graph(crate::GraphError::KernelDomain(violation)) => {
-                PlanError::KernelDomain(violation)
-            }
-            error => PlanError::ResourcePlanning(error.to_string()),
-        })
+    fn memory_charge(&self, definition: &ModelDefinition) -> Result<AssessmentMemoryCharge, PlanError> {
+        crate::assessment::execution_memory_charge(definition, self).map_err(charge_error)
     }
 
     /// What the draft allocates in the device's allocation domain at the
     /// model's context, as its assessment charges it ([`Self::allocated`]).
     pub(crate) fn allocation_bytes(&self, definition: &ModelDefinition) -> Result<u64, PlanError> {
-        Self::allocated(&self.memory_charge(definition, None)?)
+        Self::allocated(&self.memory_charge(definition)?)
     }
 
     /// What `charge` allocates in the device's allocation domain: all but a
@@ -363,27 +353,30 @@ impl ExecutionPlanDraft {
         self.load.bank.as_mut().expect("a streamed plan holds its bank")
     }
 
-    /// The draft of an elastic load: its experts held as
+    /// The draft of an elastic load, with its charge: its experts held as
     /// [`Self::with_held_experts`] decides under `cap`, when given, its
-    /// charges confirmed against the device's assessment capacity and kept
-    /// in `cache`. A capped load no plan holds is refused with why. An
-    /// uncapped one is held whole whatever it needs, its shortfall what
-    /// assessment and admission find.
-    pub fn with_bank(
-        self,
-        definition: &ModelDefinition,
-        cap: Option<u64>,
-        cache: Option<&crate::KernelCache>,
-    ) -> Result<Self, PlanError> {
+    /// charges confirmed against the device's assessment capacity. A capped
+    /// load no plan holds is refused with why. An uncapped one is held whole
+    /// whatever it needs, its shortfall what assessment and admission find.
+    pub fn with_bank(self, definition: &ModelDefinition, cap: Option<u64>) -> Result<ChargedDraft, PlanError> {
         let capacity = self.device.assessment_capacity_bytes;
-        let confirm = |draft: &Self| {
-            let charge = draft.memory_charge(definition, cache)?;
-            let excess = Self::allocated(&charge)?.saturating_sub(capacity);
-            Ok::<_, PlanError>(NonZeroU64::new(excess).map_or(Ok((charge, ())), Err))
+        let confirm = |draft: &Self, charge: &AssessmentMemoryCharge| {
+            // An uncapped load's experts that cannot stream are held whole
+            // whatever that needs.
+            if cap.is_none() && draft.load.bank.is_none() {
+                return Ok(Ok(()));
+            }
+            let excess = Self::allocated(charge)?.saturating_sub(capacity);
+            Ok::<_, PlanError>(NonZeroU64::new(excess).map_or(Ok(()), Err))
         };
-        match (self.with_held_experts(definition, cap.unwrap_or(u64::MAX), confirm)?, cap) {
-            (Ok((draft, ())), _) => Ok(draft),
-            (Err(_), None) => self.held_whole(definition),
+        let mut structures = HeldStructures::default();
+        match (self.with_held_experts(definition, cap.unwrap_or(u64::MAX), &mut structures, confirm)?, cap) {
+            (Ok((charged, ())), _) => Ok(charged),
+            (Err(_), None) => {
+                let draft = self.held_whole(definition)?;
+                let charge = structures.charge(definition, &draft)?;
+                Ok(ChargedDraft { draft, charge, structures })
+            }
             (Err(NoBank::Unstreamed(reason)), Some(_)) => Err(PlanError::Unstreamed(reason)),
             (Err(NoBank::Bound { needed }), Some(cap)) => Err(PlanError::WeightCap { cap, needed }),
             (Err(NoBank::Short { deficit_bytes }), Some(_)) => Err(PlanError::Resource(crate::CapacityError {
@@ -399,17 +392,27 @@ impl ExecutionPlanDraft {
     /// `bound` holds and `confirm` admits (`Self::with_largest_bank`),
     /// beside the host tier that bank's charge leaves room for
     /// (`Self::with_host_tier`); or, where they cannot stream, whole, if
-    /// `bound` holds them and `confirm` admits that. `confirm` gives the
-    /// charge it admitted beside what it found, or the bytes a plan is short.
+    /// `bound` holds them and `confirm` admits that. Each plan is charged
+    /// from `structures`, which derives each way of holding the experts'
+    /// structure once ([`HeldStructures`]); `confirm` judges a plan by its
+    /// charge, giving what it found or the bytes the plan is short. The
+    /// draft held comes with the charge it admitted.
     pub fn with_held_experts<T, E: From<PlanError>>(
         &self,
         definition: &ModelDefinition,
         bound: u64,
-        mut confirm: impl FnMut(&Self) -> Result<Result<(AssessmentMemoryCharge, T), NonZeroU64>, E>,
-    ) -> Result<Result<(Self, T), NoBank>, E> {
-        let reason = match self.with_largest_bank(definition, bound, &mut confirm)? {
+        structures: &mut HeldStructures,
+        mut confirm: impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
+    ) -> Result<Result<(ChargedDraft, T), NoBank>, E> {
+        let mut charged = |draft: &Self| -> Result<Result<(AssessmentMemoryCharge, T), NonZeroU64>, E> {
+            let charge = structures.charge(definition, draft)?;
+            Ok(confirm(draft, &charge)?.map(|found| (charge, found)))
+        };
+        let reason = match self.with_largest_bank(definition, bound, &mut charged)? {
+            // The host tier's size leaves the charge as it is: the charge
+            // holds the tier at its floor.
             Ok((draft, (charge, found))) => match draft.with_host_tier(&charge)? {
-                Ok(draft) => return Ok(Ok((draft, found))),
+                Ok(draft) => return Ok(Ok((ChargedDraft { draft, charge, structures: structures.clone() }, found))),
                 Err(reason) => reason,
             },
             Err(NoBank::Unstreamed(reason)) => reason,
@@ -419,8 +422,8 @@ impl ExecutionPlanDraft {
         if weight_bytes(&whole.load)? > bound {
             return Ok(Err(NoBank::Unstreamed(reason)));
         }
-        Ok(match confirm(&whole)? {
-            Ok((_, found)) => Ok((whole, found)),
+        Ok(match charged(&whole)? {
+            Ok((charge, found)) => Ok((ChargedDraft { draft: whole, charge, structures: structures.clone() }, found)),
             Err(_) => Err(NoBank::Unstreamed(reason)),
         })
     }
@@ -634,6 +637,89 @@ impl ExecutionPlan {
 
     pub fn policy(&self) -> &ResolvedPolicy {
         &self.policy
+    }
+}
+
+/// What a draft's charge derives from the structure of each way
+/// [`ExecutionPlanDraft::with_held_experts`] holds its experts: through a
+/// bank, of whatever slots, or whole ([`crate::assessment::StructuralCharge`]),
+/// each derived at the first plan of it charged and shared by every later
+/// one. A bank search's plans differ only in their slots, and a whole plan is
+/// the one its draft's experts held whole make, so the structures of one
+/// draft's searches are the same however often it is searched.
+#[derive(Clone, Debug, Default)]
+pub struct HeldStructures {
+    banked: Option<std::sync::Arc<crate::assessment::StructuralCharge>>,
+    whole: Option<std::sync::Arc<crate::assessment::StructuralCharge>>,
+}
+
+impl HeldStructures {
+    /// The charge of `draft`, of its way of holding its experts' structure.
+    fn charge(
+        &mut self,
+        definition: &ModelDefinition,
+        draft: &ExecutionPlanDraft,
+    ) -> Result<AssessmentMemoryCharge, PlanError> {
+        let held = match draft.load.bank.is_some() {
+            true => &mut self.banked,
+            false => &mut self.whole,
+        };
+        let structure = match held {
+            Some(structure) => structure,
+            None => held.insert(std::sync::Arc::new(
+                crate::assessment::StructuralCharge::of(definition, draft).map_err(charge_error)?,
+            )),
+        };
+        structure.charge(definition, draft).map_err(charge_error)
+    }
+}
+
+/// A charge's refusal as planning's: a kernel domain the graphs violate is
+/// the plan's.
+fn charge_error(error: crate::assessment::AssessmentError) -> PlanError {
+    match error {
+        crate::assessment::AssessmentError::Graph(crate::GraphError::KernelDomain(violation)) => {
+            PlanError::KernelDomain(violation)
+        }
+        error => PlanError::ResourcePlanning(error.to_string()),
+    }
+}
+
+/// A draft and the checked memory charge of it at the model's context
+/// (`assessment::execution_memory_charge`): what planning confirmed of it,
+/// which its assessment reads rather than charging it again, with the
+/// structures its search charged ([`HeldStructures`]), which a search of it
+/// again reads rather than deriving them again.
+#[derive(Clone, Debug)]
+pub struct ChargedDraft {
+    draft: ExecutionPlanDraft,
+    charge: AssessmentMemoryCharge,
+    structures: HeldStructures,
+}
+
+impl ChargedDraft {
+    /// `draft` with its charge (`assessment::execution_memory_charge`),
+    /// of no search: a search of it derives its own structures.
+    pub fn of(definition: &ModelDefinition, draft: ExecutionPlanDraft) -> Result<Self, PlanError> {
+        let charge = draft.memory_charge(definition)?;
+        Ok(Self { draft, charge, structures: HeldStructures::default() })
+    }
+
+    /// The structures this draft's charge derived from.
+    pub fn structures(&self) -> &HeldStructures {
+        &self.structures
+    }
+
+    pub fn draft(&self) -> &ExecutionPlanDraft {
+        &self.draft
+    }
+
+    pub fn charge(&self) -> &AssessmentMemoryCharge {
+        &self.charge
+    }
+
+    pub fn into_draft(self) -> ExecutionPlanDraft {
+        self.draft
     }
 }
 
