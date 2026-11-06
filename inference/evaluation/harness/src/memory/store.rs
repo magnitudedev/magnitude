@@ -50,7 +50,7 @@ impl Target {
                 topology.access_path(*path).expect("placement belongs to topology").store()))?,
         };
         let host = devices.status(topology, device.info().id()).sample.host_ram.map_err(|error| error.to_string())?;
-        let room = HostRoom::serving(&host);
+        let room = HostRoom::serving(&host, std::time::Instant::now());
         Ok(Self { devices, device, store, room })
     }
 

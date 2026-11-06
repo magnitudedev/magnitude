@@ -359,6 +359,8 @@ pub struct DisplacementWindow {
     pub swapped_out_pages: u64,
     /// Pages read back from swap within the window.
     pub swapped_in_pages: u64,
+    /// When the window ended: the reading that completed it.
+    pub ended: Instant,
 }
 
 /// The completed displacement windows of the last [`DISPLACEMENT_HISTORY`],
@@ -412,6 +414,7 @@ impl DisplacementHistory {
                 swapped_in_pages: counters
                     .swapped_in_pages
                     .saturating_sub(opening.swapped_in_pages),
+                ended: at,
             },
         );
         // Windows are contiguous, so the ones after the first that ends

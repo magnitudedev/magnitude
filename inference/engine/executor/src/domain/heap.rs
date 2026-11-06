@@ -4,9 +4,10 @@
 use crate::memory::{
     ClaimDemand, ClaimId, HoldingClass, MemoryError, MemoryHeap, MemoryObservation,
 };
+use super::borrowing::{BankRoom, Room};
 use crate::platform::{
     DomainReading, DomainRole, Fit, FitMode, HostRoom, LoadStage, MemoryBand, MemoryConstraint,
-    MemoryPolicyError, MemoryReserves, StorageDemand,
+    MemoryPolicyError, MemoryReserves, Serving, StorageDemand,
 };
 use crate::memory::CLAIMED;
 use crate::planning::BankTier;
@@ -146,6 +147,19 @@ fn besides(demand: ClaimDemand, beside: u64) -> Result<ClaimDemand, ClaimRefusal
     })
 }
 
+/// What a claim refused for want of room does to the one store's bank's
+/// borrowed room ([`DeviceHeap::claim_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refused {
+    /// A claim the load must have: it takes back what it asked, which the
+    /// bank's release gives back before the release ladder loses anything
+    /// the load committed.
+    TakesBack,
+    /// An opportunistic claim, or the bank's own growth: the refusal leaves
+    /// the room as it is.
+    Waits,
+}
+
 /// What the heap reads of the machine: one status sample a reading, every
 /// domain the device uses observed in it, of the device's executor's grants
 /// alone: no other executor's grant is read. Seismic's catalog reads the
@@ -188,8 +202,14 @@ pub struct DeviceHeap {
     host_table_bytes: u64,
     /// The host RAM room its band, claims and Seismic's limits read, and
     /// its growth's: [`HostRoom::Load`] from the load's opening on, its
-    /// growth's displacement counted from when it serves ([`Self::serve`]).
+    /// growth's displacement counted from when it serves ([`Self::serve`]),
+    /// with the hold on the expert bank's borrowed room merged in as it
+    /// reads ([`Self::room`]).
     room: HostRoom,
+    /// The one store's expert bank's slots, committed and borrowed, from
+    /// when it serves; none without one, or where it lies across a link
+    /// (a host tier's), whose slots borrow nothing.
+    bank: Option<BankRoom>,
 }
 
 impl DeviceHeap {
@@ -215,6 +235,7 @@ impl DeviceHeap {
             heap: MemoryHeap::new(),
             host_table_bytes: 0,
             room,
+            bank: None,
         };
         heap.observe(&status)?;
         Ok(heap)
@@ -224,17 +245,77 @@ impl DeviceHeap {
     /// and from now on its growth reads what can be taken without displacing
     /// any more of another program's data than is displaced now
     /// ([`HostRoom::Load`]). Its band and claims read the same room as they
-    /// did while it loaded.
-    pub fn serve(&mut self) -> Result<(), MemoryPolicyError> {
+    /// did while it loaded. A one store's expert bank of `bank`'s slots of
+    /// its bytes each serves from here, every slot committed
+    /// ([`BankRoom`]).
+    pub fn serve(&mut self, bank: Option<(u64, u64)>) -> Result<(), MemoryPolicyError> {
         let status = self.status();
         let host = status.sample.host_ram.as_ref().map_err(|error| MemoryPolicyError::Observation(error.clone()))?;
-        self.room = HostRoom::serving(host);
+        let now = std::time::Instant::now();
+        self.room = HostRoom::serving(host, now);
+        let counted = matches!(self.room, HostRoom::Load(LoadStage::Serving(_)));
+        self.bank = bank.map(|(slots, slot_bytes)| BankRoom::new(counted, slot_bytes, slots, now));
         self.observe(&status).map(drop)
     }
 
-    /// The host RAM room its readings read ([`Self::room`]'s field).
+    /// The host RAM room its readings read: its field's, the hold on the
+    /// expert bank's borrowed room merged in (`platform::Serving`).
     pub fn room(&self) -> HostRoom {
-        self.room
+        match (self.room, &self.bank) {
+            (HostRoom::Load(LoadStage::Serving(serving)), Some(bank)) => HostRoom::Load(LoadStage::Serving(Serving {
+                baseline: bank.baseline(),
+                borrows: true,
+                lent: bank.lent(),
+                ..serving
+            })),
+            (room, _) => room,
+        }
+    }
+
+    /// The one store's expert bank's slots, committed and borrowed; none
+    /// before it serves, or without one.
+    pub fn bank_room(&self) -> Option<&BankRoom> {
+        self.bank.as_ref()
+    }
+
+    /// A growth of the one store's bank's slots into `room` began, backing
+    /// `bytes` ([`BankRoom::grow`]).
+    pub fn grow_bank(&mut self, room: Room, bytes: u64) {
+        self.bank.as_mut().expect("a growth of the one store's slots is of its bank").grow(room, bytes);
+    }
+
+    /// The one store's bank's growth of its slots ended, the bank holding
+    /// `slots` ([`BankRoom::grown`]). A growth into borrowed room displaced
+    /// other programs' data by design: what it displaced is accepted, as a
+    /// load's own import's is, so that once the room is given back the hold
+    /// line does not count what stays displaced until its programs read it
+    /// again (`platform::Serving::displaced_bytes`).
+    pub fn bank_grown(&mut self, slots: u64) -> Result<(), MemoryPolicyError> {
+        let bank = self.bank.as_mut().expect("a growth of the one store's slots is of its bank");
+        if bank.grown(slots, std::time::Instant::now()) == Room::Borrowed {
+            if let HostRoom::Load(LoadStage::Serving(serving)) = &mut self.room {
+                let status = self.reading.status(&self.device);
+                let host = status.sample.host_ram.as_ref().map_err(|error| MemoryPolicyError::Observation(error.clone()))?;
+                serving.displaced_bytes = host
+                    .displaced_bytes
+                    .expect("invariant violated: a host that reported displacement as the load began to serve reports it still");
+            }
+        }
+        Ok(())
+    }
+
+    /// The one store's bank's shrink left it `slots` slots
+    /// ([`BankRoom::shrunk`]).
+    pub fn bank_shrunk(&mut self, slots: u64) {
+        if let Some(bank) = self.bank.as_mut() {
+            bank.shrunk(slots);
+        }
+    }
+
+    /// A claim of the load's wants `bytes` of the room the one store's bank
+    /// borrowed back ([`BankRoom::take_back`]): what it took back.
+    pub fn take_back(&mut self, bytes: u64) -> u64 {
+        self.bank.as_mut().map_or(0, |bank| bank.take_back(bytes))
     }
 
     pub fn device(&self) -> &Rc<Device> {
@@ -272,8 +353,14 @@ impl DeviceHeap {
         status: &seismic::Status,
     ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
         let readings =
-            crate::platform::refresh_device_ceiling(&self.device, status, &self.reserves, self.room);
+            crate::platform::refresh_device_ceiling(&self.device, status, &self.reserves, self.room());
         self.account();
+        if let (Ok(readings), Some(bank)) = (&readings, self.bank.as_mut()) {
+            let now = std::time::Instant::now();
+            for reading in readings.iter().filter(|reading| reading.constraint == MemoryConstraint::HostRam) {
+                bank.observe(reading, now);
+            }
+        }
         readings
     }
 
@@ -357,7 +444,7 @@ impl DeviceHeap {
         let topology = self.device.topology();
         let info = self.device.info();
         let executor = info.id();
-        let fit = Fit::new(topology, status, &self.reserves, self.room);
+        let fit = Fit::new(topology, status, &self.reserves, self.room());
         let host = fit
             .host_staging(info, total.staged)
             .saturating_add(self.host_table_bytes)
@@ -386,15 +473,15 @@ impl DeviceHeap {
     }
 
     /// The most bytes [`Self::claim_reserved`] of `kind` storage beside
-    /// `beside` device bytes admits now, from one fresh status sample: by
-    /// halving over [`Self::refusal`], the one test of a claim, which never
-    /// admits more bytes where it refuses fewer. Refused while a domain is
-    /// in the Reclaim band, or blind.
-    pub fn reserved_room(&mut self, kind: BankTier, beside: u64) -> Result<u64, ClaimRefusal> {
+    /// `beside` device bytes admits now in `mode`'s room, from one fresh
+    /// status sample: by halving over [`Self::refusal`], the one test of a
+    /// claim, which never admits more bytes where it refuses fewer. Refused
+    /// while a domain is in the Reclaim band, or blind.
+    pub fn reserved_room(&mut self, kind: BankTier, beside: u64, mode: FitMode) -> Result<u64, ClaimRefusal> {
         let (status, readings) = self.sample()?;
         let fits = |bytes: u64| -> Result<bool, ClaimRefusal> {
             let claim = besides(reserved(kind, bytes), beside)?;
-            Ok(self.refusal(&status, &readings, claim, 0, FitMode::Live)?.is_none())
+            Ok(self.refusal(&status, &readings, claim, 0, mode)?.is_none())
         };
         if !fits(0)? {
             return Ok(0);
@@ -453,12 +540,13 @@ impl DeviceHeap {
     /// [`Self::claim`] with `upload` bytes of upload storage beside the
     /// `required` device bytes.
     pub fn claim_storage(&mut self, demand: ClaimDemand, class: HoldingClass) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_demand(demand, 0, class)
+        self.claim_in(demand, 0, class, FitMode::Live, Refused::TakesBack)
     }
 
     /// Claim `bytes` a reservation of `kind` storage backs, the expert
-    /// bank's growth, once they fit in the headroom ([`FitMode::Live`]) with
-    /// `beside` more device bytes, as
+    /// bank's growth, once they fit in `mode`'s room (the headroom,
+    /// [`FitMode::Live`], or the line the bank borrows within,
+    /// [`FitMode::Borrow`]) with `beside` more device bytes, as
     /// [`Self::claim_demand`]: no block's free space serves them. Device
     /// storage's are fresh pages of the device's store; host storage's (a
     /// host tier's) host RAM.
@@ -468,36 +556,78 @@ impl DeviceHeap {
         bytes: u64,
         beside: u64,
         class: HoldingClass,
+        mode: FitMode,
     ) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_in(reserved(kind, bytes), beside, class, FitMode::Live)
+        self.claim_in(reserved(kind, bytes), beside, class, mode, Refused::Waits)
     }
 
     /// Claim `demand` once it fits with `beside` more device bytes, planned
     /// and not yet allocated, which the claim does not hold: an
-    /// opportunistic growth's.
+    /// opportunistic growth's, which a refusal leaves as it is.
     pub(super) fn claim_demand(
         &mut self,
         demand: ClaimDemand,
         beside: u64,
         class: HoldingClass,
     ) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_in(demand, beside, class, FitMode::Live)
+        self.claim_in(demand, beside, class, FitMode::Live, Refused::Waits)
     }
 
     /// Claim `demand` once it fits with `beside` more device bytes in
-    /// `mode`'s room.
+    /// `mode`'s room. A claim of the load's own takes the one store's
+    /// bank's borrowed room back first ([`BankRoom::take_back`]): one
+    /// granted in the live room while the bank lends it
+    /// (`platform::Serving::lent`) takes back the host RAM it adds, and one
+    /// refused for want of room that the load must have (`refused`) takes
+    /// back what it asked, so the bank's release
+    /// (`ExecutorDomain::places_shrink`, the release ladder's first rung)
+    /// gives it back before anything the load committed. The bank's own
+    /// growth into borrowed room ([`FitMode::Borrow`]) takes nothing back.
     fn claim_in(
         &mut self,
         demand: ClaimDemand,
         beside: u64,
         class: HoldingClass,
         mode: FitMode,
+        refused: Refused,
     ) -> Result<ClaimId, ClaimRefusal> {
-        self.check_storage(besides(demand, beside)?, 0, mode)?;
+        let (status, readings) = self.sample()?;
+        let taking = mode == FitMode::Live;
+        match self.refusal(&status, &readings, besides(demand, beside)?, 0, mode)? {
+            Some(refusal) => {
+                if let (true, Refused::TakesBack, ClaimRefusal::Deficit { required, .. }) = (taking, refused, &refusal) {
+                    self.take_back(*required);
+                }
+                return Err(refusal);
+            }
+            None if taking && self.bank.as_ref().is_some_and(|bank| bank.lent().is_some()) => {
+                let bytes = self.host_bytes(&status, demand)?;
+                self.take_back(bytes);
+            }
+            None => {}
+        }
         self.heap
             .claim(demand, class)
             .map(|claim| claim.id)
             .map_err(ClaimRefusal::Accounting)
+    }
+
+    /// The bytes of host RAM `claim` adds at `status` beside every
+    /// outstanding claim and the held host tables, as fit places them.
+    fn host_bytes(&self, status: &seismic::Status, claim: ClaimDemand) -> Result<u64, ClaimRefusal> {
+        let topology = self.device.topology();
+        let info = self.device.info();
+        let host_ram = topology.host_ram().id();
+        let fit = Fit::new(topology, status, &self.reserves, self.room());
+        let placed = |total: ClaimDemand| -> Result<u64, ClaimRefusal> {
+            let host = fit.host_staging(info, total.staged).saturating_add(self.host_table_bytes);
+            let demand = fit
+                .demand(&new_storage(info.id(), total, |kind| self.held_free(kind)), &[(host_ram, host)], FitMode::Stable)
+                .map_err(ClaimRefusal::Blind)?;
+            Ok(demand.placed.iter().filter(|(store, _)| *store == host_ram).map(|(_, bytes)| bytes).sum())
+        };
+        let claimed = self.heap.claimed();
+        Ok(placed(claimed.plus(claim))?.saturating_sub(placed(claimed)?))
     }
 
     /// `claim`, of `kind` storage, now demands `bytes`: the rest of what it claimed is Seismic's
@@ -619,7 +749,7 @@ mod tests {
     /// tables, in the host room its claims read, from a fresh status sample.
     fn live_ceiling(heap: &DeviceHeap) -> u64 {
         let topology = heap.device.topology();
-        Fit::new(topology, &heap.status(), &heap.reserves, heap.room)
+        Fit::new(topology, &heap.status(), &heap.reserves, heap.room())
             .storage_beside(
                 heap.device.info(),
                 &CLAIMED,

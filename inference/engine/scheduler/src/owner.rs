@@ -1805,9 +1805,11 @@ trait MemoryStep: MemoryHost + Sized {
                 self.memory().ladder.owed |= reclaim;
             }
         }
-        // A prompt's places that won memory from the bank's slots take it
-        // through the bank's shrink (`ExecutorDomain::places_shrink`), as a
-        // release waits, for no chain under way.
+        // A prompt's places that won memory from the bank's slots, and the
+        // borrowed room the load's claims took back, take it through the
+        // bank's shrink (`ExecutorDomain::places_shrink`), as a release
+        // waits, for no chain under way: a chain under way is cut beside
+        // (`ExpertBank::release_running`).
         if let (None, Some(bindings)) = (self.domain().chain_holder(), bindings.as_deref_mut()) {
             if let Some(bytes) = self.domain().places_shrink().map_err(classify_domain_error)? {
                 let before = self.domain().memory_moment();
@@ -3986,6 +3988,24 @@ impl<H: MemoryHost> Releasing<'_, H> {
                     .map_err(release_invariant("idle state release"))?
                     != 0,
             ),
+            // Borrowed room goes back before anything the load committed:
+            // a step begun, or a resize running, releases at a later flight
+            // boundary.
+            Rung::Borrowed => match self.host.domain().borrowed_deficit() {
+                0 => Release::Nothing,
+                bytes => {
+                    let wake = self.host.completion();
+                    match self.host.domain().shrink_expert_bank_by(self.bindings, bytes, wake)? {
+                        BankStep::Begun(tier) => {
+                            self.began = Some(tier);
+                            Release::Pending(Pending::Bank)
+                        }
+                        BankStep::Running => Release::Pending(Pending::Bank),
+                        BankStep::Deferred => Release::Deferred,
+                        BankStep::AtLimit => Release::Nothing,
+                    }
+                }
+            },
             Rung::Bank if self.host.domain().expert_reclaim_covered() => Release::Covered,
             // A step begun, or a resize running, releases at a later flight
             // boundary; the bank's floor releases nothing.

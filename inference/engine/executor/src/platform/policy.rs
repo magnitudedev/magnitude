@@ -32,10 +32,14 @@
 
 use seismic::{
     AccessPathId, DISPLACEMENT_HISTORY, DeviceTopology, DisplacementWindow, Executor, ExecutorId,
-    Contract, HostStatus, KernelPressure, LimitError, ObservationError, Status, Store, StoreId,
+    Contract, HostDisplacement, HostStatus, KernelPressure, LimitError, ObservationError, Status, Store, StoreId,
     StoreKind,
 };
-use std::{collections::BTreeMap, fmt, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    time::{Duration, Instant},
+};
 
 /// Harm to other programs that host headroom does not show: their memory is
 /// leaving RAM faster than the system can absorb. A host in distress is in
@@ -173,6 +177,24 @@ fn host_distress(host: &HostStatus) -> Option<HostDistress> {
     }
 }
 
+/// Whether `host` shows displacement now, judged against `baseline`: the
+/// kernel's pressure at warning or above, or the latest displacement window,
+/// ended since the expert bank last grew, swapping out pages faster than
+/// every window since then that was not itself displacement now
+/// ([`DisplacementBaseline`]). Compression alone is not: a bank holding
+/// borrowed room keeps the OS compressing others as their pages age, and a
+/// compressed page costs its program a decompression, a swapped one a read
+/// from disk. A host that reports neither never does.
+fn displacing(host: &HostStatus, baseline: &DisplacementBaseline) -> bool {
+    if matches!(host.kernel_pressure, Some(KernelPressure::Warning | KernelPressure::Critical)) {
+        return true;
+    }
+    host.displacement
+        .as_ref()
+        .and_then(|displacement| displacement.windows.first())
+        .is_some_and(|latest| latest.ended > baseline.since && baseline.exceeded_by(latest))
+}
+
 /// Host RAM's fit as `host` reads it: its capacity within the process
 /// limits `host` reports, its `room` as headroom and free headroom, and the
 /// distress `host` reports.
@@ -183,30 +205,60 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
         .fold(store.capacity().value, |bytes, limit| {
             bytes.min(limit.limit_bytes)
         });
+    let serving = match room {
+        HostRoom::Load(LoadStage::Serving(serving)) => Some(serving),
+        _ => None,
+    };
     // While the load loads, its own displacement is accepted.
     let displaced = match (room, host.displaced_bytes) {
         (HostRoom::Allocatable | HostRoom::Load(LoadStage::Loading), _) | (HostRoom::Load(LoadStage::ServingUncounted), None) => 0,
-        (HostRoom::Load(LoadStage::Serving { displaced_bytes: served }), Some(now)) => now.saturating_sub(served),
+        (HostRoom::Load(LoadStage::Serving(serving)), Some(now)) => now.saturating_sub(serving.displaced_bytes),
         (HostRoom::Load(stage), _) => panic!(
             "invariant violated: the host's displacement reading changed presence while a load served ({stage:?})"
         ),
     };
-    // Allocatable counts as free the RAM the OS made by displacing other
-    // programs' data since, which is free only while that data stays out.
-    store_fit(
-        store,
-        reserves,
-        capacity_bytes,
-        host.allocatable_bytes().saturating_sub(displaced),
-        host_distress(host),
-        MemoryConstraint::HostRam,
-    )
+    let displacing = serving.and_then(|serving| serving.baseline).is_some_and(|baseline| displacing(host, &baseline));
+    let thresholds = reserves.for_domain(store.kind(), capacity_bytes);
+    let fit = match serving.and_then(|serving| serving.lent) {
+        // Allocatable counts as free the RAM the OS made by displacing other
+        // programs' data since, which is free only while that data stays out.
+        None => store_fit(
+            store,
+            reserves,
+            capacity_bytes,
+            host.allocatable_bytes().saturating_sub(displaced),
+            host_distress(host),
+            false,
+            MemoryConstraint::HostRam,
+        ),
+        // The expert bank holds room borrowed beyond the hold line, which
+        // the OS gave it by compressing other programs' data: allocatable
+        // memory then sits near nothing for as long as the bank holds it, so
+        // its level tells another program's demand from the bank's own no
+        // more. The load's claims take back what is lent of it, within what
+        // the OS can obtain, and displacement now is the hold.
+        Some(lent) => store_fit(
+            store,
+            reserves,
+            capacity_bytes,
+            host.obtainable_bytes().min(thresholds.planning_bytes.saturating_add(lent)),
+            host_distress(host),
+            displacing,
+            MemoryConstraint::HostRam,
+        ),
+    };
+    StoreFit {
+        borrowable_bytes: serving.filter(|serving| serving.borrows).map(|_| host.obtainable_bytes()),
+        displacing,
+        ..fit
+    }
 }
 
 /// `store`'s fit from its capacity within process limits, its headroom and
 /// free headroom, and its host's distress: each less its planning reserve,
-/// in the Reclaim band at or below the reserve or while the host is in
-/// distress. The reserves are fractions of the capacity within limits, not
+/// in the Reclaim band at or below the reserve, while the host is in
+/// distress, or where `displacing` (a hold on room borrowed beyond the
+/// hold line, [`Serving::lent`]). The reserves are fractions of the capacity within limits, not
 /// of the whole store: a container limited to a few GiB of a large host
 /// keeps a reserve of those.
 fn store_fit(
@@ -215,6 +267,7 @@ fn store_fit(
     capacity_bytes: u64,
     headroom_bytes: u64,
     distress: Option<HostDistress>,
+    displacing: bool,
     constraint: MemoryConstraint,
 ) -> StoreFit {
     let thresholds = reserves.for_domain(store.kind(), capacity_bytes);
@@ -226,8 +279,10 @@ fn store_fit(
         ceiling_bytes: thresholds.ceiling(headroom_bytes),
         thresholds,
         distress,
+        borrowable_bytes: None,
+        displacing: false,
         constraint,
-        band: if headroom_bytes > thresholds.planning_bytes && distress.is_none() {
+        band: if headroom_bytes > thresholds.planning_bytes && distress.is_none() && !displacing {
             MemoryBand::Normal
         } else {
             MemoryBand::Reclaim
@@ -508,6 +563,16 @@ pub struct StoreFit {
     pub thresholds: DomainThresholds,
     /// The host's distress, for host RAM; other stores have none.
     pub distress: Option<HostDistress>,
+    /// For host RAM read by a load serving on a host that reports
+    /// displacement: what the OS can obtain for it, displacing other
+    /// programs' data ([`HostStatus::obtainable`]), the line room borrowed
+    /// beyond the hold line is held within ([`FitMode::Borrow`]). None
+    /// elsewhere: a host that reports no displacement lends no such room,
+    /// as nothing would tell another program's demand from the bank's own.
+    pub borrowable_bytes: Option<u64>,
+    /// For host RAM read by a serving load: whether the host shows
+    /// displacement now against the load's baseline ([`Serving::baseline`]).
+    pub displacing: bool,
     pub band: MemoryBand,
     /// What bounds the store's room.
     pub constraint: MemoryConstraint,
@@ -532,6 +597,10 @@ pub enum FitMode {
     /// Observed headroom and what is left of each grant, less the planning
     /// reserve.
     Live,
+    /// [`Self::Live`], host RAM's room up to the line the expert bank
+    /// borrows within ([`StoreFit::borrowable_bytes`]) where it has one: the
+    /// bank's growth into room borrowed beyond the hold line.
+    Borrow,
 }
 
 /// Bytes of one storage kind on one executor. Demands are placed in order,
@@ -593,17 +662,24 @@ pub enum HostRoom {
     /// its headroom; its free headroom, which its growth reads, less what
     /// the OS displaced of other programs' data since the load began to
     /// serve ([`LoadStage`]), so it never grows into RAM the OS freed by
-    /// compressing them.
+    /// compressing them; and while its expert bank holds room borrowed
+    /// beyond that line, the bank's hold on it ([`Serving::lent`]).
     Load(LoadStage),
 }
 
 impl HostRoom {
-    /// A load's room once it serves on `host`: its growth counts
+    /// A load's room once it serves on `host` at `now`: its growth counts
     /// displacement from what `host` reports displaced now, where the OS
-    /// reports it ([`HostStatus::displaced_bytes`]).
-    pub fn serving(host: &HostStatus) -> Self {
+    /// reports it ([`HostStatus::displaced_bytes`]), and judges
+    /// displacement now from the windows after `now`.
+    pub fn serving(host: &HostStatus, now: Instant) -> Self {
         Self::Load(match host.displaced_bytes {
-            Some(displaced_bytes) => LoadStage::Serving { displaced_bytes },
+            Some(displaced_bytes) => LoadStage::Serving(Serving {
+                displaced_bytes,
+                baseline: Some(DisplacementBaseline::since(now)),
+                borrows: false,
+                lent: None,
+            }),
             None => LoadStage::ServingUncounted,
         })
     }
@@ -617,11 +693,102 @@ impl HostRoom {
 pub enum LoadStage {
     /// Loading: its own displacement is accepted.
     Loading,
-    /// Serving where the OS reports displacement: what is displaced beyond
-    /// `displaced_bytes`, displaced as it began to serve, is not free.
-    Serving { displaced_bytes: u64 },
-    /// Serving where the OS reports no displacement: none is counted.
+    /// Serving where the OS reports displacement ([`Serving`]).
+    Serving(Serving),
+    /// Serving where the OS reports no displacement: none is counted, and
+    /// no room is borrowed beyond the hold line.
     ServingUncounted,
+}
+
+/// A load serving where the OS reports displacement.
+///
+/// Its expert bank may hold slots beyond the hold line (allocatable memory
+/// less the planning reserve) up to what the OS can obtain by compressing
+/// other programs' data less the reserve ([`FitMode::Borrow`]): borrowed
+/// room, given back first. While the bank holds any, allocatable memory sits
+/// near nothing (the OS keeps its free pages by compressing others), so the
+/// hold on it is displacement happening now ([`displacing`]), not a level:
+/// a hold on the level would read Reclaim for as long as the bank holds
+/// borrowed room, give it back, take it again once memory stayed free, and
+/// so on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Serving {
+    /// What the OS reported displaced as the load began to serve, or as its
+    /// bank's last growth into borrowed room ended: what is displaced
+    /// beyond it is not free. A growth into borrowed room displaces by
+    /// design, and once that room is given back what it displaced stays
+    /// out until its programs read it again, which no release of the load's
+    /// makes free.
+    pub displaced_bytes: u64,
+    /// What displacement now is judged against; none while the expert bank
+    /// grows, whose own backing displaces.
+    pub baseline: Option<DisplacementBaseline>,
+    /// Whether the load holds an expert bank that borrows room beyond the
+    /// hold line (the one store's): only its room reads the line it borrows
+    /// within ([`StoreFit::borrowable_bytes`]).
+    pub borrows: bool,
+    /// While the expert bank holds borrowed room: the bytes of it the load's
+    /// claims may still take back. Host RAM's headroom is then what the OS
+    /// can obtain, within the planning reserve plus these bytes, and its
+    /// band is Reclaim while the host shows displacement now. None while
+    /// the bank holds none: the hold line reads allocatable memory.
+    pub lent: Option<u64>,
+}
+
+/// What displacement now is judged against on a host that reports it: the
+/// fastest swap-out rate of the displacement windows ended
+/// since the expert bank last grew (`since`), each window folded in once
+/// ([`Self::fold`]) and only where it was not itself displacement now. Its
+/// first window seeds it: the windows right after a growth show what the
+/// host does with the bank at its new size, and a window faster than every
+/// one of them is another program's demand. Kernel pressure at warning or
+/// above is displacement now whatever the rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplacementBaseline {
+    since: Instant,
+    /// The end of the last window folded in.
+    folded: Instant,
+    /// Pages swapped out a second. None before a first window.
+    swapped: Option<u64>,
+}
+
+impl DisplacementBaseline {
+    /// A baseline of the windows ending after `since`, none yet.
+    pub fn since(since: Instant) -> Self {
+        Self { since, folded: since, swapped: None }
+    }
+
+    /// Whether `window` swaps out pages faster than every window folded
+    /// in; none before a first.
+    fn exceeded_by(&self, window: &DisplacementWindow) -> bool {
+        self.swapped.is_some_and(|swapped| exceeds(window.swapped_out_pages, window, swapped))
+    }
+
+    /// Fold in `displacement`'s windows ended since the last folded, oldest
+    /// first: each that is not displacement now raises the rate to its
+    /// own.
+    pub fn fold(&mut self, displacement: &HostDisplacement) {
+        let folded = self.folded;
+        for window in displacement.windows.iter().rev().filter(|window| window.ended > folded) {
+            self.folded = window.ended;
+            if self.exceeded_by(window) {
+                continue;
+            }
+            let rate = per_second(window.swapped_out_pages, window);
+            self.swapped = Some(self.swapped.map_or(rate, |swapped| swapped.max(rate)));
+        }
+    }
+}
+
+/// Whether `pages` within `window` exceed `per_second`.
+fn exceeds(pages: u64, window: &DisplacementWindow, per_second: u64) -> bool {
+    u128::from(pages) * 1_000 > u128::from(per_second) * window.duration.as_millis()
+}
+
+/// `pages` within `window` as pages a second, rounded up.
+fn per_second(pages: u64, window: &DisplacementWindow) -> u64 {
+    let millis = window.duration.as_millis().max(1);
+    u64::try_from((u128::from(pages) * 1_000).div_ceil(millis)).unwrap_or(u64::MAX)
 }
 
 /// The sole interpretation of stores and grants for engine fit questions.
@@ -693,6 +860,7 @@ impl<'a> Fit<'a> {
             store.capacity().value,
             headroom_bytes,
             None,
+            false,
             constraint,
         ))
     }
@@ -746,7 +914,7 @@ impl<'a> Fit<'a> {
         };
         let left = match mode {
             FitMode::Stable => grant.value,
-            FitMode::Live => match self.status.grant_left(path) {
+            FitMode::Live | FitMode::Borrow => match self.status.grant_left(path) {
                 Some(Ok(left)) => grant.value.min(left.value),
                 Some(Err(error)) => return Err(MemoryPolicyError::Observation(error.clone())),
                 // An unopened executor has only its reported stable grant.
@@ -830,6 +998,7 @@ impl<'a> Fit<'a> {
         let room_of = |fit: &StoreFit| match mode {
             FitMode::Stable => fit.stable_bytes,
             FitMode::Live => fit.ceiling_bytes,
+            FitMode::Borrow => fit.borrowable_bytes.map_or(fit.ceiling_bytes, |bytes| fit.thresholds.ceiling(bytes)),
         };
         let mut stores = BTreeMap::<StoreId, u64>::new();
         let mut grants = BTreeMap::<AccessPathId, u64>::new();
@@ -928,6 +1097,12 @@ pub struct DomainReading {
     /// The displacement windows `distress` was judged on, for host RAM on a
     /// platform that counts displacement.
     pub displacement: Option<seismic::HostDisplacement>,
+    /// The line room borrowed beyond the hold line is held within, for host
+    /// RAM read by a load serving where the OS reports displacement
+    /// ([`StoreFit::borrowable_bytes`]).
+    pub borrowable_bytes: Option<u64>,
+    /// Whether host RAM shows displacement now ([`StoreFit::displacing`]).
+    pub displacing: bool,
     pub band: MemoryBand,
 }
 
@@ -1010,6 +1185,8 @@ fn domain_readings(
                 distress: reading.distress,
                 held: host.and_then(|host| host.held),
                 displacement: host.and_then(|host| host.displacement.clone()),
+                borrowable_bytes: reading.borrowable_bytes,
+                displacing: reading.displacing,
                 band: reading.band,
             })
         })
@@ -1052,7 +1229,10 @@ pub(crate) fn refresh_device_ceiling(
 }
 
 /// Bound `device`'s stores and paths from `status`: what each has charged
-/// plus its live room. The readings it bound them from.
+/// plus its live room, host RAM's up to the line its expert bank borrows
+/// within where it has one ([`FitMode::Borrow`]): the bank's growth into
+/// borrowed room recommits into it, and every other claim the heap holds
+/// to its live ceiling first. The readings it bound them from.
 fn set_device_ceiling(
     device: &seismic::Device,
     status: &Status,
@@ -1062,9 +1242,10 @@ fn set_device_ceiling(
     let fit = Fit::new(device.topology(), status, reserves, room);
     let readings = domain_readings(device, status, reserves, room)?;
     for reading in &readings {
-        let limit = status
-            .charged(reading.domain)
-            .saturating_add(reading.ceiling_bytes);
+        let room = reading
+            .borrowable_bytes
+            .map_or(reading.ceiling_bytes, |bytes| reading.ceiling_bytes.max(reading.thresholds.ceiling(bytes)));
+        let limit = status.charged(reading.domain).saturating_add(room);
         device
             .bound(seismic::Ledger::Store(reading.domain), Some(limit))
             .map_err(MemoryPolicyError::Limit)?;
@@ -1230,7 +1411,14 @@ mod tests {
             decompressed_pages: decompressed,
             swapped_out_pages: swapped_out,
             swapped_in_pages: 0,
+            ended: epoch(),
         }
+    }
+
+    /// The instant every test window ends at but the ones a test places.
+    fn epoch() -> Instant {
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *EPOCH.get_or_init(Instant::now)
     }
 
     /// A macOS host whose displacement windows are `windows`, most recent
@@ -1501,7 +1689,7 @@ mod tests {
             Fit::new(&m4_pro, &status(host), &reserves, room).store(m4_pro.host_ram().id()).unwrap()
         };
         let free = |displaced_bytes, room| fit(displaced_bytes, room).headroom_bytes;
-        let served = HostRoom::Load(LoadStage::Serving { displaced_bytes: 4 * GIB });
+        let served = HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 4 * GIB, baseline: None, borrows: false, lent: None }));
         assert_eq!(free(Some(10 * GIB), served), 26 * GIB);
         assert_eq!(free(Some(4 * GIB), served), 32 * GIB);
         assert_eq!(free(Some(GIB), served), 32 * GIB);
@@ -1518,7 +1706,7 @@ mod tests {
     fn a_displacement_reading_that_disappears_while_serving_is_a_violation() {
         let m4_pro = recorded::m4_pro();
         let host = HostStatus { displaced_bytes: None, ..host(ReportedBy::MachAllocatablePages, 32 * GIB) };
-        let served = HostRoom::Load(LoadStage::Serving { displaced_bytes: 4 * GIB });
+        let served = HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 4 * GIB, baseline: None, borrows: false, lent: None }));
         Fit::new(&m4_pro, &status(host), &MemoryReserves::standard(), served).store(m4_pro.host_ram().id()).unwrap();
     }
 
@@ -1546,7 +1734,7 @@ mod tests {
             displaced_bytes: Some(9 * GB),
             ..host(MACOS, 0)
         };
-        let served = HostRoom::Load(LoadStage::Serving { displaced_bytes: 9 * GB });
+        let served = HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 9 * GB, baseline: None, borrows: false, lent: None }));
         let reading = |host: HostStatus| host_ram_fit(host_ram, &host, &reserves, served);
 
         let short = reading(host(5_400_000_000));
@@ -1561,6 +1749,88 @@ mod tests {
         let thrashing = displaced(lasting(thrashing_window(), DISPLACEMENT_SPAN)).displacement;
         let distressed = reading(HostStatus { displacement: thrashing, ..host(planning + 2 * GB) });
         assert_eq!((distressed.band, distressed.distress), (MemoryBand::Reclaim, Some(HostDistress::Thrashing)));
+    }
+
+    /// The same Mac's load, its expert bank holding room borrowed beyond
+    /// the hold line: allocatable memory sits at 1 GB (the OS keeps its free
+    /// pages by compressing others for the bank), which reads Reclaim on the
+    /// line alone, and 20 GB is obtainable. Holding borrowed room, the load
+    /// reads Normal on that level, its claims taking at most what is lent of
+    /// it, and Reclaim once the host shows displacement now: a window
+    /// swapping out faster than every one since the bank last grew, or the
+    /// kernel's pressure at warning. The bank's growth reads what is
+    /// obtainable above the planning reserve.
+    #[test]
+    fn a_bank_holding_borrowed_room_is_held_on_displacement_now_not_the_level() {
+        const GB: u64 = 1_000_000_000;
+        let reserves = MemoryReserves::standard();
+        let mut m4_max = seismic::fixtures::m4_pro();
+        m4_max.host.value = 64 * GIB;
+        let m4_max = seismic::fixtures::topology(&m4_max);
+        let host_ram = m4_max.host_ram();
+        let planning = reserves.for_domain(host_ram.kind(), host_ram.capacity().value).planning_bytes;
+        let grown = epoch();
+        let second = |seconds: u64| grown + Duration::from_secs(seconds);
+        let at = |ended: Instant, swapped: u64| DisplacementWindow { ended, ..window(1_000, 0, 0, swapped) };
+        // Two windows since the bank grew: 3,000 then 2,000 pages swapped a
+        // second.
+        let mut baseline = DisplacementBaseline::since(grown);
+        baseline.fold(&HostDisplacement { windows: vec![at(second(2), 2_000), at(second(1), 3_000)] });
+        let host = |latest: DisplacementWindow, pressure: KernelPressure| HostStatus {
+            allocatable: Reported::new(GB, ReportedBy::MachAllocatablePages),
+            obtainable: Reported::new(20 * GB, ReportedBy::MachMovablePages),
+            displaced_bytes: Some(9 * GB),
+            displacement: Some(HostDisplacement { windows: vec![latest, at(second(2), 2_000), at(second(1), 3_000)] }),
+            kernel_pressure: Some(pressure),
+            ..host(MACOS, 0)
+        };
+        let room = |lent| HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 9 * GB, baseline: Some(baseline), borrows: true, lent }));
+        let reading = |host: HostStatus, lent| host_ram_fit(host_ram, &host, &reserves, room(lent));
+
+        let steady = host(at(second(3), 3_000), KernelPressure::Normal);
+        assert_eq!(reading(steady.clone(), None).band, MemoryBand::Reclaim, "the level alone reads the bank's own borrowing");
+        let held = reading(steady.clone(), Some(4 * GB));
+        assert_eq!((held.band, held.displacing), (MemoryBand::Normal, false));
+        assert_eq!(held.ceiling_bytes, 4 * GB, "claims take at most what is lent");
+        assert_eq!(held.borrowable_bytes, Some(20 * GB));
+        assert_eq!(reading(steady.clone(), Some(0)).band, MemoryBand::Reclaim, "nothing left lent");
+
+        let asked = reading(host(at(second(3), 3_001), KernelPressure::Normal), Some(4 * GB));
+        assert_eq!((asked.band, asked.displacing), (MemoryBand::Reclaim, true), "faster than every window since");
+        let warned = reading(host(at(second(3), 0), KernelPressure::Warning), Some(4 * GB));
+        assert_eq!((warned.band, warned.displacing), (MemoryBand::Reclaim, true), "the kernel's warning");
+        let growing = HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 9 * GB, baseline: None, borrows: true, lent: Some(4 * GB) }));
+        let during = host_ram_fit(host_ram, &host(at(second(3), 9_000), KernelPressure::Warning), &reserves, growing);
+        assert_eq!((during.band, during.displacing), (MemoryBand::Normal, false), "nothing is judged while the bank grows");
+
+        let sampled = status(steady);
+        let borrow = Fit::new(&m4_max, &sampled, &reserves, room(Some(4 * GB)));
+        let cpu = executor(&m4_max, BackendName::Cpu).id();
+        let demand = |mode| borrow.demand(&[StorageDemand { executor: cpu, kind: Contract::DeviceOnly, bytes: 10 * GB }], &[], mode).unwrap();
+        assert!(!demand(FitMode::Live).fits(), "beyond what is lent");
+        assert!(20 * GB - planning > 10 * GB);
+        assert!(demand(FitMode::Borrow).fits(), "the bank's growth reads what is obtainable");
+    }
+
+    /// A window that is itself displacement now never raises the baseline,
+    /// and each window is folded in once: the baseline is the fastest of the
+    /// steady windows since the bank last grew, seeded by the first.
+    #[test]
+    fn displacement_now_never_raises_its_own_baseline() {
+        let since = epoch();
+        let at = |seconds: u64, swapped: u64| DisplacementWindow { ended: since + Duration::from_secs(seconds), ..window(1_000, 0, 0, swapped) };
+        let mut baseline = DisplacementBaseline::since(since);
+        let windows = |windows: Vec<DisplacementWindow>| HostDisplacement { windows };
+        baseline.fold(&windows(vec![at(0, 99_000)]));
+        assert_eq!(baseline.swapped, None, "a window ended as the bank grew is not one since");
+        baseline.fold(&windows(vec![at(1, 500)]));
+        assert_eq!(baseline.swapped, Some(500), "the first window seeds it");
+        baseline.fold(&windows(vec![at(2, 80_000), at(1, 500)]));
+        assert_eq!(baseline.swapped, Some(500), "displacement now is not folded in");
+        baseline.fold(&windows(vec![at(3, 400), at(2, 80_000), at(1, 500)]));
+        assert_eq!(baseline.swapped, Some(500));
+        baseline.fold(&windows(vec![at(4, 700), at(3, 400), at(2, 80_000)]));
+        assert_eq!(baseline.swapped, Some(500), "faster than every one since: displacement now");
     }
 
     /// Each reserve is the larger of its fraction of the store's capacity

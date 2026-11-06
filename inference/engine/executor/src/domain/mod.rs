@@ -27,6 +27,7 @@ use magnitude_state::{
     TentativeAdvance,
 };
 use seismic::Tensor;
+mod borrowing;
 mod draft;
 mod family;
 mod features;
@@ -589,6 +590,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The places a prompt's chunks are worth beyond what memory gave its
     /// group, and the slots the bank shrinks to for them (`grant_group`).
     places_want: Option<state::PlacesWant>,
+    /// The class room of the chain's planned places no group holds
+    /// (`ExecutorDomain::refresh_unheld_class`): what the one store's bank's
+    /// committed growth leaves free.
+    unheld_class: u64,
     /// The service's measurement job's claim beside the model, which the
     /// bank's shrink makes room for (`ExecutorDomain::measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
@@ -992,8 +997,13 @@ impl<'d> MemoryProbe<'d> {
         state::storage_store(device.topology(), device.info(), kind)
     }
 
-    /// What `store` is short of now (`MemoryPace::shortfall`), against the
-    /// process's charge of it now.
+    /// What `store` is short of now: its level's shortfall
+    /// (`MemoryPace::shortfall`), against the process's charge of it now,
+    /// and in host RAM what the one store's expert bank owes back of the
+    /// room it borrowed (`BankRoom::owed`), the more of the two. While the
+    /// bank holds room borrowed beyond allocatable memory the level says
+    /// nothing of the hold line (`platform::Serving`): what the bank owes
+    /// alone.
     fn shortfall(&self, store: seismic::StoreId) -> Shortfall {
         let charged = self
             .domain
@@ -1004,7 +1014,19 @@ impl<'d> MemoryProbe<'d> {
             .filter(|(of, _)| *of == store)
             .map(|(_, bytes)| bytes)
             .sum();
-        self.pace.borrow().shortfall(store, charged)
+        let level = self.pace.borrow().shortfall(store, charged);
+        let memory = self.memory.borrow();
+        let host_ram = self.domain.device().topology().host_ram().id();
+        let Some(bank) = memory.bank_room().filter(|_| store == host_ram) else {
+            return level;
+        };
+        match (bank.owed(), bank.lent().is_some(), level) {
+            (0, true, _) => Shortfall::Above,
+            (owed, true, _) => Shortfall::Short(owed),
+            (owed, false, Shortfall::Short(bytes)) => Shortfall::Short(bytes.max(owed)),
+            (0, false, level) => level,
+            (owed, false, _) => Shortfall::Short(owed),
+        }
     }
 
     /// What the process holds now (`MemoryMoment`).
@@ -1021,7 +1043,9 @@ impl<'d> MemoryProbe<'d> {
     /// chain's submissions (`ExpertBank::release_running`): a probe as the
     /// owner's ([`ExecutorDomain::probe_memory`]) at most every reading
     /// interval, and the shortfall it leaves the bank's store
-    /// (`MemoryPace::shortfall`), with what the process held then. None
+    /// ([`Self::shortfall`]: the level's, or the borrowed room the bank owes
+    /// back on displacement now or for the load's claims), with what the
+    /// process held then. None
     /// while a bank resize runs (its advance is a boundary's, and the bank
     /// begins no cut beside it), between readings, where the reading is
     /// blind (the heap holds it so, and the owner's next probe reads again),
@@ -2475,6 +2499,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             planned: Vec::new(),
             decode_owed: None,
             places_want: None,
+            unheld_class: 0,
             measurement_claim: None,
             grown_last: None,
             next_flight: 0,

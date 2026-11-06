@@ -89,7 +89,11 @@ every planned chunk that fits. So a plan sizes the two together: a bank beyond i
 floor leaves room for the class of every chunk of a whole-context prompt, priced as a
 group opening holds it (its graph slots and graphs, the target's group buffers, the
 bank's placed words and the tables' stagings; `AssessmentMemoryCharge::group_class`),
-and only the floor is admitted without it.
+and only the floor is admitted without it. That room stays the places': while no group
+holds the class, the one store's bank grows into it only as borrowed slots (below),
+and a group whose grant finds it borrowed takes it back first, unweighed: the bank
+owes what the class lacks, which a cut beside the running chain or the shrink before
+the next group gives back.
 
 A class's slots are each launch's activation with its upload regions, its output in
 the chain's rotation of `n + 1` slots, and its readout and drafter slots
@@ -120,8 +124,8 @@ Apply these steps in order when preparation cannot fit:
    (`DomainError::StateCeiling`, `PrefixCache::release_unspared`). This runs before
    the ladder.
 2. Release down the owner's one ladder (`scheduler/src/release.rs`), cheapest loss
-   first and short of preemption: surplus state backing, idle state, the expert bank
-   toward its floor, retained prefixes (least recently used first), then the
+   first and short of preemption: the expert bank's borrowed slots, surplus state
+   backing, idle state, the expert bank toward its floor, retained prefixes (least recently used first), then the
    optional components once no request is resident. Each release goes to the
    cheapest rung with anything left, so what a costlier release frees for a cheaper
    rung is released before the next costly one. A release that a later flight
@@ -155,10 +159,30 @@ is answered by the load's releases, not by the OS displacing that program's data
 plan sizes the expert bank in the stable fit, the one room its assessment settles into
 too; what the moment leaves it is the running memory pace's, which settles the bank to it
 as the load serves.
-What the OS could obtain by compressing others is reported, never planned on.
-Growth (the expert bank's and a prompt group's places) also leaves out what the OS
-displaced of other programs' data since the load began to serve. Sustained swapping or
-thrashing is Reclaim at any headroom.
+Growth (the expert bank's and a prompt group's places) also leaves out what the
+OS displaced of other programs' data since the load began to serve. Sustained swapping
+or thrashing is Reclaim at any headroom.
+
+The one store's expert bank (unified memory) splits its slots into committed and
+borrowed (`BankRoom`). Committed slots sit within that measure, beside the class room
+of the planned places no group holds; borrowed slots above them, up to the places'
+room and, where the OS reports displacement (macOS), what it can obtain by
+compressing other programs' data, less the planning reserve (`FitMode::Borrow`). A
+growth takes committed room first, and borrowed room only once the host has shown
+no displacement now for `RECOVERY_STABLE_TIME`. Every release takes borrowed slots
+first: the committed count only falls to the slots held. While the bank holds room
+borrowed beyond allocatable memory, allocatable memory sits near nothing (the OS
+keeps its free pages by compressing others), so the hold on it is not that level,
+which would read Reclaim for as long as the bank holds the room and make it give it
+back and take it again: it is displacement now (`platform::Serving`), swap-outs a
+second above every window since the bank last grew, or the kernel's pressure at
+warning. Compression alone is not: a bank holding borrowed room keeps the OS
+compressing others' ageing pages. That gives all borrowed room back; the load's own claims take
+back what they need of it (`DeviceHeap::take_back`), and the level's Reclaim acts on
+committed slots once none is borrowed. What a growth into borrowed room displaced is
+accepted as the load's own, so the line does not count it once the room is given
+back. A host that reports no displacement (Linux, Windows) borrows nothing beyond the
+places' room, which its level counts.
 Allocation denial keeps its typed required/available byte facts through model
 preparation; native failures without capacity evidence are not reclassified by
 matching diagnostic text. Reclamation and eviction report the observed decrease

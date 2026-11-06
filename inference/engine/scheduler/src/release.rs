@@ -7,6 +7,11 @@
 /// What the owner can release, cheapest loss first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Rung {
+    /// The expert bank's slots borrowed beyond the hold line
+    /// (`ExecutorDomain::borrowed_deficit`): room the load took from the
+    /// places' class or from other programs' data on the understanding it
+    /// gives it back first, so nothing the load committed is lost.
+    Borrowed,
     /// State backing beyond what the stores need, one spare slab kept per
     /// store, and idle graph slots: nothing is lost.
     Surplus,
@@ -28,7 +33,8 @@ pub(crate) enum Rung {
 }
 
 impl Rung {
-    const LADDER: [Self; 6] = [
+    const LADDER: [Self; 7] = [
+        Self::Borrowed,
         Self::Surplus,
         Self::Idle,
         Self::Bank,
