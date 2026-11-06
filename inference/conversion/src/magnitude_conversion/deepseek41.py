@@ -128,17 +128,25 @@ class _NativeFp8(_KeepBf16):
                 raise ValueError(f"{name}: its weight {weight_name} is {found}, not E4M3 FP8")
             out_f, in_f = weight().shape
             scale = self.model_tensors.pop(name)
-            if tuple(scale().shape) != (-(-out_f // bo), -(-in_f // bi)):
-                raise ValueError(f"{weight_name}: scale shape {tuple(scale().shape)} does not match {(bo, bi)} blocks")
+            # whole tiles only: a reader infers the tile from the two shapes, which a partial last tile makes ambiguous
+            if out_f % bo or in_f % bi or tuple(scale().shape) != (out_f // bo, in_f // bi):
+                raise ValueError(f"{weight_name} {(out_f, in_f)}: scale shape {tuple(scale().shape)} is not whole "
+                                 f"{(bo, bi)} blocks")
             check_ue8m0(name, LazyTorchTensor.to_eager(scale()).view(torch.uint8).numpy())
             self._fp8_scales[weight_name] = scale
             self._fp8_e4m3_preserved.add(weight_name)
 
     def modify_tensors(self, data_torch, name: str, bid: int | None) -> Iterable[tuple[str, torch.Tensor]]:
+        scale = self._fp8_scales.get(name)
+        written = 0
         for new_name, data in super().modify_tensors(data_torch, name, bid):
+            if scale is not None and (written or tuple(data.shape) != tuple(self.model_tensors[name]().shape)):
+                # a split or reshaped FP8 weight no longer matches the grid beside it
+                raise ValueError(f"{name}: an FP8 weight written as {new_name} {tuple(data.shape)}, not whole")
+            written += 1
             yield new_name, data
             # resumed after the weight is added, so its scale follows it in the file
-            if (scale := self._fp8_scales.get(name)) is not None:
+            if scale is not None:
                 codes = LazyTorchTensor.to_eager(scale()).view(torch.uint8).numpy().view(np.int8)
                 self.gguf_writer.add_tensor(scale_name(new_name), codes, raw_dtype=gguf.GGMLQuantizationType.I8)
 
