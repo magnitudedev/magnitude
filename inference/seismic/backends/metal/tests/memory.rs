@@ -173,3 +173,39 @@ fn programs_formed_and_released_leave_only_what_metal_keeps_a_pipeline() {
         );
     }
 }
+
+/// Metal counts a reservation's backed bytes once in the device's
+/// allocated size (`currentAllocatedSize`, which the device's grant is read
+/// from), as Seismic charges them: in each form (chunks while a granule is
+/// unbacked, one buffer over the range while every one is) and through each
+/// change between them.
+#[test]
+fn a_reservation_counts_its_backed_bytes_once_in_the_devices_allocated_size() {
+    let _alone = ALONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    const GRANULE: u64 = seismic_metal::device::RESERVATION_GRANULE as u64;
+    const GRANULES: u64 = 64;
+    let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
+    let allocated = || device.handle().current_allocated_bytes();
+    let resize = |resizer: seismic_metal::MetalResizer, bytes: u64| {
+        resizer.prepare(bytes).map_err(|(_, error)| error).unwrap().install().release()
+    };
+    // An empty reservation holds its record table alone, which a reservation
+    // of the same range always does.
+    let before = allocated();
+    let (buffer, resizer) = device.allocate_reserved(0, GRANULES * GRANULE, GRANULE, GRANULE).unwrap();
+    let table = allocated() - before;
+    let backed = || allocated() - before - table;
+    let resizer = resize(resizer, GRANULES / 2 * GRANULE);
+    assert_eq!(backed(), GRANULES / 2 * GRANULE, "half the granules, as chunks");
+    let resizer = resize(resizer, GRANULES * GRANULE);
+    assert_eq!(backed(), GRANULES * GRANULE, "every granule, as one buffer");
+    let resizer = resize(resizer, (GRANULES - 1) * GRANULE);
+    assert_eq!(backed(), (GRANULES - 1) * GRANULE, "a shrink from every granule, as chunks");
+    let resizer = resize(resizer, GRANULES * GRANULE);
+    assert_eq!(backed(), GRANULES * GRANULE, "a growth back to every granule");
+    drop((buffer, resizer));
+    assert_eq!(allocated(), before);
+    let (formed, resizer) = device.allocate_reserved(GRANULES * GRANULE, GRANULES * GRANULE, GRANULE, GRANULE).unwrap();
+    assert_eq!(backed(), GRANULES * GRANULE, "a reservation formed with every granule backed");
+    drop((formed, resizer));
+}

@@ -632,19 +632,29 @@ impl Resizer {
             backend,
         } = self;
         match backend.prepare(bytes) {
-            Ok(prepared) => Ok(PreparedRecommit {
-                next: Some(Next {
-                    resizer: Parts {
-                        allocation,
-                        memory,
-                        limits,
-                    },
-                    bytes,
-                    backing,
-                    grant,
-                    backend: prepared,
-                }),
-            }),
+            Ok(prepared) => {
+                // Work submitted from here on is committed with what the
+                // prepare formed in the queue's residency set; what was
+                // submitted before is read once no encoding holds a permit.
+                let before = prepared.rebinds().then(|| {
+                    let _encodings = allocation.acquire_exclusive();
+                    allocation.last_device_uses()
+                });
+                Ok(PreparedRecommit {
+                    next: Some(Next {
+                        resizer: Parts {
+                            allocation,
+                            memory,
+                            limits,
+                        },
+                        bytes,
+                        backing,
+                        grant,
+                        backend: prepared,
+                        before,
+                    }),
+                })
+            }
             Err((backend, error)) => Err(RecommitRefusal {
                 resizer: Parts {
                     allocation,
@@ -719,6 +729,11 @@ struct Next {
     backing: u64,
     grant: Option<MemoryReservation>,
     backend: crate::backends::ReservedPrepared,
+    /// Where the install moves rows device work already reaches
+    /// (`seismic_reservation::Backing::rebinds`): the device work submitted
+    /// before the prepare formed what it moves them to, which the install
+    /// waits for.
+    before: Option<DeviceUses>,
 }
 
 impl PreparedRecommit {
@@ -746,9 +761,16 @@ impl PreparedRecommit {
     /// returns once the device work submitted before its install completes,
     /// so a holder that hands a growth's new rows to device work only after
     /// its release (`magnitude_executor`'s growth joins) lets no earlier
-    /// work reach them, on any backend.
+    /// work reach them, on any backend. A resize that moves rows device work
+    /// already reaches (Metal's change between its chunks and one buffer
+    /// over a whole range) first waits, before taking the tensor, for the
+    /// device work submitted before its prepare, which may not reach where
+    /// they move; at a boundary between flights there is none.
     pub fn install(mut self) -> Result<RecommitRelease, RecommitRefusal> {
         let next = self.next.take().expect("a resize installs once");
+        if let Some(before) = &next.before {
+            before.retire();
+        }
         let allocation = next.resizer.allocation.clone();
         let exclusive = allocation.acquire_exclusive();
         let mut charge = allocation

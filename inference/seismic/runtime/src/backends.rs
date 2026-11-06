@@ -1164,6 +1164,19 @@ impl ReservedResizer {
 }
 
 impl ReservedPrepared {
+    /// Whether its install moves records device work already reaches
+    /// (`seismic_reservation::Backing::rebinds`).
+    pub(crate) fn rebinds(&self) -> bool {
+        match self {
+            Self::Cpu(prepared) => prepared.rebinds(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(prepared) => prepared.rebinds(),
+            Self::Cuda(prepared) => prepared.rebinds(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(prepared) => prepared.rebinds(),
+        }
+    }
+
     pub(crate) fn install(self) -> ReservedPending {
         match self {
             Self::Cpu(prepared) => ReservedPending::Cpu(prepared.install()),

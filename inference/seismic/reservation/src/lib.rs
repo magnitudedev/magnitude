@@ -81,6 +81,14 @@ pub trait Backing: Send + Sync + 'static {
     /// or the host see. Every granule the view or the change spans is
     /// backed.
     fn change(&self, installed: usize, granules: usize) -> Result<Self::Change, Self::Error>;
+    /// Whether applying `change` moves records device work already reaches
+    /// to other device addresses (Metal's change of form, which rewrites
+    /// every table entry): device work submitted before the change was
+    /// formed, which may not reach what it moves them to, must end before it
+    /// is applied. None by default.
+    fn rebinds(&self, _change: &Self::Change) -> bool {
+        false
+    }
     /// Apply `change` to `view`: device work encoded from now binds the
     /// result. What it retires is dropped by the change's release, before
     /// the granules it releases are unbacked.
@@ -537,6 +545,13 @@ struct Next<B: Backing> {
 }
 
 impl<B: Backing> Prepared<B> {
+    /// Whether its install moves records device work already reaches
+    /// ([`Backing::rebinds`]).
+    pub fn rebinds(&self) -> bool {
+        let next = self.next.as_ref().expect("a prepared commitment is held until it installs");
+        next.change.as_ref().is_some_and(|change| next.reserved.backing.rebinds(change))
+    }
+
     /// Publish the commitment: its length, and the view's change, which
     /// device work encoded from now binds. A shrink's granules and what the
     /// change retires stay until the returned release, so device work

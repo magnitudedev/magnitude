@@ -500,8 +500,8 @@ pub struct ReservationChunks {
     pub unit: u64,
     pub table: Contract,
     /// Whether the backend binds the whole range as one buffer while every
-    /// granule is backed, which device work then reaches directly (Metal),
-    /// beside the chunks and their table.
+    /// granule is backed, in its chunks' place, which device work then
+    /// reaches directly as well as through the table (Metal).
     pub whole: bool,
 }
 
