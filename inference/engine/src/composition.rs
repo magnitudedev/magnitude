@@ -83,6 +83,7 @@ impl EngineConfiguration {
             self.path,
             self.device,
             self.kernel_cache,
+            Some(host.package().store().to_path_buf()),
             self.reserves,
         )
         .map_err(invalid)?;

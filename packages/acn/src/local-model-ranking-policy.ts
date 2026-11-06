@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import {
   type LocalModelRankingScores,
-  type LocalModelStreamedPerformance,
+  type LocalModelPerformance,
   type ServingProfile,
 } from "@magnitudedev/acn-protocol"
 
@@ -14,7 +14,7 @@ export interface LocalModelRankingCandidate {
   readonly fidelityRank: number
   readonly profile: ServingProfile
   /** The fit's speed as offered: its residency's `performance`. */
-  readonly performance: LocalModelStreamedPerformance
+  readonly performance: LocalModelPerformance
 }
 
 const clamp01 = (value: number): number => Math.max(0, Math.min(1, value))
@@ -31,8 +31,7 @@ export const normalizedModelSpeedScore = (tokensPerSecond: number): number => {
 /**
  * The speed term is the estimate at the comparison depth; none while speed is not estimated.
  * A streamed fit's estimate is at the expert share this machine allows, so streamed and resident
- * fits rank by estimated speed alike: a streamed fit is not judged by its floor, and one still
- * unmeasured has no speed term, so it ranks after every estimated fit.
+ * fits rank by estimated speed alike: a streamed fit is not judged by its floor.
  */
 export const modelRankingScores = (
   candidate: LocalModelRankingCandidate,

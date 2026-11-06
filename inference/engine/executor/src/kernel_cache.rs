@@ -104,11 +104,10 @@ const READOUT: &str = "readout";
 const PREPARED: &str = "prepared";
 const RECORDS: &str = "records";
 const MEASUREMENT_ATTEMPTS: &str = "measurement-attempts";
-const MISSES: &str = "misses";
 const MEASUREMENT_REQUESTS: &str = "measurement-requests";
 /// The directories under the root that hold no entry: eviction never walks
 /// them.
-const KEPT: [&str; 4] = [RECORDS, MEASUREMENT_ATTEMPTS, MISSES, MEASUREMENT_REQUESTS];
+const KEPT: [&str; 3] = [RECORDS, MEASUREMENT_ATTEMPTS, MEASUREMENT_REQUESTS];
 
 /// The bytes at `path`, refreshing its use time; `None` on any failure.
 fn read_entry(path: &Path) -> Option<Vec<u8>> {
@@ -237,13 +236,6 @@ impl KernelCache {
     /// next, beside the records it stores. Eviction leaves them alone.
     pub fn measurement_requests(root: &Path) -> JsonFileStore {
         JsonFileStore::new(&root.join(MEASUREMENT_REQUESTS))
-    }
-
-    /// The streamed loads' miss records kept in the kernel cache at `root`
-    /// (`assessment::StoredMisses`), one per executor and model, every
-    /// load's record merged into it. Eviction leaves them alone.
-    pub fn miss_records(root: &Path) -> JsonFileStore {
-        JsonFileStore::new(&root.join(MISSES))
     }
 
     fn entry(&self, directory: &str, key: &str, extension: &str) -> PathBuf {

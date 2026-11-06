@@ -374,9 +374,8 @@ pub(crate) struct CompletedTargetOutput {
 #[derive(Clone, Debug)]
 pub(crate) enum ExpertStepEnd {
     /// It ran; the experts it could not read fail their slots
-    /// ([`CompletedTargetOutput::failures`]). The load's miss record, once
-    /// a new one is due.
-    Ran(Option<std::sync::Arc<crate::assessment::MissRecord>>),
+    /// ([`CompletedTargetOutput::failures`]).
+    Ran,
     /// A late beat of the load's pulse interrupted it: the step's outputs
     /// are not to be used, and it is re-run from its accepted state.
     Interrupted(String),
@@ -408,11 +407,10 @@ impl TargetOutput {
             None => step,
         });
         let (experts, unread) = match step.map(crate::experts::ExpertStep::complete) {
-            None => (ExpertStepEnd::Ran(None), None),
-            Some(Ok(record)) => (ExpertStepEnd::Ran(record), None),
+            None | Some(Ok(())) => (ExpertStepEnd::Ran, None),
             Some(Err(
                 crate::experts::StepFailure::Read { rows, reason } | crate::experts::StepFailure::Site { rows, reason },
-            )) => (ExpertStepEnd::Ran(None), Some((rows, crate::WeightReadError { detail: reason }))),
+            )) => (ExpertStepEnd::Ran, Some((rows, crate::WeightReadError { detail: reason }))),
             Some(Err(crate::experts::StepFailure::Interrupted(reason))) => (ExpertStepEnd::Interrupted(reason), None),
             Some(Err(failure @ crate::experts::StepFailure::Watcher(_))) => {
                 return Err(crate::InvariantError { context: "expert bank", detail: failure.to_string() });
@@ -1244,14 +1242,13 @@ impl NativeTargetProgram {
     /// Queue every run of a chain (`TargetProgram::submit`), one step per
     /// launch: each launch with its queued step. On failure, runs already
     /// queued are observed before the caller regains the storage they use,
-    /// and the expert steps complete: the miss record their completion made
-    /// due goes with the failure, and the launches with it.
+    /// and the expert steps are refused: the launches go with the failure.
     fn queue_chain(
         &self,
         chain: Chain<ValidatedTargetLaunch>,
         spare: &mut TargetGraphOutputLease,
     ) -> Result<Chain<(ValidatedTargetLaunch, DeviceStep)>, super::ChainRefusal> {
-        let refused = |error, chain| super::ChainRefusal { error, chain, misses: None };
+        let refused = |error, chain| super::ChainRefusal { error, chain };
         // A streamed load's steps, in chain order, one group: the watcher
         // serves each from before its first run is queued until it
         // completes.
@@ -1338,21 +1335,14 @@ impl NativeTargetProgram {
                 submitter.abandon_unsubmitted();
                 // The device is past the chain's runs: each step is refused,
                 // none fed, as no run of the chain's is known to have written
-                // its records. A watcher that panicked fails the load. A miss
-                // record due now goes with the submission that failed.
-                let (mut watcher, mut misses) = (None, None);
+                // its records. A watcher that panicked fails the load.
                 let (chain, expert_steps) = steps.unzip();
-                for outcome in expert_steps.into_iter().flatten().map(|(_, step)| step.refuse()) {
-                    match outcome {
-                        Ok(record) => misses = record.or(misses),
-                        Err(failure) => watcher = watcher.or(Some(failure)),
-                    }
-                }
+                let watcher = expert_steps.into_iter().flatten().map(|(_, step)| step.refuse()).filter_map(Result::err).reduce(|first, _| first);
                 let error = match watcher {
                     Some(failure) => invalid(format!("{error}; {failure}")),
                     None => error,
                 };
-                Err(super::ChainRefusal { error, chain, misses })
+                Err(super::ChainRefusal { error, chain })
             }
         }
     }

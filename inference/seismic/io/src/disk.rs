@@ -14,10 +14,12 @@ use std::sync::Arc;
 mod file;
 mod platform;
 mod probe;
+mod storage;
 mod volume;
 
 pub use platform::cached_pages;
 pub use probe::{Curve, Lone, Point, Urgent};
+pub use storage::{StorageProbe, FULL_DEPTH, FULL_READ, LONE_READ, STORAGE_PROBE_BYTES};
 pub use volume::{adopt_earlier, adopt_volume, link_shape, probe_volume, read_cores, EarlierChoice, Shape};
 
 pub(crate) use file::{SourceFile, Through};

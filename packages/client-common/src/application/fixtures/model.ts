@@ -153,15 +153,14 @@ const estimated = (estimatedTokensPerSecond: number) => ({
 
 /**
  * A streamed fit as the protocol carries it: 60% of experts in memory at ~20 tok/s, a floor of 1%
- * (the least its steps hold at once) at ~5 tok/s, the rest kept as `coldExperts` says (read from disk unless given); or, unmeasured,
- * before its first streamed load.
+ * (the least its steps hold at once) at ~5 tok/s, the rest kept as `coldExperts` says (read from disk unless given).
  */
-export const streamedFitResidency = (unmeasured = false, coldExperts = "disk"): LocalModelFitResidency =>
+export const streamedFitResidency = (coldExperts = "disk"): LocalModelFitResidency =>
   Schema.decodeUnknownSync(LocalModelFitResidencySchema)({
     _tag: "Streamed",
     bank: { experts: 100, slots: 60, floorSlots: 1, coldExperts },
-    performance: unmeasured ? { _tag: "Unmeasured" } : estimated(20.4),
-    floorPerformance: unmeasured ? { _tag: "Unmeasured" } : estimated(5.4),
+    performance: estimated(20.4),
+    floorPerformance: estimated(5.4),
   })
 
 /**

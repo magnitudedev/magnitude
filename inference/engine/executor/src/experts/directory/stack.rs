@@ -12,6 +12,14 @@ pub struct RoutedRead {
     pub choices: u64,
 }
 
+/// A counted decode step's launch: its rows and the context tokens a row
+/// reads, the mean over its rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CountedLaunch {
+    pub rows: u64,
+    pub tokens: u64,
+}
+
 /// Each streamed layer's decode reads by the depth at which they found their
 /// experts in the ranking's stack ([`Stack`]), so the misses of a bank of every size at
 /// once: a bank of `s` slots misses a read whose depth bucket is `s` or more
@@ -52,18 +60,6 @@ impl LayerCurve {
         let depth = slots.min(self.misses.len());
         (self.requests[depth..].iter().sum(), self.misses[depth..].iter().sum())
     }
-
-    /// Add `other`'s reads and their choices, of the same buckets.
-    pub(crate) fn add(&mut self, other: &Self) {
-        add_counts(&mut self.misses, &other.misses);
-        add_counts(&mut self.requests, &other.requests);
-        self.choices += other.choices;
-    }
-}
-
-/// Add `other`'s counts into `counts`, of one length.
-fn add_counts(counts: &mut [u64], other: &[u64]) {
-    counts.iter_mut().zip(other).for_each(|(count, other)| *count += other);
 }
 
 /// The reads of the bank's layers by their depth in the one ranking's stack
@@ -77,9 +73,9 @@ pub struct Stack {
     curve: MissCurve,
     /// The last decode step counted.
     counted: Option<Step>,
-    /// The rows of the decode steps `curve` counts, summed: each step's
-    /// launch's, counted with it.
-    rows: u64,
+    /// The rows and context tokens of the decode steps `curve` counts,
+    /// summed: each step's launch's, counted with it.
+    launches: CountedLaunch,
     /// Each prompt group's union by its depth, `steps` the groups counted,
     /// and the last group's read sequence ([`Self::read_group`]).
     group_curve: MissCurve,
@@ -203,7 +199,7 @@ impl Stack {
                 layers: vec![empty.clone(); layers],
             },
             counted: None,
-            rows: 0,
+            launches: CountedLaunch::default(),
             group_curve: MissCurve {
                 steps: 0,
                 layers: vec![empty.clone(); layers],
@@ -233,10 +229,10 @@ impl Stack {
     /// Step `read.sequence` read `read.experts` at `read.layer`, in the
     /// device's order of reads: together, each expert at its depth before
     /// any of them is ranked again. A decode read is counted where its
-    /// step's launch's rows are given (`counted`), and so is its step, with
-    /// those rows, the first time one of its reads is (a group's steps first
+    /// step's launch is given (`counted`), and so is its step, with that
+    /// launch, the first time one of its reads is (a group's steps first
     /// read in sequence order, and groups in theirs).
-    pub fn read(&mut self, read: &RoutedRead, counted: Option<u64>) {
+    pub fn read(&mut self, read: &RoutedRead, counted: Option<CountedLaunch>) {
         let mut experts = read.experts.clone();
         experts.sort_unstable();
         // Each expert with its choices: the rows that chose it.
@@ -249,9 +245,9 @@ impl Stack {
         }
         let depths = self.rank(read, routed);
         count(&mut self.decoded, &mut self.last_decoded, read, &depths);
-        if let Some(rows) = counted {
+        if let Some(launch) = counted {
             if count(&mut self.curve, &mut self.counted, read, &depths) {
-                self.rows += rows;
+                self.launches = CountedLaunch { rows: self.launches.rows + launch.rows, tokens: self.launches.tokens + launch.tokens };
             }
         }
     }
@@ -278,13 +274,17 @@ impl Stack {
         Reuse::feeding(&self.ranking).read(&RoutedRead { experts, ..read.clone() }, &choices)
     }
 
-    pub fn curve(&self) -> &MissCurve {
-        &self.curve
-    }
-
-    /// The rows of the decode steps the curve counts, summed.
-    pub fn rows(&self) -> u64 {
-        self.rows
+    /// What the load's counted decode read and ran ([`LiveDecode`]); none
+    /// before it counted a step.
+    pub fn live(&self) -> Option<crate::assessment::LiveDecode> {
+        let steps = self.curve.steps;
+        if steps == 0 {
+            return None;
+        }
+        let rows = self.launches.rows as f64 / steps as f64;
+        let depth = u32::try_from(self.launches.tokens / steps).expect("a decode's mean context fits a launch's");
+        let layers = self.curve.layers.iter().map(|layer| crate::assessment::LayerReads::of_depths(&layer.misses, &layer.requests)).collect();
+        Some(crate::assessment::LiveDecode { layers, steps, rows, depth })
     }
 
     /// Every decode step read since the load, counted into the record or

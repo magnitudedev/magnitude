@@ -245,7 +245,7 @@ describe("automatic assessment projection", () => {
                 _tag: "Streamed",
                 bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },
                 performance: { _tag: "Pending" },
-                floorPerformance: { _tag: "Unmeasured" },
+                floorPerformance: { _tag: "Pending" },
               },
               drafter: { _tag: "None" },
             }],
@@ -262,7 +262,7 @@ describe("automatic assessment projection", () => {
       _tag: "Streamed",
       bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },
       performance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
-      floorPerformance: { _tag: "Unmeasured" },
+      floorPerformance: { _tag: "Pending", measurement: { _tag: "Failed", retryAt: 1_000 } },
     })
   })
 })

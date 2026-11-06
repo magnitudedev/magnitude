@@ -188,6 +188,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 devices: catalog,
             } = open_served_store(inventory_config, reserves).await?;
             let kernels = inventory.derived_cache().kernel_directory();
+            let storage = inventory.root().to_owned();
             // The serving device is decided once over the discovered topology. Every model is
             // assessed on it, from that topology and a status sample, under what the
             // measurement job has stored of this machine; every load and the hardware report
@@ -196,11 +197,11 @@ async fn run(command: Command) -> anyhow::Result<()> {
             // points, whatever the models.
             let (serving, structure, stored) = {
                 let catalog = Arc::clone(&catalog);
-                let kernels = kernels.clone();
+                let (kernels, storage) = (kernels.clone(), storage.clone());
                 magnitude_service_utils::blocking::run(move || {
                     let serving = ServingDevice::select(&catalog)?;
                     let structure = assessment_structure(&catalog, serving, Some(kernels.as_path()))?;
-                    let stored = structure.stored_measurements(&kernels);
+                    let stored = structure.stored_measurements(&kernels, &storage);
                     anyhow::Ok((serving, Arc::new(structure), stored))
                 })
                 .await
@@ -221,6 +222,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                     worker_launcher.clone(),
                     inventory.served_paths(),
                     kernels.clone(),
+                    storage,
                 )),
                 stored,
                 device.clone(),

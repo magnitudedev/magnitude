@@ -226,14 +226,33 @@ impl StepInputs<'_> {
     /// A run of `steps`, each its layers' loads: `T`, its schedule's and the
     /// sustained rate's means, the slower.
     pub fn run<'s>(&self, steps: impl IntoIterator<Item = &'s [LayerLoad]>) -> StepTime {
-        let (mut count, mut scheduled, mut served, mut bytes) = (0f64, 0., 0., 0.);
         let mut carried = vec![0.; self.lines.len()];
-        for loads in steps {
-            let (step, service, read) = self.one(loads, &mut carried);
-            count += 1.;
-            scheduled += step;
-            served += service;
-            bytes += read;
+        self.mean(steps.into_iter().map(|loads| (self.one(loads, &mut carried), 1)))
+    }
+
+    /// What [`Self::run`] gives a run holding each of `steps` its count of
+    /// times, in any order, none reading ahead, each priced once: with no
+    /// hint, no rounding carries from step to step, so a step's terms are
+    /// its loads' alone and the run's means weigh each by its count.
+    pub fn unhinted<'s>(&self, steps: impl IntoIterator<Item = (&'s [LayerLoad], usize)>) -> StepTime {
+        let mut carried = vec![0.; self.lines.len()];
+        self.mean(steps.into_iter().map(|(loads, count)| {
+            assert!(loads.iter().all(|load| load.recall == 0.), "an unhinted step reads ahead");
+            (self.one(loads, &mut carried), count)
+        }))
+    }
+
+    /// The run of `steps`' terms (`T_s`, service, bytes), each with its
+    /// count: their means, and `T` the slower of the schedule's and the
+    /// sustained rate's.
+    fn mean(&self, steps: impl Iterator<Item = ((f64, f64, f64), usize)>) -> StepTime {
+        let (mut count, mut scheduled, mut served, mut bytes) = (0f64, 0., 0., 0.);
+        for ((step, service, read), times) in steps {
+            let times = times as f64;
+            count += times;
+            scheduled += step * times;
+            served += service * times;
+            bytes += read * times;
         }
         let (scheduled, served, bytes) = (scheduled / count, served / count, bytes / count);
         let sustained = bytes * self.sustained;
@@ -320,6 +339,21 @@ mod tests {
         let run = token.run([&flood[..]]);
         close(run.sustained, 40e-3);
         assert!(run.total >= 40e-3);
+    }
+
+    /// Without hints a run's terms are its distinct steps', each priced
+    /// once and weighed by its count, whatever their order.
+    #[test]
+    fn an_unhinted_run_prices_each_distinct_step_once() {
+        let lines = [unified(); 4];
+        let demand = inputs(&lines, Lead::Layers(0.), 1.);
+        let quiet = [load(0, 0.); 4];
+        let missing = [load(0, 0.), load(2, 0.), load(0, 0.), load(1, 0.)];
+        let run = demand.run([&quiet[..], &missing[..], &quiet[..], &quiet[..], &missing[..]]);
+        let counted = demand.unhinted([(&missing[..], 2), (&quiet[..], 3)]);
+        for (actual, expected) in [(counted.scheduled, run.scheduled), (counted.sustained, run.sustained), (counted.bytes, run.bytes), (counted.total, run.total)] {
+            close(actual, expected);
+        }
     }
 
     /// A miss's records are whole only once they land, which its layer's

@@ -373,8 +373,8 @@ impl GroupReads {
     /// given up cost the prompt's groups (the group-read curve: an expert a
     /// slot gave up is read from the file, or pulled from the host tier
     /// where groups pull from it and it holds the expert) and the
-    /// decode running while they run (the miss record's step at fewer
-    /// slots, for the decode seconds owed). Each count's groups are priced
+    /// decode running while they run (the load's priced step at fewer
+    /// slots, `DecodePrice`, for the decode seconds owed). Each count's groups are priced
     /// at their size, their passes by `pass` where the executor's costs
     /// are measured ([`Self::at`]). The count of least seconds wins, fewer
     /// places on a tie; never below the bank's floor.

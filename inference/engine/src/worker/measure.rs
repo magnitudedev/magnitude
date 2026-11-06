@@ -44,6 +44,9 @@ pub struct MeasureRequest {
     pub paths: Vec<PathBuf>,
     /// The kernel cache the records and their attempts are stored in.
     pub kernels: PathBuf,
+    /// The model store, whose volume's read line the job measures
+    /// (`PointRequest::Storage`).
+    pub storage: PathBuf,
     /// The executor whose cost points are measured: the one a native load
     /// selects.
     pub executor: seismic::ExecutorSelector,
@@ -373,7 +376,7 @@ pub fn measure_machine(
     let records = KernelCache::measurement_records(&request.kernels);
     let (topology, executor) = (device.topology(), device.info());
     let costs = ExecutorCosts::stored(topology, executor, &records).is_ok_and(|walked| walked.outstanding());
-    let outstanding = PointRequests::new(&request.kernels).outstanding(topology, executor, &records, costs);
+    let outstanding = PointRequests::new(&request.kernels).outstanding(topology, executor, &request.storage, &records, costs);
     let outstanding = match outstanding {
         Ok(outstanding) => outstanding,
         Err(reason) => return machine(format!("the point requests: {reason}")),
@@ -579,6 +582,7 @@ mod tests {
         let request = MeasureRequest {
             paths: vec!["/models".into(), "/cache".into()],
             kernels: "/cache/kernels".into(),
+            storage: "/models".into(),
             executor: seismic::ExecutorSelector::Cuda { uuid: [7; 16] },
             job: MeasureJob(9),
             time: std::time::Duration::from_millis(9_500),

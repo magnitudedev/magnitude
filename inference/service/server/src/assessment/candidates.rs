@@ -807,12 +807,12 @@ impl ManagedModelCandidates {
             drafter.map(|drafter| drafter.identity.as_str()),
             &method,
         );
-        if let Some(cached) = self.assessor.cached(&environment, &evidence) {
+        if let Some(cached) = self.models().read_model_assessment(&evidence) {
             return Ok(cached);
         }
         let gate = self.gate(&evidence).await;
         let _admitted = gate.lock().await;
-        if let Some(cached) = self.assessor.cached(&environment, &evidence) {
+        if let Some(cached) = self.models().read_model_assessment(&evidence) {
             return Ok(cached);
         }
         let _share = self.host.share().await;
@@ -886,7 +886,7 @@ impl ManagedModelCandidates {
     ) -> Option<CachedModelAssessment> {
         let environment = self.assessor.environment();
         let evidence = assessment_evidence(&environment.id, target, drafter, method);
-        self.assessor.cached(&environment, &evidence)
+        self.models().read_model_assessment(&evidence)
     }
 
     /// The identity `hugging_face_target` would give a version's material, from cached header

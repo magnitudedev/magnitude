@@ -571,16 +571,6 @@ export const LocalModelPerformanceSchema = Schema.Union(
 )
 export type LocalModelPerformance = typeof LocalModelPerformanceSchema.Type
 
-/**
- * A streamed fit's decode speed: a fit's speed, or unmeasured before the model's first streamed
- * load has recorded which experts its routing misses.
- */
-export const LocalModelStreamedPerformanceSchema = Schema.Union(
-  ...LocalModelPerformanceSchema.members,
-  Schema.TaggedStruct("Unmeasured", {}),
-)
-export type LocalModelStreamedPerformance = typeof LocalModelStreamedPerformanceSchema.Type
-
 export const localModelPerformanceContexts = (contextLength: number): readonly number[] => [...new Set([
   ...[25_000, 50_000, 75_000].filter((value) => value <= contextLength),
   contextLength,
@@ -918,8 +908,8 @@ export const LocalModelFitResidencySchema = Schema.Union(
   Schema.TaggedStruct("Resident", { performance: LocalModelPerformanceSchema }),
   Schema.TaggedStruct("Streamed", {
     bank: StreamedBankSchema,
-    performance: LocalModelStreamedPerformanceSchema,
-    floorPerformance: LocalModelStreamedPerformanceSchema,
+    performance: LocalModelPerformanceSchema,
+    floorPerformance: LocalModelPerformanceSchema,
   }),
 )
 export type LocalModelFitResidency = typeof LocalModelFitResidencySchema.Type

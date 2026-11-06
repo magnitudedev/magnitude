@@ -203,16 +203,6 @@ pub fn load(load: Load) -> Result<(), String> {
         "host bytes",
     )?;
     let vocabulary = definition.decoder.vocabulary;
-    // What a shrink's release costs device work beside it, as the executor's
-    // costs measured it in the kernel cache: the ratio a release may slow a
-    // decode step it overlaps by. None unread.
-    let release_step_ratio = match kernel_cache.as_deref().map(|cache| structure.stored_measurements(cache)) {
-        Some(magnitude_engine::assessment::Measurements::Measured { costs, .. }) => {
-            costs.release_step_ratio.map(|ratio| ratio.value)
-        }
-        _ => None,
-    };
-
     // The load, in a worker process as the service loads.
     let WorkerProcess { transport, retire } =
         start_worker_process(crate::engine::worker(&[])?).map_err(|error| error.to_string())?;
@@ -269,7 +259,6 @@ pub fn load(load: Load) -> Result<(), String> {
             "plan_host_bytes": host_terms,
             "weight_bytes": weights,
             "vocabulary": vocabulary,
-            "release_step_ratio": release_step_ratio,
             "kernels": process.kernels,
             "charged_runtime_bytes": process.runtime,
             "charged_vocabulary_bytes": process.vocabulary,

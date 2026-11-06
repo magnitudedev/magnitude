@@ -146,22 +146,27 @@ pub struct ServiceMachine {
     pub served: Vec<std::path::PathBuf>,
     /// The kernel cache the job stores its records and attempts in.
     pub kernels: std::path::PathBuf,
+    /// The model store, whose volume's read line the job measures.
+    pub storage: std::path::PathBuf,
 }
 
 impl ServiceMachine {
-    /// The job measuring `structure`'s selected executor into the kernel cache `kernels`,
-    /// discovering with the paths `served`, which the service discovered with.
+    /// The job measuring `structure`'s selected executor and the model store `storage` into the
+    /// kernel cache `kernels`, discovering with the paths `served`, which the service discovered
+    /// with.
     pub fn new(
         structure: Arc<AssessmentStructure>,
         launcher: WorkerLauncher,
         served: Vec<std::path::PathBuf>,
         kernels: std::path::PathBuf,
+        storage: std::path::PathBuf,
     ) -> Self {
         Self {
             structure,
             launcher,
             served,
             kernels,
+            storage,
         }
     }
 }
@@ -181,7 +186,7 @@ impl MeasuredMachine for ServiceMachine {
     type Stored = Measurements;
 
     fn stored(&self) -> Measurements {
-        self.structure.stored_measurements(&self.kernels)
+        self.structure.stored_measurements(&self.kernels, &self.storage)
     }
 
     fn start(&self, time: Duration) -> anyhow::Result<StartedJob> {
@@ -189,6 +194,7 @@ impl MeasuredMachine for ServiceMachine {
         let request = MeasureRequest {
             paths: self.served.clone(),
             kernels: self.kernels.clone(),
+            storage: self.storage.clone(),
             executor: self.structure.selected.info.selector(),
             job,
             time,
@@ -286,7 +292,7 @@ async fn run<M: MeasuredMachine>(
     status: watch::Sender<MeasurementStatus<M::Stored>>,
     time: Duration,
 ) {
-    // A streamed load stores its miss records and its point requests while it holds the device:
+    // A streamed load stores its point requests while it holds the device:
     // what it stored is read again once the device changes, as the job's records are after each
     // job, and requests it left run jobs again.
     let mut changes = device.changes();

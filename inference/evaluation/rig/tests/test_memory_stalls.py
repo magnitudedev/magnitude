@@ -22,11 +22,10 @@ def resize(at, ms=1.0, release=0.002):
             "decided": at, "prepared": at + 0.0005, "installed": at + 0.001, "released": at + 0.001 + release}
 
 
-def report(steps, resizes, window=(50, 150), ratio=1.1, served=()):
-    """`ratio` the executor's measured release step ratio: a tenth, as on a GB10, by default;
-    `served` the streamed steps' reads as they completed."""
+def report(steps, resizes, window=(50, 150), served=()):
+    """`served` the streamed steps' reads as they completed."""
     pressure = {"steps": steps, "window": {"from": window[0], "to": window[1]} if window else {}}
-    memory.report_stalls(pressure, resizes, 0.0, ratio, list(served))
+    memory.report_stalls(pressure, resizes, 0.0, list(served))
 
 
 def test_a_slow_step_no_resize_costs_is_a_slow_step(capsys):
@@ -38,35 +37,9 @@ def test_a_slow_step_no_resize_costs_is_a_slow_step(capsys):
     report(steps, [resize(at[60] + 0.010)], served=[read])
     out = capsys.readouterr().out
     assert "1 of 1 resizes in it" in out
-    assert "by thread time and release: 1 of 1" in out
+    assert "by thread time: 1 of 1" in out
     assert "slow steps of their own in the window: 1" in out
     assert "missed 12 experts, 24.0 MB read on demand, 55.0 ms reading (3.0 ms parked)" in out
-
-
-def test_a_slow_step_the_resize_explains_is_the_resize(capsys):
-    steps = decode(slow_at=61, slow=0.040)
-    at = dict(steps)
-    # A release measured to double the work beside it, overlapping the slow step 40 ms and more:
-    # the slow step is the release's, and more than a step.
-    report(steps, [resize(at[60] + 0.010, release=0.060)], ratio=2.0)
-    out = capsys.readouterr().out
-    assert "by thread time and release: 0 of 1" in out
-    assert "slow steps of their own in the window: 0" in out
-
-
-def test_a_release_explains_only_its_measured_cost(capsys):
-    steps = decode(slow_at=61, slow=0.040)
-    at = dict(steps)
-    # The same release, measured to slow work beside it by a tenth: it explains at most a tenth of
-    # what it overlaps, so the step is slow of its own and the resize within one step.
-    report(steps, [resize(at[60] + 0.010, release=0.060)])
-    out = capsys.readouterr().out
-    assert "by thread time and release: 1 of 1" in out
-    assert "slow steps of their own in the window: 1" in out
-    # Unread, a release explains nothing, and says so.
-    report(steps, [resize(at[60] + 0.010, release=0.060)], ratio=None)
-    out = capsys.readouterr().out
-    assert "is unread" in out and "slow steps of their own in the window: 1" in out
 
 
 def test_resizes_every_step_are_judged_against_their_neighbours(capsys):
@@ -75,7 +48,7 @@ def test_resizes_every_step_are_judged_against_their_neighbours(capsys):
     at = dict(steps)
     report(steps, [resize(at[token] + 0.005, ms=0.6, release=0.001) for token in range(50, 150)])
     out = capsys.readouterr().out
-    assert "by thread time and release: 100 of 100" in out
+    assert "by thread time: 100 of 100" in out
     assert "slow steps of their own in the window: 1" in out
 
 
@@ -104,7 +77,7 @@ def _shrink(at, charged, footprint=(None, None), holding="Host", claimed=(None, 
 
 def test_the_pressure_gate_fails_on_missing_transitions_and_wrong_tokens(tmp_path, capsys):
     charge = physical_cell()
-    charge.update(decoded_tokens=[1, 2, 3], release_step_ratio=1.1)
+    charge.update(decoded_tokens=[1, 2, 3])
     charge["pressure"]["steps"] = decode()
     failures = memory.report_pressure(charge, [], [1, 2, 4], tmp_path)
     assert any("never shrank" in failure for failure in failures)
@@ -115,7 +88,7 @@ def test_the_pressure_gate_fails_on_missing_transitions_and_wrong_tokens(tmp_pat
 def test_the_pressure_gate_fails_a_bank_step_that_needs_new_memory(tmp_path, capsys):
     """A shrink's charge and footprint fall at every step: one that grew either fails the gate."""
     charge = physical_cell()
-    charge.update(decoded_tokens=[1, 2, 3], release_step_ratio=1.1)
+    charge.update(decoded_tokens=[1, 2, 3])
     charge["pressure"]["steps"] = decode()
     grew = memory.report_pressure(charge, [_shrink(3, (1e9, 2e9))], [1, 2, 3], tmp_path)
     assert any("1 of 1 bank steps grew" in failure for failure in grew)

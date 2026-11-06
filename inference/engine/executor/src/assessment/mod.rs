@@ -7,10 +7,12 @@
 //! [`launches`]) over its executor's measured kernel costs
 //! ([`executor_costs`]). No model is loaded and nothing runs on a device:
 //! the costs derive from measurements the measurement job recorded. A
-//! streamed decode is priced by the one cost function of where a missed
-//! expert is computed ([`cost`]) over a load's miss record ([`misses`]).
-//! What the measurement job measures is what consumers request of it
-//! ([`requests`]), in the order of who waits on it.
+//! streamed decode is priced from the plan's structure through the one step
+//! model ([`streamed`]), on the machine's stored figures and the one generic
+//! miss model; a load prices its own bank on the same step, beside what its
+//! decode read this session ([`DecodePrice`]). What the
+//! measurement job measures is assessment's standing requests, fixed per
+//! backend, then what loads request of it at runtime ([`requests`]).
 
 pub mod assess;
 #[cfg(test)]
@@ -22,10 +24,12 @@ pub mod executor_costs;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod launches;
+pub mod miss_model;
 pub mod misses;
 pub mod priced;
 pub mod requests;
 pub mod step;
+pub mod streamed;
 pub mod streaming;
 pub mod streaming_costs;
 
@@ -53,17 +57,15 @@ pub use priced::Priced;
 pub(crate) use streaming_costs::CpuForm;
 pub use requests::{PointRequest, PointRequests, SiteRequest, Waiter};
 pub use step::{LayerLoad, Lead, ReadAhead, StepInputs, StepTime};
-pub use misses::{
-    Anticipated, HeldSlots, HintCounts, LaunchResiduals, LaunchSample, LayerStep, MissMergeError, MissRecord, MissRecordError, RecordFeed,
-    Residuals, StoredMisses, MeasuredLayer, StreamedStep, TableCurve, TableRange, MISS_RATE_ERROR,
-};
+pub use streamed::{DecodePrice, LayerReads, LiveDecode, StreamedError, StreamedFigures, StreamedLayers};
+pub use misses::{Anticipated, HeldSlots, HintCounts, LayerStep, StreamedStep, TableCurve, TableRange};
 pub use streaming::{
     BankSlots, DecodeWaiting, GroupLayerTerms, GroupReads, GroupUnion, Notice, PlaceGrant, Places, Stages,
 };
 pub use streaming_costs::{
     CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, RecordLine,
     CONVERTED_RECORDS,
-    CpuCosts, GraphMemory, MoveLines, ReadLine, ReadLineError, RequestReads, TierCopyCosts, TierCopyError, TierCopyPoint, StoredVolume, VolumeCosts,
+    CpuCosts, GraphMemory, MoveLines, ReadLine, ReadLineError, RequestReads, StorageCosts, StorageError, TierCopyCosts, TierCopyError, TierCopyPoint, StoredVolume, VolumeCosts,
 };
 
 use crate::GraphError;

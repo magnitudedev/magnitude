@@ -648,29 +648,23 @@ impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
 /// (`assessment::step_seconds`, a row a sequence).
 pub type ResidentStep = dyn Fn(u32, u32) -> Result<f64, crate::assessment::AssessmentError>;
 
-/// Where a streamed load stores each miss record as it is due: in place of
-/// what the load stored last, within what every load stored
-/// (`MissRecord::restored`), under the store's lock.
-pub type MissStore = dyn Fn(&crate::assessment::MissRecord) -> Result<(), MissStoreError>;
-
 /// What every streamed load prices its experts' decisions on, each input in
 /// its state (`assessment::Priced`): a decision whose input is pending runs
 /// its policy that needs no cost until the measurement job stores it and the
-/// load prices again ([`ExecutorDomain::measure_experts`]). Each record is
-/// the load's own as it is due (it prices the bank's growth), and is stored
-/// merged onto earlier loads' where the host keeps them.
+/// load prices again ([`ExecutorDomain::measure_experts`]). Its decode is
+/// priced on the generic miss model beside what the load's own decode read
+/// ([`ExecutorDomain::decode_price`]).
 pub struct ExpertMeasures {
     /// Each streamed layer's lines on this executor, the host's the bank
     /// holds and the GPU's its kernels' costs price
-    /// (`assessment::ExpertLines::priced`): σ's residuals and the records
-    /// are taken along them, and the route's policy words are written from
-    /// them. Until measured, every miss is served on the GPU's path, no
-    /// record is due, and nothing grows.
+    /// (`assessment::ExpertLines::priced`): the decode is priced along them,
+    /// and the route's policy words are written from them. Until measured,
+    /// every miss is served on the GPU's path, and nothing grows.
     pub lines: crate::assessment::Priced<std::sync::Arc<[crate::assessment::ExpertLines]>>,
-    /// Where the records are stored; none where the host keeps no store or
-    /// the model has no key to keep them under (reported where the store is
-    /// built), and they live for the load alone.
-    pub store: Option<Box<MissStore>>,
+    /// The model store's read line the decode's file misses take, the
+    /// measurement job's (`assessment::StreamedFigures`), which also prices
+    /// a stored table's records.
+    pub read: crate::assessment::Priced<crate::assessment::ReadLine>,
     /// What the bank's growth is priced on: until measured, nothing grows.
     pub resident: crate::assessment::Priced<Box<ResidentStep>>,
     /// What a routed pass over each streamed layer's experts costs on this
@@ -693,26 +687,6 @@ pub struct ExpertMeasures {
     /// measured, the host lands every miss.
     pub convert: crate::assessment::Priced<Option<std::sync::Arc<[crate::assessment::RecordLine]>>>,
 }
-
-/// Why a streamed load's miss record was not stored.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MissStoreError {
-    /// The store refused the record.
-    Store(seismic::measure::StoreError),
-    /// The load's record does not merge onto the stored one.
-    Merge(crate::assessment::MissMergeError),
-}
-
-impl std::fmt::Display for MissStoreError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Store(error) => write!(formatter, "the miss record could not be stored: {error}"),
-            Self::Merge(error) => write!(formatter, "the miss record does not merge onto the stored one: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for MissStoreError {}
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Each streamed layer's lines as the bank's load measured them
@@ -778,10 +752,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         _between_flights: &mut StateBindings,
     ) -> Result<(), DomainError> {
         tracing::info!(
-            records = match measures.store {
-                None => "kept for the load alone",
-                Some(_) => "stored",
-            },
+            read = measures.read.why().unwrap_or("measured"),
             lines = measures.lines.why().unwrap_or("measured"),
             resident = measures.resident.why().unwrap_or("measured"),
             pass = measures.pass.why().unwrap_or("measured"),
@@ -843,6 +814,28 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.experts.as_ref().map(|measures| &measures.lines)
     }
 
+    /// The load's decode step as its experts' decisions price it now
+    /// ([`crate::assessment::DecodePrice`]): its variant's routing
+    /// calibrated by the decode it counted, at that decode's mean rows and
+    /// context, on the resident step of those rows there. None before its
+    /// lines, routing, read line and resident step are measured, or before
+    /// it counted a decode step.
+    pub(crate) fn decode_price(&self) -> Result<Option<crate::assessment::DecodePrice>, DomainError> {
+        let (Some(measures), Some(bank)) = (self.experts.as_ref(), self.family.expert_bank()) else {
+            return Ok(None);
+        };
+        let measured = (measures.lines.measured(), measures.read.measured(), measures.resident.measured());
+        let (Some(lines), Some(&read), Some(resident)) = measured else {
+            return Ok(None);
+        };
+        let Some(live) = bank.live() else {
+            return Ok(None);
+        };
+        let rows = live.rows.round() as u32;
+        let compute = resident(rows, live.depth).map_err(|error| DomainError::invariant(format!("the resident step: {error}")))?;
+        Ok(Some(crate::assessment::DecodePrice::new(bank.streamed_layers(lines.clone()), live, read, compute)))
+    }
+
     /// What a routed pass over each streamed layer's experts costs, in its
     /// state; none before [`Self::measure_experts`].
     pub fn expert_pass(&self) -> Option<&crate::assessment::Priced<crate::assessment::ExpertPass>> {
@@ -864,29 +857,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 }
 
-/// How a completed step of `work` has its misses recorded by a load
+/// Whether a completed step of `work` has its decode counted by a load
 /// measuring its experts by `experts`: not before
 /// [`ExecutorDomain::measure_experts`], and only generation's (a prompt's
-/// rows, even in the decode form, are no decode step the record prices);
-/// then by each layer's lines where the load has them, which σ's residuals
-/// need.
+/// rows, even in the decode form, are no decode step its decisions price).
 fn recording(experts: Option<&ExpertMeasures>, work: crate::operation::LaunchWork) -> Option<crate::experts::Recording> {
-    experts.filter(|_| work == crate::operation::LaunchWork::Generation).map(|measures| crate::experts::Recording {
-        lines: measures.lines.measured().cloned(),
-    })
-}
-
-/// Store a record due where a load measuring its experts by `experts` keeps
-/// them. A record the store refuses is reported, as a cache write that fails
-/// is: the load prices on its own records all the same, and only later loads
-/// lose it.
-fn publish_misses(experts: Option<&ExpertMeasures>, record: Option<std::sync::Arc<crate::assessment::MissRecord>>) {
-    let (Some(record), Some(ExpertMeasures { store: Some(store), .. })) = (record, experts) else {
-        return;
-    };
-    if let Err(error) = store(&record) {
-        tracing::warn!("{error}");
-    }
+    experts.filter(|_| work == crate::operation::LaunchWork::Generation).map(|_| crate::experts::Recording)
 }
 
 /// The expert bank's resizes: how many began so far, and whether one runs

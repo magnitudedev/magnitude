@@ -7,21 +7,28 @@
 //!   beside the executor. Its points are measured once their records exist;
 //!   a request whose points all have records is satisfied, and is forgotten
 //!   as it is next read ([`PointRequests::outstanding`]).
-//! - **Who waits** ([`Waiter`]): a load serving with a decision pending on a
-//!   request touches it when it loads and each time it prices again, so the
-//!   load that touched last (the resident one) is measured for first, its
-//!   requests in the order it lists them; then assessment's standing
-//!   request for the executor's costs ([`PointRequest::Costs`]) where no
-//!   load requested them, which is never absent: every estimate waits on
-//!   it.
+//! - **Assessment's standing requests** ([`standing`]): the figures every
+//!   estimate is made from, fixed per backend and of no model: what its
+//!   graphs hold ([`PointRequest::GraphCost`]), the model store's read line ([`PointRequest::Storage`]), the host memory's line
+//!   where a bank can have a host tier ([`PointRequest::HostMemory`]), and
+//!   the executor's costs ([`PointRequest::Costs`]). They are measured first,
+//!   whatever a load asks, so one job's time is allocated across them alone
+//!   and no load moves them later or earlier.
+//! - **Who waits** ([`Waiter`]): a load serving with a runtime decision
+//!   pending on a request (its sites, moves, converts, tier copies and
+//!   volumes) touches it when it loads and each time it prices again, so
+//!   the load that touched last (the resident one) is measured for next,
+//!   its requests in the order it lists them. A load's requests are its
+//!   runtime's: none enters assessment, which waits on its standing
+//!   requests alone.
 //! - **The job** ([`measure`]) measures the outstanding requests in that
 //!   order within its time, each point sampling for an equal part of what
 //!   is left, and stops where its time ends: the next job resumes from the
 //!   records stored. No load measures, and no load waits on the job.
 
-use super::executor_costs::{executor_identity, retraced, walk_points, ExecutorCostsError, Measurement, Scope, Visit, Walks};
-use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
-use super::{Priced, StoredCosts};
+use super::executor_costs::{executor_identity, walk_points, ExecutorCostsError, Measurement, Visit, Walks};
+use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
+use super::Priced;
 use crate::native::SiteForm;
 use crate::planning::BankBinding;
 use magnitude_kernels::constants::DECODE_ROWS;
@@ -38,26 +45,25 @@ pub enum PointRequest {
     /// precision system, then its pool and lines (`CpuCosts`). Until both
     /// are stored the site serves nothing.
     Site(SiteRequest),
-    /// The executor's whole cost walk (`ExecutorCosts`): assessment's
-    /// standing request, every estimate's input, and a streamed load's
-    /// request after host storage's routes, as its lines, pass and resident
-    /// step read it.
+    /// The executor's whole cost walk (`ExecutorCosts`): a standing
+    /// request, every estimate's input.
     Costs,
-    /// The probe and host storage's routes of the walk: a host tier's link
-    /// line (`ExpertPass::lines`).
-    HostRoutes,
+    /// The read line of the volume `directory` lies on (`StorageCosts`): a
+    /// standing request, every streamed estimate's file reads.
+    Storage { directory: std::path::PathBuf },
     /// A bank group's shrink move line at its record form and moves
     /// (`MoveCosts`).
     Moves(MoveForm),
     /// A bank group's convert ceiling at its record form (`ConvertCosts`).
     Convert(ConvertForm),
     /// The host memory's read line with `readers` threads reading at once
-    /// (`MemoryCosts`): a host tier's record read from host memory.
+    /// (`MemoryCosts`): a host tier's record read from host memory, a
+    /// standing request where a bank can have one.
     HostMemory { readers: u64 },
     /// The blocks a host tier's copy takes over the link (`TierCopyCosts`).
     TierCopy,
-    /// What the executor's recorded graphs hold (`GraphMemory`): a load
-    /// prices its graphs at its backend's bound
+    /// What the executor's recorded graphs hold (`GraphMemory`): a standing
+    /// request, every fit's graphs, priced at its backend's bound
     /// (`seismic::unmeasured_graph_cost`) until it is recorded.
     GraphCost,
     /// How the volume `file` lies on is read, for the urgent request of
@@ -78,7 +84,7 @@ impl PointRequest {
     pub fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>, costs_outstanding: bool) -> bool {
         match self {
             Self::Costs => costs_outstanding,
-            Self::HostRoutes => walk_outstanding(topology, executor, store, Scope::HostRoutes),
+            Self::Storage { directory } => StorageCosts::outstanding(topology, executor, directory, store),
             Self::Moves(form) => {
                 matches!(MoveCosts::stored(topology, executor, *form, store), Err(MoveError::Unrecorded { .. }))
             }
@@ -101,11 +107,10 @@ impl PointRequest {
     /// The points the job visits for it.
     fn points(&self, topology: &DeviceTopology, executor: &Executor) -> Result<usize, ExecutorCostsError> {
         match self {
-            Self::Costs => walk_points(topology, executor, Scope::Whole),
-            Self::HostRoutes => walk_points(topology, executor, Scope::HostRoutes),
+            Self::Costs => walk_points(topology, executor),
             // Two points each: a line's ends, or a site's admission and its
             // pool's lines.
-            Self::Moves(_) | Self::Convert(_) | Self::HostMemory { .. } | Self::TierCopy | Self::Site(_) => Ok(2),
+            Self::Storage { .. } | Self::Moves(_) | Self::Convert(_) | Self::HostMemory { .. } | Self::TierCopy | Self::Site(_) => Ok(2),
             // Measured as the job's device opened: nothing to time.
             Self::GraphCost => Ok(0),
             // One probe of the volume, its own points its own.
@@ -118,8 +123,8 @@ impl PointRequest {
     /// not be read outside its points' timings.
     fn measure(&self, walks: &mut Walks<'_, '_>) -> (Option<ExecutorCostsError>, Vec<ExecutorCostsError>) {
         match self {
-            Self::Costs => walks.walk(Scope::Whole),
-            Self::HostRoutes => walks.walk(Scope::HostRoutes),
+            Self::Costs => walks.walk(),
+            Self::Storage { directory } => (StorageCosts::measure(directory, walks).err().map(|error| ExecutorCostsError(error.to_string())), Vec::new()),
             Self::Moves(form) => (form.measure(walks).err(), Vec::new()),
             Self::Convert(form) => (form.measure(walks).err(), Vec::new()),
             Self::HostMemory { readers } => {
@@ -229,9 +234,24 @@ impl SiteRequest {
     }
 }
 
-/// Whether the walk of `scope` has a point no record holds.
-fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>, scope: Scope) -> bool {
-    retraced(topology, executor, store, scope).is_ok_and(|stored| stored.outstanding())
+/// Whether the walk has a point no record holds.
+#[cfg(test)]
+fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> bool {
+    super::executor_costs::retraced(topology, executor, store).is_ok_and(|stored| stored.outstanding())
+}
+
+/// Assessment's standing requests on `executor`, in the order the job
+/// measures them: what its graphs hold, which its device read as it opened;
+/// the read line of the volume the model store `storage`
+/// lies on, the host memory's line with every CPU reading where a bank can
+/// have a host tier (a discrete device), and the executor's costs. Each is
+/// of the machine alone, so what is measured is fixed per backend.
+pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) -> Result<Vec<PointRequest>, String> {
+    let tier = (!topology.shared_ranges_lie_in_device_memory(executor))
+        .then(|| std::thread::available_parallelism().map(|readers| PointRequest::HostMemory { readers: readers.get() as u64 }))
+        .transpose()
+        .map_err(|error| format!("the host's processors: {error}"))?;
+    Ok([PointRequest::GraphCost, PointRequest::Storage { directory: storage.to_owned() }].into_iter().chain(tier).chain([PointRequest::Costs]).collect())
 }
 
 /// Who waits on a stored request: a load, as of the latest time it touched
@@ -317,18 +337,21 @@ impl PointRequests {
     }
 
     /// The requests on `executor` whose points `store`'s records do not all
-    /// hold, the load that waited latest first, then assessment's standing
-    /// request for the costs where its walk is not whole
-    /// (`costs_outstanding`, as [`PointRequest::outstanding`] takes it); each
-    /// request satisfied is forgotten.
+    /// hold: assessment's standing requests of the model store `storage`
+    /// ([`standing`]) first, then the loads', the load that waited latest
+    /// first; each load's request satisfied is forgotten. The costs' is
+    /// `costs_outstanding`, as [`PointRequest::outstanding`] takes it.
     pub fn outstanding(
         &self,
         topology: &DeviceTopology,
         executor: &Executor,
+        storage: &Path,
         store: &dyn RecordStore<PointKey>,
         costs_outstanding: bool,
     ) -> Result<Vec<PointRequest>, String> {
         let identity = executor_identity(topology, executor).map_err(|error| error.to_string())?;
+        let mut requests = standing(topology, executor, storage)?;
+        requests.retain(|request| request.outstanding(topology, executor, store, costs_outstanding));
         let mut waiting = Vec::new();
         for stored in self.files.values::<Stored>(LARGEST_REQUEST).map_err(|error| error.to_string())? {
             if stored.executor != identity {
@@ -340,10 +363,8 @@ impl PointRequests {
             }
         }
         waiting.sort_by(|first, second| second.waiter.cmp(&first.waiter));
-        let mut requests = waiting.into_iter().map(|stored| stored.request).collect::<Vec<_>>();
-        if !requests.contains(&PointRequest::Costs) && costs_outstanding {
-            requests.push(PointRequest::Costs);
-        }
+        let loads = waiting.into_iter().map(|stored| stored.request).filter(|request| !requests.contains(request)).collect::<Vec<_>>();
+        requests.extend(loads);
         Ok(requests)
     }
 }
@@ -397,29 +418,35 @@ mod tests {
         (topology, executor, identity)
     }
 
-    /// Requests are kept across readers; a later touch moves a request
-    /// ahead and an earlier one does not; each executor's are its own.
+    /// Requests are kept across readers, after the standing requests; a
+    /// later touch moves a load's request ahead and an earlier one does not;
+    /// each executor's are its own.
     #[test]
     fn requests_are_durable_and_the_latest_waiter_first() {
         let root = std::env::temp_dir().join(format!("point-requests-{}", std::process::id()));
+        let storage = std::env::temp_dir();
         let requests = PointRequests::new(&root);
         let (topology, executor, identity) = host();
         // Another executor's identity: the recorded RTX 3090's CUDA one.
         let recorded = seismic::fixtures::recorded::rtx3090();
         let other = recorded.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Cuda).unwrap();
         let other_identity = recorded.executor_identity(other.id()).unwrap();
-        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 5, rank: 0 }).unwrap();
-        requests.request(&identity, PointRequest::Costs, Waiter { touched: 7, rank: 0 }).unwrap();
-        requests.request(&other_identity, PointRequest::HostRoutes, Waiter { touched: 9, rank: 0 }).unwrap();
+        let (tier, moves) = (PointRequest::TierCopy, PointRequest::HostMemory { readers: 1 });
+        requests.request(&identity, tier.clone(), Waiter { touched: 5, rank: 0 }).unwrap();
+        requests.request(&identity, moves.clone(), Waiter { touched: 7, rank: 0 }).unwrap();
+        requests.request(&other_identity, tier.clone(), Waiter { touched: 9, rank: 0 }).unwrap();
         let records = seismic::measure::HeldStore::default();
-        let costs = walk_outstanding(&topology, &executor, &records, Scope::Whole);
-        let order = |requests: &PointRequests| requests.outstanding(&topology, &executor, &records, costs).unwrap();
-        assert_eq!(order(&requests), [PointRequest::Costs, PointRequest::HostRoutes]);
-        // A later touch moves the host routes ahead; an earlier does not
-        // move them back. Another reader sees the same.
-        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 8, rank: 0 }).unwrap();
-        requests.request(&identity, PointRequest::HostRoutes, Waiter { touched: 1, rank: 0 }).unwrap();
-        assert_eq!(order(&PointRequests::new(&root)), [PointRequest::HostRoutes, PointRequest::Costs]);
+        let costs = walk_outstanding(&topology, &executor, &records);
+        let standing = standing(&topology, &executor, &storage).unwrap();
+        let order = |requests: &PointRequests| requests.outstanding(&topology, &executor, &storage, &records, costs).unwrap();
+        // What the machine measures of them: a unified device has no tier copy.
+        let measured = |listed: Vec<PointRequest>| listed.into_iter().filter(|request| request.outstanding(&topology, &executor, &records, costs)).collect::<Vec<_>>();
+        assert_eq!(order(&requests), measured([standing.clone(), vec![moves.clone(), tier.clone()]].concat()));
+        // A later touch moves the tier copy ahead; an earlier does not move
+        // it back. Another reader sees the same.
+        requests.request(&identity, tier.clone(), Waiter { touched: 8, rank: 0 }).unwrap();
+        requests.request(&identity, tier.clone(), Waiter { touched: 1, rank: 0 }).unwrap();
+        assert_eq!(order(&PointRequests::new(&root)), measured([standing, vec![tier, moves]].concat()));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -459,14 +486,21 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// Assessment's costs are always waited on: with no load's request, the
-    /// costs alone are outstanding while their walk is not whole.
+    /// Assessment's standing requests are always waited on, and are of the
+    /// machine alone: with no load's request, the model store's read line,
+    /// then the host memory's line where a bank can have a host tier, then
+    /// the costs, while none is measured.
     #[test]
-    fn the_costs_are_a_standing_request() {
+    fn the_standing_requests_are_the_machines() {
         let root = std::env::temp_dir().join(format!("point-requests-standing-{}", std::process::id()));
         let (topology, executor, _) = host();
+        let storage = std::env::temp_dir();
         let records = seismic::measure::HeldStore::default();
-        let costs = walk_outstanding(&topology, &executor, &records, Scope::Whole);
-        assert_eq!(PointRequests::new(&root).outstanding(&topology, &executor, &records, costs).unwrap(), [PointRequest::Costs]);
+        let costs = walk_outstanding(&topology, &executor, &records);
+        let outstanding = PointRequests::new(&root).outstanding(&topology, &executor, &storage, &records, costs).unwrap();
+        assert_eq!(outstanding.first(), Some(&PointRequest::Storage { directory: storage.clone() }));
+        assert_eq!(outstanding.last(), Some(&PointRequest::Costs));
+        let measured = standing(&topology, &executor, &storage).unwrap().into_iter().filter(|request| request.outstanding(&topology, &executor, &records, costs)).collect::<Vec<_>>();
+        assert_eq!(outstanding, measured);
     }
 }

@@ -574,8 +574,8 @@ fn promotions_bring_each_layers_share_into_the_bank() {
     );
 }
 
-/// The stack counts every decode step it reads, counted into the record
-/// or not, by depth: what a reserve is sized by, at the whole share,
+/// The stack counts every decode step it reads, counted into the live
+/// decode or not, by depth: what a reserve is sized by, at the whole share,
 /// whether or not the load records.
 #[test]
 fn the_stack_counts_every_decode_reads_misses_at_its_share() {
@@ -587,7 +587,7 @@ fn the_stack_counts_every_decode_reads_misses_at_its_share() {
     // depth 1), step 3 misses 3; at a share of 1, step 2 misses 0 too.
     assert_eq!(stack.decoded().steps, 3);
     assert_eq!((stack.decoded().layers[0].at(1).1, stack.decoded().layers[0].at(2).1), (5, 4));
-    assert_eq!(stack.curve().steps, 0, "none counted into the record");
+    assert_eq!(stack.live(), None, "none counted into the live decode");
 }
 
 /// A group's reserve keeps records free beyond its wants, its shares

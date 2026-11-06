@@ -3966,12 +3966,8 @@ async fn live_fixture_reaching(
         Arc::new(NoCatalogEffects),
     )
     .expect("model services");
-    let assessor = Arc::new(ModelAssessor::new(
-        Arc::clone(&models),
-        resolver.clone(),
-        Arc::new(ReleaseCatalog::without_material(catalog).expect("release catalog")),
-        environment,
-    ));
+    let release = Arc::new(ReleaseCatalog::without_material(catalog).expect("release catalog"));
+    let assessor = Arc::new(ModelAssessor::new(Arc::clone(&models), resolver.clone(), release.clone(), environment));
     let candidates = ManagedModelCandidates::new(
         assessor,
         lineage,

@@ -3,11 +3,14 @@
 //! ([`super::cost`]): the reads, landings, moves and transfers the cost
 //! function, the prompt-group model and the shrink take from measurement.
 //!
-//! - **The served file's read line** ([`RequestReads::line`]): a read of
-//!   `b` bytes takes `λ + b / D`, from the load's own reads of its served
-//!   file: `D` the volume's bytes over its busy time, `λ` what its demand
-//!   reads took beyond that. A run is judged by it, and its miss record
-//!   carries it to the estimates made from the record.
+//! - **The model store's read line** ([`StorageCosts`]): a read of `b`
+//!   bytes takes `λ + b / D`, measured by the job on a probe file of its
+//!   own in the store, of no model: what assessment prices every streamed
+//!   model's file reads by.
+//! - **The served file's read line** ([`RequestReads::line`]): the same
+//!   line from a load's own reads of its served file, `D` the volume's bytes
+//!   over its busy time and `λ` what its demand reads took beyond that: a
+//!   run is judged by it.
 //! - **The landing line** ([`FileLine`]): what a request's file misses add
 //!   past their read as they land into the host tier.
 //! - **The shrink's move line** ([`MoveCosts`]), per bank group: moving `n`
@@ -1411,6 +1414,163 @@ impl VolumeCosts {
             store.store(&Self::key(&identity, file, urgent, schema, term, &at)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
         }
         Ok(())
+    }
+}
+
+/// The read line of the volume a directory lies on ([`ReadLine`]): a read
+/// of `b` bytes takes `λ + b/D`. A figure of the measurement job, kept in the
+/// record store keyed by the executor and the volume, of no model: the job
+/// reads its own probe file there (`seismic_io::disk::StorageProbe`), so
+/// every model the volume stores, loaded or not, is priced by one line. Two
+/// points, each timed for its part of the job's time as every point is: a
+/// full read, `FULL_DEPTH` readers each reading `FULL_READ` at once (its
+/// seconds a byte, `1/D`), and a lone read of `LONE_READ` (`λ` what it takes
+/// past its bytes at `D`, at least none).
+pub struct StorageCosts;
+
+/// Why there is no read line of a volume.
+#[derive(Debug)]
+pub enum StorageError {
+    /// The volume's identity could not be read.
+    Volume(String),
+    /// The job has not measured `point` yet.
+    Unrecorded { point: &'static str },
+    /// The job recorded `point` unobtainable.
+    Unobtainable { point: &'static str, reason: Reason },
+    /// Its records make no line.
+    Line(InvalidLine),
+    Costs(ExecutorCostsError),
+    Store(StoreError),
+}
+
+impl fmt::Display for StorageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Volume(cause) => write!(formatter, "the model store's volume: {cause}"),
+            Self::Unrecorded { point } => write!(formatter, "the model store's {point} read is not measured yet"),
+            Self::Unobtainable { point, reason } => write!(formatter, "the model store's {point} read cannot be measured: {reason}"),
+            Self::Line(invalid) => write!(formatter, "the model store's read line: {invalid}"),
+            Self::Costs(error) => error.fmt(formatter),
+            Self::Store(error) => write!(formatter, "the model store's read line record: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
+
+impl From<ExecutorCostsError> for StorageError {
+    fn from(error: ExecutorCostsError) -> Self {
+        Self::Costs(error)
+    }
+}
+
+impl From<StoreError> for StorageError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+/// The storage line's two points.
+const STORAGE_POINTS: [&str; 2] = ["full", "lone"];
+
+impl StorageCosts {
+    fn key(identity: &seismic::Identity, directory: &Path, point: &str) -> Result<PointKey, StorageError> {
+        let volume = seismic::volume_identity(directory).map_err(|cause| StorageError::Volume(cause.to_string()))?;
+        let mut configuration = named(&[("storage", 1), ("volume_device", volume.device)]);
+        configuration.insert(format!("volume_{}", volume.uuid.as_deref().unwrap_or("unnamed")), 1);
+        Ok(PointKey { executor: identity.clone(), kernels: Vec::new(), configuration, point: named(&[(point, 1)]) })
+    }
+
+    /// The read line of `directory`'s volume that `store`'s records give,
+    /// measuring nothing; why there is none.
+    pub fn stored(
+        topology: &DeviceTopology,
+        executor: &Executor,
+        directory: &Path,
+        store: &dyn RecordStore<PointKey>,
+    ) -> Result<ReadLine, StorageError> {
+        let identity = executor_identity(topology, executor)?;
+        let [full, lone] = STORAGE_POINTS.map(|point| match store.load(&Self::key(&identity, directory, point)?)? {
+            Some(Record::Measured(timing)) => Ok(timing.median),
+            Some(Record::Unobtainable { reason }) => Err(StorageError::Unobtainable { point, reason }),
+            None => Err(StorageError::Unrecorded { point }),
+        });
+        let byte_seconds = full? / (seismic_io::disk::FULL_DEPTH * seismic_io::disk::FULL_READ) as f64;
+        let latency = (lone? - seismic_io::disk::LONE_READ as f64 * byte_seconds).max(0.);
+        ReadLine::new(latency, byte_seconds).map_err(StorageError::Line)
+    }
+
+    /// Whether the job has a point of the line left to measure: one no
+    /// record holds. A volume whose identity cannot be read has none.
+    pub(super) fn outstanding(topology: &DeviceTopology, executor: &Executor, directory: &Path, store: &dyn RecordStore<PointKey>) -> bool {
+        matches!(Self::stored(topology, executor, directory, store), Err(StorageError::Unrecorded { .. }))
+    }
+
+    /// Measure the line's points in the job (`walks`), the probe file opened
+    /// (written first where it is not whole) by the first point taken.
+    pub(super) fn measure(directory: &Path, walks: &mut Walks<'_, '_>) -> Result<(), StorageError> {
+        let identity = walks.identity();
+        let probe = OnceCell::new();
+        for point in STORAGE_POINTS {
+            let probe = &probe;
+            walks.time_host(Self::key(&identity, directory, point)?, move || {
+                let probe = match probe.get() {
+                    Some(probe) => probe,
+                    None => {
+                        let opened = seismic_io::disk::StorageProbe::open(directory)
+                            .map_err(|cause| Unformed::Now(ExecutorCostsError(format!("the storage probe file: {cause}"))))?;
+                        probe.get_or_init(|| opened)
+                    }
+                };
+                Ok(StorageReads { probe, full: point == "full" })
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Reads of a storage probe, one a pass: a full read, or a lone one.
+struct StorageReads<'a> {
+    probe: &'a seismic_io::disk::StorageProbe,
+    full: bool,
+}
+
+impl Work for StorageReads<'_> {
+    type Error = String;
+    type Pending = Done;
+    /// Storage holds no clock a gauge raises.
+    type Clock = ();
+
+    fn submit(&self, passes: usize) -> Result<Done, String> {
+        let started = Instant::now();
+        match self.full {
+            true => self.probe.full(passes),
+            false => self.probe.lone(passes),
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(Done(started.elapsed().as_secs_f64()))
+    }
+
+    fn calls_per_pass(&self) -> usize {
+        1
+    }
+
+    /// Every read is past the host's file cache, at a random offset of a
+    /// file far larger than one pass reads.
+    fn submit_cold(&self, passes: usize) -> Result<Done, String> {
+        self.submit(passes)
+    }
+
+    fn cold_calls_per_pass(&self) -> usize {
+        1
+    }
+
+    fn clock(&self) -> Option<()> {
+        None
+    }
+
+    fn gauge(&self) -> Result<Box<dyn Gauge<String>>, String> {
+        Err("storage reads hold no clock to gauge".into())
     }
 }
 

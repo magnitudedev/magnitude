@@ -6,7 +6,7 @@ import {
   type GenerationPerformanceSamples,
   type LocalModel,
   type LocalModelServingState,
-  type LocalModelStreamedPerformance,
+  type LocalModelPerformance,
   type MachineMeasurement,
   type SpeculativeMethod,
 } from "@magnitudedev/sdk"
@@ -140,13 +140,12 @@ const measurementLabel = (measurement: MachineMeasurement): string =>
 
 /** A fit's speed, resident or streamed, as offered. */
 export const performanceRangeSpeedLabel = (
-  performance: LocalModelStreamedPerformance,
+  performance: LocalModelPerformance,
   contextLength: number
 ): string => {
   switch (performance._tag) {
     case "Pending": return measurementLabel(performance.measurement)
     case "Unavailable": return performance.failure.message
-    case "Unmeasured": return "Measured on its first streamed load"
     case "Estimated": {
       const speeds = localModelSpeedRangeContexts
         .map((contextTokens) => nearestSample(performance.samples, Math.min(contextTokens, contextLength)))

@@ -27,7 +27,8 @@
 //! implementation could reach at its cap on this machine, and the gaps
 //! between the three ([`streamed_bar`]), from the machine's own lines
 //! measured as the run loads ([`crate::machine`]); and its `estimate`, what
-//! assessment estimates it at from the stored miss record ([`estimated`]).
+//! assessment estimates it at from the plan's structure and the machine's
+//! stored figures ([`estimated`]).
 //! Its prefill cell runs a lone prompt as prompt groups, as the service
 //! does, and records the last timed sample's groups against their bar
 //! ([`prompt_groups`]).
@@ -101,8 +102,6 @@ pub fn run(
         .max()
         .expect("a fixture set is nonempty");
     let widest = time.concurrency.iter().copied().max().expect("a run has a concurrency");
-    // Read before the load stores a miss record of its own: the estimate is
-    // judged only from another load's.
     let assessment = assessment(artifacts, options);
     // The CPU's own lines, measured before the load runs anything beside
     // them: a streamed decode's bar prices a CPU-computed miss by them.
@@ -1324,7 +1323,6 @@ fn expert_step(costs: Option<magnitude_executor::ExpertCosts>, host_slots: Optio
         "sequence": sequence,
         "misses": cost.misses,
         "missed_bytes": cost.missed_bytes,
-        "launch": cost.launch,
         "layers": layers,
         "experts": experts,
         "host_slots": host_slots,
@@ -1385,8 +1383,7 @@ fn streamed_model(
     let misses = total("misses");
     let share = |name: &str| (misses > 0.).then(|| total(name) / misses);
     // The model is judged against the run, so its σ is measured apart from
-    // the model's exposure (a miss record's residual σ would make the model
-    // equal the run by construction): the all-hit steps' mean less `C`.
+    // the model's exposure: the all-hit steps' mean less `C`.
     let all_hit = window_steps(detail)?
         .iter()
         .filter(|step| step["expert_step"]["misses"] == json!(0))
@@ -1991,22 +1988,19 @@ fn streamed_bar(
 }
 
 /// What assessment estimates from, read before the load: the structure the
-/// service assesses on, this machine's measurements, the model prepared on
-/// them, the miss record stored before the load, and the kernel cache that
-/// keeps the records.
+/// service assesses on, this machine's measurements, and the model prepared
+/// on them.
 struct Assessment {
     structure: magnitude_engine::assessment::AssessmentStructure,
     measurements: magnitude_engine::assessment::Measurements,
     prepared: magnitude_engine::assessment::PreparedModelAssessment,
-    record: Option<magnitude_executor::assessment::MissRecord>,
-    cache: std::path::PathBuf,
 }
 
 /// The assessment the run's loads are judged by, as the service
 /// assesses the model on this machine; unavailable without a kernel cache.
 fn assessment(artifacts: &Artifacts, options: &EngineOptions) -> Result<Assessment, Unjudged> {
     use magnitude_engine::assessment::{
-        AssessmentStructure, ModelPackagePaths, PreparedModelAssessment, prepare_model_assessment,
+        AssessmentStructure, ModelPackagePaths, prepare_model_assessment,
     };
     use magnitude_engine::options::{ModelMethod, ModelPolicy, standard_service_limits};
     let cache = options
@@ -2023,7 +2017,8 @@ fn assessment(artifacts: &Artifacts, options: &EngineOptions) -> Result<Assessme
     let reserves = magnitude_executor::platform::MemoryReserves::standard();
     let structure = AssessmentStructure::discover(&catalog, options.device, Some(cache.as_path()), reserves, policy, standard_service_limits())
         .map_err(|error| error.to_string())?;
-    let measurements = structure.stored_measurements(cache);
+    let storage = magnitude_artifacts::model_store(&artifacts.target).map_err(|error| format!("{}: {error}", artifacts.target.display()))?;
+    let measurements = structure.stored_measurements(cache, &storage);
     let package = ModelPackagePaths {
         target: artifacts.target.clone(),
         projector: None,
@@ -2031,31 +2026,20 @@ fn assessment(artifacts: &Artifacts, options: &EngineOptions) -> Result<Assessme
         method: ModelMethod::Plain,
     };
     let prepared = prepare_model_assessment(&package, &structure).map_err(|error| error.to_string())?;
-    let record = match &prepared {
-        PreparedModelAssessment::Planned { facts, .. } => measurements.misses(facts.fingerprint.as_ref()).0?,
-        _ => None,
-    };
     Ok(Assessment {
         structure,
         measurements,
         prepared,
-        record,
-        cache: cache.clone(),
     })
 }
 
 /// The estimate of a streamed decode cell at `context` and `concurrency`: what
 /// assessment estimates its decode at, at the load's own slots and at every
 /// other, beside the host tier the window held ([`window_host_slots`]), from
-/// the miss record stored before this load, or without one the store's
-/// once this load stored its own, against the window's measured mean step,
-/// each per sequence. The estimate is structure and machine lines
-/// alone ([`magnitude_executor::assessment::MissRecord::step_seconds`]):
-/// the record's `σ`, what its launches measured past them, is reported
-/// beside it as its gap, never priced into it. Why it is unavailable, when
-/// an input is absent: the model unsupported here, no record stored, this
-/// machine's costs unmeasured, no estimate at a count of slots, no read
-/// line.
+/// the plan's structure and the machine's stored figures alone, against the
+/// window's measured mean step, each per sequence. Why it is unavailable,
+/// when an input is absent: the model unsupported here, this machine's
+/// costs or streamed figures unmeasured, no estimate at a count of slots.
 fn estimated(
     assessment: &Assessment,
     engine: &Engine,
@@ -2064,28 +2048,21 @@ fn estimated(
     cell: &Value,
 ) -> Result<Value, Unjudged> {
     use magnitude_engine::assessment::{Measurements, Performance, PreparedModelAssessment, streamed_estimate};
-    use magnitude_executor::assessment::{decode_pricing, step_seconds};
+    use magnitude_executor::assessment::{decode_pricing, step_seconds, Priced};
     let Assessment {
         structure,
         measurements,
         prepared,
-        record,
-        cache,
     } = assessment;
     let PreparedModelAssessment::Planned { facts, draft, execution, .. } = prepared else {
         return Err(unavailable("the model is unsupported here"));
     };
-    let (record, source) = match record {
-        Some(record) => (std::borrow::Cow::Borrowed(record), "stored before the load"),
-        None => {
-            let stored = structure.stored_measurements(cache).misses(facts.fingerprint.as_ref()).0?
-                .ok_or_else(|| unavailable("no load stored a miss record, this one's included"))?;
-            (std::borrow::Cow::Owned(stored), "the store's, this load's included")
-        }
-    };
-    let record = record.as_ref();
-    let Measurements::Measured { costs: machine, .. } = measurements else {
+    let Measurements::Measured { costs: machine, streamed, .. } = measurements else {
         return Err(unavailable("this machine's costs are not measured"));
+    };
+    let figures = match streamed {
+        Priced::Measured(figures) => figures,
+        Priced::Pending(why) | Priced::Unavailable(why) => return Err(unavailable(format!("the streamed figures: {why}"))),
     };
     let costs = engine.domain.expert_costs().ok_or("the load streams no experts")?;
     let own = costs.slots;
@@ -2103,73 +2080,39 @@ fn estimated(
     let mut by_slots = Vec::new();
     for slots in 1..=costs.experts {
         let held = magnitude_executor::assessment::HeldSlots { slots, host };
-        let performance = streamed_estimate(machine, record, execution, draft, &request, held)
+        let performance = streamed_estimate(machine, figures, execution, draft, &request, held)
             .map_err(|error| error.to_string())?;
         let Performance::Estimated(estimates) = performance else {
             return Err(unavailable(format!("at {slots} slots: {performance:?}")));
         };
         let estimate = estimates.iter().find(|estimate| estimate.context_tokens == context);
-        let (requests, misses) = record
-            .at(slots, concurrency as f64)
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .fold((0., 0.), |(requests, misses), (r, m)| (requests + r, misses + m));
-        by_slots.push((
-            slots,
-            estimate.ok_or("no estimate at the context")?.tokens_per_second,
-            misses,
-            requests,
-        ));
+        by_slots.push((slots, estimate.ok_or("no estimate at the context")?.tokens_per_second));
     }
     let estimated = by_slots
         .iter()
-        .find(|&&(slots, ..)| slots == own)
-        .map(|&(_, tok_s, ..)| tok_s)
+        .find(|&&(slots, _)| slots == own)
+        .map(|&(_, tok_s)| tok_s)
         .ok_or("no estimate at the load's slots")?;
     let measured = MS
         / cell["detail"]["window"]["wall_ms_per_step"]
             .as_f64()
             .ok_or("the window's mean step")?;
     // The resident step as the estimate prices it: at the request's rows and
-    // the context, and the record's σ over the resident launches of its rows.
+    // the context.
     let pricing = decode_pricing(draft, machine);
-    let resident = |rows: u32, depth: u32| {
-        step_seconds(execution.demand(), &pricing, u64::from(rows), depth)
-            .map(|step| step.total())
-            .map_err(|error| error.to_string())
-    };
-    let overhead = record
-        .overhead(&resident)?
-        .map_err(|error| error.to_string())?;
-    let line = record
-        .reads
-        .line()
-        .map_err(|error| unavailable(format!("the record's read line: {error}")))?;
+    let resident = step_seconds(execution.demand(), &pricing, u64::from(request.sequences), context)
+        .map_err(|error| error.to_string())?
+        .total();
     Ok(json!({
         "slots": own,
         "tok_s": estimated,
         "measured_tok_s": measured,
         "ratio": measured / estimated,
-        "record": {
-            "source": source,
-            "decode_steps": record.steps,
-            // What the record's launches measured past the step's terms,
-            // priced into the estimate.
-            "sigma": {
-                "ms": overhead * MS,
-                "launches_by_rows": record.residuals.rows.iter().map(|at| at.launches).collect::<Vec<_>>(),
-            },
-            "read_line": { "latency_ms": line.latency_seconds() * MS, "seconds_per_byte": line.seconds_per_byte() },
-        },
-        "resident_ms": resident(request.sequences, context)? * MS,
+        "read_line": { "latency_ms": figures.read.latency_seconds() * MS, "seconds_per_byte": figures.read.seconds_per_byte() },
+        "resident_ms": resident * MS,
         "by_slots": by_slots
             .iter()
-            .map(|&(slots, tok_s, misses, requests)| json!({
-                "slots": slots,
-                "tok_s": tok_s,
-                "misses_per_step": misses,
-                "requests_per_step": requests,
-            }))
+            .map(|&(slots, tok_s)| json!({ "slots": slots, "tok_s": tok_s }))
             .collect::<Vec<_>>(),
         "host_slots": host,
     }))

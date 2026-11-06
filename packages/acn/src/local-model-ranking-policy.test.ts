@@ -73,14 +73,6 @@ describe("modelRankingScores", () => {
     expect(scores).toEqual({ intelligence: 0.75, speed: Option.none(), fidelity: 0.5 })
   })
 
-  it("gives a streamed fit no speed term until its first streamed load has measured it", () => {
-    const scores = modelRankingScores({
-      ...candidate({ intelligence: 75, fidelity: 50 }),
-      performance: { _tag: "Unmeasured" },
-    })
-    expect(scores).toEqual({ intelligence: 0.75, speed: Option.none(), fidelity: 0.5 })
-  })
-
   it("uses the configured context as the comparison point below 50K", () => {
     const scores = modelRankingScores(candidate({
       context: 32_768,

@@ -144,19 +144,9 @@ pub struct KernelPoint {
     rotation: usize,
     arguments: Vec<EncodedArgs>,
     rotation_bytes: u64,
-    /// What runs beside the calls while the point is timed (work another
-    /// thread does on the device), held as long as the point or a gauge of
-    /// it is.
-    beside: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl KernelPoint {
-    /// The point timed with `beside` running for as long as it is held.
-    pub(crate) fn beside(mut self, beside: Arc<dyn std::any::Any + Send + Sync>) -> Self {
-        self.beside = Some(beside);
-        self
-    }
-
     /// Validate and place every call of `rotation`, then of its cold
     /// `copies`. Results of each argument set are allocated once and reused
     /// by every pass, a copy's being its source's, or taken from `outputs`
@@ -212,7 +202,6 @@ impl KernelPoint {
             rotation: own,
             arguments,
             rotation_bytes: distinct.into_iter().map(|(_, bytes)| bytes).sum(),
-            beside: None,
         })
     }
 
@@ -293,9 +282,7 @@ impl Work for KernelPoint {
     /// The rotation's calls placed again, with results of their own: a
     /// gauge submits passes alone.
     fn gauge(&self) -> Result<Box<dyn Gauge<CallError>>, CallError> {
-        let mut gauge = Self::place(&self.kernel, self.arguments.clone(), Vec::new(), None)?;
-        gauge.beside = self.beside.clone();
-        Ok(Box::new(gauge))
+        Ok(Box::new(Self::place(&self.kernel, self.arguments.clone(), Vec::new(), None)?))
     }
 }
 

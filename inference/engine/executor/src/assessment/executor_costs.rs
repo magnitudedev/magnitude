@@ -88,8 +88,7 @@ use magnitude_artifacts::gguf::Encoding;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
 use magnitude_family_contracts::{Rotary, ScaledActivations};
 use magnitude_kernels::{
-    attention_decode, attention_decode_k8v4, conditioning_overlay, constants, dense_expand, dense_output,
-    routed_move,
+    attention_decode, attention_decode_k8v4, conditioning_overlay, dense_expand, dense_output,
 };
 use magnitude_state::{HistoryEncoding, KvCodec};
 use seismic::measure::{Attempt, Measure, Outcome, Reason, Record, RecordStore, Timing, Unformed};
@@ -102,7 +101,6 @@ use seismic::{
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The format the composition chain's projections are resident in: the
 /// reference model's (Qwen3.5-9B at Q4).
@@ -269,21 +267,6 @@ impl MeasuredCost {
             value: timing.median,
             interval: timing.interval,
             samples: timing.samples,
-        }
-    }
-
-    /// `beside`'s time over `alone`'s: a ratio, its interval from the two
-    /// intervals' far ends, where both have one.
-    fn ratio(beside: &Timing, alone: &Timing) -> Self {
-        Self {
-            value: beside.median / alone.median,
-            interval: beside
-                .interval
-                .zip(alone.interval)
-                .map(|((beside_low, beside_high), (alone_low, alone_high))| {
-                    (beside_low / alone_high, beside_high / alone_low)
-                }),
-            samples: beside.samples.min(alone.samples),
         }
     }
 
@@ -570,13 +553,6 @@ pub struct ExecutorCosts {
     /// Host seconds of one submit and wait beyond its device time (decode
     /// without lookahead).
     pub step_round_trip_seconds: MeasuredCost,
-    /// What a shrink's release (a reservation's granules unmapped and
-    /// freed) costs device work running beside it: that work's time beside
-    /// a release over its time alone, where read (a backend that moves bank
-    /// records, whose move point is that work). A release slows a decode
-    /// step it overlaps by at most this ratio less one. The bank's own move
-    /// rate is measured at its record forms (`MoveCosts`).
-    pub release_step_ratio: Option<MeasuredCost>,
 }
 
 impl ExecutorCosts {
@@ -1104,8 +1080,6 @@ struct ProgramSet {
     dense: Program<attention_decode::Entry>,
     affine: Program<attention_decode_k8v4::Entry>,
     copy: Program<conditioning_overlay::Entry>,
-    /// An expert bank's record moves, over records of the chain's format.
-    moves: Program<routed_move::Entry>,
 }
 
 impl ProgramSet {
@@ -1113,8 +1087,8 @@ impl ProgramSet {
     /// expand, and one per formation beside them, each named here so a
     /// formation added to the set is counted.
     fn kernels(&self) -> u64 {
-        let Self { sizes: _, expands, chain: _, output, dense, affine, copy, moves } = self;
-        let beside = [output as &dyn std::any::Any, dense, affine, copy, moves].len() as u64;
+        let Self { sizes: _, expands, chain: _, output, dense, affine, copy } = self;
+        let beside = [output as &dyn std::any::Any, dense, affine, copy].len() as u64;
         expands.len() as u64 + beside
     }
 
@@ -1143,7 +1117,6 @@ impl ProgramSet {
             dense: Program::of(attend::<attention_decode::Entry>(KvCodec::Dense)?, backend),
             affine: Program::of(attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?, backend),
             copy: Program::of(copy(), backend),
-            moves: Program::of(moves(chain), backend),
         })
     }
 
@@ -1186,7 +1159,6 @@ impl ProgramSet {
             dense: Pending::new(),
             affine: Pending::new(),
             copy: Pending::new(),
-            moves: Pending::new(),
             formation: Arc::default(),
         };
         let (set, device, forming) = (self.clone(), device.clone(), programs.clone());
@@ -1222,7 +1194,6 @@ impl ProgramSet {
                     Job::Copy,
                     Job::Output,
                     Job::Expand(activation, Rows::Matrix),
-                    Job::Moves,
                 ];
                 // The chain's format is a backend's resident form of Q4_K,
                 // which may be the activation dtype's.
@@ -1265,19 +1236,8 @@ impl Programs {
             Job::Dense => self.dense.set(set.dense.form(device, None)),
             Job::Affine => self.affine.set(set.affine.form(device, None)),
             Job::Output => self.output.set(set.output.form(device, Some(1))),
-            Job::Moves => self.moves.set(set.moves.form(device, None)),
         }
     }
-}
-
-/// What of the walk a request reads ([`super::PointRequest`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Scope {
-    /// Its whole plan: assessment's costs.
-    Whole,
-    /// The probe and the routes beside device storage's: a host tier's
-    /// link line (`ExpertPass::lines`).
-    HostRoutes,
 }
 
 /// One program [`ProgramSet::form`] forms.
@@ -1288,7 +1248,6 @@ enum Job {
     Dense,
     Affine,
     Output,
-    Moves,
 }
 
 /// The F of `format`'s program: the executor's ([`Sizes`]), halved while a
@@ -1324,7 +1283,6 @@ struct Programs {
     dense: Forming<attention_decode::Entry>,
     affine: Forming<attention_decode_k8v4::Entry>,
     copy: Forming<conditioning_overlay::Entry>,
-    moves: Forming<routed_move::Entry>,
     /// The compiles running and the points that touch the host holding the
     /// formation between its programs ([`Self::quiet`]).
     formation: Arc<Compiles>,
@@ -1548,7 +1506,6 @@ impl Programs {
         self.dense.abandon();
         self.affine.abandon();
         self.copy.abandon();
-        self.moves.abandon();
         self.formation.abandon();
     }
 }
@@ -3047,157 +3004,6 @@ fn copy() -> Formation<conditioning_overlay::Entry> {
 /// one such pass per `LIST_ROWS` records from here on.
 pub(super) const MOVED_RECORDS: u64 = 32;
 
-/// A moved record's rows of [`HIDDEN`]: an expert's projection of the
-/// catalog's routed models (512 rows of 2048 in Qwen3.5-35B-A3B's), at the
-/// walk's H.
-const MOVED_ROWS: u64 = 512;
-
-/// `routed_move` over [`MOVED_RECORDS`] moves among twice as many records of
-/// `record`, [`MOVED_ROWS`] × [`HIDDEN`] each: what a bank's shrink carries.
-fn moves(record: Element) -> Formation<routed_move::Entry> {
-    Formation::new(
-        routed_move::native_entry_with(routed_move::Elements { U: record }),
-        &[("D", 2 * MOVED_RECORDS), ("L", MOVED_RECORDS), ("N", MOVED_ROWS), ("K", HIDDEN)],
-    )
-}
-
-/// Whether `backend` moves a bank's records (`routed_move` has its native
-/// there, as every entry of a streamed load does): only there does the walk
-/// read the moves.
-fn moves_records(backend: seismic::BackendName) -> Result<bool, ExecutorCostsError> {
-    seismic::generated::native_implementation_for_backend::<routed_move::Entry>(backend)
-        .map(|implementation| implementation.is_some())
-        .map_err(|error| failed(routed_move::Entry::NAME)(&error))
-}
-
-/// The bytes one moved record of `record` holds.
-fn moved_record_bytes(record: Element) -> Result<u64, ExecutorCostsError> {
-    record
-        .canonical_byte_len(&[MOVED_ROWS, HIDDEN])
-        .map_err(|error| failed("moved records")(&error))
-}
-
-/// A move point's operands: its records, zeros along device storage's first
-/// route, and its list, each upper record moved onto the one below it.
-struct MoveCase {
-    records: Tensor,
-    list: Tensor,
-}
-
-impl MoveCase {
-    fn new(device: &Device, record: Element) -> Result<Self, ExecutorCostsError> {
-        let error = failed("move operands");
-        let records = Tensor::zeros(device, record, &[2 * MOVED_RECORDS, MOVED_ROWS, HIDDEN])
-            .map_err(|cause| error(&cause))?;
-        let mut words = vec![0i32; magnitude_kernels::list_extent(MOVED_RECORDS) as usize];
-        words[constants::LIST_COUNT as usize] = MOVED_RECORDS as i32;
-        for entry in 0..MOVED_RECORDS {
-            let at = magnitude_kernels::list_extent(entry) as usize;
-            words[at + constants::LIST_FROM as usize] = (MOVED_RECORDS + entry) as i32;
-            words[at + constants::LIST_TO as usize] = entry as i32;
-        }
-        let mut list = Tensor::zeros(device, Element::i32(), &[words.len() as u64]).map_err(|cause| error(&cause))?;
-        let bytes = words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
-        list.write_from_host(&bytes).map_err(|cause| error(&cause))?;
-        Ok(Self { records, list })
-    }
-
-    fn args(&mut self) -> routed_move::Args<'_> {
-        routed_move::Args {
-            records: &mut self.records,
-            list: &self.list,
-        }
-    }
-}
-
-/// A reservation's granules released beside the move point
-/// ([`ReleaseCase`]): rows of the Metal and CUDA reservation granule, as
-/// many as keep a release running through each call. A release's slowdown
-/// of device work beside it does not grow with its bytes: on a GB10,
-/// releasing 1, 4 and 14 GB slowed copies running beside it from 9.43 ms to
-/// a median 10.06, 10.09 and 10.14 ms, and 500 small launches from 0.80 to
-/// 0.88 ms, 2026-10-28; at about 5 GB/s released, 256 MiB outlasts a call.
-const RELEASED_ROW: u64 = 2 << 20;
-const RELEASED_ROWS: u64 = 128;
-
-/// A thread releasing a reservation's granules beside timed device work
-/// (all but one in one release, as a bank's shrink releases its tail, and
-/// backed again), until dropped. On a GB10 and an M4 Pro, releasing one
-/// granule at a time instead, or timing 200 move calls a pass (a step's
-/// many launches) instead of one, read no consistently larger cost (GB10
-/// 1.13 this way, 1.01 with the 200 calls, 1.05 granule by granule; M4 Pro
-/// 1.05, 1.06 and 1.12, 8 samples each, 2026-10-28).
-struct Releases {
-    stop: Arc<AtomicBool>,
-    thread: std::sync::Mutex<Option<std::thread::JoinHandle<Result<(), String>>>>,
-}
-
-impl Releases {
-    fn start(device: &Device) -> Result<Self, ExecutorCostsError> {
-        let (tensor, resizer) = Tensor::reserved(device, Element::bool(), &[RELEASED_ROWS, RELEASED_ROW], RELEASED_ROWS)
-            .map_err(|cause| failed("a released reservation")(&cause))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
-        let thread = std::thread::spawn(move || {
-            let _held = tensor;
-            let mut resizer = resizer;
-            while !stopped.load(Ordering::Relaxed) {
-                for rows in [1, RELEASED_ROWS] {
-                    resizer = resizer.recommit(rows).map_err(|refusal| refusal.error.to_string())?;
-                }
-            }
-            Ok(())
-        });
-        Ok(Self { stop, thread: std::sync::Mutex::new(Some(thread)) })
-    }
-}
-
-impl Drop for Releases {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let thread = self.thread.get_mut().expect("the releases' lock").take().expect("releases end once");
-        if let Err(error) = thread.join().expect("the releases do not panic") {
-            panic!("the releases beside the move point failed: {error}");
-        }
-    }
-}
-
-/// The move point timed: its `routed_move` call over [`MOVED_RECORDS`]
-/// records of the chain's format, alone or, `releasing`, beside a
-/// reservation being released ([`Releases`]), the releases held by the
-/// point so they run for as long as it is timed (a case of the point's
-/// making is dropped once the point is made).
-fn move_timing<T: Times>(
-    programs: &ProgramSet,
-    times: &mut T,
-    share: Share,
-    releasing: bool,
-) -> Result<Timing, Stop<T::Missing>> {
-    let record = programs.chain;
-    let moved = [("records", MOVED_RECORDS), ("rows", MOVED_ROWS)];
-    let point = match releasing {
-        false => moved.to_vec(),
-        // Keyed apart from the records made while the point dropped its
-        // releases before timing them (`released_rows`), which measured none.
-        true => [&moved[..], &[("releasing_rows", RELEASED_ROWS)]].concat(),
-    };
-    let identities = vec![programs.moves.identity()?];
-    let mut build = move |device: &Device, formed: &Programs, _: &mut Backings| {
-        let kernel = formed.kernel(&formed.moves)?;
-        let mut case = MoveCase::new(device, record).map_err(Unformed::Now)?;
-        let rotation = vec![case.args()];
-        let point = match releasing {
-            false => kernel.point(rotation),
-            true => {
-                let releases = Releases::start(device).map_err(Unformed::Now)?;
-                kernel.point_beside(rotation, Arc::new(releases))
-            }
-        };
-        point.map(Point::Kernel).map_err(|error| Unformed::Now(failed(routed_move::Entry::NAME)(&error)))
-    };
-    times.time(PointSpec::new(identities, &[], &point), programs, &mut build, share)
-}
-
 fn attend<E: Attention>(layout: KvCodec) -> Result<Formation<E>, ExecutorCostsError> {
     Ok(Formation::new(E::entry(), &attention_values(layout)?))
 }
@@ -3494,10 +3300,6 @@ enum Step {
     Chain,
     /// A format's matrix throughput.
     Matrix(Element),
-    /// An expert bank's record moves.
-    Moves,
-    /// The record moves beside a reservation being released.
-    Releases,
 }
 
 /// A point of a weight rate: its pilot, its calls over one argument set,
@@ -3558,8 +3360,6 @@ impl fmt::Display for Step {
             }
             Self::Chain => formatter.write_str("the composition chain"),
             Self::Matrix(format) => write!(formatter, "the {} matrix throughput", format.name()),
-            Self::Moves => formatter.write_str("the expert bank's record moves"),
-            Self::Releases => formatter.write_str("the record moves beside a release"),
         }
     }
 }
@@ -3589,10 +3389,8 @@ impl fmt::Display for Step {
 /// 75K tokens 33% slow on its first rungs' line, 2026-10-22); then the
 /// formats' matrix throughputs, which their pilots price within the 7 to
 /// 9.4 eighths of a row's time eight rows took on a 12-core M6's CPU, and
-/// which price a step only where arithmetic bounds it. The expert bank's
-/// record moves follow the activation dtype's matrix throughput: no figure
-/// prices them unread.
-fn plan(routes: &[&Route], formats: &[Element], moves: bool) -> Vec<Step> {
+/// which price a step only where arithmetic bounds it.
+fn plan(routes: &[&Route], formats: &[Element]) -> Vec<Step> {
     let activation = Element::bf16();
     let others = formats
         .iter()
@@ -3615,10 +3413,6 @@ fn plan(routes: &[&Route], formats: &[Element], moves: bool) -> Vec<Step> {
     steps.extend(first_rungs(KvCodec::Dense));
     steps.push(Step::Chain);
     steps.push(Step::Matrix(activation));
-    // Unread, an expert bank's shrink is unpaced: one resize takes the
-    // whole deficit, however long its moves hold a decode step. Beside
-    // them, what the shrink's release costs device work running with it.
-    steps.extend(moves.then_some([Step::Moves, Step::Releases]).into_iter().flatten());
     steps.extend(first_rungs(KvCodec::AffineK8V4));
     steps.extend([GraphTiming::Waited, GraphTiming::Queued].map(Step::Launch));
     steps.extend(
@@ -3664,7 +3458,6 @@ fn walk<T: Times>(
     topology: &DeviceTopology,
     executor: &Executor,
     times: &mut T,
-    scope: Scope,
 ) -> Result<Walked<T::Missing>, Stop<T::Missing>> {
     let backend = executor.backend();
     let formats = &measured_formats(backend);
@@ -3678,7 +3471,7 @@ fn walk<T: Times>(
     let programs = ProgramSet::new(backend, Sizes::of(backend), formats, chain, largest)?;
     let (routes, placements) = Route::all(topology, executor)?;
     let routes = routes.iter().collect::<Vec<_>>();
-    let steps = plan(&routes, formats, moves_records(backend)?);
+    let mut steps = plan(&routes, formats);
     // Each step is one point, after the probe.
     let points = 1 + steps.len();
     let walk = Walk {
@@ -3690,7 +3483,7 @@ fn walk<T: Times>(
         // What shapes are sized to from records (a history rung, the
         // composition chain): a whole plan's equal part of a job's time. It
         // keys their records, so a start derives it from the same plan and
-        // retraces the same points, whatever the scope; it is no point's
+        // retraces the same points; it is no point's
         // part of a job's time, which follows the job's requests
         // (`Measured::left`).
         point_seconds: MEASUREMENT_SECONDS / points as f64,
@@ -3701,8 +3494,6 @@ fn walk<T: Times>(
     let mut pending = false;
     let mut missing = None;
     let mut failures = Vec::new();
-    let mut steps = steps;
-    scoped(&mut steps, &walk.routes, scope);
     for index in 0..steps.len() {
         // The formats' streaming rates are read in the order their pilots
         // price them furthest off ([`Read::overlap`]), once every pilot is
@@ -3751,20 +3542,12 @@ fn walk<T: Times>(
     })
 }
 
-/// The steps of a plan over `routes` that `scope` reads after its probe.
-fn scoped(steps: &mut Vec<Step>, routes: &[&Route], scope: Scope) {
-    if scope == Scope::HostRoutes {
-        steps.retain(|step| matches!(step, Step::WeightRate(route, _, Pass::Rate) if routes[*route].storage != OperandStorage::Device));
-    }
-}
-
-/// The points a walk of `scope` on `executor` visits, its probe among them:
+/// The points the walk on `executor` visits, its probe among them:
 /// what a job counts of it ahead ([`Measured::left`]).
-pub(super) fn walk_points(topology: &DeviceTopology, executor: &Executor, scope: Scope) -> Result<usize, ExecutorCostsError> {
+pub(super) fn walk_points(topology: &DeviceTopology, executor: &Executor) -> Result<usize, ExecutorCostsError> {
     let (routes, _) = Route::all(topology, executor)?;
     let routes = routes.iter().collect::<Vec<_>>();
-    let mut steps = plan(&routes, &measured_formats(executor.backend()), moves_records(executor.backend())?);
-    scoped(&mut steps, &routes, scope);
+    let steps = plan(&routes, &measured_formats(executor.backend()));
     Ok(1 + steps.len())
 }
 
@@ -3823,9 +3606,6 @@ struct Read {
     chain: Option<ChainRead>,
     activation_matrix: Option<MatrixCosts>,
     matrices: Vec<(Element, MatrixCosts)>,
-    /// The move point alone, and beside a reservation being released.
-    moves: Option<Timing>,
-    releases: Option<Timing>,
 }
 
 /// A history layout's ladder as the walk has read it.
@@ -3854,8 +3634,6 @@ impl Read {
             chain: None,
             activation_matrix: None,
             matrices: Vec::new(),
-            moves: None,
-            releases: None,
         }
     }
 
@@ -3961,10 +3739,6 @@ impl Read {
             },
             step_pipelined_seconds: beyond(queued),
             step_round_trip_seconds: beyond(waited),
-            release_step_ratio: self
-                .releases
-                .zip(self.moves)
-                .map(|(beside, alone)| MeasuredCost::ratio(&beside, &alone)),
         }))
     }
 }
@@ -4106,8 +3880,6 @@ impl Walk<'_> {
                     read.matrices.push((format, matrix));
                 }
             }
-            Step::Moves => read.moves = Some(move_timing(&self.programs, times, share, false)?),
-            Step::Releases => read.releases = Some(move_timing(&self.programs, times, share, true)?),
         }
         Ok(())
     }
@@ -4549,13 +4321,13 @@ impl<'a, 'd> Walks<'a, 'd> {
         self.measured.records.store
     }
 
-    /// Walk `scope`: why the walk ended before its end where no visited
+    /// Walk the plan: why the walk ended before its end where no visited
     /// point's outcome says (the probe's kernel identity that cannot be
     /// derived, or a placement the executor lacks), and why a step after
     /// the probe could not be read outside its points' timings (its figure
     /// stays priced).
-    pub(super) fn walk(&mut self, scope: Scope) -> (Option<ExecutorCostsError>, Vec<ExecutorCostsError>) {
-        let walked = walk(&self.topology, &self.executor, &mut self.measured, scope);
+    pub(super) fn walk(&mut self) -> (Option<ExecutorCostsError>, Vec<ExecutorCostsError>) {
+        let walked = walk(&self.topology, &self.executor, &mut self.measured);
         // No point after the walk is timed beside a release it began.
         self.measured.backings.settle();
         match walked {
@@ -4687,13 +4459,12 @@ impl<'a, 'd> Walks<'a, 'd> {
     }
 }
 
-/// What `store`'s records give `executor` of the walk of `scope`
+/// What `store`'s records give `executor` of the walk
 /// ([`ExecutorCosts::stored`]).
 pub(super) fn retraced(
     topology: &DeviceTopology,
     executor: &Executor,
     store: &dyn RecordStore<PointKey>,
-    scope: Scope,
 ) -> Result<StoredCosts, ExecutorCostsError> {
     let mut stored = Retraced {
         records: Records {
@@ -4704,7 +4475,7 @@ pub(super) fn retraced(
     };
     // A failure outside a point's timing, which leaves its figure
     // derived, is the job's to report: it recurs at each of its walks.
-    match walk(topology, executor, &mut stored, scope) {
+    match walk(topology, executor, &mut stored) {
         Ok(Walked { costs: Ok(costs), pending, .. }) => Ok(StoredCosts::Complete {
             costs,
             records: stored.read,
@@ -4736,7 +4507,7 @@ impl ExecutorCosts {
         executor: &Executor,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<StoredCosts, ExecutorCostsError> {
-        retraced(topology, executor, store, Scope::Whole)
+        retraced(topology, executor, store)
     }
 
     /// The most a job's points lay out in `executor`'s device storage at
@@ -4750,8 +4521,7 @@ impl ExecutorCosts {
     /// largest cache beyond one set, at least two ([`rotation_sets`]); or,
     /// along device storage's first route alone, where the history ladders
     /// run, a rung's rotation within the walk's room ([`rotation_room`]).
-    /// Beside them, the move point's records ([`MoveCase`]); and the job's
-    /// worker's own bytes there, its runtime and the programs it prepares
+    /// Beside them, the job's worker's own bytes there, its runtime and the programs it prepares
     /// (`measurement_process_bytes`), which hold the same room.
     pub fn room(topology: &DeviceTopology, executor: &Executor) -> Result<u64, ExecutorCostsError> {
         let (backings, kernels) = Self::backings(topology, executor)?;
@@ -4800,12 +4570,7 @@ impl ExecutorCosts {
         // The other routes in device storage's store each hold a rotation.
         let device = store(&routes.device);
         let others = routes.others.iter().filter(|route| store(route) == device).count() as u64;
-        // The move point's records, apart from the backings.
-        let moved = match moves_records(backend)? {
-            true => 2 * MOVED_RECORDS * moved_record_bytes(chain)?,
-            false => 0,
-        };
-        let backings = rotation.max(rotation_room(topology, &routes.device)) + rotation * others + moved;
+        let backings = rotation.max(rotation_room(topology, &routes.device)) + rotation * others;
         Ok((backings, programs.kernels()))
     }
 }
@@ -4827,7 +4592,6 @@ mod tests {
             dense: Pending::new(),
             affine: Pending::new(),
             copy: Pending::new(),
-            moves: Pending::new(),
             formation: Arc::default(),
             deadline,
             host: false,
@@ -4845,7 +4609,7 @@ mod tests {
         assert!(!programs.formation.begin(deadline), "no program begins while held, past the deadline");
         drop(quiet);
         assert!(!programs.formation.begin(deadline), "no program begins past the deadline, held or not");
-        assert!(matches!(programs.kernel(&programs.moves), Err(Unformed::Expired)), "a skipped program expires");
+        assert!(matches!(programs.kernel(&programs.copy), Err(Unformed::Expired)), "a skipped program expires");
     }
 
     /// A job's scratch is what it lays out in device storage: on a machine
@@ -4965,14 +4729,14 @@ mod tests {
         };
         let (device, upload) = (route(OperandStorage::Device), route(OperandStorage::Upload));
         let (bf16, f32) = (Element::bf16(), Element::f32());
-        let steps = plan(&[&device, &upload], &[bf16, f32], true);
+        let steps = plan(&[&device, &upload], &[bf16, f32]);
         let first = |layout| {
             [Rung::Pilot, Rung::Depth(0), Rung::Depth(1)].map(|rung| Step::Rung(layout, rung))
         };
         let deeper = |layout| (2..HISTORY_DEPTHS.len()).map(move |index| Step::Rung(layout, Rung::Depth(index)));
         let mut expected = vec![Step::Launch(GraphTiming::Device)];
         expected.extend(first(KvCodec::Dense));
-        expected.extend([Step::Chain, Step::Matrix(bf16), Step::Moves, Step::Releases]);
+        expected.extend([Step::Chain, Step::Matrix(bf16)]);
         expected.extend(first(KvCodec::AffineK8V4));
         expected.extend([
             Step::Launch(GraphTiming::Waited),
@@ -4984,10 +4748,6 @@ mod tests {
         expected.extend(deeper(KvCodec::Dense).chain(deeper(KvCodec::AffineK8V4)));
         expected.push(Step::Matrix(f32));
         assert_eq!(steps, expected);
-        // A backend that moves no bank's records reads no moves, nor what
-        // their release costs.
-        expected.retain(|step| !matches!(step, Step::Moves | Step::Releases));
-        assert_eq!(plan(&[&device, &upload], &[bf16, f32], false), expected);
     }
 
     /// The composition ratio is the chain's time over its layers' calls as
@@ -5158,10 +4918,6 @@ mod tests {
                 programs.affine.formation.statics(backend),
                 programs.copy.formation.statics(backend),
             ];
-            // The moves where the walk reads them.
-            if moves_records(backend).unwrap() {
-                statics.push(programs.moves.formation.statics(backend));
-            }
             statics.extend(programs.expands.iter().map(|(_, _, expand)| expand.formation.statics(backend)));
             for given in statics {
                 given.unwrap_or_else(|error| panic!("{backend:?}: {}", error.0));
@@ -5184,54 +4940,10 @@ mod tests {
             same(&programs.dense, backend);
             same(&programs.affine, backend);
             same(&programs.copy, backend);
-            same(&programs.moves, backend);
             for (_, _, expand) in &programs.expands {
                 same(expand, backend);
             }
         }
-    }
-
-    /// On Metal, where `routed_move` has its native, the move point forms
-    /// and is timed beside the probe and the required figures, alone and
-    /// beside a release, the rest skipped, and the costs the records give carry the release's ratio.
-    #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "the bank's moves are Metal's native")]
-    fn the_release_ratio_is_measured_where_the_bank_moves() {
-        let device = seismic::Devices::discover(&[])
-            .unwrap()
-            .open_backend(seismic::BackendName::Metal)
-            .unwrap();
-        let records = std::env::temp_dir().join(format!("moves-{}", std::process::id()));
-        let store = seismic::measure::JsonFileStore::new(&records);
-        let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
-        let moves = |key: &PointKey| key.point.get("records") == Some(&MOVED_RECORDS);
-        let (mut probe, mut moved) = (true, None);
-        super::super::requests::measure(
-            &mut measurer,
-            &device,
-            &store,
-            &[super::super::PointRequest::Costs],
-            std::time::Instant::now() + std::time::Duration::from_secs(20),
-            // The probe, the move points and the figures the costs require
-            // beside it (the launch graph's and the chain's, of `calls`).
-            &mut |key| match std::mem::take(&mut probe) || moves(key) || key.configuration.contains_key("calls") {
-                true => Attempt::Proceed,
-                false => Attempt::Skip(Reason::new("not this test's point".to_owned())),
-            },
-            &mut |key, outcome| {
-                if moves(&key) {
-                    moved = Some(format!("{outcome:?}"));
-                }
-            },
-        )
-        .unwrap();
-        assert!(moved.as_deref().is_some_and(|outcome| outcome.starts_with("Measured")), "{moved:?}");
-        let Ok(StoredCosts::Complete { costs, .. }) = ExecutorCosts::stored(device.topology(), device.info(), &store) else {
-            panic!("the probe and the required figures give the costs")
-        };
-        // The moves timed alone and while a reservation is released.
-        assert!(costs.release_step_ratio.is_some_and(|ratio| ratio.value > 0.), "{:?}", costs.release_step_ratio);
-        std::fs::remove_dir_all(records).unwrap();
     }
 
     /// A rotation spans four times the cache in at least two sets: a call

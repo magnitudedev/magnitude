@@ -2994,16 +2994,6 @@ pub mod kernel {
         ) -> Result<crate::native::KernelPoint, super::CallError> {
             crate::native::KernelPoint::place(&self.inner, rotation, Vec::new(), None)
         }
-        /// Calls cycling through `rotation`, as [`Self::point`], timed with
-        /// `beside` (work another thread does on the device) running for as
-        /// long as the point, or any gauge of it, is held.
-        pub fn point_beside(
-            &self,
-            rotation: Vec<EncodedArgs>,
-            beside: Arc<dyn std::any::Any + Send + Sync>,
-        ) -> Result<crate::native::KernelPoint, super::CallError> {
-            Ok(crate::native::KernelPoint::place(&self.inner, rotation, Vec::new(), None)?.beside(beside))
-        }
     }
 
     #[derive(Clone)]

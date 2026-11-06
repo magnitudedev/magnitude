@@ -4,8 +4,8 @@
 //! (through the policy words the host writes between flights,
 //! [`ExpertLines::policy`], which the route computes this function from:
 //! streaming_words.seismic's assignment), the bank's sizing
-//! ([`super::MissRecord::saving`]), assessment's streamed estimate
-//! ([`super::MissRecord::step_seconds`]), a prompt group's stages, which its
+//! and assessment's streamed estimate (both
+//! [`super::StreamedLayers::step_seconds`]), a prompt group's stages, which its
 //! size, merge sets and places are formed by ([`super::streaming`]), and the
 //! harness's bar all price a layer by [`ExpertLines::serve`]; nothing else
 //! prices one.

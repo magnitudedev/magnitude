@@ -114,9 +114,7 @@ impl AssessmentEnvironment {
     /// derived (that they are pending, or unavailable and why, otherwise), not current usage or
     /// measurement timestamps. The costs enter as the stored records they were derived from (the
     /// structure's identity includes the engine build, which derives costs from records). No
-    /// model's miss record enters it: each is its own streamed fit's input alone, named by that
-    /// assessment (`CachedModelAssessment::misses`), so one model's new record renews only its
-    /// own assessment. The identity keys every assessment's work, cache entry and contract
+    /// model's own measurement enters it. The identity keys every assessment's work, cache entry and contract
     /// identity, the candidates' cache, and the snapshot's `environment_id`, and a new one is
     /// what moves the pool to new measurements ([`super::assessor::ModelAssessor::adopt`]).
     fn of(

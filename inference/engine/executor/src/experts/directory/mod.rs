@@ -35,7 +35,7 @@ use super::staging::Staged;
 use super::watcher::{Lending, LentRecords, Step, Steps, Unbegun};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
-pub use stack::{LayerCurve, MissCurve, RoutedRead, Stack};
+pub use stack::{CountedLaunch, LayerCurve, MissCurve, RoutedRead, Stack};
 pub(crate) use stack::Ranks;
 #[cfg(any(test, feature = "expert-routing"))]
 pub use replay::{Recency, replay};

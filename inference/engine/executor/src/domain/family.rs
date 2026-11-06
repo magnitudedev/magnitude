@@ -36,8 +36,8 @@ impl Drop for TrafficHold {
 
 /// A load's elastic expert bank: the one owner of the memory its
 /// experts and the stored tables it holds take, each priced by what it saves
-/// a decode step per byte (on `resident`, the load's one-row resident step,
-/// where the domain has measured it). It shrinks toward its floor and grows
+/// a decode step per byte (on `price`, the load's decode as the domain
+/// prices it, `ExecutorDomain::decode_price`, where it can). It shrinks toward its floor and grows
 /// toward every expert one slot at a time, and each table a record at a
 /// time. An expert resize's storage is prepared off the submitting thread,
 /// installed at a later flight boundary and its surplus released after the
@@ -134,7 +134,7 @@ pub trait ElasticBank {
     /// takes the rest of the deficit.
     fn shrink(
         &self,
-        resident: Option<&super::ResidentStep>,
+        price: Option<&crate::assessment::DecodePrice>,
         moves: Option<&crate::assessment::MoveLines>,
         deficit: &dyn Fn(crate::planning::BankTier) -> u64,
         between_flights: &mut dyn FnMut() -> Result<(), super::DomainError>,
@@ -153,12 +153,11 @@ pub trait ElasticBank {
     /// the smallest such step, which runs to measure it; else of the holding
     /// whose priced step saves the decode most per byte. The host tier's
     /// step, to every expert, comes first and is priced by nothing: it needs
-    /// neither the load's miss record nor its `resident` step, which every
-    /// other holding's does. None once every holding is saturated, whole or
+    /// no `price`, which every other holding's does. None once every holding is saturated, whole or
     /// beyond the room.
     fn growth(
         &self,
-        resident: Option<&super::ResidentStep>,
+        price: Option<&crate::assessment::DecodePrice>,
         measured: &dyn Fn(BankHolding) -> bool,
         kind: crate::planning::BankTier,
         room: u64,
@@ -171,8 +170,13 @@ pub trait ElasticBank {
         &self,
     ) -> Result<Option<(crate::assessment::GroupReads, crate::assessment::BankSlots)>, super::DomainError>;
 
-    /// The load's latest miss record, which prices its decode at any slots.
-    fn latest_record(&self) -> Option<std::sync::Arc<crate::assessment::MissRecord>>;
+    /// What the load's counted decode read and ran so far, which its decode
+    /// is priced on; none before it counted a step.
+    fn live(&self) -> Option<crate::assessment::LiveDecode>;
+
+    /// The bank's streamed layers, each priced by its `lines`, which its
+    /// decode is priced on.
+    fn streamed_layers(&self, lines: std::sync::Arc<[crate::assessment::ExpertLines]>) -> crate::assessment::StreamedLayers;
 
     /// Begin the next growth step in `kind` storage ([`Self::growth`]'s, of
     /// `measured` and `room`), at a flight boundary, unless a resize runs or
@@ -182,7 +186,7 @@ pub trait ElasticBank {
     /// ends; table records' are backed now.
     fn grow(
         &self,
-        resident: Option<&super::ResidentStep>,
+        price: Option<&crate::assessment::DecodePrice>,
         measured: &dyn Fn(BankHolding) -> bool,
         kind: crate::planning::BankTier,
         room: u64,
@@ -360,11 +364,10 @@ impl BankResized {
 /// A holding's next growth step: from `from` to `to` (its slots, host
 /// slots or records, [`crate::planning::growth_target`]), the storage kind and bytes it
 /// backs (what the domain claims before it), and what it saves the decode
-/// the load's latest miss record counted, in seconds: the record's step at
-/// the holding's size less at `to` (`MissRecord::saving` for the bank's or
-/// host tier's slots, `TableCurve::step_seconds` for a table's records), on
-/// the one-row resident step at the record's depth, times the record's
-/// steps; none before the record's read line prices a table.
+/// the load counted, in seconds: the priced step at the holding's size less
+/// at `to` (`DecodePrice::saving` for the bank's or host tier's slots,
+/// `TableCurve::step_seconds` for a table's records), times the steps
+/// counted; none before the decode is priced.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Growth {
     pub holding: BankHolding,
@@ -373,8 +376,8 @@ pub struct Growth {
     pub to: u64,
     pub bytes: u64,
     pub saving: Option<f64>,
-    /// What a step with room enough reaches: where the load's latest miss
-    /// record says the holding's misses stop falling, at most its ceiling
+    /// What a step with room enough reaches: where the load's priced decode
+    /// says the holding's misses stop falling, at most its ceiling
     /// (`growth_target`'s bound).
     pub justified: u64,
 }

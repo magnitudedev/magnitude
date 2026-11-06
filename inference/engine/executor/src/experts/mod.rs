@@ -76,8 +76,6 @@ pub(crate) use watcher::{ParkKind, ParkSite, Parks, panic_message};
 pub(crate) use bank::ChainServing;
 pub(crate) use source::Records;
 pub use directory::{LayerCurve, MissCurve, RoutedRead};
-#[cfg(test)]
-pub(crate) use directory::Stack;
 #[cfg(feature = "expert-routing")]
 pub use directory::{Recency, replay};
 pub(crate) use bank::{ExpertBank, ExpertStep, HeldTable, Recording, ServedBank, StepFailure, StepRoute};

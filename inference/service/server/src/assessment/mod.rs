@@ -841,8 +841,7 @@ impl ManagedModelAssessments {
     }
 
     /// Adopt what the measurement job reports (`measurement`'s current status): its state, and
-    /// a new environment when its measurements change the current one; otherwise every
-    /// assessed model whose own miss record a load has stored since is finished again.
+    /// a new environment when its measurements change the current one.
     fn adopt_measurement(
         self: &Arc<Self>,
         measurement: &mut tokio::sync::watch::Receiver<MeasurementStatus>,
@@ -856,46 +855,8 @@ impl ManagedModelAssessments {
                     current.snapshot.measurement = status.state;
                     changed
                 });
-                self.refinish_stale(measurement.clone());
             }
         }
-    }
-
-    /// Finish again, in the current environment, every assessed model whose cached assessment
-    /// is no longer the environment's: a streamed fit whose own model's miss record changed
-    /// ([`ModelAssessor::cached`]). Every other model's assessment stands. The cache is read on
-    /// the blocking pool, with no lock held.
-    fn refinish_stale(
-        self: &Arc<Self>,
-        measurement: tokio::sync::watch::Receiver<MeasurementStatus>,
-    ) {
-        let environment = self.assessor.environment();
-        let assessed = {
-            let current = self.current.read().expect("assessment state lock poisoned");
-            let assessed = current.assessed_keys();
-            current
-                .works
-                .iter()
-                .filter(|(key, _)| assessed.contains(*key))
-                .map(|(key, work)| (key.clone(), work.clone()))
-                .collect::<std::collections::BTreeMap<_, _>>()
-        };
-        let service = Arc::clone(self);
-        magnitude_service_utils::owner::spawn("an assessment refinish", async move {
-            let stale = magnitude_service_utils::blocking::run({
-                let (service, environment) = (Arc::clone(&service), Arc::clone(&environment));
-                move || {
-                    assessed
-                        .into_iter()
-                        .filter(|(key, _)| service.assessor.cached(&environment, &key.0).is_none())
-                        .collect::<std::collections::BTreeMap<_, _>>()
-                }
-            })
-            .await;
-            if !stale.is_empty() {
-                service.refinish(environment, stale, measurement);
-            }
-        });
     }
 
     /// Move the pool to `environment`: work not yet assessed moves at once, and every assessed
@@ -1286,7 +1247,6 @@ mod tests {
                 projector: magnitude_service_contracts::models::ProjectorVerdict::None,
                 drafter: magnitude_service_contracts::models::DrafterVerdict::None,
             },
-            misses: None,
         }
     }
 
@@ -1698,7 +1658,6 @@ mod tests {
                     reasons: Vec::new(),
                     detail: failure.message.clone(),
                 },
-                misses: None,
             }),
         });
         assert_eq!(

@@ -452,46 +452,40 @@ fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, row
     (domain, bindings)
 }
 
-/// A miss record of `steps` decode steps at one streamed layer of 4
-/// experts, each step reading `misses` experts `depth` deep in the bank's
-/// LRU stack, along the reference lines (`ExpertLines::reference`): a bank
-/// of `depth` slots misses them, one of `depth + 1` none. Reads take 0.4 ms
-/// and 0.5 ms a MB; an all-hit step 15 ms.
-pub fn misses_at(depth: usize, steps: u64, misses: u64) -> crate::assessment::MissRecord {
-    let mut reads = crate::assessment::RequestReads::default();
-    for bytes in [1_000_000u64, 2_000_000] {
-        reads.add(bytes, 4e-4 + bytes as f64 / 2e9);
-    }
-    reads.deliver(2_000_000_000, 1.);
-    let mut curve = crate::experts::LayerCurve {
-        misses: vec![0; 5],
-        requests: vec![0; 5],
-        choices: 0,
-    };
-    curve.misses[depth] = steps * misses;
-    curve.requests[depth] = steps;
-    // A row a read.
-    curve.choices = steps * misses;
-    crate::assessment::MissRecord {
-        steps,
-        rows: steps,
-        layers: vec![crate::assessment::MeasuredLayer {
-            lines: crate::assessment::ExpertLines::reference(1_000_000),
-            curve,
-            anticipated: crate::assessment::Anticipated::default(),
-        }],
-        reads,
-        // One-row launches of 15 ms that miss nothing.
-        residuals: crate::assessment::Residuals {
-            rows: std::array::from_fn(|index| crate::assessment::LaunchResiduals {
-                launches: if index == 0 { steps } else { 0 },
-                seconds: if index == 0 { steps as f64 * 0.015 } else { 0. },
-                tokens: if index == 0 { steps * 100 } else { 0 },
-            }),
+/// A decode the fake bank counted ([`FakeBank::decode`]), and where its
+/// misses stop falling.
+#[derive(Clone, Debug)]
+pub struct FakeDecode {
+    pub live: crate::assessment::LiveDecode,
+    pub saturation: u64,
+}
+
+/// A decode of `steps` steps at the fake bank's one streamed layer of 4
+/// experts, each step reading all 4 of them, all `depth` deep in the
+/// bank's stack: a bank of `depth` slots misses them, one of `depth + 1`
+/// none, beside the generic model counted as one step. Reads take 0.4 ms and 0.5 ms a MB ([`READ`]); an
+/// all-hit step 15 ms.
+pub fn misses_at(depth: usize, steps: u64) -> FakeDecode {
+    let mut misses = [0; 5];
+    let mut requests = [0; 5];
+    misses[depth] = steps * 4;
+    requests[depth] = steps;
+    FakeDecode {
+        live: crate::assessment::LiveDecode {
+            layers: vec![crate::assessment::LayerReads::of_depths(&misses, &requests)],
+            steps,
+            rows: 1.,
+            depth: 100,
         },
-        hints: crate::assessment::HintCounts::default(),
+        saturation: depth as u64 + 1,
     }
 }
+
+/// The fake decode's read line: 0.4 ms and 0.5 ms a MB.
+pub const READ: crate::assessment::ReadLine = match crate::assessment::ReadLine::new(4e-4, 1. / 2e9) {
+    Ok(line) => line,
+    Err(_) => panic!("the fixtures' read line"),
+};
 
 /// Shrink `domain`'s state surplus by `policy` and wait for the idle graph
 /// slots' release it began, if any, to end on the release thread, then
@@ -515,14 +509,14 @@ pub fn shrink_settled<F: ProgramFamily>(
     shrunk.released + slots
 }
 
-/// The growth rule's inputs: the load's latest miss record (with its
-/// layers' conversion), and the resident step it is priced on: 15 ms at
-/// every depth, its all-hit steps' time, so no `σ`.
-pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, record: crate::assessment::MissRecord) {
-    domain.family.bank.as_mut().unwrap().record = Some(record);
+/// The growth rule's inputs: the decode the fake bank counted, the
+/// fixtures' read line, and the resident step it is priced on: 15 ms at every depth, its all-hit
+/// steps' time.
+pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, decode: FakeDecode) {
+    count_decode(domain, decode);
     domain.measure_experts(crate::ExpertMeasures {
         lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
-        store: None,
+        read: crate::assessment::Priced::Measured(READ),
         resident: crate::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
         pass: crate::assessment::Priced::Pending("unpriced".into()),
         moves: crate::assessment::Priced::Pending("unmeasured".into()),
@@ -536,10 +530,10 @@ pub fn bank_row(domain: &ExecutorDomain<TestFamily>) -> u64 {
     domain.family.bank.as_ref().expect("a banked fixture").tensor.extents()[1]
 }
 
-/// The fake bank of `domain` takes `record` as its load's latest miss
-/// record, which its growth is priced by.
-pub fn record_misses(domain: &mut ExecutorDomain<TestFamily>, record: crate::assessment::MissRecord) {
-    domain.family.bank.as_mut().expect("a banked fixture").record = Some(record);
+/// The fake bank of `domain` counted `decode`, which its growth is priced
+/// on.
+pub fn count_decode(domain: &mut ExecutorDomain<TestFamily>, decode: FakeDecode) {
+    domain.family.bank.as_mut().expect("a banked fixture").decode = Some(decode);
 }
 
 /// The fake bank of `domain` holds a host tier of at most `ceiling` host
@@ -746,13 +740,13 @@ pub struct TestFamily {
 /// a slot, its floor one row. A resize prepares at once and finishes over
 /// two boundaries, as the bank's does: the first installs, the second takes
 /// the release (a growth, as one slot that joins beside running steps). Its
-/// growth is priced by `record`. As the bank's watcher, it is asked to
+/// growth is priced on the decode it counted, `decode`. As the bank's watcher, it is asked to
 /// shrink only in a gap: a shrink begins only while none of its `steps`
 /// runs.
 pub struct FakeBank {
     pub(crate) tensor: seismic::Tensor,
     resize: std::sync::Mutex<Option<FakeResize>>,
-    pub(crate) record: Option<crate::assessment::MissRecord>,
+    pub(crate) decode: Option<FakeDecode>,
     steps: std::sync::atomic::AtomicUsize,
     /// A host tier's slots and the most it holds (none without a tier),
     /// each a byte of upload storage, and its growth's outcome until an
@@ -802,7 +796,7 @@ impl FakeBank {
         Self {
             tensor,
             resize: std::sync::Mutex::new(Some(FakeResize::Idle(resizer))),
-            record: None,
+            decode: None,
             steps: std::sync::atomic::AtomicUsize::new(0),
             host: std::sync::atomic::AtomicU64::new(0),
             host_ceiling: 0,
@@ -948,7 +942,7 @@ impl ElasticBank for FakeBank {
 
     fn shrink(
         &self,
-        _resident: Option<&crate::ResidentStep>,
+        _price: Option<&crate::assessment::DecodePrice>,
         _moves: Option<&crate::assessment::MoveLines>,
         _deficit: &dyn Fn(crate::planning::BankTier) -> u64,
         between_flights: &mut dyn FnMut() -> Result<(), DomainError>,
@@ -972,13 +966,13 @@ impl ElasticBank for FakeBank {
     }
 
     /// Device slots, rows of the bank's tensor, to the target within `room`
-    /// up to where the record's misses stop falling (`growth_target`), each
+    /// up to where its decode's misses stop falling (`growth_target`), each
     /// saving what as many slots more of the bank save; or host slots, a
     /// byte of upload storage each, toward the tier's ceiling within `room`,
     /// priced by nothing, as `ServedBank::growth` steps them.
     fn growth(
         &self,
-        resident: Option<&crate::ResidentStep>,
+        price: Option<&crate::assessment::DecodePrice>,
         _measured: &dyn Fn(crate::BankHolding) -> bool,
         kind: crate::planning::BankTier,
         room: u64,
@@ -994,13 +988,12 @@ impl ElasticBank for FakeBank {
             return Ok(step(host, bound, 1)
                 .map(|(from, to, bytes)| crate::Growth { holding, kind, from, to, bytes, saving: None, justified: bound }));
         }
-        let (Some(record), Some(resident)) = (&self.record, resident) else {
+        let (Some(decode), Some(price)) = (&self.decode, price) else {
             return Ok(None);
         };
         let rows = self.tensor.extents()[0];
-        let bound = rows.min(record.saturation().unwrap() as u64);
-        // A step's saving over the record's decode, as `ServedBank::growth`
-        // prices it.
+        let bound = rows.min(decode.saturation);
+        // A step's saving over the decode, as `ServedBank::growth` prices it.
         let held = crate::assessment::HeldSlots::bank(slots as usize);
         Ok(step(slots, bound, self.tensor.byte_len() / rows).map(|(from, to, bytes)| {
             let above = crate::assessment::HeldSlots::bank((slots + to - from) as usize);
@@ -1010,7 +1003,7 @@ impl ElasticBank for FakeBank {
                 from,
                 to,
                 bytes,
-                saving: Some(record.saving(held, above, resident).unwrap().unwrap() * record.steps as f64),
+                saving: Some(price.saving(held, above) * price.steps() as f64),
                 justified: bound,
             }
         }))
@@ -1022,13 +1015,19 @@ impl ElasticBank for FakeBank {
         Ok(None)
     }
 
-    fn latest_record(&self) -> Option<std::sync::Arc<crate::assessment::MissRecord>> {
-        self.record.clone().map(std::sync::Arc::new)
+    fn live(&self) -> Option<crate::assessment::LiveDecode> {
+        self.decode.as_ref().map(|decode| decode.live.clone())
+    }
+
+    /// Its one streamed layer of 4 experts, each step routing 4, on the
+    /// reference lines of 1 MB records, whatever lines the load priced.
+    fn streamed_layers(&self, _lines: std::sync::Arc<[crate::assessment::ExpertLines]>) -> crate::assessment::StreamedLayers {
+        crate::assessment::StreamedLayers::new(vec![4], 4, std::sync::Arc::from([crate::assessment::ExpertLines::reference(1_000_000)]))
     }
 
     fn grow(
         &self,
-        resident: Option<&crate::ResidentStep>,
+        price: Option<&crate::assessment::DecodePrice>,
         measured: &dyn Fn(crate::BankHolding) -> bool,
         kind: crate::planning::BankTier,
         room: u64,
@@ -1037,7 +1036,7 @@ impl ElasticBank for FakeBank {
         if self.running() {
             return Ok(BankStep::Running);
         }
-        let Some(crate::Growth { to, .. }) = self.growth(resident, measured, kind, room)? else {
+        let Some(crate::Growth { to, .. }) = self.growth(price, measured, kind, room)? else {
             return Ok(BankStep::AtLimit);
         };
         if kind == crate::planning::BankTier::Host {
@@ -1257,7 +1256,6 @@ impl ProgramFamily for TestFamily {
             return Err(crate::programs::ChainRefusal {
                 error: crate::SubmitError::Device(error),
                 chain,
-                misses: None,
             });
         }
         let now = std::time::Instant::now();

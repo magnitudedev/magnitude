@@ -9,7 +9,7 @@ use magnitude_engine::{
     assessment::{
         AssessmentSetup, AssessmentStructure, DrafterVerdict, Measurements, ModelAssessment,
         ModelAssessmentError, ModelExecution, ModelPackagePaths, ModelResidency, Performance, PreparedModelAssessment,
-        SpeculativeMethod, StreamedPerformance, assess_model, finish_model_assessment,
+        SpeculativeMethod, assess_model, finish_model_assessment,
         prepare_model_assessment,
     },
     error::UnsupportedReason,
@@ -887,9 +887,8 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
         residency:
             ModelResidency::Streamed {
                 shares,
-                performance: StreamedPerformance::Assessed(Performance::Pending),
-                floor_performance: StreamedPerformance::Assessed(Performance::Pending),
-                ..
+                performance: Performance::Pending,
+                floor_performance: Performance::Pending,
             },
         ..
     } = streamed

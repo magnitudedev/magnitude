@@ -286,13 +286,10 @@ pub trait TargetProgram {
     ) -> Result<Chain<Self::Submission>, ChainRefusal>;
 }
 
-/// A refused chain: why, its still-owned launches, and the streamed load's
-/// miss record its expert steps' refusal made due (`ExpertStep::refuse`),
-/// which the domain publishes as a completed step's.
+/// A refused chain: why, and its still-owned launches.
 pub struct ChainRefusal {
     pub error: SubmitError,
     pub chain: Chain<ValidatedTargetLaunch>,
-    pub misses: Option<std::sync::Arc<crate::assessment::MissRecord>>,
 }
 
 pub trait HeadProgram {

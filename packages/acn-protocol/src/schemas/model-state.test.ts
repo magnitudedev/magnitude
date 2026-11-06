@@ -317,9 +317,8 @@ describe("LocalModelSchema invariants", () => {
     const streamed = (performance: unknown, floorPerformance: unknown) =>
       fit({ _tag: "Streamed", bank, performance, floorPerformance })
     expect(Either.isRight(decode(streamed(estimated(20), estimated(4))))).toBe(true)
-    expect(Either.isRight(decode(streamed({ _tag: "Unmeasured" }, { _tag: "Unmeasured" })))).toBe(true)
     expect(Either.isRight(decode(fit({ _tag: "Resident", performance: estimated(20) })))).toBe(true)
-    expect(Either.isLeft(decode(fit({ _tag: "Resident", performance: { _tag: "Unmeasured" } })))).toBe(true)
+    expect(Either.isLeft(decode(streamed({ _tag: "Unmeasured" }, { _tag: "Unmeasured" })))).toBe(true)
   })
 
   it("takes a resize only as a shrink with its cause or a growth, each by at least one", () => {

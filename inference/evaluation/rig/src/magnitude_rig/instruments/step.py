@@ -15,7 +15,7 @@ hold after the resident load: each streamed load reads its routed experts from s
 jobs), and its decode is judged against the performance model predicted from the resident
 load's decode and the load's own read line and conversion, and against what assessment
 estimates from the executor costs the measurement job (`magnitude-assess` on the model) stores
-and the miss record another load stored before it (a cell's own record is never used). Each
+and the generic miss model. Each
 streamed cell reports its speed against resident, the model's prediction and their ratio, the
 estimate and its ratio, its misses and how they were anticipated, and whether its reads were
 served from the file cache (its timing is then void). Each also reports its performance bar, the
@@ -492,7 +492,7 @@ ESTIMATE_FIELDS = ("slots", "tok_s", "ratio", "record.decode_steps")
 
 
 def _estimate(estimate: dict | None) -> str:
-    """What assessment estimates the cell at, from another load's miss record, against the
+    """What assessment estimates the cell at, from headers and the machine's figures, against the
     window's measured mean step, each per sequence."""
     if estimate is None:
         return "  estimate not recorded by this build's harness"

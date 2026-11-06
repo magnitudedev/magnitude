@@ -1206,7 +1206,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The places `places`' chunks in hand are worth, and the slots the
     /// bank shrinks to for them when fewer than it holds: by value per byte
     /// within the wait bound (`GroupReads::grant`), on the decode the
-    /// load's latest miss record prices while decode waits (`decode_owed`),
+    /// load prices while decode waits (`decode_owed`, `decode_price`),
     /// each group's passes by the executor's costs where measured. Before
     /// the load has measured its groups' reads, and on a load without a
     /// bank, whose places compete with no slot, or with a whole bank, which
@@ -1226,38 +1226,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok((chunks, None));
         };
         let pass = self.experts.as_ref().and_then(|measures| measures.pass.measured());
-        let record = self.decode_owed.and_then(|_| bank.latest_record());
-        // Decode waiting is priced on the resident step; a load that could
-        // not estimate it says why.
-        let resident = match (&record, &self.experts) {
-            (Some(_), Some(measures)) => Some(measures.resident.measured().map(|resident| &**resident).ok_or_else(|| {
-                DomainError::invariant(format!(
-                    "decode waits on an unpriced resident step: {}",
-                    measures.resident.why().unwrap_or_default()
-                ))
-            })?),
-            _ => None,
-        };
-        let grant = match (self.decode_owed, record, resident) {
-            (Some(owed), Some(record), Some(resident)) => {
-                // A record is due only with a step that misses nothing, so one
-                // that prices none breaks an invariant (`ElasticBank::growth`).
-                let priced = |error: crate::assessment::MissRecordError| {
-                    DomainError::invariant(format!("the miss record prices no step: {error}"))
-                };
-                let unpriced = |error: crate::assessment::AssessmentError| {
-                    DomainError::invariant(format!("the resident step: {error}"))
-                };
-                let compute = record.compute(resident).map_err(unpriced)?.map_err(priced)?;
+        let grant = match (self.decode_owed, self.decode_owed.map(|_| self.decode_price()).transpose()?.flatten()) {
+            (Some(owed), Some(price)) => {
                 // The host tier beside the bank stays as it is.
                 let host = bank.residency()?.host.map_or(0, |host| host.slots);
                 let count = |value: u64| usize::try_from(value).map_err(|_| DomainError::invariant("bank slots exceed the host"));
                 let host = count(host)?;
                 // Decode runs beside the prompt's groups.
                 let mut step = |slots: u64| -> Result<f64, DomainError> {
-                    let held = crate::assessment::HeldSlots { slots: count(slots)?, host };
-                    let step = record.step_seconds(held, record.rows().map_err(priced)?, compute).map_err(priced)?;
-                    Ok(step.total_seconds)
+                    Ok(price.step(crate::assessment::HeldSlots { slots: count(slots)?, host }).total_seconds)
                 };
                 reads.grant(slots, places, pass, Some(DecodeWaiting { owed, step: &mut step }))?
             }
@@ -1573,9 +1550,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(super::BankStep::AtLimit);
         };
-        let resident = self.experts.as_ref().and_then(|measures| measures.resident.measured().map(|resident| &**resident));
+        let price = self.decode_price()?;
         let moves = self.experts.as_ref().and_then(|measures| measures.moves.measured());
-        let step = bank.shrink(resident, moves, deficit, &mut || self.queue.orphan(self.experts.as_ref(), bindings), wake)?;
+        let step = bank.shrink(price.as_ref(), moves, deficit, &mut || self.queue.orphan(self.experts.as_ref(), bindings), wake)?;
         match step {
             super::BankStep::Begun(tier) => {
                 self.resize_held.begin(tier, started);
@@ -1587,12 +1564,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The storage kinds whose next growth step of the expert bank
-    /// (`ElasticBank::growth`, on the resident step this load was planned
-    /// with, each to its target within its store's room, `growth_target`)
+    /// (`ElasticBank::growth`, on the load's priced decode,
+    /// `decode_price`, each to its target within its store's room, `growth_target`)
     /// pays, each store's own: a holding no resize has measured takes its
     /// first step, which measures what a step holds the submitting thread;
-    /// after that, a step pays where what it saves the decode the load's
-    /// latest miss record counted exceeds what its holding's last resize
+    /// after that, a step pays where what it saves the decode the load
+    /// counted exceeds what its holding's last resize
     /// held the thread (`growth_target` names the rule's two gaps); one that
     /// does not pay grows nothing. Each store's step is offered, paying or
     /// not ([`super::GrowthOffer`]). Device memory and host memory are
@@ -1604,7 +1581,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// reads in Reclaim or blind, nor at all beside the measurement job's
     /// claim ([`Self::claim_measurement_room`]).
     pub fn expert_bank_growths(&self) -> Result<Vec<super::GrowthOffer>, DomainError> {
-        let resident = self.experts.as_ref().and_then(|measures| measures.resident.measured().map(|resident| &**resident));
+        let price = self.decode_price()?;
         let Some(bank) = self.family.expert_bank().filter(|_| self.measurement_claim.is_none()) else {
             return Ok(Vec::new());
         };
@@ -1616,8 +1593,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut offers = Vec::new();
         for kind in kinds {
             // A prompt's places want device memory, which a device step
-            // would take; and a device step is priced on the resident step.
-            if kind == crate::planning::BankTier::Bank && (self.places_want.is_some() || resident.is_none()) {
+            // would take; and a device step is priced on the decode.
+            if kind == crate::planning::BankTier::Bank && (self.places_want.is_some() || price.is_none()) {
                 continue;
             }
             let room = match self.growth_room(kind) {
@@ -1626,7 +1603,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Err(ClaimRefusal::Reclaim(_) | ClaimRefusal::Blind(_)) => continue,
                 Err(refusal) => return Err(refusal.into()),
             };
-            let Some(growth) = bank.growth(resident, &|holding| held.contains_key(&holding), kind, room)? else {
+            let Some(growth) = bank.growth(price.as_ref(), &|holding| held.contains_key(&holding), kind, room)? else {
                 continue;
             };
             // The host tier grows to every expert wherever there is room:
@@ -1656,21 +1633,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         wake: crate::CompletionWake,
     ) -> Result<super::BankStep, DomainError> {
         let started = std::time::Instant::now();
-        let resident = self.experts.as_ref().and_then(|measures| measures.resident.measured().map(|resident| &**resident));
+        let price = self.decode_price()?;
         let Some(bank) = self.family.expert_bank() else {
             return Ok(super::BankStep::AtLimit);
         };
         let held = &self.resize_held.last;
         let measured = |holding| held.contains_key(&holding);
         let (room, unborn) = self.growth_room(kind)?;
-        let Some(super::Growth { bytes, .. }) = bank.growth(resident, &measured, kind, room)? else {
+        let Some(super::Growth { bytes, .. }) = bank.growth(price.as_ref(), &measured, kind, room)? else {
             return Ok(super::BankStep::AtLimit);
         };
         let claim = self
             .memory
             .borrow_mut()
             .claim_reserved(kind, bytes, unborn, HoldingClass::Model)?;
-        let grown = bank.grow(resident, &measured, kind, room, wake);
+        let grown = bank.grow(price.as_ref(), &measured, kind, room, wake);
         match grown {
             Ok(super::BankStep::Begun(tier)) => {
                 self.bank_claim = Some(super::GrowthClaim { id: claim, kind, bytes });

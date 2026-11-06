@@ -49,15 +49,14 @@ describe("local model radar", () => {
     expect(axis(speculating(Option.some({ _tag: "DFlash" })), "SPECULATION").value).toEqual(Option.some(0.4))
   })
 
-  it("rates a streamed fit's speed at its allowed share, and no speed while it is unmeasured", () => {
+  it("rates a streamed fit's speed at its allowed share", () => {
     const serving = makeFoundModel().servingState
     if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") throw new Error("fixture fits")
     const fits = serving.assessment
-    const streamed = (unmeasured: boolean) => makeFoundModel({
-      servingState: { ...serving, assessment: { ...fits, residency: streamedFitResidency(unmeasured) } },
+    const streamed = makeFoundModel({
+      servingState: { ...serving, assessment: { ...fits, residency: streamedFitResidency() } },
     })
-    expect(axis(streamed(false), "SPEED")).toMatchObject({ value: Option.some(normalizeLocalModelRadarSpeed(20.4)), detail: "~20 tok/s" })
-    expect(axis(streamed(true), "SPEED")).toMatchObject({ value: Option.none(), detail: "Measured on its first streamed load" })
+    expect(axis(streamed, "SPEED")).toMatchObject({ value: Option.some(normalizeLocalModelRadarSpeed(20.4)), detail: "~20 tok/s" })
   })
 
   it("spaces speculative methods evenly from none to the strongest", () => {

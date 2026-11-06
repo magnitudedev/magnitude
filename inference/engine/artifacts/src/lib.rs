@@ -19,7 +19,7 @@ pub mod support;
 pub use error::Error;
 pub use identity::{ArtifactIdentity, PackageIdentity};
 pub use layout::{BoundaryRule, InputLayout, InputSpan};
-pub use package::{ComponentFile, ComponentManifest, Package, PackageHeaders, PackageManifest};
+pub use package::{ComponentFile, ComponentManifest, Package, PackageHeaders, PackageManifest, model_store};
 pub use payload::{TemplatePayload, TemplateSource, TokenizerPayload};
 pub use preprocessing::{
     ImageProcessor, ImageProcessorConfig, ImageResize, Resampling, MAX_IMAGES_PER_REQUEST,

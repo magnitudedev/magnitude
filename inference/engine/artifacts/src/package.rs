@@ -212,6 +212,9 @@ impl PackageHeaders {
 #[derive(Debug)]
 pub struct Package {
     target: GgufArtifact,
+    /// The model store: the directory the target's file lies in, its links
+    /// followed ([`model_store`]), resolved as the package opens.
+    store: PathBuf,
     projector: Option<GgufArtifact>,
     draft: Option<GgufArtifact>,
     identity: PackageIdentity,
@@ -325,6 +328,7 @@ impl Package {
             target: target.identity(),
             projector: projector.as_ref().map(GgufArtifact::identity),
         };
+        let store = model_store(target_path)?;
         let tokenizer = TokenizerPayload::from_directory(target.directory());
         let templates = TemplatePayload::from_directory(
             target.directory(),
@@ -332,6 +336,7 @@ impl Package {
         )?;
         Ok(Self {
             target,
+            store,
             projector,
             draft: None,
             identity,
@@ -342,6 +347,11 @@ impl Package {
 
     pub fn target(&self) -> &GgufArtifact {
         &self.target
+    }
+
+    /// The model store the target was opened from ([`model_store`]).
+    pub fn store(&self) -> &Path {
+        &self.store
     }
 
     pub fn projector(&self) -> Option<&GgufArtifact> {
@@ -409,6 +419,19 @@ fn component_manifest(artifact: &GgufArtifact) -> ComponentManifest {
     }
 }
 
+/// The model store of `target`: the directory its file lies in, its links
+/// followed. A content-addressed snapshot names its files by links into a
+/// blob store that may lie in another directory, on another volume, and
+/// that store is where its reads are served from: what the measurement job
+/// measures a read line of (writing its probe there) and a streamed load
+/// prices its reads on.
+pub fn model_store(target: &Path) -> Result<PathBuf, Error> {
+    let file = target.canonicalize()?;
+    file.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| Error::Invalid(format!("{} has no directory", file.display())))
+}
+
 fn discover_projector(target: &Path) -> Result<Option<PathBuf>, Error> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let canonical_target = target.canonicalize()?;
@@ -433,5 +456,26 @@ fn discover_projector(target: &Path) -> Result<Option<PathBuf>, Error> {
         0 => Ok(None),
         1 => Ok(projectors.pop()),
         _ => Err(Error::AmbiguousProjectors(projectors)),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::model_store;
+
+    /// A snapshot's link into a blob store in another directory is stored
+    /// where the blob lies, not where the link does.
+    #[test]
+    fn a_linked_target_is_stored_where_its_file_lies() {
+        let root = std::env::temp_dir().join(format!("model-store-{}", std::process::id()));
+        let (blobs, snapshot) = (root.join("blobs"), root.join("snapshots/main"));
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(blobs.join("sha256-model"), b"GGUF").unwrap();
+        let link = snapshot.join("model.gguf");
+        std::os::unix::fs::symlink(blobs.join("sha256-model"), &link).unwrap();
+        let stored = model_store(&link);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(stored.unwrap(), blobs.canonicalize().unwrap_or(blobs));
     }
 }

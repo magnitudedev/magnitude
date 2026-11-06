@@ -18,7 +18,7 @@ use magnitude_engine::{
     assessment::{
         finish_model_assessment, prepare_model_assessment, AssessmentSetup, AssessmentStructure,
         DrafterVerdict, Measurements, ModelAssessment, ModelExecution, ModelPackagePaths,
-        ModelResidency, Performance, PreparedModelAssessment, StreamedPerformance,
+        ModelResidency, Performance, PreparedModelAssessment,
     },
     error::UnsupportedModel,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
@@ -43,6 +43,9 @@ struct Options {
     device: DeviceRequest,
     /// The kernel cache, which holds the machine's measurements.
     kernels: PathBuf,
+    /// The model store, whose volume's read line prices streamed models'
+    /// file reads: the kernel cache's directory by default.
+    storage: PathBuf,
     depths: Vec<u32>,
     /// The conversations decoding together.
     sequences: u32,
@@ -66,7 +69,7 @@ struct Options {
 const JOB_ONLY: &str = "--measurement-job-only";
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --kernels DIR \
-     [--seconds 10] [--depths 25000,50000,75000] [--sequences 1] [--breakdown] \
+     [--storage DIR] [--seconds 10] [--depths 25000,50000,75000] [--sequences 1] [--breakdown] \
      [--method auto|plain] \
      (--topology | TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...)";
 
@@ -78,6 +81,7 @@ fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, 
 fn parse() -> Result<Options, String> {
     let mut device = None;
     let mut kernels = None;
+    let mut storage = None;
     let mut depths = STANDARD_DEPTHS.to_vec();
     // A serving profile's, as the service estimates.
     let mut sequences = PROFILE_SEQUENCES;
@@ -118,6 +122,7 @@ fn parse() -> Result<Options, String> {
                     .map_err(|error| format!("--seconds: {error}"))?
             }
             "--kernels" => kernels = Some(PathBuf::from(value(&argument, &mut args)?)),
+            "--storage" => storage = Some(PathBuf::from(value(&argument, &mut args)?)),
             "--breakdown" => breakdown = true,
             "--method" => {
                 method = match value(&argument, &mut args)?.as_str() {
@@ -164,9 +169,11 @@ fn parse() -> Result<Options, String> {
     for model in &mut models {
         model.method = method;
     }
+    let kernels: PathBuf = kernels.ok_or("--kernels is required")?;
     Ok(Options {
         device: device.ok_or("--device is required")?,
-        kernels: kernels.ok_or("--kernels is required")?,
+        storage: storage.unwrap_or_else(|| kernels.clone()),
+        kernels,
         depths,
         sequences,
         breakdown,
@@ -274,6 +281,7 @@ fn run() -> Result<bool, String> {
             &MeasureRequest {
                 paths: served,
                 kernels: options.kernels.clone(),
+                storage: options.storage.clone(),
                 executor,
                 // Nothing preempts the tool's job; its process names it.
                 job: MeasureJob(u64::from(std::process::id())),
@@ -326,7 +334,7 @@ fn run() -> Result<bool, String> {
         })
         .collect::<Vec<_>>();
     let (measure_seconds, measured) = bounded_job(options.time, executor.selector())?;
-    let measurements = structure.stored_measurements(&options.kernels);
+    let measurements = structure.stored_measurements(&options.kernels, &options.storage);
 
     if options.topology {
         let costs = match &measurements {
@@ -646,10 +654,6 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
             ColdSource::File(FileOnly::NoHostRoom) => json!({ "file": "host memory admits no tier slot" }),
         }
     };
-    let streamed = |streamed: &StreamedPerformance| match streamed {
-        StreamedPerformance::Unmeasured => json!({ "_tag": "Unmeasured" }),
-        StreamedPerformance::Assessed(assessed) => performance(assessed),
-    };
     let mut object = match execution {
         ModelExecution::Fits { domains, residency } => json!({
             "_tag": "Fits",
@@ -663,14 +667,13 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
                     shares,
                     performance: at_share,
                     floor_performance,
-                    ..
                 } => json!({
                     "_tag": "Streamed",
                     "expertFloorShare": shares.floor_share(),
                     "expertShare": shares.share(),
                     "coldExperts": cold(shares.cold()),
-                    "performance": streamed(at_share),
-                    "floorPerformance": streamed(floor_performance),
+                    "performance": performance(at_share),
+                    "floorPerformance": performance(floor_performance),
                 }),
             },
         }),

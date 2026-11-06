@@ -19,7 +19,7 @@ use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, ModelAssessment,
     ModelAssessmentDomainSnapshot, ModelAssessmentEntryState, ModelAssessments, ModelId,
-    ModelPackageId, ModelResidency, StreamedModelPerformance,
+    ModelPackageId, ModelPerformance, ModelResidency,
 };
 use magnitude_service_models::{
     InventoryConfig, ManagedModelDownloads, ModelDomainResolver, load_release_catalog,
@@ -63,18 +63,17 @@ impl CatalogPackageRemover for NoCatalogEffects {
 }
 
 /// A fit's speed as the report prints it: each depth's estimate, or why there is none.
-fn tokens_per_second(performance: &StreamedModelPerformance) -> serde_json::Value {
+fn tokens_per_second(performance: &ModelPerformance) -> serde_json::Value {
     match performance {
-        StreamedModelPerformance::Estimated { samples } => json!(samples
+        ModelPerformance::Estimated { samples } => json!(samples
             .iter()
             .map(|sample| (
                 sample.context_tokens,
                 (sample.estimated_tokens_per_second * 10.0).round() / 10.0,
             ))
             .collect::<Vec<_>>()),
-        StreamedModelPerformance::Pending => json!("pending"),
-        StreamedModelPerformance::Unavailable { failure } => json!(failure.message),
-        StreamedModelPerformance::Unmeasured => json!("unmeasured"),
+        ModelPerformance::Pending => json!("pending"),
+        ModelPerformance::Unavailable { failure } => json!(failure.message),
     }
 }
 
@@ -129,7 +128,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
         ServingDevice::select(&catalog)?,
         Some(kernels.as_path()),
     )?);
-    let stored = structure.stored_measurements(&kernels);
+    let stored = structure.stored_measurements(&kernels, inventory.root());
     let environment = Arc::new(AssessmentEnvironment::new(
         Arc::clone(&structure),
         stored.clone(),
@@ -181,7 +180,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                     "context": profile.context_length,
                     "requiredBytes": memory.iter().map(|domain| domain.required_bytes).collect::<Vec<_>>(),
                     "tokensPerSecond": match residency {
-                        ModelResidency::Resident { performance } => tokens_per_second(&performance.clone().into()),
+                        ModelResidency::Resident { performance } => tokens_per_second(performance),
                         ModelResidency::Streamed { performance, .. } => tokens_per_second(performance),
                     },
                 }),

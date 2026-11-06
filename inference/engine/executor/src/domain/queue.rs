@@ -264,10 +264,7 @@ impl<F: ProgramFamily> QueuedStep<F> {
         // failures fail nothing, as no sequence takes its outputs.
         let finished = self.flight.submission.finish().map(|completed| {
             let (core, output) = completed.into_parts();
-            output.complete(core.batch(), super::recording(experts, core.work())).map(|output| match output.experts {
-                crate::programs::native_target::ExpertStepEnd::Ran(record) => super::publish_misses(experts, record),
-                crate::programs::native_target::ExpertStepEnd::Interrupted(_) => {}
-            })
+            output.complete(core.batch(), super::recording(experts, core.work())).map(|_| ())
         });
         match (finished, priming) {
             (Ok(Ok(())), None | Some(Ok(()))) => Ok(()),
@@ -687,10 +684,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let epoch = self.launch_epoch();
         let (submission, _) = match self.family.submit_target(Chain::one(launch), spare) {
             Ok(submitted) => submitted.split_first(),
-            Err(refusal) => {
-                super::publish_misses(self.experts.as_ref(), refusal.misses);
-                return Err(DomainError::from(refusal.error));
-            }
+            Err(refusal) => return Err(DomainError::from(refusal.error)),
         };
         self.queue = Queue::Successor(self.queued_step(
             flight,

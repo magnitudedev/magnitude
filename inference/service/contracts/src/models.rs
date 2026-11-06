@@ -2728,29 +2728,6 @@ pub enum ModelPerformance {
     Estimated { samples: Vec<PerformanceEvidence> },
 }
 
-/// A streamed fit's speed estimates: a [`ModelPerformance`], or unmeasured before the model's
-/// first streamed load, while the record of which experts its routing misses on this machine,
-/// which the estimate is computed from, does not exist yet.
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum StreamedModelPerformance {
-    Pending,
-    Unavailable { failure: ModelFailure },
-    Unmeasured,
-    Estimated { samples: Vec<PerformanceEvidence> },
-}
-
-impl From<ModelPerformance> for StreamedModelPerformance {
-    fn from(performance: ModelPerformance) -> Self {
-        match performance {
-            ModelPerformance::Pending => Self::Pending,
-            ModelPerformance::Unavailable { failure } => Self::Unavailable { failure },
-            ModelPerformance::Estimated { samples } => Self::Estimated { samples },
-        }
-    }
-}
-
 /// How a fitting model holds its weights, and its decode speed held that way.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2763,8 +2740,8 @@ pub enum ModelResidency {
     #[serde(rename_all = "camelCase")]
     Streamed {
         bank: StreamedBank,
-        performance: StreamedModelPerformance,
-        floor_performance: StreamedModelPerformance,
+        performance: ModelPerformance,
+        floor_performance: ModelPerformance,
     },
 }
 
@@ -2835,7 +2812,6 @@ mod model_residency_tests {
                 "samples": [{ "contextTokens": 4096, "estimatedTokensPerSecond": tokens_per_second }]
             })
         };
-        let unmeasured = StreamedModelPerformance::Unmeasured;
         let bank = |cold_experts| {
             StreamedBank::try_from(StreamedBankParts {
                 experts: NonZeroU64::new(256).unwrap(),
@@ -2858,8 +2834,8 @@ mod model_residency_tests {
             (
                 ModelResidency::Streamed {
                     bank: bank(ColdExperts::HostRam),
-                    performance: estimated(20.0).into(),
-                    floor_performance: estimated(5.5).into(),
+                    performance: estimated(20.0),
+                    floor_performance: estimated(5.5),
                 },
                 serde_json::json!({
                     "_tag": "Streamed",
@@ -2871,14 +2847,14 @@ mod model_residency_tests {
             (
                 ModelResidency::Streamed {
                     bank: bank(ColdExperts::Disk),
-                    performance: unmeasured.clone(),
-                    floor_performance: unmeasured,
+                    performance: ModelPerformance::Pending,
+                    floor_performance: ModelPerformance::Pending,
                 },
                 serde_json::json!({
                     "_tag": "Streamed",
                     "bank": wire_bank("disk"),
-                    "performance": { "_tag": "Unmeasured" },
-                    "floorPerformance": { "_tag": "Unmeasured" }
+                    "performance": { "_tag": "Pending" },
+                    "floorPerformance": { "_tag": "Pending" }
                 }),
             ),
         ] {
@@ -2888,12 +2864,6 @@ mod model_residency_tests {
                 residency
             );
         }
-        // Only a streamed fit reads a miss record, so only its speed is ever unmeasured.
-        assert!(serde_json::from_value::<ModelResidency>(serde_json::json!({
-            "_tag": "Resident",
-            "performance": { "_tag": "Unmeasured" }
-        }))
-        .is_err());
         // A streamed bank holds at least its floor, and fewer than every expert.
         for (slots, floor_slots) in [(20, 26), (256, 26)] {
             assert!(serde_json::from_value::<StreamedBank>(serde_json::json!({

@@ -249,7 +249,8 @@ mod tests {
     fn a_live_load_reprices_on_newly_stored_costs_and_grows() {
         let backend = seismic::BackendName::Metal;
         let (mut domain, bindings) = fixtures::banked(backend, 4, 2);
-        fixtures::record_misses(&mut domain, fixtures::misses_at(3, 100, 4));
+        let decode = fixtures::misses_at(3, 100);
+        fixtures::count_decode(&mut domain, decode);
         // The pricing: the streamed fixture model planned on this device,
         // its bank and resident plan, its costs kept in an empty cache.
         let catalog = seismic::Devices::discover(&[]).unwrap();
@@ -274,7 +275,7 @@ mod tests {
         let bank = resident.clone().with_bank::<magnitude_executor::AssessmentMemoryCharge>(&definition, None).unwrap().draft().load().expert_bank().cloned();
         let bank = bank.expect("the streamed fixture plans an expert bank");
         let cache = tempfile::tempdir().unwrap();
-        let pricing = ExpertPricing::unmeasured(cache.path().to_owned(), definition, resident, device.clone(), bank);
+        let pricing = ExpertPricing::unmeasured(cache.path().to_owned(), cache.path().to_owned(), definition, resident, device.clone(), bank);
         let limits = ServiceLimits {
             prefill_tokens: 2,
             decode_tokens: 2,
@@ -300,9 +301,12 @@ mod tests {
             &mut measurer,
             &device,
             &KernelCache::measurement_records(cache.path()),
-            &[magnitude_executor::assessment::PointRequest::Costs],
+            &[
+                magnitude_executor::assessment::PointRequest::Costs,
+                magnitude_executor::assessment::PointRequest::Storage { directory: cache.path().to_owned() },
+            ],
             std::time::Instant::now() + std::time::Duration::from_secs(60),
-            &mut |key| match std::mem::take(&mut probe) || key.configuration.contains_key("calls") {
+            &mut |key| match std::mem::take(&mut probe) || key.configuration.contains_key("calls") || key.configuration.contains_key("storage") {
                 true => Attempt::Proceed,
                 false => Attempt::Skip(Reason::new("not this test's point".to_owned())),
             },

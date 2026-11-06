@@ -230,9 +230,10 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
     let topology = catalog.topology();
     let records = magnitude_executor::KernelCache::measurement_records(root);
     let requests = PointRequests::new(root);
+    let storage = manifest.store().to_path_buf();
     let outstanding = || {
         let costs = magnitude_executor::assessment::ExecutorCosts::stored(&topology, &selected.info, &records).is_ok_and(|walked| walked.outstanding());
-        requests.outstanding(&topology, &selected.info, &records, costs)
+        requests.outstanding(&topology, &selected.info, &storage, &records, costs)
     };
     let mut left = outstanding()?;
     let mut job = 0;
@@ -241,6 +242,7 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
         let request = MeasureRequest {
             paths: paths.clone(),
             kernels: root.clone(),
+            storage: storage.clone(),
             executor: selected.info.selector(),
             job: MeasureJob(job),
             time: std::time::Duration::from_secs_f64(MEASUREMENT_SECONDS),
@@ -757,7 +759,7 @@ pub fn tokens(ids: &[u32]) -> Vec<TokenId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_executor::fixtures::{bank_backends, banked, host_tier, misses_at, record_misses};
+    use magnitude_executor::fixtures::{bank_backends, banked, count_decode, host_tier, misses_at, READ};
 
     /// A capped load on a discrete-shaped device, its bank whole on the
     /// device and a host tier beside it, grows that tier across the
@@ -770,10 +772,11 @@ mod tests {
         for backend in bank_backends() {
             let (mut domain, mut bindings) = banked(backend, 2, 2);
             host_tier(&mut domain, 4);
-            record_misses(&mut domain, misses_at(4, 100, 4));
+            let decode = misses_at(4, 100);
+            count_decode(&mut domain, decode);
             domain.measure_experts(magnitude_executor::ExpertMeasures {
                 lines: magnitude_executor::assessment::Priced::Measured(std::sync::Arc::from([])),
-                store: None,
+                read: magnitude_executor::assessment::Priced::Measured(READ),
                 resident: magnitude_executor::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
                 pass: magnitude_executor::assessment::Priced::Pending("unpriced".into()),
                 moves: magnitude_executor::assessment::Priced::Pending("unmeasured".into()),

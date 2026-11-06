@@ -380,6 +380,11 @@ pub struct ExecutionManifest {
     pub device: DeviceRequest,
     /// The kernel cache directory the host names; `None` caches nothing.
     pub kernel_cache: Option<PathBuf>,
+    /// The model store of the opened target (`Package::store`): where the
+    /// measurement job reads the store's line and a streamed load prices
+    /// its reads. None of a manifest no package was opened for (an
+    /// assessment's, of headers), which no load is resolved from.
+    pub model_store: Option<PathBuf>,
     /// The host's threshold policy: every engine claim keeps each domain's
     /// headroom above its planning reserve.
     pub reserves: MemoryReserves,
@@ -487,6 +492,16 @@ enum KvCodecEncoding {
 }
 
 impl ExecutionManifest {
+    /// The model store a load's requests and prices read
+    /// ([`Self::model_store`]).
+    ///
+    /// # Panics
+    /// For a manifest no package was opened for, which no load is resolved
+    /// from.
+    pub fn store(&self) -> &std::path::Path {
+        self.model_store.as_deref().expect("a load's manifest is resolved from its opened package")
+    }
+
     pub fn new(
         package: PackageManifest,
         definition: ModelDefinition,
@@ -495,6 +510,7 @@ impl ExecutionManifest {
         path: ExecutionPath,
         device: DeviceRequest,
         kernel_cache: Option<PathBuf>,
+        model_store: Option<PathBuf>,
         reserves: MemoryReserves,
     ) -> Result<Self, String> {
         let definition = model.method.executed(definition);
@@ -511,6 +527,7 @@ impl ExecutionManifest {
             path,
             device,
             kernel_cache,
+            model_store,
             reserves,
             tuning: TuningSettings::STANDARD,
             tuning_trace: None,
@@ -1104,6 +1121,7 @@ pub(crate) mod tests {
             ExecutionPath::Native,
             "metal:00000001000004a5".parse().unwrap(),
             kernel_cache,
+            Some(PathBuf::from("/models")),
             MemoryReserves::standard(),
         )
         .unwrap()

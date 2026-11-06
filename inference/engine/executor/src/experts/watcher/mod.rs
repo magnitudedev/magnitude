@@ -450,9 +450,11 @@ impl Shared {
         self.steps.window(sequence, layer, first);
     }
 
-    /// The load's latest miss record, which prices the bank's growth.
-    pub fn latest_record(&self) -> Option<std::sync::Arc<crate::assessment::MissRecord>> {
-        self.telemetry.latest()
+    /// What the load's counted decode read and ran so far
+    /// (`Stack::live`), which prices its experts' decisions; none before it
+    /// counted a step.
+    pub fn live(&self) -> Option<crate::assessment::LiveDecode> {
+        self.telemetry.live()
     }
 
     /// What weighs a prompt group's places against the bank's slots

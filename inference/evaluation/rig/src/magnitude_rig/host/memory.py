@@ -264,8 +264,8 @@ def releases(lines):
         elif event["message"] == "memory condition changed":
             found.append({"at": event["at"], "condition": event["to"]})
         elif event["message"] == "expert bank growth decision":
-            # What a growth with room enough reaches: where the load's latest miss record says
-            # the holding's misses stop falling, at most its ceiling.
+            # What a growth with room enough reaches: where the load's priced decode says the
+            # holding's misses stop falling, at most its ceiling.
             found.append({"at": event["at"], "decision": event["holding"], "justified": event["justified"]})
     return found
 
@@ -285,22 +285,18 @@ def served_steps(lines):
     return found
 
 
-def report_stalls(pressure, released, start, release_step_ratio, served):
+def report_stalls(pressure, released, start, served):
     """What each resize in the pressure's window costs the decode, apart from steps that are slow on
     their own. The window is the decode's span under the held pressure (the harness's `window`
     tokens); a resize outside it is listed, not judged. A resize costs the decode what it holds
-    the submitting thread (its decision, plan and moves: `ms`) and what its device work beside the
-    decode slows the steps it overlaps (its release, from install to released), at most
-    `release_step_ratio` less one of the time it overlaps each: the executor's costs measured that
-    ratio (device work beside a release over it alone), and none read, a release explains nothing.
-    On a GB10 a release slowed device work beside it by about a tenth, so a release spanning many
-    steps explains little of any one slow step among them. Each step's excess
+    the submitting thread (its decision, plan and moves: `ms`); its release, from install to released,
+    slowed device work beside it by about a tenth on a GB10, so a release spanning many steps
+    explains little of any one slow step among them and none is credited. Each step's excess
     is its wait less the step there, the median of the window's other waits (`step_at` says why
     that is enough); where resizes follow one another every step, the other steps carry them
-    too. A resize lands within one step when its
-    thread time and the worst excess of the steps its release overlaps are each within the step.
-    A step slower than the step there by more than a step, which no resize's thread or release
-    touches, or slower than the thread time of the resize decided in it explains, is a slow step
+    too. A resize lands within one step when its thread time is within the step.
+    A step slower than the step there by more than a step, past the thread time of the resize
+    decided in it, is a slow step
     of its own, reported as one with what the streamed steps that completed in it read (`served`,
     the worker's `expert step completed` events). Returns the gate's failures: a window that tested nothing, and
     each resize in it not within one step."""
@@ -342,20 +338,12 @@ def report_stalls(pressure, released, start, release_step_ratio, served):
     print("|---|---|---|---|---|---|---|---|---|---|")
     excess = lambda index: waits[index][0] - step_at(index)
     overlap = lambda index, since, until: max(0.0, min(waits[index][2], until) - max(waits[index][1], since))
-    # What resizes can cost each step: the thread time of those decided in it, and what each release
-    # running during it slows it by, at most the executor's measured ratio less one of the time they
-    # overlap (`release_step_ratio`, the move point beside a release over it alone). Unread, a
-    # release explains nothing.
-    slowing = max(0.0, release_step_ratio - 1.0) if release_step_ratio is not None else 0.0
-    if release_step_ratio is None:
-        print("a release's cost to a step beside it is unread (the executor's costs): it explains no step")
-    slowed = lambda index, event: slowing * overlap(index, event["installed"], event["released"])
+    # What resizes cost each step: the thread time of those decided in it.
     cost = [0.0] * len(waits)
     for event in resizes:
         for index, wait in enumerate(waits):
             if wait[1] <= event["decided"] < wait[2]:
                 cost[index] += event["ms"] / 1e3
-            cost[index] += slowed(index, event)
     within = 0
     for event in inside:
         thread = event["ms"] / 1e3
@@ -364,17 +352,15 @@ def report_stalls(pressure, released, start, release_step_ratio, served):
         anchor = decided if decided is not None else (during[0] if during else None)
         step = step_at(anchor) if anchor is not None else None
         at_decision = excess(decided) if decided is not None else None
-        # Each step its release overlaps is slower by at most what the release slows it by.
-        release = max((min(excess(index), slowed(index, event))
-                       for index in during), default=None)
-        fits = step is not None and thread <= step and (release is None or release <= step)
+        release = max((excess(index) for index in during), default=None)
+        fits = step is not None and thread <= step
         within += fits
         moves = f"{event['moves']:.1f}" if event["rung"] == "Bank" else "-"
         print(f"| {event['decided'] - start:.2f} | {event['rung']} | {event['bank_slots']} | {event['ms']:.1f} "
               f"| {moves} | {ms(event['released'] - event['installed'])} | {ms(step) if step else '-'} "
               f"| {ms(at_decision) if at_decision is not None else '-'} | {ms(release) if release is not None else '-'} "
               f"| {'yes' if fits else 'NO'} |")
-    print(f"resizes in the window within one step, by thread time and release: {within} of {len(inside)}")
+    print(f"resizes in the window within one step, by thread time: {within} of {len(inside)}")
     slow = [index for index in range(len(waits)) if excess(index) - cost[index] > step_at(index)]
     for index in slow:
         wait, since, until = waits[index]
@@ -484,7 +470,7 @@ def pressure_transitions(charge, events, samples):
             elif any(deficits[value["storage_kind"]] > 0 and current[name] > value["physical_floor"]
                      for name, value in selected.items()):
                 failures.append("costlier resource released before pressured-store holdings exhausted reclaimable backing")
-    # All it held, or less where the latest growth decision's miss record says more saves nothing.
+    # All it held, or less where the latest growth decision's priced decode says more saves nothing.
     justified = {event["decision"]: event["justified"] for event in events if "decision" in event}
     wanted = {name: min(selected[name]["initial"], justified.get(name, selected[name]["initial"])) for name in shrunk}
     failures += [f"{name} did not regrow after the pressure: {current[name]} of the {wanted[name]} its record justifies"
@@ -524,7 +510,7 @@ def report_pressure(charge, lines, resident_tokens, scratch):
         failures.append("pressured decode differs from unpressured reference")
     if not failures:
         failures += report_stalls(pressure, [event for event in events if "rung" in event],
-                                  pressure["started"]["at"], charge["release_step_ratio"], served_steps(lines))
+                                  pressure["started"]["at"], served_steps(lines))
     report = {"pressure": pressure, "bank": charge.get("bank"), "events": events, "samples": samples, "failures": failures,
               "tokens": tokens, "reference_tokens": resident_tokens}
     (scratch / PRESSURE).write_text(json.dumps(report, indent=1))

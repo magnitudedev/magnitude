@@ -132,10 +132,8 @@ describe("model expert facts", () => {
       ["Expert floor", "1%"],
       ["Speed at the floor", "~5 tok/s"],
     ])
-    expect(fitResidencyFacts(streamedFitResidency(false, "host_ram"), 32_768)[0])
+    expect(fitResidencyFacts(streamedFitResidency("host_ram"), 32_768)[0])
       .toEqual(["Experts this machine allows", "60%, the rest in system memory as it allows, else read from disk"])
-    expect(fitResidencyFacts(streamedFitResidency(true), 32_768).at(-1))
-      .toEqual(["Speed at the floor", "Measured on its first streamed load"])
   })
 
   it("states an unloaded streamed fit's facts, and needs no hardware for them", () => {

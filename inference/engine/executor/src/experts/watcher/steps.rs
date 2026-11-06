@@ -10,7 +10,7 @@
 
 use super::Shared;
 use super::core::At;
-use crate::assessment::{ExpertLines, MissRecord};
+use crate::assessment::ExpertLines;
 use crate::experts::directory::Point;
 use crate::experts::events::Events;
 use crate::FlightDepth;
@@ -298,12 +298,11 @@ impl Steps {
         (first, group.steps)
     }
 
-    /// Step `sequence`'s group, when it began, and whether the step is
-    /// alone in it.
-    fn begun(&self, sequence: Step) -> (Step, Instant, bool) {
+    /// Step `sequence`'s group and when it began.
+    fn begun(&self, sequence: Step) -> (Step, Instant) {
         let mut state = self.lock();
         let (first, group) = state.group(sequence);
-        (first, group.begun, group.steps == 1)
+        (first, group.begun)
     }
 
     /// Step `sequence` ended, by whichever exit, its failure forgotten, and
@@ -785,13 +784,9 @@ pub(crate) struct ExpertStep {
     sampled: Option<Arc<[ExpertLines]>>,
 }
 
-/// How a step's load records its misses: its decode counted, and, where the
-/// host has each streamed layer's lines (its serving from a host tier),
-/// σ's residuals.
-#[derive(Clone, Debug)]
-pub(crate) struct Recording {
-    pub(crate) lines: Option<Arc<[ExpertLines]>>,
-}
+/// A step whose load counts its decode (`Stack::live`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Recording;
 
 /// A step completed: its launch's work, when its group began, and how its
 /// route feeds it.
@@ -818,13 +813,12 @@ pub(super) struct DecodeLaunch {
 }
 
 /// A decode step completed: how its load records it, its launch, its
-/// group and whether it was alone in it, and the lines its blocks were
+/// group, and the lines its blocks were
 /// sampled by, where they were.
 pub(super) struct Decoded {
     pub(super) recording: Option<Recording>,
     pub(super) launch: Option<DecodeLaunch>,
     pub(super) group: Step,
-    pub(super) alone: bool,
     pub(super) sampled: Option<Arc<[ExpertLines]>>,
 }
 
@@ -846,10 +840,9 @@ impl ExpertStep {
         self.reads
     }
 
-    /// The step's decode launch: its rows, at `positions`. `σ` prices a
-    /// launch at its rows' mean depth (`MissRecord::overhead`), so rows of
-    /// several sequences at their own depths take theirs, not the first
-    /// row's.
+    /// The step's decode launch: its rows, at `positions`, counted at its
+    /// rows' mean context (`Stack::live`), so rows of several sequences at
+    /// their own depths take theirs, not the first row's.
     pub fn decoding(mut self, positions: impl ExactSizeIterator<Item = u64>) -> Self {
         let rows = positions.len();
         assert!(rows > 0, "a decode launch runs a row");
@@ -857,29 +850,26 @@ impl ExpertStep {
         self
     }
 
-    /// The step's load records its misses, by the lines its `recording`
-    /// holds.
+    /// The step's load counts its decode.
     pub fn recorded(mut self, recording: Recording) -> Self {
         self.recorded = Some(recording);
         self
     }
 
     /// The device has completed the step: the watcher retires its fills,
-    /// and why its requests failed, if one did, is returned, else the
-    /// load's miss record when a new one is due (`Telemetry::due`). A step
+    /// and why its requests failed, if one did, is returned. A step
     /// not [`Self::recorded`] (a load's
     /// warm-up's) is fed to the stack but not counted. Once the watcher has
     /// stopped serving every step completes with why.
-    pub fn complete(mut self) -> Result<Option<Arc<MissRecord>>, StepFailure> {
+    pub fn complete(mut self) -> Result<(), StepFailure> {
         let shared = &self.shared;
-        let (group, begun, alone) = shared.steps.begun(self.sequence);
+        let (group, begun) = shared.steps.begun(self.sequence);
         let route = match self.route {
             StepRoute::Grouped => CompletedRoute::Grouped,
             StepRoute::Decode => CompletedRoute::Decode(Decoded {
                 recording: self.recorded.take(),
                 launch: self.launch,
                 group,
-                alone,
                 sampled: self.sampled.take(),
             }),
         };
@@ -926,7 +916,7 @@ impl ExpertStep {
             )));
         }
         match (read, site) {
-            (None, None) => Ok(shared.telemetry.due()),
+            (None, None) => Ok(()),
             (Some((rows, reason)), None) => Err(StepFailure::Read { rows, reason }),
             (None, Some((rows, reason))) => Err(StepFailure::Site { rows, reason }),
             (Some(read), Some(site)) => {
@@ -939,12 +929,11 @@ impl ExpertStep {
     /// The device is past the step, whose runs its chain's submission
     /// refused: nothing of it is fed (its records hold what no run of it
     /// wrote) and it ends uncompleted. Why the watcher stopped serving, if
-    /// it did, else the load's miss record when a new one is due.
-    pub fn refuse(self) -> Result<Option<Arc<MissRecord>>, StepFailure> {
-        let shared = &self.shared;
-        match shared.life.ended() {
+    /// it did.
+    pub fn refuse(self) -> Result<(), StepFailure> {
+        match self.shared.life.ended() {
             Some(reason) => Err(StepFailure::Watcher(reason)),
-            None => Ok(shared.telemetry.due()),
+            None => Ok(()),
         }
     }
 }

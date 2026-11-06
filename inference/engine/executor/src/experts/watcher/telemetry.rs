@@ -7,11 +7,11 @@ use crate::operation::LaunchWork;
 use super::core::{Extents, Layer, RoutingRecord};
 use super::steps::{CompletedRoute, CompletedStep, Decoded, EndedReads, Recording, Step};
 use crate::assessment::{
-    ExpertLines, ExpertPass, FileLine, GroupLayerTerms, GroupReads, GroupUnion, LaunchSample, LayerStep, MissRecord, Notice, ReadLine,
-    ReadLineError, RecordFeed, RequestReads, Stages, MISS_RATE_ERROR,
+    ExpertLines, ExpertPass, FileLine, GroupLayerTerms, GroupReads, GroupUnion, LayerStep, Notice, ReadLine,
+    ReadLineError, RequestReads, Stages,
 };
 use crate::experts::Words;
-use crate::experts::directory::{Point, RoutedRead, Stack};
+use crate::experts::directory::{CountedLaunch, Point, RoutedRead, Stack};
 use crate::experts::reuse::Ranking;
 use crate::planning::RegionWords;
 use std::collections::BTreeMap;
@@ -68,9 +68,6 @@ pub struct StepCost {
     /// Each streamed layer's experts: what the bank and tier lacked, and
     /// what the step routed to there.
     pub experts: Vec<LayerExperts>,
-    /// Its launch as the record sampled it for `σ`: a counted decode
-    /// launch alone in its group's; none otherwise.
-    pub launch: Option<LaunchSample>,
     /// Its time from the later of its begin and the end of the step before
     /// ([`step_seconds`]); none of a prompt step.
     pub seconds: f64,
@@ -618,8 +615,8 @@ struct Costs {
 /// performance model takes it (`assessment::streaming`): a hint's read
 /// still reading it, which the request
 /// waits out (a hint is always the layer before's route's), or neither:
-/// read on demand. The one classification both a layer's cost
-/// ([`LayerCost`]) and the miss record's anticipation read.
+/// read on demand. The one classification a layer's cost
+/// ([`LayerCost`]) and its step's anticipation read.
 #[derive(Clone, Copy)]
 pub(super) enum Anticipation {
     Reading,
@@ -773,18 +770,12 @@ pub(super) struct GroupReadWords {
 /// What the ranking's stack is fed, in the device's order: a prompt group's reads
 /// as it ends (its passes' records, `Telemetry::group_read`) and a decode
 /// step's as it completes (its routing records), fed once every step of the
-/// group and of those before it has ended, by group, layer, then sequence;
-/// and the one-row decode steps σ is fitted from.
+/// group and of those before it has ended, by group, layer, then sequence.
 struct Feed {
     /// The reads not yet fed, each with its group and what it is.
     pending: Vec<(Step, RoutedRead, Fed)>,
-    /// The record's counts, step by step.
-    record: RecordFeed,
-    /// The last step's end, and the decode steps counted when a record was
-    /// last due.
+    /// The last step's end.
     ended: Option<Instant>,
-    published: u64,
-    latest: Option<Arc<MissRecord>>,
 }
 
 /// What a read fed to the stack is: a decode step's, counted while its load
@@ -793,9 +784,9 @@ struct Feed {
 /// merged at the layer, and the choices its rows routed to each expert read,
 /// in the read's order.
 enum Fed {
-    /// A decode read, counted into the record with its step's launch's
-    /// rows where the step is (`counted`).
-    Decode { counted: Option<u64> },
+    /// A decode read, counted with its step's launch where the step is
+    /// (`counted`).
+    Decode { counted: Option<CountedLaunch> },
     Group { steps: usize, merged: usize, choices: Vec<u32> },
 }
 
@@ -1014,13 +1005,7 @@ impl Telemetry {
                     resident,
                     experts: layers.iter().map(|layer| layer.experts).collect(),
                 },
-                feed: Feed {
-                    pending: Vec::new(),
-                    record: RecordFeed::default(),
-                    ended: None,
-                    published: 0,
-                    latest: None,
-                },
+                feed: Feed { pending: Vec::new(), ended: None },
                 records,
             }),
             slots,
@@ -1502,13 +1487,8 @@ impl Telemetry {
             }
         }
         costs.line = costs.reads.measured()?;
-        // The run's own read line, along which σ's residuals take the
-        // misses' exposure.
-        if let Some((mut decoded, routed, ..)) = decoded {
-            if let Some(Recording { lines: Some(lines) }) = &mut decoded.recording {
-                *lines = self.with_observed(costs, lines);
-            }
-            feed_decode(feed, &mut cost, routed, decoded, begun, ended, costs.line);
+        if let Some((decoded, routed, ..)) = decoded {
+            feed_decode(feed, routed, decoded);
         }
         // What the step cost in reads, for whoever traces steps (a step slow
         // of its own is read by its misses and reads).
@@ -1589,47 +1569,10 @@ impl Telemetry {
         }
     }
 
-    /// The record of what the load's decode measured, once a new one is due:
-    /// its misses at the bank's own slots are at least `1 / ε²`, so their
-    /// rate's relative standard error (`1/√M`, Poisson) is within
-    /// [`MISS_RATE_ERROR`], a decode launch measured its residuals (its
-    /// depth), it counted twice the decode steps of the last one due (so
-    /// a load's records are as many as the doublings of its decode). What a
-    /// growth step saves is the difference of two steps that carry one `σ`
-    /// (`MissRecord::saving`): it asks the record for its miss rates, not
-    /// for `σ`'s precision. Asked as each step completes, on the thread
-    /// submitting steps, which never waits behind a feed: one running leaves
-    /// the record to the next step.
-    pub(super) fn due(&self) -> Option<Arc<MissRecord>> {
-        let slots = self.slots();
-        let mut stack = match self.stack.try_lock() {
-            Ok(stack) => stack,
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-            Err(std::sync::TryLockError::Poisoned(error)) => panic!("watcher telemetry stack: {error}"),
-        };
-        self.feed_stack(&mut stack);
-        let mut recorded = self.lock();
-        let Recorded { costs, feed, .. } = &mut *recorded;
-        let curve = stack.curve();
-        let misses = curve.layers.iter().map(|layer| layer.at(slots).1).sum::<u64>();
-        if (misses as f64) < MISS_RATE_ERROR.powi(-2)
-            || feed.record.launches() == 0
-            || curve.steps < 2 * feed.published.max(1)
-        {
-            return None;
-        }
-        // The curves and counts are the load's layers' (`Telemetry::new`).
-        // One record, shared by its publication and the latest's readers.
-        let record = Arc::new(feed.record.record(curve, stack.rows(), costs.reads)?);
-        feed.published = curve.steps;
-        feed.latest = Some(record.clone());
-        Some(record)
-    }
-
-    /// The latest record due ([`Self::due`]), which prices the bank's
-    /// growth.
-    pub(super) fn latest(&self) -> Option<Arc<MissRecord>> {
-        self.lock().feed.latest.clone()
+    /// What the load's counted decode read and ran so far
+    /// ([`Stack::live`]); none before it counted a step.
+    pub(super) fn live(&self) -> Option<crate::assessment::LiveDecode> {
+        self.fed().live()
     }
 
     /// Step `sequence`'s routing record at each streamed layer, each layer's
@@ -1964,46 +1907,16 @@ fn served_within(cpu: u64, tiered: u64, absent: u64, layer: usize, sequence: Ste
     );
 }
 
-/// A completed decode step cost `cost`: its routing at every layer,
-/// `routed`, is fed. While its load records it, the step is counted into
-/// the record ([`RecordFeed::decode`]), along the read `line` and the
-/// recording's lines; alone in its group, its
-/// launch is sampled for σ ([`LaunchSample`]) from its group's beginning
-/// (`begun`) or the step before's end, whichever is later, to its end
-/// (`ended`: those two ends), and the cost keeps that sample, so a replay of
-/// the run feeds the record the same step.
-fn feed_decode(
-    feed: &mut Feed,
-    cost: &mut StepCost,
-    routed: Vec<RoutedRead>,
-    decoded: Decoded,
-    begun: Instant,
-    ended: (Option<Instant>, Instant),
-    line: Option<ReadLine>,
-) {
-    let Decoded {
-        recording: recorded,
-        launch,
-        group,
-        alone,
-        sampled: _,
-    } = decoded;
-    let (previous, now) = ended;
+/// A completed decode step's routing at every layer, `routed`, is fed;
+/// while its load records it, counted with its launch.
+fn feed_decode(feed: &mut Feed, routed: Vec<RoutedRead>, decoded: Decoded) {
+    let Decoded { recording, launch, group, .. } = decoded;
     // A recorded decode step runs its launch (`ExpertStep::decoding`).
-    let counted = recorded
-        .as_ref()
-        .map(|_| launch.expect("a recorded decode step has its launch").rows as u64);
-    feed.pending
-        .extend(routed.into_iter().map(|read| (group, read, Fed::Decode { counted })));
-    let Some(Recording { lines }) = recorded else {
-        return;
-    };
-    cost.launch = launch.filter(|_| alone).zip(line).zip(lines.as_ref()).map(|((launch, line), lines)| {
-        let seconds = step_seconds(previous, begun, now);
-        let exposed = cost.layers.iter().zip(lines.iter()).map(|(layer, lines)| layer.exposed(lines, &line)).sum();
-        LaunchSample { rows: launch.rows, tokens: launch.tokens, seconds, exposed }
+    let counted = recording.map(|Recording| {
+        let launch = launch.expect("a recorded decode step has its launch");
+        CountedLaunch { rows: launch.rows as u64, tokens: launch.tokens }
     });
-    feed.record.decode(&cost.layers, cost.launch, lines);
+    feed.pending.extend(routed.into_iter().map(|read| (group, read, Fed::Decode { counted })));
 }
 
 #[cfg(test)]

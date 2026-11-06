@@ -4402,18 +4402,6 @@ impl<E: Entry> NativeKernel<E> {
             .point(rotation.into_iter().map(E::encode).collect())
     }
 
-    /// Calls cycling through `rotation`, as [`Self::point`], timed with
-    /// `beside` (work another thread does on the device) running for as
-    /// long as the point, or any gauge of it, is held.
-    pub fn point_beside(
-        &self,
-        rotation: Vec<E::Args<'_>>,
-        beside: std::sync::Arc<dyn std::any::Any + Send + Sync>,
-    ) -> Result<KernelPoint, CallError> {
-        self.inner
-            .point_beside(rotation.into_iter().map(E::encode).collect(), beside)
-    }
-
     pub fn call(&self, args: E::Args<'_>) -> Result<E::Results, CallError> {
         let encoded = E::encode(args);
         let decoded = seismic_runtime::api::kernel::call_native(&self.inner, encoded)?;

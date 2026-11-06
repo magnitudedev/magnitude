@@ -647,7 +647,7 @@ fn test_measures(domain: &ExecutorDomain, sited: bool, device_landed: bool) -> c
     };
     crate::ExpertMeasures {
         lines,
-        store: None,
+        read: Priced::Pending(pending()),
         resident: Priced::Pending(pending()),
         pass: Priced::Pending(pending()),
         moves: Priced::Pending(pending()),
@@ -735,8 +735,7 @@ fn a_banked_loads_prompt_groups_score_as_resident() {
 /// from the first step after it.
 /// With every stack of one form (one bank group) and with the last routed
 /// layer's in another (two groups, each shrinking its own records), and
-/// without and with lookahead. After each shrink the miss record counts
-/// misses at the slots the bank commits (`Telemetry::due`).
+/// without and with lookahead.
 #[test]
 fn a_whole_bank_shrunk_between_decode_steps_scores_as_resident() {
     let _placement = crate::test_support::process_placement();

@@ -168,8 +168,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let (submission, queued) = match submitted {
             Ok(submissions) => submissions.split_first(),
-            Err(crate::programs::ChainRefusal { error, chain, misses }) => {
-                super::publish_misses(self.experts.as_ref(), misses);
+            Err(crate::programs::ChainRefusal { error, chain }) => {
                 // The rest of the chain follows the first launch's advances
                 // and returns its rows and banks as it drops.
                 let (core, _) = chain.split_first().0.into_submission_parts();
@@ -686,10 +685,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             experts,
         } = output.complete(batch, super::recording(self.experts.as_ref(), core.work())).map_err(DomainError::Invariant)?;
         let interrupted = match experts {
-            crate::programs::native_target::ExpertStepEnd::Ran(record) => {
-                super::publish_misses(self.experts.as_ref(), record);
-                None
-            }
+            crate::programs::native_target::ExpertStepEnd::Ran => None,
             crate::programs::native_target::ExpertStepEnd::Interrupted(reason) => Some(reason),
         };
         for ((request, ..), failure) in flight.requests.iter().zip(failures) {

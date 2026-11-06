@@ -387,18 +387,21 @@ fn a_banks_counts_are_its_plans_derivations_at_every_count() {
 
 /// A tiered record prices the misses its host tier holds as served by
 /// the cost function at once, not after a storage read: beside a bank of
-/// one slot, a tier of the record's saturation in host slots holds every
+/// one slot, a tier of the decode's saturation in host slots holds every
 /// miss, and the step costs what serving them from it does, the CPU and
 /// the link bounded together by the host memory they read
 /// ([`crate::assessment::StepInputs`]).
 #[test]
 fn a_tiered_records_host_held_misses_are_priced_as_served() {
-    use crate::assessment::HeldSlots;
-    let record = crate::domain::fixtures::misses_at(3, 100, 4);
-    let host = record.saturation().unwrap();
-    assert_eq!(host, 4, "the misses stop falling at the record's 4 slots");
+    use crate::assessment::{DecodePrice, ExpertLines, HeldSlots, StreamedLayers};
+    let decode = crate::domain::fixtures::misses_at(3, 100);
+    let host = decode.saturation as usize;
+    assert_eq!(host, 4, "the misses stop falling at the decode's 4 slots");
     let held = HeldSlots { slots: 1, host };
-    let step = |held| record.step_seconds(held, record.rows().unwrap(), 0.015).unwrap();
+    let lines = ExpertLines::reference(1_000_000);
+    let layers = StreamedLayers::new(vec![4], 4, std::sync::Arc::from([lines]));
+    let price = DecodePrice::new(layers, decode.live, crate::domain::fixtures::READ, 0.015);
+    let step = |held| price.step(held);
     let (bank_alone, tiered) = (step(HeldSlots::bank(1)), step(held));
     assert!(tiered.total_seconds < bank_alone.total_seconds, "{tiered:?} against {bank_alone:?}");
     // Four cold tier misses of one row a step and no hit, of 1 MB
@@ -406,7 +409,6 @@ fn a_tiered_records_host_held_misses_are_priced_as_served() {
     // and one in place over the link (44.6 µs) end at 66.2 µs, but every
     // one leaves host memory at its record's 19.7 µs, so the four take
     // 78.8 µs of it.
-    let lines = record.layers[0].lines;
     let cpu = lines.host.cpu.unwrap();
     let served = (cpu.handshake.get() + 3. * cpu.expert.nanoseconds(1.)).max(lines.gpu.link.nanoseconds(1.)) * 1e-9;
     let memory = 4. * lines.host.memory.unwrap().get() * 1e-9;

@@ -119,7 +119,6 @@ pub(crate) fn costs() -> super::ExecutorCosts {
         launch_seconds: cost(5e-6),
         step_pipelined_seconds: cost(50e-6),
         step_round_trip_seconds: cost(150e-6),
-        release_step_ratio: Some(cost(1.1)),
     }
 }
 

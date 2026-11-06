@@ -75,7 +75,7 @@ fn a_bank_shrunk_for_a_press_regrows_once_memory_has_stayed_free() {
         let (mut domain, mut bindings) = banked(backend, 4, 4);
         let row = bank_row(&domain);
         // Misses at 3 slots, none at 4: a fourth slot saves the decode time.
-        price_growth(&mut domain, &mut bindings, misses_at(3, 100, 4));
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100));
         // The state's surplus is released already: the bank's is the rung
         // that answers the press.
         shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);

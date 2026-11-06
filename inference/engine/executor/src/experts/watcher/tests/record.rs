@@ -14,92 +14,31 @@ fn a_gap_between_steps_is_no_steps_time() {
     assert!(seconds <= step.as_secs_f64(), "the step's time ({seconds} s) took in the gap: it ran {step:?}");
 }
 
-/// The lines of the harness's one layer, the reference cell's
-/// (`ExpertLines::reference`); an expert's stored record is three tensors'
-/// [`RECORD`] bytes.
-fn tier_lines() -> std::sync::Arc<[crate::assessment::ExpertLines]> {
-    vec![crate::assessment::ExpertLines::reference(3 * RECORD)].into()
-}
-
-/// A decode of four-row launches alone (a verify's), whose every launch
-/// misses, measures `σ` at four rows and becomes due once its misses reach
-/// `1 / ε²`: no one-row launch, nor any precision of `σ`, is asked for.
+/// A counted decode is live at its launches' rows and context: a decode of
+/// four-row launches (a verify's) counts its steps at four rows, each its
+/// rows' mean context, and its requests as single rows' (every step here
+/// misses, so a row's share is `1 − (1 − 1)^¼ = 1`); a step not counted
+/// (a warm-up's) is not.
 #[test]
-fn a_decode_of_multi_row_launches_is_recorded_at_their_rows() {
-    use crate::assessment::MISS_RATE_ERROR;
-    let harness = harness("launch-rows", EXPERTS, 2);
-    let lines = tier_lines();
-    let misses = MISS_RATE_ERROR.powi(-2) as usize;
-    let mut record = None;
-    for position in 0..misses as u64 {
+fn a_counted_decode_is_live_at_its_launches_rows_and_context() {
+    let harness = harness("live", EXPERTS, 2);
+    let warm = harness.step().decoding([10; 4].into_iter());
+    harness.request_at(&warm, 0, &[0, 1]);
+    warm.complete().unwrap();
+    assert_eq!(harness.watcher.shared().live(), None, "a warm-up's step is not counted");
+    let steps = 6u64;
+    for position in 0..steps {
         // Two experts a launch, cycling through every expert: each misses.
-        let first = (2 * position as usize) % EXPERTS;
-        let step = harness
-            .step()
-            .decoding([1000 + position; 4].into_iter())
-            .recorded(Recording { lines: Some(lines.clone()) });
+        let first = (2 * (position as usize + 1)) % EXPERTS;
+        let step = harness.step().decoding([1000 + position; 4].into_iter()).recorded(Recording);
         harness.request_at(&step, 0, &[first, first + 1]);
-        if let Some(due) = step.complete().unwrap() {
-            record = Some(due);
-            break;
-        }
+        step.complete().unwrap();
     }
-    let record = record.expect("a record is due");
-    let launches = record.residuals.rows.map(|at| at.launches);
-    assert!(launches[3] > 0 && launches.iter().sum::<u64>() == launches[3], "{launches:?}");
-    assert!(record.compute(&|rows, _| Ok::<_, ()>(0.01 * rows as f64)).unwrap().is_ok());
-}
-
-/// A replay of a decode from what the run recorded of it, as the harness
-/// keeps a cell (each step's layers and the launch it sampled for σ, the
-/// served file's reads, through their serialized
-/// form), assembles through the one record assembly (`RecordFeed`) the
-/// record the live telemetry made due. The reads' curve and returns are the
-/// ranking's stack's, which the replay feeds from the same routing.
-#[test]
-fn a_replay_of_the_recorded_steps_assembles_the_live_record() {
-    use crate::assessment::{LaunchSample, LayerStep, RecordFeed, MISS_RATE_ERROR};
-    let harness = harness("replayed", EXPERTS, 2);
-    let lines = tier_lines();
-    // As a cell records each completed step's expert step.
-    let mut recorded = Vec::new();
-    let mut live = None;
-    for position in 0..MISS_RATE_ERROR.powi(-2) as u64 {
-        let first = (2 * position as usize) % EXPERTS;
-        // Launches of one to four rows, so σ is sampled at each.
-        let step = harness
-            .step()
-            .decoding(std::iter::repeat_n(1000 + position, 1 + position as usize % 4))
-            .recorded(Recording { lines: Some(lines.clone()) });
-        harness.request_at(&step, 0, &[first, first + 1]);
-        let due = step.complete().unwrap();
-        let (_, cost) = harness.watcher.shared().costs().completed.expect("a completed step");
-        recorded.push(serde_json::json!({ "layers": cost.layers, "launch": cost.launch }));
-        if due.is_some() {
-            live = due;
-            break;
-        }
-    }
-    let live = live.expect("a record is due");
-    let costs = harness.watcher.shared().costs();
-    let bank = serde_json::json!({ "reads": costs.reads });
-    let mut feed = RecordFeed::default();
-    // The lines as the record took them, with the landing line observed.
-    let lines = live.layers.iter().map(|layer| layer.lines).collect::<std::sync::Arc<[_]>>();
-    for step in &recorded {
-        let layers = serde_json::from_value::<Vec<LayerStep>>(step["layers"].clone()).unwrap();
-        let sample = serde_json::from_value::<Option<LaunchSample>>(step["launch"].clone()).unwrap();
-        feed.decode(&layers, sample, Some(lines.clone()));
-    }
-    let curve = crate::experts::MissCurve {
-        steps: live.steps,
-        layers: live.layers.iter().map(|layer| layer.curve.clone()).collect(),
-    };
-    let reads = serde_json::from_value(bank["reads"].clone()).unwrap();
-    let replayed = feed.record(&curve, live.rows, reads).expect("the replay sampled σ");
-    let rows = live.residuals.rows.map(|at| at.launches);
-    assert!(rows[..4].iter().all(|&launches| launches > 0), "σ sampled at one to four rows: {rows:?}");
-    assert_eq!(replayed, *live);
+    let live = harness.watcher.shared().live().expect("a counted decode");
+    assert_eq!((live.steps, live.rows), (steps, 4.));
+    // Each launch's context is its rows' positions plus one.
+    assert_eq!(live.depth, 1001 + (steps as u32 - 1) / 2);
+    assert_eq!(live.layers.len(), 1);
 }
 
 /// With two prompt groups in flight, the watcher counts the second's first
