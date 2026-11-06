@@ -117,8 +117,13 @@ impl DeviceProcessCosts {
     ///
     /// The block allocator holds free space beside the charge at every
     /// moment, the fit depth included; it depends on the order of
-    /// allocations, not on a count the plan fixes. On CUDA it never exceeded
-    /// one block cap (0.28–1.04 GB measured), which is its cost. On Vulkan,
+    /// allocations, not on a count the plan fixes. On CUDA, where every
+    /// allocation of more than half the first block takes a block of its own
+    /// (`seismic_compiler::blocks::takes_own_block`), it stays within one
+    /// block cap, which is its cost: replaying the tensors of Nemotron 3.5
+    /// Lightning, Qwen3.8 Flash Next, Qwen3.8 27B and Gemma 4 31B gives
+    /// 0.05–0.78 GB, where doubled blocks shared by expert stacks held up to
+    /// 5.4 GB (measured). On Vulkan,
     /// whose upload storage has blocks of its own, it reached 1.151 GB on
     /// both systems, the most measured. Metal and the CPU are unified: their
     /// kernels and runtime are measured in the worker's host bytes.

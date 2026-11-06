@@ -6,7 +6,7 @@
 //! with its charges.
 
 use crate::driver::{self, Allocation, Context, DriverError};
-use seismic_compiler::blocks::{block_bytes, FreeRanges, BLOCK_CAP_BYTES};
+use seismic_compiler::blocks::{block_bytes, takes_own_block, FreeRanges, BLOCK_CAP_BYTES};
 use seismic_compiler::errors::ExecutionError;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -107,7 +107,7 @@ impl Blocks {
                 let block = Arc::new(Block {
                     _charge: charge,
                     allocation,
-                    dedicated: bytes > BLOCK_CAP_BYTES,
+                    dedicated: takes_own_block(bytes, BLOCK_CAP_BYTES),
                     free: Mutex::new(FreeRanges::new(size)),
                 });
                 let offset = block

@@ -5,7 +5,8 @@
 //! address; an allocation is a range of a block, and its address is the
 //! block's address plus the range's offset. Blocks of one storage kind grow
 //! from 64 MiB to the block cap (min(`maxMemoryAllocationSize`,
-//! `maxBufferSize`, 1 GiB)); a request beyond the cap gets a dedicated block.
+//! `maxBufferSize`, 1 GiB)); a request of more than half the first block gets a
+//! block of its own.
 //! A block is freed once it holds no allocation, so released storage returns
 //! to the device's memory budget: the engine reads the budget less usage as
 //! its headroom, and a block kept empty would hide released storage from it.
@@ -21,7 +22,7 @@
 use crate::device::{call, Inner};
 use crate::instance::Instance;
 use ash::vk;
-use seismic_compiler::blocks::{block_bytes, FreeRanges, BLOCK_CAP_BYTES};
+use seismic_compiler::blocks::{block_bytes, takes_own_block, FreeRanges, BLOCK_CAP_BYTES};
 use seismic_compiler::errors::ExecutionError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -349,7 +350,7 @@ impl Memory {
                     .filter(|block| !block.dedicated)
                     .map(|block| block.bytes)
                     .max();
-                let dedicated = bytes > self.block_cap;
+                let dedicated = takes_own_block(bytes, self.block_cap);
                 // A type whose heap's budget cannot hold the block, or whose
                 // heap refuses it, is passed over for the next; the last
                 // type, with none after it, is left to the driver.

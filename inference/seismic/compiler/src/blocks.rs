@@ -2,7 +2,7 @@
 //! (CUDA, Vulkan). Device memory is taken from the driver in blocks, and an
 //! allocation is a range of a block, so a model's many small tensors cost
 //! no per-allocation driver rounding. Blocks grow from 64 MiB to the cap; a
-//! request beyond the cap gets a dedicated block. A block's unallocated
+//! request of more than half the first block gets a block of its own. A block's unallocated
 //! space is device usage no allocation charges, so a new block never exceeds
 //! the room the caller grants, and the backend reports its blocks' free
 //! space as held memory.
@@ -68,18 +68,27 @@ impl FreeRanges {
     }
 }
 
+/// Whether an allocation of `bytes` takes a block of its own, which nothing
+/// else shares and no later block doubles: one of more than half the first
+/// block (or of the cap). Sharing doubled blocks, a run of such allocations
+/// (a model's expert stacks) would hold a tail of each block that fits none
+/// of them and that the model's few smaller tensors never fill: 343 MiB
+/// stacks two to a 1 GiB block held 5.0 GB free beside Nemotron 3.5
+/// Lightning's 20.5 GB, and 450 MiB stacks 5.4 GB beside Qwen3.8 Flash
+/// Next's 73.5 GB, against a one-block allowance.
+pub fn takes_own_block(bytes: u64, cap: u64) -> bool {
+    bytes > FIRST_BLOCK_BYTES.min(cap) / 2
+}
+
 /// The size of a new block for an allocation of `bytes`: double the largest
-/// block (64 MiB first) up to `cap`, in whole `granularity` units. An
-/// allocation of more than half that block gets a block of its own size
-/// rounded up to the granularity: a block shares its space so many smaller
-/// allocations cost one driver allocation, and what such an allocation
-/// would leave free fits no allocation its size, so a run of them (a
-/// model's expert stacks) would hold most of a block each in tails nothing
-/// takes. When `room` is given and the doubled block does not fit it, the
-/// block is the allocation's own size: a device near its limit holds no
-/// free block space it was not asked for, so its usage stays with its
-/// claims and clear of the planning reserve. An allocation that needs more
-/// than the room is a capacity shortfall.
+/// shared block (64 MiB first) up to `cap`, in whole `granularity` units,
+/// so many smaller allocations cost one driver allocation. An allocation
+/// that takes its own block (`takes_own_block`) gets its own size rounded up
+/// to the granularity. When `room` is given and the doubled block does not
+/// fit it, the block is the allocation's own size: a device near its limit
+/// holds no free block space it was not asked for, so its usage stays with
+/// its claims and clear of the planning reserve. An allocation that needs
+/// more than the room is a capacity shortfall.
 pub fn block_bytes(
     largest: Option<u64>,
     cap: u64,
@@ -91,7 +100,11 @@ pub fn block_bytes(
     let doubled = largest
         .map_or(FIRST_BLOCK_BYTES, |largest| largest * 2)
         .min(cap);
-    let size = if needed > doubled / 2 { needed } else { doubled };
+    let size = if takes_own_block(bytes, cap) || needed > doubled / 2 {
+        needed
+    } else {
+        doubled
+    };
     match room {
         Some(room) if needed > room => Err(ExecutionError::AllocationCapacity {
             required: needed.into(),
@@ -162,11 +175,11 @@ mod tests {
         ));
     }
 
-    /// An allocation of more than half the block it would open takes a
-    /// block of its own size: its tail would fit nothing its size. Half or
-    /// less shares the doubled block.
+    /// An allocation of more than half the first block takes a block of its
+    /// own size, however large the shared blocks have grown: its tail would
+    /// fit nothing its size. Half or less shares the doubled block.
     #[test]
-    fn an_allocation_beyond_half_a_new_block_takes_its_own_size() {
+    fn an_allocation_beyond_half_the_first_block_takes_its_own_size() {
         let cap = 1024 * MIB;
         let g = 2 * MIB;
         assert_eq!(
@@ -174,12 +187,19 @@ mod tests {
             758 * MIB
         );
         assert_eq!(
-            block_bytes(Some(512 * MIB), cap, 512 * MIB, None, g).unwrap(),
+            block_bytes(Some(512 * MIB), cap, 343 * MIB + 1, None, g).unwrap(),
+            344 * MIB
+        );
+        assert_eq!(
+            block_bytes(Some(512 * MIB), cap, 32 * MIB, None, g).unwrap(),
             cap
         );
         assert_eq!(
             block_bytes(None, cap, 40 * MIB, None, g).unwrap(),
             40 * MIB
         );
+        assert!(takes_own_block(32 * MIB + 1, cap));
+        assert!(!takes_own_block(32 * MIB, cap));
+        assert!(takes_own_block(9 * MIB, 16 * MIB));
     }
 }
