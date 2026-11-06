@@ -1,4 +1,4 @@
-use super::policy::{DomainRole, Fit, HostRoom, MemoryPolicyError, MemoryReserves, refresh_device_ceiling};
+use super::policy::{DomainRole, Fit, HostRoom, LoadStage, MemoryPolicyError, MemoryReserves, refresh_device_ceiling};
 use super::selection::{DeviceRequest, SelectionError, select};
 use crate::planning::HostTier;
 use crate::{CatalogError, ExecutionPath};
@@ -264,11 +264,11 @@ pub fn open_selected(
     // A load opens the device: its first allocations are a load's, which
     // may take what the OS can obtain (`DeviceHeap::open` holds the device
     // to the same room until the load ends).
-    refresh_device_ceiling(&device, &status, &config.reserves, HostRoom::Obtainable)
+    refresh_device_ceiling(&device, &status, &config.reserves, HostRoom::Obtainable(LoadStage::Loading))
         .map_err(PlatformError::Memory)?;
     let topology = device.topology();
     let host_ram = topology.host_ram().id();
-    let fit = Fit::new(topology, &status, &config.reserves, HostRoom::Obtainable);
+    let fit = Fit::new(topology, &status, &config.reserves, HostRoom::Obtainable(LoadStage::Loading));
     let room = crate::TuningRoom {
         device_bytes: fit
             .placement(device.info(), Contract::DeviceOnly)

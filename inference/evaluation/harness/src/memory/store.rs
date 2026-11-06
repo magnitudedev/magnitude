@@ -26,12 +26,13 @@ pub struct Target {
     device: Device,
     store: StoreId,
     /// Host RAM's room as the pressed load reads it while it serves
-    /// (`HostRoom::Served`): what the host can give without displacing more
-    /// of other programs' data than it held displaced as this target
-    /// opened, before the approach, the load serving already. Read as
-    /// allocatable alone, RAM the host freed by swapping under the approach
-    /// is room the load does not count, and a press sized from it lands
-    /// deeper below the load's line than its deficit.
+    /// (`HostRoom::Obtainable`), its free headroom what the host can give
+    /// without displacing more of other programs' data than it held
+    /// displaced as this target opened, before the approach, the load
+    /// serving already. Read as allocatable alone, RAM the host freed by
+    /// swapping under the approach is room the load does not count, and a
+    /// press sized from it lands deeper below the load's line than its
+    /// deficit.
     room: HostRoom,
 }
 
@@ -49,8 +50,7 @@ impl Target {
                 topology.access_path(*path).expect("placement belongs to topology").store()))?,
         };
         let host = devices.status(topology, device.info().id()).sample.host_ram.map_err(|error| error.to_string())?;
-        // A platform that counts no displaced RAM displaces none.
-        let room = HostRoom::Served { displaced: host.displaced_bytes.unwrap_or(0) };
+        let room = HostRoom::serving(&host);
         Ok(Self { devices, device, store, room })
     }
 
@@ -64,7 +64,7 @@ impl Target {
         let reading = self.reading()?;
         // `name`: as the owner's memory readings name the store.
         Ok(json!({ "store": reading.identity, "name": format!("{:?}", reading.identity), "headroom_bytes": reading.headroom_bytes,
-            "ceiling_bytes": reading.ceiling_bytes, "planning_bytes": reading.thresholds.planning_bytes,
+            "ceiling_bytes": reading.ceiling_bytes, "growth_ceiling_bytes": reading.thresholds.ceiling(reading.free_headroom_bytes), "planning_bytes": reading.thresholds.planning_bytes,
             "band": format!("{:?}", reading.band) }))
     }
 

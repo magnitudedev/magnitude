@@ -174,8 +174,8 @@ fn host_distress(host: &HostStatus) -> Option<HostDistress> {
 }
 
 /// Host RAM's fit as `host` reads it: its capacity within the process
-/// limits `host` reports, its `room` as headroom, and the distress `host`
-/// reports.
+/// limits `host` reports, its `room` as headroom and free headroom, and the
+/// distress `host` reports.
 fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, room: HostRoom) -> StoreFit {
     let capacity_bytes = host
         .limits
@@ -183,32 +183,61 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
         .fold(store.capacity().value, |bytes, limit| {
             bytes.min(limit.limit_bytes)
         });
+    let (headroom_bytes, free_headroom_bytes) = match room {
+        HostRoom::Allocatable => (host.allocatable_bytes(), host.allocatable_bytes()),
+        HostRoom::Admission => obtainable_room(host, 0),
+        HostRoom::Obtainable(stage) => {
+            // While the load loads, its own displacement is accepted.
+            let displaced = match (stage, host.displaced_bytes) {
+                (LoadStage::Loading, _) | (LoadStage::ServingUncounted, None) => 0,
+                (LoadStage::Serving { displaced_bytes: served }, Some(now)) => now.saturating_sub(served),
+                (LoadStage::Serving { .. }, None) | (LoadStage::ServingUncounted, Some(_)) => panic!(
+                    "invariant violated: the host's displacement reading changed presence while a load served ({stage:?})"
+                ),
+            };
+            obtainable_room(host, displaced)
+        }
+    };
     store_fit(
         store,
         reserves,
         capacity_bytes,
-        match room {
-            HostRoom::Allocatable => host.allocatable_bytes(),
-            HostRoom::Obtainable => host.obtainable_bytes(),
-            HostRoom::Served { displaced } => host
-                .allocatable_bytes()
-                .saturating_sub(host.displaced_bytes.map_or(0, |now| now.saturating_sub(displaced))),
-        },
+        (headroom_bytes, free_headroom_bytes),
         host_distress(host),
         MemoryConstraint::HostRam,
     )
 }
 
+/// Host RAM's headroom and free headroom as a load's room reads them
+/// ([`HostRoom::Obtainable`]), `displaced` bytes of other programs' data
+/// displaced since it began to serve. Allocatable counts as free the RAM
+/// the OS made by displacing other programs' data, which is free only while
+/// that data stays out: what was displaced since takes it back.
+fn obtainable_room(host: &HostStatus, displaced: u64) -> (u64, u64) {
+    let undisplacing = host.allocatable_bytes().saturating_sub(displaced);
+    // A figure of its own counts other programs' data in RAM as obtainable,
+    // so displacing it shrinks the figure itself; one that is allocatable's
+    // (no OS reports what displacing would add) counts the displacement as
+    // free.
+    let headroom = if host.obtainable.by == host.allocatable.by {
+        undisplacing
+    } else {
+        host.obtainable_bytes()
+    };
+    (headroom, undisplacing.min(headroom))
+}
+
 /// `store`'s fit from its capacity within process limits, its headroom and
-/// its host's distress: each less its planning reserve, in the Reclaim band
-/// at or below the reserve or while the host is in distress. The reserves are
-/// fractions of the capacity within limits, not of the whole store: a
-/// container limited to a few GiB of a large host keeps a reserve of those.
+/// free headroom, and its host's distress: each less its planning reserve,
+/// in the Reclaim band at or below the reserve or while the host is in
+/// distress. The reserves are fractions of the capacity within limits, not
+/// of the whole store: a container limited to a few GiB of a large host
+/// keeps a reserve of those.
 fn store_fit(
     store: &Store,
     reserves: &MemoryReserves,
     capacity_bytes: u64,
-    headroom_bytes: u64,
+    (headroom_bytes, free_headroom_bytes): (u64, u64),
     distress: Option<HostDistress>,
     constraint: MemoryConstraint,
 ) -> StoreFit {
@@ -218,6 +247,7 @@ fn store_fit(
         capacity_bytes,
         stable_bytes: capacity_bytes.saturating_sub(thresholds.planning_bytes),
         headroom_bytes,
+        free_headroom_bytes,
         ceiling_bytes: thresholds.ceiling(headroom_bytes),
         thresholds,
         distress,
@@ -277,7 +307,9 @@ pub struct DomainThresholds {
 
 impl DomainThresholds {
     /// What a store with `headroom_bytes` left lets a live claim take: its
-    /// headroom above the planning reserve.
+    /// headroom above the planning reserve. Of its free headroom
+    /// ([`StoreFit::free_headroom_bytes`]), what an opportunistic growth may
+    /// take.
     pub fn ceiling(&self, headroom_bytes: u64) -> u64 {
         headroom_bytes.saturating_sub(self.planning_bytes)
     }
@@ -498,6 +530,10 @@ pub struct StoreFit {
     /// Observed available bytes, bounded by every applicable process limit.
     /// Existing Seismic charges are already absent from it.
     pub headroom_bytes: u64,
+    /// What of the headroom can be taken without displacing any more of
+    /// another program's data ([`HostRoom`]); the headroom itself in a
+    /// store other than host RAM.
+    pub free_headroom_bytes: u64,
     /// Headroom less the planning reserve: what a live claim may take.
     pub ceiling_bytes: u64,
     pub thresholds: DomainThresholds,
@@ -527,6 +563,9 @@ pub enum FitMode {
     /// Observed headroom and what is left of each grant, less the planning
     /// reserve.
     Live,
+    /// Free headroom and what is left of each grant, less the planning
+    /// reserve: what an opportunistic growth (the expert bank's) may take.
+    Growth,
 }
 
 /// Bytes of one storage kind on one executor. Demands are placed in order,
@@ -573,19 +612,50 @@ impl DemandFit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostRoom {
     /// What can be taken without the OS displacing another program's data
-    /// ([`HostStatus::allocatable`]): what a load that grows and gives back
-    /// while others run, its Reclaim band and its claims, read.
+    /// ([`HostStatus::allocatable`]), as headroom and free headroom alike:
+    /// what a question of no loaded model reads.
     Allocatable,
-    /// What the OS can make available, displacing other programs' data if
-    /// it must ([`HostStatus::obtainable`]): what an explicit load's
-    /// admission reads.
-    Obtainable,
-    /// What a serving load may take without displacing any more of other
+    /// Whether a load may open, asked before any opens: what the OS can make
+    /// available, displacing other programs' data if it must, as the load
+    /// will read it once it opens ([`HostStatus::obtainable`]), with no
+    /// load's displacement to count.
+    Admission,
+    /// A load's, from its opening through serving. Its headroom, which its
+    /// band, its shortfall and its claims read, is what the OS can make
+    /// available, displacing other programs' data if it must
+    /// ([`HostStatus::obtainable`]). Its free headroom, which its growth
+    /// reads, is what can be taken without displacing any more of other
     /// programs' data than the OS held displaced as it began to serve
-    /// (`displaced` bytes, [`HostStatus::displaced_bytes`]): `Allocatable`
-    /// less the displacement since, which made free RAM that is free only
-    /// while another program's data stays out.
-    Served { displaced: u64 },
+    /// ([`LoadStage`]). Where the OS reports no obtainable figure of its
+    /// own, both are that.
+    Obtainable(LoadStage),
+}
+
+impl HostRoom {
+    /// A load's room once it serves on `host`: its growth counts
+    /// displacement from what `host` reports displaced now, where the OS
+    /// reports it ([`HostStatus::displaced_bytes`]).
+    pub fn serving(host: &HostStatus) -> Self {
+        Self::Obtainable(match host.displaced_bytes {
+            Some(displaced_bytes) => LoadStage::Serving { displaced_bytes },
+            None => LoadStage::ServingUncounted,
+        })
+    }
+}
+
+/// Where a load is, as its growth's free headroom reads displacement.
+/// Whether the OS reports displacement is the platform's, fixed for the
+/// process: a serving load whose reading appears or disappears is an
+/// invariant violation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadStage {
+    /// Loading: its own displacement is accepted.
+    Loading,
+    /// Serving where the OS reports displacement: what is displaced beyond
+    /// `displaced_bytes`, displaced as it began to serve, is not free.
+    Serving { displaced_bytes: u64 },
+    /// Serving where the OS reports no displacement: none is counted.
+    ServingUncounted,
 }
 
 /// The sole interpretation of stores and grants for engine fit questions.
@@ -655,7 +725,7 @@ impl<'a> Fit<'a> {
             store,
             self.reserves,
             store.capacity().value,
-            headroom_bytes,
+            (headroom_bytes, headroom_bytes),
             None,
             constraint,
         ))
@@ -710,7 +780,7 @@ impl<'a> Fit<'a> {
         };
         let left = match mode {
             FitMode::Stable => grant.value,
-            FitMode::Live => match self.status.grant_left(path) {
+            FitMode::Live | FitMode::Growth => match self.status.grant_left(path) {
                 Some(Ok(left)) => grant.value.min(left.value),
                 Some(Err(error)) => return Err(MemoryPolicyError::Observation(error.clone())),
                 // An unopened executor has only its reported stable grant.
@@ -794,6 +864,7 @@ impl<'a> Fit<'a> {
         let room_of = |fit: &StoreFit| match mode {
             FitMode::Stable => fit.stable_bytes,
             FitMode::Live => fit.ceiling_bytes,
+            FitMode::Growth => fit.thresholds.ceiling(fit.free_headroom_bytes),
         };
         let mut stores = BTreeMap::<StoreId, u64>::new();
         let mut grants = BTreeMap::<AccessPathId, u64>::new();
@@ -884,6 +955,9 @@ pub struct DomainReading {
     /// Additional bytes the engine may still claim in the store: its
     /// headroom above the planning reserve.
     pub ceiling_bytes: u64,
+    /// What of the headroom can be taken without displacing any more of
+    /// another program's data ([`StoreFit::free_headroom_bytes`]).
+    pub free_headroom_bytes: u64,
     /// The host's distress, for host RAM; a device's own memory has none.
     pub distress: Option<HostDistress>,
     /// What the OS held outside headroom, for host RAM on a platform that
@@ -971,6 +1045,7 @@ fn domain_readings(
                 constraint: reading.constraint,
                 thresholds: reading.thresholds,
                 ceiling_bytes: reading.ceiling_bytes,
+                free_headroom_bytes: reading.free_headroom_bytes,
                 distress: reading.distress,
                 held: host.and_then(|host| host.held),
                 displacement: host.and_then(|host| host.displacement.clone()),
@@ -1450,25 +1525,90 @@ mod tests {
         assert_eq!(host_ram.band, MemoryBand::Normal);
     }
 
-    /// A serving load's room leaves out what the OS displaced from other
-    /// programs since it began serving: 32 GiB free of which 6 GiB exist
+    /// A load's growth leaves out what the OS displaced from other programs
+    /// since it began to serve: 32 GiB allocatable of which 6 GiB exist
     /// because 6 GiB more of another program's data went to swap or the
-    /// compressor is 26 GiB; displacement it began beside, or that came back,
-    /// takes nothing.
+    /// compressor is 26 GiB free; displacement it began beside, or that came
+    /// back, takes nothing, and while it loads its own displacement is
+    /// accepted. Where the OS reports no obtainable figure of its own, its
+    /// headroom is the same.
     #[test]
-    fn a_serving_load_reads_no_room_made_by_displacing_another_program() {
+    fn a_loads_growth_reads_no_room_made_by_displacing_another_program() {
         let reserves = MemoryReserves::standard();
         let m4_pro = recorded::m4_pro();
-        let headroom = |displaced_bytes, room| {
+        let fit = |displaced_bytes, room| {
             let host = HostStatus { displaced_bytes, ..host(ReportedBy::MachAllocatablePages, 32 * GIB) };
-            Fit::new(&m4_pro, &status(host), &reserves, room).store(m4_pro.host_ram().id()).unwrap().headroom_bytes
+            Fit::new(&m4_pro, &status(host), &reserves, room).store(m4_pro.host_ram().id()).unwrap()
         };
-        let served = HostRoom::Served { displaced: 4 * GIB };
-        assert_eq!(headroom(Some(10 * GIB), served), 26 * GIB);
-        assert_eq!(headroom(Some(4 * GIB), served), 32 * GIB);
-        assert_eq!(headroom(Some(GIB), served), 32 * GIB);
-        assert_eq!(headroom(None, served), 32 * GIB, "a platform that counts no displacement");
-        assert_eq!(headroom(Some(10 * GIB), HostRoom::Allocatable), 32 * GIB);
+        let free = |displaced_bytes, room| fit(displaced_bytes, room).free_headroom_bytes;
+        let served = HostRoom::Obtainable(LoadStage::Serving { displaced_bytes: 4 * GIB });
+        assert_eq!(free(Some(10 * GIB), served), 26 * GIB);
+        assert_eq!(fit(Some(10 * GIB), served).headroom_bytes, 26 * GIB, "one figure");
+        assert_eq!(free(Some(4 * GIB), served), 32 * GIB);
+        assert_eq!(free(Some(GIB), served), 32 * GIB);
+        assert_eq!(free(None, HostRoom::Obtainable(LoadStage::ServingUncounted)), 32 * GIB, "a platform that counts no displacement");
+        assert_eq!(free(Some(10 * GIB), HostRoom::Obtainable(LoadStage::Loading)), 32 * GIB, "loading");
+        assert_eq!(free(Some(10 * GIB), HostRoom::Allocatable), 32 * GIB);
+    }
+
+    /// Whether the OS reports displacement is the platform's: a reading that
+    /// disappears while a load serves is an invariant violation, never read
+    /// as nothing displaced.
+    #[test]
+    #[should_panic(expected = "invariant violated")]
+    fn a_displacement_reading_that_disappears_while_serving_is_a_violation() {
+        let m4_pro = recorded::m4_pro();
+        let host = HostStatus { displaced_bytes: None, ..host(ReportedBy::MachAllocatablePages, 32 * GIB) };
+        let served = HostRoom::Obtainable(LoadStage::Serving { displaced_bytes: 4 * GIB });
+        Fit::new(&m4_pro, &status(host), &MemoryReserves::standard(), served).store(m4_pro.host_ram().id()).unwrap();
+    }
+
+    /// The host of a load that compressed other programs' data to fit, as
+    /// it begins to serve (an M4 Max, 64 GB, 47.8 GB wired and 10.7 GB
+    /// compressed): 5.4 GB can be taken without displacing more, 10 GB is
+    /// obtainable, against a planning reserve of 6.87 GB. The load reads
+    /// Normal on what it was admitted on and keeps what it holds; its growth
+    /// has no room. Sustained thrashing is Reclaim, owed what its free
+    /// headroom is below the line; at or below the line in obtainable
+    /// memory it is Reclaim as well.
+    #[test]
+    fn a_load_that_displaced_to_fit_serves_normal_and_grows_nothing() {
+        const GB: u64 = 1_000_000_000;
+        let reserves = MemoryReserves::standard();
+        let mut m4_max = seismic::fixtures::m4_pro();
+        m4_max.host.value = 64 * GIB;
+        let m4_max = seismic::fixtures::topology(&m4_max);
+        let host_ram = m4_max.host_ram();
+        let planning = reserves.for_domain(host_ram.kind(), host_ram.capacity().value).planning_bytes;
+        assert_eq!(planning / (GB / 100), 687, "6.87 GB");
+        let host = |obtainable: u64| HostStatus {
+            allocatable: Reported::new(5_400_000_000, ReportedBy::MachAllocatablePages),
+            obtainable: Reported::new(obtainable, ReportedBy::MachMovablePages),
+            displaced_bytes: Some(9 * GB),
+            ..host(MACOS, 0)
+        };
+        let served = HostRoom::Obtainable(LoadStage::Serving { displaced_bytes: 9 * GB });
+        let reading = |host: HostStatus| host_ram_fit(host_ram, &host, &reserves, served);
+
+        let normal = reading(host(10 * GB));
+        assert_eq!(normal.band, MemoryBand::Normal);
+        assert_eq!(normal.headroom_bytes, 10 * GB);
+        assert_eq!(normal.ceiling_bytes, 10 * GB - planning);
+        assert_eq!(normal.free_headroom_bytes, 5_400_000_000);
+        assert_eq!(normal.thresholds.ceiling(normal.free_headroom_bytes), 0, "its growth's ceiling");
+        // Allocatable alone, which a serving load read before, is Reclaim.
+        assert_eq!(host_ram_fit(host_ram, &host(10 * GB), &reserves, HostRoom::Allocatable).band, MemoryBand::Reclaim);
+
+        let thrashing = displaced(lasting(thrashing_window(), DISPLACEMENT_SPAN)).displacement;
+        let distressed = reading(HostStatus { displacement: thrashing, ..host(10 * GB) });
+        assert_eq!(distressed.distress, Some(HostDistress::Thrashing));
+        assert_eq!(distressed.band, MemoryBand::Reclaim);
+        assert_eq!(distressed.free_headroom_bytes, 5_400_000_000);
+
+        let full = reading(host(planning));
+        assert_eq!((full.band, full.distress), (MemoryBand::Reclaim, None));
+        // Free headroom is never more than headroom.
+        assert_eq!(reading(host(4 * GB)).free_headroom_bytes, 4 * GB);
     }
 
     /// Each reserve is the larger of its fraction of the store's capacity

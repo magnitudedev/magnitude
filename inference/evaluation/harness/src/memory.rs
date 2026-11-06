@@ -435,7 +435,12 @@ fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
 /// back, which leaves the engine the room it had before it (`deficit` above
 /// the line), and prints `released`; it holds the approach until standard
 /// input closes, so giving the memory back takes the press's time, not
-/// the host's (freeing 107 GB on a GB10 took 14 s). The bytes are pseudo-random
+/// the host's (freeing 107 GB on a GB10 took 14 s). The press is sized from
+/// the free headroom's ceiling (`DomainThresholds::ceiling`), what the host
+/// gives without displacing another program's data: where the OS counts
+/// other programs' data as obtainable (macOS), the press's own pages are,
+/// so it lands below the load's growth line and leaves its band to the
+/// host's distress. The bytes are pseudo-random
 /// words, as an application's data is: zeroed pages the OS compresses to
 /// nothing would press nothing. They are written on every core the host
 /// has, as fast as its memory takes them, by threads that yield any core
@@ -453,7 +458,7 @@ pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Re
             "a press of {deficit} bytes is deeper than the store's planning reserve of {planning} bytes, all that is free below its line"
         ));
     }
-    let ceiling = reading.ceiling_bytes;
+    let ceiling = reading.thresholds.ceiling(reading.free_headroom_bytes);
     let approach = ceiling.saturating_sub(deficit);
     let approaching = Instant::now();
     let approached = target.take(approach, 0)?;
@@ -461,7 +466,8 @@ pub fn occupy(backend: BackendName, selected: PressureStore, deficit: u64) -> Re
         "at": unix_seconds(), "before": before, "observation": target.snapshot()? }));
     let mut line = String::new();
     if std::io::stdin().read_line(&mut line).map_err(|error| error.to_string())? == 0 { return Ok(()); }
-    let ceiling = target.reading()?.ceiling_bytes;
+    let reading = target.reading()?;
+    let ceiling = reading.thresholds.ceiling(reading.free_headroom_bytes);
     let press = ceiling.checked_add(deficit).ok_or("pressure allocation size overflows")?;
     let pressed = target.take(press, 1)?;
     println!("{}", json!({ "occupied": approach + press, "ceiling": ceiling, "at": unix_seconds(), "observation": target.snapshot()? }));

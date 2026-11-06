@@ -778,6 +778,7 @@ pub(crate) fn build(
     let import_progress = progress.clone();
     let import_device = device.clone();
     let import_catalog = catalog.clone();
+    let import_room = startup.heap.room();
     let mut band_observed = Instant::now();
     let target = residency
         .load_target(
@@ -790,7 +791,7 @@ pub(crate) fn build(
                 });
                 if band_observed.elapsed() >= IMPORT_OBSERVATION_INTERVAL {
                     band_observed = Instant::now();
-                    require_normal(&import_catalog, &import_device, &reserves)?;
+                    require_normal(&import_catalog, &import_device, &reserves, import_room)?;
                 }
                 Ok(())
             }),

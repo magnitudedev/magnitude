@@ -45,7 +45,7 @@ pub const MEMORY_PRESSURE_FAILURE_CODE: &str = "memory_pressure";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostMemorySample {
     /// What the OS can make available to a load, within every process limit
-    /// ([`HostRoom::Obtainable`]): what load admission reopens on.
+    /// ([`HostRoom::Admission`]): what load admission reopens on.
     pub headroom_bytes: u64,
     /// The host's distress, on a platform that reports displacement.
     pub distress: Option<HostDistress>,
@@ -81,7 +81,7 @@ impl HostMemoryObserver for SeismicHostMemory {
             .inventory()
             .host_status()
             .map_err(|error| error.to_string())?;
-        let host = Fit::host_ram(&topology, &reading, &self.reserves, HostRoom::Obtainable);
+        let host = Fit::host_ram(&topology, &reading, &self.reserves, HostRoom::Admission);
         Ok(HostMemorySample {
             headroom_bytes: host.headroom_bytes,
             distress: host.distress,

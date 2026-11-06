@@ -128,7 +128,15 @@ not unconditionally during logical admission. Capacity facts come from the share
 runtime resource domain, including retained model weights, state, and scratch.
 The memory stores are read fresh only by the owner's memory probes, a deficit's
 retry and claims; between them the heap follows the process's own charge in
-Seismic's ledgers, so a step reads nothing of the OS. Allocation denial keeps its typed required/available byte facts through model
+Seismic's ledgers, so a step reads nothing of the OS. A load reads host RAM in one room
+from its opening through serving (`HostRoom::Obtainable`): its band, its deficits and
+its claims read what the OS can make available, other programs' idle data included
+where the OS counts it (macOS), so a load that compressed other programs' data to fit
+serves on what it was admitted on. Growth (the expert bank's and a prompt group's
+places) reads only what can be taken without displacing more of other programs' data
+than was displaced as the load began to serve. Sustained swapping or thrashing is
+Reclaim at any headroom, owed what that undisplacing room is below the planning line.
+Allocation denial keeps its typed required/available byte facts through model
 preparation; native failures without capacity evidence are not reclassified by
 matching diagnostic text. Reclamation and eviction report the observed decrease
 in charged bytes, including aliases and retained checkpoints, and beside it the

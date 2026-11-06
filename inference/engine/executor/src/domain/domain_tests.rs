@@ -386,9 +386,8 @@ fn places_grow_only_beyond_what_the_bank_can_grow_into() {
             domain.pace.borrow_mut().domains.insert(store, DomainPace {
                 role: DomainRole::Allocation,
                 headroom: room,
-                planning: 0,
-                emergency: 0,
-                ceiling: room,
+                free_headroom: room,
+                thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
                 charged: 0,
                 band: MemoryBand::Normal,
                 unseen: 0,
@@ -860,10 +859,9 @@ fn a_growth_step_is_sized_within_what_the_heap_admits() {
         // Misses stop falling past the bank's 4 rows.
         price_growth(&mut domain, &mut bindings, misses_at(4, 100, 4));
         let device = crate::planning::BankTier::Bank;
-        let available = match domain.memory.borrow_mut().claim(u64::MAX / 2, 0, HoldingClass::Live) {
-            Err(ClaimRefusal::Deficit { available, .. }) => available,
-            refused => panic!("the heap granted every byte: {refused:?}"),
-        };
+        // What a growth may take: the free headroom's room, which a growth's
+        // claim reads.
+        let available = domain.memory.borrow_mut().reserved_room(device, 0).unwrap();
         let held = domain.memory.borrow_mut().claim_reserved(device, available - 5 * row / 2, 0, HoldingClass::Live).unwrap();
         let room = domain.memory.borrow_mut().reserved_room(device, 0).unwrap();
         assert!(
@@ -935,9 +933,8 @@ fn a_full_device_leaves_the_host_stores_room() {
     let domain = |role, ceiling| DomainPace {
         role,
         headroom: ceiling,
-        planning: 0,
-        emergency: 0,
-        ceiling,
+        free_headroom: ceiling,
+        thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
         charged: 0,
         band: MemoryBand::Normal,
         unseen: 0,
@@ -1233,12 +1230,9 @@ fn a_paying_growth_stops_at_the_line() {
         let resident = &**domain.experts.as_ref().unwrap().resident.measured().unwrap();
         let crate::Growth { kind, bytes: step, .. } =
             domain.family.expert_bank().unwrap().growth(Some(resident), &|_| true, crate::planning::BankTier::Bank, u64::MAX).unwrap().unwrap();
-        // What the heap grants now, by whichever constraint binds: its refusal
-        // of more than any domain holds says.
-        let available = match domain.memory.borrow_mut().claim(u64::MAX / 2, 0, HoldingClass::Live) {
-            Err(ClaimRefusal::Deficit { available, .. }) => available,
-            refused => panic!("the heap granted every byte: {refused:?}"),
-        };
+        // What the heap grants a growth now, by whichever constraint binds:
+        // the free headroom's room, which a growth's claim reads.
+        let available = domain.memory.borrow_mut().reserved_room(kind, 0).unwrap();
         // Claimed as a reservation's, the bytes take the store's room itself,
         // which `available` reads: the free space of the device's blocks serves
         // none of them.
@@ -1388,6 +1382,7 @@ fn read_pace(pace: &mut MemoryPace, store: seismic::StoreId, headroom: u64, char
         constraint: crate::platform::MemoryConstraint::HostRam,
         thresholds,
         ceiling_bytes: thresholds.ceiling(headroom),
+        free_headroom_bytes: headroom,
         distress: None,
         held: None,
         displacement: None,
@@ -1521,9 +1516,8 @@ fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
     let domain = |headroom| DomainPace {
         role: DomainRole::Allocation,
         headroom,
-        planning: 10 * GB,
-        emergency: 2 * GB,
-        ceiling: 0,
+        free_headroom: headroom,
+        thresholds: crate::platform::DomainThresholds { planning_bytes: 10 * GB, emergency_bytes: 2 * GB },
         charged: 0,
         band: MemoryBand::Normal,
         unseen: 0,
@@ -1544,6 +1538,14 @@ fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
     // released for it a slot at a time.
     pace.domains.get_mut(&ample).unwrap().band = MemoryBand::Reclaim;
     assert_eq!(pace.shortfall(ample, 0), Shortfall::Covered);
+    // In distress, what was displaced since the load began to serve is
+    // owed: the shortfall is its free headroom's below the line. Without
+    // distress, headroom above the line owes nothing however little of it
+    // is free.
+    pace.domains.get_mut(&ample).unwrap().free_headroom = 6 * GB;
+    assert_eq!(pace.shortfall(ample, 0), Shortfall::Short(4 * GB));
+    pace.domains.get_mut(&ample).unwrap().band = MemoryBand::Normal;
+    assert_eq!(pace.shortfall(ample, 0), Shortfall::Above);
 }
 
 /// A shrink covers its deficit now and what the host takes at its rate
@@ -1592,9 +1594,8 @@ fn the_wait_bound_is_the_reserve_between_the_lines_at_the_fastest_taking() {
     let domain = |role, fastest| DomainPace {
         role,
         headroom: 0,
-        planning: 10 * GB,
-        emergency: 2 * GB,
-        ceiling: 0,
+        free_headroom: 0,
+        thresholds: crate::platform::DomainThresholds { planning_bytes: 10 * GB, emergency_bytes: 2 * GB },
         charged: 0,
         band: MemoryBand::Normal,
         unseen: 0,

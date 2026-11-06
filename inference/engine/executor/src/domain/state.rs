@@ -1691,8 +1691,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// The model has loaded: its memory reads what can be taken without
-    /// displacing another program's data from now on (`DeviceHeap::serve`).
+    /// The model has loaded: the displacement its load caused is accepted,
+    /// and its growth reads what can be taken without displacing more of
+    /// another program's data from now on (`DeviceHeap::serve`).
     pub fn serve(&mut self) -> Result<(), DomainError> {
         self.memory
             .borrow_mut()

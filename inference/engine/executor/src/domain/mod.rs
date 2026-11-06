@@ -7,7 +7,7 @@ use crate::batching::{
     ValidatedTargetBatch,
 };
 use crate::memory::{ClaimId, HoldingClass, HoldingId, MemoryHeap};
-use crate::platform::{DomainReading, DomainRole, MemoryBand};
+use crate::platform::{DomainReading, DomainRole, DomainThresholds, MemoryBand};
 use crate::programs::{Chain, ProgramSubmission};
 use crate::programs::graph::readout;
 use crate::{
@@ -1014,7 +1014,11 @@ impl ResizeHeld {
 /// held pressure growth so stops short of the line by the reading's own
 /// fluctuation and does not re-enter Reclaim; once the pressure lifts, the
 /// ceiling rises by what it freed and the bank grows while a step and the
-/// fluctuation fit, to every expert where memory allows.
+/// fluctuation fit, to every expert where memory allows. A step's room is
+/// the free headroom's ceiling (`DomainThresholds::ceiling`), at
+/// most the headroom's: growth takes nothing it would have to displace
+/// another program's data for, and the band it must not re-enter is the
+/// headroom's.
 struct MemoryPace {
     domains: BTreeMap<seismic::StoreId, DomainPace>,
     /// The interval the owner reads memory at, as its probes say.
@@ -1027,11 +1031,12 @@ struct MemoryPace {
 struct DomainPace {
     role: DomainRole,
     headroom: u64,
-    planning: u64,
-    /// The emergency reserve (`DomainThresholds::emergency_bytes`): the
-    /// headroom a load must not run into.
-    emergency: u64,
-    ceiling: u64,
+    /// What of the headroom can be taken without displacing any more of
+    /// another program's data (`DomainReading::free_headroom_bytes`).
+    free_headroom: u64,
+    /// The planning and emergency reserves: the line a load reads Reclaim
+    /// at, and the headroom it must not run into.
+    thresholds: DomainThresholds,
     charged: u64,
     /// The reading's band: Reclaim at or below the planning line, or while
     /// the host is in distress.
@@ -1112,7 +1117,7 @@ impl DomainPace {
     /// in a domain that grows nothing, or before the host took memory.
     fn wait_bound(&self) -> Option<f64> {
         (self.role == DomainRole::Allocation && self.fastest > 0.0)
-            .then(|| self.planning.saturating_sub(self.emergency) as f64 / self.fastest)
+            .then(|| self.thresholds.planning_bytes.saturating_sub(self.thresholds.emergency_bytes) as f64 / self.fastest)
     }
 }
 
@@ -1196,9 +1201,8 @@ impl MemoryPace {
                 DomainPace {
                     role: reading.role,
                     headroom: reading.headroom_bytes,
-                    planning: reading.thresholds.planning_bytes,
-                    emergency: reading.thresholds.emergency_bytes,
-                    ceiling: reading.ceiling_bytes,
+                    free_headroom: reading.free_headroom_bytes,
+                    thresholds: reading.thresholds,
                     charged,
                     band: reading.band,
                     unseen,
@@ -1219,21 +1223,25 @@ impl MemoryPace {
     /// next shrink takes effect, less what the witness has yet to drop and
     /// the charge dropped since this one. Only a release charged in a domain
     /// lifts its deficit, so each holding shrinks by its own domain's; a
-    /// domain no probe observed is above.
+    /// domain no probe observed is above. In distress above the line, the
+    /// host shows it is not absorbing what the load displaces: the reading
+    /// is its free headroom, which leaves out what was displaced since the
+    /// load began to serve (`HostRoom::Obtainable`).
     fn shortfall(&self, store: seismic::StoreId, charged: u64) -> Shortfall {
         let Some(pace) = self.domains.get(&store) else {
             return Shortfall::Above;
         };
-        let below = pace.planning.saturating_sub(pace.headroom);
+        let planning = pace.thresholds.planning_bytes;
+        let below = match (planning.saturating_sub(pace.headroom), pace.band) {
+            (0, MemoryBand::Normal) => return Shortfall::Above,
+            (0, MemoryBand::Reclaim) => planning.saturating_sub(pace.free_headroom),
+            (below, _) => below,
+        };
         if below == 0 {
-            // In distress above the line, the room the load reads already
-            // leaves out what the host displaced since it began serving
-            // (`HostRoom::Served`): nothing it holds is short, and a release
-            // would only buy what no measure says is owed.
-            return match pace.band {
-                MemoryBand::Reclaim => Shortfall::Covered,
-                MemoryBand::Normal => Shortfall::Above,
-            };
+            // In distress with free headroom above the line, nothing it holds
+            // is short, and a release would only buy what no measure says is
+            // owed.
+            return Shortfall::Covered;
         }
         let released = pace.unseen + pace.charged.saturating_sub(charged);
         match projected(below, pace.rate, self.horizon()).saturating_sub(released) {
@@ -1261,7 +1269,7 @@ impl MemoryPace {
     fn growth_room(&self, store: seismic::StoreId) -> Option<(u64, u64)> {
         self.domains
             .get(&store)
-            .map(|pace| (pace.ceiling.saturating_sub(pace.fluctuation.largest), pace.fluctuation.largest))
+            .map(|pace| (pace.thresholds.ceiling(pace.free_headroom).saturating_sub(pace.fluctuation.largest), pace.fluctuation.largest))
     }
 
     /// `store`'s available memory's fluctuation at the latest probe, which a
