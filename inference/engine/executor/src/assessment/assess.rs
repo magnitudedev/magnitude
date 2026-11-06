@@ -187,7 +187,11 @@ pub fn prepare_execution_assessment(
     )
     .map_err(AssessmentError::Memory)?;
     let device_process =
-        DeviceProcessBytes::derive(draft.device().backend(), host_process.kernels)
+        DeviceProcessBytes::derive(
+            draft.device().backend(),
+            host_process.kernels,
+            draft.load().weights(),
+        )
             .map_err(AssessmentError::Memory)?;
     let bounds = header
         .with_graph_resource_bound(&graph, host_process, device_process)

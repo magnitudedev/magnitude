@@ -181,6 +181,21 @@ pub use seismic_runtime::native::recorded_graph_device_bytes;
 /// The largest block a dedicated device's allocator takes from its driver
 /// for an ordinary allocation (blocks grow from 64 MiB to it).
 pub use seismic_compiler::blocks::BLOCK_CAP_BYTES as DEVICE_BLOCK_CAP_BYTES;
+pub use seismic_compiler::blocks::Packing as DeviceBlockPacking;
+
+/// A replay of `backend`'s device block allocator, the rule its blocks are
+/// placed by (`DeviceBlockPacking`), or `None` for a backend whose memory is
+/// the host's. CUDA blocks are whole granules of the driver's recommended
+/// allocation granularity, 2 MiB on every device measured, with ranges 256
+/// aligned; Vulkan blocks are exact, capped at 1 GiB (a device whose
+/// allocation limit is lower caps them lower), with ranges 16 aligned.
+pub fn device_block_packing(backend: BackendName) -> Option<DeviceBlockPacking> {
+    match backend {
+        BackendName::Cuda => Some(DeviceBlockPacking::new(DEVICE_BLOCK_CAP_BYTES, 2 << 20, 256)),
+        BackendName::Vulkan => Some(DeviceBlockPacking::new(DEVICE_BLOCK_CAP_BYTES, 1, 16)),
+        BackendName::Metal | BackendName::Cpu => None,
+    }
+}
 mod slab;
 /// Measuring work on a device (`seismic-measure`): the timing session, the
 /// sustained clock, the statistics and the records of measured points. The

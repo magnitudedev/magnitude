@@ -96,7 +96,8 @@ impl ExecutionManifest {
         )
         .map_err(internal)?;
         let device_process =
-            DeviceProcessBytes::derive(backend, host_process.kernels).map_err(internal)?;
+            DeviceProcessBytes::derive(backend, host_process.kernels, draft.load().weights())
+                .map_err(internal)?;
         let bounds = AssessmentHeaderBounds::derive(draft.load())
             .and_then(|header| header.with_graph_resource_bound(&graph, host_process, device_process))
             .map_err(internal)?;

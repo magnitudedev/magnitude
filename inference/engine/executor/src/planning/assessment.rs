@@ -11,6 +11,7 @@
 //! domain's stable capacity and reserve.
 
 use super::resources::{NativeGraphCharge, history_row_bytes, recurrent_bank_bytes};
+use super::weights::WeightPlan;
 use super::{
     ComponentSelection, ModelLoadPlan, PlannedMethod, ResourceLimits,
     weight_bytes_by_component,
@@ -155,16 +156,30 @@ const VULKAN_BLOCK_SLACK: u64 = 1_151_000_000;
 
 impl DeviceProcessBytes {
     /// The device bytes of a load on `backend` that prepares `kernels`
-    /// native kernels (`HostProcessBytes::kernels`).
-    pub fn derive(backend: BackendName, kernels: u64) -> Result<Self, String> {
+    /// native kernels (`HostProcessBytes::kernels`) and imports `weights`.
+    /// The blocks' free space is the measured allowance, or what the
+    /// weights' device storage leaves free when replayed through the
+    /// backend's own block rule (`seismic::device_block_packing`), whichever
+    /// is more: a layout whose blocks hold more free space than was measured
+    /// is charged it.
+    pub fn derive<'a>(
+        backend: BackendName,
+        kernels: u64,
+        weights: impl IntoIterator<Item = &'a WeightPlan>,
+    ) -> Result<Self, String> {
         let costs = DeviceProcessCosts::of(backend);
+        let mut allocations = Vec::new();
+        for weight in weights {
+            allocations.extend(weight_device_allocations(weight)?);
+        }
+        let replayed = replayed_block_free_bytes(backend, allocations)?;
         Ok(Self {
             context: costs.context,
             programs: costs
                 .per_kernel
                 .checked_mul(kernels)
                 .ok_or("prepared program device bytes overflow")?,
-            slack: costs.slack,
+            slack: costs.slack.max(replayed),
         })
     }
 
@@ -174,6 +189,42 @@ impl DeviceProcessBytes {
             .and_then(|bytes| bytes.checked_add(self.slack))
             .ok_or_else(|| "worker device bytes overflow".to_owned())
     }
+}
+
+/// What `backend`'s blocks leave free holding `allocations`, in order,
+/// placed by its own block rule; 0 where the device's memory is the host's.
+fn replayed_block_free_bytes(
+    backend: BackendName,
+    allocations: impl IntoIterator<Item = u64>,
+) -> Result<u64, String> {
+    let Some(mut packing) = seismic::device_block_packing(backend) else {
+        return Ok(0);
+    };
+    for bytes in allocations {
+        packing
+            .allocate(bytes, 1)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(packing.free_bytes())
+}
+
+/// The device storage a weight's import keeps, in the order it allocates
+/// it: the resident tensor (a streamed table's slots), its scale, and a
+/// streamed table's device staging. A table the host fills in place
+/// (`WeightPlan::stored_in_slots`) is upload storage, outside the blocks.
+fn weight_device_allocations(weight: &WeightPlan) -> Result<Vec<u64>, String> {
+    if weight.stored_in_slots() {
+        return Ok(Vec::new());
+    }
+    let staging = weight.streamed_bytes()?[1];
+    Ok([
+        weight.resident_bytes,
+        weight.scale.as_ref().map_or(0, |scale| scale.resident_bytes),
+        if weight.streamed.is_some() { staging } else { 0 },
+    ]
+    .into_iter()
+    .filter(|bytes| *bytes > 0)
+    .collect())
 }
 
 /// What a load's worker holds in host RAM that no planned holding names:
@@ -2652,7 +2703,7 @@ mod tests {
         )
         .unwrap();
         let device_process =
-            DeviceProcessBytes::derive(BackendName::Cpu, host_process.kernels).unwrap();
+            DeviceProcessBytes::derive(BackendName::Cpu, host_process.kernels, []).unwrap();
         let bounds = header
             .with_graph_resource_bound(&graph, host_process, device_process)
             .unwrap();
@@ -3023,6 +3074,31 @@ mod tests {
     /// The worker's device bytes are the backend's context and a cost per
     /// kernel the load prepares; a unified device's are in its host bytes,
     /// and a CUDA context is already outside the device's usable capacity.
+    /// The blocks' free space is charged at the measured allowance unless
+    /// the weights, replayed through the backend's block rule, leave more:
+    /// expert stacks each in a block of their own leave a granule's tail
+    /// each, well within it, but a run of allocations just past a granule
+    /// would leave nearly a granule each, beyond it.
+    #[test]
+    fn block_free_space_is_the_allowance_or_the_replayed_layout_whichever_is_more() {
+        let mib = 1u64 << 20;
+        let stacks = std::iter::repeat_n(343 * mib + mib / 2, 46);
+        let replayed = replayed_block_free_bytes(BackendName::Cuda, stacks).unwrap();
+        assert_eq!(replayed, 46 * (mib / 2));
+        assert!(replayed < CUDA_BLOCK_SLACK);
+        let stranded = std::iter::repeat_n(33 * mib + 1, 2_000);
+        let replayed = replayed_block_free_bytes(BackendName::Cuda, stranded).unwrap();
+        assert_eq!(replayed, 2_000 * (mib - 1));
+        assert!(replayed > CUDA_BLOCK_SLACK);
+        for unified in [BackendName::Cpu, BackendName::Metal] {
+            assert_eq!(
+                replayed_block_free_bytes(unified, std::iter::repeat_n(33 * mib + 1, 2_000))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
     #[test]
     fn worker_device_bytes_price_the_context_and_kernels() {
         for backend in [
@@ -3032,7 +3108,7 @@ mod tests {
             BackendName::Cuda,
         ] {
             let costs = DeviceProcessCosts::of(backend);
-            let device = DeviceProcessBytes::derive(backend, 40).unwrap();
+            let device = DeviceProcessBytes::derive(backend, 40, []).unwrap();
             assert_eq!(
                 device,
                 DeviceProcessBytes {
@@ -3047,17 +3123,17 @@ mod tests {
             );
         }
         for unified in [BackendName::Cpu, BackendName::Metal] {
-            let device = DeviceProcessBytes::derive(unified, 40).unwrap();
+            let device = DeviceProcessBytes::derive(unified, 40, []).unwrap();
             assert_eq!(device.bytes().unwrap(), 0);
         }
         // A CUDA context is outside the usable capacity; a dedicated
         // device's block allocator holds free space whatever the model.
-        let cuda = DeviceProcessBytes::derive(BackendName::Cuda, 40).unwrap();
+        let cuda = DeviceProcessBytes::derive(BackendName::Cuda, 40, []).unwrap();
         assert_eq!(cuda.context, 0);
         assert!(cuda.slack > 0);
-        let vulkan = DeviceProcessBytes::derive(BackendName::Vulkan, 40).unwrap();
+        let vulkan = DeviceProcessBytes::derive(BackendName::Vulkan, 40, []).unwrap();
         assert!(vulkan.context > 0 && vulkan.programs > 0 && vulkan.slack > 0);
-        assert!(DeviceProcessBytes::derive(BackendName::Vulkan, u64::MAX).is_err());
+        assert!(DeviceProcessBytes::derive(BackendName::Vulkan, u64::MAX, []).is_err());
     }
 
     /// The worker's host bytes are counts the plan fixes times the costs

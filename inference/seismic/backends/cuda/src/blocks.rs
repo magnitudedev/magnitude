@@ -6,7 +6,10 @@
 //! with its charges.
 
 use crate::driver::{self, Allocation, Context, DriverError};
-use seismic_compiler::blocks::{block_bytes, takes_own_block, FreeRanges, BLOCK_CAP_BYTES};
+use seismic_compiler::blocks::{
+    block_bytes, first_fit, largest_shared, takes_own_block, FreeRanges, PackedBlock,
+    BLOCK_CAP_BYTES,
+};
 use seismic_compiler::errors::ExecutionError;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -25,6 +28,18 @@ impl Block {
         self.free
             .lock()
             .expect("block free list lock is never poisoned")
+    }
+}
+
+impl PackedBlock for Block {
+    fn bytes(&self) -> u64 {
+        self.allocation.bytes as u64
+    }
+    fn own(&self) -> bool {
+        self.dedicated
+    }
+    fn take(&self, bytes: u64, alignment: u64) -> Option<u64> {
+        self.ranges().take(bytes, alignment)
     }
 }
 
@@ -71,23 +86,12 @@ impl Blocks {
         let bytes = bytes.max(1);
         let alignment = alignment.max(MINIMUM_ALIGNMENT);
         let mut blocks = self.blocks();
-        let found = blocks
-            .iter()
-            .filter(|block| !block.dedicated)
-            .find_map(|block| {
-                block
-                    .ranges()
-                    .take(bytes, alignment)
-                    .map(|offset| (block.clone(), offset))
-            });
+        let found = first_fit(&blocks, bytes, alignment)
+            .map(|(index, offset)| (blocks[index].clone(), offset));
         let (block, offset) = match found {
             Some(found) => found,
             None => {
-                let largest = blocks
-                    .iter()
-                    .filter(|block| !block.dedicated)
-                    .map(|block| block.allocation.bytes as u64)
-                    .max();
+                let largest = largest_shared(&blocks);
                 let account = self.context.device_account.get();
                 let room = account.map_or(room, |account| {
                     let available = account.available();

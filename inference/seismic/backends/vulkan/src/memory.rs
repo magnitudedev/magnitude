@@ -22,7 +22,10 @@
 use crate::device::{call, Inner};
 use crate::instance::Instance;
 use ash::vk;
-use seismic_compiler::blocks::{block_bytes, takes_own_block, FreeRanges, BLOCK_CAP_BYTES};
+use seismic_compiler::blocks::{
+    block_bytes, first_fit, largest_shared, takes_own_block, FreeRanges, PackedBlock,
+    BLOCK_CAP_BYTES,
+};
 use seismic_compiler::errors::ExecutionError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -87,11 +90,19 @@ struct Block {
 unsafe impl Send for Block {}
 unsafe impl Sync for Block {}
 
-impl Block {
+impl PackedBlock for Block {
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    fn own(&self) -> bool {
+        self.dedicated
+    }
     fn take(&self, bytes: u64, alignment: u64) -> Option<u64> {
         self.ranges().take(bytes, alignment)
     }
+}
 
+impl Block {
     /// Return a range; true when the block is entirely free afterwards.
     fn give(&self, offset: u64, bytes: u64) -> bool {
         self.ranges().give(offset, bytes)
@@ -334,22 +345,12 @@ impl Memory {
             .filter(|_| pool.room_bounded)
             .map(|room| room.saturating_sub(self.room_bounded_slack()));
         let mut blocks = pool.blocks.lock().expect("pool lock is never poisoned");
-        let found = blocks
-            .iter()
-            .filter(|block| !block.dedicated)
-            .find_map(|block| {
-                block
-                    .take(bytes, alignment)
-                    .map(|offset| (block.clone(), offset))
-            });
+        let found = first_fit(&blocks, bytes, alignment)
+            .map(|(index, offset)| (blocks[index].clone(), offset));
         let (block, offset) = match found {
             Some(found) => found,
             None => {
-                let largest = blocks
-                    .iter()
-                    .filter(|block| !block.dedicated)
-                    .map(|block| block.bytes)
-                    .max();
+                let largest = largest_shared(&blocks);
                 let dedicated = takes_own_block(bytes, self.block_cap);
                 // A type whose heap's budget cannot hold the block, or whose
                 // heap refuses it, is passed over for the next; the last
