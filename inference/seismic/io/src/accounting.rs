@@ -40,6 +40,8 @@ pub(crate) struct Book {
     /// The seconds a speculative piece was in flight, which a waiting job's
     /// time behind speculative pieces is the difference of ([`Wait`]).
     speculative: f64,
+    /// When a piece last ended, none before one did.
+    last_ended: Option<Instant>,
     totals: Totals,
 }
 
@@ -131,7 +133,7 @@ impl Totals {
 impl Book {
     /// A volume's book, counted from `now`.
     pub(crate) fn new(now: Instant) -> Self {
-        Self { at: now, flight: [0; 3], speculative: 0., totals: Totals::default() }
+        Self { at: now, flight: [0; 3], speculative: 0., last_ended: None, totals: Totals::default() }
     }
 
     /// Its counts at `now`, the time running counted to then.
@@ -146,6 +148,11 @@ impl Book {
         self.totals.requests()
     }
 
+    /// When a piece last ended, none before one did.
+    pub(crate) fn last_ended(&self) -> Option<Instant> {
+        self.last_ended
+    }
+
     /// A piece of `class` was taken at `now`.
     pub(crate) fn began(&mut self, class: Priority, now: Instant) {
         self.advance(now);
@@ -155,6 +162,9 @@ impl Book {
     /// A piece of `class` and `bytes` ended at `now`.
     pub(crate) fn ended(&mut self, class: Priority, bytes: u64, now: Instant) {
         self.advance(now);
+        // Instants taken on several threads may reach the queue's lock out of
+        // order: the latest end stands.
+        self.last_ended = self.last_ended.max(Some(now));
         let flight = &mut self.flight[class as usize];
         *flight = flight.checked_sub(1).expect("an ended piece was in flight");
         let counted = &mut self.totals.classes[class as usize];

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::watched::{MULTIPLE, PieceBound};
+use crate::watched::{MULTIPLE, VolumeBound};
 
 /// What bounds every answer of the load's exchange, fixed as the watcher
 /// starts beside the read line, which the run measures as it goes.
@@ -102,7 +102,7 @@ pub(super) fn watch(
                 Some(line) => {
                     let priced = shared.priced().map(|lines| shared.telemetry.refined(&lines));
                     let lane = answers.longest(line, &shared.telemetry.landing_lines(), priced.as_deref());
-                    Bounds { lane, pieces: PieceBound(Some(line)) }
+                    Bounds { lane, volumes: VolumeBound(Some(line)) }
                 }
                 None => Bounds::unpriced(),
             }

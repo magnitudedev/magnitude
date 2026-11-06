@@ -11,7 +11,7 @@
 //! the same way.
 
 use crate::assessment::ReadLine;
-use seismic_io::{EngineWork, Flight};
+use seismic_io::{EngineWork, Flight, Volume};
 use std::sync::{Condvar, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -37,73 +37,128 @@ pub(crate) struct Reads {
     pub(crate) engine: EngineWork,
 }
 
-/// How long a load's reads may go without progress before any of them made
-/// a read line: no line prices a piece yet, so this is what the bounds are
-/// until one does. Not a cost: nothing is priced by it, and only a read the
-/// storage never returns reaches it.
+/// How long a read may go without progress where no line prices it: a
+/// volume's silence and each lane before any of a load's reads made a read
+/// line, and at any time one piece while its volume ends others. Not a cost:
+/// nothing is priced by it, and only a read the storage never returns
+/// reaches it.
 pub(crate) const UNPRICED_PROGRESS: Duration = Duration::from_secs(60);
 
-/// How long one piece of a read may be in flight: [`MULTIPLE`] times the
-/// read line's time for it and for every other piece the engine has in
-/// flight on its device, each read on its own, all as one snapshot of the
-/// engine's work shows them: the longest the device takes over them,
-/// whether it serves them in turn or together. A slow piece on a volume saturated by the
-/// engine's own reads stays inside it; one the storage never returns does
-/// not. Before the load has a read line (none), [`UNPRICED_PROGRESS`].
+/// How long a volume may go ending none of the read engine's pieces in
+/// flight on it: [`MULTIPLE`] times the read line's time for its window of
+/// pieces, each read on its own: the longest the volume takes over all the
+/// engine may hold there, whether it serves them in turn or together, and
+/// however few of them are left in flight now, so the last of a burst, held
+/// behind I/O the engine does not see, is not bounded by a lone read's time.
+/// Its silence runs from the later of its last end and its oldest piece in
+/// flight's start. Before the load has a read line (none),
+/// [`UNPRICED_PROGRESS`].
+///
+/// A volume that keeps ending pieces may hold one of them long past what
+/// the line prices for it (behind I/O the engine does not see, or behind
+/// pieces started after it, thousands of which may pass it meanwhile), so
+/// its age is held to no line, and neither is how many pass it. Once the
+/// lane waiting on it stops the requests that read, its volume drains and
+/// falls silent; while other work keeps it busy, the piece is stuck only at
+/// [`UNPRICED_PROGRESS`].
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct PieceBound(pub(crate) Option<ReadLine>);
+pub(crate) struct VolumeBound(pub(crate) Option<ReadLine>);
 
-impl PieceBound {
-    /// The bound of `engine`'s piece in flight `flight` (one of its
-    /// `reading`).
-    pub(crate) fn of(self, flight: &Flight, engine: &EngineWork) -> Duration {
+/// What one volume does of the engine's work at one look: its pieces in
+/// flight and since when it has ended none of them.
+struct VolumeWork<'a> {
+    volume: Volume,
+    reading: Vec<&'a Flight>,
+    quiet_since: Instant,
+}
+
+impl VolumeBound {
+    /// Each volume `engine` has a piece in flight on.
+    fn volumes(engine: &EngineWork) -> Vec<VolumeWork<'_>> {
+        let mut volumes = Vec::<VolumeWork<'_>>::new();
+        for flight in &engine.reading {
+            match volumes.iter_mut().find(|work| work.volume == flight.volume) {
+                Some(work) => {
+                    work.reading.push(flight);
+                    work.quiet_since = work.quiet_since.min(flight.since);
+                }
+                None => volumes.push(VolumeWork { volume: flight.volume, reading: vec![flight], quiet_since: flight.since }),
+            }
+        }
+        for work in &mut volumes {
+            if let Some(&last) = engine.last_ended.get(&work.volume) {
+                work.quiet_since = work.quiet_since.max(last);
+            }
+        }
+        volumes
+    }
+
+    /// The bound of a volume with `reading` in flight: its widest window of
+    /// such pieces (a piece wider than its window is read alone).
+    fn of(self, reading: &[&Flight]) -> Duration {
         let Some(line) = self.0 else {
             return UNPRICED_PROGRESS;
         };
-        let sharing = engine
-            .reading
-            .iter()
-            .filter(|other| other.volume == flight.volume)
-            .map(|other| line.seconds(other.bytes))
-            .sum::<f64>();
-        Duration::from_secs_f64(sharing) * MULTIPLE
+        let longest = reading.iter().map(|flight| (flight.window / flight.bytes).max(1) as f64 * line.seconds(flight.bytes)).fold(0.0, f64::max);
+        Duration::from_secs_f64(longest) * MULTIPLE
     }
 
-    /// Whether `engine`'s piece in flight `flight` is past its bound at `now`.
-    fn overdue(self, flight: &Flight, engine: &EngineWork, now: Instant) -> bool {
-        now.saturating_duration_since(flight.since) >= self.of(flight, engine)
+    /// Whether `flight` is stuck at `now`, however busy its volume.
+    fn stuck(flight: &Flight, now: Instant) -> bool {
+        now.saturating_duration_since(flight.since) >= UNPRICED_PROGRESS
     }
 
-    /// Each piece `engine` has in flight at `now`: its file, bytes, time in
-    /// flight and bound, and whether it is past it.
+    /// Whether some volume of `engine` has gone past its bound at `now`
+    /// ending none of its pieces in flight, or holds one stuck.
+    fn stalled(self, engine: &EngineWork, now: Instant) -> bool {
+        Self::volumes(engine).iter().any(|work| now.saturating_duration_since(work.quiet_since) >= self.of(&work.reading))
+            || engine.reading.iter().any(|flight| Self::stuck(flight, now))
+    }
+
+    /// Each volume `engine` has pieces in flight on at `now`: how long it
+    /// has ended none of them, of its bound, and whether it is past it; and
+    /// each of its pieces: its file, bytes and time in flight, and whether
+    /// it is stuck.
     pub(crate) fn describe(self, engine: &EngineWork, now: Instant) -> String {
-        let flights = engine
-            .reading
+        let volumes = Self::volumes(engine)
             .iter()
-            .map(|flight| {
+            .map(|work| {
+                let quiet = now.saturating_duration_since(work.quiet_since);
+                let bound = self.of(&work.reading);
+                let flights = work
+                    .reading
+                    .iter()
+                    .map(|flight| {
+                        format!(
+                            "{} at {} ({} bytes) for {:?}{}",
+                            flight.path.display(),
+                            flight.offset,
+                            flight.bytes,
+                            now.saturating_duration_since(flight.since),
+                            if Self::stuck(flight, now) { ", stuck" } else { "" }
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 format!(
-                    "{} at {} ({} bytes, volume {}) for {:?} of {:?}{}",
-                    flight.path.display(),
-                    flight.offset,
-                    flight.bytes,
-                    flight.volume,
-                    now.saturating_duration_since(flight.since),
-                    self.of(flight, engine),
-                    if self.overdue(flight, engine, now) { ", past its bound" } else { "" }
+                    "volume {} ended none for {quiet:?} of {bound:?}{}, in flight [{}]",
+                    work.volume,
+                    if quiet >= bound { ", past its bound" } else { "" },
+                    flights.join("; ")
                 )
             })
             .collect::<Vec<_>>();
-        format!("{} pieces ended, in flight [{}]", engine.ended, flights.join("; "))
+        format!("{} pieces ended, volumes [{}]", engine.ended, volumes.join("; "))
     }
 }
 
 /// Whether an owner's reads were being served between two looks: they were
 /// outstanding and the read engine progressed, ending a piece meanwhile or
-/// reading one now, with no piece it reads past its own bound
-/// ([`PieceBound`]). While they are, the engine is serving them or the reads
-/// queued ahead of them, however slowly the storage returns each piece; an
-/// engine holding a piece the storage never returns, or reading nothing
-/// and ending nothing while reads are owed, is not serving them.
+/// reading one now, with no volume past its bound ending none of its pieces
+/// and no piece stuck ([`VolumeBound`]). While they are, the engine is
+/// serving them or the reads queued ahead of them, however slowly the
+/// storage returns each piece; an engine whose volume stopped returning
+/// reads or holds a piece stuck, or reading nothing and ending nothing while
+/// reads are owed, is not serving them.
 pub(crate) struct Serving {
     ended: u64,
 }
@@ -113,12 +168,11 @@ impl Serving {
         Self { ended: engine.ended }
     }
 
-    /// Whether `reads`, seen at `now` with each piece bounded by `pieces`,
-    /// were served since the last look.
-    pub(crate) fn look(&mut self, reads: &Reads, pieces: PieceBound, now: Instant) -> bool {
+    /// Whether `reads`, seen at `now` with each volume bounded by
+    /// `volumes`, were served since the last look.
+    pub(crate) fn look(&mut self, reads: &Reads, volumes: VolumeBound, now: Instant) -> bool {
         let engine = &reads.engine;
-        let progressed = (engine.ended != self.ended || !engine.reading.is_empty())
-            && !engine.reading.iter().any(|flight| pieces.overdue(flight, engine, now));
+        let progressed = (engine.ended != self.ended || !engine.reading.is_empty()) && !volumes.stalled(engine, now);
         self.ended = engine.ended;
         reads.outstanding && progressed
     }
@@ -243,6 +297,7 @@ mod tests {
     use super::*;
     /// A piece in flight's bytes: any read size a volume reads in.
     const PIECE: u64 = 128 << 10;
+    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex, mpsc};
 
@@ -269,44 +324,76 @@ mod tests {
         assert_eq!(clock.look(at, interval, false), interval * 8, "reads not served credit again");
     }
 
-    /// An owner's reads are served while outstanding and the engine ends a
-    /// piece (the reads queued ahead of them) or reads one within its bound,
-    /// however slowly (its own read on a saturated volume); not while it
-    /// reads a piece past its bound (one the storage never returns), nor
-    /// while it neither ends nor reads one, nor while the owner reads
-    /// nothing whatever the engine serves others.
-    #[test]
-    fn reads_are_served_while_the_engine_progresses_within_each_pieces_bound() {
-        let pieces = PieceBound(Some(ReadLine::new(1e-3, 0.0).unwrap()));
-        let now = Instant::now();
-        let flight = |age| Flight { path: Path::new("/experts").into(), volume: seismic_io::Volume(1), offset: 0, bytes: PIECE, since: now - age };
-        let reads = |outstanding, ended, reading: Vec<Flight>| Reads { outstanding, engine: EngineWork { ended, reading } };
-        let mut serving = Serving::new(&EngineWork { ended: 0, reading: Vec::new() });
-        assert!(!serving.look(&reads(true, 0, Vec::new()), pieces, now), "an engine that neither ends nor reads a piece serves nothing");
-        assert!(serving.look(&reads(true, 3, Vec::new()), pieces, now), "pieces ended serve the reads queued behind them");
-        assert!(serving.look(&reads(true, 3, vec![flight(Duration::from_millis(9))]), pieces, now), "a slow piece within its bound is served");
-        assert!(!serving.look(&reads(true, 3, vec![flight(Duration::from_millis(10))]), pieces, now), "a piece past its bound is not");
-        assert!(
-            !serving.look(&reads(true, 4, vec![flight(Duration::from_millis(1)), flight(Duration::from_secs(5))]), pieces, now),
-            "nor is any read while a piece the storage never returns is held, whatever else ends"
-        );
-        assert!(!serving.look(&reads(false, 9, vec![flight(Duration::ZERO)]), pieces, now), "nor the reads of an owner that reads nothing");
-        let report = pieces.describe(&reads(true, 9, vec![flight(Duration::from_secs(5))]).engine, now);
-        assert!(report.contains("/experts at 0 (131072 bytes, volume 1) for 5s of 10ms, past its bound"), "{report}");
+    /// A piece of `PIECE` bytes in flight since `age` before `now`, on
+    /// `volume`, of a window of `window` such pieces.
+    fn flown(volume: u64, window: u64, now: Instant, age: Duration) -> Flight {
+        Flight { path: Path::new("/experts").into(), volume: Volume(volume), offset: 0, bytes: PIECE, window: window * PIECE, since: now - age }
     }
 
-    /// A piece's bound is MULTIPLE times the line's time for it and for
-    /// every other piece in flight on its device, each on its own, none on
-    /// another.
+    /// An owner's reads are served while outstanding and the engine ends a
+    /// piece (the reads queued ahead of them) or reads one, its volume
+    /// within its bound; not once its volume has ended none of its pieces
+    /// past it (one that stopped returning reads), nor while the engine
+    /// neither ends nor reads one, nor while the owner reads nothing
+    /// whatever the engine serves others.
     #[test]
-    fn a_pieces_bound_covers_the_pieces_sharing_its_device() {
-        let pieces = PieceBound(Some(ReadLine::new(1e-6, 9e-9).unwrap()));
+    fn reads_are_served_while_each_volume_ends_pieces_within_its_bound() {
+        let volumes = VolumeBound(Some(ReadLine::new(1e-3, 0.0).unwrap()));
         let now = Instant::now();
-        let flight = |volume| Flight { path: Path::new("/experts").into(), volume: seismic_io::Volume(volume), offset: 0, bytes: 1000, since: now };
-        let alone = EngineWork { ended: 0, reading: vec![flight(1), flight(2), flight(2)] };
-        assert_eq!(pieces.of(&alone.reading[0], &alone), Duration::from_secs_f64(1e-5) * MULTIPLE, "alone on its device");
-        let sharing = EngineWork { ended: 0, reading: vec![flight(1), flight(1), flight(1), flight(2)] };
-        assert_eq!(pieces.of(&sharing.reading[0], &sharing), Duration::from_secs_f64(3e-5) * MULTIPLE, "behind two others on its device");
+        let reads = |outstanding, ended, reading: Vec<Flight>| Reads { outstanding, engine: EngineWork { ended, reading, last_ended: HashMap::new() } };
+        let mut serving = Serving::new(&EngineWork { ended: 0, reading: Vec::new(), last_ended: HashMap::new() });
+        assert!(!serving.look(&reads(true, 0, Vec::new()), volumes, now), "an engine that neither ends nor reads a piece serves nothing");
+        assert!(serving.look(&reads(true, 3, Vec::new()), volumes, now), "pieces ended serve the reads queued behind them");
+        assert!(serving.look(&reads(true, 3, vec![flown(1, 1, now, Duration::from_millis(9))]), volumes, now), "a volume within its bound is served");
+        assert!(!serving.look(&reads(true, 3, vec![flown(1, 1, now, Duration::from_millis(10))]), volumes, now), "one past it is not");
+        assert!(!serving.look(&reads(false, 9, vec![flown(1, 1, now, Duration::ZERO)]), volumes, now), "nor the reads of an owner that reads nothing");
+        let report = volumes.describe(&reads(true, 9, vec![flown(1, 1, now, Duration::from_secs(5))]).engine, now);
+        assert!(report.contains("volume 1 ended none for 5s of 10ms, past its bound, in flight [/experts at 0 (131072 bytes) for 5s]"), "{report}");
+    }
+
+    /// The failure that made this rule: pieces of one window on a volume
+    /// that keeps ending the others, two of them held past what the line
+    /// prices for the whole window, thousands passing them. They are served
+    /// throughout, and only at [`UNPRICED_PROGRESS`] is one reported stuck,
+    /// however busy its volume.
+    #[test]
+    fn a_piece_held_while_its_volume_ends_others_is_served_until_it_is_stuck() {
+        // 2.51 s for a window of 256 pieces, as observed.
+        let volumes = VolumeBound(Some(ReadLine::new(2.51 / 2560.0, 0.0).unwrap()));
+        let now = Instant::now();
+        let held = |age| {
+            let mut reading = vec![flown(1, 256, now, age), flown(1, 256, now, age)];
+            reading.extend((0..254).map(|_| flown(1, 256, now, Duration::from_micros(500))));
+            Reads { outstanding: true, engine: EngineWork { ended: 5000, reading, last_ended: HashMap::from([(Volume(1), now - Duration::from_micros(100))]) } }
+        };
+        let mut serving = Serving::new(&EngineWork { ended: 0, reading: Vec::new(), last_ended: HashMap::new() });
+        assert!(serving.look(&held(Duration::from_millis(2960)), volumes, now), "held past the window's bound as the others end");
+        assert!(serving.look(&held(UNPRICED_PROGRESS - Duration::from_millis(1)), volumes, now), "held just short of stuck");
+        assert!(!serving.look(&held(UNPRICED_PROGRESS), volumes, now), "stuck, however busy its volume");
+        let report = volumes.describe(&held(UNPRICED_PROGRESS).engine, now);
+        assert!(report.contains("for 60s, stuck"), "{report}");
+    }
+
+    /// A volume's bound is MULTIPLE times the line's time for its window of
+    /// pieces, however few are in flight now, so the last of a burst is not
+    /// bounded by a lone read's time; a piece wider than its window is
+    /// read alone. One volume's progress does not hide another's silence.
+    #[test]
+    fn a_volumes_bound_covers_its_window_whatever_is_left_in_flight() {
+        let volumes = VolumeBound(Some(ReadLine::new(1e-3, 0.0).unwrap()));
+        let now = Instant::now();
+        let bound = |flight: &Flight| volumes.of(&[flight]);
+        assert_eq!(bound(&flown(1, 16, now, Duration::ZERO)), Duration::from_millis(160), "the last of a window of 16");
+        let wide = Flight { window: 1, ..flown(1, 16, now, Duration::ZERO) };
+        assert_eq!(bound(&wide), Duration::from_millis(10), "wider than its window, read alone");
+
+        let engine = |quiet| EngineWork {
+            ended: 1,
+            reading: vec![flown(1, 16, now, Duration::from_secs(1)), flown(2, 16, now, Duration::from_secs(1))],
+            last_ended: HashMap::from([(Volume(1), now), (Volume(2), now - quiet)]),
+        };
+        assert!(!volumes.stalled(&engine(Duration::from_millis(159)), now), "both within their bounds");
+        assert!(volumes.stalled(&engine(Duration::from_millis(160)), now), "the first's ends do not cover the second's silence");
     }
 
     /// A wait whose awaited value never comes trips past its bound, its

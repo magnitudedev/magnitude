@@ -22,30 +22,36 @@ impl Outstanding {
 }
 
 /// A piece a worker of the engine is reading: its file and the volume it
-/// lies on, its bytes there, and since when.
+/// lies on, its bytes there, the bytes its volume's window holds in flight
+/// for its class, and since when.
 #[derive(Clone, Debug)]
 pub struct Flight {
     pub path: Arc<Path>,
     pub volume: Volume,
     pub offset: u64,
     pub bytes: u64,
+    pub window: u64,
     pub since: Instant,
 }
 
 /// The read engine's work as a waiter on a read sees it at one look: the
-/// pieces it has ended so far, read or failed, and each piece its workers
-/// are reading now. Whether that is progress is the waiter's to judge, by
-/// how long each piece in flight may take.
+/// pieces it has ended so far, read or failed, each piece its workers are
+/// reading now, and when it last ended a piece on each volume (none for a
+/// volume it has ended none on). Whether that is progress is the waiter's
+/// to judge, by how long each volume may go ending none of its pieces in
+/// flight.
 #[derive(Clone, Debug)]
 pub struct EngineWork {
     pub ended: u64,
     pub reading: Vec<Flight>,
+    pub last_ended: HashMap<Volume, Instant>,
 }
 
 /// The process's read engine's work now ([`EngineWork`]): its pieces ended
-/// are every volume's requests ([`crate::accounting`]). A worker counts its
-/// piece ended before it stops reporting it in flight, and the two are read
-/// in the other order, so no look misses a piece between them.
+/// are every volume's requests, and each volume's last end its book's
+/// ([`crate::accounting`]). A worker counts its piece ended before it stops
+/// reporting it in flight, and the two are read in the other order, so no
+/// look misses a piece between them.
 pub fn engine_work() -> EngineWork {
     let engine = engine();
     let reading = engine
@@ -55,8 +61,10 @@ pub fn engine_work() -> EngineWork {
         .iter()
         .filter_map(|flight| flight.lock().expect("a read worker's flight").clone())
         .collect();
-    let ended = engine.queue.lock().expect("read queue").volumes.values().map(|flight| flight.book.requests()).sum();
-    EngineWork { ended, reading }
+    let queue = engine.queue.lock().expect("read queue");
+    let ended = queue.volumes.values().map(|flight| flight.book.requests()).sum();
+    let last_ended = queue.volumes.iter().filter_map(|(volume, flight)| Some((*volume, flight.book.last_ended()?))).collect();
+    EngineWork { ended, reading, last_ended }
 }
 
 /// The counts of `volume` at `now` ([`crate::accounting::totals`]), none
@@ -136,6 +144,7 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
             volume: taken.volume.id,
             offset: piece.start,
             bytes: piece.end - piece.start,
+            window: taken.volume.window_for(taken.class),
             since: Instant::now(),
         });
         // A panic is the job's, whose observer resumes it: the worker serves

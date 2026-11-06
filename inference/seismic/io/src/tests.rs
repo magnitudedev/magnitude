@@ -156,6 +156,24 @@ fn ranges_read_as_stored_whatever_their_alignment_and_order() {
     std::fs::remove_file(path).unwrap();
 }
 
+/// A read's end is its volume's last, whoever reads next, and a piece in
+/// flight states its volume's window for its class: what a waiter on a read
+/// judges the volume's progress by.
+#[test]
+fn the_engines_work_shows_each_volumes_last_end() {
+    let path = temporary("last-end", &vec![4u8; 4 * LEAST_READ as usize]);
+    let reader = Reader::open(&path, CachePolicy::Cached).unwrap();
+    let began = Instant::now();
+    let sink = Arc::new(Buffer::new(LEAST_READ as usize));
+    let range = Range { offset: 0, length: LEAST_READ as usize, into: sink, at: 0 };
+    // SAFETY: the sink is this job's alone, waited for here.
+    let ended = unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap().wait();
+    assert!(matches!(ended, Ended::Read { ref failed } if failed.is_empty()), "{ended:?}");
+    let last = *engine_work().last_ended.get(&reader.volume()).expect("the volume ended a piece");
+    assert!(last >= began && last <= Instant::now(), "the end is the read's");
+    std::fs::remove_file(&path).unwrap();
+}
+
 /// A job's hook runs once, with how it ended: registered before it
 /// ends, on the thread that ends it; registered after, at once. A job of
 /// no piece ends at its submission. Each hook is waited for through what

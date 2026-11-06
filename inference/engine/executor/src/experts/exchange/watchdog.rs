@@ -28,7 +28,7 @@ use crate::experts::events::Events;
 use magnitude_kernels::constants;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use crate::watched::{HostClock, PieceBound, Reads, Serving, UNPRICED_PROGRESS};
+use crate::watched::{HostClock, Reads, Serving, UNPRICED_PROGRESS, VolumeBound};
 pub(in crate::experts) use crate::watched::{Bound, Trip, abort};
 use std::time::{Duration, Instant};
 
@@ -104,21 +104,21 @@ struct Open {
 }
 
 /// What bounds the load's waits at a look, as its lines are measured: each
-/// lane and park, and each piece of its reads in flight.
+/// lane and park, and each volume its reads have pieces in flight on.
 pub(in crate::experts) struct Bounds {
     pub lane: Bound,
-    pub pieces: PieceBound,
+    pub volumes: VolumeBound,
 }
 
 impl Bounds {
     /// The bounds of a load none of whose reads made a read line yet: its
-    /// reads' progress alone, which takes no measured figure. A piece in
-    /// flight past [`UNPRICED_PROGRESS`] is no progress, and a lane or park
-    /// then waits as long again, with the host's time able to answer
-    /// counted as ever.
+    /// reads' progress alone, which takes no measured figure. A volume
+    /// ending none of its pieces in flight for [`UNPRICED_PROGRESS`] is no
+    /// progress, and a lane or park then waits as long again, with the
+    /// host's time able to answer counted as ever.
     pub fn unpriced() -> Self {
         let derivation = "no read line yet: the load's reads' progress alone".to_owned();
-        Self { lane: Bound { limit: UNPRICED_PROGRESS, derivation }, pieces: PieceBound(None) }
+        Self { lane: Bound { limit: UNPRICED_PROGRESS, derivation }, volumes: VolumeBound(None) }
     }
 }
 
@@ -134,7 +134,7 @@ impl Watchdog {
     /// Watch `tables` of the load and the park it waits at (`parked`),
     /// whose steps end as `ended` says, whose events are `events` and whose
     /// reads of the read engine are as `reads` says ([`Serving`]), each
-    /// lane, park and piece in flight bounded by `bounds` (read at every
+    /// lane, park and volume with pieces in flight bounded by `bounds` (read at every
     /// look, as the load's lines are measured), reporting `witnesses` and
     /// the engine's pieces in flight when one trips.
     #[allow(clippy::too_many_arguments)]
@@ -255,13 +255,13 @@ impl Watch {
     /// A look at `at`, a tenth of `bounds`' lane bound after the last: the
     /// report of the lane or park overdue, if one is.
     fn look(&mut self, at: Instant, bounds: &Bounds) -> Option<String> {
-        let Bounds { lane: Bound { limit, derivation }, pieces } = bounds;
-        let (limit, pieces) = (*limit, *pieces);
+        let Bounds { lane: Bound { limit, derivation }, volumes } = bounds;
+        let (limit, volumes) = (*limit, *volumes);
         let (tables, ended, witnesses) = (&self.tables, &*self.ended, &self.witnesses);
         let looked = (self.reads)();
-        let served = self.serving.look(&looked, pieces, at);
+        let served = self.serving.look(&looked, volumes, at);
         let (now, seen) = (self.clock.look(at, limit / 10, served), self.events.seen());
-        let engine = || format!("{}, the load's reads outstanding {}", pieces.describe(&looked.engine, at), looked.outstanding);
+        let engine = || format!("{}, the load's reads outstanding {}", volumes.describe(&looked.engine, at), looked.outstanding);
         let current = unanswered(tables, ended);
         self.open.retain(|open| current.contains(&open.lane));
         for &lane in &current {

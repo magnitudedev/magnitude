@@ -8,8 +8,9 @@ use super::*;
 use magnitude_kernels::SlotTable;
 use seismic::{BackendName, Devices, Element, Tensor};
 use crate::assessment::ReadLine;
-use crate::watched::PieceBound;
-use seismic_io::{EngineWork, Flight};
+use crate::watched::VolumeBound;
+use seismic_io::{EngineWork, Flight, Volume};
+use std::collections::HashMap;
 
 /// A piece in flight's bytes: any read size a volume reads in.
 const PIECE: u64 = 128 << 10;
@@ -24,19 +25,19 @@ fn slots(table: SlotTable) -> ExchangeTable {
 /// The reads of a load that reads nothing, of an engine that works on
 /// nothing.
 fn idle() -> Reads {
-    Reads { outstanding: false, engine: EngineWork { ended: 0, reading: Vec::new() } }
+    Reads { outstanding: false, engine: EngineWork { ended: 0, reading: Vec::new(), last_ended: HashMap::new() } }
 }
 
-/// Each piece in flight bounded at [`MULTIPLE`](crate::watched::MULTIPLE)
-/// times a read line of `latency` seconds.
-fn pieces(latency: f64) -> PieceBound {
-    PieceBound(Some(ReadLine::new(latency, 0.0).unwrap()))
+/// Each volume bounded at [`MULTIPLE`](crate::watched::MULTIPLE) times a
+/// read line of `latency` seconds a piece of its window.
+fn volumes(latency: f64) -> VolumeBound {
+    VolumeBound(Some(ReadLine::new(latency, 0.0).unwrap()))
 }
 
-/// The bounds of a test's load: each lane and park at `limit`, each piece
-/// by `pieces`.
-fn bounds(limit: Duration, pieces: PieceBound) -> Bounds {
-    Bounds { lane: Bound { limit, derivation: "the test's".into() }, pieces }
+/// The bounds of a test's load: each lane and park at `limit`, each volume
+/// by `volumes`.
+fn bounds(limit: Duration, volumes: VolumeBound) -> Bounds {
+    Bounds { lane: Bound { limit, derivation: "the test's".into() }, volumes }
 }
 
 /// A watch begun at `began` over `tables` and the park `parked`, whose
@@ -57,10 +58,10 @@ fn looks(watch: &mut Watch, began: Instant, bounds: &Bounds, until: Duration) ->
         .find_map(|after| watch.look(began + after, bounds).map(|report| (after, report)))
 }
 
-/// A load's first read, with no read line yet, on a piece the storage never
-/// returns: its progress stops once the piece passes its bound, and the
-/// lane waiting on it then trips within its own, the piece in the report. A
-/// slow read that keeps ending pieces never does.
+/// A load's first read, with no read line yet, on a volume that never
+/// returns it: its progress stops once the volume has ended none of it for
+/// its bound, and the lane waiting on it then trips within its own, the
+/// volume in the report. A slow read that keeps ending pieces never does.
 #[test]
 fn a_read_that_never_ends_trips_with_no_read_line() {
     let began = Instant::now();
@@ -68,8 +69,8 @@ fn a_read_that_never_ends_trips_with_no_read_line() {
     let limit = unpriced.lane.limit;
     let flight = move |ended| {
         Box::new(move || {
-            let reading = vec![Flight { path: Path::new("/models/experts.gguf").into(), volume: seismic_io::Volume(1), offset: 0, bytes: PIECE, since: began }];
-            Reads { outstanding: true, engine: EngineWork { ended, reading } }
+            let reading = vec![Flight { path: Path::new("/models/experts.gguf").into(), volume: Volume(1), offset: 0, bytes: PIECE, window: PIECE, since: began }];
+            Reads { outstanding: true, engine: EngineWork { ended, reading, last_ended: HashMap::new() } }
         }) as Box<dyn Fn() -> Reads + Send>
     };
     let unanswered = || {
@@ -85,7 +86,7 @@ fn a_read_that_never_ends_trips_with_no_read_line() {
     let ended = std::sync::atomic::AtomicU64::new(0);
     let progressing = Box::new(move || Reads {
         outstanding: true,
-        engine: EngineWork { ended: ended.fetch_add(1, std::sync::atomic::Ordering::Relaxed), reading: Vec::new() },
+        engine: EngineWork { ended: ended.fetch_add(1, std::sync::atomic::Ordering::Relaxed), reading: Vec::new(), last_ended: HashMap::new() },
     });
     let mut slow = watch(unanswered(), Box::new(|| None), Box::new(|_| false), progressing, began);
     assert!(looks(&mut slow, began, &unpriced, limit * 10).is_none(), "tripped while its reads progressed");
@@ -106,7 +107,7 @@ fn the_watchdogs_thread_trips_with_its_report_and_stops_when_dropped() {
             ended,
             Arc::default(),
             Box::new(idle),
-            Box::new(move || bounds(limit, pieces(1e-3))),
+            Box::new(move || bounds(limit, volumes(1e-3))),
             Vec::new(),
             Box::new(move |report| tripped.send(report).unwrap()),
         )
@@ -125,7 +126,7 @@ fn the_watchdogs_thread_trips_with_its_report_and_stops_when_dropped() {
 #[test]
 fn an_unanswered_lane_of_each_kind_trips_with_its_report() {
     let (limit, began) = (Duration::from_millis(50), Instant::now());
-    let bounds = bounds(limit, pieces(1e-3));
+    let bounds = bounds(limit, volumes(1e-3));
     for (kind, table, lane) in [
         (Kind::File, SlotTable::file(4, 2), 0),
         (Kind::Site, SlotTable::site(2, 4), 0),
@@ -148,15 +149,19 @@ fn an_unanswered_lane_of_each_kind_trips_with_its_report() {
     }
 }
 
-/// A lane whose read has a piece in flight, no piece of any read ending
-/// (the load's only read on a saturated volume, far past the lane's
-/// bound), is being answered and never trips while the piece is within its
-/// own bound; on a slow device, a piece sharing it with others is bounded by
-/// them too. The same piece in flight forever (a `pread` the storage never
-/// returns) trips once past its bound, the report naming it; and so does a
-/// read outstanding that the engine neither reads nor ends a piece of.
+/// A lane whose read has pieces in flight is being answered and never trips
+/// while their volume ends one within its bound: neither while it is within
+/// the bound ending none (the load's only reads on a saturated volume, far
+/// past the lane's bound), nor while it holds one piece far past what the
+/// line prices for its whole window as it ends the others (I/O the read
+/// engine does not see, or pieces started after it), however many pass it.
+/// A volume that ends none past its bound (one that stopped returning
+/// reads) trips the lane the lane's bound later, the report naming it and
+/// its pieces; so does a piece it holds to the end of what any read is given
+/// while it ends others; and so does a read outstanding that the engine
+/// neither reads nor ends a piece of.
 #[test]
-fn a_lane_whose_read_is_in_flight_trips_only_past_its_pieces_bound() {
+fn a_lane_whose_read_is_in_flight_trips_only_past_its_volumes_bound() {
     let (limit, began) = (Duration::from_millis(30), Instant::now());
     let period = limit / 10;
     let unanswered = || {
@@ -164,32 +169,53 @@ fn a_lane_whose_read_is_in_flight_trips_only_past_its_pieces_bound() {
         slots.request(6, 0);
         vec![Watched { kind: Kind::File, layer: 3, slots }]
     };
-    // A device reading a piece in 2 ms: alone, a piece's bound is 20 ms;
-    // behind 15 others in flight on it, 320 ms.
-    let bounds = bounds(limit, PieceBound(Some(ReadLine::new(0.0, 2e-3 / PIECE as f64).unwrap())));
+    // A volume reading a piece in 2 ms: with a window of 16 pieces, its bound
+    // is 320 ms.
+    let bounds = bounds(limit, VolumeBound(Some(ReadLine::new(0.0, 2e-3 / PIECE as f64).unwrap())));
+    let window = Duration::from_millis(320);
+    let flight = |piece: u64, since| Flight { path: Path::new("/models/experts.gguf").into(), volume: Volume(1), offset: piece * PIECE, bytes: PIECE, window: 16 * PIECE, since };
     let flying = |count: u64, since: Instant| -> Box<dyn Fn() -> Reads + Send> {
-        let reading = (0..count)
-            .map(|piece| Flight { path: Path::new("/models/experts.gguf").into(), volume: seismic_io::Volume(1), offset: piece * PIECE, bytes: PIECE, since })
-            .collect::<Vec<_>>();
-        Box::new(move || Reads { outstanding: true, engine: EngineWork { ended: 7, reading: reading.clone() } })
+        let reading = (0..count).map(|piece| flight(piece, since)).collect::<Vec<_>>();
+        Box::new(move || Reads { outstanding: true, engine: EngineWork { ended: 7, reading: reading.clone(), last_ended: HashMap::new() } })
     };
-    let reading = |count, since| watch(unanswered(), Box::new(|| None), Box::new(|_| false), flying(count, since), began);
-    // Behind 15 others: in flight ten lane bounds, within its own.
-    assert!(looks(&mut reading(16, began), began, &bounds, limit * 10).is_none(), "tripped while the lane's read was in flight within its bound behind others");
-    // Stuck behind the same pieces: past its bound of 320 ms, then the lane's.
-    let (after, report) = looks(&mut reading(16, began - Duration::from_secs(10)), began, &bounds, limit * 2).expect("a piece in flight forever never tripped");
+    let reading = |reads| watch(unanswered(), Box::new(|| None), Box::new(|_| false), reads, began);
+    // Sixteen pieces in flight ten lane bounds, none ending: within 320 ms.
+    assert!(looks(&mut reading(flying(16, began)), began, &bounds, limit * 10).is_none(), "tripped while the volume was within its bound");
+    // The last of the window, alone in flight, no sooner than the window's.
+    assert!(looks(&mut reading(flying(1, began)), began, &bounds, limit * 10).is_none(), "tripped on the last of a window within the window's bound");
+    // One piece held from the start as the volume ends another, started
+    // after it, each look: past its window's bound many times, and passed
+    // by more pieces than a window holds, as the observed failure was.
+    let starved = || -> Box<dyn Fn() -> Reads + Send> {
+        let ended = std::sync::atomic::AtomicU64::new(0);
+        Box::new(move || {
+            let ended = ended.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let since = began + period * u32::try_from(ended).unwrap();
+            let reading = vec![flight(0, began), flight(ended + 1, since)];
+            Reads { outstanding: true, engine: EngineWork { ended, reading, last_ended: HashMap::from([(Volume(1), since)]) } }
+        })
+    };
+    let held = window * 20;
+    assert!(looks(&mut reading(starved()), began, &bounds, held).is_none(), "tripped while one piece was held as others ended");
+    // Held until it is stuck, however busy its volume: the lane's bound after.
+    let (after, report) = looks(&mut reading(starved()), began, &bounds, UNPRICED_PROGRESS + limit * 2).expect("a piece stuck on a busy volume never tripped");
+    let both = UNPRICED_PROGRESS + limit;
+    assert!(after + period >= both && after <= both + period, "tripped {after:?} after, not within a look of {both:?}");
+    assert!(report.contains("/models/experts.gguf at 0 (131072 bytes) for") && report.contains(", stuck"), "{report}");
+    // Sixteen pieces the volume ends none of, past its bound from the start:
+    // the lane's bound later.
+    let (after, report) = looks(&mut reading(flying(16, began - window)), began, &bounds, limit * 2).expect("a volume that stopped returning reads never tripped");
     assert!(after > limit, "tripped before the lane's bound");
     assert!(report.contains("File 3 2 0: 6, 0x0"), "{report}");
-    assert!(report.contains("/models/experts.gguf at 0 (131072 bytes, volume 1) for"), "{report}");
-    assert!(report.contains("of 320ms, past its bound"), "{report}");
-    // Alone and slow: within its bound of 20 ms, not tripped; past it, the
-    // lane's bound later. The look that first sees it past its bound credits
+    assert!(report.contains(&format!("of {window:?}, past its bound, in flight [/models/experts.gguf at 0 (131072 bytes) for")), "{report}");
+    // A piece alone, its volume passing its bound 320 ms in: tripped the
+    // lane's bound after. The look that first sees it past its bound credits
     // the period it ends, so within a look of both.
-    let (after, _) = looks(&mut reading(1, began), began, &bounds, limit * 2).expect("a lone piece in flight forever never tripped");
-    let both = Duration::from_millis(20) + limit;
+    let (after, _) = looks(&mut reading(flying(1, began)), began, &bounds, window + limit * 2).expect("a lone piece in flight forever never tripped");
+    let both = window + limit;
     assert!(after + period >= both && after <= both + period, "tripped {after:?} after, not within a look of {both:?}");
     // Unserved: outstanding, nothing in flight and nothing ending.
-    let (after, _) = looks(&mut reading(0, began), began, &bounds, limit * 2).expect("a read the engine does not serve never tripped");
+    let (after, _) = looks(&mut reading(flying(0, began)), began, &bounds, limit * 2).expect("a read the engine does not serve never tripped");
     assert!(after > limit, "tripped before its bound");
 }
 
@@ -213,7 +239,7 @@ fn only_a_lane_the_device_waits_on_trips() {
         Box::new(idle),
         began,
     );
-    assert!(looks(&mut watch, began, &bounds(limit, pieces(1e-3)), limit * 10).is_none(), "tripped on a lane nothing waits on");
+    assert!(looks(&mut watch, began, &bounds(limit, volumes(1e-3)), limit * 10).is_none(), "tripped on a lane nothing waits on");
 }
 
 /// A park the device reached and no answer released trips the watchdog
@@ -222,7 +248,7 @@ fn only_a_lane_the_device_waits_on_trips() {
 #[test]
 fn a_reached_unreleased_park_trips_whoever_writes_its_request() {
     let (limit, began) = (Duration::from_millis(30), Instant::now());
-    let bounds = bounds(limit, pieces(1e-3));
+    let bounds = bounds(limit, volumes(1e-3));
     let parked = || -> ParkedAt { Box::new(|| Some(Parked { value: 853, step: 5, site: "layer 7 Round(2)".into() })) };
     let mut tripping = watch(Vec::new(), parked(), Box::new(|_| false), Box::new(idle), began);
     let (after, report) = looks(&mut tripping, began, &bounds, limit * 2).expect("a reached park never tripped");
