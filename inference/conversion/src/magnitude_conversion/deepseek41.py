@@ -69,13 +69,24 @@ def _add_file_metadata(writer: gguf.GGUFWriter, source_repo_url: str) -> None:
 
 
 class _KeepBf16:
-    """Writes a BF16 tensor the base would widen to F32 (a vector, or a norm) as BF16."""
+    """Writes a BF16 tensor the base would widen as BF16: a vector or a norm (which the base casts to F32 before any
+    type choice), or a tensor the base forces to F32 or F16 (the router and the drafter's confidence projection,
+    which upstream writes F32, and the projector's patch embedding, for ggml's convolution)."""
 
     gguf_writer: gguf.GGUFWriter
     model_tensors: dict[str, Callable[[], torch.Tensor]]
 
+    def _bf16(self, name: str) -> bool:
+        return name in self.model_tensors and self.model_tensors[name]().dtype == torch.bfloat16
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
+        forced = super().tensor_force_quant(name, new_name, bid, n_dims)
+        # `False` (no type forced) equals F32 (0) as an integer, so membership alone would match it
+        wider = forced is not False and forced in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
+        return gguf.GGMLQuantizationType.BF16 if wider and self._bf16(name) else forced
+
     def modify_tensors(self, data_torch, name: str, bid: int | None) -> Iterable[tuple[str, torch.Tensor]]:
-        bf16 = name in self.model_tensors and self.model_tensors[name]().dtype == torch.bfloat16
+        bf16 = self._bf16(name)
         for new_name, data in super().modify_tensors(data_torch, name, bid):
             if bf16 and (data.ndim <= 1 or new_name.endswith("_norm.weight")):
                 # the base casts sources to F32 first, which BF16 survives exactly
@@ -93,8 +104,6 @@ class _NativeFp8(_KeepBf16):
     model_tensors: dict[str, Callable[[], torch.Tensor]]
     _fp8_block: tuple[int, int]
     _fp8_e4m3_preserved: set[str]
-    _dsv4_bf16_tensors: set[str]
-    _dsv4_f32_tensors: set[str]
     _ENGRAM_EMBED_RE: Any
 
     def __init__(self, *args, source_repo_url: str, **kwargs):
@@ -136,11 +145,10 @@ class _NativeFp8(_KeepBf16):
     def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int):
         if name in self._fp8_e4m3_preserved:
             return gguf.GGMLQuantizationType.F8_E4M3
-        if new_name.endswith(".engram_gate.weight") or name in self._dsv4_f32_tensors:
+        if new_name.endswith(".engram_gate.weight"):
+            # upstream's F32 product of two BF16 tensors, exact only in F32: not a BF16 source to keep
             return gguf.GGMLQuantizationType.F32
-        if name in self._dsv4_bf16_tensors and n_dims >= 2:
-            return gguf.GGMLQuantizationType.BF16
-        return False
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
 
 
 class Slice:
@@ -305,8 +313,8 @@ class DeepseekV41DSpark(_NativeFp8, DeepseekV41DSparkModel):
 
 
 class DeepseekV41Vision(_KeepBf16, DeepseekV41VisionModel):
-    """The vision tower and aligner as a projector GGUF. It has no FP8 tensors: its BF16 vectors and the file
-    metadata are what differ."""
+    """The vision tower and aligner as a projector GGUF. It has no FP8 tensors: the BF16 tensors the base would widen
+    (vectors, norms, the patch embedding) and the file metadata are what differ."""
 
     model_arch = gguf.MODEL_ARCH.MMPROJ
 
