@@ -4,7 +4,7 @@
 //! requests through.
 
 use crate::scheduler::{self, Ended, Handle, Outstanding, Range, Want};
-use crate::{Destination, Error};
+use crate::{Buffer, Destination, Error};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -84,18 +84,6 @@ impl OpenFile {
 
     pub fn size(&self) -> u64 {
         self.size
-    }
-
-    /// `out.len()` bytes from `offset`, read through the file cache on the
-    /// caller's thread. A range past the file's end, or a file that ends
-    /// short of it, fails as `UnexpectedEof`.
-    pub fn read_exact_at(&self, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        let wanted = out.len();
-        match file::read_positioned(&self.file, offset, out, wanted) {
-            Ok(done) if done == wanted => Ok(()),
-            Ok(_) => Err(file::truncated()),
-            Err((error, _)) => Err(error),
-        }
     }
 }
 
@@ -214,11 +202,66 @@ impl Reader {
         evict(file, self.file.size)
     }
 
-    /// `length` bytes from `offset`, read in order as a stream: each read
-    /// of the stream is one undated request into the caller's buffer, so
-    /// the stream holds none of the bytes itself.
-    pub fn range(&self, offset: u64, length: u64) -> RangeReader<'_> {
-        RangeReader { reader: self, offset, remaining: length }
+    /// Read each of `reads`' buffers from its offset, as one request for
+    /// `want`, and wait for it: a caller that needs the bytes before it goes
+    /// on (a header, a table's rows wanted now). The first read's error
+    /// fails it, its kind kept.
+    pub fn read_at<'a>(&self, reads: impl IntoIterator<Item = (u64, &'a mut [u8])>, want: Want) -> io::Result<()> {
+        let ranges = reads
+            .into_iter()
+            .filter_map(|(offset, into)| {
+                let length = into.len();
+                NonNull::new(into.as_mut_ptr()).filter(|_| length != 0).map(|base| Range { offset, length, into: Arc::new(Borrowed(base, length)), at: 0 })
+            })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: each buffer is the caller's, borrowed alone (disjoint `&mut`
+        // borrows) until the request ends (`wait`), which it does before this
+        // returns.
+        let request = unsafe { self.request(ranges, want) }.map_err(io_error)?;
+        ended(request.wait())
+    }
+
+    /// Read the `length` bytes from `offset` in order, as requests for
+    /// `want` of half the link's knee each (at least one read), handing each
+    /// chunk to `sink` with its offset in the range as it lands: three
+    /// requested at once, so the link holds its knee while `sink` takes one
+    /// and the stream holds a knee and a half of the file. The first
+    /// error, the read's or `sink`'s, ends it; the requests not yet taken
+    /// are cancelled.
+    pub fn stream<E: From<io::Error>>(
+        &self,
+        offset: u64,
+        length: u64,
+        want: Want,
+        mut sink: impl FnMut(u64, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let chunk = (self.knee() / 2).max(LEAST_READ) as usize;
+        let depth = 3;
+        let mut flight = std::collections::VecDeque::<(Handle, Arc<Buffer>, u64, usize)>::new();
+        let mut spare = Vec::<Arc<Buffer>>::new();
+        let mut next = 0u64;
+        loop {
+            while flight.len() < depth && next < length {
+                let bytes = (length - next).min(chunk as u64) as usize;
+                let buffer = spare.pop().unwrap_or_else(|| Arc::new(Buffer::new(chunk)));
+                let range = Range { offset: offset + next, length: bytes, into: buffer.clone(), at: 0 };
+                // SAFETY: the buffer is the stream's alone, read by it only
+                // once its request has ended (`wait`).
+                let request = unsafe { self.request(vec![range], want) }.map_err(io_error)?;
+                flight.push_back((request, buffer, next, bytes));
+                next += bytes as u64;
+            }
+            let Some((request, buffer, at, bytes)) = flight.pop_front() else {
+                return Ok(());
+            };
+            ended(request.wait())?;
+            // SAFETY: its one request has ended.
+            sink(at, &unsafe { buffer.bytes() }[..bytes])?;
+            spare.push(buffer);
+        }
     }
 
     /// Request `ranges` of its volume's link for `want`. A range outside
@@ -239,16 +282,9 @@ impl Reader {
     }
 }
 
-/// A range of a file read in order ([`Reader::range`]).
-pub struct RangeReader<'a> {
-    reader: &'a Reader,
-    offset: u64,
-    remaining: u64,
-}
-
 /// A caller's buffer as a read's destination, for a read the caller waits
-/// out before the borrow ends ([`RangeReader`]): no request outlives the
-/// read that writes it.
+/// out before the borrow ends ([`Reader::read_at`]): no request outlives
+/// the read that writes it.
 struct Borrowed(NonNull<u8>, usize);
 
 // SAFETY: the buffer is the borrower's alone while its one request runs.
@@ -256,41 +292,34 @@ unsafe impl Send for Borrowed {}
 unsafe impl Sync for Borrowed {}
 
 // SAFETY: the borrow it is made from outlasts every write to it: its
-// request ends before `RangeReader::read` returns.
+// request ends before `Reader::read_at` returns.
 unsafe impl Destination for Borrowed {
     fn region(&self) -> (NonNull<u8>, usize) {
         (self.0, self.1)
     }
 }
 
-impl io::Read for RangeReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let length = usize::try_from(self.remaining).map_or(buffer.len(), |left| left.min(buffer.len()));
-        let Some(sink) = NonNull::new(buffer.as_mut_ptr()).filter(|_| length != 0) else {
-            return Ok(0);
-        };
-        let range = Range { offset: self.offset, length, into: Arc::new(Borrowed(sink, length)), at: 0 };
-        // SAFETY: `buffer` is the caller's, `length` writable bytes of it,
-        // touched by nothing else until the request ends (`wait`).
-        // An error keeps its kind and itself as the source.
-        let request = unsafe { self.reader.request(vec![range], Want::undated(0.)) }.map_err(|error| match error {
-            Error::Io(error) => error,
-            error => io::Error::other(error),
-        })?;
-        match request.wait() {
-            Ended::Read { failed } => {
-                if let Some((_, error)) = failed.into_iter().next() {
-                    let kind = match &*error {
-                        Error::Io(error) => error.kind(),
-                        _ => io::ErrorKind::Other,
-                    };
-                    return Err(io::Error::new(kind, error));
-                }
+/// An error as an I/O error, its kind kept where it is one.
+fn io_error(error: Error) -> io::Error {
+    match error {
+        Error::Io(error) => error,
+        error => io::Error::other(error),
+    }
+}
+
+/// A request's end as the first of its reads' errors, kind kept.
+fn ended(end: Ended) -> io::Result<()> {
+    match end {
+        Ended::Read { failed } => match failed.into_iter().next() {
+            Some((_, error)) => {
+                let kind = match &*error {
+                    Error::Io(error) => error.kind(),
+                    _ => io::ErrorKind::Other,
+                };
+                Err(io::Error::new(kind, error))
             }
-            Ended::Panicked(panic) => panic.resume(),
-        }
-        self.offset += length as u64;
-        self.remaining -= length as u64;
-        Ok(length)
+            None => Ok(()),
+        },
+        Ended::Panicked(panic) => panic.resume(),
     }
 }

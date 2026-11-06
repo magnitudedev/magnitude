@@ -7,9 +7,8 @@ use crate::{
     ValidatedImportLaunch, WeightStorageIdentity, native::AttestedImport,
 };
 use magnitude_kernels::{import_dense, packing_bound, repack_weight};
-use seismic_io::{Reader, CachePolicy};
+use seismic_io::{CachePolicy, Reader, Want};
 use seismic::{NativeKernel, NativeTensorBatch, Tensor};
-use std::io::Read;
 
 pub struct NativeImportProgram {
     identity: WeightStorageIdentity,
@@ -80,11 +79,12 @@ impl ImportProgram for NativeImportProgram {
 }
 
 /// Write a staged upload from its stored source, the one way every import
-/// does: host-prepared bytes whole, a weight uploaded as stored through the
-/// device's reader upload, which holds no more of it on the host than one
-/// block at a time. `policy` says how the stored range is read: through the
-/// file cache as a resident load imports, or around it as a streamed load
-/// reads its experts, so none of its pages stay cached.
+/// does: one stream of the stored range on its volume's link
+/// (`seismic_io::Reader::stream`, a load's: no deadline), each chunk written
+/// into the upload as it lands, or, where the host prepares the bytes, the
+/// range gathered whole and transformed. `policy` says how the stored range
+/// is read: through the file cache as a resident load imports, or around it
+/// as a streamed load reads its experts, so none of its pages stay cached.
 pub(crate) fn fill_staged_source(
     stored: &Stored,
     plan: &crate::WeightPlan,
@@ -93,60 +93,31 @@ pub(crate) fn fill_staged_source(
 ) -> Result<(), SubmitError> {
     let transfer = |error: String| SubmitError::Device(DeviceError::Transfer(error));
     let (source, offset, length) = stored.file_range();
-    let uncached;
-    let mut range: Box<dyn Read + '_> = match policy {
-        CachePolicy::Cached => {
-            Box::new(source.range(offset, length).map_err(|error| transfer(error.to_string()))?)
-        }
-        CachePolicy::Uncached => {
-            uncached = Reader::of(&**source, CachePolicy::Uncached)
-                .map_err(|error| transfer(error.to_string()))?;
-            Box::new(uncached.range(offset, length))
-        }
+    let uncached = match policy {
+        CachePolicy::Cached => None,
+        CachePolicy::Uncached => Some(Reader::of(&**source, CachePolicy::Uncached).map_err(|error| transfer(error.to_string()))?),
+    };
+    let stream = |sink: &mut dyn FnMut(u64, &[u8]) -> std::io::Result<()>| match &uncached {
+        None => source.stream(offset, length, Want::undated(0.), sink),
+        Some(reader) => reader.stream(offset, length, Want::undated(0.), sink),
     };
     if plan.host_prepared() {
-        let bytes = read_stored(&mut range, length)?;
-        let bytes = crate::import_transforms::upload_bytes(plan, stored, bytes)
-            .map_err(transfer)?;
+        let length = usize::try_from(length).map_err(|_| transfer("stored tensor exceeds the host address range".into()))?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|error| transfer(format!("stored tensor of {length} bytes: {error}")))?;
+        stream(&mut |_, chunk| Ok(bytes.extend_from_slice(chunk))).map_err(|error| transfer(error.to_string()))?;
+        let bytes = crate::import_transforms::upload_bytes(plan, stored, bytes).map_err(transfer)?;
         if upload.byte_len() != bytes.len() as u64 {
-            return Err(transfer(
-                "transformed source byte length differs from its tensor".into(),
-            ));
+            return Err(transfer("transformed source byte length differs from its tensor".into()));
         }
-        return upload
-            .write_from_host(&bytes)
-            .map_err(|error| transfer(error.to_string()));
+        return upload.write_from_host(&bytes).map_err(|error| transfer(error.to_string()));
     }
     if upload.byte_len() != length {
-        return Err(transfer(
-            "staged source byte length differs from its tensor".into(),
-        ));
+        return Err(transfer("staged source byte length differs from its tensor".into()));
     }
-    upload
-        .write_from_reader(&mut range)
-        .map_err(|error| transfer(error.to_string()))
-}
-
-/// The `length` bytes of a stored range, read whole from `range` into a
-/// buffer of exactly that capacity: a range that ends short, or runs on,
-/// fails.
-fn read_stored(range: &mut dyn Read, length: u64) -> Result<Vec<u8>, SubmitError> {
-    let transfer = |error: String| SubmitError::Device(DeviceError::Transfer(error));
-    let length = usize::try_from(length)
-        .map_err(|_| transfer("stored tensor exceeds the host address range".into()))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(length)
-        .map_err(|error| transfer(format!("stored tensor of {length} bytes: {error}")))?;
-    let read = range
-        .read_to_end(&mut bytes)
-        .map_err(|error| transfer(error.to_string()))?;
-    if read != length {
-        return Err(transfer(format!(
-            "stored tensor read {read} bytes of its {length}"
-        )));
-    }
-    Ok(bytes)
+    upload.write_chunks(|write| stream(write)).map_err(|error| transfer(error.to_string()))
 }
 
 /// The artifact bytes of one stored source tensor.
@@ -310,21 +281,6 @@ fn shaped(tensor: &Tensor, view: &[u64; 3], role: &str) -> Result<Tensor, Submit
 mod tests {
     use super::*;
     use seismic::{BackendName, Element};
-
-    /// A stored range is read whole or not at all: a reader that ends short
-    /// fails, and a length no allocation can hold reports the allocation's
-    /// refusal, not the address range.
-    #[test]
-    fn a_stored_range_is_read_exactly() {
-        let detail = |result: Result<Vec<u8>, SubmitError>| match result {
-            Err(SubmitError::Device(DeviceError::Transfer(detail))) => detail,
-            other => panic!("expected a transfer error, got {other:?}"),
-        };
-        assert_eq!(read_stored(&mut &[1u8, 2, 3][..], 3).unwrap(), [1, 2, 3]);
-        assert!(detail(read_stored(&mut &[1u8, 2, 3][..], 4)).contains("read 3 bytes of its 4"));
-        let refused = Vec::<u8>::new().try_reserve_exact(usize::MAX).unwrap_err();
-        assert!(detail(read_stored(&mut &[0u8; 0][..], usize::MAX as u64)).contains(&refused.to_string()));
-    }
 
     #[test]
     fn staged_source_streams_the_exact_file_range() {

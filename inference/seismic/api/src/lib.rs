@@ -1585,11 +1585,16 @@ impl Tensor {
     pub fn write_from_host(&mut self, bytes: &[u8]) -> Result<(), TensorError> {
         self.inner.write_from_host(bytes)
     }
-    /// Fill all physical bytes of a canonical upload tensor from `reader`
-    /// with bounded scratch, rather than materializing a second whole tensor.
-    /// On error the tensor is only partly initialized and must not be used.
-    pub fn write_from_reader(&mut self, reader: &mut dyn std::io::Read) -> Result<(), TensorError> {
-        self.inner.write_from_reader(reader)
+    /// Write a canonical upload tensor's physical bytes in place as `fill`
+    /// hands them over, each chunk at its byte offset, holding the tensor's
+    /// host access until `fill` returns: never a second whole tensor on the
+    /// host. Covering every byte is `fill`'s to do; on error the tensor is
+    /// only partly initialized and must not be used.
+    pub fn write_chunks(
+        &mut self,
+        fill: impl FnOnce(&mut dyn FnMut(u64, &[u8]) -> std::io::Result<()>) -> std::io::Result<()>,
+    ) -> Result<(), TensorError> {
+        self.inner.write_chunks(fill)
     }
     pub fn device(&self) -> Device {
         Device {

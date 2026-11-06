@@ -64,9 +64,18 @@ impl Drop for MappedWindow {
 ///
 /// Reads remain attached to this open file if its pathname is later replaced.
 /// Callers must keep the file's contents unchanged while this source is in use.
-#[derive(Debug)]
+///
+/// Every read of it is a request of its volume's link
+/// (`seismic_io::Reader`), through the file cache.
 pub struct FileSource {
     opened: seismic_io::OpenFile,
+    reader: seismic_io::Reader,
+}
+
+impl std::fmt::Debug for FileSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("FileSource").field("path", &self.path()).finish()
+    }
 }
 
 impl FileSource {
@@ -75,7 +84,9 @@ impl FileSource {
     /// links, and a split GGUF finds its shards by that name.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
         // Its reads fill the cache with the ranges they name, no more.
-        Ok(Self { opened: seismic_io::OpenFile::open(path)? })
+        let opened = seismic_io::OpenFile::open(path)?;
+        let reader = seismic_io::Reader::of(&opened, seismic_io::CachePolicy::Cached)?;
+        Ok(Self { opened, reader })
     }
 
     pub fn size(&self) -> u64 {
@@ -158,7 +169,19 @@ impl FileSource {
         if end > self.size() {
             return Err(Error::Invalid("read outside artifact".into()));
         }
-        Ok(self.opened.read_exact_at(offset, out)?)
+        // A caller waits on the bytes: due now.
+        Ok(self.reader.read_at([(offset, out)], seismic_io::Want::now())?)
+    }
+
+    /// Read each of `reads`' buffers from its offset, as one request a caller
+    /// waits on (`seismic_io::Reader::read_at`): the link reads them at its
+    /// depth, not one after another. Each lies inside the artifact.
+    pub fn read_each<'a>(&self, reads: impl IntoIterator<Item = (u64, &'a mut [u8])>) -> Result<(), Error> {
+        let reads = reads.into_iter().collect::<Vec<_>>();
+        if reads.iter().any(|(offset, out)| offset.checked_add(out.len() as u64).is_none_or(|end| end > self.size())) {
+            return Err(Error::Invalid("read outside artifact".into()));
+        }
+        Ok(self.reader.read_at(reads, seismic_io::Want::now())?)
     }
 
     pub fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>, Error> {
@@ -183,48 +206,21 @@ impl FileSource {
         }
     }
 
-    /// A reader of the `length` bytes from `offset`, whose pages the cache
-    /// reads ahead of the reads as one range (on Linux, `POSIX_FADV_WILLNEED`
-    /// over exactly it): the file reads ahead of no range on its own
-    /// ([`FileSource::open`]), so a range read whole asks for all of it. An
-    /// empty range asks for nothing.
-    pub fn range(&self, offset: u64, length: u64) -> Result<io::Take<SourceReader<'_>>, Error> {
-        offset
-            .checked_add(length)
-            .filter(|end| *end <= self.size())
-            .ok_or_else(|| Error::Invalid("read outside artifact".into()))?;
-        if let Some(length) = std::num::NonZeroU64::new(length) {
-            self.will_need(offset, length)?;
+    /// Read the `length` bytes from `offset` in order for `want`, handing
+    /// each chunk to `sink` with its offset in the
+    /// range as it lands (`seismic_io::Reader::stream`): the link reads the
+    /// range at its depth, through the cache, and no more of the file.
+    pub fn stream<E: From<io::Error>>(
+        &self,
+        offset: u64,
+        length: u64,
+        want: seismic_io::Want,
+        sink: impl FnMut(u64, &[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if offset.checked_add(length).is_none_or(|end| end > self.size()) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "read outside artifact").into());
         }
-        Ok(SourceReader {
-            source: self,
-            offset,
-        }
-        .take(length))
-    }
-
-    /// Ask the cache to read the `length` bytes from `offset` ahead. Never
-    /// empty: advice of length zero means "to the end of the file".
-    #[cfg(target_os = "linux")]
-    fn will_need(&self, offset: u64, length: std::num::NonZeroU64) -> Result<(), Error> {
-        let (start, count) = (libc::off_t::try_from(offset), libc::off_t::try_from(length.get()));
-        let (Ok(start), Ok(count)) = (start, count) else {
-            return Err(Error::Invalid("artifact range exceeds the host file domain".into()));
-        };
-        // SAFETY: advice on a range of a descriptor this source owns.
-        let advised = unsafe {
-            libc::posix_fadvise(self.file().as_raw_fd(), start, count, libc::POSIX_FADV_WILLNEED)
-        };
-        if advised != 0 {
-            return Err(io::Error::from_raw_os_error(advised).into());
-        }
-        Ok(())
-    }
-
-    /// The platform reads ahead as reads go.
-    #[cfg(not(target_os = "linux"))]
-    fn will_need(&self, _offset: u64, _length: std::num::NonZeroU64) -> Result<(), Error> {
-        Ok(())
+        self.reader.stream(offset, length, want, sink)
     }
 }
 

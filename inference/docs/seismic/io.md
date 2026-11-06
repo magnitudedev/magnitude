@@ -40,7 +40,7 @@
 
 ## What it doesn't own
 
-- **Formats and sources.** Formats stay in `magnitude-artifacts`. Its `FileSource` holds an `OpenFile` and reads its cached ranges through it (`OpenFile::read_exact_at`), synchronously on the caller's thread and outside the scheduler, so they don't appear in any volume's accounting. Mmap windows serve resident loads.
+- **Formats and sources.** Formats stay in `magnitude-artifacts`. Its `FileSource` reads every cached range as a request of its volume's link (`Reader::read_at`, due now: a header, a host table's rows as one request), and streams a whole stored range (`Reader::stream`: no deadline, half-knee requests three at a time, each chunk handed on as it lands) into an import's upload, so every read appears in its volume's accounting. Mmap windows serve resident loads; their faults are the device's, not the link's.
 - **Where storage measurements are stored**, and how assessment prices reads. The executor's assessment persists the probe's curve.
 - **Policy over what to read.** Why a unit moves, its deadline and value, residency and prediction belong to the engine; the link sees deadlines, values and bytes, never "hint" or "load".
 - **The copy engine.** Host-to-device copies are a separate link owned by the runtime, and they get their own contract alongside the runtime's per-queue timeline.

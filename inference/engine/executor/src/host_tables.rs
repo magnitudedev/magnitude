@@ -144,7 +144,8 @@ impl HostTable {
     }
 
     /// Copy the source bytes of `rows` (table row indices, one per batch
-    /// row, in batch order) into `out`, which holds exactly that many rows.
+    /// row, in batch order) into `out`, which holds exactly that many rows,
+    /// as one read of them all.
     pub fn gather(&self, rows: &[i64], out: &mut [u8]) -> Result<(), HostTableError> {
         let expected = rows.len() * self.row_bytes;
         if out.len() != expected {
@@ -153,13 +154,14 @@ impl HostTable {
                 actual: out.len(),
             });
         }
-        for (&row, destination) in rows.iter().zip(out.chunks_exact_mut(self.row_bytes)) {
-            let index = self.row_index(row)?;
-            self.file
-                .read_into(self.offset + index * self.row_bytes as u64, destination)
-                .map_err(HostTableError::Read)?;
-        }
-        Ok(())
+        let offsets = rows
+            .iter()
+            .map(|&row| Ok(self.offset + self.row_index(row)? * self.row_bytes as u64))
+            .collect::<Result<Vec<_>, HostTableError>>()?;
+        // One request of every row, which the link reads at its depth.
+        self.file
+            .read_each(offsets.into_iter().zip(out.chunks_exact_mut(self.row_bytes)))
+            .map_err(HostTableError::Read)
     }
 }
 

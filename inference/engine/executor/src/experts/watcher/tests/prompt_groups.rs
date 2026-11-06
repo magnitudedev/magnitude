@@ -58,25 +58,6 @@ fn a_conveyors_records_cycle_as_rounds_convert() {
     }
 }
 
-/// A reader that holds its tensor's host access from its first read until
-/// released: what keeps a transfer into the tensor from being issued, as a
-/// device's queue full behind a parked step keeps one waiting in the driver.
-struct Holding {
-    held: Option<std::sync::mpsc::Sender<()>>,
-    release: std::sync::mpsc::Receiver<()>,
-}
-
-impl std::io::Read for Holding {
-    fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(held) = self.held.take() {
-            held.send(()).unwrap();
-            self.release.recv().unwrap();
-        }
-        into.fill(0);
-        Ok(into.len())
-    }
-}
-
 /// A scratch round's answer is host work into host memory alone: a cold
 /// expert the host tier keeps whole is answered by naming its tier record
 /// in the tier list, which the device's tier copy reads after round 0, so
@@ -94,7 +75,18 @@ fn a_rounds_answer_needs_no_transfer() {
     let (release, released) = std::sync::mpsc::channel();
     let writer = {
         let mut slots = harness.scratch[0].clone();
-        std::thread::spawn(move || slots.write_from_reader(&mut Holding { held: Some(held), release: released }).unwrap())
+        // Its host access held from the upload's start until released: what
+        // keeps a transfer into the slots from being issued, as a device's
+        // queue full behind a parked step keeps one waiting in the driver.
+        std::thread::spawn(move || {
+            slots
+                .write_chunks(|_| {
+                    held.send(()).unwrap();
+                    released.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap()
+        })
     };
     holding.recv().unwrap();
     let decode = harness.step();

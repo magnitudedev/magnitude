@@ -980,7 +980,6 @@ pub mod tensor {
     use seismic_lang::ids::RepresentationId;
     use seismic_lang::registry::representation_info;
     use seismic_topology::Contract;
-    use std::io::Read;
     use std::sync::{
         atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
@@ -2475,13 +2474,20 @@ pub mod tensor {
             Ok(())
         }
 
-        /// Fill the physical bytes of a canonical, contiguous tensor from a
-        /// reader using bounded scratch. Intended for complete upload inputs;
-        /// an error leaves the tensor only partly initialized.
-        pub fn write_from_reader(&self, reader: &mut dyn Read) -> Result<(), TensorError> {
+        /// Write a canonical, contiguous tensor's physical bytes in place as
+        /// `fill` hands them over, chunk by chunk, each at its byte offset
+        /// into the tensor, holding its host access until `fill` returns: a
+        /// whole upload filled as a stream lands, never held on the host at
+        /// once. A chunk outside the tensor fails `fill`'s write; covering
+        /// every byte is `fill`'s to do, and on error the tensor is only
+        /// partly initialized.
+        pub fn write_chunks(
+            &self,
+            fill: impl FnOnce(&mut dyn FnMut(u64, &[u8]) -> std::io::Result<()>) -> std::io::Result<()>,
+        ) -> Result<(), TensorError> {
             if self.slabs.is_some() {
                 return Err(TensorError::SlabLayout(
-                    "reader upload requires one contiguous allocation".into(),
+                    "a chunked upload requires one contiguous allocation".into(),
                 ));
             }
             if self.allocation.storage().read_only() {
@@ -2490,27 +2496,26 @@ pub mod tensor {
             let canonical = crate::layout::canonical(self.representation, &self.extents)?;
             if self.strides != canonical.strides || self.byte_len != canonical.byte_len {
                 return Err(TensorError::HostRegion(
-                    "reader requires a canonical contiguous tensor".into(),
+                    "a chunked upload requires a canonical contiguous tensor".into(),
                 ));
             }
             let _guard = self.allocation.acquire(true)?;
             self.backed()?;
-            // On the heap: a 1 MiB array would fill a whole Windows main-thread stack.
-            let mut scratch = vec![0u8; 1024 * 1024];
-            let mut written = 0u64;
-            while written < self.byte_len {
-                let count = usize::try_from((self.byte_len - written).min(scratch.len() as u64))
-                    .expect("chunk fits usize");
-                reader
-                    .read_exact(&mut scratch[..count])
-                    .map_err(|error| TensorError::HostIo(error.to_string()))?;
-                let offset = self.byte_offset.checked_add(written).ok_or_else(|| {
-                    TensorError::HostRegion("reader write offset overflows".into())
-                })?;
-                self.allocation.storage().write(offset, &scratch[..count])?;
-                written += count as u64;
-            }
-            Ok(())
+            let mut write = |at: u64, bytes: &[u8]| -> std::io::Result<()> {
+                let end = at.checked_add(bytes.len() as u64).filter(|end| *end <= self.byte_len);
+                if end.is_none() {
+                    return Err(std::io::Error::other(format!(
+                        "a chunk of {} bytes at {at} of a tensor of {}",
+                        bytes.len(),
+                        self.byte_len
+                    )));
+                }
+                self.allocation
+                    .storage()
+                    .write(self.byte_offset + at, bytes)
+                    .map_err(std::io::Error::other)
+            };
+            fill(&mut write).map_err(|error| TensorError::HostIo(error.to_string()))
         }
         pub fn device(&self) -> &Arc<DeviceInner> {
             &self.device
@@ -2760,36 +2765,29 @@ pub mod tensor {
     }
 
     #[cfg(test)]
-    mod reader_tests {
+    mod chunk_tests {
         use super::TensorInner;
         use std::sync::Arc;
         use seismic_lang::registry;
         use seismic_lang::types::DType;
 
-        /// A reader upload runs on a Windows main thread (1 MiB of stack) in a
-        /// model's Prepare; it must not need a stack of its own size.
+        /// A chunked upload lands each chunk at its offset, whatever order
+        /// they come in, and refuses one past the tensor.
         #[test]
-        fn reader_upload_fits_a_small_thread_stack() {
-            std::thread::Builder::new()
-                .stack_size(256 * 1024)
-                .spawn(|| {
-                    let devices = crate::devices::Devices::discover(&[]).unwrap();
-                    let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
-                    let count = 3 * 1024 * 1024 / 4 + 5;
-                    let tensor = TensorInner::from_host(
-                        &device,
-                        registry::dense(DType::F32),
-                        &[count],
-                        &vec![0; count as usize * 4],
-                    )
-                    .unwrap();
-                    let bytes = (0..count * 4).map(|i| i as u8).collect::<Vec<_>>();
-                    tensor.write_from_reader(&mut bytes.as_slice()).unwrap();
-                    assert_eq!(tensor.read_to_host().unwrap(), bytes);
-                })
-                .unwrap()
-                .join()
-                .unwrap();
+        fn a_chunked_upload_lands_each_chunk_at_its_offset() {
+            let devices = crate::devices::Devices::discover(&[]).unwrap();
+            let device = devices.open_backend(registry::BackendName::Cpu).unwrap();
+            let count = 3 * 1024 * 1024 / 4 + 5;
+            let tensor = TensorInner::from_host(&device, registry::dense(DType::F32), &[count], &vec![0; count as usize * 4]).unwrap();
+            let bytes = (0..count * 4).map(|i| i as u8).collect::<Vec<_>>();
+            let half = bytes.len() / 2;
+            tensor.write_chunks(|write| {
+                write(half as u64, &bytes[half..])?;
+                write(0, &bytes[..half])
+            })
+            .unwrap();
+            assert_eq!(tensor.read_to_host().unwrap(), bytes);
+            assert!(tensor.write_chunks(|write| write(1, &bytes)).is_err());
         }
 
         /// Views formed per run of the same records bind the one table their

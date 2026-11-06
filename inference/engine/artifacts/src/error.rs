@@ -94,6 +94,15 @@ impl From<seismic_io::OpenError> for Error {
     }
 }
 
+impl From<seismic_io::Error> for Error {
+    fn from(error: seismic_io::Error) -> Self {
+        match error {
+            seismic_io::Error::Io(error) => Self::Io(error),
+            error => Self::Io(io::Error::other(error)),
+        }
+    }
+}
+
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
