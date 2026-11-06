@@ -881,8 +881,8 @@ pub(crate) fn build(
     )
     .map_err(internal)?;
     domain
-        .register_allocated_holdings()
-        .map_err(|error| internal(format!("register allocated memory holdings: {error}")))?;
+        .refresh_memory()
+        .map_err(|error| internal(format!("read the allocated memory's charge: {error}")))?;
     report_load_phase("state and domain allocation", &mut phase_started);
     report_load_memory("domain allocated", &catalog, &device);
     // A drafter that keeps its own history is primed by the warm-up; a draft

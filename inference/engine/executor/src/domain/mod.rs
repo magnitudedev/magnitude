@@ -6,7 +6,7 @@ use crate::batching::{
     Demand, Draw, DrawKind, Row, RowHistory, Select, Shaping as RowShaping, Slot,
     ValidatedTargetBatch,
 };
-use crate::memory::{ClaimId, HoldingClass, HoldingId, MemoryHeap};
+use crate::memory::{ClaimId, HoldingClass, MemoryHeap};
 use crate::platform::{DomainReading, DomainRole, DomainThresholds, MemoryBand};
 use crate::programs::{Chain, ProgramSubmission};
 use crate::programs::graph::readout;
@@ -558,9 +558,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     domain: ResourceDomain,
     /// The device's heap, carried over from the startup claims.
     memory: RefCell<DeviceHeap>,
-    /// The one holding of everything the load holds beside its claims
-    /// ([`Self::classify_memory`]).
-    holding: Option<HoldingId>,
     target_store: Rc<StateStore>,
     head_store: Option<Rc<StateStore>>,
     family: F,
@@ -1046,9 +1043,6 @@ struct MemoryPace {
 struct DomainPace {
     role: DomainRole,
     headroom: u64,
-    /// What of the headroom can be taken without displacing any more of
-    /// another program's data (`DomainReading::free_headroom_bytes`).
-    free_headroom: u64,
     /// The planning and emergency reserves: the line a load reads Reclaim
     /// at, and the headroom it must not run into.
     thresholds: DomainThresholds,
@@ -1216,7 +1210,6 @@ impl MemoryPace {
                 DomainPace {
                     role: reading.role,
                     headroom: reading.headroom_bytes,
-                    free_headroom: reading.free_headroom_bytes,
                     thresholds: reading.thresholds,
                     charged,
                     band: reading.band,
@@ -1238,26 +1231,19 @@ impl MemoryPace {
     /// next shrink takes effect, less what the witness has yet to drop and
     /// the charge dropped since this one. Only a release charged in a domain
     /// lifts its deficit, so each holding shrinks by its own domain's; a
-    /// domain no probe observed is above. In distress above the line, the
-    /// host shows it is not absorbing what the load displaces: the reading
-    /// is its free headroom, which leaves out what was displaced since the
-    /// load began to serve (`HostRoom::Obtainable`).
+    /// domain no probe observed is above. In distress above the line nothing
+    /// it holds is short: a release would only buy what no measure says is
+    /// owed, its reading already leaving out what was displaced since the
+    /// load began to serve (`HostRoom::Load`).
     fn shortfall(&self, store: seismic::StoreId, charged: u64) -> Shortfall {
         let Some(pace) = self.domains.get(&store) else {
             return Shortfall::Above;
         };
-        let planning = pace.thresholds.planning_bytes;
-        let below = match (planning.saturating_sub(pace.headroom), pace.band) {
+        let below = match (pace.thresholds.planning_bytes.saturating_sub(pace.headroom), pace.band) {
             (0, MemoryBand::Normal) => return Shortfall::Above,
-            (0, MemoryBand::Reclaim) => planning.saturating_sub(pace.free_headroom),
+            (0, MemoryBand::Reclaim) => return Shortfall::Covered,
             (below, _) => below,
         };
-        if below == 0 {
-            // In distress with free headroom above the line, nothing it holds
-            // is short, and a release would only buy what no measure says is
-            // owed.
-            return Shortfall::Covered;
-        }
         let released = pace.unseen + pace.charged.saturating_sub(charged);
         match projected(below, pace.rate, self.horizon()).saturating_sub(released) {
             0 => Shortfall::Covered,
@@ -1272,7 +1258,7 @@ impl MemoryPace {
     fn growth_room(&self, store: seismic::StoreId) -> Option<(u64, u64)> {
         self.domains
             .get(&store)
-            .map(|pace| (pace.thresholds.ceiling(pace.free_headroom).saturating_sub(pace.fluctuation.largest), pace.fluctuation.largest))
+            .map(|pace| (pace.thresholds.ceiling(pace.headroom).saturating_sub(pace.fluctuation.largest), pace.fluctuation.largest))
     }
 
     /// `store`'s available memory's fluctuation at the latest probe, which a
@@ -1336,23 +1322,6 @@ impl ExecutorDomain<NativeFamily> {
     /// whose experts are held whole.
     pub fn experts_held(&self) -> Option<Vec<Vec<usize>>> {
         self.family.experts_held()
-    }
-
-    /// Classify the allocations that are already physically committed before
-    /// any request reservation begins. The byte total comes from the actual
-    /// graph pools and state stores; Seismic remains the charge authority.
-    /// The holding is classified as every observation classifies it
-    /// ([`Self::refresh_memory`]).
-    pub fn register_allocated_holdings(&mut self) -> Result<HoldingId, String> {
-        let holding = self
-            .memory
-            .borrow_mut()
-            .heap_mut()
-            .insert(0, HoldingClass::Model)
-            .map_err(|error| format!("memory holding rejected: {error:?}"))?;
-        self.holding = Some(holding);
-        self.refresh_memory().map_err(|error| error.to_string())?;
-        Ok(holding)
     }
 
     pub fn new(
@@ -1434,63 +1403,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .is_some_and(|head| head.history == magnitude_family_contracts::HeadHistory::Target)
     }
 
-    /// Every byte the domain's holding classifies ([`Self::classify_memory`]):
-    /// the static storage's ([`Self::static_bytes`]) and the optional
-    /// components' ([`Self::optional_bytes`]), read together.
-    fn holding_bytes(&self) -> Result<u64, String> {
-        self.static_bytes()?
-            .checked_add(self.optional_bytes()?)
-            .ok_or_else(|| "memory holding byte count overflow".to_owned())
-    }
-
-    /// Every byte that remains resident as part of the model's static
-    /// footprint.
-    fn static_bytes(&self) -> Result<u64, String> {
-        let mut bytes = self
-            .resources
-            .committed_bytes()
-            .map_err(|error| error.to_owned())?;
-        bytes = bytes
-            .checked_add(self.target_store.committed_bytes())
-            .ok_or_else(|| "static holding byte count overflow".to_owned())?;
-        if let Some(store) = &self.head_store {
-            bytes = bytes
-                .checked_add(store.committed_bytes())
-                .ok_or_else(|| "static holding byte count overflow".to_owned())?;
-        }
-        bytes = bytes
-            .checked_add(
-                self.target_store
-                    .external_pinned_bytes()
-                    .map_err(|error| error.to_string())?,
-            )
-            .ok_or_else(|| "static holding byte count overflow".to_owned())?;
-        if let Some(store) = &self.head_store {
-            bytes = bytes
-                .checked_add(
-                    store
-                        .external_pinned_bytes()
-                        .map_err(|error| error.to_string())?,
-                )
-                .ok_or_else(|| "static holding byte count overflow".to_owned())?;
-        }
-        // What the device's graph budget charges, which its ledgers count.
-        let device = self.domain.device();
-        let graphs = device.graph_cost().bytes(device.graph_budget()).ok_or("graph budget charge overflows")?;
-        for charge in [
-            self.family.target_weight_bytes()?,
-            self.family.prepared_program_bytes(),
-            self.family.target_constant_bytes()?,
-            graphs.device,
-            graphs.upload,
-        ] {
-            bytes = bytes
-                .checked_add(charge)
-                .ok_or_else(|| "static holding byte count overflow".to_owned())?;
-        }
-        Ok(bytes)
-    }
-
     /// The head's own resident weights: the imports its loader brought into
     /// the residency cache it inherits from the target, as imported
     /// (`ComponentLoader::own_bytes`), none of the target's it found there.
@@ -1502,29 +1414,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
-    /// The optional components' storage: the head's own resident weights,
-    /// the projector's, and their bound graph constants.
-    fn optional_bytes(&self) -> Result<u64, String> {
-        let head_weights = self.head_weight_bytes()?;
-        let vision_weights = self
-            .vision_loader
-            .as_ref()
-            .map(|loader| loader.own_bytes())
-            .transpose()?
-            .unwrap_or(0);
-        let bound_constants = self.family.optional_constant_bytes()?;
-        head_weights
-            .checked_add(vision_weights)
-            .and_then(|weights| weights.checked_add(bound_constants))
-            .ok_or_else(|| "optional component byte count overflow".to_owned())
-    }
-
     /// Observe every domain the device uses from a reading taken now, set
     /// Seismic's allocation ceiling from the readings, and refresh the
     /// heap's view of the charge ([`Self::refresh_memory`]): a memory
     /// probe's, and what waits on memory another process frees. Seismic
-    /// remains the physical charge authority; the heap only classifies
-    /// ownership and issues claims. A failed observation revokes unspent
+    /// remains the physical charge authority; the heap only keeps the
+    /// claims. A failed observation revokes unspent
     /// grants and leaves the heap Blind.
     pub fn observe_memory(&self) -> Result<Vec<DomainReading>, DomainError> {
         let _rises = self.family.expert_bank().map(|bank| bank.hold_rises());
@@ -1533,7 +1428,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .borrow_mut()
             .refresh()
             .map_err(|error| DomainError::Blind(error.to_string()))?;
-        self.classify_memory()?;
+        self.settle_growth_claim()?;
         Ok(readings)
     }
 
@@ -1546,42 +1441,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.refreshes.set(self.refreshes.get() + 1);
         let _rises = self.family.expert_bank().map(|bank| bank.hold_rises());
         self.memory.borrow_mut().account();
-        self.classify_memory()
+        self.settle_growth_claim()
     }
 
-    /// Classify the charge just read by the growth's claim and the one
-    /// holding of everything else the load holds ([`Self::holding_bytes`]).
-    ///
-    /// Every byte of the holding is read here, in one pass after the charge,
-    /// so no part of it stands from an earlier reading: after a release on
-    /// this thread (a prompt group's buffers and stagings dropped, an
-    /// optional component unloaded) the holding reads nothing the charge no
-    /// longer holds. Off this thread, the expert bank holds every rise of
-    /// its charge (`ElasticBank::hold_rises`) while the charge and its
-    /// classification are read; what remains off it is a release (an expert
-    /// bank shrink's, once the device work before it completes; idle graph
-    /// slots'; an allocation an outside view retained), which the holding
-    /// stops reading no later than the charge stops holding it. So the
-    /// holding is never classified above the charge it is read against, and
-    /// one that is breaks an invariant.
-    fn classify_memory(&self) -> Result<(), DomainError> {
-        // In the heap a running growth's bytes are counted once: what it backed is in the
-        // charge just read, so its claim holds only the rest, read under the same hold of the
-        // bank's rises.
+    /// Take what a running growth backed out of its claim: the charge just
+    /// read holds those bytes, so the claim holds only the rest, read under
+    /// the same hold of the bank's rises ([`ElasticBank::hold_rises`]), so a
+    /// growth's bytes are counted once. The load's holding itself is the
+    /// device's charge, which Seismic keeps; nothing here counts it again.
+    fn settle_growth_claim(&self) -> Result<(), DomainError> {
         if let (Some(claim), Some(bank)) = (&self.bank_claim, self.family.expert_bank()) {
             let rest = claim.bytes.saturating_sub(bank.growth_backed(claim.kind)?);
             self.memory
                 .borrow_mut()
                 .reduce_reserved(claim.id, claim.kind, rest)
                 .map_err(|error| DomainError::invariant(format!("a growth's claim: {error:?}")))?;
-        }
-        if let Some(holding) = self.holding {
-            let bytes = self.holding_bytes().map_err(DomainError::invariant)?;
-            self.memory
-                .borrow_mut()
-                .heap_mut()
-                .resize(holding, bytes)
-                .map_err(|error| DomainError::invariant(format!("the memory holding exceeds the charge it is read against: {error:?}")))?;
         }
         Ok(())
     }
@@ -2371,7 +2245,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resources,
             domain: ResourceDomain::new(id, memory.device().clone()),
             memory: RefCell::new(memory),
-            holding: None,
             target_store: Rc::clone(&target_state),
             head_store: head_state.as_ref().map(|state| Rc::clone(state)),
             family,

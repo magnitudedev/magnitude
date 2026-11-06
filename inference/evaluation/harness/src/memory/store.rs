@@ -26,7 +26,7 @@ pub struct Target {
     device: Device,
     store: StoreId,
     /// Host RAM's room as the pressed load reads it while it serves
-    /// (`HostRoom::Obtainable`), its free headroom what the host can give
+    /// (`HostRoom::Load`), its free headroom what the host can give
     /// without displacing more of other programs' data than it held
     /// displaced as this target opened, before the approach, the load
     /// serving already. Read as allocatable alone, RAM the host freed by
@@ -64,7 +64,7 @@ impl Target {
         let reading = self.reading()?;
         // `name`: as the owner's memory readings name the store.
         Ok(json!({ "store": reading.identity, "name": format!("{:?}", reading.identity), "headroom_bytes": reading.headroom_bytes,
-            "ceiling_bytes": reading.ceiling_bytes, "growth_ceiling_bytes": reading.thresholds.ceiling(reading.free_headroom_bytes), "planning_bytes": reading.thresholds.planning_bytes,
+            "ceiling_bytes": reading.ceiling_bytes, "planning_bytes": reading.thresholds.planning_bytes,
             "band": format!("{:?}", reading.band) }))
     }
 

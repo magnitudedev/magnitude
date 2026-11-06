@@ -141,7 +141,7 @@ fn besides(demand: ClaimDemand, beside: u64) -> Result<ClaimDemand, ClaimRefusal
         device: demand
             .device
             .checked_add(beside)
-            .ok_or(ClaimRefusal::Accounting(MemoryError::HoldingOverflow))?,
+            .ok_or(ClaimRefusal::Accounting(MemoryError::Overflow))?,
         ..demand
     })
 }
@@ -187,15 +187,14 @@ pub struct DeviceHeap {
     /// for the model's lifetime and never counted as free page cache.
     host_table_bytes: u64,
     /// The host RAM room its band, claims and Seismic's limits read, and
-    /// its growth's: [`HostRoom::Obtainable`] from the load's opening on,
-    /// its growth's displacement counted from when it serves
-    /// ([`Self::serve`]).
+    /// its growth's: [`HostRoom::Load`] from the load's opening on, its
+    /// growth's displacement counted from when it serves ([`Self::serve`]).
     room: HostRoom,
 }
 
 impl DeviceHeap {
     /// The heap of `device`, observed once, for a load
-    /// ([`HostRoom::Obtainable`], accepting its own displacement). Its
+    /// ([`HostRoom::Load`], accepting its own displacement). Its
     /// capacity, the stable fit of the device's storage
     /// ([`MemoryObservation::capacity_bytes`]), is fixed here.
     pub fn open(
@@ -204,7 +203,7 @@ impl DeviceHeap {
         device: Rc<Device>,
     ) -> Result<Self, MemoryPolicyError> {
         let status = reading.status(&device);
-        let room = HostRoom::Obtainable(LoadStage::Loading);
+        let room = HostRoom::Load(LoadStage::Loading);
         let capacity_bytes = Fit::new(device.topology(), &status, &reserves, room)
             .storage_beside(device.info(), &CLAIMED, &[])?
             .stable_bytes;
@@ -224,8 +223,8 @@ impl DeviceHeap {
     /// The model has loaded: the displacement its load caused is accepted,
     /// and from now on its growth reads what can be taken without displacing
     /// any more of another program's data than is displaced now
-    /// ([`HostRoom::Obtainable`]). Its band and claims read the same room as
-    /// they did while it loaded.
+    /// ([`HostRoom::Load`]). Its band and claims read the same room as they
+    /// did while it loaded.
     pub fn serve(&mut self) -> Result<(), MemoryPolicyError> {
         let status = self.status();
         let host = status.sample.host_ram.as_ref().map_err(|error| MemoryPolicyError::Observation(error.clone()))?;
@@ -249,12 +248,6 @@ impl DeviceHeap {
 
     pub fn heap(&self) -> &MemoryHeap {
         &self.heap
-    }
-
-    /// The classified holdings. Callers add or resize a holding only after
-    /// the physical operation succeeded.
-    pub(crate) fn heap_mut(&mut self) -> &mut MemoryHeap {
-        &mut self.heap
     }
 
     /// The process's host RAM footprint now ([`StatusReading::footprint`]).
@@ -401,7 +394,7 @@ impl DeviceHeap {
         let (status, readings) = self.sample()?;
         let fits = |bytes: u64| -> Result<bool, ClaimRefusal> {
             let claim = besides(reserved(kind, bytes), beside)?;
-            Ok(self.refusal(&status, &readings, claim, 0, FitMode::Growth)?.is_none())
+            Ok(self.refusal(&status, &readings, claim, 0, FitMode::Live)?.is_none())
         };
         if !fits(0)? {
             return Ok(0);
@@ -435,7 +428,7 @@ impl DeviceHeap {
         self.host_table_bytes = self
             .host_table_bytes
             .checked_add(bytes)
-            .ok_or(ClaimRefusal::Accounting(MemoryError::HoldingOverflow))?;
+            .ok_or(ClaimRefusal::Accounting(MemoryError::Overflow))?;
         self.refresh().map_err(ClaimRefusal::Blind)?;
         Ok(())
     }
@@ -464,8 +457,8 @@ impl DeviceHeap {
     }
 
     /// Claim `bytes` a reservation of `kind` storage backs, the expert
-    /// bank's growth, once they fit in the free headroom its growth reads
-    /// ([`FitMode::Growth`]) with `beside` more device bytes, as
+    /// bank's growth, once they fit in the headroom ([`FitMode::Live`]) with
+    /// `beside` more device bytes, as
     /// [`Self::claim_demand`]: no block's free space serves them. Device
     /// storage's are fresh pages of the device's store; host storage's (a
     /// host tier's) host RAM.
@@ -476,7 +469,7 @@ impl DeviceHeap {
         beside: u64,
         class: HoldingClass,
     ) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_in(reserved(kind, bytes), beside, class, FitMode::Growth)
+        self.claim_in(reserved(kind, bytes), beside, class, FitMode::Live)
     }
 
     /// Claim `demand` once it fits with `beside` more device bytes, planned
@@ -647,7 +640,7 @@ mod tests {
         let catalog = Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
         assert_eq!(
-            require_normal(&catalog, &device, &MemoryReserves::standard(), HostRoom::Obtainable(LoadStage::Loading)),
+            require_normal(&catalog, &device, &MemoryReserves::standard(), HostRoom::Load(LoadStage::Loading)),
             Ok(())
         );
     }

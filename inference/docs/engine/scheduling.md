@@ -128,14 +128,18 @@ not unconditionally during logical admission. Capacity facts come from the share
 runtime resource domain, including retained model weights, state, and scratch.
 The memory stores are read fresh only by the owner's memory probes, a deficit's
 retry and claims; between them the heap follows the process's own charge in
-Seismic's ledgers, so a step reads nothing of the OS. A load reads host RAM in one room
-from its opening through serving (`HostRoom::Obtainable`): its band, its deficits and
-its claims read what the OS can make available, other programs' idle data included
-where the OS counts it (macOS), so a load that compressed other programs' data to fit
-serves on what it was admitted on. Growth (the expert bank's and a prompt group's
-places) reads only what can be taken without displacing more of other programs' data
-than was displaced as the load began to serve. Sustained swapping or thrashing is
-Reclaim at any headroom, owed what that undisplacing room is below the planning line.
+Seismic's ledgers, so a step reads nothing of the OS. Every host-RAM question reads one
+measure, what the OS gives without compressing or swapping another program's data
+(free, file-backed and purgeable pages): a load's admission, its band, its deficits and
+its claims (`HostRoom::Load`). So another program's ask that takes it to the planning line
+is answered by the load's releases, not by the OS displacing that program's data. The
+plan sizes the expert bank in the stable fit, the one room its assessment settles into
+too; what the moment leaves it is the running memory pace's, which settles the bank to it
+as the load serves.
+What the OS could obtain by compressing others is reported, never planned on.
+Growth (the expert bank's and a prompt group's places) also leaves out what the OS
+displaced of other programs' data since the load began to serve. Sustained swapping or
+thrashing is Reclaim at any headroom.
 Allocation denial keeps its typed required/available byte facts through model
 preparation; native failures without capacity evidence are not reclassified by
 matching diagnostic text. Reclamation and eviction report the observed decrease

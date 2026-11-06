@@ -33,7 +33,8 @@ pub struct SelectedDevice {
     pub identity: seismic::Identity,
     /// Device storage's stable fit: what its placement holds across its
     /// stores, each within process limits and grants, less its planning
-    /// reserve (`Fit::placement`).
+    /// reserve (`Fit::placement`). It is not a reading of the moment: the
+    /// bounds sealed into a load's graphs are derived from it.
     pub assessment_capacity_bytes: u64,
     /// How an expert bank's host tier is reserved on this device, where it
     /// has one, or why it has none ([`host_tier`]).
@@ -237,8 +238,8 @@ pub fn selected(
     info: Executor,
     graph_cost: GraphPricing,
 ) -> Result<SelectedDevice, MemoryPolicyError> {
-    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable);
-    let assessment_capacity_bytes = fit.placement(&info, Contract::DeviceOnly)?.stable_bytes;
+    let placement = Fit::new(topology, status, reserves, HostRoom::Allocatable).placement(&info, Contract::DeviceOnly)?;
+    let assessment_capacity_bytes = placement.stable_bytes;
     Ok(SelectedDevice {
         graph_cost,
         host_tier: host_tier(topology, &info),
@@ -275,11 +276,11 @@ pub fn open_selected(
     // A load opens the device: its first allocations are a load's, which
     // may take what the OS can obtain (`DeviceHeap::open` holds the device
     // to the same room until the load ends).
-    refresh_device_ceiling(&device, &status, &config.reserves, HostRoom::Obtainable(LoadStage::Loading))
+    refresh_device_ceiling(&device, &status, &config.reserves, HostRoom::Load(LoadStage::Loading))
         .map_err(PlatformError::Memory)?;
     let topology = device.topology();
     let host_ram = topology.host_ram().id();
-    let fit = Fit::new(topology, &status, &config.reserves, HostRoom::Obtainable(LoadStage::Loading));
+    let fit = Fit::new(topology, &status, &config.reserves, HostRoom::Load(LoadStage::Loading));
     let room = crate::TuningRoom {
         device_bytes: fit
             .placement(device.info(), Contract::DeviceOnly)

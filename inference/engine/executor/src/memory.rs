@@ -2,14 +2,11 @@
 //!
 //! This module consumes Seismic observations and produces typed decisions. It
 //! does not allocate device memory and it does not replace Seismic's byte
-//! ledger. Physical callers commit a holding only after the backend allocation
-//! succeeds; the holding is the engine's classification of that charged
-//! allocation.
+//! ledger: what the load holds is the device's own charge, read from Seismic,
+//! and nothing here keeps a second count of it. The heap keeps only what
+//! Seismic cannot know: the claims made before a fallible allocation.
 
 use std::collections::BTreeMap;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct HoldingId(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ClaimId(pub u64);
@@ -145,15 +142,8 @@ impl ClaimDemand {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Holding {
-    pub id: HoldingId,
-    pub bytes: u64,
-    pub class: HoldingClass,
-}
-
 /// One outstanding claim: what it demands until its physical operation's
-/// charge is classified or it is cancelled.
+/// charge has taken it ([`MemoryHeap::reduce_claim`]) or it is cancelled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryClaim {
     pub id: ClaimId,
@@ -162,33 +152,24 @@ pub struct MemoryClaim {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemoryStanding {
-    pub observation: MemoryObservation,
-    pub classified_bytes: u64,
-    pub unattributed_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryError {
     InvalidObservation,
-    UnknownHolding(HoldingId),
     UnknownClaim(ClaimId),
-    HoldingOverflow,
-    ChargeMismatch { classified: u64, charged: u64 },
-    NotReleasable(HoldingClass),
+    /// A count past `u64`: a claim identifier or a sum of claims.
+    Overflow,
     /// A claim reduced to more than it demanded ([`MemoryHeap::reduce_claim`]).
     ClaimGrew { claimed: u64, reduced: u64 },
 }
 
-/// Engine-level ownership state: the classified holdings and the one ledger
-/// of outstanding claims. The physical allocation and Seismic charge remain
-/// outside this type; callers add a holding only after the physical
-/// operation succeeds. Whether a claim fits is its owner's fit decision
+/// Engine-level memory state: the latest observation of Seismic's charge and
+/// the one ledger of outstanding claims. The physical allocation and its
+/// charge stay Seismic's; a claim's bytes leave the claim as its operation's
+/// charge rises ([`Self::reduce_claim`]) and the claim ends with it
+/// ([`Self::cancel_claim`]). Whether a claim fits is its owner's fit decision
 /// (`DeviceHeap`, over `platform::Fit`), which reads the claims here.
 #[derive(Clone, Debug)]
 pub struct MemoryHeap {
     observation: Option<MemoryObservation>,
-    holdings: BTreeMap<HoldingId, Holding>,
     claims: BTreeMap<ClaimId, MemoryClaim>,
     next_id: u64,
 }
@@ -197,7 +178,6 @@ impl MemoryHeap {
     pub fn new() -> Self {
         Self {
             observation: None,
-            holdings: BTreeMap::new(),
             claims: BTreeMap::new(),
             next_id: 1,
         }
@@ -215,27 +195,6 @@ impl MemoryHeap {
         self.observation.is_some()
     }
 
-    pub fn standing(&self) -> Result<MemoryStanding, MemoryError> {
-        let observation = self.observation.ok_or(MemoryError::InvalidObservation)?;
-        let classified_bytes = self.classified_bytes()?;
-        let unattributed_bytes = observation
-            .charged_bytes
-            .checked_sub(classified_bytes)
-            .ok_or(MemoryError::ChargeMismatch {
-                classified: classified_bytes,
-                charged: observation.charged_bytes,
-            })?;
-        Ok(MemoryStanding {
-            observation,
-            classified_bytes,
-            unattributed_bytes,
-        })
-    }
-
-    pub fn holdings(&self) -> impl Iterator<Item = Holding> + '_ {
-        self.holdings.values().copied()
-    }
-
     pub fn claims(&self) -> impl Iterator<Item = MemoryClaim> + '_ {
         self.claims.values().copied()
     }
@@ -247,57 +206,6 @@ impl MemoryHeap {
             .fold(ClaimDemand::default(), |total, claim| {
                 total.plus(claim.demand)
             })
-    }
-
-    pub fn classified_bytes(&self) -> Result<u64, MemoryError> {
-        self.holdings.values().try_fold(0u64, |total, holding| {
-            total
-                .checked_add(holding.bytes)
-                .ok_or(MemoryError::HoldingOverflow)
-        })
-    }
-
-    pub fn insert(&mut self, bytes: u64, class: HoldingClass) -> Result<HoldingId, MemoryError> {
-        let observation = self.observation.ok_or(MemoryError::InvalidObservation)?;
-        let classified = self.classified_bytes()?;
-        let next = classified
-            .checked_add(bytes)
-            .ok_or(MemoryError::HoldingOverflow)?;
-        if next > observation.charged_bytes {
-            return Err(MemoryError::ChargeMismatch {
-                classified: next,
-                charged: observation.charged_bytes,
-            });
-        }
-        let id = HoldingId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or(MemoryError::HoldingOverflow)?;
-        self.holdings.insert(id, Holding { id, bytes, class });
-        Ok(id)
-    }
-
-    pub fn resize(&mut self, id: HoldingId, bytes: u64) -> Result<(), MemoryError> {
-        let observation = self.observation.ok_or(MemoryError::InvalidObservation)?;
-        let holding = self
-            .holdings
-            .get(&id)
-            .copied()
-            .ok_or(MemoryError::UnknownHolding(id))?;
-        let classified = self
-            .classified_bytes()?
-            .saturating_sub(holding.bytes)
-            .checked_add(bytes)
-            .ok_or(MemoryError::HoldingOverflow)?;
-        if classified > observation.charged_bytes {
-            return Err(MemoryError::ChargeMismatch {
-                classified,
-                charged: observation.charged_bytes,
-            });
-        }
-        self.holdings.insert(id, Holding { bytes, ..holding });
-        Ok(())
     }
 
     /// Record a claim of `demand`, which its owner's fit decided, before a
@@ -312,7 +220,7 @@ impl MemoryHeap {
         self.next_id = self
             .next_id
             .checked_add(1)
-            .ok_or(MemoryError::HoldingOverflow)?;
+            .ok_or(MemoryError::Overflow)?;
         let claim = MemoryClaim { id, demand, class };
         self.claims.insert(id, claim);
         Ok(claim)
@@ -331,46 +239,6 @@ impl MemoryHeap {
 
     pub fn cancel_claim(&mut self, id: ClaimId) -> Result<MemoryClaim, MemoryError> {
         self.claims.remove(&id).ok_or(MemoryError::UnknownClaim(id))
-    }
-
-    pub fn commit_claim(
-        &mut self,
-        id: ClaimId,
-        charged_bytes: u64,
-    ) -> Result<HoldingId, MemoryError> {
-        let claim = self
-            .claims
-            .remove(&id)
-            .ok_or(MemoryError::UnknownClaim(id))?;
-        if charged_bytes > claim.demand.bytes() {
-            self.claims.insert(id, claim);
-            return Err(MemoryError::ChargeMismatch {
-                classified: charged_bytes,
-                charged: claim.demand.bytes(),
-            });
-        }
-        match self.insert(charged_bytes, claim.class) {
-            Ok(holding) => Ok(holding),
-            Err(error) => {
-                self.claims.insert(id, claim);
-                Err(error)
-            }
-        }
-    }
-
-    pub fn remove(&mut self, id: HoldingId) -> Result<Holding, MemoryError> {
-        let holding = self
-            .holdings
-            .remove(&id)
-            .ok_or(MemoryError::UnknownHolding(id))?;
-        if matches!(
-            holding.class,
-            HoldingClass::Live | HoldingClass::InFlight | HoldingClass::Model
-        ) {
-            self.holdings.insert(id, holding);
-            return Err(MemoryError::NotReleasable(holding.class));
-        }
-        Ok(holding)
     }
 }
 
@@ -394,24 +262,6 @@ mod tests {
         heap
     }
 
-    #[test]
-    fn classifications_reconcile_against_seismic_charge() {
-        let mut heap = heap(100, 20);
-        heap.insert(40, HoldingClass::Model).unwrap();
-        heap.insert(60, HoldingClass::Live).unwrap();
-        assert_eq!(heap.standing().unwrap().unattributed_bytes, 0);
-    }
-
-    #[test]
-    fn live_and_in_flight_holdings_cannot_be_released_directly() {
-        let mut heap = heap(20, 0);
-        let id = heap.insert(20, HoldingClass::Live).unwrap();
-        assert_eq!(
-            heap.remove(id),
-            Err(MemoryError::NotReleasable(HoldingClass::Live))
-        );
-    }
-
     /// A storage demand of `device` device bytes alone.
     fn device(device: u64) -> ClaimDemand {
         ClaimDemand {
@@ -420,8 +270,11 @@ mod tests {
         }
     }
 
+    /// Claims hold their demand until their charge takes it: a claim
+    /// reduced keeps the rest, never more than it demanded, and a cancelled
+    /// one demands nothing.
     #[test]
-    fn claims_hold_their_demand_and_commit_only_observed_charge() {
+    fn claims_hold_their_demand_until_their_charge_takes_it() {
         let mut heap = heap(80, 40);
         let claim = heap.claim(device(30), HoldingClass::Dormant).unwrap();
         let other = ClaimDemand {
@@ -435,42 +288,11 @@ mod tests {
         heap.claim(other, HoldingClass::Live).unwrap();
         assert_eq!(heap.claims().count(), 2);
         assert_eq!(heap.claimed(), device(30).plus(other));
-        assert_eq!(
-            heap.commit_claim(claim.id, 31),
-            Err(MemoryError::ChargeMismatch {
-                classified: 31,
-                charged: 30,
-            })
-        );
-        let holding = heap.commit_claim(claim.id, 24).unwrap();
+        assert_eq!(heap.reduce_claim(claim.id, device(31)), Err(MemoryError::ClaimGrew { claimed: 30, reduced: 31 }));
+        heap.reduce_claim(claim.id, device(6)).unwrap();
+        assert_eq!(heap.claimed(), device(6).plus(other));
+        heap.cancel_claim(claim.id).unwrap();
         assert_eq!(heap.claimed(), other);
         assert_eq!(heap.claims().count(), 1);
-        assert_eq!(
-            heap.holdings()
-                .find(|item| item.id == holding)
-                .unwrap()
-                .bytes,
-            24
-        );
-    }
-
-    #[test]
-    fn peak_claim_releases_into_one_measured_existing_holding() {
-        let mut heap = heap(80, 40);
-        let model = heap.insert(80, HoldingClass::Model).unwrap();
-        let peak = heap.claim(device(30), HoldingClass::Model).unwrap();
-        assert_eq!(heap.claims().count(), 1);
-        heap.observe(MemoryObservation {
-            capacity_bytes: 120,
-            charged_bytes: 92,
-        })
-        .unwrap();
-        heap.cancel_claim(peak.id).unwrap();
-        heap.resize(model, 92).unwrap();
-        let standing = heap.standing().unwrap();
-        assert_eq!(standing.classified_bytes, 92);
-        assert_eq!(standing.unattributed_bytes, 0);
-        assert_eq!(heap.holdings().count(), 1);
-        assert_eq!(heap.claims().count(), 0);
     }
 }

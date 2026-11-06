@@ -386,7 +386,6 @@ fn places_grow_only_beyond_what_the_bank_can_grow_into() {
             domain.pace.borrow_mut().domains.insert(store, DomainPace {
                 role: DomainRole::Allocation,
                 headroom: room,
-                free_headroom: room,
                 thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
                 charged: 0,
                 band: MemoryBand::Normal,
@@ -775,27 +774,23 @@ fn pending_target_state_is_classified_as_in_flight() {
     }
 }
 
+/// What Seismic charges the domain's device on every store: the load's
+/// holding, which nothing else counts.
+fn charged<F: ProgramFamily>(domain: &ExecutorDomain<F>) -> u64 {
+    domain.domain.device().ledgers().own.iter().map(|(_, ledger)| ledger.charged).sum()
+}
+
+/// Released state backing leaves the device's charge, which the heap's next
+/// observation reads.
 #[test]
-fn fresh_memory_observation_reconciles_released_state_backing() {
+fn fresh_memory_observation_reads_released_state_backing() {
     let (mut domain, mut bindings) = fixture(None);
-    let bytes = domain.holding_bytes().unwrap();
-    domain.holding = Some(
-        domain
-            .memory
-            .borrow_mut()
-            .heap_mut()
-            .insert(bytes, HoldingClass::Model)
-            .unwrap(),
-    );
     domain.refresh_memory().unwrap();
-    let before = domain.memory().standing().unwrap();
-    assert_eq!(before.unattributed_bytes, 0);
+    let before = charged(&domain);
     let released = super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     assert!(released > 0);
     domain.refresh_memory().unwrap();
-    let after = domain.memory().standing().unwrap();
-    assert!(before.classified_bytes - after.classified_bytes >= released);
-    assert_eq!(after.unattributed_bytes, 0);
+    assert!(before - charged(&domain) >= released);
 }
 
 /// A tier copy whose grid the device refuses is the caller's error and
@@ -956,7 +951,6 @@ fn a_full_device_leaves_the_host_stores_room() {
     let domain = |role, ceiling| DomainPace {
         role,
         headroom: ceiling,
-        free_headroom: ceiling,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
         charged: 0,
         band: MemoryBand::Normal,
@@ -1298,39 +1292,13 @@ fn a_holding_update_beside_a_shrinks_release_classifies_within_the_charge() {
         // A claim's observation, which no holding follows.
         domain.memory.borrow_mut().refresh().unwrap();
         domain.refresh_memory().unwrap();
-        assert_eq!(domain.memory().standing().unwrap().unattributed_bytes, 0);
         assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { from: 4, to: 3, released, .. } if released == row));
-    }
-}
-
-/// A release on the domain's thread of storage an optional component's
-/// part of the holding counts, and then a classification of the charge it
-/// lowered before anything else reads the optional part: every part of the
-/// holding is read with that charge, so nothing it released stays
-/// classified above it (the optional part held from the observation before
-/// a release once took the holding past the charge it was read against).
-#[test]
-fn a_release_the_optional_part_counts_classifies_within_the_charge_after_it() {
-    for backend in bank_backends() {
-        let (mut domain, _) = banked(backend, 4, 4);
-        let row = bank_row(&domain);
-        let optional = seismic::Tensor::zeros(domain.domain.device(), seismic::Element::bool(), &[row]).unwrap();
-        let charged = optional.charged_bytes();
-        domain.family.optional = Some(optional);
-        domain.refresh_memory().unwrap();
-        let held = domain.memory().standing().unwrap();
-        assert_eq!(held.unattributed_bytes, 0);
-        domain.family.optional = None;
-        domain.refresh_memory().unwrap();
-        let released = domain.memory().standing().unwrap();
-        assert_eq!(released.unattributed_bytes, 0);
-        assert_eq!(held.classified_bytes - released.classified_bytes, charged);
     }
 }
 
 /// The ladder's bank rung reaches the family's bank: each step begins at
 /// one boundary, installs at the next and is credited exactly what Seismic
-/// stopped charging once released, the static holding following; a step
+/// stopped charging once released; a step
 /// its storage refuses breaks an invariant (a shrink needs no memory), and at
 /// the floor a step begins none. A growth step backs what it claimed, the claim then returned.
 #[test]
@@ -1352,7 +1320,8 @@ fn an_expert_bank_shrink_credits_what_seismic_releases() {
         assert!(matches!(refused, DomainError::Invariant(_)), "{backend:?}: {refused}");
         drop((pin, tensor, domain, bindings));
         let (mut domain, mut bindings) = banked(backend, 4, 4);
-        let before = domain.memory().standing().unwrap();
+        domain.refresh_memory().unwrap();
+        let before = charged(&domain);
         for slots in [3, 2, 1] {
             assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
             assert!(domain.advance_expert_bank(unwatched()).unwrap().is_none(), "installed, not yet released");
@@ -1370,9 +1339,7 @@ fn an_expert_bank_shrink_credits_what_seismic_releases() {
         }
         assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::AtLimit);
         domain.refresh_memory().unwrap();
-        let after = domain.memory().standing().unwrap();
-        assert_eq!(before.classified_bytes - after.classified_bytes, 3 * row);
-        assert_eq!(after.unattributed_bytes, 0);
+        assert_eq!(before - charged(&domain), 3 * row);
         // Without a priced decode there are no grounds to grow: the rule
         // grows nothing.
         assert!(!device_pays(&domain));
@@ -1384,9 +1351,7 @@ fn an_expert_bank_shrink_credits_what_seismic_releases() {
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 4, grown, .. } if grown == 3 * row));
         assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::AtLimit);
         domain.refresh_memory().unwrap();
-        let regrown = domain.memory().standing().unwrap();
-        assert_eq!(regrown.classified_bytes, before.classified_bytes);
-        assert_eq!(regrown.unattributed_bytes, 0);
+        assert_eq!(charged(&domain), before);
     }
 }
 
@@ -1406,7 +1371,6 @@ fn read_pace(pace: &mut MemoryPace, store: seismic::StoreId, headroom: u64, char
         constraint: crate::platform::MemoryConstraint::HostRam,
         thresholds,
         ceiling_bytes: thresholds.ceiling(headroom),
-        free_headroom_bytes: headroom,
         distress: None,
         held: None,
         displacement: None,
@@ -1557,7 +1521,6 @@ fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
     let domain = |headroom| DomainPace {
         role: DomainRole::Allocation,
         headroom,
-        free_headroom: headroom,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 10 * GB, emergency_bytes: 2 * GB },
         charged: 0,
         band: MemoryBand::Normal,
@@ -1579,14 +1542,6 @@ fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
     // released for it a slot at a time.
     pace.domains.get_mut(&ample).unwrap().band = MemoryBand::Reclaim;
     assert_eq!(pace.shortfall(ample, 0), Shortfall::Covered);
-    // In distress, what was displaced since the load began to serve is
-    // owed: the shortfall is its free headroom's below the line. Without
-    // distress, headroom above the line owes nothing however little of it
-    // is free.
-    pace.domains.get_mut(&ample).unwrap().free_headroom = 6 * GB;
-    assert_eq!(pace.shortfall(ample, 0), Shortfall::Short(4 * GB));
-    pace.domains.get_mut(&ample).unwrap().band = MemoryBand::Normal;
-    assert_eq!(pace.shortfall(ample, 0), Shortfall::Above);
 }
 
 /// A shrink covers its deficit now and what the host takes at its rate
@@ -1635,7 +1590,6 @@ fn the_wait_bound_is_the_reserve_between_the_lines_at_the_fastest_taking() {
     let domain = |role, fastest| DomainPace {
         role,
         headroom: 0,
-        free_headroom: 0,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 10 * GB, emergency_bytes: 2 * GB },
         charged: 0,
         band: MemoryBand::Normal,
