@@ -54,8 +54,11 @@
 //!   deep, by the noise; M4 Pro: 4 deep; GB10 above any decode depth.
 //! - **The size read ahead:** of the sizes that reach the best rate, the one
 //!   whose knee holds the fewest bytes, the wider of two that tie (fewer
-//!   pieces, the same depth). Its knee is the **speculation depth**: the link
-//!   reads at its knee from reads ahead alone.
+//!   pieces, the same depth). Its knee is the **knee depth**: the most in
+//!   flight, due and ahead, beside which a read ahead may start. Below it
+//!   depth still adds rate, so a read ahead runs on throughput a due read
+//!   would leave unused; past it every byte more in flight delays a due
+//!   byte.
 //! - **The size read due:** the one a lone request is served soonest at
 //!   through the engine, its least median. Sizes within each other's noise
 //!   cost it the same, so no tie rule picks among them: one that took the
@@ -63,20 +66,12 @@
 //!   Metal, slower than 256 KiB through the engine (capped decode +3.4%). A
 //!   reader with no request reads due pieces at the size read ahead.
 //! - **The due depth:** the due size's widest window within the noise of
-//!   its line's best rate, at least the speculation depth. Due reads only
+//!   its line's best rate, at least the knee depth. Due reads only
 //!   share the link with due reads, so a wider window costs nothing they
 //!   would not wait for anyway, while serving lengthens each read's time in
 //!   flight, so the knee measured alone falls short of the window a served
 //!   prompt needs (GB10 CUDA's prompt fill beside the device's rounds:
 //!   7.07 GB/s at 8 MiB, 7.50 at 32; capped 4k prefill 2160 to 2021 ms).
-//! - **The overlap depth:** the bytes the link reads in a lone piece's time
-//!   at its best rate (a piece of the size read ahead, one in flight: its
-//!   bandwidth-delay product). Below it, pieces in flight overlap their
-//!   latencies and each reads in about its lone time, so a read ahead beside
-//!   a due read costs it about nothing. M4 Max stacked ranges: 0.31 ms one
-//!   deep at 6.7 GB/s, two ranges; M4 Pro: about 0.6 MB; GB10 about
-//!   3–5 MB, above its speculation depth for a decode request, so there it
-//!   limits nothing.
 //!
 //! A volume probed by the rule before this one keeps five figures instead
 //! of its curve ([`EarlierChoice`]), which a load reads as they were while
@@ -328,12 +323,10 @@ impl Shape {
         let due_line = line(due_read);
         let full = full_rate(&due_line);
         let ahead_line = line(ahead_read);
-        let overlap = overlap(&ahead_line, top.rate);
         let cores_at = |line: &[Point], window: u64| line.iter().filter(|point| point.window <= window).map(|point| point.cores).fold(0., f64::max);
         Self {
             due: full.window.max(knee),
             knee,
-            overlap,
             ahead_read,
             due_read,
             cores: cores_at(&due_line, full.window).max(cores_at(&ahead_line, knee)),
@@ -350,15 +343,6 @@ pub(crate) fn full_rate(line: &[Point]) -> Point {
         .filter(|point| point.rate + point.spread + top.spread >= top.rate)
         .max_by_key(|point| point.window)
         .expect("the best is within its own noise")
-}
-
-/// Of a line's points, ascending by window, the overlap depth: the bytes
-/// read at `best` (bytes a second) in the time its narrowest point (one
-/// read in flight) holds a piece, at least that piece ("A volume's curve").
-pub(crate) fn overlap(line: &[Point], best: f64) -> u64 {
-    let alone = line.first().expect("a probed point");
-    let seconds = alone.window as f64 / alone.rate;
-    ((seconds * best) as u64).max(alone.window)
 }
 
 /// The points a probe of read sizes `reads` reads: each size at every

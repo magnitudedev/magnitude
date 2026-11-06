@@ -225,16 +225,15 @@ impl Link {
 /// bytes in flight of due pieces, then of those read ahead), by `shape`'s
 /// depths ("Order and depth"): a due piece while the due bytes leave it
 /// room under the due depth; a piece not due (the caller's to know that
-/// none due waits) while those read ahead leave it room under the
-/// speculation depth and, while a due piece is in flight, everything in
-/// flight leaves it room under the overlap depth. A piece past its depth
-/// starts where nothing it is counted against is in flight.
+/// none due waits) while everything in flight leaves it room under the
+/// knee. A piece past its depth starts where nothing it is counted against
+/// is in flight.
 fn admits((due_bytes, ahead_bytes): (u64, u64), shape: &Shape, bytes: u64, due: bool) -> bool {
     if due {
         return due_bytes == 0 || due_bytes + bytes <= shape.due;
     }
-    let ahead = ahead_bytes == 0 || ahead_bytes + bytes <= shape.knee;
-    ahead && (due_bytes == 0 || due_bytes + ahead_bytes + bytes <= shape.overlap)
+    let flight = due_bytes + ahead_bytes;
+    flight == 0 || flight + bytes <= shape.knee
 }
 
 /// Change request `id`'s wait by `change`, removed once `change` says it

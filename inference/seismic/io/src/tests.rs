@@ -2,7 +2,7 @@ use super::*;
 use crate::accounting::{Book, Wait};
 #[cfg(unix)]
 use crate::disk::drop_pages;
-use crate::disk::{full_rate, grid, overlap, Shape, VolumeReads, LEAST_READ, WIDEST_WINDOW};
+use crate::disk::{full_rate, grid, Shape, VolumeReads, LEAST_READ, WIDEST_WINDOW};
 use crate::scheduler::{pieces, Engine, Part, Piece, Queue, Queued, RequestState, Span};
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -464,10 +464,10 @@ fn reads_coalesce_then_split_into_pieces() {
     assert_eq!(parts(&pieces[4]), [(3, 0, skip)]);
 }
 
-/// A link of its own, sharing nothing: due depth, speculation depth and
-/// overlap depth `(due, knee, overlap)`, its pieces cut at `read`.
-fn volume(device: u64, (due, knee, overlap): (u64, u64, u64), read: u64) -> VolumeReads {
-    VolumeReads { id: Volume(device), shape: Shape { due, knee, overlap, ahead_read: read, due_read: read, cores: 0. } }
+/// A link of its own, sharing nothing: due depth and knee `(due, knee)`,
+/// its pieces cut at `read`.
+fn volume(device: u64, (due, knee): (u64, u64), read: u64) -> VolumeReads {
+    VolumeReads { id: Volume(device), shape: Shape { due, knee, ahead_read: read, due_read: read, cores: 0. } }
 }
 
 /// A queued request of its own, `pieces` pieces long, on a link of no
@@ -481,7 +481,7 @@ fn queued(pieces: usize) -> (Queued, Arc<RequestState>) {
     let request = Queued {
         state: state.clone(),
         file,
-        volume: volume(0, (u64::MAX, u64::MAX, u64::MAX), LEAST_READ),
+        volume: volume(0, (u64::MAX, u64::MAX), LEAST_READ),
         pieces: (0..pieces as u64)
             .map(|index| Piece {
                 start: index,
@@ -677,7 +677,7 @@ fn a_reader_reads_by_the_earlier_choice_until_the_curve_holds_its_request() {
     let earlier = EarlierChoice { window: 4 << 20, demand: 8 << 20, read: 256 << 10, demand_read: 1 << 20, cores: 1.5 };
     adopt_earlier(&source, Some(&urgent), earlier).unwrap();
     let adopted = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap().volume.shape;
-    assert_eq!((adopted.due, adopted.knee, adopted.overlap, adopted.ahead_read, adopted.due_read), (8 << 20, 4 << 20, 4 << 20, 256 << 10, 1 << 20));
+    assert_eq!((adopted.due, adopted.knee, adopted.ahead_read, adopted.due_read), (8 << 20, 4 << 20, 256 << 10, 1 << 20));
     assert_eq!(read_cores([&source], &urgent).unwrap(), 1.5);
     let point = |window: u64, rate: f64| Point { read: LEAST_READ, window, rate: rate * 1e9, spread: 0.01e9, cores: 2. };
     let curve = Curve { points: vec![point(LEAST_READ, 0.4), point(4 * LEAST_READ, 1.5), point(16 * LEAST_READ, 3.)], lone: vec![Lone { read: LEAST_READ, seconds: 1e-3, error: 1e-5 }] };
@@ -750,12 +750,10 @@ fn recorded(lines: &[(u64, &[(u64, f64)])]) -> Vec<Point> {
 /// random offsets of Qwen3.6 35B's file, by depth): the M4 Max's internal
 /// drive reaches its best (6.73 GB/s) only 64 deep in 256 KiB reads and 128
 /// deep in 128 KiB ones, 16 MiB either way, so it reads ahead 16 MiB deep in
-/// the wider; its overlap is a 256 KiB piece's lone time at the best rate,
-/// 1.6 MB. The M4 Pro's flattens at 4.02 GB/s 8 deep in 256 KiB reads,
-/// 128 KiB ones never reach it: 2 MiB ahead, an overlap of 0.69 MB. GB10's
-/// 128 KiB line reaches 10.09 GB/s at 8 MiB and is flat after: it reads
-/// ahead 8 MiB deep and due at the line's widest, 32 MiB, and a lone piece
-/// (299 µs) overlaps 3 MB, past which no due read's own pieces wait.
+/// the wider. The M4 Pro's flattens at 4.02 GB/s 8 deep in 256 KiB reads,
+/// 128 KiB ones never reach it: 2 MiB ahead. GB10's 128 KiB line reaches
+/// 10.09 GB/s at 8 MiB and is flat after: it reads ahead 8 MiB deep and due
+/// at the line's widest, 32 MiB.
 #[test]
 fn a_links_depths_come_from_its_curve() {
     let mib = 1024 * 1024;
@@ -765,20 +763,16 @@ fn a_links_depths_come_from_its_curve() {
     ]);
     let shape = Shape::of(&max, None);
     assert_eq!((shape.ahead_read, shape.knee, shape.due_read), (2 * LEAST_READ, 16 * mib, 2 * LEAST_READ));
-    assert_eq!(shape.overlap, (262_144. / 1.12e9 * 6.73e9) as u64);
     let pro = recorded(&[
         (LEAST_READ, &[(1, 1.01), (2, 1.86), (4, 2.66), (8, 3.30), (16, 3.67), (32, 3.69), (128, 3.66)]),
         (2 * LEAST_READ, &[(1, 1.60), (2, 2.65), (4, 3.23), (8, 4.02), (16, 4.05), (32, 4.08), (128, 4.08)]),
     ]);
     let shape = Shape::of(&pro, None);
     assert_eq!((shape.ahead_read, shape.knee), (2 * LEAST_READ, 2 * mib));
-    assert_eq!(shape.overlap, (262_144. / 1.60e9 * 4.08e9) as u64);
     let gb10 = recorded(&[(LEAST_READ, &[(1, 0.438), (16, 6.02), (32, 9.66), (64, 10.09), (128, 10.12), (256, 10.10)])]);
     let lone = [Lone { read: LEAST_READ, seconds: 0.634e-3, error: 0.02e-3 }];
     let shape = Shape::of(&gb10, Some(&lone));
     assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (LEAST_READ, 8 * mib, LEAST_READ, 32 * mib));
-    assert!((3_000_000..3_100_000).contains(&shape.overlap), "{}", shape.overlap);
-    assert_eq!(overlap(&[Point { read: LEAST_READ, window: LEAST_READ, rate: 1e12, spread: 0., cores: 0. }], 1e9), LEAST_READ, "at least a piece");
 }
 
 /// A request's due pieces are cut at the size its lone record is served
@@ -813,11 +807,11 @@ fn a_range_past_the_widest_window_probes_only_sizes_a_window_holds() {
 /// Nothing read ahead starts while a due piece is queued, however much
 /// room its own depths leave: behind a due piece in flight at the due depth
 /// (4 of 4), a second due piece waits, and a read ahead of 2 waits behind
-/// it though speculation (8) and overlap (8) hold it; once the first ends,
+/// it though the knee (8) holds it; once the first ends,
 /// the second due piece goes first, then the read ahead.
 #[test]
 fn a_piece_read_ahead_never_starts_while_a_due_one_is_queued() {
-    let link = volume(9, (4, 8, 8), 4);
+    let link = volume(9, (4, 8), 4);
     let mut queue = Queue::default();
     queue.push(queued_on(&link, &[(0, 4), (4, 8)]), Want::now());
     queue.push(queued_on(&link, &[(8, 10)]), ahead());
@@ -827,41 +821,39 @@ fn a_piece_read_ahead_never_starts_while_a_due_one_is_queued() {
     queue.ended(first.returned(Instant::now()));
     let second = queue.take().expect("the second due piece");
     assert_eq!((second.piece.start, second.due), (4, true));
-    let ahead = queue.take().expect("the read ahead, beside due work within the overlap");
+    let ahead = queue.take().expect("the read ahead, beside due work within the knee");
     assert_eq!((ahead.piece.start, ahead.due), (8, false));
 }
 
-/// Beside due work a piece read ahead starts only within the overlap
-/// depth of everything in flight, and with none due in flight up to the
-/// speculation depth: behind a due piece of 4 (overlap 6, speculation 8),
-/// one read ahead of 2 starts and a second waits; once the due piece ends,
-/// the rest start up to the speculation depth. Another link is held by
-/// none of it.
+/// A piece read ahead starts only while everything in flight, due and
+/// ahead, leaves it room under the knee: beside a due piece of 4 (knee 8),
+/// two reads ahead of 2 start and a third waits; once the due piece ends,
+/// two more start. Another link is held by none of it.
 #[test]
-fn beside_due_work_a_piece_read_ahead_starts_only_within_the_overlap() {
-    let link = volume(10, (8, 8, 6), 4);
+fn a_piece_read_ahead_starts_only_while_everything_in_flight_fits_the_knee() {
+    let link = volume(10, (8, 8), 4);
     let mut queue = Queue::default();
     queue.push(queued_on(&link, &[(0, 4)]), Want::now());
     let due = queue.take().unwrap();
     queue.push(queued_on(&link, &[(4, 6), (6, 8), (8, 10), (10, 12), (12, 14)]), ahead());
-    assert_eq!(queue.take().map(|taken| taken.piece.start), Some(4), "4 + 2 is within the overlap");
-    assert!(queue.take().is_none(), "4 + 2 + 2 passes the overlap");
-    let other = volume(11, (8, 8, 6), 4);
+    assert_eq!(queue.take().map(|taken| taken.piece.start), Some(4), "4 + 2 is within the knee");
+    assert_eq!(queue.take().map(|taken| taken.piece.start), Some(6), "4 + 4 is the knee");
+    assert!(queue.take().is_none(), "4 + 4 + 2 passes the knee");
+    let other = volume(11, (8, 8), 4);
     queue.push(queued_on(&other, &[(0, 2)]), ahead());
     assert_eq!(queue.take().map(|taken| (taken.volume.id, taken.piece.start)), Some((Volume(11), 0)), "another link's room is its own");
     queue.ended(due.returned(Instant::now()));
-    assert_eq!(queue.take().map(|taken| taken.piece.start), Some(6));
     assert_eq!(queue.take().map(|taken| taken.piece.start), Some(8));
     assert_eq!(queue.take().map(|taken| taken.piece.start), Some(10), "8 of 8 read ahead");
-    assert!(queue.take().is_none(), "past the speculation depth");
+    assert!(queue.take().is_none(), "past the knee");
 }
 
 /// Due pieces join the due bytes in flight up to the due depth, whatever
 /// is read ahead: a due piece arriving at a link full of reads ahead starts
 /// at once, which bounds its wait by what was in flight.
 #[test]
-fn a_due_piece_starts_beside_a_full_speculation_depth() {
-    let link = volume(12, (4, 8, 8), 4);
+fn a_due_piece_starts_beside_a_full_knee() {
+    let link = volume(12, (4, 8), 4);
     let mut queue = Queue::default();
     queue.push(queued_on(&link, &[(0, 4), (4, 8), (8, 12)]), ahead());
     assert!(queue.take().is_some() && queue.take().is_some());
@@ -872,17 +864,17 @@ fn a_due_piece_starts_beside_a_full_speculation_depth() {
 }
 
 /// A read ahead a consumer comes to wait on starts as due once repriced:
-/// held back beside a due piece past the overlap, it starts at the due
+/// held back beside a due piece past the knee, it starts at the due
 /// depth from its reprice, and a worker is woken for it.
 #[test]
 fn a_repriced_request_starts_at_its_new_depth() {
-    let link = volume(13, (8, 4, 4), 4);
+    let link = volume(13, (8, 4), 4);
     let mut queue = Queue::default();
     queue.push(queued_on(&link, &[(0, 2)]), Want::now());
     assert!(queue.take().is_some());
     let (id, woken) = queue.push(queued_on(&link, &[(2, 6)]), ahead());
     assert_eq!(woken, 0);
-    assert!(queue.take().is_none(), "past the overlap");
+    assert!(queue.take().is_none(), "past the knee");
     assert_eq!(queue.reprice(id, Want::now()), 1);
     assert!(queue.take().is_some_and(|taken| taken.due), "within the due depth");
 }
@@ -892,7 +884,7 @@ fn a_repriced_request_starts_at_its_new_depth() {
 /// piece past it.
 #[test]
 fn a_request_wakes_a_worker_for_each_piece_its_link_may_start() {
-    let link = volume(7, (4, 4, 4), 2);
+    let link = volume(7, (4, 4), 2);
     let mut queue = Queue::default();
     assert_eq!(queue.push(queued_on(&link, &[(0, 2), (2, 4), (4, 6)]), Want::now()).1, 2);
     let mut other = Queue::default();
@@ -981,7 +973,7 @@ fn a_due_requests_wait_splits_by_what_it_waited_behind() {
 /// taken; one ending says the link has a piece that may now be.
 #[test]
 fn a_link_holds_at_most_its_due_depth_in_flight() {
-    let narrow = volume(1, (3, 3, 3), 2);
+    let narrow = volume(1, (3, 3), 2);
     let mut queue = Queue::default();
     let urgent = queued_on(&narrow, &[(0, 2), (2, 4)]);
     let urgent_state = urgent.state.clone();

@@ -65,11 +65,10 @@
 //!    under the due depth. Nothing not due starts while a due piece is
 //!    queued.
 //! 2. A piece not due starts only while none due is queued, and only while
-//!    the bytes read ahead in flight leave it room under the speculation
-//!    depth: the link sits at its knee from reads ahead alone.
-//! 3. While a due piece is in flight, a piece not due starts only within
-//!    the overlap depth of everything in flight: the depth at which a piece
-//!    still reads in its lone time, so it costs the due piece nothing.
+//!    everything in flight, due and ahead, leaves it room under the knee:
+//!    below the knee depth still adds rate, so the read ahead runs on
+//!    throughput the due reads leave unused; past it every byte more in
+//!    flight would delay a due byte, so the read ahead waits.
 //!
 //! A piece past its depth starts where nothing it is counted against is in
 //! flight. So what a wrong read ahead costs a due read is bounded. One not
@@ -77,8 +76,8 @@
 //! while no due read was outstanding used link time nothing was due on.
 //! One in flight when a due read arrives shares the device with it: the due
 //! read's pieces start at once (rule 1), and its extra time is at most the
-//! bytes read ahead in flight over the rate, which nothing later adds to
-//! (rules 1 and 3).
+//! bytes read ahead in flight over the rate, at most the knee's, which
+//! nothing later adds to (rules 1 and 2).
 //!
 //! # How reads share the engine
 //!

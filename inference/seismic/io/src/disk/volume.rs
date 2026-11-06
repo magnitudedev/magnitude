@@ -17,16 +17,14 @@ pub(crate) struct VolumeReads {
 
 /// A link's depths, in bytes in flight, and its read sizes ("A volume's
 /// curve", "Order and depth"): due pieces join the due bytes in flight up
-/// to `due`; a piece read ahead joins those read ahead up to `knee` (the
-/// speculation depth) and, beside a due piece, everything in flight up to
-/// `overlap`. Due pieces are cut at `due_read`, the others at `ahead_read`.
+/// to `due`; a piece read ahead joins everything in flight up to `knee`.
+/// Due pieces are cut at `due_read`, the others at `ahead_read`.
 /// Its reads at once occupy `cores` of the host's processors (the cores
 /// its threads ran, in seconds a second).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shape {
     pub due: u64,
     pub knee: u64,
-    pub overlap: u64,
     pub ahead_read: u64,
     pub due_read: u64,
     pub cores: f64,
@@ -36,12 +34,11 @@ impl std::fmt::Display for Shape {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "due {} KiB in {} KiB reads, ahead {} KiB in {} KiB reads, overlap {} KiB, {:.2} cores",
+            "due {} KiB in {} KiB reads, knee {} KiB in {} KiB reads, {:.2} cores",
             self.due >> 10,
             self.due_read >> 10,
             self.knee >> 10,
             self.ahead_read >> 10,
-            self.overlap >> 10,
             self.cores,
         )
     }
@@ -52,16 +49,17 @@ impl Shape {
     /// and every depth the widest window, every piece at the most any device
     /// measured needs (the declared bounds of the search), which takes no
     /// measurement.
-    pub(crate) const PENDING: Self = Self { due: WIDEST_WINDOW, knee: WIDEST_WINDOW, overlap: WIDEST_WINDOW, ahead_read: LEAST_READ, due_read: LEAST_READ, cores: 0. };
+    pub(crate) const PENDING: Self = Self { due: WIDEST_WINDOW, knee: WIDEST_WINDOW, ahead_read: LEAST_READ, due_read: LEAST_READ, cores: 0. };
 
     /// The size a piece is cut at, due or not.
     pub(crate) fn read(&self, due: bool) -> u64 {
         if due { self.due_read } else { self.ahead_read }
     }
 
-    /// The workers that hold its deepest flight, due and read ahead at
-    /// once, in pieces of the least size: as many as its pieces in flight
-    /// can be (a range smaller than a read is a piece of its own).
+    /// The workers that hold its deepest flight, a knee read ahead and the
+    /// due depth beside it, in pieces of the least size: as many as its
+    /// pieces in flight can be (a range smaller than a read is a piece of
+    /// its own).
     pub(crate) fn workers(&self) -> usize {
         (self.due + self.knee).div_ceil(LEAST_READ) as usize
     }
@@ -88,7 +86,7 @@ impl EarlierChoice {
     /// Its figures as a link's shape: a demand piece is due, any other read
     /// ahead, which joined every byte in flight up to `window`.
     pub(crate) fn shape(&self) -> Shape {
-        Shape { due: self.demand, knee: self.window, overlap: self.window, ahead_read: self.read, due_read: self.demand_read, cores: self.cores }
+        Shape { due: self.demand, knee: self.window, ahead_read: self.read, due_read: self.demand_read, cores: self.cores }
     }
 }
 

@@ -40,10 +40,10 @@ pub enum Deadline {
 }
 
 /// What a request is for, as its link orders it ("Order and depth"): its
-/// deadline, and its value, the bytes of due reads it is expected to spare
-/// (a read ahead right with probability `p` spares its `p · b`; within one
-/// link that is its seconds saved, `p · b / R`, at the link's one rate),
-/// which only orders requests of one deadline. A request is **due** once
+/// deadline, and its value, the step time it is expected to save, in
+/// seconds (a read ahead right with probability `p` saves its bytes' time
+/// at the volume's rate, `p · b/R`), which only orders requests of one
+/// deadline. A request is **due** once
 /// its deadline has come: a consumer waits on it now. More urgent orders
 /// first: the earlier deadline, then the greater value.
 #[derive(Clone, Copy, Debug)]
@@ -69,7 +69,7 @@ impl Want {
     }
 
     fn new(deadline: Deadline, value: f64) -> Self {
-        assert!(value.is_finite() && value >= 0., "a want's value is a measure of bytes, {value}");
+        assert!(value.is_finite() && value >= 0., "a want's value is seconds saved, {value}");
         Self { deadline, value }
     }
 
