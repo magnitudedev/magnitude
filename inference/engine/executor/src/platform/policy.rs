@@ -251,14 +251,10 @@ impl DomainThresholds {
 impl MemoryReserves {
     /// Host RAM, unified memory included: planning reserve
     /// `max(capacity / 10, 2 GiB)` and emergency reserve
-    /// `max(capacity / 20, 1 GiB)`, which also keep the system and other
-    /// programs out of swap. A dedicated device's own memory, whose
-    /// capacity is already what its driver grants this process: a flat
-    /// 512 MiB planning reserve and 256 MiB emergency reserve, whatever its
-    /// size. They cover the residual between what a load is charged and what
-    /// the device holds, which does not grow with the device
-    /// (`specs/26-10-11/gpu-memory/notes.md`). A volume: planning reserve
-    /// 2 GiB.
+    /// `max(capacity / 20, 1 GiB)`. A dedicated device's own memory, whose
+    /// capacity is already what its driver grants this process: planning
+    /// reserve `max(capacity / 20, 512 MiB)` and emergency reserve
+    /// `max(capacity / 40, 256 MiB)`. A volume: planning reserve 2 GiB.
     pub fn standard() -> Self {
         Self {
             host: KindReserves {
@@ -273,11 +269,11 @@ impl MemoryReserves {
             },
             device: KindReserves {
                 planning: Reserve {
-                    fraction_divisor: u64::MAX,
+                    fraction_divisor: 20,
                     floor_bytes: 512 * MIB,
                 },
                 emergency: Reserve {
-                    fraction_divisor: u64::MAX,
+                    fraction_divisor: 40,
                     floor_bytes: 256 * MIB,
                 },
             },
@@ -1230,7 +1226,7 @@ mod tests {
     /// twentieth (1 GiB) for emergency, device memory a twentieth (512 MiB)
     /// and a fortieth (256 MiB).
     #[test]
-    fn standard_reserves_use_the_larger_of_fraction_and_floor_on_host_ram_and_flat_on_devices() {
+    fn standard_reserves_use_the_larger_of_fraction_and_floor() {
         let reserves = MemoryReserves::standard();
         let thresholds = |topology: &DeviceTopology, store: StoreId| {
             let store = topology.store(store).unwrap();
@@ -1264,13 +1260,18 @@ mod tests {
                 emergency_bytes: 256 * MIB,
             }
         );
-        // The RTX 3090's 25.3 GB: the same flat device reserves.
+        // The RTX 3090's 25.3 GB: the device fractions.
         let rtx3090 = recorded::rtx3090();
+        let capacity = rtx3090
+            .store(device_memory(&rtx3090))
+            .unwrap()
+            .capacity()
+            .value;
         assert_eq!(
             thresholds(&rtx3090, device_memory(&rtx3090)),
             DomainThresholds {
-                planning_bytes: 512 * MIB,
-                emergency_bytes: 256 * MIB,
+                planning_bytes: capacity / 20,
+                emergency_bytes: capacity / 40,
             }
         );
         // Every volume keeps 2 GiB free, whatever its size, and has no
