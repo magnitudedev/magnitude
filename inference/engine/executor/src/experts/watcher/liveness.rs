@@ -10,6 +10,7 @@ use super::{Shared, decode, scratch};
 use crate::assessment::{FileLine, ReadLineError};
 use crate::experts::ExchangeTable;
 use crate::experts::exchange::{Bound, Bounds, Kind, Trip, Watchdog, Watched, Witness};
+use crate::experts::yielding::Yielding;
 use magnitude_kernels::constants;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -80,7 +81,7 @@ impl Answers {
 pub(super) fn watch(
     core: &Core,
     shared: &Arc<Shared>,
-    residency: Arc<Mutex<Residency>>,
+    residency: Arc<Yielding<Residency>>,
     service: Arc<Mutex<Service>>,
     copies: Option<crate::experts::copies::Copies>,
     answers: Answers,
@@ -110,8 +111,8 @@ pub(super) fn watch(
     let reads = Box::new(core.source.reads());
     let witnesses = vec![
         Witness { name: "steps", report: Arc::new({ let shared = shared.clone(); move || shared.steps.describe() }) },
-        Witness { name: "request service", report: Arc::new(move || held(&service, Service::report)) },
-        Witness { name: "residency", report: Arc::new(move || held(&residency, Residency::describe)) },
+        Witness { name: "request service", report: Arc::new(move || held(|| service.try_lock(), Service::report)) },
+        Witness { name: "residency", report: Arc::new(move || held(|| residency.try_hold(), Residency::describe)) },
         Witness {
             name: "transfer queue",
             report: Arc::new(move || copies.as_ref().map_or_else(|| "none".into(), crate::experts::copies::Copies::describe)),
@@ -143,13 +144,13 @@ pub(super) fn watch(
     Watchdog::start(tables, parked, ended, shared.events().clone(), reads, bounds, witnesses, trip)
 }
 
-/// `describe` of what `mutex` guards, once it is free within a short
+/// `describe` of what `try_lock` takes, once it is free within a short
 /// while: a thread that holds it longer is stuck inside it, which is
 /// itself the report.
-fn held<T>(mutex: &Mutex<T>, describe: fn(&T) -> String) -> String {
+fn held<'a, T: 'a>(try_lock: impl Fn() -> std::sync::TryLockResult<std::sync::MutexGuard<'a, T>>, describe: fn(&T) -> String) -> String {
     let deadline = std::time::Instant::now() + Duration::from_millis(100);
     loop {
-        match mutex.try_lock() {
+        match try_lock() {
             Ok(guard) => return describe(&guard),
             Err(std::sync::TryLockError::Poisoned(_)) => return "left by a panic".into(),
             Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => std::thread::yield_now(),

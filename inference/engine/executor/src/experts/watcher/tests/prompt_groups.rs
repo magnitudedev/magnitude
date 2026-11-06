@@ -847,7 +847,9 @@ fn a_group_claims_its_lent_records_and_returns_them_empty() {
     let conveying = Conveying { conveyed: 4, lent: 4, bytes: RECORD };
     let harness = lending("lender", EXPERTS, 12, 1, STAGING, conveying, 0, Placer::Tier, false);
     harness.request(&[0, 1]).complete().unwrap();
-    assert!(harness.in_tier(0, 0).is_some() && harness.in_tier(0, 1).is_some());
+    // Residency maps a landing into the tier as it learns it, which may
+    // follow the answer.
+    harness.tiering(0, &[0, 1]);
     let step = harness.prompt_step();
     harness.publish(&step, 0, &[2]);
     eventually("the lent records were never claimed", || harness.in_tier(0, 0).is_none() && harness.in_tier(0, 1).is_none());

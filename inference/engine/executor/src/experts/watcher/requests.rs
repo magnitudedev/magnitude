@@ -23,6 +23,7 @@ use super::liveness;
 use super::residency::{Residency, lock};
 use super::scratch::{self, Pending};
 use super::{Shared, panic_message};
+use crate::experts::yielding::Yielding;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -55,7 +56,7 @@ pub(super) fn rest_precisely() -> Result<(), String> {
 
 /// The request service: what it serves through, and its own state.
 pub(super) struct Requests {
-    residency: Arc<Mutex<Residency>>,
+    residency: Arc<Yielding<Residency>>,
     shared: Arc<Shared>,
     /// Held by its thread through each pass, beside residency's lock: the
     /// exchange's watchdog reads it ([`Service::report`]).
@@ -87,7 +88,7 @@ impl Service {
 }
 
 impl Requests {
-    pub(super) fn new(residency: Arc<Mutex<Residency>>, shared: Arc<Shared>, layers: usize) -> Self {
+    pub(super) fn new(residency: Arc<Yielding<Residency>>, shared: Arc<Shared>, layers: usize) -> Self {
         let service = Service { decode: Decode::new(layers), pending: (0..layers).map(|_| None).collect() };
         Self { residency, shared, service: Arc::new(Mutex::new(service)) }
     }
@@ -173,11 +174,7 @@ impl Requests {
         // A served group's reads that landed move on, ahead of its rounds.
         let conveyed = residency.scratch.convey(&mut residency.core, &self.shared);
         let served = self.serve_requests(service, residency, pass);
-        let progressed = resumed | conveyed | served;
-        if progressed {
-            residency.publish_held();
-        }
-        progressed
+        resumed | conveyed | served
     }
 
     /// Each layer's decode and scratch requests, served in step order, then

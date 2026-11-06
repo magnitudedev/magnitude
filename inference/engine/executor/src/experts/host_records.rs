@@ -264,6 +264,9 @@ pub(super) struct HostRecords {
     /// Each layer's landing map, of the group's own layers, whose one
     /// writer these records are; none without a device.
     maps: Vec<Option<LandingMap>>,
+    /// Bumped as any layer's count of experts kept alone changes
+    /// ([`Self::holdings`]).
+    holdings: u64,
 }
 
 impl HostRecords {
@@ -291,6 +294,7 @@ impl HostRecords {
             progress: None,
             lent,
             maps,
+            holdings: 0,
         };
         assert!(lent <= records, "a tier lends {lent} of its {records} records");
         host.grow(records);
@@ -319,6 +323,7 @@ impl HostRecords {
                 self.kept.remove(&staged);
                 if kept == Kept::Alone {
                     self.alone[staged.0] -= 1;
+                    self.holdings += 1;
                 }
                 if matches!(old, Host::Answering(..)) {
                     self.answering.retain(|&answering| answering != record);
@@ -334,6 +339,7 @@ impl HostRecords {
                 assert!(self.kept.insert(staged, record).is_none(), "{staged:?} kept twice");
                 if kept == Kept::Alone {
                     self.alone[staged.0] += 1;
+                    self.holdings += 1;
                 }
                 if matches!(content, Host::Answering(..)) {
                     self.answering.push(record);
@@ -427,6 +433,12 @@ impl HostRecords {
     /// Per layer, the experts the tier holds alone.
     pub fn alone(&self) -> &[usize] {
         &self.alone
+    }
+
+    /// The count of changes to what its layers keep alone: equal counts,
+    /// equal counts kept alone.
+    pub fn holdings(&self) -> u64 {
+        self.holdings
     }
 
     /// Commit records up to `records`, the new ones ready.

@@ -17,20 +17,24 @@
 //! a gap. Each turn of it runs on the load's events (`events`): a step's
 //! end (the frontier), a landing's or a read's end, a copy's completion, a
 //! growth joined, a resize asked, the request service's progress. It never
-//! waits on a time, and no job it does waits for another.
+//! waits on a time, and no job it does waits for another. It holds the lock
+//! as its background ([`lock`]): it takes it only once no request waits,
+//! and gives it up between its jobs to any request that came meanwhile,
+//! so a request waits out at most one job of a turn, never the turn.
 
 use super::core::Core;
 use super::decode;
 use super::prefetch::Prefetch;
 use super::promotions::{Copier, Promotions};
-use super::resize::Asked;
+use super::resize::{Asked, Owed};
 use super::scratch::Scratch;
 use super::{Shared, panic_message};
 use crate::assessment::{ExpertLines, SiteLines};
-use crate::experts::directory::Point;
+use crate::experts::directory::{MissCurve, Point};
+use crate::experts::yielding::Yielding;
 use magnitude_kernels::constants;
 use std::panic::AssertUnwindSafe;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, MutexGuard};
 use std::time::Instant;
 
 /// Where experts live and what moves them, behind one lock
@@ -62,20 +66,108 @@ pub(super) struct Residency {
     /// Each layer's line words as last published ([`Self::publish_lines`]);
     /// none before the first.
     pub(super) lines: Option<Vec<Vec<(usize, i32)>>>,
+    /// What each layer holds, as last published ([`Self::publish_held`]).
+    pub(super) published: Published,
+    /// What waits on that publication, answered as residency is released
+    /// ([`Held`]).
+    pub(super) owed: Owed,
 }
 
-/// Residency's lock. A panic while it is held is caught inside it, and
-/// serving ends before it is released (`Residency::keep`,
-/// `Requests::serve`): no thread serves from the state it left, which only
-/// the refusals read (`liveness::refuse`), so a poisoned lock is never
-/// observed. Every holder finds a shrink plan its owner dropped uncommitted
-/// undone already ([`Residency::unshrink`]): no holder, whichever thread,
-/// meets the records it held.
-pub(super) fn lock(residency: &Mutex<Residency>) -> MutexGuard<'_, Residency> {
-    let mut held = residency.lock().expect("residency is never left by a panic");
-    held.unshrink();
-    held
+/// What each layer holds as residency last published it: the directory's
+/// count of holding changes then, and each layer's experts held and kept
+/// alone, the buffers every publication reuses.
+pub(super) struct Published {
+    holdings: Option<u64>,
+    held: Vec<usize>,
+    alone: Vec<usize>,
 }
+
+impl Published {
+    /// None published yet, of `layers` layers.
+    pub(super) fn new(layers: usize) -> Self {
+        Self { holdings: None, held: vec![0; layers], alone: vec![0; layers] }
+    }
+}
+
+/// Residency's lock: its keeper is its background ([`Yielding`]), so a
+/// request never waits out a turn of the keeper's, only the one job of it
+/// running ([`Residency::keep`]). Whoever releases it publishes what each
+/// layer holds, then answers whoever waits on that publication ([`Held`]),
+/// so every holder, and every owner a resize answers, finds it published.
+/// A panic while it is held is caught inside it, and serving ends before
+/// it is released (`Residency::keep`, `Requests::serve`): no thread serves
+/// from the state it left, which only the refusals read
+/// (`liveness::refuse`), so a poisoned lock is never observed. Every
+/// holder finds a shrink plan its owner dropped uncommitted undone already
+/// ([`Residency::unshrink`]): no holder, whichever thread, meets the
+/// records it held.
+pub(super) fn lock(residency: &Yielding<Residency>) -> Held<'_> {
+    Held::new(residency.hold(POISONED))
+}
+
+/// Why residency's lock is never poisoned ([`lock`]).
+const POISONED: &str = "residency is never left by a panic";
+
+/// Residency held ([`lock`]): a shrink plan its owner dropped undone as it
+/// is taken; as it is released, what each layer holds published and then
+/// what waits on that publication answered (`Owed`), the one publisher of
+/// what any holder moved.
+pub(super) struct Held<'a>(MutexGuard<'a, Residency>);
+
+impl<'a> Held<'a> {
+    fn new(mut held: MutexGuard<'a, Residency>) -> Self {
+        held.unshrink();
+        Self(held)
+    }
+
+    /// Given first to every holder waiting for it (the keeper's, between
+    /// its jobs: [`Yielding::give_way`]), released as every holder is.
+    fn give_way(self, residency: &'a Yielding<Residency>) -> Self {
+        residency.give_way(self, POISONED, Self::new)
+    }
+}
+
+impl std::ops::Deref for Held<'_> {
+    type Target = Residency;
+    fn deref(&self) -> &Residency {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut Residency {
+        &mut self.0
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        // A panic is caught inside the lock, never unwinding through it,
+        // and ends serving before the lock is released ([`lock`]): nothing
+        // is published or answered from the state it left.
+        if !std::thread::panicking() && self.0.shared.life.ended().is_none() {
+            let residency = &mut *self.0;
+            residency.publish_held();
+            residency.owed.settle(&residency.shared);
+        }
+    }
+}
+
+/// What one turn of the keeper did so far, carried from job to job
+/// ([`Residency::TURN`]): only what the turn announces at its end. Nothing
+/// a job reads of the load is carried, since a request may hold residency
+/// between two jobs and change it.
+#[derive(Default)]
+pub(super) struct Turn {
+    /// What a request is served by changed (a step retired, a landing
+    /// learned, a promotion asked, a growth joined, a prompt group
+    /// cleared): the request service looks again.
+    changed: bool,
+}
+
+/// One job of a turn, given what the turn did so far: whether the turn
+/// goes on.
+pub(super) type Job<'a> = &'a dyn Fn(&mut Residency, &mut Turn, Option<&Copier>, Option<&MissCurve>) -> bool;
 
 impl Residency {
     /// Residency's thread: a turn ([`Self::tend`]) on every event of the
@@ -85,7 +177,7 @@ impl Residency {
     /// woken with why.
     /// Promotions copy by `copier` (none where the bank has no host tier),
     /// which this thread alone holds.
-    pub(super) fn keep(residency: Arc<Mutex<Self>>, shared: Arc<Shared>, copier: Option<Copier>) {
+    pub(super) fn keep(residency: Arc<Yielding<Self>>, shared: Arc<Shared>, copier: Option<Copier>) {
         let events = shared.events().clone();
         // The decode steps the reserve was last sized at.
         let mut decoded_steps = 0;
@@ -103,11 +195,9 @@ impl Residency {
                     shared.telemetry.feed();
                     copier.as_ref().and_then(|_| shared.telemetry.decoded_since(&mut decoded_steps))
                 }));
-                let mut held = lock(&residency);
-                if let Err(payload) =
-                    fed.and_then(|decoded| std::panic::catch_unwind(AssertUnwindSafe(|| held.tend(copier.as_ref(), decoded.as_ref()))))
-                {
-                    shared.end_serving(format!("it panicked: {}", panic_message(payload.as_ref())));
+                match fed {
+                    Ok(decoded) => Self::tend(&residency, copier.as_ref(), decoded.as_ref()),
+                    Err(payload) => shared.end_serving(format!("it panicked: {}", panic_message(payload.as_ref()))),
                 }
             }
             events.wait(seen);
@@ -125,58 +215,118 @@ impl Residency {
     /// turn that changed what a request is served by (a retirement, a
     /// landing learned, a promotion, a group cleared, a growth joined) is
     /// an event: the request service looks again.
-    fn tend(&mut self, copier: Option<&Copier>, decoded: Option<&crate::experts::directory::MissCurve>) {
-        // A panic of the executor's work, or the device lost under the
-        // parks, ends serving, as residency's own panic does.
+    ///
+    /// The turn takes residency's lock once no request waits for it, and
+    /// between its jobs gives it to any request that came to wait since
+    /// ([`Yielding::give_way`]): a request waits out at most the job it
+    /// found running. Each job leaves residency as a turn's end does (what it
+    /// moved published as it gives way, [`Held`], and nothing it decided
+    /// left for a later job), so a pass
+    /// between two serves from it as from one between turns. A panic
+    /// of a job ends serving before the lock is released.
+    fn tend(residency: &Yielding<Self>, copier: Option<&Copier>, decoded: Option<&MissCurve>) {
+        Self::turn(residency, &Self::TURN, copier, decoded);
+    }
+
+    /// A turn of `jobs` ([`Self::tend`]'s, [`Self::TURN`]).
+    pub(super) fn turn(residency: &Yielding<Self>, jobs: &[Job<'_>], copier: Option<&Copier>, decoded: Option<&MissCurve>) {
+        let mut held = Held::new(residency.background(POISONED));
+        let mut turn = Turn::default();
+        for job in jobs {
+            match std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut held, &mut turn, copier, decoded))) {
+                Ok(true) => held = held.give_way(residency),
+                Ok(false) => return,
+                Err(payload) => {
+                    held.shared.end_serving(format!("it panicked: {}", panic_message(payload.as_ref())));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A turn's jobs, in order ([`Self::tend`]).
+    pub(super) const TURN: [Job<'static>; 5] = [&Self::learn, &Self::promote, &Self::clear, &Self::fill, &Self::publish_turn];
+
+    /// A growth's slots joined, the steps the frontier passed retired, the
+    /// landings that ended learned and the tier's reserve kept; then a
+    /// resize asked served, which ends the turn. A fault of the executor's
+    /// work, or the device lost under the parks, ends serving, as
+    /// residency's own panic does, and the turn.
+    fn learn(&mut self, turn: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         if let Some(reason) = self.shared.fault() {
             self.shared.end_serving(reason);
-            return;
+            return false;
         }
         let joined = self.join();
         let retired = self.retire();
         let landed = self.prefetch.settle(&mut self.core.directory);
         self.refill_tier();
+        turn.changed = joined || retired || landed;
         if let Some(asked) = self.asked.take().or_else(|| self.shared.resizing.asked().map(Asked::taken)) {
             self.asked = self.resize(asked, copier);
-            return;
+            return false;
         }
-        // A shrink planned and not yet committed holds its records: nothing
-        // is promoted or released until it commits or is dropped.
-        // Held for a measurement beside the idle load, the copies running
-        // end and none is asked; a step running ends the hold at once, so
-        // no request waits on a measurement (the service preempts the
-        // measurement as a request arrives, and serving outranks it here
-        // until it has).
-        let idle = self.shared.steps.idle();
-        let held = self.shared.traffic_held() && idle;
+        true
+    }
+
+    /// The promotions asked and carried. A shrink planned and not yet
+    /// committed holds its records: nothing is promoted or released until
+    /// it commits or is dropped. Held for a measurement beside the idle
+    /// load, the copies running end and none is asked; a step running ends
+    /// the hold at once, so no request waits on a measurement (the service
+    /// preempts the measurement as a request arrives, and serving outranks
+    /// it here until it has).
+    fn promote(&mut self, turn: &mut Turn, copier: Option<&Copier>, decoded: Option<&MissCurve>) -> bool {
+        let held = self.traffic_held();
         let promoted = !self.core.directory.shrink_pending()
             && copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held));
-        let cleared = self.scratch.clear_past(&mut self.core, &mut self.prefetch);
-        if retired || landed || promoted {
-            self.publish_held();
-        }
+        turn.changed |= promoted;
+        true
+    }
+
+    /// A prompt group past cleared from the conveyor.
+    fn clear(&mut self, turn: &mut Turn, _: Option<&Copier>, _: Option<&MissCurve>) -> bool {
+        turn.changed |= self.scratch.clear_past(&mut self.core, &mut self.prefetch);
+        true
+    }
+
+    /// The tier filled ahead of the steps unless traffic is held; its
+    /// turning quiet is an event, which a hold waits on. Whether it is held
+    /// is read here, not carried from the promotions: a request served
+    /// between them means a step runs, which ends the hold at once.
+    fn fill(&mut self, _: &mut Turn, copier: Option<&Copier>, _: Option<&MissCurve>) -> bool {
+        let held = self.traffic_held();
         if !held {
             self.read_ahead();
         }
         let copying = copier.is_some_and(|copier| !copier.copies.idle());
-        // Its turning quiet is an event: a hold waits on it.
         let quiet = held && !copying && !self.prefetch.outstanding();
         if self.shared.traffic_quiet.swap(quiet, std::sync::atomic::Ordering::AcqRel) != quiet {
             self.shared.events().notify();
         }
+        true
+    }
+
+    /// The words a run's encoding reads, only while no step runs; the
+    /// lines at every turn; and the turn's change announced.
+    fn publish_turn(&mut self, turn: &mut Turn, _: Option<&Copier>, _: Option<&MissCurve>) -> bool {
         let steps = self.shared.steps.clone();
-        // The words a run's encoding reads only while no step runs; the
-        // lines at every turn.
         steps.while_idle(|| self.publish_policy());
         self.publish_lines();
-        if joined || retired || landed || promoted || cleared {
+        if turn.changed {
             self.shared.events().notify();
         }
+        true
+    }
+
+    /// Whether traffic is held for a measurement beside the idle load: as
+    /// of now, a step running ending it ([`Self::promote`]).
+    fn traffic_held(&self) -> bool {
+        self.shared.traffic_held() && self.shared.steps.idle()
     }
 
     /// Retire through the frontier (`Steps::frontier`): the device is past
-    /// every group whose every step is below it; and publish what each layer
-    /// holds then. Whether the frontier moved.
+    /// every group whose every step is below it. Whether the frontier moved.
     pub(super) fn retire(&mut self) -> bool {
         let frontier = self.shared.steps.frontier();
         if frontier <= self.core.retired {
@@ -190,7 +340,6 @@ impl Residency {
         for _ in 0..reserving {
             self.shared.lent.release();
         }
-        self.publish_held();
         true
     }
 
@@ -278,15 +427,19 @@ impl Residency {
     }
 
     /// Publish the experts each layer holds to the size rule, and those its
-    /// group's host tier holds alone.
+    /// group's host tier holds alone, where they changed since last
+    /// published: otherwise it counts nothing and takes no lock.
     pub(super) fn publish_held(&mut self) {
-        let held = (0..self.core.layers.len())
-            .map(|layer| self.core.directory.held_count(layer))
-            .collect::<Vec<_>>();
-        let alone = (0..self.core.layers.len())
-            .map(|layer| self.core.directory.alone(layer))
-            .collect::<Vec<_>>();
-        self.shared.telemetry.publish_held(&held, &alone);
+        let holdings = self.core.directory.holdings();
+        if self.published.holdings != Some(holdings) {
+            let Published { held, alone, .. } = &mut self.published;
+            for layer in 0..self.core.layers.len() {
+                held[layer] = self.core.directory.held_count(layer);
+                alone[layer] = self.core.directory.alone(layer);
+            }
+            self.shared.telemetry.publish_held(held, alone);
+            self.published.holdings = Some(holdings);
+        }
         // The moment the records misses land into first keep every expert:
         // from then no decode miss reads the file (`Prefetch::fill`). They
         // are a host tier's where the device places, the bank's own (the one

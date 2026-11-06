@@ -1,17 +1,19 @@
 //! A lock its background holder gives way on: the one shape of a value one
-//! thread works on at length in the background (the ranking's feed) while
-//! others hold it for what a device waits on (a parked request's claims).
+//! thread works on at length in the background (the ranking's feed,
+//! residency's keeper) while others hold it for what a device waits on (a
+//! parked request's claims, the request service's passes).
 //!
 //! A plain mutex lets a background holder that releases it and takes it
 //! again at once take it before a waiter the release woke can, so the
 //! waiter waits out the next hold too, and the one after. Here a holder
 //! the device waits on ([`Yielding::hold`]) is counted while it waits; the
 //! background takes the lock only once none is counted
-//! ([`Yielding::background`]): a waiter waits out at most the one
-//! background hold it found running, never a run of them.
+//! ([`Yielding::background`]), and between its jobs gives it to any that
+//! came meanwhile ([`Yielding::give_way`]): a waiter waits out at most the
+//! one background job it found running, never a run of them.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, TryLockResult};
 
 /// `T` behind a lock its background holder gives way on (module
 /// documentation).
@@ -41,5 +43,30 @@ impl<T> Yielding<T> {
             std::thread::yield_now();
         }
         self.value.lock().expect(poisoned)
+    }
+
+    /// The background's `held` (its guard, or what wraps it, which
+    /// `again` wraps it in once more), given first to every holder that
+    /// came to wait for it since: the value is theirs between two of the
+    /// background's jobs. Released by dropping `held`, so a wrapper's
+    /// release runs as at any other.
+    pub(crate) fn give_way<'a, H>(&'a self, held: H, poisoned: &str, again: impl FnOnce(MutexGuard<'a, T>) -> H) -> H {
+        if self.waiting.load(Ordering::Acquire) == 0 {
+            return held;
+        }
+        drop(held);
+        again(self.background(poisoned))
+    }
+
+    /// The holders waiting for it now, besides the background: a test's
+    /// sign that one waits.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+
+    /// The value if no one holds it now, for a report that must not wait.
+    pub(crate) fn try_hold(&self) -> TryLockResult<MutexGuard<'_, T>> {
+        self.value.try_lock()
     }
 }

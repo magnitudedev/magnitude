@@ -180,3 +180,83 @@ fn every_landing_of_an_expert_claims_it_once_in_the_one_store() {
         step.complete().unwrap();
     }
 }
+
+/// A request waiting while the keeper's turn runs takes residency between
+/// two of its jobs (`Residency::tend`), and finds it as at a turn's end.
+/// Under a traffic hold beside the idle load, the turn's refill takes
+/// victims the tier kept alone (graced through steps the device is past,
+/// so ready at once), and its promotions find the hold in force: the
+/// request, taking the lock after them, reads holdings already published
+/// without the victims. It begins a step while it holds the
+/// lock, which ends the hold's effect: the turn's fill, after it, reads
+/// the hold as it stands, so it reads ahead and leaves the traffic not
+/// quiet, as the running step asks.
+#[test]
+fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
+    let harness = layered("turn-handoff", EXPERTS, 12, 3, 4 + 4);
+    harness.demand_step(4);
+    harness.tier_ready();
+    let shared = harness.watcher.shared().clone();
+    let state = harness.watcher.state.clone();
+    let _hold = shared.hold_traffic();
+    shared.wait_traffic_quiet().unwrap();
+    let reserve = harness.staging_records as usize;
+    // Claims that leave the reserve short, so the turn's refill graces
+    // victims; kept until the turn ends.
+    let grants = std::cell::RefCell::new(Vec::new());
+    let alone = |state: &residency::Residency| (0..state.core.layers.len()).map(|layer| state.core.directory.alone(layer)).collect::<Vec<_>>();
+    let claimed = std::cell::RefCell::new(Vec::new());
+    let short = |state: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
+        for expert in 0..EXPERTS {
+            if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0) {
+                grants.borrow_mut().push(grant);
+            }
+            if state.core.directory.refill_short(reserve) {
+                break;
+            }
+        }
+        assert!(state.core.directory.refill_short(reserve), "the claims left the reserve short");
+        state.publish_held();
+        *claimed.borrow_mut() = alone(state);
+        true
+    };
+    // The request: waiting once the refill's and the promotions' jobs have
+    // run, it takes the lock as the latter gives way, reads the holdings
+    // and begins a step, before the fill.
+    let request = std::cell::RefCell::new(None);
+    let wait = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
+        assert_ne!(alone(held), *claimed.borrow(), "the refill took no victim the tier kept alone");
+        let (requested, shared) = (state.clone(), shared.clone());
+        let records = harness.layers.iter().map(|layer| layer.4.clone()).collect::<Vec<_>>();
+        let thread = std::thread::spawn(move || {
+            let held = residency::lock(&requested);
+            let directory = &held.core.directory;
+            let layers = 0..held.core.layers.len();
+            let found = (layers.clone().map(|layer| directory.held_count(layer)).collect::<Vec<_>>(), layers.map(|layer| directory.alone(layer)).collect::<Vec<_>>());
+            let step = begin(&shared, &[StepRoute::Decode], false).unwrap().pop().unwrap();
+            // Its route chooses nothing at every layer, published before
+            // the lock is released, as a route publishes before any read.
+            let base = (step.sequence() % WORDS.flight) as usize * WORDS.routing_words() as usize;
+            for record in &records {
+                record.store(base + constants::RING_COUNT as usize, 0);
+                record.store(base + constants::RING_SEQUENCE as usize, super::super::steps::low_word(step.sequence()));
+            }
+            (shared.telemetry.holdings(), found, step)
+        });
+        eventually("the request never waited for residency", || state.waiting() > 0);
+        *request.borrow_mut() = Some(thread);
+        true
+    };
+    let quiet = std::cell::Cell::new(true);
+    let after = |held: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
+        quiet.set(held.shared.traffic_quiet.load(std::sync::atomic::Ordering::Acquire));
+        true
+    };
+    let turn = residency::Residency::TURN;
+    residency::Residency::turn(&state, &[&short, turn[0], turn[1], &wait, turn[2], turn[3], &after], None, None);
+    let (published, found, step) = request.into_inner().expect("the request ran").join().unwrap();
+    assert_eq!(published, found, "the request read holdings the refill left unpublished");
+    assert!(!quiet.get(), "the fill called the traffic quiet while a step ran");
+    drop(grants);
+    step.complete().unwrap();
+}

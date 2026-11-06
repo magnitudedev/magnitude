@@ -294,7 +294,7 @@ impl ResizeHandoff {
     }
 
     /// Answer the owner, once what the resize changed is published
-    /// ([`Residency::publish_resized`]).
+    /// ([`Residency::publish_resized`]) and what each layer holds ([`Owed`]).
     fn answer(&self, answer: Answer, _: Published) {
         let mut resize = self.resize.lock().expect("watcher resize");
         *resize = Resize::Answered(answer);
@@ -443,6 +443,28 @@ impl Asked {
 /// device has not been given.
 struct Published(());
 
+/// What waits on what each layer holds being published, answered once
+/// residency has published it as it is released
+/// (`super::residency::Held`): a resize's answer, whose owner reads the
+/// holdings it left, and the joins applied, whose holdings follow them.
+#[derive(Default)]
+pub(super) struct Owed {
+    answer: Option<(Answer, Published)>,
+    joined: usize,
+}
+
+impl Owed {
+    /// Answer what waits, what each layer holds published.
+    pub(super) fn settle(&mut self, shared: &Shared) {
+        if let Some((answer, published)) = self.answer.take() {
+            shared.resizing.answer(answer, published);
+        }
+        if self.joined > 0 {
+            shared.joins.applied(std::mem::take(&mut self.joined));
+        }
+    }
+}
+
 impl Residency {
     /// Return the records of every plan dropped uncommitted
     /// ([`ShrinkPlan`]'s drop), as residency's lock is taken
@@ -481,8 +503,7 @@ impl Residency {
         }
         if count > 0 {
             self.shared.telemetry.resized(self.core.bank_records());
-            self.publish_held();
-            self.shared.joins.applied(count);
+            self.owed.joined += count;
         }
         count > 0
     }
@@ -526,7 +547,7 @@ impl Residency {
         };
         let answer = self.serve_resize(ask, trip);
         let published = self.publish_resized();
-        self.shared.resizing.answer(answer, published);
+        assert!(self.owed.answer.replace((answer, published)).is_none(), "a resize is answered before residency is released");
         None
     }
 
@@ -568,14 +589,12 @@ impl Residency {
                 let slots = candidates.slots(chosen);
                 let records = (candidates.records)(slots);
                 let groups = plan(&mut self.core, &records, &target, last_read);
-                self.publish_held();
                 Answer::Planned(ShrinkPlan { slots, groups, trip: trip(), holds: Some(self.shared.clone()) })
             }
             Ask::Commit(mut plan) => {
                 commit(&mut self.core, &plan);
                 plan.holds = None;
                 self.shared.telemetry.resized(self.core.bank_records());
-                self.publish_held();
                 Answer::Done(trip())
             }
             Ask::ShrinkHost { candidates, keeping } => Answer::Cut(self.serve_cut(&candidates, keeping, trip)),
@@ -631,7 +650,6 @@ impl Residency {
         }
         self.address_tier(views);
         self.shared.telemetry.resized(self.core.bank_records());
-        self.publish_held();
         let cut = HostCut { slots, trip: trip() };
         Ok(Some(match keeping {
             Keeping::Host => Cut::Copied(cut),

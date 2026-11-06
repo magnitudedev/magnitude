@@ -488,7 +488,7 @@ pub(super) struct Watcher {
     watchdog: Option<crate::experts::exchange::Watchdog>,
     /// Residency's state, which a test reads to set up what serving finds.
     #[cfg(test)]
-    state: Arc<Mutex<Residency>>,
+    state: Arc<crate::experts::yielding::Yielding<Residency>>,
 }
 
 /// What a streamed load hands its watcher to serve.
@@ -694,11 +694,13 @@ impl Watcher {
             site_opened: shared.compute.site_served(),
             site_share: Default::default(),
             lines: None,
+            published: residency::Published::new(count),
+            owed: resize::Owed::default(),
         };
         residency.publish_held();
         residency.publish_policy();
         residency.publish_lines();
-        let residency = Arc::new(Mutex::new(residency));
+        let residency = Arc::new(crate::experts::yielding::Yielding::new(residency));
         // From here a thread that cannot start drops the watcher, which
         // stops and joins those that did.
         let mut watcher = Self {

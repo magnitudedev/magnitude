@@ -169,6 +169,9 @@ pub(super) struct BankRecords {
     /// without a device (an offline replay) or where the host places, whose
     /// landings write the one store's.
     tier: Option<(Vec<StampedMap>, (usize, usize))>,
+    /// Bumped as any expert comes to be held or leaves: what each layer
+    /// holds changed since a reader last saw it ([`Self::holdings`]).
+    holdings: u64,
 }
 
 impl BankRecords {
@@ -190,6 +193,7 @@ impl BankRecords {
             changed: false,
             shrink_held: 0,
             tier,
+            holdings: 0,
         }
     }
 
@@ -214,6 +218,12 @@ impl BankRecords {
     /// `layer`'s group.
     pub fn group(&self, layer: usize) -> usize {
         self.layers[layer].0
+    }
+
+    /// The count of changes to what any layer holds: equal counts, equal
+    /// holdings.
+    pub fn holdings(&self) -> u64 {
+        self.holdings
     }
 
     /// The record holding `layer`'s `expert`.
@@ -351,6 +361,7 @@ impl BankRecords {
         let held = &mut self.layers[staged.0].1[staged.1];
         assert!(held.is_none(), "expert {staged:?} is held already, in record {held:?}");
         *held = Some(record);
+        self.holdings += 1;
         self.set(self.layers[staged.0].0, record, Record::Held(staged));
     }
 
@@ -361,6 +372,7 @@ impl BankRecords {
             Record::Free => None,
             Record::Held(staged) => {
                 self.layers[staged.0].1[staged.1] = None;
+                self.holdings += 1;
                 self.unmap(staged, until);
                 Some(staged)
             }

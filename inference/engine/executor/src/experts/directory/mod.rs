@@ -1098,6 +1098,13 @@ impl Directory {
         (!self.stores(layer, expert)).then(|| self.reuse(layer, expert, None))
     }
 
+    /// The count of changes to what any layer holds, in the bank or its
+    /// host tier alone ([`Self::held_count`], [`Self::alone`]): equal
+    /// counts, equal holdings.
+    pub fn holdings(&self) -> u64 {
+        self.bank.holdings() + self.host.iter().map(HostRecords::holdings).sum::<u64>()
+    }
+
     /// The experts `layer` holds.
     pub fn held_count(&self, layer: usize) -> usize {
         (0..self.bank.experts(layer)).filter(|&expert| self.bank.held(layer, expert).is_some()).count()

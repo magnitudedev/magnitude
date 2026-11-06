@@ -27,7 +27,8 @@ fn a_dropped_shrink_plan_is_undone_for_every_holder_of_residency() {
 /// cleared), while the kept ones above the new commitment stay mapped where
 /// their bytes are until the plan, its moves carried, is committed; then
 /// their map entries follow, from the first step not yet begun, and the
-/// records it carries are the telemetry's. A dropped plan leaves every kept
+/// records it carries are the telemetry's. Its owner finds what each layer
+/// holds published as the plan is answered. A dropped plan leaves every kept
 /// expert where it was. A regrowth joins beside a running step and adds free records, which the
 /// next seeding takes.
 #[test]
@@ -61,6 +62,7 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     let map = &harness.layer.0;
     let mapped = || (1..=4).map(|expert| map.held(expert).map_or(-1, |record| record as i32)).collect::<Vec<_>>();
     assert_eq!(mapped(), [3, 2, -1, -1], "evicted at once, the kept where their bytes are");
+    assert_eq!(shared.holdings().0, [2], "the plan's evictions are published as it is answered");
     assert_eq!(shared.costs().records, [4]);
     drop(plan);
     assert_eq!(mapped(), [3, 2, -1, -1], "a dropped plan moves nothing");
