@@ -265,6 +265,21 @@ checkpoints keep those weights in BF16, refuse W4A4 weights rather than form row
 The stored `input_scale` marks the recipe and is not applied: each row's global scale is the
 row's own power of two.
 
+## UE8M0-scaled FP8 weights
+
+A GGUF declaring `magnitude.scale_encoding = "ue8m0"` stores an FP8 checkpoint's block-scaled
+weights as the checkpoint ships them (`inference/conversion`). A weight `X` is its F8_E4M3 codes
+`X.weight` `[rows, columns]` beside an I8 grid `X.scale` `[rows / r, columns / c]` of UE8M0
+bytes, one per `[r, c]` tile. A reader takes the tile as the quotient of the two shapes, which
+is unambiguous only for whole tiles, so a file holds whole tiles only. A code q in a tile of
+byte b has the value q · 2^(b − 127), one F32 product (OCP MX's E8M0: 255 is NaN). DeepSeek
+V4.1's dense FP8 weights have 32 × 32 tiles and its Engram table 1 × 32.
+
+The converter and the model references (`inference/evaluation`) refuse bytes above 246, the
+range in which every product is exact in F32: E4M3's largest code, 448 = 1.75 · 2^8, reaches
+F32's largest binade at b = 246, and its smallest step, 2^−9, stays above F32's smallest at
+every b.
+
 ## Evidence and boundaries
 
 Development evaluation measures the four relations together: scaling at fixed structure;

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+# Converts released checkpoints into the GGUFs Magnitude publishes. It builds on llama.cpp's converter at a pinned
+# release, whose scripts pin transformers 4.57.6; the evaluation workspace's references check against transformers
+# 5.17.0, so the converter is its own project.
+[project]
+name = "magnitude-conversion"
+version = "0.1.0"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+  "llama-cpp-scripts",
+  "torch==2.11.0",
+  "safetensors>=0.6",
+]
+
+[project.scripts]
+magnitude-conversion = "magnitude_conversion.__main__:main"
+
+[tool.uv]
+# llama-cpp-scripts names its gguf-py by relative path; the same commit's gguf-py by URL keeps the lock portable
+override-dependencies = ["gguf @ git+https://github.com/ggml-org/llama.cpp@cd959bae99ff4bed22bef2604f45241c09bbb8c8#subdirectory=gguf-py"]
+
+[tool.uv.sources]
+# llama.cpp v0.9.0
+llama-cpp-scripts = { git = "https://github.com/ggml-org/llama.cpp", rev = "cd959bae99ff4bed22bef2604f45241c09bbb8c8" }
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magnitude_conversion"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
