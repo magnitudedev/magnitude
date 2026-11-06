@@ -595,7 +595,7 @@ fn scores(
         if waited {
             let costs = domain.expert_costs().expect("a banked load's costs");
             let (misses, read) = costs.layers.iter().fold((0, 0), |(misses, read), layer| {
-                (misses + layer.misses, read + layer.staged + layer.reading + layer.unanticipated)
+                (misses + layer.misses, read + layer.reading + layer.unanticipated)
             });
             assert!(misses > 0, "{backend:?}: a partial bank misses");
             assert_eq!(read, 0, "{backend:?}: every miss is the tier's, none read from the file ({misses} misses)");

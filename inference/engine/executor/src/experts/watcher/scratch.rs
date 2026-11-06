@@ -196,12 +196,6 @@ fn compose_rounds(cold: &[usize], borrowers: &[Option<usize>], round_records: us
     composed
 }
 
-/// `items` by `rank`, each ranked once. The ranking is shared and its feed moves it as this reads
-/// it, so a key read at each comparison would make no consistent order, which a sort panics on.
-fn ranked_once<T, K: Ord>(items: &mut [T], rank: impl FnMut(&T) -> K) {
-    items.sort_by_cached_key(rank);
-}
-
 /// The load's scratch words: each chain place's flags, each scratch
 /// round's convert list, the tier list and the seed list.
 pub(super) struct ScratchWords {
@@ -466,12 +460,7 @@ impl Scratch {
     /// the conveyor's records of those layers, and once it is past the
     /// group, clear the conveyor as soon as nothing of the group runs
     /// ([`Self::clear_past`]).
-    pub(super) fn advance(
-        &mut self,
-        progress: Point,
-        core: &mut Core,
-        prefetch: &mut Prefetch,
-    ) {
+    pub(super) fn advance(&mut self, progress: Point, core: &mut Core) {
         let Some(serving) = self.conveyor.serving.as_mut() else {
             return;
         };
@@ -502,21 +491,21 @@ impl Scratch {
             });
             return;
         }
-        self.clear_past(core, prefetch);
+        self.clear_past(core);
     }
 
     /// The group served is past: once no read or landing of it runs (a
     /// failed step's reads, which no round listed, the conveyor's landings
-    /// into the host tier, each an event as it ends), stage what the
-    /// conveyor holds whole, empty it, release the tier records its rounds
+    /// into the host tier, each an event as it ends), empty the conveyor,
+    /// release the tier records its rounds
     /// held and return the lender's records empty. Nothing takes what
     /// those ran for, so a failed one's outcome is no step's. Until then
     /// nothing is done, and the next group's requests wait
     /// ([`Self::clearing`]). Whether it cleared.
-    pub(super) fn clear_past(&mut self, core: &mut Core, prefetch: &mut Prefetch) -> bool {
-        let Some(serving) = self.conveyor.serving.filter(|serving| serving.past) else {
+    pub(super) fn clear_past(&mut self, core: &mut Core) -> bool {
+        if !self.conveyor.serving.is_some_and(|serving| serving.past) {
             return false;
-        };
+        }
         // Its landings from the conveyor end before a record takes another
         // read, each learned before a decode request asks the tier for its
         // expert.
@@ -524,9 +513,6 @@ impl Scratch {
         if !self.conveyor.quiet() {
             return false;
         }
-        // Clearing forgets which record holds whom: what the conveyor holds
-        // whole is staged first.
-        self.stage_landed(serving, core, prefetch);
         self.conveyor.clear();
         // The device is past every tier copy of the group.
         for (layer, record) in self.held.drain(..) {
@@ -535,48 +521,6 @@ impl Scratch {
         core.directory.end_prompt_group(self.conveyor.lending().group);
         self.conveyor.serving = None;
         true
-    }
-
-    /// The group `serving` is past and no read of it runs: copy each expert
-    /// the conveyor's records hold whole and its seeding ranked, which the
-    /// bank does not hold and staging does not keep, into a staging record
-    /// beyond the demand reserve, the most reused first while records
-    /// remain (`Directory::reuse` beside the step that last routed it,
-    /// staging's records taken as it ranks them). The records would
-    /// otherwise return to the bank empty, the
-    /// experts discarded; a decode demand for one takes it back staged and
-    /// lands it into the tier as any staged miss, and nothing is read from
-    /// storage. The device is past the group and nothing is placed in a lent
-    /// record before it returns, so nothing accesses either record during
-    /// the copy.
-    fn stage_landed(&mut self, serving: Serving, core: &Core, prefetch: &mut Prefetch) {
-        let mut landed = self.conveyor.take_landed();
-        let pools = self.conveyor.pools();
-        // Nor what a host tier keeps or lands, which serves it.
-        landed.retain(|&(_, layer, expert, _)| !core.directory.stores(layer, expert) && !prefetch.staging.keeps((layer, expert)));
-        let directory = &core.directory;
-        ranked_once(&mut landed, |&(routed, layer, expert, _)| {
-            (std::cmp::Reverse(directory.reuse(layer, expert, Some(routed))), layer, expert)
-        });
-        landed.truncate(prefetch.staging.free().saturating_sub(core.extents.demand));
-        let records = prefetch
-            .staging
-            .take_many(landed.len(), |staged| directory.staged_worth(staged))
-            .expect("staging records beyond the demand reserve");
-        let steps = serving.last - serving.group + 1;
-        for (&(_, layer, expert, conveyed), record) in landed.iter().zip(records) {
-            // SAFETY: the record is free, so no read lands in it until a
-            // request takes it (no device work reads staging), and the
-            // conveyor's record holds the bytes the device is past.
-            unsafe { core.stage_conveyed(pools, layer, conveyed, record) };
-            let point = Point {
-                group: serving.group,
-                layer,
-                sequence: serving.last,
-            };
-            prefetch.read_at[record as usize] = Some(At::new(point, steps, core.layers.len()));
-            prefetch.staging.release(record, Some((layer, expert)));
-        }
     }
 
     /// `mark` came at `at` at `layer` of the group the conveyor serves
@@ -1133,8 +1077,6 @@ impl Scratch {
     /// step, its seeding.
     fn opened(&mut self, at: At, arrived: Instant, request: Request, core: &mut Core, shared: &Shared) -> Opened {
         let Point { group, layer, sequence } = at.point;
-        let experts = core.layers[layer].experts;
-        let index = self.tiers.iter().position(|tier| (tier.group, tier.layer) == (group, layer)).expect("an opened request's tier");
         let Request { routed, hits, cold, .. } = request;
         // What the records freed since let the conveyor carry, this
         // request's deferred experts among them.
@@ -1145,18 +1087,6 @@ impl Scratch {
         // every reader of the lists, staging and conveyor before it.
         shared.telemetry.arrived(group, arrived);
         self.mark_at(shared, layer, Mark::Arrived(sequence), arrived);
-        // The group's last step ranks what the conveyor holds of the
-        // layer by the step that last routed each (`Conveyor::rank`), which
-        // stages it as the group's records return (`Self::stage_landed`).
-        let last = self.conveyor.serving.expect("a scratch request's group is served").last;
-        if sequence == last {
-            let tier = &self.tiers[index];
-            let tier_routed = (0..experts)
-                .filter(|&expert| tier.routed[expert] > 0)
-                .map(|expert| (expert, tier.last[expert]))
-                .collect::<Vec<_>>();
-            self.conveyor.rank(layer, &tier_routed);
-        }
         Opened { routed, hits, cold }
     }
 
@@ -1540,7 +1470,7 @@ impl Request {
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_rounds, ranked_once};
+    use super::compose_rounds;
 
     /// A slot's expert converts in a round after its borrower's, which
     /// converts the borrower out of it, the rest in the order they are
@@ -1559,18 +1489,5 @@ mod tests {
         // Its borrower ready last, in the last full round, which nothing
         // else fills: 1 joins it.
         assert_eq!(compose_rounds(&[2, 4, 3, 1], &[None, None, None, Some(3)], 2), [2, 4, 3, 1]);
-    }
-
-    /// A ranking moving under a sort orders what was read of it, whatever it reads next.
-    #[test]
-    fn a_moving_ranking_is_read_once_an_item() {
-        let mut items = (0..64).collect::<Vec<u32>>();
-        let mut reads = 0;
-        // Each read of the ranking reverses the order the last read gave.
-        ranked_once(&mut items, |&item| {
-            reads += 1;
-            if reads % 2 == 0 { item as i64 } else { -(item as i64) }
-        });
-        assert_eq!(reads, 64);
     }
 }

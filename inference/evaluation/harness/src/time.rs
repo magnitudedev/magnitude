@@ -1071,8 +1071,7 @@ fn measure(
             let reads = end.reads.since(&start.reads);
             let sums = |reads| serde_json::to_value(reads).expect("read sums serialize");
             let (demand_reads, served_reads) = (sums(reads), sums(end.reads));
-            // Staged misses read nothing: the bandwidth is the demand
-            // requests' that read every miss.
+            // The bandwidth is the demand requests' that read every miss.
             let bandwidth = (reads.seconds > 0.).then(|| reads.bytes / reads.seconds);
             let layers = start
                 .layers
@@ -1083,7 +1082,6 @@ fn measure(
                         "misses": end.misses - start.misses,
                         "missed_bytes": end.missed_bytes - start.missed_bytes,
                         "hosted": end.hosted - start.hosted,
-                        "staged": end.staged - start.staged,
                         "reading": end.reading - start.reading,
                         "unanticipated": end.unanticipated - start.unanticipated,
                         "lead": end.lead - start.lead,
@@ -1413,7 +1411,6 @@ fn streamed_model(
         "misses_per_step": misses / window,
         "miss_shares": {
             "hosted": share("hosted"),
-            "staged": share("staged"),
             "reading": share("reading"),
             "unanticipated": share("unanticipated"),
         },
@@ -1772,7 +1769,7 @@ fn streamed_bar(
                 let at = &detail["experts"][layer];
                 let count = |name: &str| at[name].as_f64().ok_or(format!("streamed layer {layer}'s {name}"));
                 let misses = count("misses")?;
-                Ok(if misses > 0. { (count("staged")? + count("reading")?) / misses } else { 0. })
+                Ok(if misses > 0. { count("reading")? / misses } else { 0. })
             }
             false => Ok(0.),
         })

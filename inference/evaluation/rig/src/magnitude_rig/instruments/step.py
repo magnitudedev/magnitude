@@ -275,7 +275,7 @@ STREAMED_MEASURED = ("detail.window.wall_ms_per_step",)
 # The optional sections' fields, each rendered only when a build records all of them.
 ENTRY_FIELDS = ("entry", "device_ms_per_step", "launches_per_step", "share")
 MODEL_FIELDS = (
-    "miss_shares.staged", "miss_shares.reading", "miss_shares.unanticipated", "figures.overhead_ms",
+    "miss_shares.reading", "miss_shares.unanticipated", "figures.overhead_ms",
     "predicted_tok_s", "ratio", "misses_per_step", "all_hit_steps", "window_steps",
 )
 PAGE_FIELDS = ("expert_pages",)
@@ -710,8 +710,8 @@ def _streamed(arguments, cap: int, result: JobResult, resident: dict | None) -> 
                    f"all-hit {(resident_mean_ms + overhead_ms) / resident_mean_ms:.3f}× resident")
         predicted = f"{model['predicted_tok_s']:.1f} tok/s · measured/model {model['ratio']:.3f}"
         # A window without misses has no shares of them.
-        missed = ("" if shares["staged"] is None else
-                  f" (staged {shares['staged']:.3f}, reading {shares['reading']:.3f}, "
+        missed = ("" if shares["reading"] is None else
+                  f" (reading {shares['reading']:.3f}, "
                   f"unanticipated {shares['unanticipated']:.3f})")
         lines.append(
             f"  model {predicted} · {model['misses_per_step']:.1f} misses/step{missed} · "

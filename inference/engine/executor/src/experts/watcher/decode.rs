@@ -1,10 +1,9 @@
 //! Decode requests (`routed_route_streamed`): each expert neither the bank
 //! nor its host tier holds (the device serves the tier's itself) lands
 //! into a ready tier record of its layer's group (`experts::landing`):
-//! revived from staging at once, landed by its hint's read, or read now
-//! into staging. Each choice's record is written as its expert lands, so no
-//! landing waits for another's read, and the request's slot is answered as
-//! its last lands; a landing is no promotion into the bank, which the
+//! landed by its hint's read, or read now into staging. Each choice's
+//! record is written as its expert lands, so no landing waits for
+//! another's read, and the request's slot is answered as its last lands; a landing is no promotion into the bank, which the
 //! ranking alone decides (`promotions`).
 
 use super::{Shared, Step};
@@ -38,8 +37,7 @@ pub(super) fn fail(core: &Core, shared: &Shared, layer: usize, sequence: Step, r
     shared.parks.settle();
 }
 
-/// How a request's absent expert lands: from the staging record keeping it
-/// (revived, no read) into a tier record; already landed in a tier record;
+/// How a request's absent expert lands: already landed in a tier record;
 /// read now into a staging record and landed as it ends; or once its read
 /// ahead (a hint's or the tier's fill's, hastened to demand) has landed,
 /// or, the tier holding no record past its grace or staging no free record
@@ -52,26 +50,14 @@ enum Plan {
     Unread(Unread),
 }
 
-/// How an absent expert read by nothing now lands ([`Plan`]): kept by
-/// staging record `record`, revived into a ready tier record once the read
-/// is submitted, or waiting for one; kept already in tier record `tier`;
-/// waiting for the landing in flight that reads it (`Reading`); or waiting
-/// for a staging or tier record before it is read (`Waits`).
+/// How an absent expert read by nothing now lands ([`Plan`]): kept already
+/// in tier record `tier`; waiting for the landing in flight that reads it
+/// (`Reading`); or waiting for a staging or tier record before it is read
+/// (`Waits`).
 enum Unread {
-    Staged { record: u32 },
     Kept(u32),
     Reading,
     Waits,
-}
-
-/// How an absent expert read by nothing now lands, its tier record decided
-/// ([`Unread`]): revived from staging record `record` into the tier record
-/// its claim's `grant` took, kept in `tier`, or waiting (`Waiting`) for its landing in flight
-/// or, where `record`, for a record.
-enum Landed {
-    Revived { record: u32, grant: Grant },
-    Kept(u32),
-    Waits { record: bool },
 }
 
 /// An absent expert of a served request waiting for its read ahead's
@@ -173,9 +159,8 @@ impl Decode {
     /// Answer each waiting expert its tier keeps now (its read ahead
     /// landed), pass over each whose read ahead still runs, and land the
     /// rest a tier record is now past its grace for, in the order they
-    /// waited: each read now and answered as it lands (or revived from
-    /// staging); one of a step that ended (retired, or failed) is dropped,
-    /// as its launches returned. The landings that ended are learned first
+    /// waited: each read now and answered as it lands; one of a step that
+    /// ended (retired, or failed) is dropped, as its launches returned. The landings that ended are learned first
     /// (`Prefetch::settle`), so a miss waits for its read ahead's landing
     /// alone, never for residency's next turn to learn it. True when any
     /// landing was learned, or any miss answered, landed or dropped.
@@ -214,10 +199,9 @@ impl Decode {
                 }
                 Located::Lacked => {}
             }
-            // A record to read it into, unless staging keeps it: none free
-            // (a failed step's read still holds one) waits for one, its
-            // landing's end an event.
-            if !prefetch.staging.keeps(staged) && prefetch.staging.free() == 0 {
+            // A record to read it into: none free (a failed step's read
+            // still holds one) waits for one, its landing's end an event.
+            if prefetch.staging.free() == 0 {
                 break;
             }
             let steps = shared.steps.group_of(waits.at.point.sequence).1;
@@ -232,18 +216,7 @@ impl Decode {
             if waits.record {
                 crate::experts::landing::LandingAccount::add(&shared.landings.waited, waits.named.elapsed());
             }
-            if let Some(record) = prefetch.staging.revive(staged) {
-                let landing = parked_landing(core, grant, record, waits.at.point, steps);
-                let revived = (staged, record, Some(waits.at.point.sequence));
-                prefetch.revive(landing, revived, Priority::Demand, Some(waits.answer), shared);
-                continue;
-            }
-            let directory = &core.directory;
-            let record = prefetch
-                .staging
-                .take(|staged| directory.staged_worth(staged))
-                .expect("a free staging record, looked at above");
-            prefetch.read_at[record as usize] = Some(waits.at);
+            let record = prefetch.staging.take().expect("a free staging record, looked at above");
             let reads = core.reads(layer, expert, record);
             let count = reads.len();
             let landing = Named {
@@ -266,7 +239,7 @@ impl Decode {
                 // expert fail, and its wait is answered with none, so the rest of the step serves.
                 Err(reason) => {
                     core.directory.unlanded(layer, HostRecord(tier));
-                    prefetch.staging.release(record, None);
+                    prefetch.staging.release(record);
                     shared.steps.fail_request_rows(naming.sequence, layer, &landing.rows, reason);
                     landing.answer.publish(None);
                 }
@@ -364,10 +337,9 @@ impl Decode {
         };
         let naming = Naming { layer, sequence, named: started };
         seismic_io::timeline::note_at(started, seismic_io::timeline::Kind::Noted("notice"), sequence as u64, (layer as i64, absent.len() as i64, count as i64));
-        // Each absent expert's landing: one staging keeps (revived), a read
-        // ahead's, hastened to demand (reading), or one read now. The
-        // request's lead is the layers since its last read a route issued
-        // was submitted: none where every miss had landed already, a read it
+        // Each absent expert's landing: a read ahead's, hastened to demand
+        // (reading), or one read now. The request's lead is the layers since
+        // its last read a route issued was submitted: none where every miss had landed already, a read it
         // never saw. A fill's read no route issued is a demand's to it: no
         // prediction made it.
         let mut served = RequestCost { missed: absent.clone(), ..RequestCost::default() };
@@ -393,8 +365,8 @@ impl Decode {
                     (Some(Plan::Unread(Unread::Kept(tier))), None)
                 }
                 // A landing of it is in flight, whoever's (a read ahead's,
-                // another request's, the fill's from staging): it waits for
-                // it, hastened to demand.
+                // another request's, the fill's): it waits for it, hastened
+                // to demand.
                 Located::Landing => {
                     match prefetch.hasten(staged) {
                         Some(Reading::Hint(issued)) => {
@@ -404,24 +376,15 @@ impl Decode {
                         Some(Reading::Unpredicted) | None => (Some(Plan::Unread(Unread::Reading)), Some(Anticipation::Demand)),
                     }
                 }
-                Located::Lacked => match prefetch.staging.revive(staged) {
-                    Some(record) => {
-                        if let Some(issued) = prefetch.read_at[record as usize] {
-                            taken_from(issued);
-                        }
-                        (Some(Plan::Unread(Unread::Staged { record })), Some(Anticipation::Staged))
-                    }
-                    None => {
-                        fresh += 1;
-                        (None, Some(Anticipation::Demand))
-                    }
-                },
+                Located::Lacked => {
+                    fresh += 1;
+                    (None, Some(Anticipation::Demand))
+                }
             };
             let code = match (&plan, anticipation) {
                 (Some(Plan::Unread(Unread::Kept(_))), _) => 0,
                 (_, Some(Anticipation::Reading)) => 1,
                 (Some(Plan::Unread(Unread::Reading)), _) => 2,
-                (_, Some(Anticipation::Staged)) => 3,
                 _ => 4,
             };
             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), sequence as u64, (layer as i64, expert as i64, code));
@@ -435,8 +398,8 @@ impl Decode {
         // Its own hints hastened, the device is at this layer: the hints of
         // layers it has begun or passed read nothing more.
         prefetch.withdraw_passed(core, &shared.steps, Some((sequence, layer)));
-        // Those read now, each into a staging record free once every revival
-        // took its own: an earlier request's are free once its landings end,
+        // Those read now, each into a free staging record: an earlier
+        // request's are free once its landings end,
         // which the device past its answers proves (`Residency::advance`
         // learned them), but one a failed step left reading frees only as
         // its read and landing end. An expert beyond them waits for one
@@ -467,19 +430,13 @@ impl Decode {
         // it reads all the request's misses. It is submitted before
         // anything it does not need.
         let reading = plans.iter().filter(|plan| matches!(plan, Plan::Read { .. })).count();
-        let directory = &core.directory;
-        let mut taken = prefetch
-            .staging
-            .take_many(reading, |staged| directory.staged_worth(staged))
-            .expect("a free staging record for each read, counted above")
-            .into_iter();
+        let mut taken = prefetch.staging.take_many(reading).expect("a free staging record for each read, counted above").into_iter();
         let (mut reads, mut landings, mut tracked, mut others) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (&expert, plan) in absent.iter().zip(plans) {
             match plan {
                 Plan::Read { grant } => {
                     let tier = grant.record();
                     let record = taken.next().expect("a staging record a read");
-                    prefetch.read_at[record as usize] = Some(at);
                     let begun = reads.len();
                     reads.extend(core.reads(layer, expert, record));
                     landings.push(Named {
@@ -510,24 +467,6 @@ impl Decode {
         // Counted before any answer, which releases the device to complete
         // the step: no landing is registered yet, nor answer published.
         shared.telemetry.serve(layer, sequence, served);
-        // A staged expert's tier record, after the reads': it reads nothing.
-        let others = others
-            .into_iter()
-            .map(|(expert, unread)| match unread {
-                // Lacked, as located above: a claim takes a record, or
-                // finds none ready.
-                Unread::Staged { record } => match demand_claim(core, (layer, expert), (point, steps)) {
-                    Claim::Taken(grant) => (expert, Landed::Revived { record, grant }),
-                    _ => {
-                        prefetch.staging.release(record, Some((layer, expert)));
-                        (expert, Landed::Waits { record: true })
-                    }
-                },
-                Unread::Kept(tier) => (expert, Landed::Kept(tier)),
-                Unread::Reading => (expert, Landed::Waits { record: false }),
-                Unread::Waits => (expert, Landed::Waits { record: true }),
-            })
-            .collect::<Vec<_>>();
         // The tier map's unmappings, a ready record's reclaim among them,
         // were stored as each claim took its record, before any landing
         // starts: no step after the parked one resolves an unmapped expert
@@ -550,7 +489,7 @@ impl Decode {
             Some((_, Err(reason))) => {
                 for (record, (layer, _), tier, _) in tracked {
                     core.directory.unlanded(layer, HostRecord(tier));
-                    prefetch.staging.release(record, None);
+                    prefetch.staging.release(record);
                 }
                 for landing in landings {
                     shared.steps.fail_request_rows(sequence, layer, &landing.rows, reason.clone());
@@ -559,21 +498,16 @@ impl Decode {
             }
             None => {}
         }
-        for (expert, landed) in others {
-            let record = match landed {
-                Landed::Revived { record, grant } => {
-                    let landing = parked_landing(core, grant, record, point, steps);
-                    let revived = ((layer, expert), record, Some(sequence));
-                    prefetch.revive(landing, revived, Priority::Demand, Some(answer_of(expert)), shared);
-                    continue;
-                }
-                Landed::Kept(tier) => {
+        for (expert, unread) in others {
+            let record = match unread {
+                Unread::Kept(tier) => {
                     answer_of(expert).publish(Some(tier));
                     continue;
                 }
                 // Its landing in flight, or a record, answers it as the
                 // watcher resumes it (`Self::resume`).
-                Landed::Waits { record } => record,
+                Unread::Reading => false,
+                Unread::Waits => true,
             };
             if record {
                 shared.landings.waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

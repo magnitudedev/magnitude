@@ -407,25 +407,6 @@ impl Core {
         }
     }
 
-    /// Copy expert `expert` of `layer`, whose stored form conveyor record
-    /// `conveyed` holds whole, into staging record `record` of each of its
-    /// pools: the bytes its read into staging would have landed there.
-    ///
-    /// # Safety
-    ///
-    /// No read lands in either record and no device work reads either
-    /// until it returns.
-    pub(super) unsafe fn stage_conveyed(&self, conveyor: &[Records], layer: usize, conveyed: u32, record: u32) {
-        for stored in &self.layers[layer].stored {
-            // SAFETY: the caller's.
-            unsafe {
-                self.pools[stored.pool]
-                    .staging
-                    .copy_record(u64::from(record), &conveyor[stored.pool], u64::from(conveyed), stored.bytes)
-            };
-        }
-    }
-
     /// The reads that bring expert `expert` of `layer` into conveyor
     /// record `record` (`Conveyor::target`): of each of its pools, or the
     /// base of a slot of its scratch.

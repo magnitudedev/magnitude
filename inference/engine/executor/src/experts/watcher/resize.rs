@@ -536,7 +536,7 @@ impl Residency {
             // A prompt group the device is past holds its records claimed
             // until its conveyor clears (its landings from the conveyor end,
             // each an event): a resize moves no record a group still holds.
-            if self.scratch.clearing() && !self.scratch.clear_past(&mut self.core, &mut self.prefetch) {
+            if self.scratch.clearing() && !self.scratch.clear_past(&mut self.core) {
                 return Some(asked);
             }
         }

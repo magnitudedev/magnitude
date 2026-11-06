@@ -30,10 +30,6 @@
 //! (`Scratch::claim_lent`), so no hit lies in one, and they return empty once
 //! the group is past: the conveyor holds the stored form, which
 //! `routed_convert` repacks, so a claimed record holds no bank-form expert.
-//! What an in-place conveyor's records hold whole as they return, the
-//! group's seeding having ranked it, is copied into staging
-//! (`Scratch::stage_landed`): a decode demand for it then takes it from
-//! there without a read.
 //!
 //! Beside a host tier, a cold expert the tier keeps whole is not read and
 //! takes no record: the fill's tier copy reads its tier record, already in
@@ -144,20 +140,6 @@ pub(super) struct Carrier {
     pub pools: Vec<Records>,
 }
 
-/// Whose stored bytes a conveyor record holds, from its read's
-/// start until the group is past or another read takes the record (only a
-/// read into the record writes it, and its lent records stay claimed until
-/// then), whether or not the expert is still carried: expert `expert` of
-/// `layer`, whole once `landed`, last routed by the group's step `recency`
-/// (its seeding's).
-#[derive(Clone, Copy)]
-struct Bytes {
-    layer: usize,
-    expert: usize,
-    landed: bool,
-    recency: Option<Step>,
-}
-
 pub(super) struct Conveyor {
     /// Each streamed layer's form: the records its experts take.
     form_of: Vec<usize>,
@@ -167,8 +149,6 @@ pub(super) struct Conveyor {
     reading: Vec<(usize, usize)>,
     /// Per form, each conveyor record's expert (layer, expert).
     occupant: Vec<Vec<Option<(usize, usize)>>>,
-    /// Per form, whose bytes each conveyor record holds.
-    bytes: Vec<Vec<Option<Bytes>>>,
     /// Per scratch slot, the expert (layer, expert) whose stored bytes it
     /// carries, from its read's start until its round's converts are past.
     slots: Vec<Option<(usize, usize)>>,
@@ -200,7 +180,6 @@ impl Conveyor {
             carried: experts.iter().map(|&experts| (0..experts).map(|_| None).collect()).collect(),
             reading: Vec::new(),
             occupant: vec![vec![None; carrier.records]; forms],
-            bytes: vec![vec![None; carrier.records]; forms],
             slots: vec![None; carrier.slots],
             landings: Vec::new(),
             form_of,
@@ -247,8 +226,7 @@ impl Conveyor {
     }
 
     /// Free record `record` of `layer`'s form for another read, a conveyor
-    /// record or a slot; a conveyor record keeps its bytes for staging
-    /// once the group is past (a slot keeps none).
+    /// record or a slot.
     fn unoccupy(&mut self, layer: usize, record: u32) {
         match self.slot_of(record) {
             Some(slot) => self.slots[slot as usize] = None,
@@ -322,16 +300,11 @@ impl Conveyor {
         let slot = &mut self.occupant[form][record as usize];
         assert!(slot.is_none(), "a conveyor record carries two experts");
         *slot = Some((layer, expert));
-        self.bytes[form][record as usize] = Some(Bytes { layer, expert, landed: false, recency: None });
     }
 
-    /// Give back record `record`, which a layer of `layer`'s form took, its
-    /// bytes forgotten.
+    /// Give back record `record`, which a layer of `layer`'s form took.
     pub fn untake(&mut self, layer: usize, record: u32) {
         self.unoccupy(layer, record);
-        if self.slot_of(record).is_none() {
-            self.bytes[self.form_of[layer]][record as usize] = None;
-        }
     }
 
     /// Expert `expert` of `layer` is being read into conveyor record
@@ -341,32 +314,6 @@ impl Conveyor {
         assert!(slot.is_none(), "an expert carried twice");
         *slot = Some(State::Reading { ticket, record });
         self.reading.push((layer, expert));
-    }
-
-    /// The group's seeding at `layer` ranked its routed experts, each with
-    /// the step that last routed it there: what ranks the bytes of those
-    /// the conveyor holds.
-    pub fn rank(&mut self, layer: usize, routed: &[(usize, Step)]) {
-        for bytes in self.bytes[self.form_of[layer]].iter_mut().flatten().filter(|bytes| bytes.layer == layer) {
-            if let Some(&(_, recency)) = routed.iter().find(|&&(expert, _)| expert == bytes.expert) {
-                bytes.recency = Some(recency);
-            }
-        }
-    }
-
-    /// The group is past and no read of it runs ([`Self::clear`]): every
-    /// expert whose stored bytes a record holds whole and the
-    /// group ranked, (recency, layer, expert, record), forgotten here, as
-    /// the records return to the bank.
-    pub fn take_landed(&mut self) -> Vec<(Step, usize, usize, u32)> {
-        self.bytes
-            .iter_mut()
-            .flat_map(|records| records.iter_mut().enumerate())
-            .filter_map(|(record, bytes)| match bytes.take()? {
-                Bytes { layer, expert, landed: true, recency: Some(recency) } => Some((recency, layer, expert, record as u32)),
-                _ => None,
-            })
-            .collect()
     }
 
     /// How many experts are being read now.
@@ -393,13 +340,6 @@ impl Conveyor {
             match ended {
                 Outcome::Read => {
                     self.carried[layer][expert] = Some(State::Held { record });
-                    let bytes = match self.slot_of(record) {
-                        Some(_) => None,
-                        None => self.bytes[self.form_of[layer]][record as usize].as_mut(),
-                    };
-                    if let Some(bytes) = bytes {
-                        bytes.landed = true;
-                    }
                     settled.landed.push((layer, expert, record));
                 }
                 Outcome::Failed(reason) => {
@@ -454,8 +394,7 @@ impl Conveyor {
     }
 
     /// Free every unlisted record of a layer the served group is past
-    /// (`past`): no step of the group lists it any more. A landed record
-    /// keeps its bytes for staging once the group is past.
+    /// (`past`): no step of the group lists it any more.
     pub fn release_past(&mut self, past: impl Fn(usize) -> bool) {
         for layer in (0..self.carried.len()).filter(|&layer| past(layer)) {
             for expert in 0..self.carried[layer].len() {

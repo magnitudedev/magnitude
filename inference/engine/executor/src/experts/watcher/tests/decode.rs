@@ -161,11 +161,11 @@ fn a_request_past_its_staging_lands_on_the_host() {
     step.complete().unwrap();
 }
 
-/// A free staging record keeps the expert it held: once the tier has
-/// unmapped it for its reserve, a request for it lands it from the record
-/// without a read, its bytes the file's.
+/// An expert the tier has unmapped for its reserve lives only in the file:
+/// a request for it reads it on demand, whatever staging record last held
+/// it, its bytes the file's.
 #[test]
-fn a_request_revives_an_expert_its_staging_kept() {
+fn a_request_reads_an_expert_its_tier_unmapped() {
     // The tier's records are short of its reserve: it keeps nothing it has
     // landed.
     let harness = lending("kept", EXPERTS, 4, 1, 8, DECODE, 7, Placer::Tier, false);
@@ -179,8 +179,7 @@ fn a_request_revives_an_expert_its_staging_kept() {
     assert_eq!([0, 1, 2].map(|kind| harness.tiered(kind, record)), [0, 100, 200]);
     step.complete().unwrap();
     let layer = harness.watcher.shared().costs().layers[0];
-    assert_eq!((layer.misses, layer.staged, layer.unanticipated), (9, 1, 8));
-    assert_eq!(layer.lead, 2 * 1, "read two steps before, a layer each");
+    assert_eq!((layer.misses, layer.unanticipated), (9, 9));
 }
 
 /// A tier record unmapped for the reserve is graced through its expert's

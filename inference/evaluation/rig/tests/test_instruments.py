@@ -270,7 +270,7 @@ def test_step_answers_a_record_whose_harness_lacks_optional_sections(tmp_path):
     assert answer.lines[3] == "  attribution not recorded by this build's harness (no share)"
     streamed = next(line for line in answer.lines if line.startswith("streamed 7"))
     assert streamed.endswith("tokens not recorded") and "0.938× resident" in streamed
-    assert any(line.startswith("  model not recorded by this build's harness (no miss_shares.staged") for line in answer.lines)
+    assert any(line.startswith("  model not recorded by this build's harness (no miss_shares.reading") for line in answer.lines)
     assert "streamed-7 mean_step_ms" in answer.measures and "entry e" not in answer.measures
 
 
@@ -509,7 +509,7 @@ def test_a_streamed_step_answers_against_resident_and_voids_a_cache_served_one(t
     figures = {"tier": [tier, tier], "file": [file, file], "site": [site, None]}
     model = {"predicted_tok_s": 52.0, "ratio": 0.98, "misses_per_step": 12.0, "all_hit_steps": 2,
              "window_steps": 7, "figures": {**figures, "overhead_ms": 0.5},
-             "miss_shares": {"staged": 0.5, "reading": 0.25, "unanticipated": 0.25}}
+             "miss_shares": {"reading": 0.25, "unanticipated": 0.75}}
     _timed_result(tmp_path / "step", 13.0, 12.5, "aa")
     _timed_result(tmp_path / "cap", 20.0, 25.0, "aa", model)
     log = tmp_path / "cap.log"
@@ -627,7 +627,7 @@ def test_a_streamed_only_step_times_no_resident_cell_and_answers_absolute_terms_
     # A record a resident run would price: a model and a bar the streamed-only answer never reads.
     bar = {"form": "discrete", "step_ms": {"measured": 25.0, "model": 24.4, "bar": 10.0}, "bar_ms": {"resident": 9.0}}
     model = {"predicted_tok_s": 52.0, "ratio": 0.98, "misses_per_step": 12.0, "all_hit_steps": 2, "window_steps": 7,
-             "figures": {"overhead_ms": 0.5}, "miss_shares": {"staged": 0.5, "reading": 0.25, "unanticipated": 0.25}}
+             "figures": {"overhead_ms": 0.5}, "miss_shares": {"reading": 0.25, "unanticipated": 0.75}}
     _timed_result(tmp_path / "cap", 20.0, 25.0, "aa", model)
     record = json.loads((tmp_path / "cap" / "result.json").read_text())
     decode = record["measurements"]["speed"][1]

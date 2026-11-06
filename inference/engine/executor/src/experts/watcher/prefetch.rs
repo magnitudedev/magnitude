@@ -21,8 +21,7 @@
 //! should it fail (`Decode::resume`). The watcher learns each landing once
 //! it ended
 //! ([`Prefetch::settle`]): the tier record keeps its expert, or is ready
-//! again, and the staging record frees, keeping the stored expert where its
-//! read landed.
+//! again, and the staging record frees.
 
 use super::Shared;
 use super::telemetry::Admitted;
@@ -206,14 +205,14 @@ pub(super) enum Reading {
     Unpredicted,
 }
 
-/// A landing a request named, or the fill landed from what staging kept,
-/// in flight: its staging record, the expert, its tier record, the step
-/// that read it, its end once recorded, and its urgency on the executor.
+/// A landing a request named, in flight: its staging record, the expert,
+/// its tier record, the step that read it, its end once recorded, and its
+/// urgency on the executor.
 struct Tracked {
     record: u32,
     staged: Staged,
     tier: u32,
-    read: Option<Step>,
+    read: Step,
     ended: Ended,
     urgency: Arc<Urgency>,
     /// Where the device converts it.
@@ -224,17 +223,13 @@ struct Tracked {
 pub(super) struct Prefetch {
     /// Staging record indices, valid in every pool.
     pub(super) staging: Staging,
-    /// Where each staging record's last read was issued: none where no
-    /// route issued it (never read, or read by the tier's fill).
-    pub(super) read_at: Vec<Option<At>>,
     /// Hints' reads in flight, by the expert they stage.
     hints: HashMap<Staged, Hint>,
     /// The fill's reads in flight, by the expert they stage.
     fills: HashMap<Staged, Fill>,
     /// Demand reads in flight.
     demands: Vec<Ticket>,
-    /// Landings a request named, or the fill landed from staging, until the
-    /// watcher learns their ends.
+    /// Landings a request named, until the watcher learns their ends.
     landings: Vec<Tracked>,
     /// How far the device is known to be (`Residency::advance`), which ends
     /// the landings it converted behind it.
@@ -252,7 +247,6 @@ impl Prefetch {
     pub(super) fn new(records: u32, layers: usize) -> Self {
         Self {
             staging: Staging::new(records),
-            read_at: vec![None; records as usize],
             hints: HashMap::new(),
             fills: HashMap::new(),
             demands: Vec::new(),
@@ -318,37 +312,8 @@ impl Prefetch {
                 .into_iter()
                 .zip(ends)
                 .zip(converted)
-                .map(|(((record, staged, tier, read), (ended, urgency)), device)| Tracked { record, staged, tier, read: Some(read), ended, urgency, device }),
+                .map(|(((record, staged, tier, read), (ended, urgency)), device)| Tracked { record, staged, tier, read, ended, urgency, device }),
         );
-    }
-
-    /// Land `landing` of `staged`, revived whole in staging record `record`
-    /// for step `read` (none for the fill's), on the executor at `urgency`, then `answer` it (a
-    /// request's choices with its tier record once mapped, or nothing): the
-    /// watcher learns its end as a demand's.
-    pub(super) fn revive(
-        &mut self,
-        landing: Landing,
-        (staged, record, read): (Staged, u32, Option<Step>),
-        urgency: Priority,
-        answer: Option<Answer>,
-        shared: &Shared,
-    ) {
-        let ended = Ended::new(shared.events());
-        let urgency = Urgency::new(urgency);
-        let tier = landing.record();
-        // SAFETY: staging keeps the expert whole and no read lands in a
-        // revived record until the watcher frees it; the tier record is
-        // ready.
-        let converting = unsafe {
-            Converting::new(landing, urgency.clone(), shared.landings.clone(), ended.clone(), move || {
-                if let Some(answer) = answer {
-                    answer.publish(Some(tier));
-                }
-            })
-        };
-        shared.compute.submit(Arc::new(converting));
-        self.landings.push(Tracked { record, staged, tier, read, ended, urgency, device: None });
     }
 
     /// The landing of `staged` in flight a step waits for (a decode
@@ -461,8 +426,7 @@ impl Prefetch {
 
     /// Settle the landings that ended (their ends mapped or failed their
     /// experts): each tier record keeps its expert in `directory`, or is
-    /// ready again, and each staging record frees, keeping its expert where
-    /// it landed. True when any ended.
+    /// ready again, and each staging record frees. True when any ended.
     pub(super) fn settle(&mut self, directory: &mut Directory) -> bool {
         let now = Instant::now();
         for device in self.landings.iter().filter_map(|tracked| tracked.device.as_ref()) {
@@ -491,7 +455,7 @@ impl Prefetch {
                 continue;
             };
             let Tracked { record, staged, tier, read, .. } = self.landings.swap_remove(index);
-            ended.push((record, staged, tier, read, landed));
+            ended.push((record, staged, tier, Some(read), landed));
         }
         let settled = !ended.is_empty();
         for (record, staged, tier, read, landed) in ended {
@@ -509,7 +473,7 @@ impl Prefetch {
             true => directory.landed(layer, HostRecord(tier), expert, read),
             false => directory.unlanded(layer, HostRecord(tier)),
         }
-        self.staging.release(record, landed.then_some(staged));
+        self.staging.release(record);
     }
 
     /// Read each layer's ring if it changed, of a step whose request at the
@@ -594,21 +558,18 @@ impl Prefetch {
 
     /// Whether `staged` is a hint's candidate: an expert that lives only in
     /// the file (the bank lacks it, its host tier holds none of it) and
-    /// nothing stages or lands (whatever lands it took its tier record,
+    /// nothing lands (whatever lands it took its tier record,
     /// `Directory::lands`).
-    fn candidate(core: &Core, staging: &Staging, staged: Staged) -> bool {
+    fn candidate(core: &Core, staged: Staged) -> bool {
         let (layer, expert) = staged;
-        !(core.directory.lands(layer, expert)
-            || core.directory.held(layer, expert).is_some()
-            || core.directory.in_tier(layer, expert)
-            || staging.keeps(staged))
+        !(core.directory.lands(layer, expert) || core.directory.held(layer, expert).is_some() || core.directory.in_tier(layer, expert))
     }
 
     /// Admit the hints `hinted` (each expert with the rank of the choice it
     /// was hinted as) of `target` at lead `lead` (its ring row: 0 one layer
     /// ahead, 1 two), issued by the route at `issued`: each
     /// candidate (an expert whose file is on the path:
-    /// nothing holds, keeps or lands it; one a longer lead's hint reads lands
+    /// nothing holds or lands it; one a longer lead's hint reads lands
     /// already) whose rank's precision at its lead pays for its read
     /// (`Telemetry::pays`) is read into a
     /// staging record beyond the demand reserve at [`Priority::Prefetch`],
@@ -624,7 +585,7 @@ impl Prefetch {
         let ranked = hinted
             .iter()
             .copied()
-            .filter(|&(expert, _)| seen.insert(expert) && Self::candidate(core, &self.staging, (target, expert)))
+            .filter(|&(expert, _)| seen.insert(expert) && Self::candidate(core, (target, expert)))
             .collect::<Vec<_>>();
         // A hint takes staging beyond the demand reserve, so a request
         // finds its own, and the ready tier records beyond what the
@@ -641,7 +602,6 @@ impl Prefetch {
             }
             match self.read_ahead(core, shared, (target, expert), Priority::Prefetch, (request, demand)) {
                 Ok((ahead, bytes)) => {
-                    self.read_at[ahead.record as usize] = Some(issued);
                     self.hints.insert((target, expert), Hint { ahead, issued });
                     shared.telemetry.hint(bytes);
                 }
@@ -662,10 +622,9 @@ impl Prefetch {
     /// reused first, a tie, never used yet, each layer's alike), is landed
     /// into a tier record beyond the tier's reserve (`Extents::reserve`,
     /// or every expert still lacked, where fewer: `HostRecords::claim`), so
-    /// it displaces nothing the tier keeps: from staging where staging
-    /// keeps it whole, no read; else read into a staging record at
-    /// [`Priority::Load`], below every step's reads, as a hint's read
-    /// lands, so a request that waits for one hastens its read. `carried`
+    /// it displaces nothing the tier keeps: read into a staging record at
+    /// [`Priority::Load`], below every step's reads, as a hint's read lands, so a
+    /// request that waits for one hastens its read. `carried`
     /// names the experts a prompt group's conveyor carries, which land
     /// through it (`Scratch::carries`): no expert is read twice.
     ///
@@ -693,29 +652,13 @@ impl Prefetch {
         if room == 0 {
             return;
         }
-        // Among equals, what staging keeps first: it lands without a read,
-        // and no read of its equal takes its record.
-        let staging = &self.staging;
-        let order = core.directory.fill_order(reserve, room, carried, |staged| staging.keeps(staged));
+        let order = core.directory.fill_order(reserve, room, carried);
         for staged in order {
             if self.staging.free() <= keep {
                 break;
             }
-            let (layer, expert) = staged;
-            if let Some(record) = self.staging.revive(staged) {
-                match core.directory.claim_landing(layer, expert, reserve) {
-                    Claim::Taken(grant) => {
-                        self.read_at[record as usize] = None;
-                        let landing = core.landing(grant, record);
-                        self.revive(landing, (staged, record, None), Priority::Load, None, shared);
-                    }
-                    Claim::Kept(_) | Claim::Landing | Claim::Short => self.staging.release(record, Some(staged)),
-                }
-                continue;
-            }
             match self.read_ahead(core, shared, staged, Priority::Load, (keep, reserve)) {
                 Ok((ahead, _)) => {
-                    self.read_at[ahead.record as usize] = None;
                     self.fills.insert(staged, Fill { ahead });
                 }
                 // Refused, or its group's tier holds no record for it now:
@@ -760,11 +703,7 @@ impl Prefetch {
             return Err(Short::Tier);
         };
         let tier = grant.record();
-        let directory = &core.directory;
-        let record = self
-            .staging
-            .take(|staged| directory.staged_worth(staged))
-            .expect("a record beyond the reserve");
+        let record = self.staging.take().expect("a record beyond the reserve");
         let reads = core.reads(target, expert, record);
         let bytes = reads.iter().map(crate::experts::source::Read::bytes).sum::<u64>();
         let landing = core.landing(grant, record);
@@ -802,7 +741,7 @@ impl Prefetch {
             // fails its own step if that read fails).
             Err(_) => {
                 core.directory.unlanded(target, HostRecord(tier));
-                self.staging.release(record, None);
+                self.staging.release(record);
                 Err(Short::Refused)
             }
         }

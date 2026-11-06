@@ -32,14 +32,12 @@ pub struct LayerCost {
     pub missed_bytes: u64,
     /// The misses the device served from the host tier, which read nothing; the rest
     /// by what prediction had done when they were requested
-    /// (`Anticipation`): already staged (no read), already reading (a
-    /// hint's read, promoted), or neither (read on demand). They sum to
-    /// `misses`.
+    /// (`Anticipation`): already reading (a hint's read, promoted), or not
+    /// (read on demand). They sum to `misses`.
     pub hosted: u64,
     /// Of `hosted`, those the CPU site served: the device read the rest
     /// over the link.
     pub sited: u64,
-    pub staged: u64,
     pub reading: u64,
     pub unanticipated: u64,
     /// Each request's lead summed over the requests it is measured on
@@ -302,7 +300,7 @@ impl GroupLayer {
 /// The reads hints made: hint reads submitted and their stored bytes. And
 /// how the prediction did over completed decode steps, whether or not a
 /// hint was read:
-/// - `candidates`: hinted experts nothing held, kept, staged, read or landed
+/// - `candidates`: hinted experts nothing held, kept, read or landed
 ///   when their ring was read;
 /// - `named`: those the step's route at the hinted layer chose as a miss
 ///   their hint saves ([`saves`]), of which `early` the route found landed
@@ -593,14 +591,13 @@ struct Costs {
 }
 
 /// What prediction had done for a miss when its request came, as the
-/// performance model takes it (`assessment::streaming`): its record already
-/// in staging (no read), a hint's read still reading it, which the request
+/// performance model takes it (`assessment::streaming`): a hint's read
+/// still reading it, which the request
 /// waits out (a hint is always the layer before's route's), or neither:
 /// read on demand. The one classification both a layer's cost
 /// ([`LayerCost`]) and the miss record's anticipation read.
 #[derive(Clone, Copy)]
 pub(super) enum Anticipation {
-    Staged,
     Reading,
     Demand,
 }
@@ -613,7 +610,7 @@ pub(super) struct RequestCost {
     /// The misses the device served from the host tier, and the rest by
     /// [`Anticipation`].
     pub(super) hosted: u64,
-    pub(super) anticipated: [u64; 3],
+    pub(super) anticipated: [u64; 2],
     /// Its lead (`LayerCost::lead`), where it saw a read of its misses.
     pub(super) lead: Option<u64>,
     /// The absent experts it read (not kept already).
@@ -1698,12 +1695,11 @@ impl Telemetry {
             return;
         }
         let costs = &mut self.lock().costs;
-        let [staged, reading, demand] = served.anticipated;
+        let [reading, demand] = served.anticipated;
         let cost = &mut costs.layers[layer];
         cost.misses += served.misses;
         cost.missed_bytes += served.bytes;
         cost.hosted += served.hosted;
-        cost.staged += staged;
         cost.reading += reading;
         cost.unanticipated += demand;
         if let Some(lead) = served.lead {
@@ -1721,7 +1717,7 @@ impl Telemetry {
         let timeline = &mut step.layers[layer];
         timeline.misses += served.misses - served.hosted;
         timeline.hosted += served.hosted;
-        timeline.hinted += staged + reading;
+        timeline.hinted += reading;
         let experts = &mut step.experts[layer];
         experts.missed.extend(served.missed);
     }

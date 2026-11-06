@@ -534,15 +534,14 @@ impl Directory {
     /// pass over (another read carries them), in the order each tier lands
     /// them ([`HostRecords::lacking`], by this one order) across the groups:
     /// those each layer's ranked share holds first (`Reuse::in_top`), then
-    /// the most reused, among equals those `kept` names (staging keeps them
-    /// whole, so they land with no read), then by expert, then by layer: a
+    /// the most reused, then by expert, then by layer: a
     /// tie every layer's alike, whatever batches the fill lands in. So a tier with a
     /// record for every expert is filled to every expert, and a smaller
     /// one's records beyond the reserve with each layer's ranked share.
-    pub fn fill_order(&self, keep: usize, count: usize, skip: impl Fn(Staged) -> bool, kept: impl Fn(Staged) -> bool) -> Vec<Staged> {
+    pub fn fill_order(&self, keep: usize, count: usize, skip: impl Fn(Staged) -> bool) -> Vec<Staged> {
         let reuse = self.reuse_now();
         let rank = store_rank(&reuse, &self.prompt_reads);
-        let order = |score: Score, staged @ (layer, expert): Staged| (!reuse.in_top(layer, expert), std::cmp::Reverse(score), !kept(staged), expert, layer);
+        let order = |score: Score, (layer, expert): Staged| (!reuse.in_top(layer, expert), std::cmp::Reverse(score), expert, layer);
         let mut order = self
             .host
             .iter()
@@ -703,12 +702,6 @@ impl Directory {
     /// ([`HostRecords::unhold`]).
     pub fn unhold_tier(&mut self, layer: usize, HostRecord(record): HostRecord) {
         self.tier(layer).unhold(record);
-    }
-
-    /// `layer`'s `expert`'s reuse ([`Reuse::rank`]), beside a read at step
-    /// `read` the log may not have brought yet.
-    pub fn reuse(&self, layer: usize, expert: usize, read: Option<Step>) -> Score {
-        self.reuse_now().rank(layer, expert, read).score()
     }
 
     /// The half-life the reuse ranks by, in steps ([`Reuse::half_life`]).
@@ -1084,18 +1077,6 @@ impl Directory {
     /// tier, a prompt group's hits.
     pub fn resolve(&self, layer: usize, expert: usize, step: Step) -> Option<BankRecord> {
         self.bank.resolve(layer, expert, step)
-    }
-
-    /// Whether the store serves `layer`'s `expert` without staging: held,
-    /// kept by its group's host tier, or landing there.
-    pub fn stores(&self, layer: usize, expert: usize) -> bool {
-        self.held(layer, expert).is_some() || self.in_tier(layer, expert) || self.lands(layer, expert)
-    }
-
-    /// What staging's copy of `layer`'s `expert` is worth keeping
-    /// (`Staging::take`): none where the store serves it, else its reuse.
-    pub fn staged_worth(&self, (layer, expert): Staged) -> Option<Score> {
-        (!self.stores(layer, expert)).then(|| self.reuse(layer, expert, None))
     }
 
     /// The count of changes to what any layer holds, in the bank or its

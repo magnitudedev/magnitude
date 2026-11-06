@@ -774,12 +774,6 @@ impl Watcher {
     pub fn bank_lent(&self, group: usize, record: u32) -> bool {
         residency::lock(&self.state).core.directory.lent(group, record as usize)
     }
-
-    /// Every expert staging keeps, (layer, expert).
-    #[cfg(test)]
-    pub fn staged(&self) -> std::collections::BTreeSet<crate::experts::staging::Staged> {
-        residency::lock(&self.state).prefetch.staging.kept()
-    }
 }
 
 /// The load's account of its landings and of its starved steps, once
