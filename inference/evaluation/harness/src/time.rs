@@ -32,7 +32,7 @@
 //! does, and records the last timed sample's groups against their bar
 //! ([`prompt_groups`]).
 
-use crate::rest::{BankRest, STEADY_ATTEMPTS};
+use crate::rest::{BankRest, STEADY_ATTEMPTS, warm_to_rest};
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence, Step};
 use crate::fixture::FixtureSet;
@@ -922,22 +922,16 @@ fn measure(
     // resize is timed as decode, and every figure of the window is of one
     // steady span.
     let mut discarded = Vec::new();
-    let mut warm = time.warm;
+    // What the bank moved across the window last discarded: the decode is
+    // warm, and steps on only to rest.
+    let mut unrested = None;
     let (summaries, mut submissions, phases, span, cpu, threads, throttling, experts, graphs) = loop {
-        let (mut warmed, mut moved) = (0, None);
-        while warmed < warm || moved.is_some() {
-            if warmed == STEADY_ATTEMPTS * warm.max(1) {
-                return Err(format!(
-                    "the expert bank was not at rest after {warmed} warm decode steps: {}",
-                    moved.unwrap_or(Value::Null)
-                ));
-            }
+        warm_to_rest(time.warm, unrested.take(), || {
             let before = BankRest::filled(engine)?;
             run(engine, sequences, &trace)?;
             warm_expert_steps.extend(expert_step_of(engine)?);
-            moved = BankRest::moved(before, BankRest::of(engine)?);
-            warmed += 1;
-        }
+            Ok(BankRest::moved(before, BankRest::of(engine)?))
+        })?;
         collect(&trace)?;
         let mut summaries = Vec::with_capacity(time.steps);
         let mut previous = None;
@@ -988,7 +982,7 @@ fn measure(
             let after = BankRest::of(engine)?;
             if let Some(moves) = BankRest::moved(rest, after) {
                 expert_costs.push((engine.domain.expert_costs(), after.and_then(|after| after.host_slots())));
-                moved = Some(json!({ "step": index, "moved": moves }));
+                moved = Some((index, moves));
                 break;
             }
             rest = after;
@@ -1033,7 +1027,7 @@ fn measure(
             .into_iter()
             .map(|(costs, host_slots)| expert_step(costs, host_slots))
             .collect::<Result<Vec<_>, _>>()?;
-        let Some(moved) = moved else {
+        let Some((step, moves)) = moved else {
             for (summary, expert_step) in summaries.iter_mut().zip(expert_steps) {
                 if let Some(expert_step) = expert_step {
                     summary["expert_step"] = expert_step;
@@ -1045,7 +1039,8 @@ fn measure(
         // steps' routing, which a replay of the decode runs through.
         warm_expert_steps.extend(expert_steps.into_iter().flatten());
         collect(&trace)?;
-        discarded.push(moved);
+        discarded.push(json!({ "step": step, "moved": moves }));
+        unrested = Some(moves);
         if discarded.len() == STEADY_ATTEMPTS {
             return Err(format!(
                 "no decode window of {} steps ran with the expert bank at rest in {STEADY_ATTEMPTS}: {}",
@@ -1053,8 +1048,6 @@ fn measure(
                 Value::from(discarded)
             ));
         }
-        // Warming again only to rest: the decode is warm.
-        warm = 0;
     };
     submissions.extend(collect(&trace)?);
     drop(trace);

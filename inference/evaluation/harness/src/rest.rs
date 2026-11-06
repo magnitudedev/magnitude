@@ -72,6 +72,34 @@ impl BankRest {
     }
 }
 
+/// Warm a decode to rest before its window: `warm` steps, then more until
+/// one runs at rest. `unrested` is what the bank moved across the window
+/// just discarded, if one was: the decode is warm then, and steps on only
+/// until a step runs at rest, so no window begins inside a resize. Past
+/// `STEADY_ATTEMPTS` times the cell's warm steps the bank is taken never to
+/// rest. `step` runs one step and says what moved across it
+/// ([`BankRest::moved`]).
+pub fn warm_to_rest(
+    warm: usize,
+    unrested: Option<Value>,
+    mut step: impl FnMut() -> Result<Option<Value>, String>,
+) -> Result<(), String> {
+    let wanted = if unrested.is_none() { warm } else { 0 };
+    let mut moved = unrested;
+    let mut warmed = 0;
+    while warmed < wanted || moved.is_some() {
+        if warmed == STEADY_ATTEMPTS * warm.max(1) {
+            return Err(format!(
+                "the expert bank was not at rest after {warmed} warm decode steps: {}",
+                moved.unwrap_or(Value::Null)
+            ));
+        }
+        moved = step()?;
+        warmed += 1;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +152,28 @@ mod tests {
     #[test]
     fn no_bank_is_steady() {
         assert_eq!(BankRest::moved(None, None), None);
+    }
+
+    /// After a window the bank moved across (a resize still running at its
+    /// end), the decode steps on until a step runs at rest, as long as the
+    /// first warm-up may take, before the next window begins.
+    #[test]
+    fn a_discarded_window_warms_on_to_rest() {
+        let moved = json!({ "resizing": [true, true] });
+        // The resize runs on for 10 steps; the cell warms 8.
+        let mut steps = 0;
+        let warmed = warm_to_rest(8, Some(moved.clone()), || {
+            steps += 1;
+            Ok((steps <= 10).then(|| moved.clone()))
+        });
+        assert_eq!((warmed, steps), (Ok(()), 11));
+        // A bank that never rests is refused past the cell's bound.
+        let mut steps = 0;
+        let refused = warm_to_rest(8, Some(moved.clone()), || {
+            steps += 1;
+            Ok(Some(moved.clone()))
+        });
+        assert!(refused.is_err());
+        assert_eq!(steps, STEADY_ATTEMPTS * 8);
     }
 }
