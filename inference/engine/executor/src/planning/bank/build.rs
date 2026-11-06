@@ -148,30 +148,52 @@ impl ModelLoadPlan {
             tables,
             sites: BankSites::Unadmitted,
         };
-        if slots < bank.floor() || slots > bank.widest().get() {
-            return Err(PlanError::Topology(
-                "an expert bank holds from its floor to every expert of each layer",
-            ));
-        }
         for weight in &mut self.target {
-            let Some((index, layer)) = bank.layer(weight.role.scope) else {
+            let Some((_, layer)) = bank.layer(weight.role.scope) else {
                 continue;
             };
-            let Some(kind) = RoutedTensor::of(weight.role.kind) else {
+            if RoutedTensor::of(weight.role.kind).is_none() {
                 continue;
-            };
+            }
             weight.shape[0] = bank.records(layer.group);
-            weight.resident_bytes = *bank
-                .banked_bytes(index)
-                .map_err(PlanError::InvalidDefinition)?
-                .get(kind)
-                .ok_or(PlanError::Topology("a banked layer's stack outside its record"))?;
             // The bank holds the values: empty, or every expert imported
             // into its records (`ExpertBankPlan::whole`).
             weight.source_bytes = 0;
             weight.holding = Holding::Banked { group: layer.group };
         }
         self.bank = Some(bank);
+        self.with_bank_slots(slots, slots)
+    }
+
+    /// The plan with its expert bank at `slots` committed records per
+    /// layer, growing to `ceiling` however few it holds now (from its floor
+    /// to every expert of each layer): what a bank's slots move of its plan,
+    /// each banked stack's charge of its committed records
+    /// (`ExpertBankPlan::banked_bytes`). Everything else of the plan, its
+    /// program plan included, is of the bank's structure alone.
+    pub fn with_bank_slots(mut self, slots: u64, ceiling: u64) -> Result<Self, PlanError> {
+        let bank = self.bank.as_mut().ok_or(PlanError::Topology("a plan without a bank has no slots"))?;
+        if slots < bank.floor() || slots > ceiling || ceiling > bank.widest().get() {
+            return Err(PlanError::Topology(
+                "an expert bank holds from its floor to its ceiling, at most every expert of each layer",
+            ));
+        }
+        bank.slots = slots;
+        bank.ceiling = ceiling;
+        let bank = self.bank.as_ref().expect("the bank was just resized");
+        for weight in &mut self.target {
+            let Some((index, _)) = bank.layer(weight.role.scope) else {
+                continue;
+            };
+            let Some(kind) = RoutedTensor::of(weight.role.kind) else {
+                continue;
+            };
+            weight.resident_bytes = *bank
+                .banked_bytes(index)
+                .map_err(PlanError::InvalidDefinition)?
+                .get(kind)
+                .ok_or(PlanError::Topology("a banked layer's stack outside its record"))?;
+        }
         Ok(self)
     }
 

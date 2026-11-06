@@ -125,7 +125,7 @@ pub use planning::{
     ConvolutionBinding, ConvolvedLayerBinding, CorrectorBinding, CorrectorLayerBinding,
     DenseBinding, DenseBranchBinding, DenseScales, DeviceProcessBytes, DraftBlockBinding,
     DraftProgramPlan, DraftWidths,
-    ChargedDraft, EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, HeldStructures,
+    ChargedDraft, EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, HeldCharges,
     FeedForwardProgramSlot, FlightDepth, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     HostTablePlan, ImportProgramSlot, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,
     MixerProgramSlot, ModelLoadPlan, NGramBinding, NoBank, NativeGraphCharge, ParallelBinding,

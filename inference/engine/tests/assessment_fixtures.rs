@@ -17,7 +17,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentFitVerdict, ConveyorCarrier, HeldStructures, PlanError,
+    AssessmentFitVerdict, ConveyorCarrier, HeldCharges, PlanError,
     assessment::{AssessmentError, ColdSource, Residency, execution_memory_charge},
     platform::{DeviceRequest, DomainRole, MemoryReserves},
 };
@@ -771,7 +771,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     // A draft re-planned as an assessment's fallback does keeps its tier,
     // which is then what its fit reports the cold experts lie in.
     let (replanned, ()) = draft
-        .with_held_experts(&definition, u64::MAX, &mut HeldStructures::default(), |_, _| {
+        .with_held_experts(&definition, u64::MAX, &mut HeldCharges::default(), |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
@@ -945,7 +945,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     }
     // The plan of one slot more, whatever its fit.
     let (beyond, ()) = draft
-        .with_held_experts(definition, weights(shares.slots() + 1), &mut HeldStructures::default(), |_, _| {
+        .with_held_experts(definition, weights(shares.slots() + 1), &mut HeldCharges::default(), |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
@@ -955,7 +955,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     // derived: the plan it holds has that size's own charge.
     let (fewer, ()) = beyond
         .draft()
-        .with_held_experts(definition, u64::MAX, &mut beyond.structures().clone(), |candidate, _| {
+        .with_held_experts(definition, u64::MAX, &mut beyond.held(), |candidate, _| {
             let slots = candidate.load().expert_bank().map_or(0, |bank| bank.slots);
             Ok::<_, AssessmentError>(match slots <= shares.slots() {
                 true => Ok(()),

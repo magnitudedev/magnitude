@@ -817,9 +817,7 @@ impl AssessmentMemoryTerms {
             fit_depth: fit_depth(definition),
             conversations: limits.conversations.get() as u64,
             host_table_bytes: load.host_table_bytes()?,
-            weight_demand: demands.into_iter().try_fold(ClaimDemand::default(), |sum, demand| {
-                sum.checked_plus(demand).ok_or("weight demand overflows")
-            })?,
+            weight_demand: ClaimDemand::checked_sum(demands).ok_or("weight demand overflows")?,
         })
     }
 
@@ -868,13 +866,40 @@ impl AssessmentMemoryTerms {
         startup_state_bytes: u64,
         loaded_state_bytes: u64,
     ) -> Result<AssessmentMemoryCharge, String> {
-        let exact_resident_bytes = self.exact_resident_bytes(state_slab_bytes)?;
+        AssessmentMemoryCharge::compose(
+            self.exact_resident_bytes(0)?,
+            self.weight_demand,
+            bounds,
+            state_slab_bytes,
+            startup_state_bytes,
+            loaded_state_bytes,
+            self.host_table_bytes,
+        )
+    }
+}
+
+impl AssessmentMemoryCharge {
+    /// The charge of each memory role ([`AssessmentMemoryTerms::charge`])
+    /// from the weights' bytes (`weight_bytes`, which `weight_demand`
+    /// places), the bounds and the state's phases: the one owner of how the
+    /// roles compose.
+    fn compose(
+        weight_bytes: u64,
+        weight_demand: ClaimDemand,
+        bounds: AssessmentMemoryBounds,
+        state_slab_bytes: u64,
+        startup_state_bytes: u64,
+        loaded_state_bytes: u64,
+        host_table_bytes: u64,
+    ) -> Result<Self, String> {
+        let exact_resident_bytes = weight_bytes
+            .checked_add(state_slab_bytes)
+            .ok_or("assessment resident bytes overflow")?;
         let loading_bytes = startup_state_bytes
             .checked_add(bounds.startup_additional_bytes)
             .ok_or("assessment startup charge overflow")?
             .max(loaded_state_bytes);
-        let prepared_bytes = self
-            .exact_resident_bytes(0)?
+        let prepared_bytes = weight_bytes
             .checked_add(bounds.prepared_resource_bytes()?)
             .ok_or("assessment prepared charge overflow")?;
         let serving_bytes = prepared_bytes
@@ -886,7 +911,7 @@ impl AssessmentMemoryTerms {
         let allocation_bytes = prepared_bytes
             .checked_add(serving_peak_bytes.max(loading_bytes))
             .ok_or("assessment allocation charge overflow")?;
-        Ok(AssessmentMemoryCharge {
+        Ok(Self {
             exact_resident_bytes,
             state_bytes: state_slab_bytes,
             startup_state_bytes,
@@ -897,13 +922,36 @@ impl AssessmentMemoryTerms {
             staging_bytes: bounds
                 .staging_upload_bytes
                 .max(bounds.component_upload_bytes),
-            host_table_bytes: self.host_table_bytes,
-            weight_demand: self.weight_demand,
+            host_table_bytes,
+            weight_demand,
         })
     }
-}
 
-impl AssessmentMemoryCharge {
+    /// The charge of `load`, a load that differs from this charge's only in
+    /// its expert bank's slots: of its weight demand (all of its weights, a
+    /// bank's committed records among them) and its header bounds' startup
+    /// peak, the two terms a bank's slots move. Every other term is of the
+    /// bank's structure alone (`assessment::StructuralCharge`); its upload
+    /// windows are, which `load`'s must agree with.
+    pub fn at_bank_slots(self, load: &ModelLoadPlan) -> Result<Self, String> {
+        let weight_demand = ClaimDemand::checked_sum(load.weight_demands()?).ok_or("weight demand overflows")?;
+        let header = AssessmentHeaderBounds::derive(load)?;
+        assert_eq!(
+            (header.component_upload_bytes, header.staging_upload_bytes),
+            (self.bounds.component_upload_bytes, self.bounds.staging_upload_bytes),
+            "a bank's slots moved an upload window, which is of the bank's structure"
+        );
+        Self::compose(
+            weight_demand.checked_bytes().ok_or("weight demand overflows")?,
+            weight_demand,
+            AssessmentMemoryBounds { startup_additional_bytes: header.startup_additional_bytes, ..self.bounds },
+            self.state_bytes,
+            self.startup_state_bytes,
+            self.loaded_state_bytes,
+            self.host_table_bytes,
+        )
+    }
+
     /// The charge with `more` weight storage held beside its own: what
     /// [`AssessmentMemoryTerms::charge`] makes of weights that much
     /// larger, whose bytes every weight-inclusive figure carries. A linked

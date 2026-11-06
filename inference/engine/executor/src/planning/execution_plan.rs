@@ -369,13 +369,13 @@ impl ExecutionPlanDraft {
             let excess = Self::allocated(charge)?.saturating_sub(capacity);
             Ok::<_, PlanError>(NonZeroU64::new(excess).map_or(Ok(()), Err))
         };
-        let mut structures = HeldStructures::default();
-        match (self.with_held_experts(definition, cap.unwrap_or(u64::MAX), &mut structures, confirm)?, cap) {
+        let mut held = HeldCharges::default();
+        match (self.with_held_experts(definition, cap.unwrap_or(u64::MAX), &mut held, confirm)?, cap) {
             (Ok((charged, ())), _) => Ok(charged),
             (Err(_), None) => {
                 let draft = self.held_whole(definition)?;
-                let charge = structures.charge(definition, &draft)?;
-                Ok(ChargedDraft { draft, charge, structures })
+                let charge = held.charge(definition, &draft)?;
+                Ok(ChargedDraft { draft, charge, held })
             }
             (Err(NoBank::Unstreamed(reason)), Some(_)) => Err(PlanError::Unstreamed(reason)),
             (Err(NoBank::Bound { needed }), Some(cap)) => Err(PlanError::WeightCap { cap, needed }),
@@ -393,26 +393,26 @@ impl ExecutionPlanDraft {
     /// beside the host tier that bank's charge leaves room for
     /// (`Self::with_host_tier`); or, where they cannot stream, whole, if
     /// `bound` holds them and `confirm` admits that. Each plan is charged
-    /// from `structures`, which derives each way of holding the experts'
-    /// structure once ([`HeldStructures`]); `confirm` judges a plan by its
-    /// charge, giving what it found or the bytes the plan is short. The
-    /// draft held comes with the charge it admitted.
+    /// from `held`, which charges each way of holding the experts once
+    /// ([`HeldCharges`]); `confirm` judges a plan by its charge, giving what
+    /// it found or the bytes the plan is short. The draft held comes with
+    /// the charge it admitted.
     pub fn with_held_experts<T, E: From<PlanError>>(
         &self,
         definition: &ModelDefinition,
         bound: u64,
-        structures: &mut HeldStructures,
+        held: &mut HeldCharges,
         mut confirm: impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
     ) -> Result<Result<(ChargedDraft, T), NoBank>, E> {
         let mut charged = |draft: &Self| -> Result<Result<(AssessmentMemoryCharge, T), NonZeroU64>, E> {
-            let charge = structures.charge(definition, draft)?;
+            let charge = held.charge(definition, draft)?;
             Ok(confirm(draft, &charge)?.map(|found| (charge, found)))
         };
         let reason = match self.with_largest_bank(definition, bound, &mut charged)? {
             // The host tier's size leaves the charge as it is: the charge
             // holds the tier at its floor.
             Ok((draft, (charge, found))) => match draft.with_host_tier(&charge)? {
-                Ok(draft) => return Ok(Ok((ChargedDraft { draft, charge, structures: structures.clone() }, found))),
+                Ok(draft) => return Ok(Ok((ChargedDraft { draft, charge, held: *held }, found))),
                 Err(reason) => reason,
             },
             Err(NoBank::Unstreamed(reason)) => reason,
@@ -423,7 +423,7 @@ impl ExecutionPlanDraft {
             return Ok(Err(NoBank::Unstreamed(reason)));
         }
         Ok(match charged(&whole)? {
-            Ok((charge, found)) => Ok((ChargedDraft { draft: whole, charge, structures: structures.clone() }, found)),
+            Ok((charge, found)) => Ok((ChargedDraft { draft: whole, charge, held: *held }, found)),
             Err(_) => Err(NoBank::Unstreamed(reason)),
         })
     }
@@ -435,17 +435,18 @@ impl ExecutionPlanDraft {
     /// what `confirm` found of it; or why no bank's does. The bank grows to
     /// the most slots `bound` holds, its ceiling. Its record tensors are
     /// reserved for every expert and commit their slots, each within the
-    /// device's single allocation. A
-    /// bank's weights grow by `ExpertBankPlan::slot_bytes` a slot, up to the
-    /// granules backing each record tensor, so the largest slots under
-    /// `bound` are found from one plan's weights. A plan `confirm` finds
-    /// short by some bytes, whose charge grows by the same bytes a slot,
-    /// takes slots away by that shortfall, down to the floor: each pass ends
-    /// below the last. Its prompt groups chain every chunk of a
-    /// whole-context prompt (`with_chain`), which the plan charges at their
-    /// floor of one place: a group's places are granted when it opens. The
-    /// one search for a bank's slots: under a weight cap, and under a
-    /// machine's capacity.
+    /// device's single allocation. The bank is built once, of every expert:
+    /// its floor, its program plan and everything but its slots are of its
+    /// structure alone, so each bank searched is that one resized
+    /// (`ModelLoadPlan::with_bank_slots`), and its weights at any slots are
+    /// that bank's less what its record reservations release
+    /// (`ExpertBankPlan::resident_charge`), which finds the ceiling by
+    /// arithmetic. A plan `confirm` finds short by some bytes takes slots
+    /// away by that shortfall, down to the floor: each pass ends below the
+    /// last. Its prompt groups chain every chunk of a whole-context prompt
+    /// (`with_chain`), which the plan charges at their floor of one place: a
+    /// group's places are granted when it opens. The one search for a bank's
+    /// slots: under a weight cap, and under a machine's capacity.
     fn with_largest_bank<T, E: From<PlanError>>(
         &self,
         definition: &ModelDefinition,
@@ -461,45 +462,45 @@ impl ExecutionPlanDraft {
             Ok(substrate) => substrate,
             Err(error) => return unstreamed(error),
         };
-        // The most slots `bound` admits, once found: what the bank grows to.
-        let ceiling = std::cell::Cell::new(None);
         let places = self.prompt_places(definition);
-        let resident = self.load.clone().unbanked();
-        let streamed = |slots: u64| -> Result<Self, PlanError> {
-            let mut load = resident
-                .clone()
-                .with_expert_bank(definition, slots, places, self.policy.limits.flights(), reservation, host)?;
-            if let Some(ceiling) = ceiling.get() {
-                load.bank.as_mut().expect("a banked plan holds its bank").ceiling = ceiling;
-            }
+        let whole = match super::bank::routed_experts(definition).and_then(|experts| {
+            let load = self.load.clone().unbanked().with_expert_bank(
+                definition,
+                experts,
+                places,
+                self.policy.limits.flights(),
+                reservation,
+                host,
+            )?;
             let programs = load.program_plan(definition, self.policy.codec)?;
-            Self {
-                load,
-                programs,
-                ..self.clone()
-            }
-            .with_chain(places)
-        };
-        let (experts, floor, mut draft) = match resident
-            .bank_floor(definition, places, self.policy.limits.flights(), reservation, host)
-            .and_then(|floor| Ok((super::bank::routed_experts(definition)?, floor, streamed(floor)?)))
-        {
-            Ok(found) => found,
+            Self { load, programs, ..self.clone() }.with_chain(places)
+        }) {
+            Ok(whole) => whole,
             Err(error) => return unstreamed(error),
         };
+        let bank = whole.bank();
+        let (experts, floor) = (bank.slots, bank.floor());
         // A banked draft's re-planning never raises its ceiling.
         let top = self.load.bank.as_ref().map_or(experts, |bank| bank.ceiling);
+        let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
         let (slot_bytes, most) = (
-            draft.bank().slot_bytes().map_err(PlanError::ResourcePlanning)?,
-            draft
-                .bank()
-                .most_slots(self.device.max_allocation_bytes)
+            bank.slot_bytes().map_err(PlanError::ResourcePlanning)?,
+            bank.most_slots(self.device.max_allocation_bytes)
                 .map_err(PlanError::ResourcePlanning)?,
         );
         if most < floor {
             return Ok(Err(NoBank::Unstreamed(UnstreamedExperts::Allocation { floor, most })));
         }
-        let needed = weight_bytes(&draft.load)?;
+        // The weights of the bank at `slots`.
+        let (whole_bytes, whole_charge) = (weight_bytes(&whole.load)?, reserved(experts)?);
+        let weights_at = |slots| -> Result<u64, PlanError> {
+            let reserved = reserved(slots)?;
+            whole_bytes
+                .checked_sub(whole_charge)
+                .and_then(|bytes| bytes.checked_add(reserved))
+                .ok_or(PlanError::Arithmetic("a bank's weights hold less than its record reservations' charge"))
+        };
+        let needed = weights_at(floor)?;
         let Some(room) = bound.checked_sub(needed) else {
             return Ok(Err(NoBank::Bound { needed }));
         };
@@ -509,17 +510,18 @@ impl ExecutionPlanDraft {
         // its records, and `slot_bytes` over-states a slot of a group still
         // holding its decode request's records (`ExpertBankPlan::records_at`).
         let estimate = (floor + room / slot_bytes).min(top).min(most);
-        let mut slots = most_admitted(floor, top.min(most), estimate, |slots| {
-            let planned = streamed(slots)?;
-            let fits = weight_bytes(&planned.load)? <= bound;
-            if fits {
-                draft = planned;
-            }
-            Ok(fits)
-        })?;
-        // Every bank planned from here grows to these slots (`draft`'s are
-        // they), however few the machine admits now.
-        ceiling.set(Some(slots));
+        let ceiling = most_admitted(floor, top.min(most), estimate, |slots| Ok(weights_at(slots)? <= bound))?;
+        // Every bank planned from here grows to the ceiling, however few
+        // slots the machine admits now.
+        let resized = |slots| -> Result<Self, PlanError> {
+            Ok(Self { load: whole.load.clone().with_bank_slots(slots, ceiling)?, ..whole.clone() })
+        };
+        let (mut slots, mut draft) = (ceiling, resized(ceiling)?);
+        assert_eq!(
+            weight_bytes(&draft.load)?,
+            weights_at(ceiling)?,
+            "a bank's weights moved other than by its record reservations' charge"
+        );
         let found = loop {
             match confirm(&draft)? {
                 Ok(found) => break found,
@@ -537,7 +539,7 @@ impl ExecutionPlanDraft {
                         return Ok(Err(NoBank::Short { deficit_bytes }));
                     };
                     slots = next;
-                    draft = streamed(slots)?;
+                    draft = resized(slots)?;
                 }
             }
         };
@@ -640,37 +642,36 @@ impl ExecutionPlan {
     }
 }
 
-/// What a draft's charge derives from the structure of each way
-/// [`ExecutionPlanDraft::with_held_experts`] holds its experts: through a
-/// bank, of whatever slots, or whole ([`crate::assessment::StructuralCharge`]),
-/// each derived at the first plan of it charged and shared by every later
-/// one. A bank search's plans differ only in their slots, and a whole plan is
-/// the one its draft's experts held whole make, so the structures of one
-/// draft's searches are the same however often it is searched.
-#[derive(Clone, Debug, Default)]
-pub struct HeldStructures {
-    banked: Option<std::sync::Arc<crate::assessment::StructuralCharge>>,
-    whole: Option<std::sync::Arc<crate::assessment::StructuralCharge>>,
+/// The charge of each way [`ExecutionPlanDraft::with_held_experts`] holds
+/// a draft's experts, once charged: through a bank, at whatever slots, or
+/// whole. A bank search's plans differ only in their slots, whose charges
+/// follow from any one's ([`AssessmentMemoryCharge::at_bank_slots`]), and a
+/// whole plan is the one its draft's experts held whole make, so each way is
+/// charged from its structure ([`crate::assessment::StructuralCharge`]) once
+/// however often one draft is searched.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HeldCharges {
+    banked: Option<AssessmentMemoryCharge>,
+    whole: Option<AssessmentMemoryCharge>,
 }
 
-impl HeldStructures {
-    /// The charge of `draft`, of its way of holding its experts' structure.
+impl HeldCharges {
+    /// The charge of `draft`, of its way of holding its experts.
     fn charge(
         &mut self,
         definition: &ModelDefinition,
         draft: &ExecutionPlanDraft,
     ) -> Result<AssessmentMemoryCharge, PlanError> {
-        let held = match draft.load.bank.is_some() {
+        let banked = draft.load.bank.is_some();
+        let held = match banked {
             true => &mut self.banked,
             false => &mut self.whole,
         };
-        let structure = match held {
-            Some(structure) => structure,
-            None => held.insert(std::sync::Arc::new(
-                crate::assessment::StructuralCharge::of(definition, draft).map_err(charge_error)?,
-            )),
-        };
-        structure.charge(definition, draft).map_err(charge_error)
+        match *held {
+            Some(charge) if banked => charge.at_bank_slots(&draft.load).map_err(PlanError::ResourcePlanning),
+            Some(charge) => Ok(charge),
+            None => Ok(*held.insert(draft.memory_charge(definition)?)),
+        }
     }
 }
 
@@ -688,26 +689,27 @@ fn charge_error(error: crate::assessment::AssessmentError) -> PlanError {
 /// A draft and the checked memory charge of it at the model's context
 /// (`assessment::execution_memory_charge`): what planning confirmed of it,
 /// which its assessment reads rather than charging it again, with the
-/// structures its search charged ([`HeldStructures`]), which a search of it
-/// again reads rather than deriving them again.
+/// charges its search made ([`HeldCharges`]), which a search of it again
+/// reads rather than charging them again.
 #[derive(Clone, Debug)]
 pub struct ChargedDraft {
     draft: ExecutionPlanDraft,
     charge: AssessmentMemoryCharge,
-    structures: HeldStructures,
+    held: HeldCharges,
 }
 
 impl ChargedDraft {
     /// `draft` with its charge (`assessment::execution_memory_charge`),
-    /// of no search: a search of it derives its own structures.
+    /// of no search: a search of it charges its own ways of holding its
+    /// experts.
     pub fn of(definition: &ModelDefinition, draft: ExecutionPlanDraft) -> Result<Self, PlanError> {
         let charge = draft.memory_charge(definition)?;
-        Ok(Self { draft, charge, structures: HeldStructures::default() })
+        Ok(Self { draft, charge, held: HeldCharges::default() })
     }
 
-    /// The structures this draft's charge derived from.
-    pub fn structures(&self) -> &HeldStructures {
-        &self.structures
+    /// The charges this draft's search made.
+    pub fn held(&self) -> HeldCharges {
+        self.held
     }
 
     pub fn draft(&self) -> &ExecutionPlanDraft {

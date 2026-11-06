@@ -15,7 +15,7 @@ use super::AssessmentError;
 use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, ChargedDraft, DeviceProcessBytes, ExecutionPlanDraft, HeldStructures,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, ChargedDraft, DeviceProcessBytes, ExecutionPlanDraft, HeldCharges,
     HostProcessBytes, ResourceCapacity, ResourcePlanner,
 };
 use magnitude_family_contracts::ModelDefinition;
@@ -208,9 +208,9 @@ pub struct PreparedExecutionAssessment {
     demand: DecodeDemand,
     fit_context_tokens: u32,
     charge: AssessmentMemoryCharge,
-    /// What planning's search charged the draft from, which a fit's search
-    /// of it charges from again ([`assess_execution_fit`]).
-    structures: HeldStructures,
+    /// The charges planning's search made, which a fit's search of the
+    /// draft charges from again ([`assess_execution_fit`]).
+    held: HeldCharges,
 }
 
 impl PreparedExecutionAssessment {
@@ -245,7 +245,7 @@ pub fn prepare_execution_assessment(
         demand: decode_demand(definition, planned.draft())?,
         fit_context_tokens,
         charge: *planned.charge(),
-        structures: planned.structures().clone(),
+        held: planned.held(),
     })
 }
 
@@ -388,9 +388,9 @@ fn planned_executor<'a>(
 /// stable capacity. A plan that does not fit holds its experts as a load
 /// does ([`ExecutionPlanDraft::with_held_experts`]) within the allocation
 /// domain's stable capacity, and fits so; otherwise the plan's own shortfall
-/// is the verdict. Its plans are charged from the structures planning
-/// charged the draft from ([`HeldStructures`]), so a structure planning
-/// derived is never derived again.
+/// is the verdict. Its plans are charged from the charges planning made
+/// ([`HeldCharges`]), so a way of holding the experts planning charged is
+/// never charged from its structure again.
 pub fn assess_execution_fit(
     definition: &ModelDefinition,
     prepared: &PreparedExecutionAssessment,
@@ -432,8 +432,8 @@ pub fn assess_execution_fit(
             AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
         })
     };
-    let mut structures = prepared.structures.clone();
-    Ok(match draft.with_held_experts(definition, bound, &mut structures, confirm)? {
+    let mut held = prepared.held;
+    Ok(match draft.with_held_experts(definition, bound, &mut held, confirm)? {
         Ok((held, (fit_context_tokens, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains,

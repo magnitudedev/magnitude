@@ -96,6 +96,11 @@ impl ClaimDemand {
         })
     }
 
+    /// Exact composition of every one of `demands` ([`Self::checked_plus`]).
+    pub fn checked_sum(demands: impl IntoIterator<Item = Self>) -> Option<Self> {
+        demands.into_iter().try_fold(Self::default(), Self::checked_plus)
+    }
+
     /// A reservation's backing in its tier and its record table, an
     /// ordinary allocation in the table's own placement.
     pub fn reservation(tier: crate::planning::BankTier, charges: seismic::ReservationCharges) -> Self {
