@@ -309,10 +309,18 @@ impl ResidentWeight {
     /// scale, its packing bound and a streamed table's directory and
     /// staging.
     pub(crate) fn storage_bytes(&self) -> u64 {
+        self.storage_bytes_staging(self.table.staging_bytes())
+    }
+
+    /// [`Self::storage_bytes`], its table's stagings counted as `stagings`
+    /// bytes: every other allocation as charged now, a stored table's slots
+    /// at the records the bank resized them to.
+    fn storage_bytes_staging(&self, stagings: u64) -> u64 {
         self.tensor.charged_bytes()
             + self.scale.as_ref().map_or(0, Tensor::storage_bytes)
             + self.bound.as_ref().map_or(0, Tensor::storage_bytes)
-            + self.table.streamed_bytes()
+            + self.table.held_bytes()
+            + stagings
     }
 }
 
@@ -540,13 +548,14 @@ pub(crate) enum Importer {
 }
 
 /// A completed import in a residency cache: the weight, its importer, and
-/// its storage's bytes as imported (`ResidentWeight::storage_bytes`), a
-/// streamed table's stagings at the floor's class; those it holds beyond it
-/// for a group's class are the group's.
+/// a streamed table's stagings as imported, at the floor's class; those it
+/// holds beyond it for a group's class are the group's. Everything else the
+/// weight holds is read as charged now (`ResidentWeight::storage_bytes`):
+/// a stored table's slots are resized by the bank after import.
 struct Imported {
     weight: ResidentWeight,
     importer: Importer,
-    bytes: u64,
+    stagings: u64,
 }
 
 /// A residency cache's completed imports, each with its importer, so every
@@ -565,19 +574,24 @@ impl Imports {
     /// Cache `weight`, `importer`'s import: its bytes as imported.
     fn insert(&self, key: ResidencyKey, weight: ResidentWeight, importer: Importer) -> u64 {
         let bytes = weight.storage_bytes();
-        self.0.borrow_mut().insert(key, Imported { weight, importer, bytes });
+        let stagings = weight.table.staging_bytes();
+        self.0.borrow_mut().insert(key, Imported { weight, importer, stagings });
         bytes
     }
 
-    /// The bytes of `importer`'s imports, as imported. Tied roles share one
-    /// key and one allocation; a failed component import may leave a
+    /// The bytes of `importer`'s imports ([`Imported`]). Tied roles share
+    /// one key and one allocation; a failed component import may leave a
     /// partial set, which this still counts exactly.
     pub(crate) fn bytes(&self, importer: Importer) -> Result<u64, &'static str> {
         self.0
             .borrow()
             .values()
             .filter(|imported| imported.importer == importer)
-            .try_fold(0u64, |bytes, imported| bytes.checked_add(imported.bytes).ok_or("resident cache charge overflows"))
+            .try_fold(0u64, |bytes, imported| {
+                bytes
+                    .checked_add(imported.weight.storage_bytes_staging(imported.stagings))
+                    .ok_or("resident cache charge overflows")
+            })
     }
 
     /// Drop `importer`'s imports; every other importer's stay resident with
@@ -1738,6 +1752,47 @@ mod tests {
     use super::*;
 
     type Span = (u8, u64, u64);
+
+    /// A reserved stored table the bank shrinks after its import is read
+    /// at what its slots are charged then: the importer's bytes fall with
+    /// the slots' charge, never above it.
+    #[test]
+    fn an_imported_table_is_counted_at_its_resized_charge() {
+        const ROWS: u64 = 4096;
+        let path = std::env::temp_dir().join(format!("magnitude-imported-table-{}.bin", std::process::id()));
+        std::fs::write(&path, vec![0u8; 100 + ROWS as usize * 90]).unwrap();
+        let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let table = Arc::new(
+            StoredTable::new(
+                &device,
+                Element::named("gguf_iq4_nl").unwrap(),
+                Element::named("iq4g32s@rows16").unwrap(),
+                ROWS,
+                160,
+                crate::stored_table::StoredSlots::Reserved { records: 4, record_rows: 256 },
+                crate::planning::DirectoryForm::Hashed,
+                seismic_io::Reader::open(&path, seismic_io::CachePolicy::Uncached).unwrap(),
+                100,
+                None,
+            )
+            .unwrap(),
+        );
+        let descriptor = WeightDescriptor::stored("ngram", [ROWS, 160]);
+        let key = ResidencyKey {
+            artifact: magnitude_artifacts::ArtifactIdentity([0; 32]),
+            name: descriptor.name.clone(),
+            transforms: Vec::new(),
+            resident: Element::named("iq4g32s@rows16").unwrap(),
+        };
+        let weight = ResidentWeight::stored(descriptor, table.clone());
+        let imports = Imports::default();
+        let imported = imports.insert(key, weight.clone(), Importer::Target);
+        table.resize(2).unwrap().unwrap();
+        assert!(weight.storage_bytes() < imported);
+        assert_eq!(imports.bytes(Importer::Target), Ok(weight.storage_bytes()));
+        drop((imports, weight, table));
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// `plan`'s target tensors as the import orders them: its imported and
     /// its streamed spans in `manifest`'s one file.

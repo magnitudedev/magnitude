@@ -100,19 +100,28 @@ impl ResidentTable {
         }
     }
 
-    /// What a streamed table allocates beside its slots: its directory, its
-    /// staging, its landing staging and its notice
-    /// (`WeightPlan::streamed_bytes`).
-    pub fn streamed_bytes(&self) -> u64 {
+    /// What a table allocates beside its slots and its stagings
+    /// ([`Self::staging_bytes`]): a streamed table's directory, landing
+    /// staging and notice, or a stored table's directory
+    /// (`WeightPlan::streamed_bytes` holds these and the stagings).
+    pub fn held_bytes(&self) -> u64 {
         match self {
             Self::Whole => 0,
             Self::Streamed(table) => {
                 table.shared.directory.storage_bytes()
-                    + table.staging.borrow().values().map(seismic::Tensor::storage_bytes).sum::<u64>()
                     + table.shared.landing_staging.storage_bytes()
                     + table.shared.notice.storage_bytes()
             }
             Self::Stored(table) => table.directory_bytes(),
+        }
+    }
+
+    /// The stagings a streamed table holds now, for the class of places it
+    /// serves (`DeviceTable::hold_places`).
+    pub fn staging_bytes(&self) -> u64 {
+        match self {
+            Self::Streamed(table) => table.staging.borrow().values().map(seismic::Tensor::storage_bytes).sum(),
+            Self::Whole | Self::Stored(_) => 0,
         }
     }
 
@@ -1217,7 +1226,7 @@ mod tests {
     fn a_table_held_whole_gathers_by_row() {
         let table = ResidentTable::whole();
         assert!(table.directory().is_none());
-        assert_eq!(table.streamed_bytes(), 0);
+        assert_eq!((table.held_bytes(), table.staging_bytes()), (0, 0));
         assert_eq!(table.indices(&[5, 0, -1, 5]).unwrap(), [5, 0, -1, 5]);
         assert!(table.indices(&[-2]).is_err());
     }
@@ -1233,7 +1242,7 @@ mod tests {
         // in flight and one more, each bringing twice:
         // `TableFlights::stagings`), its two landing staging rows and their
         // notice.
-        assert_eq!(table.streamed_bytes(), 8 * 4 + 4 * 4 * 12 + 2 * 12 + 2 * 8);
+        assert_eq!((table.held_bytes(), table.staging_bytes()), (8 * 4 + 2 * 12 + 2 * 8, 4 * 4 * 12));
 
         // A step's rows gather by slot. An absent row replaces a row no
         // step named, once however often the step names it: the clock
