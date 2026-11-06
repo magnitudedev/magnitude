@@ -3,7 +3,8 @@
 Tensor names come from upstream's mapping, the one the converter writes by. Every tensor's bytes are rebuilt from the
 safetensors by this module's rules, independently of the converter's data path:
 
-- F8_E4M3 codes, I8 scales, BF16 and F32 tensors equal the checkpoint's bytes, at the checkpoint's type;
+- F8_E4M3 codes, I8 scales, BF16 and F32 tensors equal the checkpoint's bytes, at the checkpoint's type; a source
+  upstream splits into several tensors is compared run of rows by run of rows;
 - the Engram gate equals the F32 product of `q_weight` and `k_weight`;
 - MXFP4 experts equal the ggml `block_mxfp4` layout built from the checkpoint's codes and UE8M0 scales;
 - the Engram table equals the kept layers' code and scale rows, concatenated.
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 T = gguf.GGMLQuantizationType
 _CHUNK = 1 << 28
+_RAW = {torch.bfloat16: T.BF16, torch.float32: T.F32}  # checkpoint types stored as they are
 
 
 @dataclass
@@ -82,7 +84,22 @@ def expected_tensors(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision)
             continue
         source = gen()
         bid = next((int(p) for p in name.split(".") if p.isdecimal()), None)
-        for new_name, data in upstream.modify_tensors(model, source, name, bid):
+        outputs = list(upstream.modify_tensors(model, source, name, bid))
+        if len(outputs) > 1:
+            # one source written as several tensors (the vision MLP's w1 as gate and up): each must be the next run of
+            # the source's rows, at the source's type
+            shapes = [tuple(data.shape) for _, data in outputs]
+            if (source.dtype not in _RAW or sum(s[0] for s in shapes) != source.shape[0]
+                    or any(s[1:] != tuple(source.shape[1:]) for s in shapes)):
+                raise ValueError(f"{name}: no rule for {source.dtype} {tuple(source.shape)} written as {shapes}")
+            qtype = _RAW[source.dtype]
+            r0 = 0
+            for (new_name, _), shape in zip(outputs, shapes):
+                add(new_name, Expected(qtype, shape, _once(
+                    lambda g=gen, r0=r0, n=shape[0]: _raw(_eager(g)[r0:r0 + n]))))
+                r0 += shape[0]
+            continue
+        for new_name, data in outputs:
             shape = tuple(data.shape)
             if new_name.endswith(".engram_gate.weight"):
                 k = model.model_tensors[name.removesuffix("q_weight") + "k_weight"]
@@ -92,9 +109,8 @@ def expected_tensors(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision)
                 add(new_name, Expected(T.F8_E4M3, shape, _once(lambda g=gen: _raw(_eager(g)))))
                 scale = model._fp8_scales[name]
                 add(scale_name(new_name), Expected(T.I8, tuple(scale().shape), _once(lambda s=scale: _raw(_eager(s)))))
-            elif source.dtype in (torch.bfloat16, torch.float32):
-                qtype = T.BF16 if source.dtype == torch.bfloat16 else T.F32
-                add(new_name, Expected(qtype, shape, _once(lambda g=gen: _raw(_eager(g)))))
+            elif source.dtype in _RAW:
+                add(new_name, Expected(_RAW[source.dtype], shape, _once(lambda g=gen: _raw(_eager(g)))))
             else:
                 raise ValueError(f"{name}: no rule for {source.dtype}")
 
