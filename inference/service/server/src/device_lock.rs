@@ -18,12 +18,15 @@
 //! preempted is gone ([`DeviceLock::admit_request`]): no point is timed beside a request.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures_util::future::BoxFuture;
 use magnitude_engine::error::RequestError;
 use magnitude_engine::worker::protocol::RoomAnswer;
 use magnitude_service_contracts::models::ModelInstanceId;
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, watch};
+
+use crate::dying_process::{self, DyingProcess};
 
 /// What a measurement beside an idle resident model asks of that model's worker.
 pub trait ResidentRoom: Send + Sync {
@@ -72,11 +75,13 @@ struct Sharing {
 }
 
 /// A job holding the device, as far as host memory pressure reads it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum HeldJob {
-    /// Running, or giving way: its process is being killed and reaped, freeing what it holds
-    /// until the reap returns, however long that takes.
+    /// Running, or told to end by its preemption and not yet killed: its owner kills it at once.
     Live,
+    /// Its process has been killed: it gives way as the system reports its death
+    /// ([`DyingProcess`]).
+    Dying(DyingProcess),
     /// The system refused its kill or its reap ([`DeviceJob::unretired`]): it keeps the device
     /// until a retry shows it gone, and gives no memory back meanwhile.
     Unretired,
@@ -173,11 +178,23 @@ impl DeviceJob {
     /// longer ([`DeviceLock::job_giving_way`]).
     pub fn unretired(&self) {
         self.sharing.send_if_modified(|sharing| {
-            let marked = sharing.job == Some(HeldJob::Live);
+            let marked = matches!(sharing.job, Some(HeldJob::Live | HeldJob::Dying(_)));
             if marked {
                 sharing.job = Some(HeldJob::Unretired);
             }
             marked
+        });
+    }
+
+    /// The job's process `pid` is being killed: host memory pressure judges it by its death
+    /// from here on ([`DeviceLock::job_giving_way`]). One the system refused stays so: a retry
+    /// is not a death it shows. Nothing waits on this, so no one is woken.
+    pub fn dying(&self, pid: u32) {
+        self.sharing.send_if_modified(|sharing| {
+            if matches!(sharing.job, Some(HeldJob::Live)) {
+                sharing.job = Some(HeldJob::Dying(DyingProcess::new(pid)));
+            }
+            false
         });
     }
 }
@@ -265,6 +282,14 @@ impl DeviceHold {
     pub fn unretired(&self) {
         if let Self::Job(job) = self {
             job.unretired();
+        }
+    }
+
+    /// The worker's process `pid` is being killed: a job's hold judges it by its death
+    /// ([`DeviceJob::dying`]); a load's share is no job's.
+    pub fn dying(&self, pid: u32) {
+        if let Self::Job(job) = self {
+            job.dying(pid);
         }
     }
 }
@@ -356,11 +381,28 @@ impl DeviceLock {
         preempted
     }
 
-    /// Whether a job holds the device that is still giving way, running or being killed and
-    /// reaped, its kill or reap not refused by the system ([`DeviceJob::unretired`]): while one
-    /// does, host memory pressure waits for what it frees before taking a model.
-    pub fn job_giving_way(&self) -> bool {
-        self.sharing.borrow().job == Some(HeldJob::Live)
+    /// Whether a job holds the device that is still giving way at `now`, the host at `headroom`:
+    /// running or about to be killed, or killed and not shown hung ([`DyingProcess`]), its kill or
+    /// reap not refused by the system ([`DeviceJob::unretired`]). While one does, host memory
+    /// pressure waits for what it frees before taking a model.
+    pub fn job_giving_way(&self, now: Instant, headroom: u64) -> bool {
+        // The look is taken outside the watch's lock, which loads and jobs take.
+        let pid = match &self.sharing.borrow().job {
+            Some(HeldJob::Live) => return true,
+            None | Some(HeldJob::Unretired) => return false,
+            Some(HeldJob::Dying(dying)) => dying.pid,
+        };
+        let look = dying_process::look(pid);
+        let mut giving_way = true;
+        self.sharing.send_if_modified(|sharing| {
+            // A job gone or refused since the look is judged at the next sample, on memory read
+            // after it.
+            if let Some(HeldJob::Dying(dying)) = &mut sharing.job {
+                giving_way = dying.giving_way(look, now, headroom);
+            }
+            false
+        });
+        giving_way
     }
 
     /// The device's changes from now on ([`DeviceChanges`]).
@@ -411,7 +453,7 @@ impl DeviceLock {
         let wanted = self.wanted.subscribe();
         let mut taken = None;
         self.sharing.send_if_modified(|sharing| {
-            if let (Some(idle), 1, None, false) = (&sharing.idle, sharing.shares, sharing.job, sharing.held_off) {
+            if let (Some(idle), 1, None, false) = (&sharing.idle, sharing.shares, &sharing.job, sharing.held_off) {
                 taken = Some((Arc::clone(&idle.room), sharing.idleness));
                 sharing.job = Some(HeldJob::Live);
             }

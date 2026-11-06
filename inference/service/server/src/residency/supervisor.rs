@@ -33,7 +33,7 @@ use super::worker::worker_exit_code;
 use super::{ModelOperationFailure, ResidencyNotification, ResidencyNotifier, ResidencyWorker};
 use crate::memory_domains::instance_allocation;
 
-const RESIDENT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+pub(crate) const RESIDENT_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const IDLE_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const MONITOR_LOSS_DEADLINE: Duration = Duration::from_secs(1);
 const CENSUS_INTERVAL: Duration = Duration::from_secs(1);
@@ -249,8 +249,8 @@ impl Inner {
                 state.observation_failed_since = None;
                 // A job on the device gives way first: the emergency's start preempts it and
                 // holds jobs off until memory recovers. The model is spared while the job gives
-                // way, and killed once none does: the job gone, or its end refused by the system,
-                // so it frees nothing.
+                // way, and killed once none does: the job gone, its end refused by the system, or
+                // its death shown hung, so it frees nothing.
                 if emergency.is_some() && self.device.hold_off_jobs(true) {
                     tracing::warn!(
                         memory.headroom_bytes = headroom,
@@ -260,7 +260,7 @@ impl Inner {
                     state.admission = Admission::Recovering(Recovery::new());
                 }
                 if let Some(emergency) = emergency
-                    && !self.device.job_giving_way()
+                    && !self.device.job_giving_way(now.into_std(), headroom)
                     && let Some(supervised) = state.supervised.take()
                 {
                     tracing::warn!(
@@ -650,6 +650,57 @@ mod tests {
         assert!(released_for_memory_pressure(fixture.notifications.try_recv().unwrap()));
         drop(job);
         assert!(device.try_job().is_none(), "no job starts while memory recovers");
+    }
+
+    /// A killed job spares the model as the system reports its death, on real processes. One
+    /// shown running does so however long it runs, past the bound a silent one gets. One shown
+    /// doing nothing, with the host getting nothing back, spares the model up to the bound and
+    /// is then taken for hung, whatever it still holds of the device; the model is killed, and
+    /// its reap, when it comes, still releases the device.
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_job_spares_the_model_until_its_death_is_shown_hung() {
+        use crate::dying_process::{SILENCE, real};
+        let emergency = |fixture: &Fixture| {
+            fixture.memory.0.store(GIB, Ordering::Release);
+            *fixture.memory.2.lock().unwrap() = Some(HostEmergency::EmergencyReserve);
+        };
+
+        let running = real::running();
+        let fixture_running = fixture();
+        let worker = supervise(&fixture_running, Arc::default());
+        let job = fixture_running.inner.device.try_job().unwrap();
+        emergency(&fixture_running);
+        let start = Instant::now();
+        fixture_running.inner.tick(start);
+        job.dying(running.pid());
+        for look in 0..=3 {
+            fixture_running.inner.tick(start + SILENCE * look);
+            assert!(!worker.terminated.load(Ordering::Acquire), "a process shown running spares the model, look {look}");
+        }
+        running.reap();
+        drop(job);
+        fixture_running.inner.tick(start + SILENCE * 4);
+        assert!(worker.terminated.load(Ordering::Acquire), "the job gone, the emergency takes the model");
+
+        let silent = real::silent();
+        let mut fixture_silent = fixture();
+        let worker = supervise(&fixture_silent, Arc::default());
+        let device = fixture_silent.inner.device.clone();
+        let job = device.try_job().unwrap();
+        emergency(&fixture_silent);
+        let start = Instant::now();
+        fixture_silent.inner.tick(start);
+        job.dying(silent.pid());
+        fixture_silent.inner.tick(start);
+        fixture_silent.inner.tick(start + SILENCE - RESIDENT_SAMPLE_INTERVAL);
+        assert!(!worker.terminated.load(Ordering::Acquire), "silent short of the bound");
+        fixture_silent.inner.tick(start + SILENCE);
+        assert!(worker.terminated.load(Ordering::Acquire), "a death shown hung spares the model no more");
+        assert!(released_for_memory_pressure(fixture_silent.notifications.try_recv().unwrap()));
+        assert!(device.try_job().is_none(), "it still holds the device");
+        silent.reap();
+        drop(job);
     }
 
     #[test]
