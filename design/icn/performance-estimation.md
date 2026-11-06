@@ -71,7 +71,7 @@ or its identity, so a model never loaded has the same estimate as one loaded man
 - **What is measured is fixed per backend.** The measurement job's standing requests are the
   executor's cost walk, what its recorded graphs hold, the model store's read line, the device's
   convert at one reference record form, and, where a bank can have a host tier (a discrete device),
-  the host memory's read line with every CPU reading. They are measured first in every job, in one
+  the host memory's read line with every CPU reading and a CPU site's lines at one reference form. They are measured first in every job, in one
   10 s allocation with the walk's points (each point an equal part of the time left; nothing starts
   past the deadline). Loads' own requests (CPU sites, shrink moves, their forms' converts, tier
   copies, volume windows) are runtime: the job measures them after the standing requests, and no
@@ -84,11 +84,12 @@ or its identity, so a model never loaded has the same estimate as one loaded man
   formats and bytes, over host storage's route and over device memory; a host tier's record read
   is priced at the host memory's line; a file miss reads its stored bytes along the store's read
   line. With no host tier a file miss then lands through the device's convert, its stored bytes at
-  the reference form's rate. A miss of a layer the plan gives a CPU site is bound by the host memory
-  it reads, so the site's expert is priced at the record's read from host memory; a form's own CPU
-  lines, convert and observed landing lines are runtime and do not enter the estimate. The step is the
-  resident plan's, so it does not price a bank plan's own launches, a site's handshake or its copies,
-  and no read is credited to or charged for a hint.
+  the reference form's rate. A miss of a layer the plan gives a CPU site is served at the reference
+  site's lines (the reference convert's record, a decode row's 8 choices): an expert's lines in
+  proportion to the record's bytes, and the site's handshake per request. A form's own CPU lines,
+  convert and observed landing lines are runtime and do not enter the estimate. The step is the
+  resident plan's, so it does not price a bank plan's own launches or its copies, and no read is
+  credited to or charged for a hint.
 - **Misses.** One generic function of a layer's `E` and `k` gives the share `m̄(s)` of a step's
   distinct routed experts a bank of a share `s` of the layer's experts lacks. Routing is a top-`k`
   competition: a score is what persists over a text and what changes with the token, so an expert of

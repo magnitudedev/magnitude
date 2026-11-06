@@ -462,3 +462,15 @@ fn the_site_counts_each_answered_requests_experts_and_path() {
     assert_eq!(served.since(&served), super::SiteServed::default());
     drop(flight);
 }
+
+/// The measurement job's reference site is a layer a site computes: its
+/// pool is sized and its lines measured, as a discrete device's job reads
+/// them, on records of each streaming backend's resident form.
+#[test]
+fn the_reference_site_measures() {
+    for backend in [seismic::BackendName::Cuda, seismic::BackendName::Vulkan] {
+        let form = crate::assessment::CpuForm::reference(backend).unwrap().expect("a discrete backend streams");
+        let (workers, lines) = measure_cpu_site(&cpu(), &form).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        assert!(workers > 0 && lines.expert.one.get() > 0., "{backend:?}: {workers} workers, {lines:?}");
+    }
+}

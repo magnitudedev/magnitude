@@ -14,8 +14,9 @@
 //!   its route, a share `q = 1 − (1 − m)^k` of a row's steps requesting.
 //! - **Lines**: the GPU's over each layer's expert from the executor's
 //!   costs ([`ExpertPass::lines`]), one expert's stored bytes from the plan,
-//!   a host tier's record read at the host memory's line, which also binds
-//!   a CPU site's misses where the plan has one, the file's reads at the
+//!   a host tier's record read at the host memory's line, a CPU site's
+//!   misses where the plan has one at the site's lines of a reference form
+//!   scaled by the record's bytes, the file's reads at the
 //!   model store's read line and, with no host tier, a read's landing at the
 //!   device's convert, all measured by the measurement job
 //!   ([`StreamedFigures`]).
@@ -28,14 +29,14 @@
 //! read this session ([`LiveDecode`]), at its decode's rows and context.
 //! Nothing it counts is stored.
 //!
-use super::cost::{BankLines, CpuLines, ExpertLines, HostLines, HostLinesError, LineError, Nanoseconds, RowCost, RowLine};
+use super::cost::{BankLines, CpuLines, ExpertLines, HostLines, HostLinesError, LineError};
 use super::estimate::ExpertPass;
 use super::executor_costs::ExecutorCosts;
 use super::miss_model::MissModel;
 use super::misses::{HeldSlots, StreamedStep};
 use super::priced::Priced;
 use super::step::{LayerLoad, ReadAhead, StepInputs};
-use super::streaming_costs::{CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, ReadLine, RecordLine, StorageCosts, StorageError};
+use super::streaming_costs::{CeilingError, ConvertCosts, ConvertForm, CpuCosts, CpuForm, FileLine, MemoryCosts, MemoryError, ReadLine, RecordLine, StorageCosts, StorageError};
 use crate::planning::ExpertBankPlan;
 use seismic::measure::{InvalidLine, Record, RecordStore, StoreError};
 use seismic::{DeviceTopology, Executor, PointKey};
@@ -47,12 +48,14 @@ use std::path::Path;
 /// What a streamed estimate reads beside the executor's costs, each a
 /// standing request of the measurement job (`requests::standing`): the
 /// model store's read line, where a bank can have a host tier, the host
-/// memory's seconds a byte with every CPU reading, and a stored byte's
+/// memory's seconds a byte with every CPU reading and a CPU site's lines
+/// at its reference form (`CpuForm::reference`), and a stored byte's
 /// seconds through the device's convert (`ConvertForm::reference`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StreamedFigures {
     pub read: ReadLine,
     pub memory: Option<f64>,
+    pub site: Option<(CpuForm, CpuLines)>,
     pub convert: f64,
 }
 
@@ -84,6 +87,18 @@ impl StreamedFigures {
                 },
             },
         };
+        let site = match topology.shared_ranges_lie_in_device_memory(executor) {
+            true => Priced::Measured(None),
+            false => match CpuForm::reference(executor.backend()) {
+                Err(error) => Priced::Unavailable(error.to_string()),
+                Ok(None) => Priced::Unavailable(format!("{:?} streams nothing", executor.backend())),
+                Ok(Some(form)) => match CpuCosts::stored(topology, executor, &form, &reading) {
+                    Ok(Some(costs)) => Priced::Measured(Some((form, costs.lines))),
+                    Ok(None) => Priced::Pending("no record of the reference CPU site's lines".into()),
+                    Err(error) => Priced::Unavailable(error.to_string()),
+                },
+            },
+        };
         let convert = match ConvertForm::reference(executor.backend()) {
             Err(error) => Priced::Unavailable(error.to_string()),
             Ok(None) => Priced::Unavailable(format!("{:?} streams nothing", executor.backend())),
@@ -94,7 +109,7 @@ impl StreamedFigures {
             },
         };
         let figures = read.and_then(|read| {
-            memory.and_then(|memory| convert.and_then(|convert| Priced::Measured(Self { read, memory, convert })))
+            memory.and_then(|memory| site.and_then(|site| convert.and_then(|convert| Priced::Measured(Self { read, memory, site, convert }))))
         });
         (figures, reading.read.into_inner())
     }
@@ -249,9 +264,10 @@ impl StreamedLayers {
             .enumerate()
             .map(|(layer, &host)| {
                 let gpu = pass.lines(layer).ok_or(StreamedError::UnreadLink)?.map_err(StreamedError::Line)?;
-                // A CPU site's misses are bound by the host memory they read: its record at the
-                // memory's whole rate, no form's line being the machine's.
-                let cpu = host.memory.filter(|_| bank.sited(layer)).map(|one| CpuLines { handshake: Nanoseconds::saturating(0.), expert: RowLine { one, row: RowCost::AtMost(gpu.link.row) } });
+                let cpu = match figures.site.filter(|_| bank.sited(layer)) {
+                    Some((form, lines)) => Some(form.lines_of(lines, host.record_bytes).map_err(|error| StreamedError::Costs(error.to_string()))?),
+                    None => None,
+                };
                 let file = landing(&host, figures.convert).map_err(StreamedError::Landing)?;
                 Ok(ExpertLines { host: HostLines { cpu, file, ..host }, gpu })
             })
@@ -406,6 +422,7 @@ fn layer_period(shares: &dyn Fn(usize) -> Shares, routed: f64, choices: u64, hel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assessment::cost::Nanoseconds;
 
     /// A bank's misses are the generic model's share of its routed experts,
     /// spread over every step while it misses more than a step's worth; a

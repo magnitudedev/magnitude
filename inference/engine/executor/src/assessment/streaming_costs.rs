@@ -1636,6 +1636,48 @@ pub struct CpuCosts {
 }
 
 impl CpuForm {
+    /// The site the measurement job reads a machine's CPU lines on, of no
+    /// model: the reference convert's record (`ConvertForm::reference`), its
+    /// down turned to a layer's `[hidden, features]`, a
+    /// decode row's 8 choices of a layer's 256 experts, expanding by the
+    /// fused routed activation, a served load's steps in flight; none on a
+    /// backend that streams nothing. A streamed estimate prices a sited
+    /// miss's record at this form's lines scaled by its bytes
+    /// ([`Self::lines_of`]).
+    pub(crate) fn reference(backend: seismic::BackendName) -> Result<Option<Self>, ExecutorCostsError> {
+        const CHOICES: u64 = 8;
+        // A site reads down as its layer computes it, `[hidden, features]`:
+        // the reference convert's `[features, hidden]` turned.
+        let turned = |tensor: RecordTensor| RecordTensor { matrix: [tensor.matrix[1], tensor.matrix[0]], ..tensor };
+        Ok(ConvertForm::reference(backend)?.map(|convert| Self {
+            record: RecordTensors { down: turned(convert.record.down), ..convert.record },
+            choices: CHOICES,
+            experts: 256,
+            function: crate::operators::routed::FUSED_ACTIVATION,
+            flight: crate::planning::FlightDepth::PIPELINED.steps(1),
+            widest: CHOICES,
+        }))
+    }
+
+    /// `lines`, this form's site, for a record of `record_bytes` resident
+    /// bytes: an expert's lines in proportion to the bytes it reads, the
+    /// handshake as it is.
+    pub(crate) fn lines_of(&self, lines: super::cost::CpuLines, record_bytes: u64) -> Result<super::cost::CpuLines, ExecutorCostsError> {
+        use super::cost::{Nanoseconds, RowCost};
+        let bytes = self
+            .record
+            .iter()
+            .map(|(_, tensor)| tensor.record_bytes())
+            .sum::<Result<u64, _>>()
+            .map_err(|cause| failed("the reference site form")(&cause))?;
+        let scale = |line: Nanoseconds| Nanoseconds::of(line.get() * 1e-9 * record_bytes as f64 / bytes as f64).map_err(|cause| failed("a sited record's line")(&cause));
+        let row = match lines.expert.row {
+            RowCost::Measured(row) => RowCost::Measured(scale(row)?),
+            RowCost::AtMost(row) => RowCost::AtMost(scale(row)?),
+        };
+        Ok(super::cost::CpuLines { expert: super::cost::RowLine { one: scale(lines.expert.one)?, row }, handshake: lines.handshake })
+    }
+
     /// The form of a site over `binding`, expanding by `function`.
     pub(crate) fn of(binding: &BankBinding, function: i32) -> Self {
         Self {
@@ -1901,6 +1943,20 @@ mod tests {
     use seismic::measure::{Attempt, Measure, Outcome, Stop};
 
     /// A reference record's seconds price its stored bytes.
+    /// A sited record's CPU lines are the reference site's in proportion to
+    /// the bytes it reads, its handshake as the reference measured it.
+    #[test]
+    fn a_sited_record_reads_at_the_reference_site_by_its_bytes() {
+        use crate::assessment::cost::{CpuLines, Nanoseconds, RowCost, RowLine};
+        let form = CpuForm::reference(seismic::BackendName::Cuda).unwrap().unwrap();
+        let bytes = form.record.iter().map(|(_, tensor)| tensor.record_bytes().unwrap()).sum::<u64>();
+        let ns = |value: f64| Nanoseconds::of(value * 1e-9).unwrap();
+        let lines = CpuLines { expert: RowLine { one: ns(100_000.), row: RowCost::Measured(ns(10_000.)) }, handshake: ns(30_000.) };
+        assert_eq!(form.lines_of(lines, bytes).unwrap(), lines);
+        let twice = CpuLines { expert: RowLine { one: ns(200_000.), row: RowCost::Measured(ns(20_000.)) }, handshake: ns(30_000.) };
+        assert_eq!(form.lines_of(lines, 2 * bytes).unwrap(), twice);
+    }
+
     #[test]
     fn the_reference_convert_prices_a_stored_byte() {
         assert_eq!(ConvertForm::reference(seismic::BackendName::Cpu).unwrap(), None, "the CPU streams nothing");

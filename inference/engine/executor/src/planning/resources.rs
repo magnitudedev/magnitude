@@ -174,7 +174,6 @@ impl FlightDepth {
     }
 }
 
-#[cfg(test)]
 impl FlightDepth {
     /// A depth of a step and its lookahead successor: a served load's.
     pub(crate) const PIPELINED: Self = Self { groups: NonZeroUsize::new(2).unwrap() };

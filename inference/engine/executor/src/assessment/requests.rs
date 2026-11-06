@@ -10,6 +10,7 @@
 //! - **Assessment's standing requests** ([`standing`]): the figures every
 //!   estimate is made from, fixed per backend and of no model: what its
 //!   graphs hold ([`PointRequest::GraphCost`]), the model store's read line ([`PointRequest::Storage`]), the host memory's line
+//!   and a CPU site's lines at its reference form ([`PointRequest::CpuSite`])
 //!   where a bank can have a host tier ([`PointRequest::HostMemory`]), the
 //!   device's convert at its reference form ([`PointRequest::Convert`]), and
 //!   the executor's costs ([`PointRequest::Costs`]). They are measured first,
@@ -46,6 +47,11 @@ pub enum PointRequest {
     /// precision system, then its pool and lines (`CpuCosts`). Until both
     /// are stored the site serves nothing.
     Site(SiteRequest),
+    /// A CPU site's pool and lines at its form, admitted by nothing
+    /// (`CpuCosts`): a standing request at the reference form
+    /// (`CpuForm::reference`) where a bank can have a host tier, every
+    /// streamed estimate's sited misses.
+    CpuSite(CpuForm),
     /// The executor's whole cost walk (`ExecutorCosts`): a standing
     /// request, every estimate's input.
     Costs,
@@ -100,6 +106,7 @@ impl PointRequest {
             Self::TierCopy => matches!(TierCopyCosts::stored(topology, executor, store), Err(TierCopyError::Unrecorded { .. })),
             Self::GraphCost => matches!(GraphMemory::stored(topology, executor, store), Ok(None)),
             Self::Site(site) => site.outstanding(topology, executor, store),
+            Self::CpuSite(form) => matches!(CpuCosts::stored(topology, executor, form, store), Ok(None)),
             Self::Volume { file, urgent } => {
                 let urgent = VolumeCosts::urgent(urgent);
                 matches!(VolumeCosts::stored(topology, executor, file, urgent.as_ref(), store), Ok(None | Some(StoredVolume::Earlier(_))))
@@ -114,6 +121,8 @@ impl PointRequest {
             // Two points each: a line's ends, or a site's admission and its
             // pool's lines.
             Self::Storage { .. } | Self::Moves(_) | Self::Convert(_) | Self::HostMemory { .. } | Self::TierCopy | Self::Site(_) => Ok(2),
+            // Its pool's lines.
+            Self::CpuSite(_) => Ok(1),
             // Measured as the job's device opened: nothing to time.
             Self::GraphCost => Ok(0),
             // One probe of the volume, its own points its own.
@@ -137,6 +146,7 @@ impl PointRequest {
             Self::TierCopy => (TierCopyCosts::measure(walks).err(), Vec::new()),
             Self::GraphCost => (GraphMemory::record(walks.device(), walks.store()).err(), Vec::new()),
             Self::Site(site) => (site.measure(walks).err(), Vec::new()),
+            Self::CpuSite(form) => (CpuCosts::measure(walks.device(), form, walks.store()).err(), Vec::new()),
             Self::Volume { file, urgent } => {
                 let urgent = VolumeCosts::urgent(urgent);
                 (VolumeCosts::measure(walks.device(), file, urgent.as_ref(), walks.store()).err(), Vec::new())
@@ -246,18 +256,26 @@ fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn 
 /// Assessment's standing requests on `executor`, in the order the job
 /// measures them: what its graphs hold, which its device read as it opened;
 /// the read line of the volume the model store `storage`
-/// lies on, the host memory's line with every CPU reading where a bank can
-/// have a host tier (a discrete device), and the executor's costs. Each is
+/// lies on, the host memory's line with every CPU reading and a CPU site's
+/// lines at its reference form where a bank can have a host tier (a
+/// discrete device), the device's convert at its reference form, and the
+/// executor's costs. Each is
 /// of the machine alone, so what is measured is fixed per backend.
 pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) -> Result<Vec<PointRequest>, String> {
-    let tier = (!topology.shared_ranges_lie_in_device_memory(executor))
+    let tiered = !topology.shared_ranges_lie_in_device_memory(executor);
+    let memory = tiered
         .then(|| std::thread::available_parallelism().map(|readers| PointRequest::HostMemory { readers: readers.get() as u64 }))
         .transpose()
         .map_err(|error| format!("the host's processors: {error}"))?;
+    let site = match tiered {
+        true => CpuForm::reference(executor.backend()).map_err(|error| error.to_string())?,
+        false => None,
+    };
     let convert = ConvertForm::reference(executor.backend()).map_err(|error| error.to_string())?;
     Ok([PointRequest::GraphCost, PointRequest::Storage { directory: storage.to_owned() }]
         .into_iter()
-        .chain(tier)
+        .chain(memory)
+        .chain(site.map(PointRequest::CpuSite))
         .chain(convert.map(PointRequest::Convert))
         .chain([PointRequest::Costs])
         .collect())
@@ -497,8 +515,9 @@ mod tests {
 
     /// Assessment's standing requests are always waited on, and are of the
     /// machine alone: with no load's request, the model store's read line,
-    /// then the host memory's line where a bank can have a host tier, then
-    /// the costs, while none is measured.
+    /// then the host memory's line and the reference CPU site where a bank
+    /// can have a host tier, the reference convert where a device streams,
+    /// then the costs, while none is measured.
     #[test]
     fn the_standing_requests_are_the_machines() {
         let root = std::env::temp_dir().join(format!("point-requests-standing-{}", std::process::id()));
@@ -519,6 +538,10 @@ mod tests {
         let cuda = recorded.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Cuda).unwrap();
         let convert = PointRequest::Convert(ConvertForm::reference(cuda.backend()).unwrap().unwrap());
         assert!(standing(&recorded, cuda, &storage).unwrap().contains(&convert));
+        // A device that can hold a host tier also measures every streamed
+        // estimate's sited misses, at the reference CPU site.
+        let site = PointRequest::CpuSite(CpuForm::reference(cuda.backend()).unwrap().unwrap());
+        assert!(standing(&recorded, cuda, &storage).unwrap().contains(&site));
         for executor in topology.executors() {
             if let Some(form) = ConvertForm::reference(executor.backend()).unwrap() {
                 let convert = PointRequest::Convert(form);
