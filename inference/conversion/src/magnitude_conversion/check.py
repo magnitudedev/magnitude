@@ -176,8 +176,9 @@ def check(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision, first_shar
 
     if field(gguf.Keys.General.SOURCE_REPO_URL) != model._source_repo_url:
         raise ValueError(f"general.source.repo_url is {field(gguf.Keys.General.SOURCE_REPO_URL)!r}")
-    if field(gguf.Keys.General.ALIGNMENT) != ALIGNMENT:
-        raise ValueError(f"general.alignment is {field(gguf.Keys.General.ALIGNMENT)}, expected {ALIGNMENT}")
+    for path, reader in zip(shards(first_shard), readers):
+        if (f := reader.get_field(gguf.Keys.General.ALIGNMENT)) is None or f.contents() != ALIGNMENT:
+            raise ValueError(f"{path.name}: general.alignment is {f and f.contents()}, expected {ALIGNMENT}")
     if not isinstance(model, DeepseekV41Vision):
         if field(SCALE_ENCODING) != UE8M0:
             raise ValueError(f"{SCALE_ENCODING} is {field(SCALE_ENCODING)!r}")

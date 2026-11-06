@@ -15,6 +15,9 @@ dependencies = [
   "safetensors>=0.6",
 ]
 
+[dependency-groups]
+dev = ["pytest>=9.1.1"]
+
 [project.scripts]
 magnitude-conversion = "magnitude_conversion.__main__:main"
 

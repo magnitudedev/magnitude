@@ -51,7 +51,19 @@ def check_ue8m0(name: str, scales: np.ndarray) -> None:
         raise ValueError(f"{name}: UE8M0 byte {largest} is above {MAX_UE8M0}, where E4M3 products leave F32's range")
 
 
+class AlignedShardsWriter(gguf.GGUFWriter):
+    """gguf-py pads every shard's data to `general.alignment` but writes the key into the first shard only, so a
+    reader of any later shard falls back to the default 32 and misplaces every tensor. Each shard carries it here."""
+
+    def add_shard_kv_data(self) -> None:
+        super().add_shard_kv_data()
+        key = gguf.Keys.General.ALIGNMENT
+        for kv_data in self.kv_data[1:]:
+            kv_data[key] = self.kv_data[0][key]
+
+
 def _add_file_metadata(writer: gguf.GGUFWriter, source_repo_url: str) -> None:
+    writer.__class__ = AlignedShardsWriter  # the writer is made by ModelBase; only its sharding differs
     writer.add_custom_alignment(ALIGNMENT)
     writer.add_key_value(gguf.Keys.General.SOURCE_REPO_URL, source_repo_url, gguf.GGUFValueType.STRING)
 
