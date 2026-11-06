@@ -672,6 +672,39 @@ impl ConvertForm {
     }
 }
 
+impl ConvertForm {
+    /// The form the measurement job reads a machine's convert on, of no
+    /// model: gate, up and down at about a catalog expert's size, stored as
+    /// Q4_K and resident as `backend` keeps it; none on a backend with no
+    /// convert, which streams nothing. A streamed estimate prices a record's
+    /// landing by its bytes at this form's rate
+    /// ([`Self::stored_byte_seconds`]).
+    pub(crate) fn reference(backend: seismic::BackendName) -> Result<Option<Self>, ExecutorCostsError> {
+        let convert = seismic::generated::native_implementation_for_backend::<routed_convert::Entry>(backend)
+            .map_err(|cause| failed("routed_convert")(&cause))?;
+        if convert.is_none() {
+            return Ok(None);
+        }
+        let source = Element::named("gguf_q4_k").expect("the registry names Q4_K's stored form");
+        let resident = super::executor_costs::chain_element(backend)
+            .ok_or_else(|| ExecutorCostsError(format!("{backend:?} keeps no Q4_K weights resident")))?;
+        let tensor = RecordTensor { source, resident, matrix: [512, 2048] };
+        Ok(Some(Self { record: RecordTensors { gate: Some(tensor), up: tensor, down: tensor } }))
+    }
+
+    /// `record_seconds`, this form's convert of a record, over its stored
+    /// bytes.
+    pub(crate) fn stored_byte_seconds(&self, record_seconds: f64) -> Result<f64, ExecutorCostsError> {
+        let bytes = self
+            .record
+            .iter()
+            .map(|(_, tensor)| tensor.stored_bytes())
+            .sum::<Result<u64, _>>()
+            .map_err(|cause| failed("the reference convert form")(&cause))?;
+        Ok(record_seconds / bytes as f64)
+    }
+}
+
 /// One round's graph: each routed tensor's `routed_convert` of the first
 /// `converted` list entries, conveyor record `i` into scratch record `i`,
 /// both zero and in the device's own memory, on the grid
@@ -1866,6 +1899,17 @@ impl MemoryCosts {
 mod tests {
     use super::*;
     use seismic::measure::{Attempt, Measure, Outcome, Stop};
+
+    /// A reference record's seconds price its stored bytes.
+    #[test]
+    fn the_reference_convert_prices_a_stored_byte() {
+        assert_eq!(ConvertForm::reference(seismic::BackendName::Cpu).unwrap(), None, "the CPU streams nothing");
+        let form = ConvertForm::reference(seismic::BackendName::Cuda).unwrap().unwrap();
+        // Three matrices of 512 x 2048 Q4_K weights, half a byte each and
+        // its blocks' scales.
+        let bytes = 1. / form.stored_byte_seconds(1.).unwrap();
+        assert!((3. * 512. * 1024.) < bytes && bytes < (3. * 512. * 2048.), "{bytes}");
+    }
     use seismic::Measurer;
 
     use crate::source_element;

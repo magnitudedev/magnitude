@@ -10,7 +10,8 @@
 //! - **Assessment's standing requests** ([`standing`]): the figures every
 //!   estimate is made from, fixed per backend and of no model: what its
 //!   graphs hold ([`PointRequest::GraphCost`]), the model store's read line ([`PointRequest::Storage`]), the host memory's line
-//!   where a bank can have a host tier ([`PointRequest::HostMemory`]), and
+//!   where a bank can have a host tier ([`PointRequest::HostMemory`]), the
+//!   device's convert at its reference form ([`PointRequest::Convert`]), and
 //!   the executor's costs ([`PointRequest::Costs`]). They are measured first,
 //!   whatever a load asks, so one job's time is allocated across them alone
 //!   and no load moves them later or earlier.
@@ -54,7 +55,9 @@ pub enum PointRequest {
     /// A bank group's shrink move line at its record form and moves
     /// (`MoveCosts`).
     Moves(MoveForm),
-    /// A bank group's convert ceiling at its record form (`ConvertCosts`).
+    /// A bank group's convert ceiling at its record form (`ConvertCosts`); a
+    /// standing request at the reference form (`ConvertForm::reference`),
+    /// every streamed estimate's landing.
     Convert(ConvertForm),
     /// The host memory's read line with `readers` threads reading at once
     /// (`MemoryCosts`): a host tier's record read from host memory, a
@@ -251,7 +254,13 @@ pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) 
         .then(|| std::thread::available_parallelism().map(|readers| PointRequest::HostMemory { readers: readers.get() as u64 }))
         .transpose()
         .map_err(|error| format!("the host's processors: {error}"))?;
-    Ok([PointRequest::GraphCost, PointRequest::Storage { directory: storage.to_owned() }].into_iter().chain(tier).chain([PointRequest::Costs]).collect())
+    let convert = ConvertForm::reference(executor.backend()).map_err(|error| error.to_string())?;
+    Ok([PointRequest::GraphCost, PointRequest::Storage { directory: storage.to_owned() }]
+        .into_iter()
+        .chain(tier)
+        .chain(convert.map(PointRequest::Convert))
+        .chain([PointRequest::Costs])
+        .collect())
 }
 
 /// Who waits on a stored request: a load, as of the latest time it touched
@@ -502,5 +511,20 @@ mod tests {
         assert_eq!(outstanding.last(), Some(&PointRequest::Costs));
         let measured = standing(&topology, &executor, &storage).unwrap().into_iter().filter(|request| request.outstanding(&topology, &executor, &records, costs)).collect::<Vec<_>>();
         assert_eq!(outstanding, measured);
+        // A device that streams measures every streamed estimate's landing:
+        // on any recorded machine it stands, and on this host's own executors
+        // (only a host's toolchain derives their kernels' identities) it is
+        // outstanding until measured.
+        let recorded = seismic::fixtures::recorded::rtx3090();
+        let cuda = recorded.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Cuda).unwrap();
+        let convert = PointRequest::Convert(ConvertForm::reference(cuda.backend()).unwrap().unwrap());
+        assert!(standing(&recorded, cuda, &storage).unwrap().contains(&convert));
+        for executor in topology.executors() {
+            if let Some(form) = ConvertForm::reference(executor.backend()).unwrap() {
+                let convert = PointRequest::Convert(form);
+                assert!(standing(&topology, executor, &storage).unwrap().contains(&convert));
+                assert!(convert.outstanding(&topology, executor, &records, walk_outstanding(&topology, executor, &records)), "{:?}", executor.backend());
+            }
+        }
     }
 }

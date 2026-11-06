@@ -15,8 +15,9 @@
 //! - **Lines**: the GPU's over each layer's expert from the executor's
 //!   costs ([`ExpertPass::lines`]), one expert's stored bytes from the plan,
 //!   a host tier's record read at the host memory's line, which also binds
-//!   a CPU site's misses where the plan has one, and the file's reads at the
-//!   model store's read line, all measured by the measurement job
+//!   a CPU site's misses where the plan has one, the file's reads at the
+//!   model store's read line and, with no host tier, a read's landing at the
+//!   device's convert, all measured by the measurement job
 //!   ([`StreamedFigures`]).
 //! - **The step** is the one step model's ([`super::step`]) on `C`, the
 //!   resident plan's step, with no read ahead: a hint saves only what it
@@ -34,9 +35,9 @@ use super::miss_model::MissModel;
 use super::misses::{HeldSlots, StreamedStep};
 use super::priced::Priced;
 use super::step::{LayerLoad, ReadAhead, StepInputs};
-use super::streaming_costs::{MemoryCosts, MemoryError, ReadLine, StorageCosts, StorageError};
+use super::streaming_costs::{CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, ReadLine, RecordLine, StorageCosts, StorageError};
 use crate::planning::ExpertBankPlan;
-use seismic::measure::{Record, RecordStore, StoreError};
+use seismic::measure::{InvalidLine, Record, RecordStore, StoreError};
 use seismic::{DeviceTopology, Executor, PointKey};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -45,12 +46,14 @@ use std::path::Path;
 
 /// What a streamed estimate reads beside the executor's costs, each a
 /// standing request of the measurement job (`requests::standing`): the
-/// model store's read line, and where a bank can have a host tier, the host
-/// memory's seconds a byte with every CPU reading.
+/// model store's read line, where a bank can have a host tier, the host
+/// memory's seconds a byte with every CPU reading, and a stored byte's
+/// seconds through the device's convert (`ConvertForm::reference`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StreamedFigures {
     pub read: ReadLine,
     pub memory: Option<f64>,
+    pub convert: f64,
 }
 
 impl StreamedFigures {
@@ -81,7 +84,18 @@ impl StreamedFigures {
                 },
             },
         };
-        let figures = read.and_then(|read| memory.and_then(|memory| Priced::Measured(Self { read, memory })));
+        let convert = match ConvertForm::reference(executor.backend()) {
+            Err(error) => Priced::Unavailable(error.to_string()),
+            Ok(None) => Priced::Unavailable(format!("{:?} streams nothing", executor.backend())),
+            Ok(Some(form)) => match ConvertCosts::stored(topology, executor, form, &reading) {
+                Ok(costs) => form.stored_byte_seconds(costs.record_seconds).map_or_else(|error| Priced::Unavailable(error.to_string()), Priced::Measured),
+                Err(error @ CeilingError::Unrecorded { .. }) => Priced::Pending(error.to_string()),
+                Err(error) => Priced::Unavailable(error.to_string()),
+            },
+        };
+        let figures = read.and_then(|read| {
+            memory.and_then(|memory| convert.and_then(|convert| Priced::Measured(Self { read, memory, convert })))
+        });
         (figures, reading.read.into_inner())
     }
 }
@@ -114,6 +128,8 @@ pub enum StreamedError {
     Line(LineError),
     Host(HostLinesError),
     Costs(String),
+    /// A landing's line from the convert's figure.
+    Landing(InvalidLine),
 }
 
 impl fmt::Display for StreamedError {
@@ -123,6 +139,7 @@ impl fmt::Display for StreamedError {
             Self::Line(error) => error.fmt(formatter),
             Self::Host(error) => error.fmt(formatter),
             Self::Costs(error) => write!(formatter, "the streamed layers' passes: {error}"),
+            Self::Landing(error) => write!(formatter, "a landing's line: {error}"),
         }
     }
 }
@@ -235,7 +252,8 @@ impl StreamedLayers {
                 // A CPU site's misses are bound by the host memory they read: its record at the
                 // memory's whole rate, no form's line being the machine's.
                 let cpu = host.memory.filter(|_| bank.sited(layer)).map(|one| CpuLines { handshake: Nanoseconds::saturating(0.), expert: RowLine { one, row: RowCost::AtMost(gpu.link.row) } });
-                Ok(ExpertLines { host: HostLines { cpu, ..host }, gpu })
+                let file = landing(&host, figures.convert).map_err(StreamedError::Landing)?;
+                Ok(ExpertLines { host: HostLines { cpu, file, ..host }, gpu })
             })
             .collect::<Result<Vec<_>, StreamedError>>()?;
         Ok(Self::new(bank.layers().iter().map(|layer| layer.experts).collect(), bank.selected(), lines.into()))
@@ -295,6 +313,17 @@ impl StreamedLayers {
         };
         let step = inputs.unhinted(steps.iter().map(|(loads, count)| (loads.as_slice(), *count)));
         StreamedStep { compute_seconds, exposed_seconds: step.total - compute_seconds, total_seconds: step.total }
+    }
+}
+
+/// What a file miss of a layer of `host`'s lines takes past its read: with no
+/// host tier it lands through the device's convert into its bank record before
+/// its layer computes, its stored bytes at `byte_seconds`; beside a tier the
+/// CPU or the link serves it where it landed.
+fn landing(host: &HostLines, byte_seconds: f64) -> Result<Option<FileLine>, InvalidLine> {
+    match host.memory {
+        Some(_) => Ok(None),
+        None => RecordLine::new(0., host.record_bytes as f64 * byte_seconds).map(|landing| Some(FileLine { landing })),
     }
 }
 
@@ -397,6 +426,16 @@ mod tests {
         assert!(tiered.iter().all(|load| load.file == 0));
         assert_eq!(tiered.iter().map(|load| load.tier).sum::<u64>(), misses);
         assert!(period(HeldSlots::bank(32)).iter().all(|load| load.tier + load.file == 0));
+    }
+
+    /// A file miss lands at the convert's rate only with no host tier.
+    #[test]
+    fn a_file_miss_lands_through_the_convert_with_no_host_tier() {
+        let host = HostLines { cpu: None, memory: None, file: None, convert: None, record_bytes: 2_000_000 };
+        let line = landing(&host, 1e-10).unwrap().expect("no tier: the device lands it");
+        assert!((line.seconds(3) - 3. * 2e-4).abs() < 1e-12);
+        let tier = HostLines { memory: Some(Nanoseconds::saturating(1.)), ..host };
+        assert_eq!(landing(&tier, 1e-10).unwrap(), None);
     }
 
     /// A load prices on the generic model counted as one more step: at its

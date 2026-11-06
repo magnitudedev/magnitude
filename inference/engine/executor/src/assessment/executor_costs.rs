@@ -150,7 +150,7 @@ impl Sizes {
 }
 
 /// The representation `backend` keeps [`CHAIN_FORMAT`] weights resident as.
-fn chain_element(backend: seismic::BackendName) -> Option<Element> {
+pub(super) fn chain_element(backend: seismic::BackendName) -> Option<Element> {
     resident_element(
         CHAIN_FORMAT,
         ScaledActivations::Rounded,
