@@ -108,6 +108,12 @@ pub trait CustomModelEnrichment: Send + Sync + 'static {
     fn catalog_drafter_fit(&self, _model_id: &ModelId) -> CatalogDrafterFit {
         CatalogDrafterFit::default()
     }
+    /// Whether `catalog_drafter_fit` answers for `model_id` from knowledge rather than from not
+    /// having worked it out yet. When this becomes true it calls
+    /// [`ModelDomainResolver::catalog_drafter_fit_changed`].
+    fn knows_catalog_drafter_fit(&self, _model_id: &ModelId) -> bool {
+        true
+    }
 }
 
 /// How a catalog model serves without its catalog drafter, which depends on the release material
@@ -225,6 +231,15 @@ impl ModelDomainResolver {
             .read()
             .map(|enrichment| enrichment.catalog_drafter_fit(model_id))
             .unwrap_or_default()
+    }
+
+    /// Whether how a catalog model serves without its catalog drafter is known yet.
+    pub(crate) fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
+        self.local
+            .enrichment
+            .read()
+            .map(|enrichment| enrichment.knows_catalog_drafter_fit(model_id))
+            .unwrap_or(true)
     }
 
     /// Republishes the local-models list after the enrichment's knowledge changed.
@@ -7329,6 +7344,88 @@ mod tests {
                 ..
             } if draft.id == old_draft.id
         ));
+    }
+
+    /// Has not worked out how any catalog model serves without its catalog drafter.
+    struct DrafterFitNotWorkedOut;
+
+    impl CustomModelEnrichment for DrafterFitNotWorkedOut {
+        fn enrich(&self, _model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult {
+            CustomModelEnrichmentResult::default()
+        }
+        fn knows_catalog_drafter_fit(&self, _model_id: &ModelId) -> bool {
+            false
+        }
+    }
+
+    /// QA (RTX 4090, round 4): right after an update, `catalog pull` refused Nemotron 3.5
+    /// Lightning as 88.6 MB short while the catalog reported every model assessed; a minute later
+    /// it fit at 256K. A catalog model with a drafter was assessed with that drafter before it was
+    /// known whether it fits only without it, and that placeholder's verdict was published. Until
+    /// the fit is known, such a model's configuration waits rather than being assessed.
+    #[tokio::test]
+    async fn a_catalog_model_with_a_drafter_waits_for_its_drafter_fit_before_it_is_assessed() {
+        use magnitude_service_contracts::models::{CatalogModelSelection, ModelAssessmentSubject};
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+        let fixture = Fixture::new().await;
+        publish_managed(
+            &fixture.store,
+            "owner/Model-GGUF",
+            &"c".repeat(40),
+            &[("Model.gguf", drafter_bytes("model"))],
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let package = fixture
+            .inventory()
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .map(|entry| entry.package)
+            .next()
+            .expect("the published package");
+        let plain = catalog_definition(package.clone());
+        let mut drafted = catalog_definition(package.clone());
+        drafted.model_id =
+            magnitude_service_contracts::models::CatalogBaseId::new("drafted").unwrap();
+        drafted.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target: package.clone(),
+            draft_source: SpeculativeDraftSource::Separate { draft: package },
+            method: SpeculativeMethod::Mtp,
+        };
+        let (plain_id, drafted_id) = (catalog_id(&plain), catalog_id(&drafted));
+        let fixture = fixture.restart(vec![plain, drafted]).await;
+        let subject = |model_id: &ModelId, selection| ModelAssessmentSubject::Catalog {
+            model_id: model_id.clone(),
+            selection,
+        };
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(DrafterFitNotWorkedOut));
+        for selection in [CatalogModelSelection::Desired, CatalogModelSelection::Effective] {
+            assert!(
+                fixture
+                    .resolver
+                    .awaits_catalog_drafter_fit(&subject(&drafted_id, selection)),
+                "{selection:?} waits for the drafter fit"
+            );
+            assert!(
+                !fixture
+                    .resolver
+                    .awaits_catalog_drafter_fit(&subject(&plain_id, selection)),
+                "a model without a drafter never waits"
+            );
+        }
+        fixture
+            .resolver
+            .set_custom_model_enrichment(Arc::new(NoEnrichment));
+        assert!(
+            !fixture
+                .resolver
+                .awaits_catalog_drafter_fit(&subject(&drafted_id, CatalogModelSelection::Desired)),
+            "once the fit is known it is assessed"
+        );
     }
 
     /// Recommends each model the drafter beside it and reports it matching one catalog model, as

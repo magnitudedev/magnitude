@@ -678,6 +678,22 @@ impl ManagedModelAssessments {
                 work: None,
             };
         }
+        // A configuration that depends on a drafter fit not worked out yet is a placeholder: it
+        // is assessed once the fit is known, and meanwhile reported as assessing, never as a
+        // verdict that refuses its download or its load.
+        if self.assessor.awaits_catalog_drafter_fit(&subject) {
+            return AssessmentTarget {
+                key: AssessmentWorkKey(
+                    serde_json::to_string(&(&subject, &profile, "awaiting catalog drafter fit"))
+                        .expect("assessment target identity is serializable"),
+                ),
+                entry: ModelAssessmentEntry {
+                    subject,
+                    state: ModelAssessmentEntryState::Assessing,
+                },
+                work: None,
+            };
+        }
         let environment = self.assessor.environment();
         let work = self
             .assessor

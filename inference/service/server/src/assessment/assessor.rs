@@ -183,6 +183,14 @@ impl ModelAssessor {
         self.resolve(&bundle_key, bundle).await
     }
 
+    /// Whether `subject`'s configuration still waits on its catalog drafter's fit.
+    pub fn awaits_catalog_drafter_fit(
+        &self,
+        subject: &magnitude_service_contracts::models::ModelAssessmentSubject,
+    ) -> bool {
+        self.model_domains.awaits_catalog_drafter_fit(subject)
+    }
+
     pub fn configuration_for(
         &self,
         subject: &magnitude_service_contracts::models::ModelAssessmentSubject,

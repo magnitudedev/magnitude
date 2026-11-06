@@ -5897,3 +5897,32 @@ async fn a_repository_declaring_another_generation_never_makes_the_shape_matched
         "{candidates:#?}"
     );
 }
+
+/// How a catalog model serves without its drafter is news to the catalog when it first becomes
+/// known, even when it keeps the drafter, so a model waiting for it is assessed; and when the fits
+/// may not be worked out soon, every model still waiting is released to serve as before.
+#[test]
+fn a_catalog_drafter_fit_is_news_once_known_or_unreachable() {
+    use magnitude_service_models::CustomModelEnrichment;
+    let knows = |enrichment: &super::CandidateEnrichment, model: &ModelId| {
+        CustomModelEnrichment::knows_catalog_drafter_fit(enrichment, model)
+    };
+    let enrichment = super::CandidateEnrichment::default();
+    let model = qwen_catalog_id();
+    assert!(!knows(&enrichment, &model));
+    assert!(enrichment.record_catalog_drafter_fit(model.clone(), CatalogDrafterFit::default()));
+    assert!(knows(&enrichment, &model));
+    assert!(!enrichment.record_catalog_drafter_fit(model.clone(), CatalogDrafterFit::default()));
+    let withheld = CatalogDrafterFit {
+        withheld: true,
+        built_in_heads: false,
+    };
+    assert!(enrichment.record_catalog_drafter_fit(model, withheld));
+
+    let unreachable = super::CandidateEnrichment::default();
+    let other = qwen_catalog_id();
+    assert!(!knows(&unreachable, &other));
+    assert!(unreachable.record_catalog_drafter_fits_unreachable());
+    assert!(!unreachable.record_catalog_drafter_fits_unreachable());
+    assert!(knows(&unreachable, &other));
+}

@@ -212,6 +212,7 @@ struct CandidateEnrichment {
         std::sync::RwLock<BTreeMap<(ModelId, String), (u64, Reach, CustomModelEnrichmentResult)>>,
     drafter_contents: std::sync::RwLock<BTreeMap<String, DrafterContent>>,
     catalog_drafter_fits: std::sync::RwLock<BTreeMap<ModelId, CatalogDrafterFit>>,
+    catalog_drafter_fits_unreachable: std::sync::atomic::AtomicBool,
 }
 
 impl CandidateEnrichment {
@@ -277,18 +278,30 @@ impl CandidateEnrichment {
         previous.map(|(_, previous)| previous).unwrap_or_default() != result
     }
 
-    fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
+    /// Whether how a catalog model serves without its drafter is worked out.
+    fn has_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
         self.catalog_drafter_fits
             .read()
             .is_ok_and(|fits| fits.contains_key(model_id))
     }
 
-    /// Record how a catalog model serves without its drafter; whether that changed what it serves.
+    /// Record how a catalog model serves without its drafter; whether that is new: it was not
+    /// known before, or it changed what the model serves.
     fn record_catalog_drafter_fit(&self, model_id: ModelId, fit: CatalogDrafterFit) -> bool {
         let Ok(mut known) = self.catalog_drafter_fits.write() else {
             return false;
         };
-        known.insert(model_id, fit).unwrap_or_default() != fit
+        known.insert(model_id, fit) != Some(fit)
+    }
+
+    /// Record that the fits not worked out yet may not be soon: a fit failed, as every one does
+    /// while the Hub is out of reach. Those models then serve as if their drafter fits, as before
+    /// the fit was known, so none waits for it; whether this is new. The local pass, which never
+    /// works fits out, says nothing about them.
+    fn record_catalog_drafter_fits_unreachable(&self) -> bool {
+        !self
+            .catalog_drafter_fits_unreachable
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Record a drafter reference's bytes; whether they are new.
@@ -344,6 +357,13 @@ impl CustomModelEnrichment for CandidateEnrichment {
             .ok()
             .and_then(|fits| fits.get(model_id).copied())
             .unwrap_or_default()
+    }
+
+    fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
+        self.has_catalog_drafter_fit(model_id)
+            || self
+                .catalog_drafter_fits_unreachable
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -645,6 +665,10 @@ impl ManagedModelCandidates {
                     }
                 }
             }
+            // Catalog drafter fits come before the custom models: every catalog model with a
+            // drafter is held assessing until its fit is known.
+            let catalog_failed =
+                reach == Reach::Hub && !self.fit_catalog_drafters(resolver, revision).await;
             // Models with no result yet come first, so a model just added or installed is
             // never kept waiting behind recomputing the others; each result is published as
             // soon as it is known, and a pass restarts as soon as the inputs move again.
@@ -690,8 +714,6 @@ impl ManagedModelCandidates {
                     }
                 }
             }
-            let catalog_failed =
-                reach == Reach::Hub && !self.fit_catalog_drafters(resolver, revision).await;
             tokio::select! {
                 change = changes.next() => if change.is_none() { return },
                 () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !failed.is_empty() || catalog_failed => {}
@@ -714,7 +736,7 @@ impl ManagedModelCandidates {
                 break;
             }
             if model.desired.speculative_method.is_none()
-                || self.enrichment.knows_catalog_drafter_fit(&model.id)
+                || self.enrichment.has_catalog_drafter_fit(&model.id)
             {
                 continue;
             }
@@ -727,6 +749,9 @@ impl ManagedModelCandidates {
                 Err(error) => {
                     tracing::warn!(model.id = %model.id.as_str(), %error, "catalog drafter fit failed");
                     complete = false;
+                    if self.enrichment.record_catalog_drafter_fits_unreachable() {
+                        resolver.catalog_drafter_fit_changed();
+                    }
                 }
             }
         }
