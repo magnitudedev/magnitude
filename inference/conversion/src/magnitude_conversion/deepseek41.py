@@ -8,7 +8,8 @@ MXFP4 expert repack, DSpark and vision paths, and store what upstream widens as 
   bytes, one per block, in the checkpoint's block grid), declared by `magnitude.scale_encoding = "ue8m0"`
   (the convention is `inference/docs/precision.md`'s "UE8M0-scaled FP8 weights");
 - the Engram tables are `per_layer_token_embd.weight` (F8_E4M3) plus `per_layer_token_embd.scale` (I8, one per 32);
-- BF16 and F32 tensors keep their type. The Engram gate stays upstream's F32 product of two BF16 tensors (exact).
+- BF16 and F32 tensors keep their type, vectors and norms included (upstream's base writes those F32). The Engram
+  gate stays upstream's F32 product of two BF16 tensors (exact).
 
 A slice (`layers`) is a sub-model of the checkpoint: the kept layers renumbered from 0, with every layer-indexed
 config value remapped, so a slice converts like any model.
@@ -55,7 +56,25 @@ def _add_file_metadata(writer: gguf.GGUFWriter, source_repo_url: str) -> None:
     writer.add_key_value(gguf.Keys.General.SOURCE_REPO_URL, source_repo_url, gguf.GGUFValueType.STRING)
 
 
-class _NativeFp8:
+class _KeepBf16:
+    """Writes a BF16 tensor the base would widen to F32 (a vector, or a norm) as BF16."""
+
+    gguf_writer: gguf.GGUFWriter
+    model_tensors: dict[str, Callable[[], torch.Tensor]]
+
+    def modify_tensors(self, data_torch, name: str, bid: int | None) -> Iterable[tuple[str, torch.Tensor]]:
+        bf16 = name in self.model_tensors and self.model_tensors[name]().dtype == torch.bfloat16
+        for new_name, data in super().modify_tensors(data_torch, name, bid):
+            if bf16 and (data.ndim <= 1 or new_name.endswith("_norm.weight")):
+                # the base casts sources to F32 first, which BF16 survives exactly
+                values = LazyTorchTensor.to_eager(data).float().numpy()
+                self.gguf_writer.add_tensor(new_name, gguf.quants.quantize(values, gguf.GGMLQuantizationType.BF16),
+                                            raw_dtype=gguf.GGMLQuantizationType.BF16)
+                continue
+            yield new_name, data
+
+
+class _NativeFp8(_KeepBf16):
     """Keeps FP8 weights as F8_E4M3 codes with their block scales beside them, and stored types as they are."""
 
     gguf_writer: gguf.GGUFWriter
@@ -273,8 +292,9 @@ class DeepseekV41DSpark(_NativeFp8, DeepseekV41DSparkModel):
     model_arch = gguf.MODEL_ARCH.DFLASH
 
 
-class DeepseekV41Vision(DeepseekV41VisionModel):
-    """The vision tower and aligner as a projector GGUF. It has no FP8 tensors, so only the file metadata differs."""
+class DeepseekV41Vision(_KeepBf16, DeepseekV41VisionModel):
+    """The vision tower and aligner as a projector GGUF. It has no FP8 tensors: its BF16 vectors and the file
+    metadata are what differ."""
 
     model_arch = gguf.MODEL_ARCH.MMPROJ
 

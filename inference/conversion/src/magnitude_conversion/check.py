@@ -1,10 +1,9 @@
 """Byte-exact check of a converted file against the checkpoint it came from.
 
-Tensor names come from the converter's own mapping (upstream's). Every tensor's bytes are rebuilt from the
+Tensor names come from upstream's mapping, the one the converter writes by. Every tensor's bytes are rebuilt from the
 safetensors by this module's rules, independently of the converter's data path:
 
-- F8_E4M3 codes, I8 scales, BF16 and F32 tensors equal the checkpoint's bytes;
-- a 1-D BF16 tensor stored as F32 equals its exact widening;
+- F8_E4M3 codes, I8 scales, BF16 and F32 tensors equal the checkpoint's bytes, at the checkpoint's type;
 - the Engram gate equals the F32 product of `q_weight` and `k_weight`;
 - MXFP4 experts equal the ggml `block_mxfp4` layout built from the checkpoint's codes and UE8M0 scales;
 - the Engram table equals the kept layers' code and scale rows, concatenated.
@@ -74,6 +73,8 @@ def expected_tensors(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision)
 
     # experts and Engram tables are written whole by the converter, not tensor by tensor; checked below
     separate = re.compile(r"layers\.\d+\.(ffn\.experts\.\d+\.w[123]|engram\.embed)\.(weight|scale)$")
+    # upstream's modify_tensors: names only, without the writes this package's classes make inside it
+    upstream = next(c for c in type(model).__mro__ if c.__module__.startswith("conversion."))
     if not isinstance(model, DeepseekV41Vision):
         model.dequant_model()  # the converter's bookkeeping only: which weights keep FP8 codes, and their scales
     for name, gen in model.model_tensors.items():
@@ -81,7 +82,7 @@ def expected_tensors(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision)
             continue
         source = gen()
         bid = next((int(p) for p in name.split(".") if p.isdecimal()), None)
-        for new_name, data in model.modify_tensors(source, name, bid):
+        for new_name, data in upstream.modify_tensors(model, source, name, bid):
             shape = tuple(data.shape)
             if new_name.endswith(".engram_gate.weight"):
                 k = model.model_tensors[name.removesuffix("q_weight") + "k_weight"]
@@ -91,10 +92,9 @@ def expected_tensors(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision)
                 add(new_name, Expected(T.F8_E4M3, shape, _once(lambda g=gen: _raw(_eager(g)))))
                 scale = model._fp8_scales[name]
                 add(scale_name(new_name), Expected(T.I8, tuple(scale().shape), _once(lambda s=scale: _raw(_eager(s)))))
-            elif source.dtype == torch.bfloat16 and len(shape) >= 2:
-                add(new_name, Expected(T.BF16, shape, _once(lambda g=gen: _raw(_eager(g)))))
             elif source.dtype in (torch.bfloat16, torch.float32):
-                add(new_name, Expected(T.F32, shape, _once(lambda g=gen: _raw(_eager(g).float()))))
+                qtype = T.BF16 if source.dtype == torch.bfloat16 else T.F32
+                add(new_name, Expected(qtype, shape, _once(lambda g=gen: _raw(_eager(g)))))
             else:
                 raise ValueError(f"{name}: no rule for {source.dtype}")
 
