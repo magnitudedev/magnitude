@@ -241,6 +241,11 @@ impl Ticket {
         Some(outcome_of(&endeds, &reads).0)
     }
 
+    /// Its jobs' submissions: the ids their read timeline events carry.
+    pub fn jobs(&self) -> impl Iterator<Item = u64> + '_ {
+        self.jobs.iter().map(|(job, _)| job.id())
+    }
+
     /// Run `hook` with the outcome, and the indices of the ticket's reads
     /// that failed (every one after a panic), once every job has ended, on
     /// the thread that ends the last (a read worker), or at once where every

@@ -217,6 +217,10 @@ impl Queue {
         let volume = self.volumes.entry(job.volume.id).or_insert_with(|| VolumeFlight::new(now));
         self.waits.insert(id, Wait::new(job.pieces.len(), priority, &mut volume.book, now));
         let woken = room(volume.bytes, &job, priority);
+        if crate::timeline::recording() {
+            let bytes = job.pieces.iter().map(|piece| piece.end - piece.start).sum::<u64>();
+            crate::timeline::note(crate::timeline::Kind::Submit, id, (priority as i64, job.pieces.len() as i64, bytes as i64));
+        }
         self.priorities.insert(id, priority);
         self.jobs.insert((priority, id), job);
         (id, woken)
@@ -256,6 +260,7 @@ impl Queue {
         let piece = job.pieces.pop_front().expect("a queued job has a piece");
         let now = Instant::now();
         let flight = self.volumes.get_mut(&job.volume.id).expect("a queued job's volume");
+        crate::timeline::note_at(now, crate::timeline::Kind::Take, key.1, (piece.start as i64, (piece.end - piece.start) as i64, flight.bytes as i64));
         flight.bytes += piece.end - piece.start;
         flight.book.began(key.0, now);
         self.waits.get_mut(&key.1).expect("a queued job is waited").taken(key.0, &mut flight.book, now);
@@ -292,6 +297,7 @@ impl Queue {
         }
         let job = self.jobs.remove(&(*current, id)).expect("a queued job");
         *current = priority;
+        crate::timeline::note(crate::timeline::Kind::Promote, id, (priority as i64, job.pieces.len() as i64, 0));
         let woken = self.room(&job, priority);
         self.jobs.insert((priority, id), job);
         woken
@@ -302,6 +308,7 @@ impl Queue {
     pub(crate) fn withdraw(&mut self, id: u64) -> Option<Queued> {
         let priority = self.priorities.remove(&id)?;
         let job = self.jobs.remove(&(priority, id))?;
+        crate::timeline::note(crate::timeline::Kind::Withdraw, id, (job.pieces.len() as i64, 0, 0));
         let flight = self.volumes.get_mut(&job.volume.id).expect("a queued job's volume");
         settle(&mut self.waits, id, |wait| wait.withdrawn(&mut flight.book, Instant::now()));
         Some(job)

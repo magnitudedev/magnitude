@@ -84,6 +84,7 @@ pub mod destination;
 pub mod disk;
 mod error;
 pub mod scheduler;
+pub mod timeline;
 
 pub use accounting::{Class, Totals, Waits};
 pub use destination::{Buffer, Destination};

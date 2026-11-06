@@ -1333,6 +1333,13 @@ impl Telemetry {
         let decoded = match route {
             CompletedRoute::Grouped => None,
             CompletedRoute::Decode(mut decoded) => {
+                if seismic_io::timeline::recording() {
+                    for (layer, record) in self.records(sequence) {
+                        for (expert, source) in record.choices() {
+                            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("route"), sequence, (layer as i64, expert as i64, source as i64));
+                        }
+                    }
+                }
                 let blocks = decoded.sampled.take().map(|lines| self.sampled_blocks(sequence, lines)).transpose()?;
                 Some((decoded, self.routed(sequence), self.tiered(sequence), self.sourced(sequence), self.absent(sequence), blocks))
             }
@@ -1452,6 +1459,10 @@ impl Telemetry {
         // Every step's end, from which the next decode step's time is taken.
         let now = Instant::now();
         let ended = (feed.ended.replace(now), now);
+        if let Some(begun_at) = seismic_io::timeline::stamp(begun) {
+            let previous = ended.0.and_then(seismic_io::timeline::stamp).map_or(-1, |previous| previous as i64);
+            seismic_io::timeline::note_at(now, seismic_io::timeline::Kind::Noted("step"), sequence, (begun_at as i64, previous, (work == LaunchWork::Generation) as i64));
+        }
         // What the volumes read since the step before: a generation step's
         // busy time, over its time, whatever its form (a verify wider than
         // the decode form ranks no hints). A prompt step's reads drain a

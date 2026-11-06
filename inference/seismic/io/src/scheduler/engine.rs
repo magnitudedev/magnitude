@@ -129,7 +129,10 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
             // counted ended before it stops being reported in flight
             // ([`engine_work`]).
             if let Some(ended) = read.take() {
-                let held_back = queue.ended(&ended, Instant::now());
+                let now = Instant::now();
+                let piece = &ended.piece;
+                crate::timeline::note_at(now, crate::timeline::Kind::Freed, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
+                let held_back = queue.ended(&ended, now);
                 *flight.lock().expect("a read worker's flight") = None;
                 if held_back {
                     engine.work.notify_one();
@@ -166,7 +169,10 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
                 })
                 .collect(),
         })) {
-            Ok(failed) => taken.state.pieces_ended(1, failed, None),
+            Ok(failed) => {
+                crate::timeline::note(crate::timeline::Kind::Read, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
+                taken.state.pieces_ended(1, failed, None)
+            }
             Err(payload) => taken.state.pieces_ended(1, [], Some(Panic::new(payload))),
         }
         read = Some(taken);

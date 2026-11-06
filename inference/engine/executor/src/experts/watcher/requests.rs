@@ -108,17 +108,20 @@ impl Requests {
     pub(super) fn serve(self) {
         let events = self.shared.events().clone();
         let residency = self.residency.clone();
+        let mut ended = Instant::now();
         loop {
             let seen = events.seen();
             if self.shared.life.stopping() {
                 return;
             }
+            let asked = Instant::now();
             let (progressed, polls) = {
                 let mut held = lock(&residency);
                 let mut service = self.service.lock().expect("the request service is never left by a panic");
+                let pass = Pass { ended, asked, held: Instant::now() };
                 let progressed = match self.shared.life.ended() {
                     Some(_) => liveness::refuse(&held.core, &self.shared),
-                    None => match std::panic::catch_unwind(AssertUnwindSafe(|| self.pass(&mut service, &mut held))) {
+                    None => match std::panic::catch_unwind(AssertUnwindSafe(|| self.pass(&mut service, &mut held, pass))) {
                         Ok(progressed) => progressed,
                         Err(payload) => {
                             self.shared.end_serving(format!("it panicked: {}", panic_message(payload.as_ref())));
@@ -128,6 +131,7 @@ impl Requests {
                 };
                 (progressed, self.polls(&held))
             };
+            ended = Instant::now();
             if progressed {
                 events.notify();
                 continue;
@@ -154,7 +158,7 @@ impl Requests {
     /// the request's reads reach the readers before any read of those
     /// hints, and a ring whose hinted layer's request is noticed is
     /// decided, not read (`Prefetch::hint`). True when it changed anything.
-    fn pass(&self, service: &mut Service, residency: &mut Residency) -> bool {
+    fn pass(&self, service: &mut Service, residency: &mut Residency, pass: Pass) -> bool {
         // A panic of the executor's work, or the device lost under the
         // parks, ends serving, as the service's own panic does.
         if let Some(reason) = self.shared.fault() {
@@ -168,7 +172,7 @@ impl Requests {
         let resumed = service.decode.resume(residency.serving());
         // A served group's reads that landed move on, ahead of its rounds.
         let conveyed = residency.scratch.convey(&mut residency.core, &self.shared);
-        let served = self.serve_requests(service, residency);
+        let served = self.serve_requests(service, residency, pass);
         let progressed = resumed | conveyed | served;
         if progressed {
             residency.publish_held();
@@ -183,7 +187,7 @@ impl Requests {
     /// advise, once they may be (`Parks::settled`). What the host alone
     /// holds (a scratch request taken, its rounds) is carried every pass.
     /// Whether it served any.
-    fn serve_requests(&self, service: &mut Service, residency: &mut Residency) -> bool {
+    fn serve_requests(&self, service: &mut Service, residency: &mut Residency, pass: Pass) -> bool {
         let parked = self.shared.parks.parked();
         let layers = residency.core.layers.len();
         let mut progressed = false;
@@ -198,6 +202,10 @@ impl Requests {
                 // it, and a group past staged, `Residency::advance`).
                 if let Some(sequence) = service.decode.request(&residency.core, &self.shared, layer) {
                     let started = Instant::now();
+                    if let (Some(ended), Some(asked), Some(held)) = (seismic_io::timeline::stamp(pass.ended), seismic_io::timeline::stamp(pass.asked), seismic_io::timeline::stamp(pass.held)) {
+                        seismic_io::timeline::note_at(started, seismic_io::timeline::Kind::Noted("pass"), sequence, (layer as i64, asked as i64, held as i64));
+                        seismic_io::timeline::note_at(started, seismic_io::timeline::Kind::Noted("pass_ended"), sequence, (layer as i64, ended as i64, 0));
+                    }
                     let at = self.shared.steps.at(sequence, layer, layers);
                     residency.advance(at.point);
                     service.decode.serve(at, started, residency.serving());
@@ -268,4 +276,14 @@ impl Requests {
             }
         }
     }
+}
+
+/// When a pass of the request service began, for the read timeline: the
+/// previous pass's end, when it asked for residency's lock, and when it
+/// held it.
+#[derive(Clone, Copy)]
+struct Pass {
+    ended: Instant,
+    asked: Instant,
+    held: Instant,
 }

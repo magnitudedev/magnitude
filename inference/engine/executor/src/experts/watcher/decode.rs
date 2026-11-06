@@ -253,7 +253,13 @@ impl Decode {
             };
             let naming = Naming { layer, sequence: waits.at.point.sequence, named: waits.named };
             match core.source.submit(reads, Priority::Demand) {
-                Ok(ticket) => prefetch.demand(ticket, vec![landing], vec![(record, staged, tier, naming.sequence)], naming, None, None, shared),
+                Ok(ticket) => {
+                    for job in ticket.jobs() {
+                        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, naming.sequence as i64, -1));
+                    }
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), naming.sequence as u64, (layer as i64, expert as i64, 5));
+                    prefetch.demand(ticket, vec![landing], vec![(record, staged, tier, naming.sequence)], naming, None, None, shared)
+                }
                 // The read was never made: as a failed read, only the rows that named the
                 // expert fail, and its wait is answered with none, so the rest of the step serves.
                 Err(reason) => {
@@ -345,6 +351,7 @@ impl Decode {
         // Each absent expert answers once, the last the slot.
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(absent.len()));
         let answer_of = |expert: usize| Answer {
+            layer,
             file: file.clone(),
             sequence,
             choices: named(expert).collect(),
@@ -354,6 +361,7 @@ impl Decode {
             parks: shared.parks.clone(),
         };
         let naming = Naming { layer, sequence, named: started };
+        seismic_io::timeline::note_at(started, seismic_io::timeline::Kind::Noted("notice"), sequence as u64, (layer as i64, absent.len() as i64, count as i64));
         // Each absent expert's landing: one staging keeps (revived), a read
         // ahead's, hastened to demand (reading), or one read now. The
         // request's lead is the layers since its last read a route issued
@@ -407,6 +415,14 @@ impl Decode {
                     }
                 },
             };
+            let code = match (&plan, anticipation) {
+                (Some(Plan::Unread(Unread::Kept(_))), _) => 0,
+                (_, Some(Anticipation::Reading)) => 1,
+                (Some(Plan::Unread(Unread::Reading)), _) => 2,
+                (_, Some(Anticipation::Staged)) => 3,
+                _ => 4,
+            };
+            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), sequence as u64, (layer as i64, expert as i64, code));
             // A miss kept already reads nothing: no read miss, nor its bytes.
             match anticipation {
                 Some(anticipation) => served.anticipated[anticipation as usize] += 1,
@@ -477,6 +493,11 @@ impl Decode {
             }
         }
         let submitted = (!reads.is_empty()).then(|| (Instant::now(), core.source.submit(reads, Priority::Demand)));
+        if let Some((_, Ok(ticket))) = &submitted {
+            for job in ticket.jobs() {
+                seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, sequence as i64, reading as i64));
+            }
+        }
         if fresh > 0 {
             lead = Some(0);
         }

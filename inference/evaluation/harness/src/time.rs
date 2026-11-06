@@ -966,6 +966,12 @@ fn measure(
         // the expert costs, which are rendered once the window has closed.
         let mut rest = BankRest::of(engine)?;
         let mut expert_costs = Vec::with_capacity(time.steps);
+        // An untimed streamed cell records its window's read timeline
+        // (`seismic_io::timeline`): the warm steps' events dropped.
+        if time.untimed && engine.domain.expert_costs().is_some() {
+            seismic_io::timeline::record();
+            drop(seismic_io::timeline::take());
+        }
         for index in 0..time.steps {
             let step = run(engine, sequences, &trace)?;
             if let Some(last) = phases.last_mut() {
@@ -1052,6 +1058,13 @@ fn measure(
     };
     submissions.extend(collect(&trace)?);
     drop(trace);
+    let read_timeline = seismic_io::timeline::recording().then(|| {
+        use std::fmt::Write;
+        seismic_io::timeline::take().into_iter().fold(String::new(), |mut lines, event| {
+            let _ = writeln!(lines, "{} {} {} {} {} {}", event.at, event.kind.name(), event.job, event.a, event.b, event.c);
+            lines
+        })
+    });
     // Per streamed layer, what the window's steps (after the first, as the
     // window's span) read on demand, how long the device parked for it and
     // how long its reads took; and the window's effective read bandwidth,
@@ -1197,6 +1210,7 @@ fn measure(
         "read_bytes_per_second": read_bytes_per_second,
         "reads": demand_reads,
         "site": site,
+        "read_timeline": read_timeline,
         "expert_bank": engine.domain.expert_costs().map(|costs| json!({
             // What the weight cap bounds, by the owner of each byte: the
             // bytes beside the experts' records that decide the slots.

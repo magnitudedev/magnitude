@@ -520,6 +520,8 @@ impl super::compute::Job for Converting {
 /// of the exchange.
 #[derive(Clone)]
 pub(in crate::experts) struct Answer {
+    /// The layer whose request it answers.
+    pub layer: usize,
     pub file: super::ExchangeTable,
     pub sequence: Step,
     pub choices: Vec<usize>,
@@ -551,9 +553,11 @@ impl Answer {
             for &choice in &self.choices {
                 self.file.store(sequence, 0, SlotTable::file_entry(choice as u64) + constants::FILE_RECORD, source);
             }
-            if self.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            let slot = self.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
+            if slot {
                 self.file.answer(sequence, 0, false);
             }
+            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("answer"), sequence as u64, (self.layer as i64, record.is_some() as i64, slot as i64));
         });
         self.parks.settle();
     }

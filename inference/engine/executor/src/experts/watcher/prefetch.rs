@@ -358,19 +358,26 @@ impl Prefetch {
     /// none where staging lands none or its read failed (the step reads the
     /// expert anew once its end is learned).
     pub(super) fn hasten(&self, staged: Staged) -> Option<Reading> {
+        let noted = |code: i64| seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("hasten"), 0, (staged.0 as i64, staged.1 as i64, code));
         if let Some(tracked) = self.landings.iter().find(|tracked| tracked.staged == staged) {
+            noted(0);
             tracked.urgency.promote(Priority::Demand);
             return Some(Reading::Unpredicted);
         }
         let reading = match (self.hints.get(&staged), self.fills.contains_key(&staged)) {
             (Some(hint), _) => Reading::Hint(hint.issued),
             (None, true) => Reading::Unpredicted,
-            (None, false) => return None,
+            (None, false) => {
+                noted(-1);
+                return None;
+            }
         };
         let ahead = self.ahead(staged).expect("a read ahead in flight");
         if ahead.ended.get() == Some(false) {
+            noted(-2);
             return None;
         }
+        noted(if matches!(reading, Reading::Hint(_)) { 1 } else { 2 });
         ahead.ticket.promote(Priority::Demand);
         ahead.urgency.promote(Priority::Demand);
         Some(reading)
@@ -763,6 +770,9 @@ impl Prefetch {
         let landing = core.landing(grant, record);
         match core.source.submit(reads, priority) {
             Ok(ticket) => {
+                for job in ticket.jobs() {
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead"), job, (target as i64, expert as i64, priority as i64));
+                }
                 let ended = Ended::new(shared.events());
                 let urgency = Urgency::new(priority);
                 let (end, serving, urgent) = (ended.clone(), shared.clone(), urgency.clone());
@@ -771,9 +781,15 @@ impl Prefetch {
                 // waiting for it reads its expert anew).
                 ticket.on_end(move |outcome, failed| {
                     panicked(&serving, &outcome);
-                    if failed.is_empty() && matches!(outcome, Outcome::Read) {
+                    let read = failed.is_empty() && matches!(outcome, Outcome::Read);
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));
+                    if read {
                         // SAFETY: as `end_named`'s.
-                        let converting = unsafe { Converting::new(landing, urgent, serving.landings.clone(), end, || {}) };
+                        let converting = unsafe {
+                            Converting::new(landing, urgent, serving.landings.clone(), end, move || {
+                                seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_landed"), 0, (target as i64, expert as i64, 0));
+                            })
+                        };
                         serving.compute.submit(Arc::new(converting));
                         return;
                     }

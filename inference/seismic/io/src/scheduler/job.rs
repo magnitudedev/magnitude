@@ -16,6 +16,11 @@ pub struct Job {
 }
 
 impl Job {
+    /// Its submission: the id its timeline events carry ([`crate::timeline`]).
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     /// Withdraw the job's pieces no worker has taken: they read nothing, the
     /// ranges they serve fail [`Error::Withdrawn`], and it ends with its
     /// pieces in flight (its hook runs, its waiters wake).
