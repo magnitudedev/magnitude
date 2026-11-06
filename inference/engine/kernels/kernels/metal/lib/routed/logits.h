@@ -40,9 +40,8 @@ constant constexpr uint columns_per_tile = 32;
 // (2 row fragments of 4 steps), and the next stage's reads as many again.
 constant constexpr uint depth = 32;
 
-// The floats of a tile's threadgroup memory: the staged columns, then one
-// 8 x 8 fragment per simdgroup for the stores.
-constant constexpr uint extent = columns_per_tile * (depth + 4) + simdgroups * 64;
+// The floats of a tile's threadgroup memory: the staged columns.
+constant constexpr uint extent = columns_per_tile * (depth + 4);
 
 // The two elements lane `lane` holds of an 8 x 8 simdgroup matrix, as
 // `thread_elements()` orders them: (row, column) and (row, column + 1).
@@ -70,7 +69,6 @@ inline void tile(ulong rows, ulong columns, ulong row0, ulong column0, Input inp
     // Columns stage k-contiguous; fragments load them transposed.
     constexpr uint pitch = D + 4;
     threadgroup float *columns_tile = shared;
-    threadgroup float *published = shared + columns_per_tile * pitch + 64 * simd;
 
     const uint simd_row = simd * 8 * FR;
     // The fragments this simdgroup forms: those with a row below `rows` and
@@ -142,22 +140,18 @@ inline void tile(ulong rows, ulong columns, ulong row0, ulong column0, Input inp
             }
         }
     }
+    // Each lane stores the two elements it holds of each fragment.
     PROJECTION_UNROLL
     for (uint i = 0; i < FR; ++i)
         PROJECTION_UNROLL
-        for (uint j = 0; j < 4; ++j) {
-            if (i >= live_rows || j >= live_columns)
-                continue;
-            simdgroup_store(accumulators[i][j], published, 8);
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            for (uint item = lane; item < 64; item += 32) {
-                const ulong row = row0 + simd_row + 8 * i + item / 8;
-                const ulong c = column0 + 8 * j + item % 8;
+        for (uint j = 0; j < 4; ++j)
+            PROJECTION_UNROLL
+            for (uint e = 0; e < 2; ++e) {
+                const ulong row = row0 + simd_row + 8 * i + at.x;
+                const ulong c = column0 + 8 * j + at.y + e;
                 if (row < rows && c < columns)
-                    store(row, c, published[item]);
+                    store(row, c, accumulators[i][j].thread_elements()[e]);
             }
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-        }
 }
 
 // Logit columns that are router rows: column c is router row c, its packets
