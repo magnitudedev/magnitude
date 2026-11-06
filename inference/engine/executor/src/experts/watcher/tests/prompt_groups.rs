@@ -883,6 +883,32 @@ fn a_whole_banks_prompt_group_reads_nothing_and_claims_no_lent_record() {
     assert!(directory.tier_complete() && directory.group_whole(0), "the store gave up an expert");
 }
 
+/// On the one store a fill's landing is mapped past the steps already begun,
+/// so a running group's step misses an expert the store keeps by then. No
+/// tier copy binds there: an expert beyond the conveyor's free records when
+/// the rounds are fixed stays the rounds' own, read from the file, and the
+/// tier list, whose bound there admits no record, stays empty.
+#[test]
+fn the_one_stores_rounds_read_a_cold_expert_the_store_keeps() {
+    let _alone = alone();
+    let ahead = Ahead::queue("store-kept-ahead", 512);
+    let conveying = Conveying::of(2);
+    let harness = lending("store-kept", EXPERTS, EXPERTS as u64, 1, 2 * STAGING, conveying, EXPERTS as u32, Placer::Bank, false);
+    let step = harness.prompt_step();
+    let map = &harness.layers[0].0;
+    ahead.finish();
+    let kept = [5, 6, 7];
+    eventually("the fill never landed the experts", || kept.iter().all(|&expert| map.held(expert).is_some()));
+    assert!(kept.iter().all(|&expert| map.resolve(expert, step.sequence()).is_none()), "landed past the begun step");
+    let rounds = harness.scratch(&step, 0, &kept);
+    let mut converted = rounds.concat().iter().map(|&(_, expert)| expert as usize).collect::<Vec<_>>();
+    converted.sort_unstable();
+    assert_eq!(converted, kept, "the rounds convert every one");
+    assert_eq!(harness.from_conveyor(rounds.last().unwrap()).len(), 1, "the last, read into the conveyor once a record freed");
+    assert_eq!(listed(&harness.tiered), [], "no tier copy on the one store");
+    step.complete().unwrap();
+}
+
 /// A resident prompt group requests nothing; its passes' grouping writes
 /// its reads into its group reads record (`BankPart::GroupReads`). Once
 /// every step of it has ended the stack holds them, by layer at the

@@ -513,7 +513,15 @@ pub(super) fn lending_bank(
                 site: None,
                 stored: (0..3).map(stored_tensor).collect(),
                 landing: device_words[index].clone(),
-                lists: ListRecords { bank: bank_records, tier: reserved, conveyor: conveyor_records },
+                lists: ListRecords {
+                    bank: bank_records,
+                    // `BankBinding::tier`: the one store has no tier to copy from.
+                    tier: match placer {
+                        Placer::Tier => reserved,
+                        Placer::Bank => 0,
+                    },
+                    conveyor: conveyor_records,
+                },
             })
             .collect(),
         group_reads: reads.iter().map(|reads| PlacedLayerWords { group_reads: reads.clone(), stride: EXPERTS }).collect(),

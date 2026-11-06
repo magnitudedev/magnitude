@@ -124,6 +124,15 @@ fn hit(core: &Core, lending: &crate::experts::conveyor::Lending, layer: usize, e
     }
 }
 
+/// Whether a prompt group's cold expert can come from the host tier: only
+/// where the device places from one, whose tier copy reads it. On the one
+/// store no tier copy binds (`BankBinding::tier` is none), and a landing
+/// into the store is mapped past every step already begun, so its rounds
+/// read each cold expert from the file, even one the store keeps by now.
+fn copies_from_tier(core: &Core) -> bool {
+    core.extents.placer == crate::planning::Placer::Tier
+}
+
 impl Tier {
     /// Step `reader`'s request reads expert `expert` from now, its rounds
     /// not yet served: the one rule for every way an expert becomes a
@@ -766,8 +775,7 @@ impl Scratch {
     /// ahead's, `Scratch::awaited`), which the tier copy reads once landed.
     /// No expert is read twice.
     fn waits(&self, core: &Core, tier: &Tier, expert: usize) -> bool {
-        core.extents.placer == crate::planning::Placer::Tier
-            && (core.directory.in_tier(tier.layer, expert) || core.directory.lands(tier.layer, expert))
+        copies_from_tier(core) && (core.directory.in_tier(tier.layer, expert) || core.directory.lands(tier.layer, expert))
     }
 
     /// Whether the conveyor carries `staged`: a read of it, or its record,
@@ -784,7 +792,7 @@ impl Scratch {
         self.tiers.iter().flat_map(move |tier| {
             tier.deferred
                 .iter()
-                .filter(move |&&expert| core.directory.lands(tier.layer, expert))
+                .filter(move |&&expert| copies_from_tier(core) && core.directory.lands(tier.layer, expert))
                 .map(move |&expert| (tier.layer, expert))
         })
     }
@@ -801,7 +809,7 @@ impl Scratch {
     /// The conveyor record takes no read until its landing ends
     /// (`Conveyor::free_conveyor`).
     fn land_conveyed(&mut self, core: &mut Core, shared: &Shared, landed: Vec<(usize, usize, u32)>) {
-        if core.extents.placer != crate::planning::Placer::Tier {
+        if !copies_from_tier(core) {
             return;
         }
         for (layer, expert, record) in landed {
@@ -1013,11 +1021,14 @@ impl Scratch {
     /// host tier (the fill's, promoted to demand) is still landing: the fill
     /// copies each from the tier once it lands, never read again, and the
     /// rounds, fixed next, wait for it first. Each still landing is
-    /// hastened; its landing's end is an event.
+    /// hastened; its landing's end is an event. On the one store no landing
+    /// serves a request ([`copies_from_tier`]): nothing waits for one.
     fn await_landings(&mut self, layer: usize, cold: &[usize], core: &mut Core, prefetch: &mut Prefetch) -> bool {
         let landing = |scratch: &Self, core: &Core| {
             cold.iter()
-                .filter(|&&expert| scratch.conveyor.state(layer, expert).is_none() && core.directory.lands(layer, expert))
+                .filter(|&&expert| {
+                    copies_from_tier(core) && scratch.conveyor.state(layer, expert).is_none() && core.directory.lands(layer, expert)
+                })
                 .map(|&expert| (layer, expert))
                 .collect::<Vec<_>>()
         };
@@ -1069,13 +1080,16 @@ impl Scratch {
         }
         // Those the host tier keeps whole, each its tier record held until
         // the device is past the group, which the tier copy after round 0
-        // reads into its scratch slot; the rest the rounds convert.
+        // reads into its scratch slot; the rest the rounds convert, every one
+        // on the one store ([`copies_from_tier`]).
         let mut tiered = Vec::new();
         let mut listed = Vec::new();
         let mut cold = cold
             .into_iter()
             .filter(|&expert| {
-                let record = self.conveyor.state(layer, expert).is_none().then(|| core.directory.hold_tier(layer, expert)).flatten();
+                let record = (copies_from_tier(core) && self.conveyor.state(layer, expert).is_none())
+                    .then(|| core.directory.hold_tier(layer, expert))
+                    .flatten();
                 if let Some(record) = record {
                     tiered.push(expert);
                     listed.push((record.0 as i32, scratch(&self.tiers[index], expert) as i32));
