@@ -120,24 +120,9 @@ impl Engine {
 /// A worker: the most urgent piece it may take, read, until the process
 /// ends.
 fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
-    let mut read: Option<Taken> = None;
     loop {
         let taken = {
             let mut queue = engine.queue.lock().expect("read queue");
-            // An ended piece frees room a held-back piece may be waiting
-            // for, where this worker takes another volume's piece. It is
-            // counted ended before it stops being reported in flight
-            // ([`engine_work`]).
-            if let Some(ended) = read.take() {
-                let now = Instant::now();
-                let piece = &ended.piece;
-                crate::timeline::note_at(now, crate::timeline::Kind::Freed, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
-                let held_back = queue.ended(&ended, now);
-                *flight.lock().expect("a read worker's flight") = None;
-                if held_back {
-                    engine.work.notify_one();
-                }
-            }
             loop {
                 if let Some(taken) = queue.take() {
                     break taken;
@@ -158,7 +143,7 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
         // only some of them need, or in a gap between them none needs: each
         // part's own span is read again, and only those that fail fail.
         let file = &taken.file;
-        match std::panic::catch_unwind(AssertUnwindSafe(|| match file.read_piece(piece, &engine.buffers) {
+        let read = std::panic::catch_unwind(AssertUnwindSafe(|| match file.read_piece(piece, &engine.buffers) {
             Ok(()) => Vec::new(),
             Err(error) if piece.parts.len() == 1 => vec![(piece.parts[0].range, Arc::new(error))],
             Err(_) => piece
@@ -168,14 +153,23 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
                     file.read_piece(&alone, &engine.buffers).err().map(|error| (range, Arc::new(error)))
                 })
                 .collect(),
-        })) {
-            Ok(failed) => {
-                crate::timeline::note(crate::timeline::Kind::Read, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
-                taken.state.pieces_ended(1, failed, None)
-            }
+        }));
+        // The piece leaves its volume's flight as its read returns, before
+        // its job's end runs the job's hook (a landing), which reads
+        // nothing: the window and the book count reads alone. Room it frees
+        // for a held-back piece wakes a worker to take it. It is counted
+        // ended before it stops being reported in flight ([`engine_work`]).
+        let now = Instant::now();
+        crate::timeline::note_at(now, crate::timeline::Kind::Read, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
+        let held_back = engine.queue.lock().expect("read queue").ended(&taken, now);
+        *flight.lock().expect("a read worker's flight") = None;
+        if held_back {
+            engine.work.notify_one();
+        }
+        match read {
+            Ok(failed) => taken.state.pieces_ended(1, failed, None),
             Err(payload) => taken.state.pieces_ended(1, [], Some(Panic::new(payload))),
         }
-        read = Some(taken);
     }
 }
 

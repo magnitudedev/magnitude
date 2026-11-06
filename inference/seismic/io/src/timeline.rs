@@ -21,11 +21,9 @@ pub enum Kind {
     /// A piece taken: `a` its file offset, `b` its bytes, `c` the volume's
     /// bytes in flight before it.
     Take,
-    /// A piece's read returned: `a` its offset, `b` its bytes.
+    /// A piece's read returned, its bytes leaving the volume's flight: `a`
+    /// its offset, `b` its bytes.
     Read,
-    /// A piece's bytes left the volume's flight: `a` its offset, `b` its
-    /// bytes, `c` the volume's bytes in flight after.
-    Freed,
     /// A job promoted: `a` its new priority.
     Promote,
     /// A job withdrawn: `a` its pieces not taken.
@@ -40,7 +38,6 @@ impl Kind {
             Kind::Submit => "submit",
             Kind::Take => "take",
             Kind::Read => "read",
-            Kind::Freed => "freed",
             Kind::Promote => "promote",
             Kind::Withdraw => "withdraw",
             Kind::Noted(name) => name,
