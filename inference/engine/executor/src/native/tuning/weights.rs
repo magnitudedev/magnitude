@@ -9,7 +9,8 @@ use crate::{
     native::import::ImportKernels,
     resources::{ImportSource, ImportWindow},
 };
-use magnitude_artifacts::{CachePolicy, Package, gguf::GgufArtifact};
+use magnitude_artifacts::{Package, gguf::GgufArtifact};
+use seismic_io::CachePolicy;
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use seismic::{BuildError, Device, Element, Tensor};
 use std::collections::HashMap;

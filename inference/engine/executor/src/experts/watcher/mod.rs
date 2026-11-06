@@ -624,7 +624,7 @@ impl Watcher {
             core.bank_records(),
             resident,
             core.directory.ranking(),
-            core.source.deliveries(),
+            core.source.volumes(),
             spans,
         );
         // The load's parks, on one timeline of its device, which each answer

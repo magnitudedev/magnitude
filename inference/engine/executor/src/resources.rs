@@ -121,7 +121,7 @@ impl ImportSource {
             &stored,
             weight,
             &mut upload,
-            magnitude_artifacts::CachePolicy::Uncached,
+            seismic_io::CachePolicy::Uncached,
         )
         .map_err(|error| error.to_string())?;
         Ok(upload)

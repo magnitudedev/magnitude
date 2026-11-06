@@ -76,6 +76,10 @@ pub struct StepCost {
     /// Its time from the later of its begin and the end of the step before
     /// ([`step_seconds`]); none of a prompt step.
     pub seconds: f64,
+    /// What each volume the model's files lie on did since the step before
+    /// ([`seismic_io::Totals`]): its bytes, requests, busy time, depth and
+    /// demand waits by class, the same on every backend.
+    pub storage: Vec<(seismic_io::Volume, seismic_io::Totals)>,
 }
 
 /// One streamed layer's experts in one step, by index.
@@ -392,7 +396,7 @@ const WINDOW: f64 = 1.0;
 
 /// The latest decode steps, within [`WINDOW`] of decode time: their times
 /// and the time the volume was busy meanwhile
-/// (`magnitude_artifacts::Delivery`), what share of the time it is busy;
+/// (its account, `seismic_io::accounting`), what share of the time it is busy;
 /// and their hint candidates by choice rank, each rank's precision.
 /// Every step it holds is a generation step's since the last prompt step, which
 /// drops its reads and starts the window again (`Telemetry::complete_step`).
@@ -436,7 +440,7 @@ impl Recent {
     }
 
     /// The share of the window's time the volume was busy, at most all of
-    /// it (the volume's own busy time, `magnitude_artifacts::Delivery`).
+    /// it (the volume's own busy time, `seismic_io::accounting`).
     /// All of it until a whole window of decode time is measured since the
     /// last prompt step (the first decode steps after a prefill find its
     /// burst drained, which their own reads alone would not show).
@@ -504,7 +508,7 @@ impl HintPrice {
 
 /// Whether a hint whose prediction is right with probability `precision`
 /// pays for its read, the volume busy a share `busy` of the time. Both sides
-/// are its bytes' time at the volume's own rate (`magnitude_artifacts::Delivery`:
+/// are its bytes' time at the volume's own rate (`seismic_io::accounting`:
 /// bytes over busy time, every job's), so the rate is priced once and
 /// cancels. A right hint, read before its request, removes the demand wait
 /// for its bytes, `b/R`. A wrong one adds its bytes' time, `b/R`, as far as
@@ -579,6 +583,10 @@ struct Costs {
     /// The latest decode steps' file reads and choice ranks' candidates
     /// ([`Recent`]).
     recent: Recent,
+    /// Each volume's counts (`Routing::volumes`) as the last step's end
+    /// saw it, from none: the first step counts what each read since the
+    /// process began.
+    looked: Vec<seismic_io::Totals>,
     running: BTreeMap<Step, StepCost>,
     completed: Option<(Step, StepCost)>,
     group: Option<Counted>,
@@ -730,9 +738,8 @@ struct Routing {
     /// Per streamed layer, whether a ring row hints it ([`Layer::hints`]).
     /// The first streamed layer is hinted by none.
     hinted: Vec<bool>,
-    /// What its volumes deliver at their capacity
-    /// (`ExpertSource::deliveries`).
-    deliveries: Vec<Arc<magnitude_artifacts::Delivery>>,
+    /// The volumes its files lie on (`ExpertSource::volumes`).
+    volumes: Vec<seismic_io::Volume>,
 }
 
 /// Each streamed layer's group reads (`BankPart::GroupReads`) of `places`
@@ -936,10 +943,11 @@ impl Telemetry {
         records: Vec<usize>,
         resident: Option<Vec<u64>>,
         ranking: Ranking,
-        deliveries: Vec<Arc<magnitude_artifacts::Delivery>>,
+        volumes: Vec<seismic_io::Volume>,
         spans: bool,
     ) -> Self {
         let groups = layers.iter().map(|layer| layer.group + 1).max().unwrap_or(0);
+        let looked = vec![seismic_io::Totals::default(); volumes.len()];
         Self {
             routing: Routing {
                 maps: layers.iter().map(|layer| (layer.group, layer.map.clone())).collect(),
@@ -952,7 +960,7 @@ impl Telemetry {
                 hinted: (0..layers.len())
                     .map(|target| layers.iter().any(|layer| layer.hints.contains(&target)))
                     .collect(),
-                deliveries,
+                volumes,
             },
             recorded: Mutex::new(Recorded {
                 costs: Costs {
@@ -966,6 +974,7 @@ impl Telemetry {
                     hints: HintCost::default(),
                     hinted: BTreeMap::new(),
                     recent: Recent::default(),
+                    looked,
                     running: BTreeMap::new(),
                     completed: None,
                     group: None,
@@ -1451,11 +1460,12 @@ impl Telemetry {
         match work {
             LaunchWork::Generation => {
                 cost.seconds = step_seconds(ended.0, begun, ended.1);
-                let busy = self.delivered(&mut costs.reads);
+                let busy;
+                (busy, cost.storage) = self.delivered(costs);
                 costs.recent.step(cost.seconds, ranks, busy);
             }
             LaunchWork::Prompt => {
-                self.delivered(&mut costs.reads);
+                (_, cost.storage) = self.delivered(costs);
                 costs.recent = Recent::default();
             }
         }
@@ -1477,6 +1487,7 @@ impl Telemetry {
             missed_bytes = cost.missed_bytes,
             read_micros = cost.read.as_micros() as u64,
             parked_micros = cost.parked.as_micros() as u64,
+            storage = ?cost.storage,
             "expert step completed"
         );
         // Steps run in submission order on one queue: the device is past
@@ -1733,15 +1744,27 @@ impl Telemetry {
         self.lock().costs.hinted.insert((sequence, layer, lead), candidates);
     }
 
-    /// Count what each of the source's volumes read since the last take
-    /// into `reads` (`magnitude_artifacts::Delivery`): the seconds the
-    /// busiest was busy.
-    fn delivered(&self, reads: &mut RequestReads) -> f64 {
-        let taken = self.routing.deliveries.iter().map(|delivery| delivery.take());
-        taken.fold(0., |busiest: f64, (bytes, seconds)| {
-            reads.deliver(bytes, seconds);
-            busiest.max(seconds)
-        })
+    /// Count what each of the source's volumes read since the step before
+    /// into `costs.reads`, from their counts (`seismic_io::accounting`):
+    /// the seconds the busiest was busy, and each volume's span, the step's
+    /// attribution.
+    fn delivered(&self, costs: &mut Costs) -> (f64, Vec<(seismic_io::Volume, seismic_io::Totals)>) {
+        let mut busiest = 0f64;
+        let spans = self
+            .routing
+            .volumes
+            .iter()
+            .zip(&mut costs.looked)
+            .map(|(&volume, looked)| {
+                let now = seismic_io::accounting::totals(volume);
+                let span = now.since(looked);
+                *looked = now;
+                costs.reads.deliver(span.bytes(), span.busy);
+                busiest = busiest.max(span.busy);
+                (volume, span)
+            })
+            .collect();
+        (busiest, spans)
     }
 
     /// What a hint at lead `lead` is priced by now ([`HintPrice`]): each of

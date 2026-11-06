@@ -141,7 +141,7 @@ impl ReadLine {
 /// The served file's reads as a load's real work made them: its requests'
 /// demand reads, each its stored bytes and the seconds from a worker taking
 /// its first piece to its last's end, and what the volume read and how long
-/// it held a piece in flight (`magnitude_artifacts::Delivery`). Sums of a
+/// it held a piece in flight (`seismic_io::accounting`). Sums of a
 /// window are the difference of the sums at its ends ([`Self::since`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RequestReads {
@@ -1287,18 +1287,18 @@ impl GraphMemory {
 }
 
 /// A volume's stored choice, by the rule that made it: the current
-/// ([`VolumeChoice::SCHEMA`](magnitude_artifacts::VolumeChoice::SCHEMA)),
+/// ([`VolumeChoice::SCHEMA`](seismic_io::VolumeChoice::SCHEMA)),
 /// or the one before it, which a load reads as it was while the job probes
 /// the current one, so no load waits on the probe or reads meanwhile at the
 /// pre-probe bounds (a 32 MiB window for hints, where the earlier choice held
 /// GB10's to 1 MiB).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum StoredVolume {
-    Current(magnitude_artifacts::VolumeChoice),
-    Earlier(magnitude_artifacts::VolumeChoice),
+    Current(seismic_io::VolumeChoice),
+    Earlier(seismic_io::VolumeChoice),
 }
 
-/// How a volume is read (`magnitude_artifacts::VolumeChoice`), a requested
+/// How a volume is read (`seismic_io::VolumeChoice`), a requested
 /// point (`PointRequest::Volume`) keyed by the volume and its urgent request:
 /// the job probes it, and a load adopts what the records hold, so no load
 /// reads or evicts a file to time it.
@@ -1306,13 +1306,13 @@ pub struct VolumeCosts;
 
 impl VolumeCosts {
     /// The urgent request a [`PointRequest::Volume`](super::PointRequest) names.
-    pub fn urgent(urgent: &Option<(Vec<u64>, u64)>) -> Option<magnitude_artifacts::Urgent> {
-        urgent.as_ref().map(|(parts, records)| magnitude_artifacts::Urgent { parts: parts.clone(), records: *records })
+    pub fn urgent(urgent: &Option<(Vec<u64>, u64)>) -> Option<seismic_io::Urgent> {
+        urgent.as_ref().map(|(parts, records)| seismic_io::Urgent { parts: parts.clone(), records: *records })
     }
 
-    /// A term's key under `schema`: the choice's rule ([`VolumeChoice::SCHEMA`](magnitude_artifacts::VolumeChoice::SCHEMA)),
+    /// A term's key under `schema`: the choice's rule ([`VolumeChoice::SCHEMA`](seismic_io::VolumeChoice::SCHEMA)),
     /// or none for the first rule, whose records have no such term.
-    fn key(identity: &seismic::Identity, file: &Path, urgent: Option<&magnitude_artifacts::Urgent>, schema: Option<u64>, term: &str) -> Result<PointKey, ExecutorCostsError> {
+    fn key(identity: &seismic::Identity, file: &Path, urgent: Option<&seismic_io::Urgent>, schema: Option<u64>, term: &str) -> Result<PointKey, ExecutorCostsError> {
         let volume = seismic::volume_identity(file).map_err(|cause| failed("volume identity")(&cause))?;
         let mut configuration = named(&[("volume_device", volume.device)]);
         configuration.insert(format!("volume_{}", volume.uuid.as_deref().unwrap_or("unnamed")), 1);
@@ -1333,39 +1333,39 @@ impl VolumeCosts {
         topology: &DeviceTopology,
         executor: &Executor,
         file: &Path,
-        urgent: Option<&magnitude_artifacts::Urgent>,
+        urgent: Option<&seismic_io::Urgent>,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<Option<StoredVolume>, ExecutorCostsError> {
         let identity = executor_identity(topology, executor)?;
-        let choice = |schema: Option<u64>| -> Result<Option<magnitude_artifacts::VolumeChoice>, ExecutorCostsError> {
+        let choice = |schema: Option<u64>| -> Result<Option<seismic_io::VolumeChoice>, ExecutorCostsError> {
             let term = |term: &str| measured(store, &Self::key(&identity, file, urgent, schema, term)?, "volume record");
             let (window, demand, read, demand_read, cores) = (term("window")?, term("demand")?, term("read")?, term("demand_read")?, term("cores")?);
             let (Some(window), Some(demand), Some(read), Some(demand_read), Some(cores)) = (window, demand, read, demand_read, cores) else {
                 return Ok(None);
             };
-            Ok(Some(magnitude_artifacts::VolumeChoice { window: window as u64, demand: demand as u64, read: read as u64, demand_read: demand_read as u64, cores }))
+            Ok(Some(seismic_io::VolumeChoice { window: window as u64, demand: demand as u64, read: read as u64, demand_read: demand_read as u64, cores }))
         };
-        if let Some(current) = choice(Some(magnitude_artifacts::VolumeChoice::SCHEMA))? {
+        if let Some(current) = choice(Some(seismic_io::VolumeChoice::SCHEMA))? {
             return Ok(Some(StoredVolume::Current(current)));
         }
-        Ok(choice(magnitude_artifacts::VolumeChoice::EARLIER_SCHEMA)?.map(StoredVolume::Earlier))
+        Ok(choice(seismic_io::VolumeChoice::EARLIER_SCHEMA)?.map(StoredVolume::Earlier))
     }
 
     /// Probe `file`'s volume in the job, its choice stored.
     pub(super) fn measure(
         device: &Device,
         file: &Path,
-        urgent: Option<&magnitude_artifacts::Urgent>,
+        urgent: Option<&seismic_io::Urgent>,
         store: &dyn RecordStore<PointKey>,
     ) -> Result<(), ExecutorCostsError> {
         let error = failed("volume probe");
         let identity = executor_identity(device.topology(), device.info())?;
         let source = magnitude_artifacts::FileSource::open(file).map_err(|cause| error(&cause))?;
-        let choice = magnitude_artifacts::probe_volume(&source, urgent).map_err(|cause| error(&cause))?;
+        let choice = seismic_io::probe_volume(&source, urgent).map_err(|cause| error(&cause))?;
         let terms = [("window", choice.window as f64), ("demand", choice.demand as f64), ("read", choice.read as f64), ("demand_read", choice.demand_read as f64), ("cores", choice.cores)];
         for (term, value) in terms {
             let timing = Timing { median: value, interval: None, samples: 1 };
-            store.store(&Self::key(&identity, file, urgent, Some(magnitude_artifacts::VolumeChoice::SCHEMA), term)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
+            store.store(&Self::key(&identity, file, urgent, Some(seismic_io::VolumeChoice::SCHEMA), term)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
         }
         Ok(())
     }

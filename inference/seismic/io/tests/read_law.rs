@@ -1,6 +1,6 @@
 //! How the read engine serves several record reads at once: the measurement
 //! behind the law a streamed decode's timeline prices its reads by
-//! (`reader`, "How reads share the engine"). Each job reads one record of `bytes` at a random
+//! (`seismic_io`, "How reads share the engine"). Each job reads one record of `bytes` at a random
 //! offset of a real model file, uncached, each pass after its pages are
 //! evicted: `k` jobs submitted at once, and `k` jobs one after another,
 //! each waited for, at each record size; every time the fastest of
@@ -10,41 +10,18 @@
 //! window).
 //! The file is the target of the catalog acquisition object
 //! `MAGNITUDE_ARTIFACTS` names. Run alone on the device, with
-//! `-p magnitude-artifacts --release --test read_law -- --ignored --nocapture`.
+//! `-p seismic-io --release --test read_law -- --ignored --nocapture`.
 
-use magnitude_artifacts::{ArtifactReader, CachePolicy, Priority, Range};
-use std::alloc::{alloc_zeroed, dealloc, Layout};
-use std::ptr::NonNull;
+use seismic_io::{Buffer, CachePolicy, Priority, Range, Reader};
+use std::sync::Arc;
 use std::time::Instant;
 
 const REPEATS: usize = 5;
 
-/// Aligned sinks of `count` records of `bytes`, as staging lays them.
-struct Sinks {
-    base: NonNull<u8>,
-    layout: Layout,
-    bytes: usize,
-}
-
-impl Sinks {
-    fn new(count: usize, bytes: usize) -> Self {
-        let layout = Layout::from_size_align(count * bytes.next_multiple_of(4096), 4096).unwrap();
-        // SAFETY: a non-zero size.
-        let base = NonNull::new(unsafe { alloc_zeroed(layout) }).unwrap();
-        Self { base, layout, bytes }
-    }
-
-    fn sink(&self, index: usize) -> NonNull<u8> {
-        // SAFETY: within the allocation.
-        unsafe { self.base.add(index * self.bytes.next_multiple_of(4096)) }
-    }
-}
-
-impl Drop for Sinks {
-    fn drop(&mut self) {
-        // SAFETY: allocated with this layout.
-        unsafe { dealloc(self.base.as_ptr(), self.layout) }
-    }
+/// Where record `index` of `bytes` lies in its sinks, as staging lays
+/// records: each at its own aligned offset of one destination.
+fn at(index: usize, bytes: usize) -> usize {
+    index * bytes.next_multiple_of(seismic_io::ALIGNMENT as usize)
 }
 
 /// A deterministic stream of offsets over the file.
@@ -59,15 +36,15 @@ impl Offsets {
 
 /// Seconds to read `k` records of `bytes`: submitted at once (`together`)
 /// or each waited for before the next.
-fn pass(reader: &ArtifactReader, sinks: &Sinks, offsets: &mut Offsets, k: usize, bytes: usize, together: bool) -> f64 {
+fn pass(reader: &Reader, sinks: &Arc<Buffer>, offsets: &mut Offsets, k: usize, bytes: usize, together: bool) -> f64 {
     reader.evict_cached().unwrap();
     let ranges = (0..k)
-        .map(|index| Range { offset: offsets.next(reader.size(), bytes as u64), length: bytes, sink: sinks.sink(index) })
+        .map(|index| Range { offset: offsets.next(reader.size(), bytes as u64), length: bytes, into: sinks.clone(), at: at(index, bytes) })
         .collect::<Vec<_>>();
     let began = Instant::now();
     if together {
         // SAFETY: each sink is its own record of the allocation.
-        let jobs = ranges.iter().map(|&range| unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap()).collect::<Vec<_>>();
+        let jobs = ranges.into_iter().map(|range| unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap()).collect::<Vec<_>>();
         for job in jobs {
             job.wait();
         }
@@ -86,12 +63,12 @@ fn the_engine_serves_record_reads_by_its_law() {
     let artifacts = std::env::var_os("MAGNITUDE_ARTIFACTS").expect("set MAGNITUDE_ARTIFACTS");
     let acquisition: serde_json::Value = serde_json::from_slice(&std::fs::read(&artifacts).unwrap()).unwrap();
     let target = acquisition["target"].as_str().expect("the acquisition object names its target");
-    magnitude_artifacts::probe_volume(&magnitude_artifacts::FileSource::open(target).unwrap(), None).unwrap();
-    let reader = ArtifactReader::open(target, CachePolicy::Uncached).unwrap();
+    seismic_io::probe_volume(&seismic_io::OpenFile::open(target).unwrap(), None).unwrap();
+    let reader = Reader::open(target, CachePolicy::Uncached).unwrap();
     let window = reader.window();
     let mut offsets = Offsets(0x5eed);
     for bytes in [262_144usize, 1_900_544, 8_388_608] {
-        let sinks = Sinks::new(32, bytes);
+        let sinks = Arc::new(Buffer::new(at(32, bytes)));
         let fastest = |offsets: &mut Offsets, k: usize, together: bool| {
             (0..REPEATS).map(|_| pass(&reader, &sinks, offsets, k, bytes, together)).fold(f64::INFINITY, f64::min)
         };

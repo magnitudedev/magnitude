@@ -15,7 +15,7 @@ use crate::experts::directory::HostRecord;
 use crate::experts::host_records::{Claim, Grant, Located};
 use crate::experts::landing::{Answer, Source};
 use crate::experts::staging::Staged;
-use magnitude_artifacts::Priority;
+use seismic_io::Priority;
 use magnitude_kernels::{SlotTable, constants};
 use std::collections::BTreeSet;
 use std::sync::Arc;

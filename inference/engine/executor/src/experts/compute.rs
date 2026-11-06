@@ -40,7 +40,7 @@
 
 use super::site::{WorkerTurn, Site, SiteLayer};
 use super::source::Records;
-use magnitude_artifacts::Priority;
+use seismic_io::Priority;
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -144,7 +144,7 @@ pub(crate) struct Machine {
 
 impl Machine {
     /// This machine's beside `device` and reads occupying `read_cores`
-    /// (`magnitude_artifacts::read_cores`): the device's threads on the host
+    /// (`seismic_io::read_cores`): the device's threads on the host
     /// (`Device::host_threads`: a discrete GPU's one submitting thread, a
     /// CPU device's pool) and the memory node it is attached to
     /// (`Device::host_node`).
@@ -264,7 +264,7 @@ fn fewest_at_least(samples: &[crate::assessment::Sample]) -> usize {
 ///   and a CPU device's worker pool;
 /// - the watcher's (`watcher::THREADS`);
 /// - the read engine's workers, `read_cores` as the probe of the volumes
-///   read measured them (`magnitude_artifacts::read_cores`, the median of
+///   read measured them (`seismic_io::read_cores`, the median of
 ///   its passes), to the nearest whole core: a share that sits near a
 ///   whole core (GB10 0.77–1.38) reserves the same core in every process,
 ///   where its ceiling flipped between one and two;

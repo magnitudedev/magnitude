@@ -415,8 +415,8 @@ impl ExpertBankPlan {
     /// The urgent request its decode steps wait on: a row's selected experts
     /// of one layer, each a record of the widest group (the most stored
     /// bytes) stored as its routed tensors' ranges, which the read engine
-    /// reads its files for (`magnitude_artifacts::Urgent`).
-    pub fn urgent(&self) -> Result<magnitude_artifacts::Urgent, String> {
+    /// reads its files for (`seismic_io::Urgent`).
+    pub fn urgent(&self) -> Result<seismic_io::Urgent, String> {
         let mut widest = None::<(u64, Vec<u64>)>;
         for group in &self.groups {
             let record = &group.record;
@@ -427,7 +427,7 @@ impl ExpertBankPlan {
             }
         }
         let (_, parts) = widest.ok_or("a bank of no group")?;
-        Ok(magnitude_artifacts::Urgent { parts, records: self.selected })
+        Ok(seismic_io::Urgent { parts, records: self.selected })
     }
 }
 

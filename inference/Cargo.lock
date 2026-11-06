@@ -2241,6 +2241,7 @@ dependencies = [
  "image",
  "libc",
  "magnitude-ggml",
+ "seismic-io",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2301,6 +2302,7 @@ dependencies = [
  "opentelemetry_sdk 0.33.0",
  "postcard",
  "seismic",
+ "seismic-io",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2345,6 +2347,7 @@ dependencies = [
  "magnitude-kernels",
  "magnitude-state",
  "seismic",
+ "seismic-io",
  "seismic-lang",
  "seismic-std",
  "serde",
@@ -2515,6 +2518,7 @@ dependencies = [
  "magnitude-serving",
  "magnitude-state",
  "seismic",
+ "seismic-io",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4257,6 +4261,14 @@ dependencies = [
  "seismic-estimator",
  "seismic-ir",
  "seismic-lang",
+]
+
+[[package]]
+name = "seismic-io"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
 ]
 
 [[package]]

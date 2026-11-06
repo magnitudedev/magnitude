@@ -1236,7 +1236,7 @@ fn expert_requests(
 fn volumes(
     artifact: &magnitude_artifacts::gguf::GgufArtifact,
     bank: Option<&magnitude_executor::ExpertBankPlan>,
-) -> Result<Vec<(Arc<magnitude_artifacts::FileSource>, Option<magnitude_artifacts::Urgent>)>, String> {
+) -> Result<Vec<(Arc<magnitude_artifacts::FileSource>, Option<seismic_io::Urgent>)>, String> {
     let urgent = bank.map(magnitude_executor::ExpertBankPlan::urgent).transpose()?;
     Ok(artifact
         .sources()
@@ -1247,7 +1247,7 @@ fn volumes(
 /// The request of `source`'s volume for `urgent`.
 fn volume_request(
     source: &magnitude_artifacts::FileSource,
-    urgent: Option<&magnitude_artifacts::Urgent>,
+    urgent: Option<&seismic_io::Urgent>,
 ) -> magnitude_executor::assessment::PointRequest {
     magnitude_executor::assessment::PointRequest::Volume {
         file: source.path().to_owned(),
@@ -1329,7 +1329,7 @@ fn adopt_volumes(
             None => tracing::info!("volume of {} for {reads}: unprobed, read at the probe's bounds", source.path().display()),
         }
         if let Some(choice) = choice {
-            magnitude_artifacts::adopt_volume(&source, urgent, choice).map_err(|error| error.to_string())?;
+            seismic_io::adopt_volume(&*source, urgent, choice).map_err(|error| error.to_string())?;
         }
         // An earlier rule's choice stands until the job probes the current one.
         if !matches!(stored, Some(StoredVolume::Current(_))) {

@@ -201,8 +201,8 @@ fn a_request_is_answered_while_workers_are_held_by_a_piece() {
             }
         }
         fn end(&self) {}
-        fn priority(&self) -> magnitude_artifacts::Priority {
-            magnitude_artifacts::Priority::Demand
+        fn priority(&self) -> seismic_io::Priority {
+            seismic_io::Priority::Demand
         }
     }
     let device = cpu();

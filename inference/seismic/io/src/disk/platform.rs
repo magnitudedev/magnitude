@@ -1,7 +1,7 @@
 use super::file::Through;
-use super::volume::VolumeKey;
+use crate::Volume;
 #[cfg(doc)]
-use super::ArtifactReader;
+use super::Reader;
 use crate::Error;
 use std::fs::File;
 use std::io;
@@ -53,8 +53,8 @@ pub fn cached_pages(path: &Path, offset: u64, length: u64) -> Result<(u64, u64),
     Ok((cached as u64, pages.len() as u64))
 }
 
-/// [`ArtifactReader::evict_cached`] of the `size` bytes of `file`.
-pub(super) fn evict(file: &File, size: u64) -> Result<(), Error> {
+/// [`Reader::evict_cached`] of the `size` bytes of `file`.
+pub(crate) fn evict(file: &File, size: u64) -> Result<(), Error> {
     Ok(drop_pages(file, 0, size)?)
 }
 
@@ -68,7 +68,7 @@ pub fn cached_pages(_path: &Path, _offset: u64, _length: u64) -> Result<(u64, u6
 
 /// The processor seconds the calling thread has run.
 #[cfg(unix)]
-pub(super) fn thread_cpu_seconds() -> Result<f64, Error> {
+pub(crate) fn thread_cpu_seconds() -> Result<f64, Error> {
     let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: the clock writes the one `timespec` it is given.
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) } != 0 {
@@ -78,7 +78,7 @@ pub(super) fn thread_cpu_seconds() -> Result<f64, Error> {
 }
 
 #[cfg(windows)]
-pub(super) fn thread_cpu_seconds() -> Result<f64, Error> {
+pub(crate) fn thread_cpu_seconds() -> Result<f64, Error> {
     use std::os::windows::io::RawHandle;
     #[link(name = "kernel32")]
     extern "system" {
@@ -96,13 +96,13 @@ pub(super) fn thread_cpu_seconds() -> Result<f64, Error> {
 
 /// The volume `file` lies on.
 #[cfg(unix)]
-pub(super) fn volume_key(file: &File) -> Result<VolumeKey, Error> {
+pub(crate) fn volume_key(file: &File) -> Result<Volume, Error> {
     use std::os::unix::fs::MetadataExt;
-    Ok(VolumeKey(file.metadata()?.dev()))
+    Ok(Volume(file.metadata()?.dev()))
 }
 
 #[cfg(windows)]
-pub(super) fn volume_key(file: &File) -> Result<VolumeKey, Error> {
+pub(crate) fn volume_key(file: &File) -> Result<Volume, Error> {
     use std::os::windows::io::{AsRawHandle, RawHandle};
     /// `BY_HANDLE_FILE_INFORMATION`.
     #[repr(C)]
@@ -125,7 +125,7 @@ pub(super) fn volume_key(file: &File) -> Result<VolumeKey, Error> {
     if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
         return Err(io::Error::last_os_error().into());
     }
-    Ok(VolumeKey(u64::from(information.volume_serial_number)))
+    Ok(Volume(u64::from(information.volume_serial_number)))
 }
 
 /// How an uncached reader reads `file`, a source's open file: that file
@@ -133,7 +133,7 @@ pub(super) fn volume_key(file: &File) -> Result<VolumeKey, Error> {
 /// refuses direct I/O (tmpfs, some overlays), `file` itself, read through
 /// the cache.
 #[cfg(any(target_os = "linux", windows))]
-pub(super) fn uncached(file: &File) -> Result<Through, Error> {
+pub(crate) fn uncached(file: &File) -> Result<Through, Error> {
     match reopen(file, true) {
         Ok(direct) => Ok(Through::direct(direct)),
         Err(error) if refuses_direct(&error) => Ok(Through::Dropped(file.try_clone()?)),
@@ -145,7 +145,7 @@ pub(super) fn uncached(file: &File) -> Result<Through, Error> {
 /// neither names any more (replaced or removed under its source) is read
 /// through the cache, each read's pages dropped.
 #[cfg(target_os = "macos")]
-pub(super) fn uncached(file: &File) -> Result<Through, Error> {
+pub(crate) fn uncached(file: &File) -> Result<Through, Error> {
     match reopen(file, true) {
         Ok(direct) => Ok(Through::direct(direct)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Through::Dropped(file.try_clone()?)),
@@ -154,7 +154,7 @@ pub(super) fn uncached(file: &File) -> Result<Through, Error> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(super) fn uncached(file: &File) -> Result<Through, Error> {
+pub(crate) fn uncached(file: &File) -> Result<Through, Error> {
     Ok(Through::Dropped(file.try_clone()?))
 }
 
@@ -162,7 +162,7 @@ pub(super) fn uncached(file: &File) -> Result<Through, Error> {
 /// its own): past the cache where `direct`, through it where not. It is
 /// never what `file`'s path names now, which may be another file.
 #[cfg(target_os = "linux")]
-pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
+pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
     use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
     // `/proc/self/fd/N` opens the file descriptor N has open.
     std::fs::OpenOptions::new()
@@ -177,7 +177,7 @@ pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
 /// APFS or HFS+) opens the descriptor's path (`F_GETPATH`) instead, refused
 /// unless it is still the same file.
 #[cfg(target_os = "macos")]
-pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
+pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
     use std::os::{
         fd::AsRawFd,
         unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -202,7 +202,7 @@ pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
     if (open.dev(), open.ino()) != (named.dev(), named.ino()) {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "the open artifact's path names another file",
+            "the open file's path names another file",
         ));
     }
     // SAFETY: an fcntl on a descriptor this function owns.
@@ -213,7 +213,7 @@ pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
+pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
     const GENERIC_READ: u32 = 0x8000_0000;
     // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, as `File::open` shares.
@@ -238,7 +238,7 @@ pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
 /// No direct I/O here: every reader's file already reads through the
 /// cache, so a direct reopen is refused and any other shares `file`.
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
+pub(crate) fn reopen(file: &File, direct: bool) -> io::Result<File> {
     if direct {
         return Err(io::ErrorKind::Unsupported.into());
     }
@@ -247,18 +247,18 @@ pub(super) fn reopen(file: &File, direct: bool) -> io::Result<File> {
 
 /// The file opened for reads through the cache, advised random access: the
 /// cache reads ahead of no range. Every cached read of a model file opens it
-/// so (an [`ArtifactReader`] and a [`crate::FileSource`]): read-ahead past a
+/// so (a [`Reader`] and an [`crate::OpenFile`]): read-ahead past a
 /// resident weight filled the cache with the expert stacks beside it, 5716
 /// pages of a streamed load on a GB10.
 #[cfg(target_os = "linux")]
-pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
+pub(super) fn open_cached(path: &Path) -> io::Result<File> {
     use std::os::fd::AsRawFd;
     let file = File::open(path)?;
     // SAFETY: advice on the whole of a descriptor this function owns.
     let advised =
         unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
     if advised != 0 {
-        return Err(io::Error::from_raw_os_error(advised).into());
+        return Err(io::Error::from_raw_os_error(advised));
     }
     Ok(file)
 }
@@ -267,12 +267,12 @@ pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
 /// fills the cache past a staged resident weight with the expert stacks
 /// beside it, 1275 pages of an LFM2.5 8B load on an M4 Pro.
 #[cfg(target_os = "macos")]
-pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
+pub(super) fn open_cached(path: &Path) -> io::Result<File> {
     use std::os::fd::AsRawFd;
     let file = File::open(path)?;
     // SAFETY: a flag on a descriptor this function owns; F_RDAHEAD takes an int.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0) } == -1 {
-        return Err(io::Error::last_os_error().into());
+        return Err(io::Error::last_os_error());
     }
     Ok(file)
 }
@@ -280,34 +280,34 @@ pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
 /// [`open_cached`] on Windows: opened for random access
 /// (`FILE_FLAG_RANDOM_ACCESS`), so the cache manager reads ahead of no range.
 #[cfg(windows)]
-pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
+pub(super) fn open_cached(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
-    Ok(std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_RANDOM_ACCESS).open(path)?)
+    std::fs::OpenOptions::new().read(true).custom_flags(FILE_FLAG_RANDOM_ACCESS).open(path)
 }
 
 /// [`open_cached`] where no read-ahead control is known: the platform's own.
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-pub(crate) fn open_cached(path: &Path) -> Result<File, Error> {
-    Ok(File::open(path)?)
+pub(super) fn open_cached(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 /// Whether `error` is a filesystem's refusal of direct I/O, rather than a
 /// failure of the storage.
 #[cfg(target_os = "linux")]
-pub(super) fn refuses_direct(error: &io::Error) -> bool {
+pub(crate) fn refuses_direct(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::EINVAL | libc::EOPNOTSUPP))
 }
 
 #[cfg(windows)]
-pub(super) fn refuses_direct(error: &io::Error) -> bool {
+pub(crate) fn refuses_direct(error: &io::Error) -> bool {
     const ERROR_INVALID_PARAMETER: i32 = 87;
     error.raw_os_error() == Some(ERROR_INVALID_PARAMETER)
 }
 
 /// `F_NOCACHE` has no alignment to refuse.
 #[cfg(not(any(target_os = "linux", windows)))]
-pub(super) fn refuses_direct(_error: &io::Error) -> bool {
+pub(crate) fn refuses_direct(_error: &io::Error) -> bool {
     false
 }
 
@@ -315,7 +315,7 @@ pub(super) fn refuses_direct(_error: &io::Error) -> bool {
 /// them: pages left cached would be served from memory the reads were meant
 /// not to fill.
 #[cfg(target_os = "linux")]
-pub(super) fn drop_pages(file: &File, start: u64, end: u64) -> io::Result<()> {
+pub(crate) fn drop_pages(file: &File, start: u64, end: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let (Ok(first), Ok(count)) = (libc::off_t::try_from(start), libc::off_t::try_from(end - start))
     else {
@@ -337,7 +337,7 @@ pub(super) fn drop_pages(file: &File, start: u64, end: u64) -> io::Result<()> {
 /// macOS drops a range's cached pages by invalidating them through a
 /// mapping of them (`msync` with `MS_INVALIDATE`), which touches none.
 #[cfg(target_os = "macos")]
-pub(super) fn drop_pages(file: &File, start: u64, end: u64) -> io::Result<()> {
+pub(crate) fn drop_pages(file: &File, start: u64, end: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: `sysconf` reads a constant of the system.
     let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).map_err(|_| io::Error::last_os_error())?;
@@ -367,6 +367,6 @@ pub(super) fn drop_pages(file: &File, start: u64, end: u64) -> io::Result<()> {
 
 /// Elsewhere reads have no cache of their own to drop.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(super) fn drop_pages(_file: &File, _start: u64, _end: u64) -> io::Result<()> {
+pub(crate) fn drop_pages(_file: &File, _start: u64, _end: u64) -> io::Result<()> {
     Ok(())
 }

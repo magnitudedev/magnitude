@@ -82,3 +82,4 @@ Guarantees belong to the main construction paths and their inputs and outputs. A
 | Language | [Language overview](language/overview.md) | What should authors express, and what freedom does that leave the compiler? |
 | Compiler | [Compiler overview](compiler/overview.md) | What are the pipeline entities, their guarantees and their ownership boundaries? |
 | Execution | [Execution overview](execution/overview.md) | How do prepared implementations become actual resource-owning executions? |
+| I/O | [Seismic I/O](io.md) | How are files read from storage, and what does each device's accounting record? |

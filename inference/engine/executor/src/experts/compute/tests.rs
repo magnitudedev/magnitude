@@ -1,5 +1,5 @@
 use super::*;
-use magnitude_artifacts::Priority;
+use seismic_io::Priority;
 use std::time::{Duration, Instant};
 
 /// Recorded topologies (lscpu, 2026-11-03): each node's cores, core `c`'s

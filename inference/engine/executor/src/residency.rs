@@ -37,6 +37,8 @@ use std::{
 #[derive(Debug)]
 pub enum WeightImportError {
     Artifact(ArtifactError),
+    /// A weight's file could not be opened for reads past the cache.
+    Read(seismic_io::Error),
     Invalid(String),
     Device(String),
     Allocation(AllocationError),
@@ -52,6 +54,7 @@ impl fmt::Display for WeightImportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Artifact(error) => write!(formatter, "weight source: {error}"),
+            Self::Read(error) => write!(formatter, "weight source: {error}"),
             Self::Invalid(message) => formatter.write_str(message),
             Self::Device(message) => write!(formatter, "weight device import: {message}"),
             Self::Allocation(error) => error.fmt(formatter),
@@ -68,6 +71,7 @@ impl std::error::Error for WeightImportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Artifact(error) => Some(error),
+            Self::Read(error) => Some(error),
             Self::Allocation(error) => Some(error),
             Self::Attestation(error) => Some(error),
             Self::Submit(error) => Some(error),
@@ -76,6 +80,12 @@ impl std::error::Error for WeightImportError {
             Self::Refused(refusal) => Some(refusal),
             Self::Invalid(_) | Self::Device(_) => None,
         }
+    }
+}
+
+impl From<seismic_io::Error> for WeightImportError {
+    fn from(error: seismic_io::Error) -> Self {
+        Self::Read(error)
     }
 }
 
@@ -871,10 +881,10 @@ impl ResidencyStore {
             streamed.directory,
             // A step waits on the rows its lookups name: one head's rows of a
             // step, each a row as stored, are the table's urgent request.
-            magnitude_artifacts::ArtifactReader::of_urgent(
-                source,
-                magnitude_artifacts::CachePolicy::Uncached,
-                &magnitude_artifacts::Urgent { parts: vec![row_bytes], records: magnitude_batching::MAX_CLASS_ROWS as u64 },
+            seismic_io::Reader::of_urgent(
+                &**source,
+                seismic_io::CachePolicy::Uncached,
+                &seismic_io::Urgent { parts: vec![row_bytes], records: magnitude_batching::MAX_CLASS_ROWS as u64 },
             )?,
             offset,
             kept,

@@ -34,7 +34,7 @@ use super::Step;
 use crate::experts::landing::{Answer, Converting, DeviceLanding, DeviceWords, Ended, Landing};
 use crate::experts::source::{Outcome, Ticket};
 use crate::experts::staging::{Staged, Staging};
-use magnitude_artifacts::Priority;
+use seismic_io::Priority;
 use magnitude_kernels::constants;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -670,7 +670,7 @@ impl Prefetch {
     /// displace by reuse as they rank. One rule fills both.
     ///
     /// How many it reads at once: by the read engine's law
-    /// (`magnitude_artifacts::reader`) a demand read waits for at most the
+    /// (`seismic_io`) a demand read waits for at most the
     /// volume's window of bytes its workers already hold, however much less
     /// urgent work is queued, so the depth of the fill's queue costs no step
     /// anything; and its reads keep the engine busy at its rate only while

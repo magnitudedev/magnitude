@@ -1,10 +1,10 @@
 //! Demand reads of expert records from the model's files into staging.
 //! Reads run uncached on the read engine
-//! (`magnitude_artifacts::ArtifactReader`), which aligns, coalesces and
+//! (`seismic_io::Reader`), which aligns, coalesces and
 //! splits them into pieces its workers read in parallel, each landing
 //! straight in its staging record.
 
-use magnitude_artifacts::{ArtifactReader, CachePolicy, Ended, Job, Panic, Priority, Range};
+use seismic_io::{Reader, CachePolicy, Ended, Job, Panic, Priority, Range};
 use seismic::Tensor;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -12,9 +12,13 @@ use std::time::Instant;
 
 /// The records of a host-shared tensor that reads land in: `count` records
 /// of `bytes` each, its whole extent, each one contiguous range where the
-/// tensor lays it, checked once when they are made.
+/// tensor lays it, checked once when they are made. Shared: each clone,
+/// and each read's job, holds the one destination they lie in.
 #[derive(Clone)]
-pub(crate) struct Records {
+pub(crate) struct Records(Arc<Region>);
+
+/// The memory records lie in ([`Records`]).
+struct Region {
     tensor: Tensor,
     base: NonNull<u8>,
     placement: seismic::RecordPlacement,
@@ -24,7 +28,20 @@ pub(crate) struct Records {
 // SAFETY: `base` addresses host-shared memory that `tensor`, held beside
 // it, keeps alive; the host writes it only through the read engine's jobs
 // (`ExpertSource::submit`) and record copies (`Records::copy_record`).
-unsafe impl Send for Records {}
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
+// SAFETY: the tensor's host-shared bytes from `base`, which the tensor the
+// region holds keeps where they are while it lives.
+unsafe impl seismic_io::Destination for Region {
+    /// Through its last record where the tensor lays it: chunked storage
+    /// leaves each chunk's remainder unused, so the tensor's canonical bytes
+    /// fall short of its last records.
+    fn region(&self) -> (NonNull<u8>, usize) {
+        let end = self.count.checked_sub(1).map_or(0, |last| self.placement.offset(last) + self.placement.record());
+        (self.base, end as usize)
+    }
+}
 
 impl Records {
     /// `tensor` as `count` records of `bytes` each, its leading extent's,
@@ -40,12 +57,12 @@ impl Records {
         let base = tensor
             .shared_address()
             .ok_or_else(|| format!("{count} records of {bytes} bytes are no memory the host reads into"))?;
-        Ok(Self {
+        Ok(Self(Arc::new(Region {
             tensor,
             base,
             placement,
             count,
-        })
+        })))
     }
 
     /// Its records `start..end` as records of their own, which hold the
@@ -54,37 +71,38 @@ impl Records {
     /// or more never meets them.
     pub fn range(&self, start: u64, end: u64) -> Result<Self, String> {
         let tensor = self
+            .0
             .tensor
             .record_region(start, end)
-            .map_err(|error| format!("records {start}..{end} of {}: {error}", self.count))?;
+            .map_err(|error| format!("records {start}..{end} of {}: {error}", self.0.count))?;
         Self::new(tensor, self.bytes(), end - start)
     }
 
     /// The bytes of one record.
     pub fn bytes(&self) -> u64 {
-        self.placement.record()
+        self.0.placement.record()
     }
 
     /// The records.
     pub fn count(&self) -> u64 {
-        self.count
+        self.0.count
     }
 
     /// Where its records lie.
     #[cfg(test)]
     pub fn placement(&self) -> seismic::RecordPlacement {
-        self.placement
+        self.0.placement
     }
 
     /// The tensor the records lie in.
     #[cfg(test)]
     pub fn tensor(&self) -> &Tensor {
-        &self.tensor
+        &self.0.tensor
     }
 
     /// Where record `record` lies, in bytes from the first's.
     pub fn offset(&self, record: u64) -> u64 {
-        self.placement.offset(record)
+        self.0.placement.offset(record)
     }
 
     /// The first `bytes` of record `record`, to read.
@@ -94,19 +112,19 @@ impl Records {
     /// No read lands in the record, and no device work writes it, while the
     /// slice lives.
     pub unsafe fn record(&self, record: u64, bytes: u64) -> &[u8] {
-        assert!(record < self.count && bytes <= self.bytes(), "{bytes} bytes of record {record} of {}", self.count);
+        assert!(record < self.0.count && bytes <= self.bytes(), "{bytes} bytes of record {record} of {}", self.0.count);
         // SAFETY: the record lies within the host-shared tensor `self`
         // keeps alive, and the caller excludes every writer.
-        unsafe { std::slice::from_raw_parts(self.base.as_ptr().add(self.offset(record) as usize), bytes as usize) }
+        unsafe { std::slice::from_raw_parts(self.0.base.as_ptr().add(self.offset(record) as usize), bytes as usize) }
     }
 
     /// Where record `record` begins in host memory: what a writer of part
     /// of it (one piece of a landing's conversion) writes through.
     pub fn address(&self, record: u64) -> std::ptr::NonNull<u8> {
-        assert!(record < self.count, "record {record} of {}", self.count);
+        assert!(record < self.0.count, "record {record} of {}", self.0.count);
         // SAFETY: the record lies within the host-shared tensor `self`
         // keeps alive.
-        unsafe { self.base.add(self.offset(record) as usize) }
+        unsafe { self.0.base.add(self.offset(record) as usize) }
     }
 
     /// Copy the first `bytes` of record `source` of `from` into record
@@ -118,18 +136,18 @@ impl Records {
     /// them, until the copy returns.
     pub unsafe fn copy_record(&self, record: u64, from: &Records, source: u64, bytes: u64) {
         assert!(
-            record < self.count && source < from.count && bytes <= self.bytes().min(from.bytes()),
+            record < self.0.count && source < from.0.count && bytes <= self.bytes().min(from.bytes()),
             "a copy of {bytes} bytes from record {source} of {} into record {record} of {}",
-            from.count,
-            self.count
+            from.0.count,
+            self.0.count
         );
         // SAFETY: both records lie within their host-shared tensors, which
         // `self` and `from` keep alive, and the caller excludes every other
         // access to them; `copy` allows the two to overlap.
         unsafe {
             std::ptr::copy(
-                from.base.as_ptr().add(from.offset(source) as usize),
-                self.base.as_ptr().add(self.offset(record) as usize),
+                from.0.base.as_ptr().add(from.offset(source) as usize),
+                self.0.base.as_ptr().add(self.offset(record) as usize),
                 bytes as usize,
             );
         }
@@ -153,9 +171,9 @@ impl Read {
     /// bytes, as the watcher's geometry (checked at its start) gives.
     pub fn new(file: usize, offset: u64, bytes: u64, into: &Records, record: u64) -> Self {
         assert!(
-            record < into.count && bytes <= into.bytes(),
+            record < into.0.count && bytes <= into.bytes(),
             "a read of {bytes} bytes into record {record} of {} of {} bytes",
-            into.count,
+            into.0.count,
             into.bytes()
         );
         Self {
@@ -184,13 +202,12 @@ pub(super) enum Outcome {
     Panicked(Panic),
 }
 
-/// A submitted job: one read engine job per model file it reads, and the
-/// staging it lands in, held until every one has ended.
+/// A submitted job: one read engine job per model file it reads, each
+/// holding the staging it lands in until it has ended.
 pub(super) struct Ticket {
     /// Each file's job, and the reads it serves in their order: (the read's
     /// index among the ticket's, file, offset, bytes).
     jobs: Vec<(Job, Vec<(usize, usize, u64, usize)>)>,
-    _staging: Vec<Tensor>,
 }
 
 impl Drop for Ticket {
@@ -260,7 +277,7 @@ impl Ticket {
     }
 
     /// When a worker takes each job's first piece, each set then
-    /// (`magnitude_artifacts::Job::started`): the ticket's reads start at
+    /// (`seismic_io::Job::started`): the ticket's reads start at
     /// the earliest.
     pub fn started(&self) -> Vec<std::sync::Arc<std::sync::OnceLock<Instant>>> {
         self.jobs.iter().map(|(job, _)| job.started()).collect()
@@ -275,7 +292,7 @@ impl Ticket {
 
     /// Withdraw each job's pieces no worker has taken: they read nothing and
     /// the reads they serve fail as withdrawn
-    /// (`magnitude_artifacts::Error::Withdrawn`); pieces in flight read on.
+    /// (`seismic_io::Error::Withdrawn`); pieces in flight read on.
     pub fn withdraw(&self) {
         self.jobs.iter().for_each(|(job, _)| job.withdraw());
     }
@@ -307,33 +324,32 @@ fn outcome_of(ended: &[Ended], reads: &[Vec<(usize, usize, u64, usize)>]) -> (Ou
 
 /// The model's files, opened for reads that bypass the file cache.
 pub(super) struct ExpertSource {
-    files: Vec<ArtifactReader>,
+    files: Vec<Reader>,
 }
 
 impl ExpertSource {
     /// The model's `files`, read for decode requests of `urgent`.
-    pub fn open(files: &[std::path::PathBuf], urgent: &magnitude_artifacts::Urgent) -> Result<Self, String> {
+    pub fn open(files: &[std::path::PathBuf], urgent: &seismic_io::Urgent) -> Result<Self, String> {
         let files = files
             .iter()
             .map(|path| {
-                ArtifactReader::open_urgent(path, CachePolicy::Uncached, urgent)
+                Reader::open_urgent(path, CachePolicy::Uncached, urgent)
                     .map_err(|error| format!("expert source {}: {error}", path.display()))
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { files })
     }
 
-    /// What the volumes its files lie on read and how long each was busy,
-    /// each volume once ([`magnitude_artifacts::Delivery`]).
-    pub fn deliveries(&self) -> Vec<Arc<magnitude_artifacts::Delivery>> {
-        let mut deliveries = Vec::<Arc<magnitude_artifacts::Delivery>>::new();
-        for file in &self.files {
-            let delivery = file.delivery();
-            if !deliveries.iter().any(|known| Arc::ptr_eq(known, &delivery)) {
-                deliveries.push(delivery);
+    /// The volumes its files lie on, each once, whose counts the scheduler
+    /// keeps (`seismic_io::accounting`).
+    pub fn volumes(&self) -> Vec<seismic_io::Volume> {
+        let mut volumes = Vec::new();
+        for volume in self.files.iter().map(Reader::volume) {
+            if !volumes.contains(&volume) {
+                volumes.push(volume);
             }
         }
-        deliveries
+        volumes
     }
 
     /// Its reads of the read engine now (whether any is submitted and not
@@ -341,10 +357,10 @@ impl ExpertSource {
     /// read engine's counts, never an owner's lock: the exchange's
     /// watchdog's (`crate::watched::HostClock`).
     pub(crate) fn reads(&self) -> impl Fn() -> crate::watched::Reads + Send + 'static {
-        let outstanding = self.files.iter().map(ArtifactReader::outstanding).collect::<Vec<_>>();
+        let outstanding = self.files.iter().map(Reader::outstanding).collect::<Vec<_>>();
         move || crate::watched::Reads {
             outstanding: outstanding.iter().any(|reader| reader.jobs() > 0),
-            engine: magnitude_artifacts::engine_work(),
+            engine: seismic_io::engine_work(),
         }
     }
 
@@ -353,38 +369,28 @@ impl ExpertSource {
     /// hints. Fails only when the engine takes no job.
     pub fn submit(&self, reads: Vec<Read>, priority: Priority) -> Result<Ticket, String> {
         assert!(reads.iter().all(|read| read.file < self.files.len()), "a read of a file the source has not open");
+        // Each file's ranges, each landing in the records its read holds,
+        // and the reads they serve.
+        let mut by_file = (0..self.files.len()).map(|_| (Vec::new(), Vec::new())).collect::<Vec<_>>();
+        for (at, read) in reads.into_iter().enumerate() {
+            let (ranges, served) = &mut by_file[read.file];
+            served.push((at, read.file, read.offset, read.bytes));
+            let at = read.into.offset(read.record) as usize;
+            ranges.push(Range { offset: read.offset, length: read.bytes, into: read.into.0, at });
+        }
         let mut jobs = Vec::new();
-        for (index, file) in self.files.iter().enumerate() {
-            let mine = reads.iter().enumerate().filter(|(_, read)| read.file == index).collect::<Vec<_>>();
-            if mine.is_empty() {
+        for (file, (ranges, served)) in self.files.iter().zip(by_file) {
+            if ranges.is_empty() {
                 continue;
             }
-            let ranges = mine
-                .iter()
-                .map(|(_, read)| Range {
-                    offset: read.offset,
-                    length: read.bytes,
-                    // SAFETY: within the records, which `Read::new` holds
-                    // its record and bytes to.
-                    sink: unsafe { read.into.base.add(read.into.offset(read.record) as usize) },
-                })
-                .collect();
             // SAFETY: each staging record is the request's alone while its
             // job runs: the device reads it only after the watcher publishes
-            // it, once the job has ended, and the ticket holds the staging
-            // until then.
+            // it, once the job has ended.
             let job = unsafe { file.submit(ranges, priority) }
                 .map_err(|error| format!("expert source: {error}"))?;
-            let served = mine
-                .iter()
-                .map(|(at, read)| (*at, index, read.offset, read.bytes))
-                .collect();
             jobs.push((job, served));
         }
-        Ok(Ticket {
-            jobs,
-            _staging: reads.into_iter().map(|read| read.into.tensor).collect(),
-        })
+        Ok(Ticket { jobs })
     }
 }
 
@@ -404,7 +410,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("expert-source-{}", std::process::id()));
         let bytes = (0..64 * 1024).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
-        let source = ExpertSource::open(std::slice::from_ref(&path), &magnitude_artifacts::Urgent { parts: vec![128], records: 2 }).unwrap();
+        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
         let staging = Tensor::shared(&device, Element::i32(), &[2, 32]).unwrap();
         let records = Records::new(staging.clone(), 128, 2).unwrap();
         let read = |offset: u64, record: u64| Read::new(0, offset, 128, &records, record);
@@ -447,7 +453,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("expert-source-reserved-{}", std::process::id()));
         let bytes = (0..2 * RECORD).map(|index| (index % 251) as u8 ^ (index >> 20) as u8).collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
-        let source = ExpertSource::open(std::slice::from_ref(&path), &magnitude_artifacts::Urgent { parts: vec![128], records: 2 }).unwrap();
+        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
         // Reversed: record 0 takes the file's second half.
         let landed = source
             .submit(vec![Read::new(0, RECORD, RECORD, &records, 0), Read::new(0, 0, RECORD, &records, 1)], Priority::Demand)
@@ -458,6 +464,41 @@ mod tests {
         unsafe { records.tensor().read_shared(0, &mut host) }.unwrap();
         assert!(host[..RECORD as usize] == bytes[RECORD as usize..], "record 0 holds the file's second half");
         assert!(host[RECORD as usize..] == bytes[..RECORD as usize], "record 1 holds its first half");
+        drop(landed);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A read lands in the last record of a view of a chunked bank: on Metal
+    /// a conveyor's view holds records of the stored form inside its lender's
+    /// larger records, whole in chunks of those, so the last ones lie past the
+    /// view's canonical bytes (Qwen3.6 35B q4's 589824-byte stacks in 655360-byte
+    /// records).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_read_lands_in_the_last_record_of_a_chunked_bank() {
+        let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Metal).unwrap();
+        const RECORD: u64 = 589824;
+        const LENT: u64 = 655360;
+        const COUNT: u64 = 64;
+        let (bank, _resizer) = crate::planning::BankAllocation::reserve(
+            &device,
+            crate::planning::BankTier::Bank.contract_on(&device),
+            Element::i32(),
+            &[COUNT, LENT / 4],
+            COUNT,
+            None,
+        )
+        .unwrap();
+        let records = Records::new(bank.region(Element::i32(), &[COUNT, RECORD / 4], 0).unwrap(), RECORD, COUNT).unwrap();
+        assert!(records.offset(COUNT - 1) > (COUNT - 1) * RECORD, "the last record lies past the canonical bytes, or this tests nothing");
+        let path = std::env::temp_dir().join(format!("expert-source-padded-{}", std::process::id()));
+        let bytes = (0..RECORD).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        std::fs::write(&path, &bytes).unwrap();
+        let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![RECORD], records: 1 }).unwrap();
+        let landed = source.submit(vec![Read::new(0, 0, RECORD, &records, COUNT - 1)], Priority::Demand).unwrap();
+        assert!(matches!(landed.wait_until(Instant::now() + std::time::Duration::from_secs(30)), Some(Outcome::Read)));
+        // SAFETY: the job has ended, and no device work touches the record.
+        assert!(unsafe { records.record(COUNT - 1, RECORD) } == bytes);
         drop(landed);
         std::fs::remove_file(path).unwrap();
     }
@@ -505,8 +546,8 @@ mod tests {
             Self { path, layers, experts, read, record }
         }
 
-        fn urgent(&self) -> magnitude_artifacts::Urgent {
-            magnitude_artifacts::Urgent { parts: self.layers[0].iter().map(|&(_, per)| per).collect(), records: 1 }
+        fn urgent(&self) -> seismic_io::Urgent {
+            seismic_io::Urgent { parts: self.layers[0].iter().map(|&(_, per)| per).collect(), records: 1 }
         }
 
         /// A prompt's reads: every layer's `read` distinct experts, drawn from `seed`.
@@ -541,6 +582,25 @@ mod tests {
         }
     }
 
+    /// Memory a test frees only once every job reading into it has ended.
+    struct Held(NonNull<u8>, usize);
+
+    // SAFETY: the test's memory, written only by the jobs it waits out.
+    unsafe impl Send for Held {}
+    unsafe impl Sync for Held {}
+
+    // SAFETY: the test frees the bytes only after every job reading them ended.
+    unsafe impl seismic_io::Destination for Held {
+        fn region(&self) -> (NonNull<u8>, usize) {
+            (self.0, self.1)
+        }
+    }
+
+    /// `length` bytes at `base` as a destination ([`Held`]).
+    fn held(base: *mut u8, length: usize) -> Arc<dyn seismic_io::Destination> {
+        Arc::new(Held(NonNull::new(base).expect("a destination's bytes"), length))
+    }
+
     fn xorshift(seed: &mut u64) -> u64 {
         *seed ^= *seed << 13;
         *seed ^= *seed >> 7;
@@ -556,7 +616,7 @@ mod tests {
     /// expert into its slot of `sink` (two layers' slots, `read` a layer),
     /// two layers in flight, each job's end running `ended` on the worker
     /// that ends it. Bytes a second.
-    fn prompt_rate(reader: &ArtifactReader, sink: &[usize], read: usize, layers: &PromptReads, ended: impl Fn() + Clone + Send + 'static) -> f64 {
+    fn prompt_rate(reader: &Reader, sink: &[usize], read: usize, layers: &PromptReads, ended: impl Fn() + Clone + Send + 'static) -> f64 {
         let bytes: usize = layers.iter().flatten().flatten().map(|&(_, length)| length).sum();
         let began = Instant::now();
         let mut behind: Vec<Job> = Vec::new();
@@ -571,9 +631,9 @@ mod tests {
                         .iter()
                         .map(|&(offset, length)| {
                             // SAFETY: within the slot's record, which holds the widest layer's expert.
-                            let sink = NonNull::new(unsafe { base.add(at) }).unwrap();
+                            let into = held(unsafe { base.add(at) }, length);
                             at += length;
-                            Range { offset, length, sink }
+                            Range { offset, length, into, at: 0 }
                         })
                         .collect();
                     // SAFETY: the slot is this job's alone until the layer two on waits on it.
@@ -602,7 +662,7 @@ mod tests {
     #[ignore = "times reads into a CUDA device's reserved bank on a real model file (`MAGNITUDE_ARTIFACTS`)"]
     fn a_prompts_reads_land_in_a_reserved_bank_at_the_heaps_rate() {
         let model = PromptExperts::acquired();
-        let reader = ArtifactReader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap();
+        let reader = Reader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap();
         let mut seed = 0x9a0bu64;
         let device = cuda();
         let bank = model.bank(&device);
@@ -675,7 +735,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use std::time::Duration;
         let model = Arc::new(PromptExperts::acquired());
-        let reader = Arc::new(ArtifactReader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap());
+        let reader = Arc::new(Reader::open_urgent(&model.path, CachePolicy::Uncached, &model.urgent()).unwrap());
         let device = cuda();
         let bank = model.bank(&device);
         let sink = (0..2 * model.read as u64).map(|slot| bank.address(slot).as_ptr() as usize).collect::<Vec<_>>();
@@ -757,10 +817,10 @@ mod tests {
                         .iter()
                         .map(|&(offset, per)| {
                             // SAFETY: within the slot's record.
-                            let sink = NonNull::new(unsafe { records.as_ptr().add(at) }).unwrap();
+                            let into = held(unsafe { records.as_ptr().add(at) }, per as usize);
                             at += per as usize;
                             bytes += per as usize;
-                            Range { offset: offset + expert * per, length: per as usize, sink }
+                            Range { offset: offset + expert * per, length: per as usize, into, at: 0 }
                         })
                         .collect();
                     // SAFETY: the slot is this job's alone until the slot's next turn waits on it.

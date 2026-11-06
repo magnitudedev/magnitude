@@ -10,7 +10,7 @@ pub(super) use crate::experts::map::{LandingMap, MapView, StampedMap};
 pub(super) use crate::experts::source::{ExpertSource, Outcome, Read, Records, Ticket};
 pub(super) use crate::operation::LaunchWork;
 pub(super) use crate::planning::{Placer, RegionWords};
-pub(super) use magnitude_artifacts::Priority;
+pub(super) use seismic_io::Priority;
 pub(super) use magnitude_kernels::constants;
 pub(super) use seismic::{BackendName, Element, Tensor};
 pub(super) use std::time::{Duration, Instant};
@@ -31,8 +31,8 @@ pub(super) const EXPERTS: usize = 8;
 pub(super) const RECORD: u64 = 16;
 
 /// The tests' decode request: one record of one stored range a choice.
-fn urgent() -> magnitude_artifacts::Urgent {
-    magnitude_artifacts::Urgent { parts: vec![RECORD], records: 1 }
+fn urgent() -> seismic_io::Urgent {
+    seismic_io::Urgent { parts: vec![RECORD], records: 1 }
 }
 
 pub(super) const STAGING: u32 = 4;
@@ -131,7 +131,7 @@ pub(super) struct Harness {
 }
 
 /// The read engine's pool is the process's one
-/// (`magnitude_artifacts::reader`): reads a test queues ahead in it
+/// (`seismic_io`): reads a test queues ahead in it
 /// ([`Ahead`]) delay every other harness's demand reads, whose times refit
 /// that harness's read line and so the price its hints are admitted by
 /// (`telemetry::pays`). A test that queues reads ahead holds the pool

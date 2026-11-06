@@ -11,7 +11,7 @@
 //! the same way.
 
 use crate::assessment::ReadLine;
-use magnitude_artifacts::{EngineWork, Flight};
+use seismic_io::{EngineWork, Flight};
 use std::sync::{Condvar, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -63,7 +63,7 @@ impl PieceBound {
         let sharing = engine
             .reading
             .iter()
-            .filter(|other| other.device == flight.device)
+            .filter(|other| other.volume == flight.volume)
             .map(|other| line.seconds(other.bytes))
             .sum::<f64>();
         Duration::from_secs_f64(sharing) * MULTIPLE
@@ -82,11 +82,11 @@ impl PieceBound {
             .iter()
             .map(|flight| {
                 format!(
-                    "{} at {} ({} bytes, device {}) for {:?} of {:?}{}",
+                    "{} at {} ({} bytes, volume {}) for {:?} of {:?}{}",
                     flight.path.display(),
                     flight.offset,
                     flight.bytes,
-                    flight.device,
+                    flight.volume,
                     now.saturating_duration_since(flight.since),
                     self.of(flight, engine),
                     if self.overdue(flight, engine, now) { ", past its bound" } else { "" }
@@ -279,7 +279,7 @@ mod tests {
     fn reads_are_served_while_the_engine_progresses_within_each_pieces_bound() {
         let pieces = PieceBound(Some(ReadLine::new(1e-3, 0.0).unwrap()));
         let now = Instant::now();
-        let flight = |age| Flight { path: Path::new("/experts").into(), device: 1, offset: 0, bytes: PIECE, since: now - age };
+        let flight = |age| Flight { path: Path::new("/experts").into(), volume: seismic_io::Volume(1), offset: 0, bytes: PIECE, since: now - age };
         let reads = |outstanding, ended, reading: Vec<Flight>| Reads { outstanding, engine: EngineWork { ended, reading } };
         let mut serving = Serving::new(&EngineWork { ended: 0, reading: Vec::new() });
         assert!(!serving.look(&reads(true, 0, Vec::new()), pieces, now), "an engine that neither ends nor reads a piece serves nothing");
@@ -292,7 +292,7 @@ mod tests {
         );
         assert!(!serving.look(&reads(false, 9, vec![flight(Duration::ZERO)]), pieces, now), "nor the reads of an owner that reads nothing");
         let report = pieces.describe(&reads(true, 9, vec![flight(Duration::from_secs(5))]).engine, now);
-        assert!(report.contains("/experts at 0 (131072 bytes, device 1) for 5s of 10ms, past its bound"), "{report}");
+        assert!(report.contains("/experts at 0 (131072 bytes, volume 1) for 5s of 10ms, past its bound"), "{report}");
     }
 
     /// A piece's bound is MULTIPLE times the line's time for it and for
@@ -302,7 +302,7 @@ mod tests {
     fn a_pieces_bound_covers_the_pieces_sharing_its_device() {
         let pieces = PieceBound(Some(ReadLine::new(1e-6, 9e-9).unwrap()));
         let now = Instant::now();
-        let flight = |device| Flight { path: Path::new("/experts").into(), device, offset: 0, bytes: 1000, since: now };
+        let flight = |volume| Flight { path: Path::new("/experts").into(), volume: seismic_io::Volume(volume), offset: 0, bytes: 1000, since: now };
         let alone = EngineWork { ended: 0, reading: vec![flight(1), flight(2), flight(2)] };
         assert_eq!(pieces.of(&alone.reading[0], &alone), Duration::from_secs_f64(1e-5) * MULTIPLE, "alone on its device");
         let sharing = EngineWork { ended: 0, reading: vec![flight(1), flight(1), flight(1), flight(2)] };

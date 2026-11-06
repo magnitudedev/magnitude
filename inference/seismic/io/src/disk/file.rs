@@ -1,9 +1,8 @@
 #[cfg(doc)]
-use super::engine::Flight;
-use super::engine::Buffers;
+use crate::scheduler::Flight;
 use super::platform::{drop_pages, refuses_direct, reopen};
-use super::queue::Piece;
 use super::ALIGNMENT;
+use crate::scheduler::{Buffers, Piece};
 use crate::Error;
 use std::fs::File;
 use std::io;
@@ -11,19 +10,19 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 #[derive(Debug)]
-pub(super) struct SourceFile {
+pub(crate) struct SourceFile {
     /// The name its source gave it, which a piece in flight is reported by
     /// ([`Flight`]).
-    pub(super) path: Arc<Path>,
-    pub(super) size: u64,
-    pub(super) through: Through,
+    pub(crate) path: Arc<Path>,
+    pub(crate) size: u64,
+    pub(crate) through: Through,
 }
 
 /// How a reader's file is read. Every descriptor is of the one file the
-/// reader's [`crate::FileSource`] has open, never of what its path names
+/// reader's [`crate::OpenFile`] has open, never of what its path names
 /// later, so a replaced path changes no byte a reader reads.
 #[derive(Debug)]
-pub(super) enum Through {
+pub(crate) enum Through {
     /// Uncached: direct reads of `file`, and once its filesystem refused
     /// direct I/O at a read, reads of `fallback` (`file` reopened through
     /// the cache) through the cache, each read's pages dropped: every later
@@ -40,7 +39,7 @@ pub(super) enum Through {
 
 impl Through {
     /// Direct reads of `file`, until its filesystem refuses one.
-    pub(super) fn direct(file: File) -> Self {
+    pub(crate) fn direct(file: File) -> Self {
         Self::Direct {
             file,
             fallback: OnceLock::new(),
@@ -62,11 +61,11 @@ impl SourceFile {
     /// Read `piece` and land its parts: straight into the one sink of an
     /// uncached piece that lies within one range where the sink meets the
     /// reader's alignment, otherwise through a buffer of `buffers`.
-    pub(super) fn read_piece(&self, piece: &Piece, buffers: &Buffers) -> Result<(), Error> {
+    pub(crate) fn read_piece(&self, piece: &Piece, buffers: &Buffers) -> Result<(), Error> {
         let span = (piece.end - piece.start) as usize;
         if self.lands_straight(piece) {
             // SAFETY: the piece's one part's sink is `span` bytes the pool
-            // writes alone until the job ends (`ArtifactReader::submit`).
+            // writes alone until the job ends (`Reader::submit`).
             let sink =
                 unsafe { std::slice::from_raw_parts_mut(piece.parts[0].sink.as_ptr(), span) };
             return self.read_block(piece.start, sink);
@@ -99,7 +98,7 @@ impl SourceFile {
     /// worker's buffer 0.93 ms (M4 Pro; in a streamed 4k step, demand
     /// reads 1.55 → 1.98 GB/s). A cached
     /// piece never is.
-    pub(super) fn lands_straight(&self, piece: &Piece) -> bool {
+    pub(crate) fn lands_straight(&self, piece: &Piece) -> bool {
         let alignment = match (&self.through, self.through.dropping()) {
             (Through::Cache(_), _) => return false,
             (_, Some(_)) => 1,
@@ -119,7 +118,7 @@ impl SourceFile {
     /// whole (the tail of the file short of its end). An uncached read the
     /// filesystem refuses direct is read again through the cache, as every
     /// later one is, and the pages it filled are dropped.
-    pub(super) fn read_block(&self, start: u64, into: &mut [u8]) -> Result<(), Error> {
+    pub(crate) fn read_block(&self, start: u64, into: &mut [u8]) -> Result<(), Error> {
         let cached = match &self.through {
             Through::Cache(file) => return self.read_block_from(file, start, into, false),
             Through::Dropped(file) => file,
@@ -148,41 +147,49 @@ impl SourceFile {
     fn read_block_from(&self, file: &File, start: u64, into: &mut [u8], direct: bool) -> Result<(), Error> {
         let end = start + into.len() as u64;
         let wanted = (end.min(self.size) - start) as usize;
-        let mut done = 0usize;
-        while done < wanted {
-            let out = &mut into[done..];
-            #[cfg(unix)]
-            let result = {
-                use std::os::unix::fs::FileExt;
-                file.read_at(out, start + done as u64)
-            };
-            #[cfg(windows)]
-            let result = {
-                use std::os::windows::fs::FileExt;
-                file.seek_read(out, start + done as u64)
-            };
-            match result {
-                // A direct read of the file's last block ends at its end.
-                Ok(0) => break,
-                Ok(count) => done += count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) if direct && done as u64 % ALIGNMENT != 0 => {
-                    return Err(io::Error::new(
-                        error.kind(),
-                        format!("a direct read at {start}, misaligned {done} bytes in by a short read: {error}"),
-                    )
-                    .into());
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if done < wanted {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "open artifact changed or was truncated",
+        match read_positioned(file, start, into, wanted) {
+            Ok(done) if done < wanted => Err(truncated().into()),
+            Ok(_) => Ok(()),
+            Err((error, done)) if direct && done as u64 % ALIGNMENT != 0 => Err(io::Error::new(
+                error.kind(),
+                format!("a direct read at {start}, misaligned {done} bytes in by a short read: {error}"),
             )
-            .into());
+            .into()),
+            Err((error, _)) => Err(error.into()),
         }
-        Ok(())
     }
+}
+
+/// Read `file` from `start` into `into` until `wanted` bytes have landed or
+/// the file ends (a direct read of its last block ends at its end), each
+/// read asking for the rest of `into`: the bytes read, or the error that
+/// stopped it with the bytes read before. Every positional read of the
+/// process loops here.
+pub(crate) fn read_positioned(file: &File, start: u64, into: &mut [u8], wanted: usize) -> Result<usize, (io::Error, usize)> {
+    let mut done = 0usize;
+    while done < wanted {
+        let out = &mut into[done..];
+        #[cfg(unix)]
+        let result = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(out, start + done as u64)
+        };
+        #[cfg(windows)]
+        let result = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(out, start + done as u64)
+        };
+        match result {
+            Ok(0) => break,
+            Ok(count) => done += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err((error, done)),
+        }
+    }
+    Ok(done)
+}
+
+/// A file that ended short of the bytes it held when it was opened.
+pub(crate) fn truncated() -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, "open file changed or was truncated")
 }

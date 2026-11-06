@@ -1,12 +1,8 @@
 use crate::Error;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
-#[cfg(windows)]
-use std::os::windows::fs::FileExt;
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
@@ -70,9 +66,7 @@ impl Drop for MappedWindow {
 /// Callers must keep the file's contents unchanged while this source is in use.
 #[derive(Debug)]
 pub struct FileSource {
-    file: File,
-    path: PathBuf,
-    size: u64,
+    opened: seismic_io::OpenFile,
 }
 
 impl FileSource {
@@ -80,38 +74,24 @@ impl FileSource {
     /// resolved through links: a content-addressed store names its files by
     /// links, and a split GGUF finds its shards by that name.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = std::path::absolute(path.as_ref())?;
         // Its reads fill the cache with the ranges they name, no more.
-        let file = crate::reader::open_cached(&path)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() {
-            return Err(Error::Invalid(
-                "artifact source is not a regular file".into(),
-            ));
-        }
-        Ok(Self {
-            file,
-            path,
-            size: metadata.len(),
-        })
+        Ok(Self { opened: seismic_io::OpenFile::open(path)? })
     }
 
     pub fn size(&self) -> u64 {
-        self.size
+        self.opened.size()
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.opened.path()
     }
 
-    /// The file this source has open, which its readers read
-    /// ([`crate::ArtifactReader::of`]).
-    pub(crate) fn file(&self) -> &File {
-        &self.file
+    fn file(&self) -> &File {
+        self.opened.file()
     }
 
     pub fn metadata(&self) -> Result<std::fs::Metadata, Error> {
-        Ok(self.file.metadata()?)
+        Ok(self.file().metadata()?)
     }
 
     /// Map a nonempty source range read-only. The mapping owns this open file
@@ -124,7 +104,7 @@ impl FileSource {
     ) -> Result<Arc<MappedWindow>, Error> {
         let end = offset
             .checked_add(length)
-            .filter(|end| length != 0 && *end <= self.size)
+            .filter(|end| length != 0 && *end <= self.size())
             .ok_or_else(|| {
                 Error::Invalid("mapped artifact range is empty or outside the file".into())
             })?;
@@ -148,7 +128,7 @@ impl FileSource {
                 mapped_len,
                 libc::PROT_READ,
                 libc::MAP_PRIVATE,
-                self.file.as_raw_fd(),
+                self.file().as_raw_fd(),
                 file_offset,
             )
         };
@@ -175,35 +155,16 @@ impl FileSource {
         let end = offset
             .checked_add(out.len() as u64)
             .ok_or_else(|| Error::Invalid("artifact read overflows".into()))?;
-        if end > self.size {
+        if end > self.size() {
             return Err(Error::Invalid("read outside artifact".into()));
         }
-        let mut done = 0;
-        while done < out.len() {
-            #[cfg(unix)]
-            let result = self.file.read_at(&mut out[done..], offset + done as u64);
-            #[cfg(windows)]
-            let result = self.file.seek_read(&mut out[done..], offset + done as u64);
-            match result {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "open artifact changed or was truncated",
-                    )
-                    .into())
-                }
-                Ok(n) => done += n,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
+        Ok(self.opened.read_exact_at(offset, out)?)
     }
 
     pub fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>, Error> {
         if offset
             .checked_add(length as u64)
-            .is_none_or(|end| end > self.size)
+            .is_none_or(|end| end > self.size())
         {
             return Err(Error::Invalid("read outside artifact".into()));
         }
@@ -230,7 +191,7 @@ impl FileSource {
     pub fn range(&self, offset: u64, length: u64) -> Result<io::Take<SourceReader<'_>>, Error> {
         offset
             .checked_add(length)
-            .filter(|end| *end <= self.size)
+            .filter(|end| *end <= self.size())
             .ok_or_else(|| Error::Invalid("read outside artifact".into()))?;
         if let Some(length) = std::num::NonZeroU64::new(length) {
             self.will_need(offset, length)?;
@@ -252,7 +213,7 @@ impl FileSource {
         };
         // SAFETY: advice on a range of a descriptor this source owns.
         let advised = unsafe {
-            libc::posix_fadvise(self.file.as_raw_fd(), start, count, libc::POSIX_FADV_WILLNEED)
+            libc::posix_fadvise(self.file().as_raw_fd(), start, count, libc::POSIX_FADV_WILLNEED)
         };
         if advised != 0 {
             return Err(io::Error::from_raw_os_error(advised).into());
@@ -267,6 +228,14 @@ impl FileSource {
     }
 }
 
+/// The file a source has open, which its readers read
+/// (`seismic_io::Reader::of`) and its volume's probe times.
+impl AsRef<seismic_io::OpenFile> for FileSource {
+    fn as_ref(&self) -> &seismic_io::OpenFile {
+        &self.opened
+    }
+}
+
 pub struct SourceReader<'a> {
     source: &'a FileSource,
     offset: u64,
@@ -274,7 +243,7 @@ pub struct SourceReader<'a> {
 
 impl Read for SourceReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        let count = (out.len() as u64).min(self.source.size.saturating_sub(self.offset)) as usize;
+        let count = (out.len() as u64).min(self.source.size().saturating_sub(self.offset)) as usize;
         if count == 0 {
             return Ok(0);
         }
@@ -291,7 +260,7 @@ impl Seek for SourceReader<'_> {
         let next = match from {
             SeekFrom::Start(offset) => i128::from(offset),
             SeekFrom::Current(offset) => i128::from(self.offset) + i128::from(offset),
-            SeekFrom::End(offset) => i128::from(self.source.size) + i128::from(offset),
+            SeekFrom::End(offset) => i128::from(self.source.size()) + i128::from(offset),
         };
         self.offset = u64::try_from(next)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid artifact seek"))?;

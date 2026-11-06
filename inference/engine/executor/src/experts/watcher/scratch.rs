@@ -56,7 +56,7 @@ use crate::experts::conveyor::{Conveyor, ConveyorLanding, Serving, State, readin
 use crate::experts::directory::{BankRecord, HostRecord, Point};
 use crate::experts::landing::Converting;
 use crate::experts::staging::Staged;
-use magnitude_artifacts::Priority;
+use seismic_io::Priority;
 use magnitude_kernels::constants;
 use std::time::Instant;
 

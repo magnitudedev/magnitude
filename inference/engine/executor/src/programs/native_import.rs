@@ -7,7 +7,7 @@ use crate::{
     ValidatedImportLaunch, WeightStorageIdentity, native::AttestedImport,
 };
 use magnitude_kernels::{import_dense, packing_bound, repack_weight};
-use magnitude_artifacts::{ArtifactReader, CachePolicy};
+use seismic_io::{Reader, CachePolicy};
 use seismic::{NativeKernel, NativeTensorBatch, Tensor};
 use std::io::Read;
 
@@ -99,7 +99,7 @@ pub(crate) fn fill_staged_source(
             Box::new(source.range(offset, length).map_err(|error| transfer(error.to_string()))?)
         }
         CachePolicy::Uncached => {
-            uncached = ArtifactReader::of(source, CachePolicy::Uncached)
+            uncached = Reader::of(&**source, CachePolicy::Uncached)
                 .map_err(|error| transfer(error.to_string()))?;
             Box::new(uncached.range(offset, length))
         }

@@ -279,7 +279,7 @@ fn watch(
     // each a record stored as its routed tensors' ranges: the read engine
     // reads the files for it.
     let urgent = plan.urgent()?;
-    let read_cores = magnitude_artifacts::read_cores(artifact.sources().map(|source| &**source), &urgent)
+    let read_cores = seismic_io::read_cores(artifact.sources().map(|source| &**source), &urgent)
         .map_err(|error| format!("the read engine's cores: {error}"))?;
     let machine = super::Machine::discover(&device, read_cores)?;
     let (site_layers, lines, threads) = site_lines(plan, layout, tiers.as_deref(), sites, lines, &machine, cpu, steps.pulse())?;

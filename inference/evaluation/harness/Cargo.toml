@@ -28,6 +28,7 @@ magnitude-scheduler = { path = "../../engine/scheduler" }
 magnitude-serving = { path = "../../engine/serving" }
 magnitude-state = { path = "../../engine/state" }
 seismic.workspace = true
+seismic-io.workspace = true
 serde.workspace = true
 # Fixture key order is rendered: chat templates print tool schemas in it.
 serde_json = { workspace = true, features = ["preserve_order"] }

@@ -1,0 +1,15 @@
+[package]
+name = "seismic-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Seismic's I/O layer: storage devices, the scheduler that reads them and its
+# accounting. It depends on no other Seismic crate, so a tool that only reads
+# files needs no device runtime.
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+serde_json.workspace = true

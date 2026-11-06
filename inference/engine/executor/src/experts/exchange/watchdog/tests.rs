@@ -9,7 +9,7 @@ use magnitude_kernels::SlotTable;
 use seismic::{BackendName, Devices, Element, Tensor};
 use crate::assessment::ReadLine;
 use crate::watched::PieceBound;
-use magnitude_artifacts::{EngineWork, Flight};
+use seismic_io::{EngineWork, Flight};
 
 /// A piece in flight's bytes: any read size a volume reads in.
 const PIECE: u64 = 128 << 10;
@@ -68,7 +68,7 @@ fn a_read_that_never_ends_trips_with_no_read_line() {
     let limit = unpriced.lane.limit;
     let flight = move |ended| {
         Box::new(move || {
-            let reading = vec![Flight { path: Path::new("/models/experts.gguf").into(), device: 1, offset: 0, bytes: PIECE, since: began }];
+            let reading = vec![Flight { path: Path::new("/models/experts.gguf").into(), volume: seismic_io::Volume(1), offset: 0, bytes: PIECE, since: began }];
             Reads { outstanding: true, engine: EngineWork { ended, reading } }
         }) as Box<dyn Fn() -> Reads + Send>
     };
@@ -169,7 +169,7 @@ fn a_lane_whose_read_is_in_flight_trips_only_past_its_pieces_bound() {
     let bounds = bounds(limit, PieceBound(Some(ReadLine::new(0.0, 2e-3 / PIECE as f64).unwrap())));
     let flying = |count: u64, since: Instant| -> Box<dyn Fn() -> Reads + Send> {
         let reading = (0..count)
-            .map(|piece| Flight { path: Path::new("/models/experts.gguf").into(), device: 1, offset: piece * PIECE, bytes: PIECE, since })
+            .map(|piece| Flight { path: Path::new("/models/experts.gguf").into(), volume: seismic_io::Volume(1), offset: piece * PIECE, bytes: PIECE, since })
             .collect::<Vec<_>>();
         Box::new(move || Reads { outstanding: true, engine: EngineWork { ended: 7, reading: reading.clone() } })
     };
@@ -180,7 +180,7 @@ fn a_lane_whose_read_is_in_flight_trips_only_past_its_pieces_bound() {
     let (after, report) = looks(&mut reading(16, began - Duration::from_secs(10)), began, &bounds, limit * 2).expect("a piece in flight forever never tripped");
     assert!(after > limit, "tripped before the lane's bound");
     assert!(report.contains("File 3 2 0: 6, 0x0"), "{report}");
-    assert!(report.contains("/models/experts.gguf at 0 (131072 bytes, device 1) for"), "{report}");
+    assert!(report.contains("/models/experts.gguf at 0 (131072 bytes, volume 1) for"), "{report}");
     assert!(report.contains("of 320ms, past its bound"), "{report}");
     // Alone and slow: within its bound of 20 ms, not tripped; past it, the
     // lane's bound later. The look that first sees it past its bound credits

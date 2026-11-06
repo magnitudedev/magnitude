@@ -2678,9 +2678,9 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
             160,
             crate::stored_table::StoredSlots::Whole { records: 1, record_rows: 64 },
             crate::planning::DirectoryForm::Hashed,
-            magnitude_artifacts::ArtifactReader::open(
+            seismic_io::Reader::open(
                 &path,
-                magnitude_artifacts::CachePolicy::Uncached,
+                seismic_io::CachePolicy::Uncached,
             )
             .unwrap(),
             0,

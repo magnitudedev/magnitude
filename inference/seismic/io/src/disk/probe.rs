@@ -3,7 +3,7 @@
 //! How fast a device reads depends on the bytes it holds in flight and on
 //! the size of the reads that hold them, and how soon it serves a lone
 //! request on how the request is split; no two devices measured agree
-//! (`tests/read_depth.rs`, uncached reads at random offsets of Qwen3.6
+//! (`magnitude-artifacts`' `tests/read_depth`, uncached reads at random offsets of Qwen3.6
 //! 35B's file):
 //!
 //! - GB10's NVMe: the rate is the
@@ -118,16 +118,15 @@
 //! land straight is, the median of its passes ([`read_cores`]): what the
 //! host keeps free for the pool's workers.
 
-use super::engine::Aligned;
 use super::file::SourceFile;
 use super::platform::thread_cpu_seconds;
-use super::volume::{Bound, Delivery, Volume, VolumeChoice, VolumeKey};
+use super::volume::{Bound, VolumeReads, VolumeChoice};
 #[cfg(doc)]
 use super::volume::{adopt_volume, probe_volume, read_cores};
-use super::{queue, Ended, Priority, Range, ALIGNMENT};
-use crate::Error;
+use super::ALIGNMENT;
+use crate::scheduler::{self, queue, Ended, Priority, Range};
+use crate::{Buffer, Volume, Error};
 use std::collections::{BTreeMap, HashMap};
-use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -135,15 +134,15 @@ use std::time::Instant;
 /// that holds a record's widest range, at most the widest window ("A
 /// volume's window"): the grain the
 /// pool's workers are counted in, and below which no device measured read
-/// faster or sooner (`tests/read_depth.rs`).
-pub(super) const LEAST_READ: u64 = 128 * 1024;
+/// faster or sooner (`magnitude-artifacts`' `tests/read_depth`).
+pub(crate) const LEAST_READ: u64 = 128 * 1024;
 
 /// The least and the widest windows a volume's probe holds in flight,
 /// doubling: below 1 MiB no device measured nears its rate, and 32 MiB is
 /// twice the widest window any measured device needed to reach it
 /// (an RTX 3090 host's 128 KiB reads, 16 MiB).
 const LEAST_WINDOW: u64 = 1024 * 1024;
-pub(super) const WIDEST_WINDOW: u64 = 32 * 1024 * 1024;
+pub(crate) const WIDEST_WINDOW: u64 = 32 * 1024 * 1024;
 
 /// The seconds a volume's probe reads at each read size and window, and
 /// the passes it takes each point's median of.
@@ -177,7 +176,7 @@ impl Urgent {
     /// least that holds its widest range, past which a read reads nothing
     /// more of a record, or to [`WIDEST_WINDOW`], past which no window of
     /// the probe holds one.
-    pub(super) fn reads(&self) -> Vec<u64> {
+    pub(crate) fn reads(&self) -> Vec<u64> {
         let widest = self.parts.iter().copied().max().expect("a request has a range").max(LEAST_READ).next_power_of_two();
         std::iter::successors(Some(LEAST_READ), |read| Some(read * 2)).take_while(|read| *read <= widest.min(WIDEST_WINDOW)).collect()
     }
@@ -189,25 +188,23 @@ impl Urgent {
 /// it, with the bytes of the file it was probed through; and each urgent
 /// request's choice (none: a reader no step waits on).
 #[derive(Default)]
-pub(super) struct VolumeLines {
+pub(crate) struct VolumeLines {
     lines: BTreeMap<u64, (u64, Vec<Point>)>,
     /// The volume's bound on its less urgent bytes in flight, which its
     /// urgent readers hold their windows in while they live.
     background: Arc<Bound>,
-    /// What the volume reads and how long it is busy ([`Delivery`]).
-    delivery: Arc<Delivery>,
-    pub(super) chosen: HashMap<Option<Urgent>, Volume>,
+    pub(crate) chosen: HashMap<Option<Urgent>, VolumeReads>,
 }
 
 /// One read size and window of a volume: the median rate and cores of its
 /// passes, and the rates' half range, its spread.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct Point {
-    pub(super) read: u64,
-    pub(super) window: u64,
-    pub(super) rate: f64,
-    pub(super) spread: f64,
-    pub(super) cores: f64,
+pub(crate) struct Point {
+    pub(crate) read: u64,
+    pub(crate) window: u64,
+    pub(crate) rate: f64,
+    pub(crate) spread: f64,
+    pub(crate) cores: f64,
 }
 
 impl Point {
@@ -221,13 +218,13 @@ impl Point {
 
 impl VolumeLines {
     /// The volume `key` names, read as `choice`.
-    pub(super) fn volume(&self, key: VolumeKey, choice: VolumeChoice) -> Volume {
-        Volume { key, choice, background: self.background.clone(), delivery: self.delivery.clone() }
+    pub(crate) fn volume(&self, key: Volume, choice: VolumeChoice) -> VolumeReads {
+        VolumeReads { id: key, choice, background: self.background.clone() }
     }
 
     /// How its volume is read for `urgent`, probing through `file` the
     /// lines it needs that are not yet probed.
-    pub(super) fn choose(&mut self, key: VolumeKey, file: &Arc<SourceFile>, urgent: Option<&Urgent>) -> Result<VolumeChoice, Error> {
+    pub(crate) fn choose(&mut self, key: Volume, file: &Arc<SourceFile>, urgent: Option<&Urgent>) -> Result<VolumeChoice, Error> {
         let reads = urgent.map_or(vec![LEAST_READ], Urgent::reads);
         self.probe(file, &reads)?;
         let points = reads.iter().flat_map(|read| self.lines[read].1.iter().copied()).collect::<Vec<_>>();
@@ -282,7 +279,7 @@ impl VolumeLines {
 /// Of `points`, the full rate's: the widest window within the noise of the
 /// best rate, then the least read ("A volume's window": serving lengthens a
 /// read's time in flight, which only a wider window holds the rate through).
-pub(super) fn full_rate(points: &[Point]) -> Point {
+pub(crate) fn full_rate(points: &[Point]) -> Point {
     let top = points.iter().max_by(|a, b| a.rate.total_cmp(&b.rate)).expect("a probed point");
     *points
         .iter()
@@ -295,7 +292,7 @@ pub(super) fn full_rate(points: &[Point]) -> Point {
 /// size's lone record: its median seconds and that median's error) ("A
 /// volume's window"): least `T`, and of those within the noise of the least,
 /// the narrowest window, then the least read.
-pub(super) fn decide(points: &[Point], lone: &HashMap<u64, (f64, f64)>, urgent: &Urgent) -> Point {
+pub(crate) fn decide(points: &[Point], lone: &HashMap<u64, (f64, f64)>, urgent: &Urgent) -> Point {
     let best = points.iter().map(|point| point.rate).fold(0., f64::max);
     let record = urgent.parts.iter().sum::<u64>() as f64;
     let timed = points
@@ -328,7 +325,7 @@ fn soonest(lone: &HashMap<u64, (f64, f64)>) -> u64 {
 
 /// The points a probe of read sizes `reads` reads: each size at every
 /// window doubling from [`LEAST_WINDOW`] (or one read) to [`WIDEST_WINDOW`].
-pub(super) fn grid(reads: impl IntoIterator<Item = u64>) -> Vec<(u64, u64)> {
+pub(crate) fn grid(reads: impl IntoIterator<Item = u64>) -> Vec<(u64, u64)> {
     reads
         .into_iter()
         .flat_map(|read| {
@@ -382,7 +379,7 @@ fn rate(file: &SourceFile, read: u64, depth: usize) -> Result<(f64, f64), Error>
     std::thread::scope(|scope| {
         let reader = |thread: u64| {
             move || -> Result<(u64, f64, Instant), Error> {
-                let (mut buffer, mut sink) = (Aligned::new(length), vec![0u8; length]);
+                let (mut buffer, mut sink) = (Buffer::new(length), vec![0u8; length]);
                 let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ (thread + 1).wrapping_mul(0xbf58_476d_1ce4_e5b9);
                 let until = *start.1.wait_while(start.0.lock().expect("probe start"), |until| until.is_none()).expect("probe start");
                 let until = until.expect("the probe started");
@@ -426,37 +423,35 @@ fn rate(file: &SourceFile, read: u64, depth: usize) -> Result<(f64, f64), Error>
 /// their seconds, by size and round. What a request pays is the engine's
 /// (its cut into pieces, the workers it wakes, the copy of a piece that
 /// does not land straight), not a read's alone.
-fn lone(lines: &VolumeLines, key: VolumeKey, file: &Arc<SourceFile>, parts: &[u64], reads: &[u64]) -> Result<Vec<Vec<f64>>, Error> {
+fn lone(lines: &VolumeLines, key: Volume, file: &Arc<SourceFile>, parts: &[u64], reads: &[u64]) -> Result<Vec<Vec<f64>>, Error> {
     const GRAIN: u64 = 32;
     let record = parts.iter().sum::<u64>();
     assert!(record + ALIGNMENT * parts.len() as u64 <= file.size, "a record of {record} bytes beyond a file of {}", file.size);
-    let mut sink = Aligned::new(record as usize);
+    let sink: Arc<dyn crate::Destination> = Arc::new(Buffer::new(record as usize));
     // Every piece of a request at once: its window holds a record whole.
     let volumes = reads
         .iter()
         .map(|&read| lines.volume(key, VolumeChoice { window: WIDEST_WINDOW, demand: WIDEST_WINDOW, read, demand_read: read, cores: 0. }))
         .collect::<Vec<_>>();
-    super::engine::engine().deepen(volumes.iter().map(Volume::workers).max().expect("a read size"))?;
+    scheduler::deepen(volumes.iter().map(VolumeReads::workers).max().expect("a read size"))?;
     let outstanding = Arc::default();
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut seconds = vec![Vec::new(); reads.len()];
     let began = Instant::now();
     while began.elapsed().as_secs_f64() < LONE_SECONDS || seconds[0].is_empty() {
         for (volume, times) in volumes.iter().zip(&mut seconds) {
-            let base = sink.bytes_mut().as_mut_ptr();
             let mut at = 0;
             let ranges = parts
                 .iter()
                 .map(|&part| {
                     let offset = random_offset(file, &mut state, part + ALIGNMENT) + state % (ALIGNMENT / GRAIN) * GRAIN;
-                    // SAFETY: within the record's sink, `part` bytes from where the last part ended.
-                    let sink = NonNull::new(unsafe { base.add(at) }).expect("a sink");
+                    let range = Range { offset, length: part as usize, into: sink.clone(), at };
                     at += part as usize;
-                    Range { offset, length: part as usize, sink }
+                    range
                 })
                 .collect();
             let started = Instant::now();
-            // SAFETY: each range's sink is its own bytes of `sink`, which
+            // SAFETY: each range's bytes are its own of `sink`, which
             // nothing else touches until the job, waited on here, ends.
             let job = unsafe { queue(file, volume, &outstanding, ranges, Priority::Demand) }?;
             match job.wait() {

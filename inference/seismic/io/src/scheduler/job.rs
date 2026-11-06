@@ -1,16 +1,18 @@
 use super::engine::Engine;
 use super::{Ended, Panic, Priority};
+use super::Range;
 use crate::Error;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
 /// A submitted job: promoted, withdrawn or waited for. Dropping it withdraws
-/// it and waits for its pieces in flight, so no sink is written after its
-/// job's handle is gone.
+/// it and waits for its pieces in flight, so no destination is written
+/// after its job's handle is gone; the job's state holds every destination
+/// until its last piece ends, whatever becomes of the handle.
 pub struct Job {
-    pub(super) id: u64,
-    pub(super) state: Arc<JobState>,
-    pub(super) engine: &'static Engine,
+    pub(crate) id: u64,
+    pub(crate) state: Arc<JobState>,
+    pub(crate) engine: &'static Engine,
 }
 
 impl Job {
@@ -102,28 +104,31 @@ impl Drop for Job {
     }
 }
 
-pub(super) struct JobState {
-    pub(super) progress: Mutex<Progress>,
+pub(crate) struct JobState {
+    pub(crate) progress: Mutex<Progress>,
     changed: Condvar,
     /// Its reader's jobs not yet ended, of which it is one until it ends.
     outstanding: Arc<std::sync::atomic::AtomicUsize>,
     /// When a worker took its first piece ([`Job::started`]).
-    pub(super) started: Arc<OnceLock<Instant>>,
+    pub(crate) started: Arc<OnceLock<Instant>>,
+    /// Its ranges, which hold their destinations while any piece may write
+    /// them.
+    _ranges: Vec<Range>,
 }
 
-pub(super) struct Progress {
+pub(crate) struct Progress {
     /// Pieces not yet ended.
     left: usize,
-    pub(super) failed: Vec<(usize, Arc<Error>)>,
+    pub(crate) failed: Vec<(usize, Arc<Error>)>,
     /// The first panic of a worker reading one of its pieces.
     panic: Option<Panic>,
-    pub(super) ended: Option<Ended>,
+    pub(crate) ended: Option<Ended>,
     /// What runs once it ends ([`Job::on_end`]).
     hook: Option<Box<dyn FnOnce(&Ended) + Send>>,
 }
 
 impl JobState {
-    pub(super) fn new(pieces: usize, failed: Vec<(usize, Arc<Error>)>, outstanding: Arc<std::sync::atomic::AtomicUsize>) -> Arc<Self> {
+    pub(crate) fn new(pieces: usize, failed: Vec<(usize, Arc<Error>)>, outstanding: Arc<std::sync::atomic::AtomicUsize>, ranges: Vec<Range>) -> Arc<Self> {
         Arc::new(Self {
             progress: Mutex::new(Progress {
                 left: pieces,
@@ -135,11 +140,12 @@ impl JobState {
             changed: Condvar::new(),
             outstanding,
             started: Arc::default(),
+            _ranges: ranges,
         })
     }
 
     /// End the job now: it has no piece.
-    pub(super) fn end(&self, ended: Ended) {
+    pub(crate) fn end(&self, ended: Ended) {
         let progress = self.progress.lock().expect("job progress");
         self.finish(progress, ended);
     }
@@ -166,8 +172,8 @@ impl JobState {
     }
 
     /// `count` of the job's pieces ended, failing `failed`, or by a panic;
-    /// the job ends with its last piece, so no sink is written once it has.
-    pub(super) fn pieces_ended(&self, count: usize, failed: impl IntoIterator<Item = (usize, Arc<Error>)>, panic: Option<Panic>) {
+    /// the job ends with its last piece, so no destination is written once it has.
+    pub(crate) fn pieces_ended(&self, count: usize, failed: impl IntoIterator<Item = (usize, Arc<Error>)>, panic: Option<Panic>) {
         let mut progress = self.progress.lock().expect("job progress");
         progress.failed.extend(failed);
         if progress.panic.is_none() {
@@ -187,7 +193,7 @@ impl JobState {
 }
 
 /// Each failed range once, with its first error, in the job's order.
-pub(super) fn first_failures(mut failed: Vec<(usize, Arc<Error>)>) -> Vec<(usize, Arc<Error>)> {
+pub(crate) fn first_failures(mut failed: Vec<(usize, Arc<Error>)>) -> Vec<(usize, Arc<Error>)> {
     failed.sort_by_key(|(index, _)| *index);
     failed.dedup_by_key(|(index, _)| *index);
     failed

@@ -54,6 +54,7 @@ members = [
   "seismic/runtime",
   "seismic/measure",
   "seismic/topology",
+  "seismic/io",
   "seismic/discovery",
   "seismic/api",
   "seismic/build",
@@ -90,6 +91,7 @@ default-members = [
   "seismic/runtime",
   "seismic/measure",
   "seismic/topology",
+  "seismic/io",
   "seismic/discovery",
   "seismic/api",
   "seismic/build",
@@ -103,6 +105,7 @@ license = "UNLICENSED"
 
 [workspace.dependencies]
 seismic-topology = { path = "seismic/topology" }
+seismic-io = { path = "seismic/io" }
 seismic-discovery = { path = "seismic/discovery" }
 seismic-measure = { path = "seismic/measure" }
 seismic-estimator-metal = { path = "seismic/estimator/metal" }

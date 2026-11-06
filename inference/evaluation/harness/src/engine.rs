@@ -730,7 +730,7 @@ pub fn expert_ranges(
 /// The pages of `ranges` the file cache holds, and all their pages.
 pub fn cached_pages(ranges: &[FileRange]) -> Result<(u64, u64), String> {
     ranges.iter().try_fold((0, 0), |(cached, pages), (path, offset, bytes)| {
-        let (held, all) = magnitude_artifacts::cached_pages(path, *offset, *bytes)
+        let (held, all) = seismic_io::cached_pages(path, *offset, *bytes)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         Ok((cached + held, pages + all))
     })

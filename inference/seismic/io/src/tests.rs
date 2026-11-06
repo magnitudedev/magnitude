@@ -1,16 +1,18 @@
 use super::*;
-use super::engine::{Aligned, Buffers, Engine};
-use super::probe::{decide, full_rate, grid, Point, LEAST_READ, WIDEST_WINDOW};
-use super::queue::{Part, Piece, Queue, VolumeFlight};
+use crate::accounting::{Book, Wait};
 #[cfg(unix)]
-use super::platform::drop_pages;
-use super::volume::{Bound, VolumeKey};
+use crate::disk::drop_pages;
+use crate::disk::{decide, full_rate, grid, Bound, Point, Registered, VolumeReads, LEAST_READ, WIDEST_WINDOW};
+use crate::scheduler::{pieces, Buffers, Engine, JobState, Part, Piece, Queue, Queued, Span, VolumeFlight};
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::File;
-use std::sync::{Condvar, Mutex, OnceLock};
-use std::time::Instant;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
+use std::ptr::NonNull;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// A volume's bound is the process's one, shared by every reader of the
 /// volume (`Bound`): an urgent reader a test opens on the temporary
@@ -44,14 +46,14 @@ fn a_demand_read_beside_bulk_waits_only_for_the_pieces_in_flight() {
     let path = temporary("demand-beside-bulk", &vec![5u8; 16 << 20]);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let urgent = Urgent { parts: vec![4096], records: 1 };
-    let flood = |reader: ArtifactReader, priority: Priority, length: usize| {
+    let flood = |reader: Reader, priority: Priority, length: usize| {
         let stop = stop.clone();
         std::thread::spawn(move || {
-            let mut sink = vec![0u8; length];
+            let sink = Arc::new(Buffer::new(length));
             let mut at = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let range = Range { offset: at, length, sink: NonNull::new(sink.as_mut_ptr()).unwrap() };
-                // SAFETY: the sink outlives the job, waited for here.
+                let range = Range { offset: at, length, into: sink.clone(), at: 0 };
+                // SAFETY: the sink is this thread's alone, one job at a time, waited for here.
                 let ended = unsafe { reader.submit(vec![range], priority) }.unwrap().wait();
                 assert!(matches!(ended, Ended::Read { ref failed } if failed.is_empty()), "{ended:?}");
                 at = (at + length as u64) % (reader.size() - length as u64);
@@ -59,18 +61,18 @@ fn a_demand_read_beside_bulk_waits_only_for_the_pieces_in_flight() {
         })
     };
     let floods = [
-        flood(ArtifactReader::open(&path, CachePolicy::Uncached).unwrap(), Priority::Load, 4 << 20),
-        flood(ArtifactReader::open(&path, CachePolicy::Uncached).unwrap(), Priority::Load, 4 << 20),
-        flood(ArtifactReader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap(), Priority::Prefetch, 1 << 20),
+        flood(Reader::open(&path, CachePolicy::Uncached).unwrap(), Priority::Load, 4 << 20),
+        flood(Reader::open(&path, CachePolicy::Uncached).unwrap(), Priority::Load, 4 << 20),
+        flood(Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap(), Priority::Prefetch, 1 << 20),
     ];
-    let reader = ArtifactReader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
+    let reader = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
-    let mut sink = vec![0u8; 4096];
+    let sink = Arc::new(Buffer::new(4096));
     let longest = (0..100u64)
         .map(|sample| {
-            let range = Range { offset: (sample * 7919 * 4096) % (reader.size() - 4096), length: 4096, sink: NonNull::new(sink.as_mut_ptr()).unwrap() };
+            let range = Range { offset: (sample * 7919 * 4096) % (reader.size() - 4096), length: 4096, into: sink.clone(), at: 0 };
             let began = Instant::now();
-            // SAFETY: the sink outlives the job, waited for here.
+            // SAFETY: the sink is read by one job at a time, waited for here.
             let ended = unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap().wait();
             assert!(matches!(ended, Ended::Read { ref failed } if failed.is_empty()), "{ended:?}");
             began.elapsed().as_secs_f64() * 1e3
@@ -87,18 +89,19 @@ fn a_demand_read_beside_bulk_waits_only_for_the_pieces_in_flight() {
 /// Each range of `ranges`, `(offset, length)`, read as one demand job
 /// into a buffer of its own: its bytes, or the error that kept them
 /// from landing.
-fn read(source: &ArtifactReader, ranges: &[(u64, usize)]) -> Vec<Result<Vec<u8>, String>> {
-    let mut buffers = ranges
+fn read(source: &Reader, ranges: &[(u64, usize)]) -> Vec<Result<Vec<u8>, String>> {
+    let buffers = ranges
         .iter()
-        .map(|(_, length)| vec![0u8; *length])
+        .map(|(_, length)| Arc::new(Buffer::new(*length)))
         .collect::<Vec<_>>();
     let landing = ranges
         .iter()
-        .zip(&mut buffers)
+        .zip(&buffers)
         .map(|((offset, length), buffer)| Range {
             offset: *offset,
             length: *length,
-            sink: NonNull::new(buffer.as_mut_ptr()).unwrap(),
+            into: buffer.clone(),
+            at: 0,
         })
         .collect();
     let ended = unsafe { source.submit(landing, Priority::Demand) }.unwrap().wait();
@@ -111,7 +114,8 @@ fn read(source: &ArtifactReader, ranges: &[(u64, usize)]) -> Vec<Result<Vec<u8>,
         .enumerate()
         .map(|(index, buffer)| match failed.get(&index) {
             Some(error) => Err(error.to_string()),
-            None => Ok(buffer),
+            // SAFETY: the job has ended.
+            None => Ok(unsafe { buffer.bytes() }.to_vec()),
         })
         .collect()
 }
@@ -127,7 +131,7 @@ fn ranges_read_as_stored_whatever_their_alignment_and_order() {
         .collect::<Vec<_>>();
     let path = temporary("ranges", &bytes);
     for policy in [CachePolicy::Uncached, CachePolicy::Cached] {
-        let source = ArtifactReader::open(&path, policy).unwrap();
+        let source = Reader::open(&path, policy).unwrap();
         assert_eq!(source.size(), bytes.len() as u64);
         let ranges = [
             (5000u64, 90usize),
@@ -159,9 +163,9 @@ fn ranges_read_as_stored_whatever_their_alignment_and_order() {
 #[test]
 fn a_jobs_hook_runs_once_with_how_it_ended() {
     let path = temporary("hook", &vec![3u8; 4 * LEAST_READ as usize]);
-    let reader = ArtifactReader::open(&path, CachePolicy::Uncached).unwrap();
-    let mut sink = vec![0u8; 3 * LEAST_READ as usize];
-    let range = Range { offset: 0, length: sink.len(), sink: NonNull::new(sink.as_mut_ptr()).unwrap() };
+    let reader = Reader::open(&path, CachePolicy::Uncached).unwrap();
+    let sink = Arc::new(Buffer::new(3 * LEAST_READ as usize));
+    let range = Range { offset: 0, length: 3 * LEAST_READ as usize, into: sink.clone(), at: 0 };
     let (sent, ran) = std::sync::mpsc::channel::<Ended>();
     let job = unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap();
     let send = sent.clone();
@@ -171,7 +175,7 @@ fn a_jobs_hook_runs_once_with_how_it_ended() {
     let send = sent.clone();
     job.on_end(move |ended| send.send(ended.clone()).unwrap());
     assert!(ran.try_recv().is_ok(), "a hook after the end runs at once");
-    let outside = Range { offset: 8 * LEAST_READ, length: 1, sink: NonNull::new(sink.as_mut_ptr()).unwrap() };
+    let outside = Range { offset: 8 * LEAST_READ, length: 1, into: sink, at: 0 };
     let failed = unsafe { reader.submit(vec![outside], Priority::Demand) }.unwrap();
     failed.on_end(move |ended| sent.send(ended.clone()).unwrap());
     assert!(matches!(ran.try_recv().unwrap(), Ended::Read { failed } if failed.len() == 1), "a job of no piece ended at its submission");
@@ -191,26 +195,26 @@ fn a_jobs_hook_runs_once_with_how_it_ended() {
 #[test]
 fn a_hook_finds_its_job_ended() {
     let path = temporary("ended-first", &vec![4u8; 4 * LEAST_READ as usize]);
-    let reader = ArtifactReader::open(&path, CachePolicy::Uncached).unwrap();
-    let mut sink = vec![0u8; LEAST_READ as usize];
+    let reader = Reader::open(&path, CachePolicy::Uncached).unwrap();
+    let sink = Arc::new(Buffer::new(LEAST_READ as usize));
     let (sent, ran) = std::sync::mpsc::channel::<bool>();
     // Whether the job runs, asked from inside its hook.
     let ask = |job: Arc<Job>, sent: std::sync::mpsc::Sender<bool>| {
         let asked = job.clone();
         job.on_end(move |_| sent.send(asked.wait_until(Instant::now()).is_none()).unwrap());
     };
-    let range = |sink: &mut Vec<u8>, offset| Range { offset, length: sink.len(), sink: NonNull::new(sink.as_mut_ptr()).unwrap() };
+    let range = |sink: &Arc<Buffer>, offset| Range { offset, length: LEAST_READ as usize, into: sink.clone(), at: 0 };
     // Ended by the worker that reads its piece.
-    let read = Arc::new(unsafe { reader.submit(vec![range(&mut sink, 0)], Priority::Demand) }.unwrap());
+    let read = Arc::new(unsafe { reader.submit(vec![range(&sink, 0)], Priority::Demand) }.unwrap());
     ask(read.clone(), sent.clone());
     assert!(!ran.recv().unwrap(), "a hook saw its read still running");
     // Ended at its submission (no piece in the file).
-    let outside = Arc::new(unsafe { reader.submit(vec![range(&mut sink, 8 * LEAST_READ)], Priority::Demand) }.unwrap());
+    let outside = Arc::new(unsafe { reader.submit(vec![range(&sink, 8 * LEAST_READ)], Priority::Demand) }.unwrap());
     ask(outside.clone(), sent.clone());
     assert!(!ran.recv().unwrap());
     // Ended by its withdrawal, its hook registered first.
-    let mut late = vec![0u8; LEAST_READ as usize];
-    let withdrawn = Arc::new(unsafe { reader.submit(vec![range(&mut late, LEAST_READ)], Priority::Load) }.unwrap());
+    let late = Arc::new(Buffer::new(LEAST_READ as usize));
+    let withdrawn = Arc::new(unsafe { reader.submit(vec![range(&late, LEAST_READ)], Priority::Load) }.unwrap());
     ask(withdrawn.clone(), sent);
     withdrawn.withdraw();
     assert!(!ran.recv().unwrap());
@@ -223,7 +227,7 @@ fn a_hook_finds_its_job_ended() {
 #[test]
 fn a_cached_piece_lands_through_the_buffer() {
     let path = temporary("straight", &vec![1u8; 2 * LEAST_READ as usize]);
-    let mut sink = Aligned::new(LEAST_READ as usize);
+    let mut sink = Buffer::new(LEAST_READ as usize);
     let piece = Piece {
         start: 0,
         end: LEAST_READ,
@@ -235,7 +239,7 @@ fn a_cached_piece_lands_through_the_buffer() {
         }],
     };
     let lands_straight = |policy| {
-        let reader = ArtifactReader::open(&path, policy).unwrap();
+        let reader = Reader::open(&path, policy).unwrap();
         reader.file.lands_straight(&piece)
     };
     assert!(lands_straight(CachePolicy::Uncached));
@@ -247,7 +251,7 @@ fn a_cached_piece_lands_through_the_buffer() {
 /// `path` is in the file cache.
 #[cfg(unix)]
 fn resident(path: &Path, offset: u64, length: usize) -> bool {
-    let (cached, pages) = super::cached_pages(path, offset, length as u64).unwrap();
+    let (cached, pages) = cached_pages(path, offset, length as u64).unwrap();
     cached == pages
 }
 
@@ -260,37 +264,13 @@ fn a_cached_read_keeps_its_pages() {
     let written = File::open(&path).unwrap();
     written.sync_all().unwrap();
     drop_pages(&written, 0, 8 * LEAST_READ).unwrap();
-    let reader = ArtifactReader::open(&path, CachePolicy::Cached).unwrap();
+    let reader = Reader::open(&path, CachePolicy::Cached).unwrap();
     let (offset, length) = (LEAST_READ + 100, 3 * LEAST_READ as usize);
     // Linux drops a synced file's pages.
     #[cfg(target_os = "linux")]
     assert!(!resident(&path, offset, length));
     assert!(read(&reader, &[(offset, length)])[0].is_ok());
     assert!(resident(&path, offset, length));
-    std::fs::remove_file(path).unwrap();
-}
-
-/// A source's range asks the cache for exactly itself: an empty one for
-/// nothing (advice of length zero would mean the rest of the file), a
-/// range read whole for its pages and none beside them.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_source_range_caches_only_itself() {
-    use std::io::Read as _;
-    let path = temporary("source-range", &vec![7u8; 8 * LEAST_READ as usize]);
-    let written = File::open(&path).unwrap();
-    written.sync_all().unwrap();
-    drop_pages(&written, 0, 8 * LEAST_READ).unwrap();
-    let source = crate::FileSource::open(&path).unwrap();
-    let mut empty = source.range(LEAST_READ, 0).unwrap();
-    assert_eq!(empty.read(&mut [0u8; 1]).unwrap(), 0);
-    assert_eq!(super::cached_pages(&path, 0, 8 * LEAST_READ).unwrap().0, 0);
-    let mut bytes = Vec::new();
-    source.range(2 * LEAST_READ, LEAST_READ).unwrap().read_to_end(&mut bytes).unwrap();
-    assert_eq!(bytes, vec![7u8; LEAST_READ as usize]);
-    assert!(resident(&path, 2 * LEAST_READ, LEAST_READ as usize));
-    assert_eq!(super::cached_pages(&path, 0, 2 * LEAST_READ).unwrap().0, 0);
-    assert_eq!(super::cached_pages(&path, 3 * LEAST_READ, 5 * LEAST_READ).unwrap().0, 0);
     std::fs::remove_file(path).unwrap();
 }
 
@@ -307,11 +287,11 @@ fn an_evicted_file_is_read_from_storage() {
     File::open(&path).unwrap().sync_all().unwrap();
     std::fs::read(&path).unwrap();
     assert!(resident(&path, 0, length as usize), "a file just written and read is cached");
-    let reader = ArtifactReader::open(&path, CachePolicy::Uncached).unwrap();
+    let reader = Reader::open(&path, CachePolicy::Uncached).unwrap();
     reader.evict_cached().unwrap();
-    assert_eq!(super::cached_pages(&path, 0, length).unwrap().0, 0);
+    assert_eq!(cached_pages(&path, 0, length).unwrap().0, 0);
     assert!(read(&reader, &[(LEAST_READ, 2 * LEAST_READ as usize)])[0].is_ok());
-    assert_eq!(super::cached_pages(&path, 0, length).unwrap().0, 0, "an uncached read caches nothing");
+    assert_eq!(cached_pages(&path, 0, length).unwrap().0, 0, "an uncached read caches nothing");
     std::fs::remove_file(path).unwrap();
 }
 
@@ -324,7 +304,7 @@ fn a_failed_read_fails_only_the_ranges_it_serves() {
         .map(|index| (index * 7 % 253) as u8)
         .collect::<Vec<_>>();
     let path = temporary("failed", &bytes);
-    let source = ArtifactReader::open(&path, CachePolicy::Uncached).unwrap();
+    let source = Reader::open(&path, CachePolicy::Uncached).unwrap();
     // Cut the file to its first half: reads of the second half end
     // short. The ranges each side lie farther apart than reads join.
     std::fs::OpenOptions::new()
@@ -356,27 +336,28 @@ fn a_failed_piece_fails_only_its_job() {
         .map(|index| (index * 13 % 241) as u8)
         .collect::<Vec<_>>();
     let path = temporary("job", &bytes);
-    let source = ArtifactReader::open(&path, CachePolicy::Uncached).unwrap();
+    let source = Reader::open(&path, CachePolicy::Uncached).unwrap();
     std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
         .unwrap()
         .set_len(8 * LEAST_READ)
         .unwrap();
-    let mut short = vec![0u8; 2 * LEAST_READ as usize];
-    let mut whole = vec![0u8; 3 * LEAST_READ as usize];
-    let range = |offset: u64, sink: &mut Vec<u8>| Range {
+    let short = Arc::new(Buffer::new(2 * LEAST_READ as usize));
+    let whole = Arc::new(Buffer::new(3 * LEAST_READ as usize));
+    let range = |offset: u64, sink: &Arc<Buffer>| Range {
         offset,
-        length: sink.len(),
-        sink: NonNull::new(sink.as_mut_ptr()).unwrap(),
+        length: sink.region().1,
+        into: sink.clone(),
+        at: 0,
     };
     let (failing, landing) = unsafe {
         (
             source
-                .submit(vec![range(10 * LEAST_READ, &mut short)], Priority::Demand)
+                .submit(vec![range(10 * LEAST_READ, &short)], Priority::Demand)
                 .unwrap(),
             source
-                .submit(vec![range(LEAST_READ + 5, &mut whole)], Priority::Demand)
+                .submit(vec![range(LEAST_READ + 5, &whole)], Priority::Demand)
                 .unwrap(),
         )
     };
@@ -384,7 +365,9 @@ fn a_failed_piece_fails_only_its_job() {
     assert!(matches!(landing.wait(), Ended::Read { failed } if failed.is_empty()));
     drop((failing, landing));
     let at = LEAST_READ as usize + 5;
-    assert_eq!(whole, bytes[at..at + whole.len()]);
+    // SAFETY: both jobs have ended.
+    let whole = unsafe { whole.bytes() };
+    assert_eq!(whole, &bytes[at..at + whole.len()]);
     std::fs::remove_file(path).unwrap();
 }
 
@@ -397,9 +380,9 @@ fn sink() -> NonNull<u8> {
 /// part, and one in a gap between them fails neither.
 #[test]
 fn a_coalesced_pieces_parts_read_alone_over_their_own_blocks() {
-    let range = |offset: u64, length: usize| Range { offset, length, sink: sink() };
+    let range = |offset: u64, length: usize| Span { offset, length, sink: sink() };
     let ranges = [range(0, 90), range(ALIGNMENT + 100, 90)];
-    let pieces = pieces(&ranges, &[0, 1], 10_000_000, LEAST_READ);
+    let pieces = pieces(&[(0, ranges[0]), (1, ranges[1])], 10_000_000, LEAST_READ);
     assert_eq!(pieces.len(), 1, "near ranges share one piece");
     let alone = pieces[0]
         .parts_alone()
@@ -413,7 +396,7 @@ fn a_coalesced_pieces_parts_read_alone_over_their_own_blocks() {
 /// covers.
 #[test]
 fn reads_coalesce_then_split_into_pieces() {
-    let range = |offset: u64, length: usize| Range {
+    let range = |offset: u64, length: usize| Span {
         offset,
         length,
         sink: sink(),
@@ -424,7 +407,7 @@ fn reads_coalesce_then_split_into_pieces() {
         range(2_000_000, 90),
         range(1_000_000, 3 * LEAST_READ as usize),
     ];
-    let pieces = pieces(&ranges, &[0, 1, 3, 2], 10_000_000, LEAST_READ);
+    let pieces = pieces(&[0, 1, 3, 2].map(|index| (index, ranges[index])), 10_000_000, LEAST_READ);
     let spans = pieces
         .iter()
         .map(|piece| (piece.start, piece.end))
@@ -457,17 +440,17 @@ fn reads_coalesce_then_split_into_pieces() {
     assert_eq!(parts(&pieces[4]), [(3, 0, skip)]);
 }
 
-/// A volume `key` of its own, read as named, sharing nothing.
-fn volume(key: u64, window: u64, demand: u64, read: u64) -> Volume {
+/// A device of its own, read as named, sharing nothing.
+fn volume(device: u64, window: u64, demand: u64, read: u64) -> VolumeReads {
     let choice = VolumeChoice { window, demand, read, demand_read: read, cores: 0. };
-    Volume { key: VolumeKey(key), choice, background: Arc::default(), delivery: Arc::default() }
+    VolumeReads { id: Volume(device), choice, background: Arc::default() }
 }
 
 /// A queued job of its own, `pieces` pieces long.
 fn queued(pieces: usize) -> (Queued, Arc<JobState>) {
-    let state = JobState::new(pieces, Vec::new(), Arc::default());
+    let state = JobState::new(pieces, Vec::new(), Arc::default(), Vec::new());
     let path = std::env::current_exe().unwrap();
-    let file = ArtifactReader::open(path, CachePolicy::Uncached)
+    let file = Reader::open(path, CachePolicy::Uncached)
         .unwrap()
         .file;
     let job = Queued {
@@ -504,9 +487,9 @@ fn pieces_are_taken_most_urgent_first() {
     let later = push(&mut queue, &mut states, Priority::Prefetch, 1);
     // Each take as (the job's index in submission, the piece).
     let take = |queue: &mut Queue, states: &[Arc<JobState>]| {
-        let (state, _, _, piece) = queue.take().unwrap();
-        let job = states.iter().position(|known| Arc::ptr_eq(known, &state));
-        (job.unwrap(), piece.start)
+        let taken = queue.take().unwrap();
+        let job = states.iter().position(|known| Arc::ptr_eq(known, &taken.state));
+        (job.unwrap(), taken.piece.start)
     };
     assert_eq!(take(&mut queue, &states), (3, 0));
     queue.promote(later, Priority::Demand);
@@ -561,11 +544,11 @@ fn cached_pages_refuses_a_range_past_the_file_domain() {
 fn a_reader_reads_its_sources_file_after_the_path_is_replaced() {
     let original = vec![3u8; 2 * ALIGNMENT as usize];
     let path = temporary("replaced", &original);
-    let source = crate::FileSource::open(&path).unwrap();
+    let source = OpenFile::open(&path).unwrap();
     let replacement = temporary("replacement", &vec![9u8; original.len()]);
     std::fs::rename(&replacement, &path).unwrap();
     for policy in [CachePolicy::Cached, CachePolicy::Uncached] {
-        let reader = ArtifactReader::of(&source, policy).unwrap();
+        let reader = Reader::of(&source, policy).unwrap();
         assert_eq!(read(&reader, &[(0, original.len())]), [Ok(original.clone())], "{policy:?}");
     }
     std::fs::remove_file(path).unwrap();
@@ -599,7 +582,7 @@ fn a_withdrawal_returns_the_bytes_it_left_unread() {
     job.withdraw();
     assert!(job.wait_until(Instant::now()).is_none(), "the taken piece reads on");
     // The taken piece's end, as its worker ends it.
-    taken.0.pieces_ended(1, [], None);
+    taken.state.pieces_ended(1, [], None);
     let Ended::Read { failed } = job.wait() else { panic!("a withdrawn job reads on") };
     assert_eq!(failed.iter().map(|(range, _)| *range).collect::<Vec<_>>(), [1, 2, 3], "the ranges that ended withdrawn");
     assert!(failed.iter().all(|(_, error)| matches!(**error, Error::Withdrawn)));
@@ -613,14 +596,15 @@ fn a_withdrawal_returns_the_bytes_it_left_unread() {
 fn a_dropped_job_withdraws_or_finishes() {
     let bytes = vec![7u8; 4 * LEAST_READ as usize];
     let path = temporary("cancel", &bytes);
-    let source = ArtifactReader::open(&path, CachePolicy::Uncached).unwrap();
-    let mut sink = vec![0u8; LEAST_READ as usize];
+    let source = Reader::open(&path, CachePolicy::Uncached).unwrap();
+    let sink = Arc::new(Buffer::new(LEAST_READ as usize));
     let job = unsafe {
         source.submit(
             vec![Range {
                 offset: 0,
-                length: sink.len(),
-                sink: NonNull::new(sink.as_mut_ptr()).unwrap(),
+                length: LEAST_READ as usize,
+                into: sink.clone(),
+                at: 0,
             }],
             Priority::Prefetch,
         )
@@ -629,6 +613,8 @@ fn a_dropped_job_withdraws_or_finishes() {
     drop(job);
     // Withdrawn before a worker took its one piece, or read whole by
     // then.
+    // SAFETY: the job has ended.
+    let sink = unsafe { sink.bytes() };
     assert!(sink.iter().all(|byte| *byte == 0) || sink.iter().all(|byte| *byte == 7));
     std::fs::remove_file(path).unwrap();
 }
@@ -636,14 +622,14 @@ fn a_dropped_job_withdraws_or_finishes() {
 #[test]
 fn a_reader_reads_at_the_bounds_until_its_volume_adopts_a_choice() {
     let path = temporary("adopted", &[5u8; 4096]);
-    let source = crate::FileSource::open(&path).unwrap();
+    let source = OpenFile::open(&path).unwrap();
     // A key its own, as a volume's other tests choose for `None`.
     let urgent = Urgent { parts: vec![4096, 8192, 12288], records: 3 };
-    let pending = ArtifactReader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
+    let pending = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
     assert_eq!((pending.window(), pending.volume.choice.read), (WIDEST_WINDOW, LEAST_READ), "nothing was measured");
     let choice = VolumeChoice { window: 4 << 20, demand: 8 << 20, read: 256 << 10, demand_read: 1 << 20, cores: 1.5 };
     adopt_volume(&source, Some(&urgent), choice).unwrap();
-    let adopted = ArtifactReader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
+    let adopted = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
     assert_eq!((adopted.window(), adopted.volume.choice.demand, adopted.volume.choice.read), (4 << 20, 8 << 20, 256 << 10));
     assert_eq!(read_cores([&source], &urgent).unwrap(), 1.5);
     std::fs::remove_file(path).unwrap();
@@ -656,28 +642,30 @@ fn a_reader_reads_at_the_bounds_until_its_volume_adopts_a_choice() {
 fn a_withdrawn_prefetch_ends_with_what_it_had_in_flight_and_demand_lands() {
     // Probed on a file of its own, so the file read is four windows long.
     let probed = temporary("withdraw-window", &[5u8; 4096]);
-    probe_volume(&crate::FileSource::open(&probed).unwrap(), None).unwrap();
-    let window = ArtifactReader::open(&probed, CachePolicy::Uncached).unwrap().window();
+    probe_volume(&OpenFile::open(&probed).unwrap(), None).unwrap();
+    let window = Reader::open(&probed, CachePolicy::Uncached).unwrap().window();
     std::fs::remove_file(probed).unwrap();
     let bytes = vec![5u8; 4 * window as usize];
     let path = temporary("withdraw", &bytes);
-    let source = ArtifactReader::open(&path, CachePolicy::Uncached).unwrap();
-    let mut demand = vec![0u8; bytes.len()];
-    let mut ahead = vec![0u8; 2 * LEAST_READ as usize];
-    let range = |sink: &mut Vec<u8>| Range { offset: 0, length: sink.len(), sink: NonNull::new(sink.as_mut_ptr()).unwrap() };
-    // SAFETY: each sink outlives its job, which ends before it is read.
-    let demanded = unsafe { source.submit(vec![range(&mut demand)], Priority::Demand) }.unwrap();
-    let prefetch = unsafe { source.submit(vec![range(&mut ahead)], Priority::Prefetch) }.unwrap();
+    let source = Reader::open(&path, CachePolicy::Uncached).unwrap();
+    let demand = Arc::new(Buffer::new(bytes.len()));
+    let ahead = Arc::new(Buffer::new(2 * LEAST_READ as usize));
+    let range = |sink: &Arc<Buffer>| Range { offset: 0, length: sink.region().1, into: sink.clone(), at: 0 };
+    // SAFETY: each sink is its job's alone, which ends before it is read.
+    let demanded = unsafe { source.submit(vec![range(&demand)], Priority::Demand) }.unwrap();
+    let prefetch = unsafe { source.submit(vec![range(&ahead)], Priority::Prefetch) }.unwrap();
     prefetch.withdraw();
     let ended = prefetch.wait();
     match &ended {
-        Ended::Read { failed } if failed.is_empty() => assert!(ahead.iter().all(|byte| *byte == 5)),
+        // SAFETY: the job has ended.
+        Ended::Read { failed } if failed.is_empty() => assert!(unsafe { ahead.bytes() }.iter().all(|byte| *byte == 5)),
         Ended::Read { failed } => assert!(failed.len() == 1 && matches!(*failed[0].1, Error::Withdrawn)),
         Ended::Panicked(panic) => panic.resume(),
     }
     prefetch.withdraw();
     assert!(matches!(demanded.wait(), Ended::Read { failed } if failed.is_empty()));
-    assert!(demand.iter().all(|byte| *byte == 5));
+    // SAFETY: the job has ended.
+    assert!(unsafe { demand.bytes() }.iter().all(|byte| *byte == 5));
     std::fs::remove_file(path).unwrap();
 }
 
@@ -749,7 +737,7 @@ fn a_demand_piece_joins_up_to_the_full_rate_window_and_others_to_the_urgent_one(
     let piece = |start: u64, end: u64| Piece { start, end, parts: Vec::new() };
     for (priority, taken) in [(Priority::Prefetch, false), (Priority::Load, false), (Priority::Demand, true)] {
         let mut queue = Queue::default();
-        queue.in_flight.insert(volume.key, VolumeFlight { bytes: 2, held_back: false, delivery: Arc::default() });
+        queue.volumes.insert(volume.id, VolumeFlight { bytes: 2, ..VolumeFlight::new(Instant::now()) });
         let (mut job, _) = queued(0);
         job.volume = volume.clone();
         job.pieces = [piece(0, 4)].into();
@@ -790,10 +778,10 @@ fn a_promoted_job_joins_at_its_new_prioritys_window() {
 fn a_load_beside_a_serving_reader_does_not_raise_the_urgent_requests_time() {
     let bound = Arc::<Bound>::default();
     let serving = Registered::new(bound.clone(), 4);
-    let bulk = Volume { background: bound.clone(), ..volume(11, 8, 8, 4) };
+    let bulk = VolumeReads { background: bound.clone(), ..volume(11, 8, 8, 4) };
     let piece = |start: u64, end: u64| Piece { start, end, parts: Vec::new() };
     let mut queue = Queue::default();
-    queue.in_flight.insert(bulk.key, VolumeFlight { bytes: 2, held_back: false, delivery: Arc::default() });
+    queue.volumes.insert(bulk.id, VolumeFlight { bytes: 2, ..VolumeFlight::new(Instant::now()) });
     let (mut job, _) = queued(0);
     job.volume = bulk.clone();
     job.pieces = [piece(0, 4)].into();
@@ -817,8 +805,8 @@ fn a_load_beside_a_serving_reader_does_not_raise_the_urgent_requests_time() {
 fn an_urgent_reader_dropped_frees_its_volumes_bulk_pieces() {
     let _volume = temporary_volume();
     let path = temporary("bound", &vec![3u8; 1 << 20]);
-    let bulk = ArtifactReader::open(&path, CachePolicy::Uncached).unwrap();
-    let urgent = ArtifactReader::open_urgent(&path, CachePolicy::Uncached, &Urgent { parts: vec![4096], records: 1 }).unwrap();
+    let bulk = Reader::open(&path, CachePolicy::Uncached).unwrap();
+    let urgent = Reader::open_urgent(&path, CachePolicy::Uncached, &Urgent { parts: vec![4096], records: 1 }).unwrap();
     let clone = urgent.clone();
     assert_eq!(bulk.volume.window_for(Priority::Load), bulk.volume.choice.window.min(urgent.window()));
     drop(urgent);
@@ -834,7 +822,7 @@ fn an_urgent_reader_dropped_frees_its_volumes_bulk_pieces() {
 #[test]
 fn an_urgent_readers_window_bounds_its_volume_only_while_it_lives() {
     let bound = Arc::<Bound>::default();
-    let bulk = Volume { background: bound.clone(), ..volume(12, 8, 8, 4) };
+    let bulk = VolumeReads { background: bound.clone(), ..volume(12, 8, 8, 4) };
     assert_eq!(bulk.window_for(Priority::Load), 8, "no urgent reader: the full window");
     let narrow = Registered::new(bound.clone(), 2);
     let wide = Registered::new(bound.clone(), 4);
@@ -863,34 +851,82 @@ fn a_job_wakes_a_worker_for_each_piece_its_window_has_room_for() {
     assert_eq!(queue.room(&job, Priority::Demand), 2);
     job.pieces = [piece(0, 9)].into();
     assert_eq!(queue.room(&job, Priority::Demand), 1, "a piece past the window is taken alone");
-    queue.in_flight.insert(volume.key, VolumeFlight { bytes: 3, held_back: false, delivery: Arc::default() });
+    queue.volumes.insert(volume.id, VolumeFlight { bytes: 3, ..VolumeFlight::new(Instant::now()) });
     job.pieces = [piece(0, 2)].into();
     assert_eq!(queue.room(&job, Priority::Demand), 0, "a full window wakes none");
 }
 
-/// A volume's delivery counts every piece that ends and the time it
-/// held one in flight: from a piece taken idle to the end that leaves it
-/// idle, none while idle, and a busy span running at a take counted to
-/// the take and on from there.
+/// Whether two counts of seconds agree, to rounding.
+fn close(left: f64, right: f64) -> bool {
+    (left - right).abs() < 1e-9
+}
+
+/// A volume's book counts, per class, the time a piece of it was in
+/// flight (the union of overlapping pieces' spans), its pieces in flight
+/// integrated over time (their sum), and each piece's bytes at its end; the
+/// device's busy time is the union over every class, none while idle. A look
+/// counts the time running to its instant and consumes nothing: a later look
+/// counts it again, with what followed.
 #[test]
-fn a_volume_delivers_its_bytes_over_its_busy_time() {
-    let delivery = Delivery::default();
+fn a_volumes_book_counts_busy_time_depth_and_bytes_by_class() {
     let at = Instant::now();
-    let ms = |ms: u64| at + std::time::Duration::from_millis(ms);
-    delivery.began(ms(0));
-    delivery.ended(1_000_000, false, ms(4));
-    delivery.ended(1_000_000, true, ms(8));
+    let mut book = Book::new(at);
+    let ms = |ms: u64| at + Duration::from_millis(ms);
+    book.began(Priority::Demand, ms(0));
+    book.began(Priority::Prefetch, ms(2));
+    book.ended(Priority::Demand, 1_000_000, ms(4));
+    // A look while the prefetch piece is in flight: counted to 5 ms.
+    let middle = book.totals_at(ms(5));
+    assert!(close(middle.busy, 0.005) && close(middle.depth, 0.007), "{middle:?}");
+    let demand = middle.class(Priority::Demand);
+    assert_eq!((demand.bytes, demand.requests), (1_000_000, 1));
+    assert!(close(demand.busy, 0.004) && close(demand.depth, 0.004), "{demand:?}");
+    let prefetch = middle.class(Priority::Prefetch);
+    assert_eq!((prefetch.bytes, prefetch.requests), (0, 0), "a piece's bytes count at its end");
+    assert!(close(prefetch.busy, 0.003) && close(prefetch.depth, 0.003), "{prefetch:?}");
+    book.ended(Priority::Prefetch, 500_000, ms(8));
     // Idle 8 to 30 ms: no busy time.
-    delivery.began(ms(30));
-    delivery.ended(1_000_000, false, ms(34));
-    let (bytes, seconds) = delivery.take_at(ms(36));
-    assert_eq!(bytes, 3_000_000);
-    assert!((seconds - 0.014).abs() < 1e-9, "{seconds}");
-    delivery.ended(1_000_000, true, ms(40));
-    let (bytes, seconds) = delivery.take_at(ms(50));
-    assert_eq!(bytes, 1_000_000);
-    assert!((seconds - 0.004).abs() < 1e-9, "{seconds}");
-    assert_eq!(delivery.take_at(ms(60)), (0, 0.));
+    book.began(Priority::Load, ms(30));
+    book.ended(Priority::Load, 250_000, ms(34));
+    let later = book.totals_at(ms(40));
+    assert!(close(later.busy, 0.012) && close(later.depth, 0.014), "{later:?}");
+    assert_eq!((later.bytes(), later.requests()), (1_750_000, 3));
+    assert!(close(later.class(Priority::Prefetch).busy, 0.006) && close(later.class(Priority::Load).busy, 0.004), "{later:?}");
+    let span = later.since(&middle);
+    assert!(close(span.busy, 0.007) && span.bytes() == 750_000, "{span:?}");
+    assert_eq!(book.totals_at(ms(40)), later, "a look takes nothing");
+}
+
+/// A demand job's wait from its submission to its last piece's end is its
+/// device time (a piece of it in flight) and its time waiting, split by what
+/// the device held meanwhile: behind a speculative piece while one was in
+/// flight, behind demand otherwise; counted at its class once its last piece
+/// has ended.
+#[test]
+fn a_demand_jobs_wait_splits_by_what_it_waited_behind() {
+    let at = Instant::now();
+    let mut book = Book::new(at);
+    let ms = |ms: u64| at + Duration::from_millis(ms);
+    // A load's piece in flight, then another job's demand piece.
+    book.began(Priority::Load, ms(0));
+    let mut wait = Wait::new(2, Priority::Demand, &mut book, ms(0));
+    book.ended(Priority::Load, 1, ms(3));
+    book.began(Priority::Demand, ms(3));
+    // Its first piece: 3 ms behind the load's, 2 behind the demand piece.
+    book.began(Priority::Demand, ms(5));
+    wait.taken(Priority::Demand, &mut book, ms(5));
+    book.ended(Priority::Demand, 1, ms(7));
+    assert!(!wait.ended(&mut book, ms(7)), "a job with a piece queued has not ended");
+    assert_eq!(book.totals_at(ms(7)).class(Priority::Demand).waits.jobs, 0, "a job with a piece queued has not ended");
+    // Its second piece, behind demand alone.
+    book.began(Priority::Demand, ms(9));
+    wait.taken(Priority::Demand, &mut book, ms(9));
+    book.ended(Priority::Demand, 1, ms(10));
+    book.ended(Priority::Demand, 1, ms(12));
+    assert!(wait.ended(&mut book, ms(12)), "its last piece ended it");
+    let waits = book.totals_at(ms(12)).class(Priority::Demand).waits;
+    assert_eq!(waits.jobs, 1);
+    assert!(close(waits.behind_speculative, 0.003) && close(waits.behind_demand, 0.004) && close(waits.device, 0.005), "{waits:?}");
 }
 
 /// A volume holds at most its window's bytes in flight, or one piece
@@ -913,19 +949,22 @@ fn a_volume_holds_at_most_its_window_in_flight() {
     queue.push(urgent, Priority::Demand);
     queue.push(small, Priority::Prefetch);
     queue.push(other, Priority::Load);
-    let taken = |queue: &mut Queue| queue.take().map(|taken| (taken.2.key, taken.3.start));
-    assert_eq!(taken(&mut queue), Some((VolumeKey(1), 0)));
-    assert_eq!(taken(&mut queue), Some((VolumeKey(0), 0)), "2 + 2 passes the window; 2 + 1 would not, but waits");
-    assert_eq!(taken(&mut queue), None);
+    // Each piece taken, with its device and start.
+    let taken = |queue: &mut Queue| queue.take().map(|taken| ((taken.volume.id, taken.piece.start), taken));
+    let (first, urgent_first) = taken(&mut queue).unwrap();
+    assert_eq!(first, (Volume(1), 0));
+    let (other, other_piece) = taken(&mut queue).unwrap();
+    assert_eq!(other, (Volume(0), 0), "2 + 2 passes the window; 2 + 1 would not, but waits");
+    assert!(taken(&mut queue).is_none());
     assert!(urgent_state.started.get().is_some(), "its first piece was taken");
-    assert!(queue.ended(VolumeKey(1), 2, Instant::now()), "a piece was held back");
-    assert_eq!(taken(&mut queue), Some((VolumeKey(1), 2)));
-    assert_eq!(taken(&mut queue), Some((VolumeKey(1), 8)), "2 + 1 is within the window");
-    assert!(!queue.ended(VolumeKey(0), 1, Instant::now()));
+    assert!(queue.ended(&urgent_first, Instant::now()), "a piece was held back");
+    assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 2)));
+    assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 8)), "2 + 1 is within the window");
+    assert!(!queue.ended(&other_piece, Instant::now()));
     // A piece wider than the window is read alone.
     let (mut wide, _) = queued(0);
-    wide.volume = Volume { key: VolumeKey(2), delivery: Arc::default(), ..narrow };
+    wide.volume = VolumeReads { id: Volume(2), ..narrow };
     wide.pieces = [piece(0, 5)].into();
     queue.push(wide, Priority::Demand);
-    assert_eq!(taken(&mut queue), Some((VolumeKey(2), 0)));
+    assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(2), 0)));
 }

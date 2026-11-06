@@ -34,7 +34,7 @@ use super::compute::Urgency;
 use super::host_records::Grant;
 use super::source::Records;
 use super::watcher::Step;
-use magnitude_artifacts::Priority;
+use seismic_io::Priority;
 use magnitude_kernels::{SlotTable, constants};
 use seismic::cpu::repack::RowConversion;
 

@@ -31,13 +31,13 @@
 //! the step's owner (`failure`), who discards the failed slots' outputs and
 //! fails their sequences, and the gate opens all the same so the work
 //! behind it drains. The other slots' rows are published and read as
-//! usual. Rows are read without filling the file cache (`ArtifactReader`,
+//! usual. Rows are read without filling the file cache (`Reader`,
 //! `CachePolicy::Uncached`).
 
 use crate::device_table::KeptRows;
 use crate::planning::DirectoryForm;
 use crate::slot_directory::SlotDirectory;
-use magnitude_artifacts::{ArtifactReader, Ended, Priority, Range};
+use seismic_io::{Reader, Ended, Priority, Range};
 use seismic::cpu::repack::RowConversion;
 use seismic::Element;
 use std::collections::{BTreeMap, BTreeSet};
@@ -345,7 +345,7 @@ struct Shared {
     slot_bytes: usize,
     /// The table's rows in the artifact file: `rows` of `row_bytes` from
     /// `offset`.
-    source: ArtifactReader,
+    source: Reader,
     offset: u64,
     rows: u64,
     gate: seismic::Timeline,
@@ -380,7 +380,7 @@ impl StoredTable {
         width: u64,
         layout: StoredSlots,
         form: DirectoryForm,
-        source: ArtifactReader,
+        source: Reader,
         offset: u64,
         kept: Option<KeptRows>,
     ) -> Result<Self, String> {
@@ -791,20 +791,19 @@ impl Shared {
         // Read the absent rows as stored, convert each into its slot, then
         // publish those that were read; a row that was not leaves its slot
         // free.
-        let mut stored = vec![0u8; absent.len() * self.row_bytes];
-        let base = stored.as_mut_ptr();
+        let stored = Arc::new(seismic_io::Buffer::new(absent.len() * self.row_bytes));
         let ranges = absent
             .iter()
             .enumerate()
             .map(|(index, row)| Range {
                 offset: self.offset + row * self.row_bytes as u64,
                 length: self.row_bytes,
-                // SAFETY: within `stored`, `index` rows in.
-                sink: unsafe { std::ptr::NonNull::new_unchecked(base.add(index * self.row_bytes)) },
+                into: stored.clone(),
+                at: index * self.row_bytes,
             })
             .collect();
-        // SAFETY: the sinks are distinct rows of `stored`, which outlives
-        // the job: it ends before `stored` is read.
+        // SAFETY: the ranges are distinct rows of `stored`, which nothing
+        // reads until the job has ended.
         let ended = unsafe { self.source.submit(ranges, Priority::Demand) }
             .map_err(|error| format!("stored table rows: {error}"))?
             .wait();
@@ -819,6 +818,8 @@ impl Shared {
             errors.push(format!("table row {}: {error}", absent[index]));
         }
         let mut converted = vec![0u8; self.slot_bytes];
+        // SAFETY: the job that read into `stored` has ended.
+        let stored = unsafe { stored.bytes() };
         for (index, row) in stored.chunks_exact(self.row_bytes).enumerate() {
             if !read[index] {
                 continue;
@@ -905,7 +906,7 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_artifacts::CachePolicy;
+    use seismic_io::CachePolicy;
     use seismic::{BackendName, Element};
 
     const ROWS: u64 = 4096;
@@ -950,7 +951,7 @@ mod tests {
             WIDTH,
             StoredSlots::Whole { records: 1, record_rows: slots },
             form,
-            ArtifactReader::open(&path, CachePolicy::Uncached).unwrap(),
+            Reader::open(&path, CachePolicy::Uncached).unwrap(),
             100,
             None,
         )
@@ -1025,7 +1026,7 @@ mod tests {
             WIDTH,
             StoredSlots::Reserved { records: 4, record_rows: 256 },
             DirectoryForm::Hashed,
-            ArtifactReader::open(&path, CachePolicy::Uncached).unwrap(),
+            Reader::open(&path, CachePolicy::Uncached).unwrap(),
             100,
             None,
         )
@@ -1263,7 +1264,7 @@ mod tests {
                     WIDTH,
                     StoredSlots::Whole { records: 1, record_rows: 4 },
                     form,
-                    ArtifactReader::open(&path, CachePolicy::Uncached).unwrap(),
+                    Reader::open(&path, CachePolicy::Uncached).unwrap(),
                     100,
                     Some(KeptRows::of(&kept, "table")),
                 )
