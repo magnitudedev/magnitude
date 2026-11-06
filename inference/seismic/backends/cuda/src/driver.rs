@@ -272,10 +272,6 @@ pub(crate) struct Context {
     /// default stream it would also wait for every later queued launch of
     /// the blocking execution streams (a pipelined next step).
     transfer: Handle,
-    /// A non-blocking stream that runs the host's wakes behind device
-    /// writes of host words (`direct::HostWord`): each waits there for its
-    /// write, so no other stream's work waits for a host function.
-    notify: Handle,
     /// Where the device's memory is the host's, what the driver holds for
     /// the process outside its resident set: each allocation below adds
     /// itself as it is made and takes itself off as it is freed (device
@@ -308,25 +304,17 @@ impl Context {
             raw,
             ordinal,
             transfer: std::ptr::null_mut(),
-            notify: std::ptr::null_mut(),
             driver_memory: OnceLock::new(),
             quiet: Quiet::of(ordinal),
         };
-        let create = |context: &Self, what: &'static str| -> Result<Handle, DriverError> {
+        context.transfer = {
             let _current = context.enter()?;
             let mut stream = std::ptr::null_mut();
-            unsafe { context.driver.check((context.driver.stream_create)(&mut stream, CU_STREAM_NON_BLOCKING), what)? };
+            unsafe { context.driver.check((context.driver.stream_create)(&mut stream, CU_STREAM_NON_BLOCKING), "transfer stream creation")? };
             context.quiet.add_stream(stream);
-            Ok(stream)
+            stream
         };
-        context.transfer = create(&context, "transfer stream creation")?;
-        context.notify = create(&context, "notify stream creation")?;
         Ok(Arc::new(context))
-    }
-
-    /// The stream the host's wakes run on ([`Context::notify`]).
-    pub(crate) fn notify_stream(&self) -> Handle {
-        self.notify
     }
 
     /// Wait for every command queued on `stream` to complete, the thread
@@ -392,17 +380,14 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        for stream in [self.transfer, self.notify] {
-            if stream.is_null() {
-                continue;
-            }
+        if !self.transfer.is_null() {
             if let Ok(_current) = self.enter() {
                 // Its work complete before the quiet stops looking at it
                 // (with the device faulted, the quiet no longer drains).
-                let _ = self.synchronize(stream, "stream drain");
-                self.quiet.remove_stream(stream);
+                let _ = self.synchronize(self.transfer, "stream drain");
+                self.quiet.remove_stream(self.transfer);
                 unsafe {
-                    (self.driver.stream_destroy)(stream);
+                    (self.driver.stream_destroy)(self.transfer);
                 }
             }
         }
@@ -424,6 +409,15 @@ pub(crate) const NOT_READY: c_int = 600;
 pub(crate) struct Stream {
     raw: Handle,
     context: Arc<Context>,
+    /// Where the host's wakes behind this stream's writes of host words run
+    /// (`direct::HostWord`), made at its first such write. Each wake waits
+    /// there for its write, so this stream's work waits for no host
+    /// function, and a stream runs its work in order, so the only wakes
+    /// ahead of one are behind writes that landed before its own. No other
+    /// stream's unfinished work can hold it, as one wake stream for all
+    /// writers would: a wake queued behind a running kernel's later write
+    /// held every wake queued after it.
+    wakes: OnceLock<Arc<Stream>>,
 }
 
 unsafe impl Send for Stream {}
@@ -431,11 +425,15 @@ unsafe impl Sync for Stream {}
 
 impl Stream {
     pub fn new(context: &Arc<Context>) -> Result<Arc<Self>, DriverError> {
+        Self::with_flags(context, 0)
+    }
+
+    fn with_flags(context: &Arc<Context>, flags: c_uint) -> Result<Arc<Self>, DriverError> {
         let _current = context.enter()?;
         let mut raw = std::ptr::null_mut();
         unsafe {
             context.driver.check(
-                (context.driver.stream_create)(&mut raw, 0),
+                (context.driver.stream_create)(&mut raw, flags),
                 "stream creation",
             )?;
         }
@@ -443,11 +441,22 @@ impl Stream {
         Ok(Arc::new(Self {
             raw,
             context: context.clone(),
+            wakes: OnceLock::new(),
         }))
     }
 
     pub fn raw(&self) -> Handle {
         self.raw
+    }
+
+    /// The stream the host's wakes behind this stream's writes run on
+    /// ([`Self::wakes`]).
+    pub(crate) fn wakes(&self) -> Result<&Stream, DriverError> {
+        if let Some(wakes) = self.wakes.get() {
+            return Ok(wakes);
+        }
+        let made = Self::with_flags(&self.context, CU_STREAM_NON_BLOCKING)?;
+        Ok(self.wakes.get_or_init(|| made))
     }
 
     pub fn context(&self) -> &Arc<Context> {

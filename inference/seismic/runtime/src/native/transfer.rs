@@ -343,8 +343,8 @@ impl TransferInner {
     }
 
     /// Wait at most `timeout` for the batch that took `value`; whether it
-    /// completed, or why none can. A CUDA word has no blocking wait: it is
-    /// polled, yielding.
+    /// completed, or why none can. The thread sleeps until the batch
+    /// completes, whatever other queues of the device still run.
     pub fn wait(&self, value: u64, timeout: Duration) -> Result<bool, TransferError> {
         self.queue.wait(value, timeout).map_err(TransferError::Execution)
     }

@@ -230,3 +230,97 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
         });
     }
 }
+
+/// A wait for a batch on the device's transfer queue returns as the batch
+/// lands, beside a call parked on its answer with a signal queued behind it:
+/// what the wait sleeps on must not wait for that call. A wake held behind
+/// the call runs the wait to its full timeout though the batch landed long
+/// before.
+#[test]
+fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
+    const RECORDS: u64 = 20;
+    const RECORD: u64 = 1_900_544;
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    let n = 1024u64;
+    for device in seismic_native_tests::devices(&[BackendName::Cuda, BackendName::Vulkan]) {
+        let backend = device.backend();
+        let kernel = parked_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
+        let mut graph = device.native_graph();
+        let answer = graph.port(Element::i32(), &[1]).unwrap();
+        let skip = graph.port(Element::i32(), &[1]).unwrap();
+        let input = graph.port(Element::f32(), &[n]).unwrap();
+        let park = graph.timeline(TimelineNode::Park);
+        let waited = graph
+            .enqueue(&kernel, parked_scale::WorkflowArgs { answer: answer.tensor().into(), skip: skip.tensor().into(), x: input.tensor().into() })
+            .unwrap()
+            .value;
+        let after = graph.timeline(TimelineNode::Signal);
+        graph.export(&waited).unwrap();
+        let plan = graph.seal().unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
+
+        let data = Tensor::shared(&device, Element::f32(), &[n]).unwrap();
+        let word = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
+        let skipped = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
+        // SAFETY: no device work uses them yet.
+        unsafe {
+            data.write_shared(0, &vec![0; 4 * n as usize]).unwrap();
+            word.write_shared(0, &[0; 4]).unwrap();
+            skipped.write_shared(0, &[0; 4]).unwrap();
+        }
+        let shape = [RECORDS, RECORD];
+        let (mut tier, _resizer) = Tensor::reserved_in(seismic::ReservedContract::Shared, &device, Element::bool(), &shape, RECORDS, None).unwrap();
+        tier.write_from_host(&vec![7u8; (RECORDS * RECORD) as usize]).unwrap();
+        let into = Tensor::zeros(&device, Element::bool(), &shape).unwrap();
+        let transfer = seismic::Transfer::new(&device).unwrap();
+        let runs = (0..RECORDS)
+            .map(|record| {
+                seismic::TransferItem::Run(seismic::TransferRun {
+                    source: &tier,
+                    source_offset: record * RECORD,
+                    destination: &into,
+                    destination_offset: record * RECORD,
+                    bytes: RECORD,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let (parks, done) = (Timeline::new(&device).unwrap(), Timeline::new(&device).unwrap());
+        let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
+        let mut bindings = plan.bindings();
+        bindings.set(&answer, &word).unwrap();
+        bindings.set(&skip, &skipped).unwrap();
+        bindings.set(&input, &data).unwrap();
+        bindings.set_park(park, &parks).unwrap();
+        bindings.set_timeline(after, &done, 1).unwrap();
+        let (outputs, completion) = slot.activate(&plan).unwrap().attach(bindings, outputs).unwrap().submit().unwrap();
+        let parked = outputs.park(park);
+        let mut answering = Answer { word: &word, parks: &parks, parked, answered: false };
+        match parked {
+            Some(value) => {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !parks.parked(value).unwrap() {
+                    assert!(Instant::now() < deadline, "{backend:?}: the run never reached its park");
+                    std::thread::yield_now();
+                }
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+
+        let began = Instant::now();
+        let value = transfer.copy(&runs).unwrap();
+        let landed = transfer.wait(value, TIMEOUT).unwrap();
+        let waited = began.elapsed();
+        let still_parked = !done.reached(1).unwrap();
+        eprintln!("{backend:?}: a {} MB batch waited for in {waited:?}, the call still parked: {still_parked}", RECORDS * RECORD / 1_000_000);
+
+        answering.give().unwrap();
+        assert!(done.wait(1, Duration::from_secs(10)).unwrap(), "{backend:?}: the call ends on its answer");
+        completion.wait().unwrap();
+
+        assert!(landed, "{backend:?}: the batch never landed");
+        assert!(still_parked, "{backend:?}: the call ended before its answer, so the wait was not beside it");
+        assert!(waited < TIMEOUT / 2, "{backend:?}: the wait took {waited:?} for a batch of milliseconds");
+    }
+}

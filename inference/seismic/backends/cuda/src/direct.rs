@@ -693,20 +693,22 @@ impl Wake {
         self.changed.notify_all();
     }
 
-    /// Wake the waiters once `written`'s last record completes: the
-    /// context's notify stream waits for it, then runs the wake, so no
-    /// work of the stream recording it waits for the host.
-    fn behind(self: &Arc<Self>, context: &Arc<driver::Context>, written: &Event) -> Result<(), ExecutionError> {
+    /// Wake the waiters once `written`'s last record, on `writer`,
+    /// completes: `writer`'s wake stream waits for it, then runs the wake,
+    /// so no work of `writer` waits for the host and no other stream's work
+    /// holds the wake ([`driver::Stream::wakes`]).
+    fn behind(self: &Arc<Self>, writer: &driver::Stream, written: &Event) -> Result<(), ExecutionError> {
+        let context = writer.context();
+        let wakes = writer.wakes().map_err(submission)?.raw();
         let _current = context.enter().map_err(submission)?;
         let issue = context.issuing().map_err(submission)?;
-        let notify = context.notify_stream();
         // SAFETY: both handles are this context's; the event may be
         // destroyed once the wait is queued, and the wake's reference is the
         // host function's to release.
         unsafe {
-            context.driver.check(issue.stream_wait_event(notify, written.raw()), "wake wait").map_err(submission)?;
+            context.driver.check(issue.stream_wait_event(wakes, written.raw()), "wake wait").map_err(submission)?;
             let wake = Arc::into_raw(self.clone()).cast_mut().cast::<c_void>();
-            let status = issue.launch_host_function(notify, wake_after_write, wake);
+            let status = issue.launch_host_function(wakes, wake_after_write, wake);
             if status != 0 {
                 drop(Arc::from_raw(wake.cast::<Wake>().cast_const()));
             }
@@ -747,14 +749,14 @@ impl HostWord {
 
     /// Wake the word's waiters once `stream`'s work queued so far completes,
     /// a device write of the word among it: an event recorded behind it,
-    /// which the context's notify stream waits for before it runs their
-    /// wake, so no work of `stream` waits for the host. Every stream write
+    /// which `stream`'s wake stream waits for before it runs their wake, so
+    /// no work of `stream` waits for the host. Every stream write
     /// of a host word is followed by this, and every graph write by its own
     /// event's wake ([`DirectBatch::replay`]), so every host wait sleeps.
     pub(crate) fn wake_after(&self, stream: &driver::Stream) -> Result<(), ExecutionError> {
         let written = Event::new(stream.context()).map_err(submission)?;
         written.record(stream).map_err(submission)?;
-        self.wake.behind(stream.context(), &written)
+        self.wake.behind(stream, &written)
     }
 
     /// Wait at most `timeout` until `reached` holds of the word, sleeping
@@ -977,7 +979,7 @@ impl DirectBatch {
         graph.exec.launch(&self.stream).map_err(submission)?;
         graph.launched.record(&self.stream).map_err(submission)?;
         for (written, wake) in graph.words.iter().filter_map(|node| node.written.as_ref()) {
-            wake.behind(self.device.context(), written)?;
+            wake.behind(&self.stream, written)?;
         }
         Ok(())
     }
