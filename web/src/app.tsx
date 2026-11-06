@@ -342,7 +342,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const custom = Result.isSuccess(customModels) ? customModels.value : []
   const allModels: readonly LocalModel[] = [...models, ...custom]
   const hidden = Result.isSuccess(hiddenModels) ? hiddenModels.value : []
-  const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
+  const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).map(option => option.model) : []
   const assessment = Result.isSuccess(catalog) ? catalog.value.preparation.assessment : undefined
   const recommendationsPending = !Result.isFailure(hardware) && (Result.isInitial(hardware) || !assessment?.complete)
   const rankedIds = new Set(ranked.map(model => model.modelId))

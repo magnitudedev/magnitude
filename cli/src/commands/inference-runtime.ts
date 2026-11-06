@@ -19,6 +19,8 @@ import {
 import {
   LocalModelPreparationSchema,
   localModelDeprecation,
+  localModelIntelligence,
+  type AvailableCatalogLocalModel,
   type CatalogLocalModel,
   type LocalInferenceHardware,
   type LocalModel,
@@ -138,6 +140,9 @@ const radarDetail = (model: CatalogLocalModel, label: string): string =>
 
 const speedLabel = (model: CatalogLocalModel): string => radarDetail(model, "SPEED")
 
+const intelligenceLabel = (model: CatalogLocalModel): string =>
+  Option.match(localModelIntelligence(model), { onNone: () => "not rated", onSome: (score) => `${score}%` })
+
 const labeledModelName = (model: CatalogLocalModel): string => Option.match(
   catalogSupportLabel(model.catalogData.support), {
     onNone: () => formatLocalModelDisplayName(model),
@@ -220,7 +225,10 @@ export const parseLimit = (input: string, maximum = Number.MAX_SAFE_INTEGER) => 
       }))
 }
 
-const renderRecommendation = (hardware: LocalInferenceHardware) => (model: CatalogLocalModel, index: number): string => {
+const renderRecommendation = (hardware: LocalInferenceHardware) => (
+  model: AvailableCatalogLocalModel,
+  index: number,
+): string => {
   const capabilities = capabilityLabels(model)
   const expertFields = localModelExpertFacts(model, Option.some(hardware))
   return [
@@ -241,7 +249,7 @@ export interface RecommendationsView {
   readonly models: readonly CatalogLocalModel[]
   readonly hardware: LocalInferenceHardware
   readonly preference: { readonly label: string }
-  readonly ranked: readonly CatalogLocalModel[]
+  readonly ranked: readonly AvailableCatalogLocalModel[]
 }
 
 export const RecommendationsJsonSchema = Schema.Struct({
@@ -268,7 +276,7 @@ export const showRecommendations = (preferenceInput: string, limitInput: string,
       })), {
         fastToSmart: preference.value,
         memoryBudgetBytes: targetPhysicalMemoryBytes(hardware),
-      }, limit).flatMap(({ model }) => model._tag === "Catalog" ? [model] : [])
+      }, limit).map(({ model }) => model)
       return { catalog, models, hardware, preference, ranked }
     }))),
   ),
@@ -355,7 +363,7 @@ export const renderCatalogDetail = ({ model, models }: CatalogDetailView): strin
       ["Speed", speedLabel(model)],
       ["Fit", radarDetail(model, "FIT")],
       ...localModelFitFacts(model),
-      ["Intelligence", `${model.catalogData.intelligence}%`],
+      ["Intelligence", intelligenceLabel(model)],
       ["Fidelity", radarDetail(model, "FIDELITY")],
       ["Acceleration", accelerationLabel(model)],
     ])]

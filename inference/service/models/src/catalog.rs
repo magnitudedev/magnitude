@@ -117,11 +117,70 @@ struct CatalogModel {
     sources: Vec<CatalogModelSource>,
     #[serde(default)]
     speculative_decoding: Option<CatalogSpeculativeDecoding>,
-    artificial_analysis: ArtificialAnalysisScore,
-    support: CatalogSupport,
+    /// Required of every model that is not disabled (`valid_model_score`).
+    #[serde(default)]
+    artificial_analysis: Option<ArtificialAnalysisScore>,
+    support: DeclaredSupport,
+}
+
+/// What the release promises for a catalog model, as the catalog declares it beside the model's
+/// score; the service's `CatalogSupport` carries the two together.
+#[derive(Clone, Deserialize)]
+#[serde(tag = "level", rename_all = "camelCase", deny_unknown_fields)]
+enum DeclaredSupport {
+    Supported,
+    Disabled {
+        reason: String,
+    },
+    #[serde(rename_all = "camelCase")]
+    Deprecated {
+        since: String,
+        replacement: ModelId,
+        reason: String,
+    },
+}
+
+impl DeclaredSupport {
+    fn is_deprecated(&self) -> bool {
+        matches!(self, Self::Deprecated { .. })
+    }
+
+    fn is_available(&self) -> bool {
+        matches!(self, Self::Supported)
+    }
 }
 
 impl CatalogModel {
+    /// The model's support with its intelligence score, which `catalog_source` requires of every
+    /// model that is not disabled (`valid_model_score`).
+    fn rated_support(&self, frontier: &ArtificialAnalysisFrontier) -> CatalogSupport {
+        let intelligence = self
+            .artificial_analysis
+            .as_ref()
+            .map(|artificial_analysis| frontier.intelligence(artificial_analysis));
+        let rated =
+            || intelligence.expect("catalog_source scores every model that is not disabled");
+        match &self.support {
+            DeclaredSupport::Supported => CatalogSupport::Supported {
+                intelligence: rated(),
+            },
+            DeclaredSupport::Disabled { reason } => CatalogSupport::Disabled {
+                reason: reason.clone(),
+                intelligence,
+            },
+            DeclaredSupport::Deprecated {
+                since,
+                replacement,
+                reason,
+            } => CatalogSupport::Deprecated {
+                since: since.clone(),
+                replacement: replacement.clone(),
+                reason: reason.clone(),
+                intelligence: rated(),
+            },
+        }
+    }
+
     /// Every variant, with the source that publishes it.
     fn variants(&self) -> impl Iterator<Item = (&CatalogModelSource, &CatalogVariant)> {
         self.sources
@@ -398,10 +457,7 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                         }
                     }
                 })
-            || !valid_artificial_analysis(
-                &model.artificial_analysis,
-                &source.artificial_analysis_frontier,
-            )
+            || !valid_model_score(model, &source.artificial_analysis_frontier)
             || !ids.insert(model.id.as_str())
             || model.variants().any(|(_, variant)| {
                 !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
@@ -430,9 +486,9 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
 /// configuration of another model.
 fn valid_catalog_support(model: &CatalogModel, source: &CatalogSource) -> bool {
     match &model.support {
-        CatalogSupport::Supported => true,
-        CatalogSupport::Disabled { reason } => valid_non_empty(reason),
-        CatalogSupport::Deprecated {
+        DeclaredSupport::Supported => true,
+        DeclaredSupport::Disabled { reason } => valid_non_empty(reason),
+        DeclaredSupport::Deprecated {
             since,
             replacement,
             reason,
@@ -457,6 +513,15 @@ fn valid_catalog_support(model: &CatalogModel, source: &CatalogSource) -> bool {
                         })
                 }
         }
+    }
+}
+
+/// Every model that is not disabled has a score; a disabled one may have none, and a score it has is
+/// valid.
+fn valid_model_score(model: &CatalogModel, frontier: &ArtificialAnalysisFrontier) -> bool {
+    match &model.artificial_analysis {
+        Some(artificial_analysis) => valid_artificial_analysis(artificial_analysis, frontier),
+        None => matches!(model.support, DeclaredSupport::Disabled { .. }),
     }
 }
 
@@ -1602,8 +1667,7 @@ fn recommendable_model(
         release_date: declaration.release_date.clone(),
         license: source.license.clone(),
         parameterization: declaration.parameterization.clone(),
-        intelligence: frontier.intelligence(&declaration.artificial_analysis),
-        support: declaration.support.clone(),
+        support: declaration.rated_support(frontier),
         fidelity_rank: variant.fidelity_rank,
         quantization_aware: variant.quantization_aware,
     })
@@ -2363,7 +2427,7 @@ mod tests {
             .clone();
         assert!(valid_catalog_support(&model, &source));
         let deprecated = |since: &str, replacement: &str, reason: &str| {
-            CatalogSupport::Deprecated {
+            DeclaredSupport::Deprecated {
                 since: since.to_owned(),
                 replacement: replacement.parse().expect("model ID"),
                 reason: reason.to_owned(),
@@ -2381,7 +2445,7 @@ mod tests {
                 false,
             ),
             (
-                CatalogSupport::Disabled {
+                DeclaredSupport::Disabled {
                     reason: String::new(),
                 },
                 false,
@@ -2414,7 +2478,7 @@ mod tests {
             .iter_mut()
             .find(|model| model.id == "qwen3.5-4b")
             .expect("replacement model");
-        replacement.support = CatalogSupport::Deprecated {
+        replacement.support = DeclaredSupport::Deprecated {
             since: "2026-09-27".to_owned(),
             replacement: "qwen3.5-4b:gguf:q4".parse().expect("model ID"),
             reason: "superseded".to_owned(),
@@ -2456,9 +2520,12 @@ mod tests {
         let frontier = &source.artificial_analysis_frontier;
         assert!(valid_artificial_analysis_frontier(frontier));
         for model in &source.models {
-            assert!(valid_artificial_analysis(&model.artificial_analysis, frontier));
+            assert!(valid_model_score(model, frontier));
         }
-        let model = source.models[0].artificial_analysis.clone();
+        let model = source.models[0]
+            .artificial_analysis
+            .clone()
+            .expect("the first catalog model is scored");
         let above = ArtificialAnalysisScore {
             score: frontier.score + 0.1,
             ..model.clone()
@@ -2475,6 +2542,31 @@ mod tests {
                 ..frontier.clone()
             }));
         }
+    }
+
+    #[test]
+    fn only_a_disabled_model_may_have_no_score() {
+        let source = catalog_source().expect("catalog source should be valid");
+        let frontier = &source.artificial_analysis_frontier;
+        let mut model = source
+            .models
+            .iter()
+            .find(|model| model.support.is_available())
+            .expect("the catalog has a supported model")
+            .clone();
+        assert!(valid_model_score(&model, frontier));
+        model.artificial_analysis = None;
+        assert!(!valid_model_score(&model, frontier));
+        model.support = DeclaredSupport::Deprecated {
+            since: "2026-01-01".to_owned(),
+            replacement: "qwen3.5-4b:gguf:q4".parse().expect("model ID"),
+            reason: "superseded".to_owned(),
+        };
+        assert!(!valid_model_score(&model, frontier));
+        model.support = DeclaredSupport::Disabled {
+            reason: "not implemented yet".to_owned(),
+        };
+        assert!(valid_model_score(&model, frontier));
     }
 
     #[test]

@@ -104,8 +104,8 @@ pub(crate) fn reject_unavailable(
     definition: &RecommendableModel,
 ) -> Result<(), InventoryError> {
     match &definition.support {
-        CatalogSupport::Supported => Ok(()),
-        CatalogSupport::Disabled { reason } => Err(InventoryError::ModelOperation {
+        CatalogSupport::Supported { .. } => Ok(()),
+        CatalogSupport::Disabled { reason, .. } => Err(InventoryError::ModelOperation {
             code: "catalog_model_disabled".to_owned(),
             message: format!("catalog model {model_id} is disabled ({reason})"),
             retryable: false,
@@ -765,7 +765,6 @@ fn catalog_model(
             .into_iter()
             .collect(),
         parameterization: definition.parameterization.clone(),
-        intelligence: definition.intelligence.clone(),
         support: definition.support.clone(),
         fidelity_rank: definition.fidelity_rank,
         quantization_aware: definition.quantization_aware,
@@ -1445,8 +1444,7 @@ mod tests {
             parameterization: ModelParameterization::Dense {
                 total_parameters: 1_000_000,
             },
-            intelligence: 1,
-            support: CatalogSupport::Supported,
+            support: CatalogSupport::Supported { intelligence: 1 },
             fidelity_rank: 1,
             quantization_aware: false,
         }
@@ -1554,6 +1552,7 @@ mod tests {
         assert!(reject_unavailable(&id, &model).is_ok());
         model.support = CatalogSupport::Disabled {
             reason: "not yet qualified".to_owned(),
+            intelligence: None,
         };
         let Err(InventoryError::ModelOperation { code, message, .. }) = reject_unavailable(&id, &model) else {
             panic!("a disabled model must be rejected");
@@ -1564,6 +1563,7 @@ mod tests {
             since: "2026-09-27".to_owned(),
             replacement: "replacement:gguf:q4".parse().expect("model ID"),
             reason: "unsupported architecture".to_owned(),
+            intelligence: 1,
         };
         let Err(InventoryError::ModelOperation {
             code,

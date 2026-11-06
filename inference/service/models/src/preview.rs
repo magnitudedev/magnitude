@@ -3833,8 +3833,7 @@ mod tests {
                 parameterization: ModelParameterization::Dense {
                     total_parameters: 1,
                 },
-                intelligence: 1,
-                support: CatalogSupport::Supported,
+                support: CatalogSupport::Supported { intelligence: 1 },
                 fidelity_rank: 1,
                 quantization_aware: false,
             }],

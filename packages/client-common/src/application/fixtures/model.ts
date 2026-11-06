@@ -1,7 +1,7 @@
 import { Option, Schema } from "effect"
-import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, LocalInferenceDeviceIdSchema, CustomFormModelIdSchema, LocalModelFitResidencySchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelStreamingStatusSchema, ModelVariantLabelSchema, type CustomLocalModel, type LocalModel, type LocalModelFitResidency, type ModelInstanceAllocation, type ModelResidency, type ModelStreamingStatus } from "@magnitudedev/sdk"
+import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, LocalInferenceDeviceIdSchema, CustomFormModelIdSchema, LocalModelFitResidencySchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelStreamingStatusSchema, ModelVariantLabelSchema, type AvailableCatalogLocalModel, type CustomLocalModel, type LocalModel, type LocalModelFitResidency, type ModelInstanceAllocation, type ModelResidency, type ModelStreamingStatus } from "@magnitudedev/sdk"
 export const providerModelId = CatalogFormModelIdSchema.make("setup-model:gguf:q4")
-export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
+export const makeSetupModel = (installed: boolean): AvailableCatalogLocalModel => {
   return {
     _tag: "Catalog",
     modelId: providerModelId,

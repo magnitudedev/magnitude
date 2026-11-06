@@ -2909,8 +2909,9 @@ mod tests {
             parameterization: magnitude_service_contracts::models::ModelParameterization::Dense {
                 total_parameters: 8_000_000_000,
             },
-            intelligence: 0,
-            support: magnitude_service_contracts::models::CatalogSupport::Supported,
+            support: magnitude_service_contracts::models::CatalogSupport::Supported {
+                intelligence: 0,
+            },
             fidelity_rank: 0,
             quantization_aware: false,
         }

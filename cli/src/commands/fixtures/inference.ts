@@ -11,9 +11,9 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   ModelAssessmentIdSchema,
   ModelVariantLabelSchema,
+  type AvailableCatalogLocalModel,
   type CandidateInspection,
   type CandidateVersion,
-  type CatalogLocalModel,
   type CustomLocalModel,
   type DrafterCandidate,
   type HuggingFaceSearchResponse,
@@ -137,9 +137,9 @@ const catalogPresentation = {
 }
 
 const makeCatalogOnlyModel = (
-  overrides: Partial<CatalogLocalModel> = {},
+  overrides: Partial<AvailableCatalogLocalModel> = {},
   modelId = TEST_CATALOG_MODEL_ID,
-): CatalogLocalModel => ({
+): AvailableCatalogLocalModel => ({
   _tag: "Catalog",
   modelId,
   presentation: catalogPresentation,
@@ -168,7 +168,7 @@ const makeCatalogOnlyModel = (
   ...overrides,
 })
 
-export const makeCatalogModel = (overrides: Partial<CatalogLocalModel> = {}): CatalogLocalModel =>
+export const makeCatalogModel = (overrides: Partial<AvailableCatalogLocalModel> = {}): AvailableCatalogLocalModel =>
   makeCatalogOnlyModel(overrides)
 
 const installation = (primaryPath: string, ownership: "Magnitude" | "External" = "Magnitude") => ({
@@ -179,8 +179,8 @@ const installation = (primaryPath: string, ownership: "Magnitude" | "External" =
 })
 
 export const makeInstalledCatalogModel = (
-  overrides: Partial<CatalogLocalModel> = {},
-): CatalogLocalModel => makeCatalogOnlyModel({
+  overrides: Partial<AvailableCatalogLocalModel> = {},
+): AvailableCatalogLocalModel => makeCatalogOnlyModel({
   acquisitionState: {
     _tag: "Installed",
     installation: installation("/models/catalog-model.gguf"),
@@ -191,8 +191,8 @@ export const makeInstalledCatalogModel = (
 
 export const makeAcquiringModel = (
   acquisitionState: LocalModelAcquisitionState,
-  overrides: Partial<CatalogLocalModel> = {},
-): CatalogLocalModel => makeCatalogOnlyModel({ acquisitionState, ...overrides })
+  overrides: Partial<AvailableCatalogLocalModel> = {},
+): AvailableCatalogLocalModel => makeCatalogOnlyModel({ acquisitionState, ...overrides })
 
 export const makeDrafterCandidate = (overrides: Partial<DrafterCandidate> = {}): DrafterCandidate => ({
   category: "CatalogDrafter",

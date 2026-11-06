@@ -9,11 +9,12 @@ import type {
 } from "@magnitudedev/icn-protocol/schemas"
 import {
   assessmentTargetVisible,
+  availableCatalogModelServingState,
   catalogAcquisition,
-  catalogModelServingState,
   catalogRemovalAcquisition,
   coordinatedAssessment,
   projectLocalModelPreparation,
+  unavailableCatalogModelServingState,
 } from "./local-models"
 import type { LocalModelSourcesState } from "./local-model-sources"
 
@@ -48,9 +49,9 @@ describe("local model serving projection", () => {
           defaultEffort: Option.some("high"),
         },
       },
-    } as unknown as Parameters<typeof catalogModelServingState>[1]
+    } as unknown as Parameters<typeof availableCatalogModelServingState>[1]
 
-    const state = catalogModelServingState(ready, assessment, { intelligenceScore: 80, fidelityRank: 60 })
+    const state = availableCatalogModelServingState(ready, assessment, { intelligenceScore: 80, fidelityRank: 60 })
 
     expect(state._tag).toBe("Assessed")
     if (state._tag !== "Assessed") return
@@ -61,6 +62,10 @@ describe("local model serving projection", () => {
       speed: Option.none(),
       fidelity: 0.6,
     })
+    // The same fit of a disabled or deprecated model is never ranked.
+    const unavailable = unavailableCatalogModelServingState(ready, assessment)
+    expect(unavailable._tag === "Assessed" && unavailable.assessment._tag).toBe("Fits")
+    expect("rankingScores" in unavailable).toBe(false)
   })
 
   it("projects a non-reasoning model that accepts only an explicit none", () => {
@@ -111,7 +116,7 @@ describe("local model serving projection", () => {
     const assessment = coordinatedAssessment(snapshot, "catalog", modelId)
     expect(assessment?._tag).toBe("Assessed")
     if (assessment?._tag !== "Assessed") return
-    const state = catalogModelServingState(ready, assessment, { intelligenceScore: 50, fidelityRank: 40 })
+    const state = availableCatalogModelServingState(ready, assessment, { intelligenceScore: 50, fidelityRank: 40 })
 
     expect(state._tag).toBe("Assessed")
     if (state._tag !== "Assessed") return
@@ -126,7 +131,7 @@ describe("local model serving projection", () => {
       message: "The selected GGUF artifact is invalid",
       retryable: false,
     }
-    expect(catalogModelServingState(
+    expect(availableCatalogModelServingState(
       undefined,
       undefined,
       { intelligenceScore: 80, fidelityRank: 60 },

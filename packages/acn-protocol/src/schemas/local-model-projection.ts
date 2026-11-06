@@ -2,7 +2,9 @@ import { Option } from "effect"
 import type { ProviderModelId } from "@magnitudedev/ai/provider/model"
 import {
   installedAcquisition,
+  type AvailableCatalogLocalModel,
   type CatalogSupport,
+  type CustomLocalModel,
   type CustomModelAcquisitionState,
   type CustomModelOrigin,
   type DrafterCandidate,
@@ -55,8 +57,17 @@ export const localModelCapabilities = (
 
 export type CatalogDeprecation = Extract<CatalogSupport, { readonly _tag: "Deprecated" }>
 
-export const localModelIsAvailable = (model: LocalModel): boolean => model._tag !== "Catalog"
+export const localModelIsAvailable = (
+  model: LocalModel,
+): model is AvailableCatalogLocalModel | CustomLocalModel => model._tag !== "Catalog"
   || model.catalogData.support._tag === "Supported"
+
+/** A catalog model's rated intelligence; a custom model and a disabled model without a score have none. */
+export const localModelIntelligence = (model: LocalModel): Option.Option<number> => {
+  if (model._tag !== "Catalog") return Option.none()
+  const { intelligence } = model.catalogData
+  return typeof intelligence === "number" ? Option.some(intelligence) : intelligence
+}
 
 /** A deprecated catalog model is never recommended, installed, or loaded. */
 export const localModelDeprecation = (

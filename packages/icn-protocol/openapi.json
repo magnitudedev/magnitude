@@ -3514,7 +3514,6 @@
           "license",
           "sourceUrls",
           "parameterization",
-          "intelligence",
           "support",
           "fidelityRank",
           "quantizationAware",
@@ -3553,11 +3552,6 @@
           },
           "parameterization": {
             "$ref": "#/components/schemas/ModelParameterization"
-          },
-          "intelligence": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
           },
           "support": {
             "$ref": "#/components/schemas/CatalogSupport"
@@ -3760,9 +3754,15 @@
             "type": "object",
             "description": "Intended to be available as a supported catalog model.",
             "required": [
+              "intelligence",
               "level"
             ],
             "properties": {
+              "intelligence": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
               "level": {
                 "type": "string",
                 "enum": [
@@ -3782,6 +3782,11 @@
               "reason": {
                 "type": "string"
               },
+              "intelligence": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
               "level": {
                 "type": "string",
                 "enum": [
@@ -3797,6 +3802,7 @@
               "since",
               "replacement",
               "reason",
+              "intelligence",
               "level"
             ],
             "properties": {
@@ -3809,6 +3815,11 @@
               "reason": {
                 "type": "string"
               },
+              "intelligence": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              },
               "level": {
                 "type": "string",
                 "enum": [
@@ -3818,7 +3829,7 @@
             }
           }
         ],
-        "description": "What the release promises for a catalog model. It is independent of assessment, which says\nwhat one device can do with it."
+        "description": "What the release promises for a catalog model, with its `intelligence`: its Artificial\nAnalysis score as a percentage of the frontier's, which only a disabled model may lack. It is\nindependent of assessment, which says what one device can do with it."
       },
       "CatalogUpdatePart": {
         "type": "string",

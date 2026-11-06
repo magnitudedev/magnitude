@@ -1,5 +1,10 @@
 import { Option } from "effect"
-import { localModelIsAvailable, parseModelId, type CatalogLocalModel } from "@magnitudedev/sdk"
+import {
+  localModelIsAvailable,
+  parseModelId,
+  type AvailableCatalogLocalModel,
+  type CatalogLocalModel,
+} from "@magnitudedev/sdk"
 import type {
   LocalInferenceHardware,
   LocalModel,
@@ -15,6 +20,11 @@ export interface LocalModelOption {
   readonly id: string
   readonly kind: "running" | "stored" | "downloadable"
   readonly model: LocalModel
+}
+
+/** An option recommendations rank: only a supported catalog model is ranked. */
+export interface RankedLocalModelOption extends LocalModelOption {
+  readonly model: AvailableCatalogLocalModel
 }
 
 export interface LocalModelRankingPreference {
@@ -81,21 +91,22 @@ export const rankedLocalModelOptions = (
   options: readonly LocalModelOption[],
   preference: LocalModelRankingPreference,
   limit = 10,
-): readonly LocalModelOption[] => options
+): readonly RankedLocalModelOption[] => options
   .flatMap((option): readonly {
-    readonly option: LocalModelOption
+    readonly option: RankedLocalModelOption
     readonly speedEstimated: boolean
     readonly utility: number
   }[] => {
-    if (option.model._tag !== "Catalog" || !localModelIsAvailable(option.model)) return []
-    const serving = option.model.servingState
+    const { model } = option
+    if (model._tag !== "Catalog" || !localModelIsAvailable(model)) return []
+    const serving = model.servingState
     if (serving._tag !== "Assessed"
       || serving.assessment._tag !== "Fits"
       || !("rankingScores" in serving)
       || !Number.isFinite(preference.memoryBudgetBytes)
       || serving.assessment.memory.totalRequiredBytes > Math.max(0, preference.memoryBudgetBytes)) return []
     return [{
-      option,
+      option: { ...option, model },
       speedEstimated: Option.isSome(serving.rankingScores.speed),
       utility: localModelRankingUtility(serving.rankingScores, preference.fastToSmart),
     }]

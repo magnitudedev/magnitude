@@ -406,9 +406,9 @@ describe("local models state", () => {
       source: { ...sources([]), catalogModels: [{
         id: modelId,
         source: {
-          aliases: Option.none(), description: "", desired, displayName: "Gemma 4 E2B", fidelityRank: 1, intelligence: 1,
+          aliases: Option.none(), description: "", desired, displayName: "Gemma 4 E2B", fidelityRank: 1,
           license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: true,
-          releaseDate: "2026-04-02", sourceUrls: [], support: { level: "supported" }, variantLabel: "Q4 QAT",
+          releaseDate: "2026-04-02", sourceUrls: [], support: { level: "supported", intelligence: 1 }, variantLabel: "Q4 QAT",
           localState: {
             _tag: "Installed",
             effective: { _tag: "Ready", model: { ...desired, speculativeMethod: speculative ? Option.some({ _tag: "Mtp" }) : Option.none() } },
@@ -446,11 +446,11 @@ describe("local models state", () => {
       source: { ...sources([]), catalogModels: [{
         id: "minicpm5-2b:gguf:q8",
         source: {
-          aliases: Option.none(), description: "", displayName: "MiniCPM5 2B", fidelityRank: 1, intelligence: 1,
+          aliases: Option.none(), description: "", displayName: "MiniCPM5 2B", fidelityRank: 1,
           desired: { metadata: { storageBytes: 2_679_710_688 }, profile: { contextLength: 131_072 }, speculativeMethod: Option.none() },
           drafterWithheld: true,
           license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: false,
-          releaseDate: "2026-09-01", sourceUrls: [], support: { level: "supported" }, variantLabel: "Q8",
+          releaseDate: "2026-09-01", sourceUrls: [], support: { level: "supported", intelligence: 1 }, variantLabel: "Q8",
           localState,
         },
       } as unknown as LocalModelSourcesState["catalogModels"][number]] },
@@ -479,7 +479,6 @@ describe("local models state", () => {
         desired,
         displayName: "Catalog Model",
         fidelityRank: 1,
-        intelligence: 1,
         license: "apache-2.0",
         localState: {
           _tag: "Installed",
@@ -494,7 +493,7 @@ describe("local models state", () => {
         quantizationAware: false,
         releaseDate: "2026-08-29",
         sourceUrls: [],
-        support: { level: "supported" },
+        support: { level: "supported", intelligence: 1 },
         variantLabel: "Q4",
       },
     }) as unknown as LocalModelSourcesState["catalogModels"][number]

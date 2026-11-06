@@ -4,7 +4,7 @@ import {
   LocalModelFitsAssessmentSchema,
   CatalogBaseIdSchema,
   CatalogVariantIdSchema,
-  CatalogLocalModelServingStateSchema,
+  AvailableCatalogServingStateSchema,
   CatalogSupportSchema,
   CandidateInspectionSchema,
   CustomLocalModelServingStateSchema,
@@ -19,6 +19,7 @@ import {
   ModelIdSchema,
   ModelLocationSchema,
   StreamingResizeSchema,
+  UnavailableCatalogServingStateSchema,
   modelLocationState,
   ModelParameterizationSchema,
   ModelReleaseDateSchema,
@@ -82,6 +83,23 @@ describe("CatalogSupportSchema", () => {
     })).toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogSupportSchema)({
       _tag: "Deprecated", since: "2026-09-27", reason: "superseded", replacement: "model:gguf:q4",
+    })).not.toThrow()
+  })
+
+  it("rates every supported and deprecated model, and lets a disabled one go unrated", () => {
+    const { intelligence: _intelligence, ...unrated } = catalogModel.catalogData
+    const decode = Schema.decodeUnknownSync(LocalModelSchema)
+    expect(() => decode({ ...catalogModel, catalogData: unrated })).toThrow()
+    expect(() => decode({
+      ...catalogModel,
+      catalogData: {
+        ...unrated,
+        support: { _tag: "Deprecated", since: "2026-09-27", reason: "superseded", replacement: "other:gguf:q4" },
+      },
+    })).toThrow()
+    expect(() => decode({
+      ...catalogModel,
+      catalogData: { ...unrated, support: { _tag: "Disabled", reason: "not implemented yet" } },
     })).not.toThrow()
   })
 })
@@ -367,11 +385,16 @@ describe("LocalModelSchema invariants", () => {
         detail: "unrecognized architecture deepseek4",
       },
     }
-    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(fits)).not.toThrow()
-    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(withoutPerformance)).toThrow()
-    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(pending)).not.toThrow()
-    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unavailable)).not.toThrow()
-    expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
+    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(fits)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(withoutPerformance)).toThrow()
+    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(pending)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(unavailable)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(unsupported)).toThrow()
+    expect(() => Schema.decodeUnknownSync(UnavailableCatalogServingStateSchema)(unsupported)).toThrow()
+    // A fitting available model is ranked; an unavailable one never is.
+    const { rankingScores: _rankingScores, ...unranked } = fits
+    expect(() => Schema.decodeUnknownSync(AvailableCatalogServingStateSchema)(unranked)).toThrow()
+    expect(() => Schema.decodeUnknownSync(UnavailableCatalogServingStateSchema)(unranked)).not.toThrow()
     expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)(unsupported)).not.toThrow()
     const { profile: _profile, ...unreadable } = unsupported.assessment
     expect(Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)({

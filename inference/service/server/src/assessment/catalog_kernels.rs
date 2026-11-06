@@ -7,7 +7,6 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use magnitude_engine::assessment::{KernelInventory, kernel_inventory};
 use magnitude_engine::options::standard_service_limits;
-use magnitude_service_contracts::models::CatalogSupport;
 use magnitude_service_models::{load_release_catalog, servable_model_bundle_key_for_bundle};
 use seismic::{BackendName, KernelRequest};
 
@@ -39,7 +38,7 @@ pub fn catalog_kernel_requests(
     let mut unsupported = Vec::new();
     let mut seen = HashSet::new();
     for model in &catalog.catalog().models {
-        if !matches!(model.support, CatalogSupport::Supported) {
+        if !model.support.is_available() {
             continue;
         }
         let name = format!("{}:{}", model.model_id, model.variant_id);

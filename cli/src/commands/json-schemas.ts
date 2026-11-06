@@ -1,8 +1,7 @@
 import {
   CandidateInspectionSchema,
   CandidateVersionSchema,
-  CatalogLocalModelSchema,
-  CatalogLocalModelServingStateSchema,
+  CatalogLocalModelFields,
   CustomLocalModelSchema,
   CustomLocalModelServingStateSchema,
   CustomModelAcquisitionStateSchema,
@@ -25,6 +24,7 @@ import {
   ModelStreamingStatusSchema,
   StreamingHostStatusSchema,
   StreamingTierStatusSchema,
+  UnavailableCatalogServingStateSchema,
 } from "@magnitudedev/sdk"
 import { Schema, Struct } from "effect"
 
@@ -129,11 +129,12 @@ const CustomAcquisitionStateJsonSchema = Schema.Union(
   Schema.Struct({ ...unavailable.fields, installation: InstallationJsonSchema }),
 )
 
-const [catalogAssessing, catalogFailed, catalogAssessedFits, catalogAssessedDoesNotFit] = CatalogLocalModelServingStateSchema.members
+// Ranking scores are internal to recommendations, so JSON shows every catalog model's state as an unranked one.
+const [catalogAssessing, catalogFailed, catalogAssessedFits, catalogAssessedDoesNotFit] = UnavailableCatalogServingStateSchema.members
 const CatalogServingStateJsonSchema = Schema.Union(
   catalogAssessing,
   catalogFailed,
-  Schema.Struct({ ...Struct.omit(catalogAssessedFits.fields, "rankingScores"), assessment: FitsJsonSchema }),
+  Schema.Struct({ ...catalogAssessedFits.fields, assessment: FitsJsonSchema }),
   Schema.Struct({ ...catalogAssessedDoesNotFit.fields, assessment: DoesNotFitJsonSchema }),
 )
 
@@ -144,17 +145,24 @@ const CustomServingStateJsonSchema = Schema.Union(
   Schema.Struct({ ...customAssessed.fields, assessment: LocalModelAssessmentJsonSchema }),
 )
 
-const CatalogDataJsonSchema = Schema.Struct(Struct.omit(LocalModelCatalogDataSchema.fields, "fidelityRank"))
+const [supportedCatalogData, disabledCatalogData, deprecatedCatalogData] = LocalModelCatalogDataSchema.members
+const CatalogDataJsonSchema = Schema.Union(
+  Schema.Struct(Struct.omit(supportedCatalogData.fields, "fidelityRank")),
+  Schema.Struct(Struct.omit(disabledCatalogData.fields, "fidelityRank")),
+  Schema.Struct(Struct.omit(deprecatedCatalogData.fields, "fidelityRank")),
+)
 
 /** A catalog model as catalog commands show it: curated and machine-specific evidence, nothing on disk. */
 export const CatalogModelJsonSchema = Schema.Struct({
-  ...Struct.omit(CatalogLocalModelSchema.fields, "acquisitionState"),
+  _tag: Schema.tag("Catalog"),
+  ...Struct.omit(CatalogLocalModelFields, "acquisitionState"),
   servingState: CatalogServingStateJsonSchema,
   catalogData: CatalogDataJsonSchema,
 })
 
 export const CatalogLocalModelJsonSchema = Schema.Struct({
-  ...CatalogLocalModelSchema.fields,
+  _tag: Schema.tag("Catalog"),
+  ...CatalogLocalModelFields,
   servingState: CatalogServingStateJsonSchema,
   catalogData: CatalogDataJsonSchema,
   acquisitionState: AcquisitionStateJsonSchema,

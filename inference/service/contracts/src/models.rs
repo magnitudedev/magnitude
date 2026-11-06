@@ -1597,16 +1597,22 @@ pub enum ModelParameterization {
     },
 }
 
-/// What the release promises for a catalog model. It is independent of assessment, which says
-/// what one device can do with it.
+/// What the release promises for a catalog model, with its `intelligence`: its Artificial
+/// Analysis score as a percentage of the frontier's, which only a disabled model may lack. It is
+/// independent of assessment, which says what one device can do with it.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "level", rename_all = "camelCase", deny_unknown_fields)]
 pub enum CatalogSupport {
     /// Intended to be available as a supported catalog model.
-    Supported,
+    Supported { intelligence: u32 },
     /// Temporarily unavailable or not yet supported. Never installed or loaded.
-    Disabled { reason: String },
+    Disabled {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        intelligence: Option<u32>,
+    },
     /// Never offered for new installs and never loaded. An installed copy stays identifiable and
     /// removable, and points at its replacement.
     #[serde(rename_all = "camelCase")]
@@ -1614,6 +1620,7 @@ pub enum CatalogSupport {
         since: String,
         replacement: ModelId,
         reason: String,
+        intelligence: u32,
     },
 }
 
@@ -1625,7 +1632,7 @@ impl CatalogSupport {
 
     #[must_use]
     pub fn is_available(&self) -> bool {
-        matches!(self, Self::Supported)
+        matches!(self, Self::Supported { .. })
     }
 }
 
@@ -1642,7 +1649,6 @@ pub struct RecommendableModel {
     pub release_date: ModelReleaseDate,
     pub license: String,
     pub parameterization: ModelParameterization,
-    pub intelligence: u32,
     pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
@@ -1736,7 +1742,6 @@ pub struct CatalogModel {
     pub license: String,
     pub source_urls: Vec<String>,
     pub parameterization: ModelParameterization,
-    pub intelligence: u32,
     pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,

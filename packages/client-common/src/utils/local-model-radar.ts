@@ -1,5 +1,6 @@
 import { Option } from "effect"
 import {
+  localModelIntelligence,
   localModelServingState,
   type GenerationPerformanceEvidence,
   type GenerationPerformanceSamples,
@@ -183,15 +184,14 @@ export const localModelRadarAxes = (
     onNone: () => customFidelityRank(model),
     onSome: ({ fidelityRank }) => Option.some(fidelityRank),
   })
+  const intelligence = localModelIntelligence(model)
   const axes: LocalModelRadarAxes = [
     {
-      value: Option.map(catalog, ({ intelligence }) =>
-        clamp01(intelligence / 100)
-      ),
+      value: Option.map(intelligence, (score) => clamp01(score / 100)),
       label: "INTELLIGENCE",
-      detail: Option.match(catalog, {
+      detail: Option.match(intelligence, {
         onNone: () => "Not rated",
-        onSome: ({ intelligence }) => `${intelligence}%`,
+        onSome: (score) => `${score}%`,
       }),
     },
     {
@@ -243,7 +243,7 @@ export const localModelFacts = (model: LocalModel): LocalModelFacts => {
   const serving = Option.getOrUndefined(localModelServingState(model))
   const fits = serving?._tag === "Assessed" && serving.assessment._tag === "Fits" ? serving.assessment : undefined
   return {
-    intelligence: model._tag === "Catalog" ? Option.some(model.catalogData.intelligence) : Option.none(),
+    intelligence: localModelIntelligence(model),
     speed: fits === undefined
       ? Option.none()
       : Option.some(performanceRangeSpeedLabel(fits.residency.performance, fits.profile.contextLength)),

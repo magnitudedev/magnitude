@@ -803,32 +803,59 @@ const CatalogDeprecationDateSchema = Schema.String.pipe(
   Schema.brand("CatalogDeprecationDate"),
 )
 
-/** What the release promises for a catalog model, independent of this device's assessment. */
+const SupportedCatalogSupportSchema = Schema.TaggedStruct("Supported", {})
+const DisabledCatalogSupportSchema = Schema.TaggedStruct("Disabled", { reason: NonEmptyString })
+const DeprecatedCatalogSupportSchema = Schema.TaggedStruct("Deprecated", {
+  since: CatalogDeprecationDateSchema,
+  replacement: CatalogFormModelIdSchema,
+  reason: NonEmptyString,
+})
+
+/**
+ * What the release promises for a catalog model, independent of this device's assessment. A disabled or deprecated
+ * model is never recommended, ranked, installed, or loaded.
+ */
 export const CatalogSupportSchema = Schema.Union(
-  Schema.TaggedStruct("Supported", {}),
-  Schema.TaggedStruct("Disabled", { reason: NonEmptyString }),
-  Schema.TaggedStruct("Deprecated", {
-    since: CatalogDeprecationDateSchema,
-    replacement: CatalogFormModelIdSchema,
-    reason: NonEmptyString,
-  }),
+  SupportedCatalogSupportSchema,
+  DisabledCatalogSupportSchema,
+  DeprecatedCatalogSupportSchema,
 )
 export type CatalogSupport = typeof CatalogSupportSchema.Type
 
-/**
- * A catalog model's catalog facts. `aliases` are the IDs its files would have as found models (the
- * catalog's exact target found in another app's location); a request naming one means this model. A
- * hidden external copy keeps its own ID and is not an alias here.
- */
-export const LocalModelCatalogDataSchema = Schema.Struct({
+const LocalModelCatalogDataFields = {
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
-  intelligence: IntelligenceScoreSchema,
-  support: CatalogSupportSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
   aliases: Schema.Array(CustomFormModelIdSchema),
+} as const
+
+const AvailableCatalogDataSchema = Schema.Struct({
+  ...LocalModelCatalogDataFields,
+  support: SupportedCatalogSupportSchema,
+  intelligence: IntelligenceScoreSchema,
 })
+const DisabledCatalogDataSchema = Schema.Struct({
+  ...LocalModelCatalogDataFields,
+  support: DisabledCatalogSupportSchema,
+  intelligence: Schema.optionalWith(IntelligenceScoreSchema, { as: "Option", exact: true }),
+})
+const DeprecatedCatalogDataSchema = Schema.Struct({
+  ...LocalModelCatalogDataFields,
+  support: DeprecatedCatalogSupportSchema,
+  intelligence: IntelligenceScoreSchema,
+})
+const UnavailableCatalogDataSchema = Schema.Union(DisabledCatalogDataSchema, DeprecatedCatalogDataSchema)
+/**
+ * A catalog model's catalog facts. `aliases` are the IDs its files would have as found models (the
+ * catalog's exact target found in another app's location); a request naming one means this model. A
+ * hidden external copy keeps its own ID and is not an alias here. Only a disabled model may be unrated.
+ */
+export const LocalModelCatalogDataSchema = Schema.Union(
+  AvailableCatalogDataSchema,
+  DisabledCatalogDataSchema,
+  DeprecatedCatalogDataSchema,
+)
 export type LocalModelCatalogData = typeof LocalModelCatalogDataSchema.Type
 
 const NormalizedRankingScoreSchema = Schema.Number.pipe(
@@ -1041,11 +1068,10 @@ const LocalModelAssessedFields = {
   capabilities: ModelCapabilitiesSchema,
   speculativeMethod: Schema.optionalWith(SpeculativeMethodSchema, { as: "Option", exact: true }),
 } as const
-const CatalogModelAssessedFitsServingStateSchema = Schema.TaggedStruct("Assessed", {
+const CatalogModelAssessedFitsFields = {
   ...LocalModelAssessedFields,
   assessment: LocalModelFitsAssessmentSchema,
-  rankingScores: LocalModelRankingScoresSchema,
-})
+} as const
 const CatalogModelAssessedDoesNotFitServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
   assessment: LocalModelDoesNotFitAssessmentSchema,
@@ -1054,13 +1080,25 @@ const CustomModelAssessedServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
   assessment: LocalModelAssessmentSchema,
 })
-export const CatalogLocalModelServingStateSchema = Schema.Union(
+/** An available catalog model's serving state: when it fits, it carries the scores it is ranked by. */
+export const AvailableCatalogServingStateSchema = Schema.Union(
   LocalModelAssessingServingStateSchema,
   LocalModelFailedServingStateSchema,
-  CatalogModelAssessedFitsServingStateSchema,
+  Schema.TaggedStruct("Assessed", { ...CatalogModelAssessedFitsFields, rankingScores: LocalModelRankingScoresSchema }),
   CatalogModelAssessedDoesNotFitServingStateSchema,
 )
-export type CatalogLocalModelServingState = typeof CatalogLocalModelServingStateSchema.Type
+export type AvailableCatalogServingState = typeof AvailableCatalogServingStateSchema.Type
+
+/** An unavailable catalog model's serving state: it is never ranked, so it has no ranking scores. */
+export const UnavailableCatalogServingStateSchema = Schema.Union(
+  LocalModelAssessingServingStateSchema,
+  LocalModelFailedServingStateSchema,
+  Schema.TaggedStruct("Assessed", CatalogModelAssessedFitsFields),
+  CatalogModelAssessedDoesNotFitServingStateSchema,
+)
+export type UnavailableCatalogServingState = typeof UnavailableCatalogServingStateSchema.Type
+
+export type CatalogLocalModelServingState = AvailableCatalogServingState | UnavailableCatalogServingState
 
 /** Custom models are never ranked; `Unsupported` stays only on added models, whose files remain removable. */
 export const CustomLocalModelServingStateSchema = Schema.Union(
@@ -1071,7 +1109,8 @@ export const CustomLocalModelServingStateSchema = Schema.Union(
 export type CustomLocalModelServingState = typeof CustomLocalModelServingStateSchema.Type
 
 export const LocalModelServingStateSchema = Schema.Union(
-  CatalogLocalModelServingStateSchema,
+  AvailableCatalogServingStateSchema,
+  UnavailableCatalogServingStateSchema,
   CustomLocalModelServingStateSchema,
 )
 export type LocalModelServingState = typeof LocalModelServingStateSchema.Type
@@ -1288,17 +1327,33 @@ export type CatalogMissingComponent = typeof CatalogMissingComponentSchema.Type
  * for a model whose weights are only in another app's location (its projector and drafter); Remove deletes these
  * and the model keeps running from the found file, and with none of them Remove is Hide.
  */
-export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
+export const CatalogLocalModelFields = {
   ...LocalModelFields,
   modelId: CatalogFormModelIdSchema,
-  servingState: CatalogLocalModelServingStateSchema,
-  catalogData: LocalModelCatalogDataSchema,
   storageBytes: NonNegativeSafeInteger,
   acquisitionState: LocalModelAcquisitionStateSchema,
   missingComponents: Schema.Array(CatalogMissingComponentSchema),
   storedComponents: Schema.Array(CatalogComponentSchema),
   drafterWithheld: Schema.Boolean,
+} as const
+
+/** A supported catalog model: rated, and ranked when it fits. */
+export const AvailableCatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
+  ...CatalogLocalModelFields,
+  catalogData: AvailableCatalogDataSchema,
+  servingState: AvailableCatalogServingStateSchema,
 })
+export type AvailableCatalogLocalModel = typeof AvailableCatalogLocalModelSchema.Type
+
+/** A disabled or deprecated catalog model: shown with its reason, never ranked. */
+export const UnavailableCatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
+  ...CatalogLocalModelFields,
+  catalogData: UnavailableCatalogDataSchema,
+  servingState: UnavailableCatalogServingStateSchema,
+})
+export type UnavailableCatalogLocalModel = typeof UnavailableCatalogLocalModelSchema.Type
+
+export const CatalogLocalModelSchema = Schema.Union(AvailableCatalogLocalModelSchema, UnavailableCatalogLocalModelSchema)
 export type CatalogLocalModel = typeof CatalogLocalModelSchema.Type
 
 /**

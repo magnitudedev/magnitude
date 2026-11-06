@@ -714,21 +714,7 @@
           "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
           "license": "openmdw-1.1"
         }
-      ],
-      "artificialAnalysis": {
-        "score": 0.0,
-        "provenance": {
-          "kind": "estimate",
-          "target": "artificialAnalysisIntelligenceIndex",
-          "methodologyVersion": "4.3.2",
-          "asOfDate": "2026-09-29",
-          "methodology": "No Intelligence Index result or usable estimate; placeholder score for a disabled model.",
-          "evidenceUrls": [
-            "https://huggingface.co/poolside/Laguna-S-2.1",
-            "https://poolside.ai/blog/introducing-laguna-s-2-1"
-          ]
-        }
-      }
+      ]
     },
     {
       "id": "qwen3.5-122b-a10b",
@@ -882,6 +868,22 @@
           "url": "https://artificialanalysis.ai/models/nemotron-3-5-super-vl"
         }
       }
+    },
+    {
+      "id": "deepseek-v4.1-flash",
+      "displayName": "DeepSeek V4.1 Flash 552B-A16B",
+      "description": "Multimodal MoE model with a causal encoder-decoder, Engram memory and low active compute.",
+      "releaseDate": "2026-10-17",
+      "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 552000000000, "activeParameters": 16000000000 },
+      "support": { "level": "disabled", "reason": "The DeepSeek V4.1 Flash model family is not implemented yet." },
+      "sources": [
+        {
+          "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF",
+          "variants": [{"variantId": "gguf:mxfp4", "format": "MXFP4_MOE", "variantLabel": "MXFP4 QAT", "fidelityRank": 58, "quantizationAware": true}],
+          "license": "mit"
+        }
+      ],
+      "speculativeDecoding": { "method": "dspark", "draft": { "type": "file", "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF", "path": "DeepSeek-V4.1-Flash-1017-DSpark.gguf" } }
     },
     {
       "id": "nemotron-3-ultra-550b-a55b",

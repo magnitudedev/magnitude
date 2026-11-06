@@ -483,7 +483,6 @@ export const CatalogModel = S.Struct({
   drafterWithheld: S.Boolean,
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   id: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
-  intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   license: S.String,
   localState: S.suspend((): S.Schema<CatalogModelState, CatalogModelStateEncoded> => CatalogModelState),
   parameterization: S.suspend(
@@ -560,12 +559,14 @@ export type CatalogOptimizationStageEncoded = S.Schema.Encoded<typeof CatalogOpt
 export const CatalogSupport = S.Union(
   S.extend(
     S.Struct({
+      intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       level: S.Literal("supported"),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
   S.extend(
     S.Struct({
+      intelligence: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
       level: S.Literal("disabled"),
       reason: S.String,
     }),
@@ -573,6 +574,7 @@ export const CatalogSupport = S.Union(
   ),
   S.extend(
     S.Struct({
+      intelligence: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
       level: S.Literal("deprecated"),
       reason: S.String,
       replacement: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),

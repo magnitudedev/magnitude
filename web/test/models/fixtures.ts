@@ -2,7 +2,7 @@ import { Option } from "effect"
 import {
   AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CustomFormModelIdSchema, HuggingFaceArtifactSelectorSchema,
   HuggingFaceRepositoryIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema,
-  type CandidateInspection, type CandidateVersion, type CatalogLocalModel, type CustomLocalModel, type CustomModelOrigin,
+  type AvailableCatalogLocalModel, type CandidateInspection, type CandidateVersion, type CustomLocalModel, type CustomModelOrigin,
   type AttachedDrafter, type AttachedDrafterAvailability, type DrafterCandidate, type LocalModelAssessment, type UnsupportedLocalModel, type UnsupportedReason,
 } from "@magnitudedev/sdk"
 
@@ -34,7 +34,7 @@ export const unreadable: LocalModelAssessment = {
   _tag: "Unsupported", environmentId, profile: Option.none(), reasons: [{ _tag: "Unreadable" }], detail: "file is shorter than its header declares",
 }
 
-export const catalogModel = (): CatalogLocalModel => ({
+export const catalogModel = (): AvailableCatalogLocalModel => ({
   _tag: "Catalog",
   modelId: catalogId,
   storageBytes: 24 * GB,

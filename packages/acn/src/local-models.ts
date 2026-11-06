@@ -26,7 +26,8 @@ import {
   type DrafterReference,
   type DrafterVerdict,
   type LocalModelAcquisitionState,
-  type CatalogLocalModelServingState,
+  type AvailableCatalogServingState,
+  type UnavailableCatalogServingState,
   type LocalModelAssessment,
   type MachineMeasurement,
   type LocalModel,
@@ -310,49 +311,53 @@ export const catalogAcquisition = (
     : { _tag: "Installed", ...installed }
 }
 
-export const catalogModelServingState = (
+type CatalogFitsAssessment = Extract<LocalModelAssessment, { readonly _tag: "Fits" }>
+
+/** A catalog model's serving state; `fits` completes the state of a model that fits. */
+const catalogServingState = <Fitting>(
   ready: ReadyModel | undefined,
   assessment: VisibleCoordinatedLocalModelAssessment | undefined,
-  catalogScores: Pick<LocalModelRankingCandidate, "intelligenceScore" | "fidelityRank">,
-  unavailableFailure?: ModelFailure,
-): CatalogLocalModelServingState => {
-  if (ready === undefined) return { _tag: "Failed", profile: Option.none(), failure: unavailableFailure ?? failure(
+  unavailableFailure: ModelFailure | undefined,
+  fits: (assessment: CatalogFitsAssessment) => Fitting,
+) => {
+  if (ready === undefined) return { _tag: "Failed" as const, profile: Option.none(), failure: unavailableFailure ?? failure(
     "model_unavailable", "This model is not currently runnable.", true,
   ) }
   if (assessment === undefined || assessment._tag === "Assessing") return {
-    _tag: "Assessing", profile: ready.profile,
+    _tag: "Assessing" as const, profile: ready.profile,
   }
   const assessed = {
+    _tag: "Assessed" as const,
     metadata: ready.metadata,
     capabilities: assessment.capabilities,
     speculativeMethod: ready.speculativeMethod,
   }
   return assessment.assessment._tag === "Fits"
-    ? {
-        _tag: "Assessed", ...assessed, assessment: assessment.assessment,
-        rankingScores: modelRankingScores({
-          ...catalogScores,
-          profile: assessment.assessment.profile,
-          performance: assessment.assessment.residency.performance,
-        }),
-      }
+    ? { ...assessed, assessment: assessment.assessment, ...fits(assessment.assessment) }
     // The service never reports a catalog model as Unsupported; validation rejects that contract violation.
-    : { _tag: "Assessed", ...assessed,
-        assessment: validateDoesNotFitAssessment(assessment.assessment) }
+    : { ...assessed, assessment: validateDoesNotFitAssessment(assessment.assessment) }
 }
 
-const catalogSupport = (support: CatalogModel["support"]) => {
-  switch (support.level) {
-    case "supported": return { _tag: "Supported" as const }
-    case "disabled": return { _tag: "Disabled" as const, reason: support.reason }
-    case "deprecated": return {
-      _tag: "Deprecated" as const,
-      since: support.since,
-      replacement: support.replacement,
-      reason: support.reason,
-    }
-  }
-}
+/** A supported catalog model's serving state: a fitting one is ranked by its scores. */
+export const availableCatalogModelServingState = (
+  ready: ReadyModel | undefined,
+  assessment: VisibleCoordinatedLocalModelAssessment | undefined,
+  catalogScores: Pick<LocalModelRankingCandidate, "intelligenceScore" | "fidelityRank">,
+  unavailableFailure?: ModelFailure,
+): AvailableCatalogServingState => catalogServingState(ready, assessment, unavailableFailure, (fits) => ({
+  rankingScores: modelRankingScores({
+    ...catalogScores,
+    profile: fits.profile,
+    performance: fits.residency.performance,
+  }),
+}))
+
+/** A disabled or deprecated catalog model's serving state: it is never ranked. */
+export const unavailableCatalogModelServingState = (
+  ready: ReadyModel | undefined,
+  assessment: VisibleCoordinatedLocalModelAssessment | undefined,
+  unavailableFailure?: ModelFailure,
+): UnavailableCatalogServingState => catalogServingState(ready, assessment, unavailableFailure, () => ({}))
 
 export const catalogRemovalAcquisition = (
   acquisition: LocalModelAcquisitionState,
@@ -389,9 +394,8 @@ const catalogModel = (
     && source.localState.effective._tag === "Unavailable"
     ? source.localState.effective.failure
     : undefined
-  const catalogScores = { intelligenceScore: source.intelligence, fidelityRank: source.fidelityRank }
-  return validateCatalogLocalModel({
-    _tag: "Catalog",
+  const model = {
+    _tag: "Catalog" as const,
     modelId: entry.id,
     storageBytes: source.desired.metadata.storageBytes,
     presentation: {
@@ -401,23 +405,52 @@ const catalogModel = (
       license: Option.some(source.license),
       sourceUrls: source.sourceUrls,
     },
-    catalogData: {
-      releaseDate: decodeReleaseDate(source.releaseDate),
-      parameterization: source.parameterization,
-      intelligence: source.intelligence,
-      support: catalogSupport(source.support),
-      fidelityRank: source.fidelityRank,
-      quantizationAware: source.quantizationAware,
-      aliases: Option.getOrElse(source.aliases, () => [])
-        .filter((alias) => !hidden.some((hiddenId) => sameModelId(hiddenId, alias))).flatMap((alias) =>
-        Option.toArray(decodeCustomFormModelId(alias))),
-    },
     acquisitionState,
-    servingState: catalogModelServingState(ready, assessment, catalogScores, unavailableFailure),
     missingComponents: source.localState._tag === "Installed" ? source.localState.missingComponents : [],
     storedComponents: source.localState._tag === "Installed" ? source.localState.storedComponents : [],
     drafterWithheld: source.drafterWithheld,
-  })
+  }
+  const catalogData = {
+    releaseDate: decodeReleaseDate(source.releaseDate),
+    parameterization: source.parameterization,
+    fidelityRank: source.fidelityRank,
+    quantizationAware: source.quantizationAware,
+    aliases: Option.getOrElse(source.aliases, () => [])
+      .filter((alias) => !hidden.some((hiddenId) => sameModelId(hiddenId, alias))).flatMap((alias) =>
+      Option.toArray(decodeCustomFormModelId(alias))),
+  }
+  // Only a supported model is ranked.
+  const standing = () => {
+    const support = source.support
+    switch (support.level) {
+      case "supported": return {
+        catalogData: { ...catalogData, support: { _tag: "Supported" as const }, intelligence: support.intelligence },
+        servingState: availableCatalogModelServingState(
+          ready,
+          assessment,
+          { intelligenceScore: support.intelligence, fidelityRank: source.fidelityRank },
+          unavailableFailure,
+        ),
+      }
+      case "disabled": return {
+        catalogData: {
+          ...catalogData,
+          support: { _tag: "Disabled" as const, reason: support.reason },
+          intelligence: support.intelligence,
+        },
+        servingState: unavailableCatalogModelServingState(ready, assessment, unavailableFailure),
+      }
+      case "deprecated": return {
+        catalogData: {
+          ...catalogData,
+          support: { _tag: "Deprecated" as const, since: support.since, replacement: support.replacement, reason: support.reason },
+          intelligence: support.intelligence,
+        },
+        servingState: unavailableCatalogModelServingState(ready, assessment, unavailableFailure),
+      }
+    }
+  }
+  return validateCatalogLocalModel({ ...model, ...standing() })
 }
 
 const unavailableAssessment = failure(
