@@ -248,15 +248,15 @@ fn checked_decoder_family_bounds_every_prepared_class_axis() {
         BackendName::Cpu,
     )
     .unwrap();
-    assert_eq!(pools.target.workspace_bytes, family.storage.workspace);
-    assert_eq!(pools.target.output_bytes, family.storage.output);
+    assert_eq!(pools.target.charge.workspace_bytes, family.storage.workspace);
+    assert_eq!(pools.target.charge.output_bytes, family.storage.output);
     assert_eq!(pools.binding_constant_bytes, family.binding_constant_bytes);
     assert!(pools.binding_constant_bytes > 0);
     // The entry's tokens and the launch's controls, which its blocks
     // bind: a block of a plain load writes no input of its own.
-    assert_eq!(pools.target.upload_regions.len(), 2);
-    assert_eq!(pools.target.upload_regions[0], family.storage.upload);
-    assert!(pools.total_bytes >= pools.target.committed_bytes);
+    assert_eq!(pools.target.charge.upload_regions.len(), 2);
+    assert_eq!(pools.target.charge.upload_regions[0], family.storage.upload);
+    assert!(pools.total_bytes >= pools.target.charge.committed_bytes);
 }
 
 #[test]
@@ -749,7 +749,46 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         )
         .unwrap();
         assert!(pools.head.unwrap().workspace_bytes > 0);
+        // The target exports its exit residual to the head.
+        assert_undrafted_is_the_target_alone(&definition, &manifest, (&load, &state, method), limits, backend);
     }
+}
+
+/// A drafted load's undrafted target family
+/// (`AssessmentGraphResourceBounds::derive_with_undrafted`) is the target
+/// family a load of its target alone prepares, under that load's own state.
+fn assert_undrafted_is_the_target_alone(
+    definition: &ModelDefinition,
+    manifest: &magnitude_artifacts::PackageManifest,
+    drafted: (&ModelLoadPlan, &crate::StateResourcePlan, PlannedMethod),
+    limits: crate::ResourceLimits,
+    backend: BackendName,
+) {
+    let (load, state, method) = drafted;
+    let (bounds, undrafted) =
+        AssessmentGraphResourceBounds::derive_with_undrafted(definition, load, state, method, KvCodec::Dense, limits, backend)
+            .unwrap();
+    // The target alone: neither a separate draft nor an embedded head
+    // selected.
+    let alone = magnitude_artifacts::PackageManifest { draft: None, ..manifest.clone() };
+    let definition = &ModelDefinition { draft: None, ..definition.clone() };
+    let selection = ComponentSelection { head: false, vision: false };
+    let plain = ModelLoadPlan::derive(&alone, definition, selection, Layout::Rows16, PlannedMethod::Plain, limits).unwrap();
+    let plain_state = crate::ResourcePlanner::state_plan(
+        definition,
+        &plain,
+        PlannedMethod::Plain,
+        KvCodec::Dense,
+        limits,
+        crate::ResourceCapacity { domain_bytes: 512 << 20, tensor_operations: crate::TensorOperations::Absent },
+    )
+    .unwrap();
+    let target =
+        AssessmentGraphResourceBounds::derive(definition, &plain, &plain_state, PlannedMethod::Plain, KvCodec::Dense, limits, backend)
+            .unwrap()
+            .target;
+    assert_ne!(bounds.target, target, "the fixture's drafter writes from its target's graphs");
+    assert_eq!(undrafted, target);
 }
 
 /// A draft head of its own width that reads the target's history and is
@@ -1128,6 +1167,9 @@ fn a_projection_a_separate_draft_reads_is_stored_packed() {
         )
         .unwrap();
         assert!(family.storage.workspace > 0 && family.storage.output > 0);
+        // The target's exit block taps its output to the draft.
+        let method = PlannedMethod::DFlash { proposals: 1, widths: crate::DraftWidths::Adaptive };
+        assert_undrafted_is_the_target_alone(&definition, &manifest, (&load, &state, method), limits, BackendName::Metal);
     }
 }
 

@@ -135,7 +135,7 @@ impl SealReport {
 /// index: its geometry, the resident element and shape of each weight role
 /// within the block, and its recurrent state components. Blocks with equal
 /// shapes share plans.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct BlockGraphShape {
     geometry: String,
     /// (sublayer, branch) of each role, its resident element, shape and
@@ -148,6 +148,9 @@ pub(super) struct BlockGraphShape {
     mixes_exit: bool,
     /// Where a separate draft taps the block.
     tapped: TapPositions,
+    /// Whether the block exports its output residual to a head
+    /// (`FamilyOutline::exports_residual`).
+    residual: bool,
     /// Whether the block's routed layer is the load's first streamed one,
     /// which sets a bank-served launch's step.
     sets_step: bool,
@@ -163,6 +166,14 @@ pub(super) struct BlockGraphShape {
     /// none for a block that streams none or the first streamed one. A
     /// graph shared by blocks binds each one's predictor at the same offset.
     hinted_by: Option<u32>,
+}
+
+impl BlockGraphShape {
+    /// The shape without its drafter's writes: no taps, no exported
+    /// residual (`FamilyOutline::undrafted`).
+    pub(super) fn undrafted(&self) -> Self {
+        Self { tapped: TapPositions::default(), residual: false, ..self.clone() }
+    }
 }
 
 /// A block's draft tap indices (column blocks of the draft input rows): at
@@ -354,6 +365,7 @@ pub(super) fn block_graph_shapes(
     geometry: &Decoder,
     state: &StateResourcePlan,
     tapped: &[BlockTaps],
+    residual: Option<usize>,
 ) -> Result<Vec<BlockGraphShape>, String> {
     let components = &state.target_state().recurrent_components;
     geometry
@@ -419,6 +431,7 @@ pub(super) fn block_graph_shapes(
                 mixes_exit: index + 1 == geometry.blocks.len()
                     && matches!(geometry.exit.norm, ExitNorm::HyperConnectionHead(_)),
                 tapped: tapped[index].positions(),
+                residual: residual == Some(index),
                 sets_step: {
                     let scope = block_scopes(index)?[1];
                     load.expert_bank().is_some_and(|bank| {
@@ -610,6 +623,7 @@ impl PreparedTargetGraphs {
                 plan.blocks()[index],
                 BlockGraphInputs {
                     output_scales: handles.blocks[index].output_scales,
+                    residual: outline.exports_residual(index),
                     ..BlockGraphInputs::of_class(load, geometry, state, index, staged, capacity)
                 },
                 &certificate.blocks[index][&class_topology(staged)].layout,

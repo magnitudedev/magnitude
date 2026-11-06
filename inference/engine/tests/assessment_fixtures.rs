@@ -670,11 +670,11 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     let Err(PlanError::WeightCap {
         needed: floor_weights,
         ..
-    }) = draft.clone().with_bank(&definition, Some(0))
+    }) = draft.clone().with_bank::<magnitude_executor::AssessmentMemoryCharge>(&definition, Some(0))
     else {
         panic!("no bank holds no weights");
     };
-    let floor = draft.clone().with_bank(&definition, Some(floor_weights)).unwrap().into_draft();
+    let floor = draft.clone().with_bank::<magnitude_executor::AssessmentMemoryCharge>(&definition, Some(floor_weights)).unwrap().into_draft();
     let bank = floor.load().expert_bank().unwrap().clone();
     assert_eq!(bank.slots, bank.floor());
     // A bank's weights at `slots`, its record tensors reserved as the
@@ -771,7 +771,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     // A draft re-planned as an assessment's fallback does keeps its tier,
     // which is then what its fit reports the cold experts lie in.
     let (replanned, ()) = draft
-        .with_held_experts(&definition, u64::MAX, &mut HeldCharges::default(), |_, _| {
+        .with_held_experts(&definition, u64::MAX, &mut HeldCharges::<magnitude_executor::AssessmentMemoryCharge>::default(), |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
@@ -912,11 +912,11 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
         unreachable!("the model was assessed");
     };
     let Err(PlanError::WeightCap { needed: floor_weights, .. }) =
-        draft.clone().with_bank(definition, Some(0))
+        draft.clone().with_bank::<magnitude_executor::AssessmentMemoryCharge>(definition, Some(0))
     else {
         panic!("no bank holds no weights");
     };
-    let floor = draft.clone().with_bank(definition, Some(floor_weights)).unwrap().into_draft();
+    let floor = draft.clone().with_bank::<magnitude_executor::AssessmentMemoryCharge>(definition, Some(floor_weights)).unwrap().into_draft();
     let bank = floor.load().expert_bank().unwrap();
     assert_eq!(bank.slots, shares.floor());
     // A bank's weights at `slots`, its record tensors reserved as the
@@ -940,12 +940,12 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
         allocation.capacity_bytes - allocation.reserve_bytes,
         weights(shares.slots()),
     ] {
-        let capped = draft.clone().with_bank(definition, Some(cap)).unwrap().into_draft();
+        let capped = draft.clone().with_bank::<magnitude_executor::AssessmentMemoryCharge>(definition, Some(cap)).unwrap().into_draft();
         assert_eq!(capped.load().expert_bank().unwrap().slots, shares.slots(), "a cap of {cap}");
     }
     // The plan of one slot more, whatever its fit.
     let (beyond, ()) = draft
-        .with_held_experts(definition, weights(shares.slots() + 1), &mut HeldCharges::default(), |_, _| {
+        .with_held_experts(definition, weights(shares.slots() + 1), &mut HeldCharges::<magnitude_executor::AssessmentMemoryCharge>::default(), |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
@@ -955,7 +955,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     // derived: the plan it holds has that size's own charge.
     let (fewer, ()) = beyond
         .draft()
-        .with_held_experts(definition, u64::MAX, &mut beyond.held(), |candidate, _| {
+        .with_held_experts(definition, u64::MAX, &mut beyond.held().clone(), |candidate, _| {
             let slots = candidate.load().expert_bank().map_or(0, |bank| bank.slots);
             Ok::<_, AssessmentError>(match slots <= shares.slots() {
                 true => Ok(()),

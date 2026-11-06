@@ -165,7 +165,7 @@ fn plan_load(manifest: &ExecutionManifest, selected: &platform::SelectedDevice) 
         .map(|root| KernelCache::open(root, DEFAULT_KERNEL_CACHE_BYTES).map(Arc::new))
         .transpose()
         .map_err(|error| internal(error.to_string()))?;
-    let draft = crate::planning::plan_banked(manifest, resident.clone())
+    let draft = crate::planning::plan_banked::<magnitude_executor::AssessmentMemoryCharge>(manifest, resident.clone())
         .map_err(planned)?
         .into_draft();
     Ok(LoadPlans { resident, draft, kernel_cache })

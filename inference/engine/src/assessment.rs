@@ -3,11 +3,12 @@
 //! Opens only the GGUF headers of the target, its optional projector and
 //! drafter. Independent header checks (weight encodings, the family's
 //! interpretation, the tokenizer and the chat templates) each run and their
-//! refusals are reported together. An admitted target is planned plain
-//! through [`crate::planning::plan_execution`] (the production planning
-//! inputs), which decides whether it runs here; its drafter is then planned
-//! with it, and a drafter that does not bind or plan is `Rejected` without
-//! affecting the target. A projector the family cannot bind is `Rejected`
+//! refusals are reported together. An admitted target is planned through
+//! [`crate::planning::plan_execution`] (the production planning inputs)
+//! with its drafter, and the target's plan alone is charged beside it from
+//! its headers, which decides whether it runs here; a drafter that does not
+//! bind or plan is `Rejected` without affecting the target, which is then
+//! planned alone. A projector the family cannot bind is `Rejected`
 //! the same way: the target is interpreted and planned without it, taking
 //! text input only. The selected plan is assessed against stable memory
 //! capacity and, once the measurement job has stored them, the selected
@@ -21,7 +22,7 @@ use crate::error::{
 use crate::fingerprint::ModelFingerprint;
 use crate::host::{bind_draft, interpret_target, vocabulary_mismatch, InterpretedTarget};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod};
-use crate::planning::{plan_backend, plan_execution, ExecutionPlanningError};
+use crate::planning::{plan_backend, plan_execution, plan_resident, ExecutionPlanningError};
 use magnitude_artifacts::{
     gguf::{Directory, FileHeaders, HeaderSource, TensorDescriptor},
     ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest, TemplatePayload,
@@ -34,15 +35,15 @@ use magnitude_chat::{
 use magnitude_executor::{
     assessment::{
         assess_execution_fit, decode_demand, decode_pricing, estimate_execution, performance_depths,
-        prepare_execution_assessment, step_seconds, AssessmentError, AssessmentRequest, Pricing,
+        prepare_execution_assessment, step_seconds, undrafted_memory_charge, AssessmentError,
+        AssessmentRequest, Pricing,
         DomainFit, ExecutionAssessment, ExecutionFit, ExecutionShortfall,
         ExecutorCosts, ExpertShares, MissRecord, PerformanceEstimate, PreparedExecutionAssessment,
         PointRequests, Residency as FitResidency, StoredCosts, StoredMisses,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
-    held_storage, resident_layout, scaled_source_element, stored_weights, ExecutionPath,
-    ExecutionPlanDraft,
-    KernelCache,
+    held_storage, resident_layout, scaled_source_element, stored_weights, AssessmentMemoryCharge,
+    ChargedDraft, DraftedCharge, ExecutionPath, ExecutionPlanDraft, HeldCharge, KernelCache,
 };
 use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, ScaledActivations};
 use magnitude_scheduler::ServiceLimits;
@@ -701,15 +702,17 @@ pub fn assess_model(
 }
 
 /// Prepare one package from its headers on the selected execution
-/// configuration: admission (every header refusal at once), the target's
-/// plain plan and its decode demand and checked memory charge, then the
-/// drafter's plan when one is admitted. A drafter is `Bound` with what its
-/// plan adds to the plain plan's memory at the fit depth: its weights, state
+/// configuration: admission (every header refusal at once), then the plan
+/// assessed, with its decode demand and checked memory charge: the drafted
+/// plan when a drafter is admitted, the target's plan alone otherwise. A
+/// drafter is `Bound` with what its plan adds to the target's alone at the
+/// fit depth and the drafted plan's holding of experts: its weights, state
 /// and prepared resources on the device
 /// ([`magnitude_executor::AssessmentMemoryCharge::serving_bytes`]) and the
 /// host memory of its kernels and graphs
-/// ([`magnitude_executor::AssessmentMemoryCharge::host_bytes`]); the drafted
-/// plan is the one assessed. Reads only the structure, so a preparation
+/// ([`magnitude_executor::AssessmentMemoryCharge::host_bytes`]), the target
+/// alone charged from its headers beside the drafted plan's certification
+/// (`drafter_memory_bytes`). Reads only the structure, so a preparation
 /// holds under every measurement of it.
 pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
@@ -747,17 +750,6 @@ pub fn prepare_model_assessment_from(
     let plain = environment
         .plain(&admitted)
         .map_err(ModelAssessmentError::Configuration)?;
-    let (plain_definition, plain_draft, plain_execution) =
-        match prepare_plan(plain, &structure.selected, admitted.context_limit) {
-            Ok(planned) => planned,
-            Err(Refusal::Unsupported(unsupported)) => {
-                return Ok(PreparedModelAssessment::Unsupported {
-                    unsupported,
-                    fingerprint: admitted.fingerprint,
-                });
-            }
-            Err(Refusal::Failed(error)) => return Err(error),
-        };
     let drafted = match &admitted.drafter {
         DrafterAdmission::None => Err(DrafterVerdict::None),
         DrafterAdmission::Rejected(unsupported) => {
@@ -766,7 +758,7 @@ pub fn prepare_model_assessment_from(
         DrafterAdmission::Candidate { definition, method } => environment
             .drafted(&admitted, definition, *method)
             .and_then(|(manifest, method)| {
-                match prepare_plan(manifest, &structure.selected, admitted.context_limit) {
+                match prepare_plan::<DraftedCharge>(manifest, &structure.selected, admitted.context_limit) {
                     Ok(planned) => Ok((method, planned)),
                     Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
                     Err(Refusal::Failed(error)) => {
@@ -776,27 +768,30 @@ pub fn prepare_model_assessment_from(
             })
             .map_err(DrafterVerdict::Rejected),
     };
+    // The target's plan alone is a package's refusal: a drafter's own is
+    // the drafter's.
+    let refused = |refusal| match refusal {
+        Refusal::Unsupported(unsupported) => Ok(PreparedModelAssessment::Unsupported {
+            unsupported,
+            fingerprint: admitted.fingerprint.clone(),
+        }),
+        Refusal::Failed(error) => Err(error),
+    };
     let (drafter, definition, draft, execution) = match drafted {
-        Ok((method, (definition, draft, execution))) => {
-            let held = |charge: &magnitude_executor::AssessmentMemoryCharge| {
-                charge
-                    .host_bytes()
-                    .map(|host| charge.serving_bytes.saturating_add(host))
-                    .map_err(ModelAssessmentError::Planning)
-            };
-            let memory_bytes = held(execution.memory_charge())?
-                .saturating_sub(held(plain_execution.memory_charge())?);
-            (
-                DrafterVerdict::Bound {
-                    method,
-                    memory_bytes,
-                },
-                definition,
-                draft,
-                execution,
-            )
+        Ok((method, (definition, planned, execution))) => {
+            match drafter_memory_bytes(plain, &structure.selected, &planned) {
+                Ok(memory_bytes) => {
+                    (DrafterVerdict::Bound { method, memory_bytes }, definition, planned.into_draft(), execution)
+                }
+                Err(refusal) => return refused(refusal),
+            }
         }
-        Err(verdict) => (verdict, plain_definition, plain_draft, plain_execution),
+        Err(verdict) => {
+            match prepare_plan::<AssessmentMemoryCharge>(plain, &structure.selected, admitted.context_limit) {
+                Ok((definition, planned, execution)) => (verdict, definition, planned.into_draft(), execution),
+                Err(refusal) => return refused(refusal),
+            }
+        }
     };
     Ok(PreparedModelAssessment::Planned {
         facts: admitted.facts(drafter),
@@ -804,6 +799,43 @@ pub fn prepare_model_assessment_from(
         draft,
         execution,
     })
+}
+
+/// What a drafter adds to the target's plan alone (`plain`) at the drafted
+/// plan's holding of experts (`ExecutionPlanDraft::holding_as`): the
+/// device's serving charge and the host's, of `drafted` less of the target
+/// alone. The target alone's target family is the drafted plan's without its
+/// drafter's writes, certified with it (`ChargedDraft::undrafted`); every
+/// other term is the target's own, from its headers.
+fn drafter_memory_bytes(
+    plain: ExecutionManifest,
+    selected: &SelectedDevice,
+    drafted: &ChargedDraft<DraftedCharge>,
+) -> Result<u64, Refusal> {
+    let backend = selected.info.backend();
+    let resident = plan_resident(&plain, selected).map_err(|error| match error {
+        ExecutionPlanningError::Plan(error) => Refusal::of(classify_plan(error, backend)),
+        error => Refusal::Failed(ModelAssessmentError::Planning(error.to_string())),
+    })?;
+    let alone = resident
+        .holding_as(&plain.definition, drafted.draft())
+        .map_err(|error| Refusal::of(classify_plan(error, backend)))?;
+    let charge = undrafted_memory_charge(&plain.definition, &alone, drafted.undrafted().clone()).map_err(|error| match error {
+        AssessmentError::Graph(error) => Refusal::of(classify_graph(error)),
+        error => Refusal::Failed(ModelAssessmentError::Assessment(error)),
+    })?;
+    let held = |charge: &AssessmentMemoryCharge| {
+        charge
+            .host_bytes()
+            .and_then(|host| charge.serving_bytes.checked_add(host).ok_or_else(|| "held charge overflows".to_owned()))
+            .map_err(|error| Refusal::Failed(ModelAssessmentError::Planning(error)))
+    };
+    let (with, without) = (held(drafted.charge())?, held(&charge)?);
+    assert!(
+        with >= without,
+        "a drafted plan holds {with} bytes, less than its target's plan alone ({without}) at the same holding of experts"
+    );
+    Ok(with - without)
 }
 
 /// The native kernels a load of one package prepares on a backend, or why
@@ -896,23 +928,29 @@ enum Refusal {
     Failed(ModelAssessmentError),
 }
 
+impl Refusal {
+    /// A planner's or kernel domain's outcome as a refusal.
+    fn of(outcome: PlanOutcome) -> Self {
+        match outcome {
+            PlanOutcome::Unsupported(unsupported) => Self::Unsupported(unsupported),
+            PlanOutcome::WeightCap(error) => Self::Failed(ModelAssessmentError::WeightCap(error)),
+            PlanOutcome::Internal(reason) => Self::Failed(ModelAssessmentError::Planning(reason)),
+        }
+    }
+}
+
 /// Plan `manifest` on the selected device, then its decode demand and
 /// checked memory charge, which builds every graph a load prepares. Planner
 /// refusals and kernel domains classify exactly as a load's do.
-fn prepare_plan(
+fn prepare_plan<C: HeldCharge>(
     manifest: ExecutionManifest,
     selected: &SelectedDevice,
     context_limit: u32,
-) -> Result<(ModelDefinition, ExecutionPlanDraft, PreparedExecutionAssessment), Refusal> {
-    let refused = |outcome: PlanOutcome| match outcome {
-        PlanOutcome::Unsupported(unsupported) => Refusal::Unsupported(unsupported),
-        PlanOutcome::WeightCap(error) => Refusal::Failed(ModelAssessmentError::WeightCap(error)),
-        PlanOutcome::Internal(reason) => Refusal::Failed(ModelAssessmentError::Planning(reason)),
-    };
+) -> Result<(ModelDefinition, ChargedDraft<C>, PreparedExecutionAssessment), Refusal> {
     let planned = match plan_execution(&manifest, selected) {
         Ok(planned) => planned,
         Err(ExecutionPlanningError::Plan(error)) => {
-            return Err(refused(classify_plan(error, selected.info.backend())));
+            return Err(Refusal::of(classify_plan(error, selected.info.backend())));
         }
         Err(error) => {
             return Err(Refusal::Failed(ModelAssessmentError::Planning(
@@ -921,8 +959,8 @@ fn prepare_plan(
         }
     };
     match prepare_execution_assessment(&manifest.definition, &planned, context_limit) {
-        Ok(execution) => Ok((manifest.definition, planned.into_draft(), execution)),
-        Err(AssessmentError::Graph(error)) => Err(refused(classify_graph(error))),
+        Ok(execution) => Ok((manifest.definition, planned, execution)),
+        Err(AssessmentError::Graph(error)) => Err(Refusal::of(classify_graph(error))),
         Err(error) => Err(Refusal::Failed(ModelAssessmentError::Assessment(error))),
     }
 }

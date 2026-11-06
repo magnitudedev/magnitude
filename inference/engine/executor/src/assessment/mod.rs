@@ -30,7 +30,7 @@ pub mod streaming;
 pub mod streaming_costs;
 
 pub use assess::{
-    assess_execution_fit, decode_demand, decode_pricing, estimate_execution, execution_memory_charge, StructuralCharge,
+    assess_execution_fit, decode_demand, decode_pricing, estimate_execution, execution_memory_charge, execution_memory_charge_with_undrafted, undrafted_memory_charge, StructuralCharge,
     prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit, ExecutionAssessment,
     ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, PreparedExecutionAssessment, Residency,
 };

@@ -271,6 +271,10 @@ pub(super) struct BlockGraphInputs<'a> {
     pub(super) stage: Stage,
     /// The rows a pass groups (`group_pass_rows`).
     pub(super) capacity: u64,
+    /// Whether the graph exports the block's output residual beside its
+    /// output: the exit block's, for a head conditioned on it
+    /// (`FamilyOutline::exports_residual`).
+    pub(super) residual: bool,
 }
 
 impl<'a> BlockGraphInputs<'a> {
@@ -297,6 +301,7 @@ impl<'a> BlockGraphInputs<'a> {
             output_scales: OutputScales { mixer: 1.0, feed_forward: 1.0, per_layer: 1.0 },
             stage,
             capacity,
+            residual: false,
         }
     }
 }
@@ -399,6 +404,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         scored,
         output_scales,
         stage,
+        residual,
     } = inputs;
     let block = geometry
         .blocks
@@ -557,9 +563,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             Some(ports.step)
         }
     };
-    let residual = (block_index + 1 == geometry.blocks.len()
-        && load.residual_conditioning().is_some())
-    .then(|| output.clone());
+    let residual = residual.then(|| output.clone());
     // The block that binds the decoder's exit site (the last) ends with it,
     // and the readout sums its partials.
     let exit = streams_entries.and_then(|entries| entries.sites.exit);

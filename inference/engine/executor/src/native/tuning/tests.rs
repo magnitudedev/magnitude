@@ -3850,7 +3850,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             },
         )
         .unwrap()
-        .with_bank(&definition, None)
+        .with_bank::<crate::AssessmentMemoryCharge>(&definition, None)
         .unwrap()
         .into_draft();
         assert!(draft.load().expert_bank().is_some(), "{streamed}: the load streams its experts");

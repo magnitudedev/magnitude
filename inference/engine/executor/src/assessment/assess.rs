@@ -15,8 +15,8 @@ use super::AssessmentError;
 use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryCharge, AssessmentMemoryTerms, ChargedDraft, DeviceProcessBytes, ExecutionPlanDraft, HeldCharges,
-    HostProcessBytes, ResourceCapacity, ResourcePlanner,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, ChargedDraft, DeviceProcessBytes, ExecutionPlanDraft, HeldCharge, HeldCharges,
+    HostProcessBytes, ResourceCapacity, ResourcePlanner, TargetGraphBounds,
 };
 use magnitude_family_contracts::ModelDefinition;
 use seismic::{DeviceTopology, Executor, Status, StoreId};
@@ -228,9 +228,9 @@ impl PreparedExecutionAssessment {
 /// Perform model-specific arithmetic while the fixed generic basis is
 /// measured: the plain decode step's demand ([`decode_demand`]) beside the
 /// memory charge planning confirmed of the draft ([`ChargedDraft`]).
-pub fn prepare_execution_assessment(
+pub fn prepare_execution_assessment<C: HeldCharge>(
     definition: &ModelDefinition,
-    planned: &ChargedDraft,
+    planned: &ChargedDraft<C>,
     context_limit: u32,
 ) -> Result<PreparedExecutionAssessment, AssessmentError> {
     if definition.decoder.context_limit != u64::from(context_limit) {
@@ -245,7 +245,7 @@ pub fn prepare_execution_assessment(
         demand: decode_demand(definition, planned.draft())?,
         fit_context_tokens,
         charge: *planned.charge(),
-        held: planned.held(),
+        held: planned.held().charges(),
     })
 }
 
@@ -259,6 +259,27 @@ pub fn execution_memory_charge(
     draft: &ExecutionPlanDraft,
 ) -> Result<AssessmentMemoryCharge, AssessmentError> {
     StructuralCharge::of(definition, draft)?.charge(definition, draft)
+}
+
+/// [`execution_memory_charge`], with the bounds of the draft's target
+/// family without its drafter's writes ([`StructuralCharge::with_undrafted`]).
+pub fn execution_memory_charge_with_undrafted(
+    definition: &ModelDefinition,
+    draft: &ExecutionPlanDraft,
+) -> Result<(AssessmentMemoryCharge, TargetGraphBounds), AssessmentError> {
+    let (structure, undrafted) = StructuralCharge::with_undrafted(definition, draft)?;
+    Ok((structure.charge(definition, draft)?, undrafted))
+}
+
+/// The standard workload's checked memory charge of the target's plan
+/// alone, `plain`, at its drafted plan's holding of experts, whose target
+/// family is that plan's undrafted one ([`StructuralCharge::undrafted`]).
+pub fn undrafted_memory_charge(
+    definition: &ModelDefinition,
+    plain: &ExecutionPlanDraft,
+    target: TargetGraphBounds,
+) -> Result<AssessmentMemoryCharge, AssessmentError> {
+    StructuralCharge::undrafted(definition, plain, target)?.charge(definition, plain)
 }
 
 /// The terms of a draft's charge that its expert bank's slots leave as they
@@ -285,6 +306,78 @@ pub struct StructuralCharge {
 impl StructuralCharge {
     /// The structure of `draft`'s charge.
     pub fn of(definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<Self, AssessmentError> {
+        Self::with_graph(definition, draft, |state| {
+            let policy = draft.policy();
+            AssessmentGraphResourceBounds::derive(
+                definition,
+                draft.load(),
+                state,
+                policy.method(),
+                policy.codec(),
+                policy.limits(),
+                draft.device().backend(),
+            )
+            .map(|graph| (graph, ()))
+        })
+        .map(|(structure, ())| structure)
+    }
+
+    /// [`Self::of`], with the bounds of the draft's target family without
+    /// its drafter's writes ([`AssessmentGraphResourceBounds::derive_with_undrafted`]),
+    /// which [`Self::undrafted`] charges the target's plan alone with.
+    pub fn with_undrafted(
+        definition: &ModelDefinition,
+        draft: &ExecutionPlanDraft,
+    ) -> Result<(Self, TargetGraphBounds), AssessmentError> {
+        Self::with_graph(definition, draft, |state| {
+            let policy = draft.policy();
+            AssessmentGraphResourceBounds::derive_with_undrafted(
+                definition,
+                draft.load(),
+                state,
+                policy.method(),
+                policy.codec(),
+                policy.limits(),
+                draft.device().backend(),
+            )
+        })
+    }
+
+    /// The structure of `plain`'s charge, the target's plan alone at a
+    /// drafted plan's holding of its experts
+    /// (`ExecutionPlanDraft::holding_as`), whose target family's bounds are
+    /// `target`, the drafted plan's undrafted family
+    /// ([`Self::with_undrafted`]): every other family of `plain` is
+    /// certified here, the target's not again.
+    pub fn undrafted(
+        definition: &ModelDefinition,
+        plain: &ExecutionPlanDraft,
+        target: TargetGraphBounds,
+    ) -> Result<Self, AssessmentError> {
+        Self::with_graph(definition, plain, |state| {
+            let policy = plain.policy();
+            AssessmentGraphResourceBounds::of_target(
+                definition,
+                plain.load(),
+                plain.programs(),
+                state,
+                policy.method(),
+                policy.limits(),
+                plain.device().backend(),
+                target,
+            )
+            .map(|graph| (graph, ()))
+        })
+        .map(|(structure, ())| structure)
+    }
+
+    /// The structure of `draft`'s charge with the graph bounds `graph`
+    /// derives from its state plan, and what else `graph` gives.
+    fn with_graph<T>(
+        definition: &ModelDefinition,
+        draft: &ExecutionPlanDraft,
+        graph: impl FnOnce(&crate::StateResourcePlan) -> Result<(AssessmentGraphResourceBounds, T), crate::GraphError>,
+    ) -> Result<(Self, T), AssessmentError> {
         let policy = draft.policy();
         let backend = draft.device().backend();
         let state = ResourcePlanner::state_plan(
@@ -299,16 +392,7 @@ impl StructuralCharge {
             },
         )
         .map_err(AssessmentError::Plan)?;
-        let graph = AssessmentGraphResourceBounds::derive(
-            definition,
-            draft.load(),
-            &state,
-            policy.method(),
-            policy.codec(),
-            policy.limits(),
-            backend,
-        )
-        .map_err(AssessmentError::Graph)?;
+        let (graph, more) = graph(&state).map_err(AssessmentError::Graph)?;
         let host_process =
             HostProcessBytes::derive(definition, draft.load(), draft.programs(), policy.limits(), backend)
                 .map_err(AssessmentError::Memory)?;
@@ -319,7 +403,10 @@ impl StructuralCharge {
         };
         let (workload_state_bytes, startup_state_bytes, loaded_state_bytes) =
             state_bytes().map_err(AssessmentError::Memory)?;
-        Ok(Self { graph, host_process, device_process, workload_state_bytes, startup_state_bytes, loaded_state_bytes })
+        Ok((
+            Self { graph, host_process, device_process, workload_state_bytes, startup_state_bytes, loaded_state_bytes },
+            more,
+        ))
     }
 
     /// The charge of `draft`, a draft of this structure: its weights'
@@ -432,7 +519,7 @@ pub fn assess_execution_fit(
             AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
         })
     };
-    let mut held = prepared.held;
+    let mut held = prepared.held.clone();
     Ok(match draft.with_held_experts(definition, bound, &mut held, confirm)? {
         Ok((held, (fit_context_tokens, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,

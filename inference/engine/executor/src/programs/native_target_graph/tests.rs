@@ -195,7 +195,7 @@ mod shared_graph_tests {
         .unwrap();
         let plan = load.program_plan(&definition, codec).unwrap();
         let (_, tapped) = block_taps(plan.target(), &definition.decoder).unwrap();
-        let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped).unwrap();
+        let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, None).unwrap();
         let bank = load.expert_bank().unwrap();
         let home = |index: usize| block_layer(bank, index).ok().map(|layer| bank.home(layer));
         assert_eq!(shapes[1], shapes[2], "the first two attention blocks share a graph");
@@ -317,7 +317,7 @@ mod resource_template_tests {
         let geometry = &definition.decoder;
         let plan = load.program_plan(&definition, codec).unwrap();
         let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-        let shapes = block_graph_shapes(&load, geometry, &state, &tapped).unwrap();
+        let shapes = block_graph_shapes(&load, geometry, &state, &tapped, None).unwrap();
         assert_ne!(shapes[0], shapes[1], "stream widening cannot be shared");
         assert_eq!(shapes[1], shapes[2], "interior graphs still share");
         assert_ne!(shapes[2], shapes[3], "the exit mix cannot be omitted");
@@ -443,7 +443,7 @@ mod resource_template_tests {
             backend,
         )
         .unwrap();
-        assert_eq!(assessed.target.workspace_bytes, family);
+        assert_eq!(assessed.target.charge.workspace_bytes, family);
         let max_segments = state.target_state().span_limit().next_power_of_two() as u64;
         let listings =
             block_listings(&state, backend, plan.target().blocks()[index], index, 512).unwrap();
@@ -752,7 +752,7 @@ mod resource_template_tests {
                 // each exact class's own topology: blocks of one shape seal
                 // one plan per class (no block here reads a layer scale).
                 let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
-                let shapes = block_graph_shapes(&load, geometry, &state, &tapped).unwrap();
+                let shapes = block_graph_shapes(&load, geometry, &state, &tapped, None).unwrap();
                 let sealed = std::cell::Cell::new((0usize, HostHeap::default()));
                 let seals = |heap: HostHeap| {
                     let (graphs, held) = sealed.get();

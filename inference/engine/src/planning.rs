@@ -14,7 +14,7 @@ use magnitude_executor::{
     platform::{self, PlatformError, SelectedDevice},
     BackendPlan, ComponentSelection,
     DraftWidths,
-    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, PlanError, PlannedMethod, ResourceLimits,
+    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
 use seismic::Devices;
@@ -64,11 +64,12 @@ pub(crate) fn select_load_device(
 /// then `ExecutionPlanner::prepare`, then its expert bank under the model
 /// policy's weight cap, if any (`ExecutionPlanDraft::with_bank`). Opens no
 /// device and reads no payload. The draft comes with the memory charge its
-/// planning confirmed.
-pub fn plan_execution(
+/// planning confirmed, each way of holding its experts charged as a `C`
+/// (`HeldCharge`).
+pub fn plan_execution<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
-) -> Result<ChargedDraft, ExecutionPlanningError> {
+) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
     plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, resident))
 }
 
@@ -93,10 +94,10 @@ pub fn plan_resident(
 
 /// [`plan_execution`]'s plan from its `resident` plan: its expert bank,
 /// under the model policy's weight cap, if any, with its charge.
-pub fn plan_banked(
+pub fn plan_banked<C: HeldCharge>(
     manifest: &ExecutionManifest,
     resident: ExecutionPlanDraft,
-) -> Result<ChargedDraft, ExecutionPlanningError> {
+) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
     resident
         .with_bank(&manifest.definition, manifest.model.weight_cap)
         .map_err(ExecutionPlanningError::Plan)

@@ -69,7 +69,7 @@ pub struct AssessmentMemoryBounds {
     pub component_upload_bytes: u64,
     pub staging_upload_bytes: u64,
     /// Host heap of the sealed target graphs
-    /// (`AssessmentGraphResourceBounds::sealed_target_graphs`): system RAM
+    /// (`TargetGraphBounds::sealed`): system RAM
     /// like the host tables, held from sealing on.
     pub sealed_graph_host_bytes: SealedGraphHostBytes,
     /// Host heap of the static bindings of those graphs
@@ -429,6 +429,34 @@ pub enum AssessmentFitVerdict {
     },
 }
 
+/// A target graph family's checked bounds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetGraphBounds {
+    /// Its pools at the startup slots.
+    pub charge: NativeGraphCharge,
+    /// The graphs a load seals and the host heap they hold, from the
+    /// sealer's own enumeration: one count, or bounds from both sides where
+    /// blocks that read a layer scale could share a plan
+    /// (`PlannedSealedGraphs::exact`). Host memory, not part of
+    /// `AssessmentGraphResourceBounds::total_bytes`.
+    pub sealed: crate::PlannedSealedGraphs,
+    /// The constants and floor buffers its binding allocates.
+    pub binding_constant_bytes: u64,
+}
+
+impl TargetGraphBounds {
+    fn of(
+        (resources, sealed, upload_regions, graphs): crate::programs::native_target_graph::CheckedTargetFamily,
+        slots: super::GraphSlots,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            charge: NativeGraphCharge::from_checked(resources.storage, upload_regions, slots, graphs)?,
+            sealed,
+            binding_constant_bytes: resources.binding_constant_bytes,
+        })
+    }
+}
+
 /// Checked graph-pool demand and distinct bound constants from the same class
 /// enumeration and slot multipliers as native preparation: an upper bound for
 /// every graph pool a clean load commits on the selected backend. Deriving
@@ -437,7 +465,7 @@ pub enum AssessmentFitVerdict {
 /// outside its domain on the backend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssessmentGraphResourceBounds {
-    pub target: NativeGraphCharge,
+    pub target: TargetGraphBounds,
     pub readout: NativeGraphCharge,
     pub head: Option<NativeGraphCharge>,
     pub vision: Option<NativeGraphCharge>,
@@ -449,12 +477,6 @@ pub struct AssessmentGraphResourceBounds {
     /// prompt group grows its class, which a device's graph cost prices
     /// (`AssessmentHeaderBounds::with_graph_resource_bound`).
     pub recorded_graphs: seismic::GraphCensus,
-    /// The target graphs a load seals and the host heap they hold, from
-    /// the sealer's own enumeration: one count, or bounds from both sides
-    /// where blocks that read a layer scale could share a plan
-    /// (`PlannedSealedGraphs::exact`). Host memory, not part of
-    /// `total_bytes`.
-    pub sealed_target_graphs: crate::PlannedSealedGraphs,
     /// The host heap of the state copy graphs a load prepares
     /// (`PreparedStateCopyGraphs::host_heap`): their sealed plans and what
     /// stores them, exact from the classes the load prepares. Host memory,
@@ -477,6 +499,49 @@ impl AssessmentGraphResourceBounds {
         limits: super::ResourceLimits,
         backend: BackendName,
     ) -> Result<Self, GraphError> {
+        let plan = Self::program_plan(definition, load, method, codec)?;
+        let target =
+            crate::programs::native_target_graph::checked_target_family(backend, load, &definition.decoder, state, plan.target(), limits)?;
+        let target = TargetGraphBounds::of(target, limits.startup_slots().target)?;
+        Self::of_target(definition, load, &plan, state, method, limits, backend, target)
+    }
+
+    /// [`Self::derive`], with the bounds of the same target's family
+    /// without its drafter's writes (its draft taps and the residual its
+    /// head is conditioned on): the target family a load of the target alone
+    /// at the same holding of experts prepares, from the one certification
+    /// of the layouts both families seal into.
+    pub fn derive_with_undrafted(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        state: &super::StateResourcePlan,
+        method: PlannedMethod,
+        codec: KvCodec,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+    ) -> Result<(Self, TargetGraphBounds), GraphError> {
+        let plan = Self::program_plan(definition, load, method, codec)?;
+        let [target, undrafted] = crate::programs::native_target_graph::checked_target_and_undrafted(
+            backend,
+            load,
+            &definition.decoder,
+            state,
+            plan.target(),
+            limits,
+        )?;
+        let slots = limits.startup_slots().target;
+        let target = TargetGraphBounds::of(target, slots)?;
+        let bounds = Self::of_target(definition, load, &plan, state, method, limits, backend, target)?;
+        Ok((bounds, TargetGraphBounds::of(undrafted, slots)?))
+    }
+
+    /// The program plan the graphs are of, which must draft by `method`.
+    pub(crate) fn program_plan(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        method: PlannedMethod,
+        codec: KvCodec,
+    ) -> Result<super::ProgramPlan, GraphError> {
         let plan = load
             .program_plan(definition, codec)
             .map_err(|error| error.to_string())?;
@@ -485,23 +550,24 @@ impl AssessmentGraphResourceBounds {
         {
             return Err("assessment method and drafter program disagree".into());
         }
+        Ok(plan)
+    }
+
+    /// The bounds of a load of `plan` (its [`Self::program_plan`]) whose
+    /// target family's are `target`: every other family's certified here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn of_target(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
+        state: &super::StateResourcePlan,
+        method: PlannedMethod,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+        target: TargetGraphBounds,
+    ) -> Result<Self, GraphError> {
         // The same startup slots a load commits: one request's need.
         let slots = limits.startup_slots();
-        let (target_graph, sealed_target_graphs, upload_regions, target_family_graphs) =
-            crate::programs::native_target_graph::checked_target_family(
-                backend,
-                load,
-                &definition.decoder,
-                state,
-                plan.target(),
-                limits,
-            )?;
-        let target = NativeGraphCharge::from_checked(
-            target_graph.storage,
-            upload_regions,
-            slots.target,
-            target_family_graphs,
-        )?;
         let readout = NativeGraphCharge::serial(
             crate::programs::graph::readout::checked_readout_family_storage(
                 backend,
@@ -636,13 +702,13 @@ impl AssessmentGraphResourceBounds {
                 )?,
             )?;
         let state = NativeGraphCharge::serial(state_storage, slots.state)?;
-        let binding_constant_bytes = target_graph
+        let binding_constant_bytes = target
             .binding_constant_bytes
             .checked_add(head_constant_bytes)
             .and_then(|bytes| bytes.checked_add(vision_constant_bytes))
             .ok_or("checked graph constant charge overflow")?;
         let charges = [
-            Some(&target),
+            Some(&target.charge),
             Some(&readout),
             head.as_ref(),
             vision.as_ref(),
@@ -664,7 +730,6 @@ impl AssessmentGraphResourceBounds {
             binding_constant_bytes,
             total_bytes,
             recorded_graphs,
-            sealed_target_graphs,
             sealed_state_graphs,
             drafter_graph_host_bytes,
         })
@@ -715,17 +780,19 @@ impl AssessmentHeaderBounds {
             // graphs, which the plan fixes.
             sealed_graph_host_bytes: SealedGraphHostBytes {
                 at_most: graph
-                    .sealed_target_graphs
+                    .target
+                    .sealed
                     .at_most_bytes()
                     .and_then(|bytes| bytes.checked_add(graph.sealed_state_graphs.bytes))
                     .ok_or("assessment sealed graph bytes overflow")?,
                 at_least: graph
-                    .sealed_target_graphs
+                    .target
+                    .sealed
                     .at_least_bytes()
                     .and_then(|bytes| bytes.checked_add(graph.sealed_state_graphs.bytes))
                     .ok_or("assessment sealed graph bytes overflow")?,
             },
-            bound_graph_host_bytes: graph.sealed_target_graphs.bound.bytes,
+            bound_graph_host_bytes: graph.target.sealed.bound.bytes,
             drafter_graph_host_bytes: graph.drafter_graph_host_bytes,
             host_process,
             device_process,

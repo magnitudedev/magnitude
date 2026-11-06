@@ -41,7 +41,7 @@ impl ExecutionManifest {
         let backend = selected.info.backend();
         // The bounds planning charged the draft with: its graphs are
         // certified once, there.
-        let planned = plan_execution(manifest, &selected).map_err(|error| match error {
+        let planned = plan_execution::<magnitude_executor::AssessmentMemoryCharge>(manifest, &selected).map_err(|error| match error {
             ExecutionPlanningError::Plan(error) => classify_plan(error, backend).into(),
             error => PreviewError::from(PlanOutcome::Internal(error.to_string())),
         })?;

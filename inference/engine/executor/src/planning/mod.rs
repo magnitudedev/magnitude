@@ -17,7 +17,7 @@ mod weights;
 pub use assessment::{
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, CONVERSATION_CHECKPOINTS,
-    DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, measurement_process_bytes,
+    DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, TargetGraphBounds, measurement_process_bytes,
 };
 pub(crate) use assessment::fit_depth;
 pub use bank::{
@@ -37,7 +37,7 @@ pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, Co
 #[cfg(test)]
 pub(crate) use execution_plan::bank_substrate;
 pub use execution_plan::{
-    BackendPlan, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, HeldCharges, NoBank, PlannedDevice,
+    BackendPlan, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, DraftedCharge, HeldCharge, HeldCharges, NoBank, PlannedDevice,
     ResolvedPolicy,
 };
 pub use programs::{

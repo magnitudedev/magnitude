@@ -674,6 +674,7 @@ pub(super) struct BlockGraphEnumeration {
 
 /// What a target's graph family follows from its plan and limits before any
 /// graph is drafted: the one derivation of the planner and the sealer.
+#[derive(Clone)]
 pub(super) struct FamilyOutline {
     pub(super) backend: BackendName,
     /// The launches' row classes, ascending, never none.
@@ -692,6 +693,10 @@ pub(super) struct FamilyOutline {
     /// Per block, the first block of its shape ([`Self::first_of_shape`]).
     pub(super) firsts: Vec<usize>,
     pub(super) tap_width: Option<u64>,
+    /// The block that exports its output residual, which a head
+    /// conditioned on it reads: the exit block, of such a head's target
+    /// ([`Self::exports_residual`]).
+    pub(super) residual: Option<usize>,
 }
 
 impl FamilyOutline {
@@ -714,10 +719,8 @@ impl FamilyOutline {
             format!("target batch row bound {} has no row class", limits.max_launch_rows)
         })?;
         let (tap_width, tapped) = block_taps(plan, geometry)?;
-        let shapes = block_graph_shapes(load, geometry, state, &tapped)?;
-        let firsts = (0..shapes.len())
-            .map(|index| (0..index).find(|&first| shapes[first] == shapes[index]).unwrap_or(index))
-            .collect();
+        let residual = load.residual_conditioning().map(|_| geometry.blocks.len() - 1);
+        let shapes = block_graph_shapes(load, geometry, state, &tapped, residual)?;
         Ok(Self {
             backend,
             row_classes,
@@ -735,16 +738,45 @@ impl FamilyOutline {
             .map_err(|_| "target segment class exceeds u64")?,
             mixers: block_mixers(geometry)?,
             tapped,
+            firsts: firsts(&shapes),
             shapes,
-            firsts,
             tap_width,
+            residual,
         })
+    }
+
+    /// The outline of the same target without its drafter's writes: no
+    /// draft taps nor exported residual, so each block of a shape that
+    /// differed only in them is of one shape again. Every other input of
+    /// the family is the target's own.
+    pub(super) fn undrafted(&self) -> Self {
+        let shapes = self.shapes.iter().map(BlockGraphShape::undrafted).collect::<Vec<_>>();
+        Self {
+            tapped: vec![BlockTaps::default(); self.tapped.len()],
+            firsts: firsts(&shapes),
+            shapes,
+            tap_width: None,
+            residual: None,
+            ..self.clone()
+        }
     }
 
     /// The first block of `index`'s shape, whose layouts it holds.
     pub(super) fn first_of_shape(&self, index: usize) -> usize {
         self.firsts[index]
     }
+
+    /// Whether block `index`'s graphs export its output residual.
+    pub(super) fn exports_residual(&self, index: usize) -> bool {
+        self.residual == Some(index)
+    }
+}
+
+/// Per block, the first block of its shape.
+fn firsts(shapes: &[BlockGraphShape]) -> Vec<usize> {
+    (0..shapes.len())
+        .map(|index| (0..index).find(|&first| shapes[first] == shapes[index]).unwrap_or(index))
+        .collect()
 }
 
 /// Enumerate the block graphs of `plan` over `outline`'s row classes: the one
