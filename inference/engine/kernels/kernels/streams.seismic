@@ -137,12 +137,12 @@ native stream_mix_down for cuda from "cuda/stream_mix_down.cu":
         threads_per_threadgroup (256, 1, 1)
     launch stream_mix_down_gemv when M <= 8:
         params (arithmetic KSPLIT in [4, 2, 8] default 4)
-        threadgroups (ceil_div(ceil_div(LR, 16) + ceil_div(C * S, 16), 8 / KSPLIT), 1, 1)
+        threadgroups (ceil_div(ceil_div(LR, 16), 8 / KSPLIT) + ceil_div(ceil_div(C * S, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * S * H * 2)
     launch stream_mix_down_gemv16 when M > 8 and M <= 16:
         params (arithmetic KSPLIT in [4, 2, 8] default 4)
-        threadgroups (ceil_div(ceil_div(LR, 16) + ceil_div(C * S, 16), 8 / KSPLIT), 1, 1)
+        threadgroups (ceil_div(ceil_div(LR, 16), 8 / KSPLIT) + ceil_div(ceil_div(C * S, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch stream_mix_down_gemm_small when M > 16 and M <= 64:
         threadgroups (ceil_div(ceil_div(LR, 16), 8) + ceil_div(ceil_div(C * S, 16), 8), 1, 1)

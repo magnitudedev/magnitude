@@ -53,8 +53,8 @@ __device__ __forceinline__ void mix_gemv(const Pro &pro, projection::u8 *row, co
     __shared__ projection::GemvShared<Shape, Source> shared;
     const unsigned long long kblocks = WIDTH / 64;
     unsigned long long group = Shape::tile_group();
-    const unsigned long long groups[2] = {projection::gemv_groups<Shape>(s.rows[0]),
-                                          projection::gemv_groups<Shape>(s.rows[1])};
+    const unsigned long long groups[2] = {projection::gemv_segment_groups<Shape>(s.rows[0]),
+                                          projection::gemv_segment_groups<Shape>(s.rows[1])};
     const int segment = projection::locate_segment(group, groups);
     // Block-collective at M = 1: every warp forms the row, including a group
     // past the last segment.

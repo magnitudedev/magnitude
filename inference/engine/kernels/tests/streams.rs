@@ -471,6 +471,10 @@ fn native_stream_mix_matches_portable_bodies() {
         for c in [1, 0] {
             for rows in ROWS {
                 let case = Case::new(geometry, c, rows);
+                let (h, s, r) = geometry;
+                seismic_native_tests::progress(format_args!(
+                    "stream mix reference H {h} S {s} R {r} C {c} M {rows}"
+                ));
                 let expected = if geometry == GEOMETRIES[0] {
                     case.portable(&module)
                 } else {
@@ -478,8 +482,8 @@ fn native_stream_mix_matches_portable_bodies() {
                 };
                 let bounds = case.inject_bounds();
                 for device in &devices {
-                    let (h, s, r) = geometry;
                     let label = format!("{:?} H {h} S {s} R {r} C {c} M {rows}", device.backend());
+                    seismic_native_tests::progress(format_args!("stream mix {label}"));
                     assert_stages(&label, &case.native(device, &expected), &expected, &bounds);
                 }
             }

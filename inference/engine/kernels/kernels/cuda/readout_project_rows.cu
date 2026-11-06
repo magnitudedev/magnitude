@@ -31,8 +31,7 @@ __device__ __forceinline__ void head_gemv(const Pro &pro, projection::u8 *row, c
     __shared__ projection::GemvShared<Shape, Source::type> shared;
     const Source::type x = Source::make(pro, row, O, D, staged);
     const unsigned long long group = Shape::tile_group();
-    if (group < projection::gemv_groups<Shape>(V))
-        projection::gemv_segment<Shape>(shared, x, O, D / 64, group, V, head, projection::NoWeight{}, epi);
+    projection::gemv_segment<Shape>(shared, x, O, D / 64, group, V, head, projection::NoWeight{}, epi);
 }
 
 // The GEMM of one row band over the staged A rows.
@@ -116,11 +115,9 @@ __global__ void readout_project_rows_indexed(SEISMIC_KERNEL_PARAMS) {
         SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + 4 * (row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1),
         0, __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP)}, (projection::u64)vocabulary},
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT_SCALE), SEISMIC_DIM_WS, 0, 0), 1.0f);
-    // Only one weight-row group is live. Its named reduction barrier covers
-    // precisely KSPLIT warps, as in the full canonical-row GEMV.
-    if (Shape::group() == 0)
-        projection::gemv_segment<Shape>(shared, source, 1, SEISMIC_DIM_D / 64,
-                                       (projection::u64)vocabulary / 16, SEISMIC_DIM_V,
-                                       weight, projection::NoWeight{}, epilogue);
+    // One weight-row group is live; the others are past the segment.
+    projection::gemv_segment<Shape>(shared, source, 1, SEISMIC_DIM_D / 64,
+                                    Shape::group() == 0 ? (projection::u64)vocabulary / 16 : SEISMIC_DIM_V,
+                                    SEISMIC_DIM_V, weight, projection::NoWeight{}, epilogue);
 }
 #endif

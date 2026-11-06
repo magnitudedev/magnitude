@@ -646,15 +646,23 @@ fn decode_matches_portable_body_on(device: &Device, case: &Case) {
     }
 }
 
+// 300 history rows are 10 key tiles: SPLIT_GROUPS 1 keeps one key partition
+// per query tile; 256 splits the first sequence's history spans over two
+// partitions and merges them, while its short second sequence stays unsplit.
+fn prefill_case() -> Case {
+    Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23)
+}
+
 #[test]
-fn prefill_matches_portable_body() {
-    // 300 history rows are 10 key tiles: SPLIT_GROUPS 1 keeps one key
-    // partition per query tile; 256 splits the first sequence's history
-    // spans over two partitions and merges them, while its short second
-    // sequence stays unsplit.
-    let case = Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23);
-    check_host_model_against_portable_body("attention_prefill", &case);
+fn prefill_host_model_matches_portable_body() {
+    check_host_model_against_portable_body("attention_prefill", &prefill_case());
+}
+
+#[test]
+fn prefill_natives_match_host_model() {
+    let case = prefill_case();
     for device in devices() {
+        seismic_native_tests::progress(format_args!("prefill on {:?}", device.backend()));
         prefill_matches_portable_body_on(&device, &case);
     }
 }
@@ -664,6 +672,7 @@ fn prefill_matches_portable_body_on(device: &Device, case: &Case) {
     for (config, specialization) in
         prefill_specializations_on(device, SMALL, &[(16, 1), (8, 1), (16, 256), (8, 256)])
     {
+        seismic_native_tests::progress(format_args!("small prefill {config}"));
         let kernel = prefill_kernel(device, &specialization);
         let mut bound = Bound::new(device, case);
         let gated = run_prefill(&kernel, &mut bound, case);

@@ -46,8 +46,9 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
     const auto x = projection::source_after_dependency(pro, row, M, H, staged);
     const unsigned long long kblocks = H / 64;
     unsigned long long group = Shape::tile_group();
-    const unsigned long long groups[4] = {projection::gemv_groups<Shape>(rows[0]), projection::gemv_groups<Shape>(rows[1]),
-                                          projection::gemv_groups<Shape>(rows[2]), projection::gemv_groups<Shape>(rows[3])};
+    const unsigned long long groups[4] = {
+        projection::gemv_segment_groups<Shape>(rows[0]), projection::gemv_segment_groups<Shape>(rows[1]),
+        projection::gemv_segment_groups<Shape>(rows[2]), projection::gemv_segment_groups<Shape>(rows[3])};
     switch (projection::locate_segment(group, groups)) {
     case 0:
         projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, rows[0], w0, projection::NoWeight{},

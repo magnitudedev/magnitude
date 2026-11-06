@@ -219,6 +219,7 @@ impl Case {
             .collect::<Vec<_>>();
         let mut gated = vec![0.0; self.rows * kv * g * w];
         for row in 0..self.rows {
+            seismic_native_tests::progress(format_args!("host model: row {row} of {}", self.rows));
             for head in 0..kv * g {
                 let kv_head = head / g;
                 let query = self.prepare(

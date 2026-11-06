@@ -40,8 +40,7 @@ __device__ __forceinline__ void expand_gemv(const Pro &pro, projection::u8 *row,
     __shared__ projection::GemvShared<Shape, Source::type> shared;
     const Source::type x = Source::make(pro, row, M, H, staged);
     const unsigned long long group = Shape::tile_group();
-    if (group < projection::gemv_groups<Shape>(F))
-        projection::gemv_segment<Shape>(shared, x, M, H / 64, group, F, gate, up, epi);
+    projection::gemv_segment<Shape>(shared, x, M, H / 64, group, F, gate, up, epi);
 }
 
 // The GEMM of one row band over the staged rows (A rows, or q8_1 rows with Q).

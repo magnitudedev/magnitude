@@ -27,8 +27,7 @@ __device__ __forceinline__ void gate_gemv(const Pro &rounded, unsigned M, unsign
     using Shape = projection::GemvShape<8, 1, KSPLIT, NB>;
     __shared__ projection::GemvShared<Shape, Pro> shared;
     const unsigned long long group = Shape::tile_group();
-    if (group < projection::gemv_groups<Shape>(P))
-        projection::gemv_segment<Shape>(shared, rounded, M, D / 64, group, P, gate, projection::NoWeight{}, epi);
+    projection::gemv_segment<Shape>(shared, rounded, M, D / 64, group, P, gate, projection::NoWeight{}, epi);
 }
 
 // The strided F32 hidden source publishes semantic Act before its selected

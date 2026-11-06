@@ -101,9 +101,7 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
     element::Act::storage *published = ROUTED_PUBLISHED + m * (K + 1) * H;
 
     const PublishEpi epi{published + slot * H};
-    const bool projects = group < projection::gemv_groups<Shape>(H);
-    // A warp that projects nothing waits before arriving: the arrival and
-    // the combine follow the launch before.
+    // The arrival and the combine follow the launch before.
     if (slot < K) {
         const int *routes = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROUTES));
         const routed::Place down =
@@ -113,21 +111,17 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
             // block publishes its channels of a zero projection.
             seismic_dependency_start();
             routed::zero_block_rows<Shape>(H, [&](projection::u64 n) { epi.published[n] = element::Act::store(0.0f); });
-        } else if (projects) {
+        } else {
             const Pro pro{EXPERT_ROWS + (m * EXPERT_STRIDE_0 + slot * EXPERT_STRIDE_1) * 2, 0, projection::AllRows{}};
             projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), 1u, SEISMIC_DIM_F / 64, group, H,
                                             KERNEL_W0_MATRIX(down.stack, down.record),
                                             projection::NoWeight{}, epi);
-        } else {
-            seismic_dependency_start();
         }
-    } else if (projects) {
+    } else {
         const Pro pro{SHARED_ROWS + m * SHARED_STRIDE_0 * 2, 0, projection::AllRows{}};
         projection::gemv_segment_ready<Shape>(shared, projection::after_dependency(pro), 1u, SEISMIC_DIM_S / 64, group, H,
                                         KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN)),
                                         projection::NoWeight{}, epi);
-    } else {
-        seismic_dependency_start();
     }
 
     ROUTED_OUTPUT_ARRIVED(m, static_cast<unsigned>(K) + 1u, m * gridDim.x + blockIdx.x, blockIdx.x * CHANNELS, CHANNELS,

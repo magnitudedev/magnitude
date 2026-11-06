@@ -60,8 +60,6 @@ __global__ void routed_down(SEISMIC_KERNEL_PARAMS) {
         return;
     }
     const projection::u64 group = Shape::tile_group();
-    if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_H))
-        return;
     projection::gemv_segment<Shape>(shared, pro, 1u, SEISMIC_DIM_F / 64, group, SEISMIC_DIM_H,
                                     KERNEL_W0_MATRIX(down.stack, down.record), projection::NoWeight{},
                                     ProjectedEpi{projected});
@@ -132,8 +130,6 @@ __global__ void routed_down_gathered(SEISMIC_KERNEL_PARAMS) {
         return;
     }
     const projection::u64 group = Shape::tile_group();
-    if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_H))
-        return;
     const projection::u8 *rows =
         NVFP4 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_OPERANDS) : SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT);
     projection::gemv_segment<Shape>(shared, routed::GatheredRows{rows, rows_at}, count, SEISMIC_DIM_F / 64, group,

@@ -65,8 +65,6 @@ __global__ void routed_expand(SEISMIC_KERNEL_PARAMS) {
     // first; the shared expert's issue their first weight loads before.
     if (blockIdx.y < choices) {
         seismic_dependency_start();
-        if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_F))
-            return;
         const projection::u64 m = blockIdx.y / SEISMIC_DIM_K, k = blockIdx.y % SEISMIC_DIM_K;
         const projection::u64 expert = (projection::u64)routes[m * SEISMIC_ROUTES_STRIDE_0 + k * SEISMIC_ROUTES_STRIDE_1];
         const Pro pro{ROWS_OF(ROUTED_NVFP4) + m * STRIDE_OF(ROUTED_NVFP4) * 2, STRIDE_OF(ROUTED_NVFP4),
@@ -127,8 +125,6 @@ __global__ void routed_expand_gathered(SEISMIC_KERNEL_PARAMS) {
             }
         }
         __syncthreads();
-        if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_F))
-            return;
         const projection::u64 expert =
             (projection::u64)routed::route(routes, SEISMIC_ROUTES_STRIDE_0, SEISMIC_ROUTES_STRIDE_1, slots, choice);
         projection::gemv_segment<Shape>(shared, routed::GatheredRows{ROWS_OF(ROUTED_NVFP4), rows_at}, count, SEISMIC_DIM_H / 64,

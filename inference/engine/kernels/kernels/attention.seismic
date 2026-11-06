@@ -478,12 +478,14 @@ native attention_project for cuda from "cuda/attention_project.cu":
         threads_per_threadgroup (256, 1, 1)
     launch attention_project_gemv when M <= 8:
         params (arithmetic KSPLIT in [8, 4, 2] default 8)
-        threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+        threadgroups (ceil_div(ceil_div(Q, 16), 8 / KSPLIT) + ceil_div(ceil_div(GR, 16), 8 / KSPLIT)
+            + ceil_div(ceil_div(K, 16), 8 / KSPLIT) + ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes ((1 - min(1, M - 1)) * D * 2)
     launch attention_project_gemv16 when M > 8 and M <= 16:
         params (arithmetic KSPLIT in [4, 2, 8] default 4)
-        threadgroups (ceil_div(ceil_div(Q, 16) + ceil_div(GR, 16) + ceil_div(K, 16) + ceil_div(V, 16), 8 / KSPLIT), 1, 1)
+        threadgroups (ceil_div(ceil_div(Q, 16), 8 / KSPLIT) + ceil_div(ceil_div(GR, 16), 8 / KSPLIT)
+            + ceil_div(ceil_div(K, 16), 8 / KSPLIT) + ceil_div(ceil_div(V, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_project_gemm_small when M > 16 and M <= 64:
         reads (INT8, OPERAND)

@@ -27,6 +27,14 @@ pub fn devices(backends: &[seismic::BackendName]) -> Vec<seismic::Device> {
     )
 }
 
+/// A line of a test's progress, written to stderr past the test harness's
+/// capture: a test whose host model takes minutes stays visibly alive, so its
+/// silence means no progress.
+pub fn progress(line: std::fmt::Arguments) {
+    use std::io::Write;
+    writeln!(std::io::stderr(), "{line}").unwrap();
+}
+
 /// Every available backend's device, the CPU's included, or the backend
 /// the runner requests ([`devices`]): for a test every backend runs.
 pub fn every_device() -> Vec<seismic::Device> {

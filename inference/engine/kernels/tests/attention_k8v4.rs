@@ -1223,11 +1223,17 @@ fn cuda_prefill_of_two_piece_heads_matches_host_model() {
         return;
     };
     for geometry in [GEMMA_E4B_FULL, GEMMA26_FULL] {
+        // 44 rows end the last query tile in row blocks of padding, which meet
+        // at the pair barrier: at G = 4 one of 2 (2 warps, with producers) and
+        // one of 4 (4 warps, inline); at G = 8 two of 4 (4 warps, inline).
         for (rows, history, total, slab_rows) in [
-            (40, 300, 512, None),
+            (44, 300, 512, None),
             (128, 1000, 1280, None),
             (64, 4096, 4352, Some(1088)),
         ] {
+            seismic_native_tests::progress(format_args!(
+                "two-piece prefill: {rows} rows, {history} history"
+            ));
             let encoded = Encoded::new(Case::new(
                 geometry,
                 total,
@@ -2157,15 +2163,24 @@ fn decode_reads_spans_crossing_affine_history_slabs() {
     }
 }
 
+// 300 history rows are 10 key tiles: the split configurations split the first
+// sequence's history spans over two partitions and merge them. One affine
+// group per vector keeps the interpreter's prefill affordable; the Qwen
+// geometry test covers eight groups.
+fn prefill_case() -> Encoded {
+    Encoded::new(Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23))
+}
+
 #[test]
-fn prefill_matches_portable_body() {
-    // 300 history rows are 10 key tiles: the split configurations split the
-    // first sequence's history spans over two partitions and merge them.
-    // One affine group per vector keeps the interpreter's prefill affordable;
-    // the Qwen geometry test covers eight groups.
-    let encoded = Encoded::new(Case::new(SMALL, 400, 2, &prefill_rows(20, 300), 23));
-    check_host_model_against_portable_body("attention_prefill_k8v4", &encoded);
+fn prefill_host_model_matches_portable_body() {
+    check_host_model_against_portable_body("attention_prefill_k8v4", &prefill_case());
+}
+
+#[test]
+fn prefill_natives_match_host_model() {
+    let encoded = prefill_case();
     for device in seismic_native_tests::every_device() {
+        seismic_native_tests::progress(format_args!("prefill on {:?}", device.backend()));
         prefill_matches_portable_body_on(&device, &encoded);
     }
 }
@@ -2174,6 +2189,7 @@ fn prefill_matches_portable_body_on(device: &Device, encoded: &Encoded) {
     let backend = device.backend();
     let expected = encoded.expected();
     for config in prefill_configs(backend, SMALL) {
+        seismic_native_tests::progress(format_args!("small prefill {config:?}"));
         let kernel = prefill_kernel(device, SMALL, &config);
         let mut bound = Bound::new(device, encoded);
         let gated = kernel

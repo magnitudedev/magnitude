@@ -35,8 +35,7 @@ __device__ __forceinline__ void project_gemv(const Pro &source, projection::u8 *
     __shared__ projection::GemvShared<Shape, Source::type> shared;
     const Source::type x = Source::make(source, row, M, K, staged);
     const unsigned long long group = Shape::tile_group();
-    if (group < projection::gemv_groups<Shape>(N))
-        projection::gemv_segment<Shape>(shared, x, M, K / 64, group, N, weight, projection::NoWeight{}, epi);
+    projection::gemv_segment<Shape>(shared, x, M, K / 64, group, N, weight, projection::NoWeight{}, epi);
 }
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_STAGE

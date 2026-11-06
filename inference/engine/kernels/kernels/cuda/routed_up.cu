@@ -56,8 +56,6 @@ __global__ void routed_up(SEISMIC_KERNEL_PARAMS) {
         return;
     }
     const projection::u64 group = Shape::tile_group();
-    if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_F))
-        return;
     const auto epi = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(
         Epi{product, 0, (int)SEISMIC_PARAM_ACTIVATION},
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US,
@@ -133,8 +131,6 @@ __global__ void routed_up_gathered(SEISMIC_KERNEL_PARAMS) {
         return;
     }
     const projection::u64 group = Shape::tile_group();
-    if (group >= projection::gemv_groups<Shape>(SEISMIC_DIM_F))
-        return;
     const auto epi = projection::scaling<(SEISMIC_DIM_US != 0)>::wrap(
         ChoiceEpi{Epi{SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), 0, (int)SEISMIC_PARAM_ACTIVATION}, products_at},
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_US, SEISMIC_UP_SCALE_STRIDE_0,

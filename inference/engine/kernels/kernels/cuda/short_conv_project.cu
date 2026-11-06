@@ -54,7 +54,7 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
     const unsigned long long group = Shape::tile_group(), segment = projection::gemv_groups<Shape>(CH);
     if (group < segment)
         projection::gemv_segment<Shape>(shared, x, M, H / 64, group, CH, segments.b, segments.x, segments.product);
-    else if (group < 2 * segment)
+    else
         projection::gemv_segment<Shape>(shared, x, M, H / 64, group - segment, CH, segments.c, projection::NoWeight{},
                                         segments.gate);
 }

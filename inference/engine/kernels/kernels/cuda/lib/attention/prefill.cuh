@@ -1170,7 +1170,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     const bool valid_a = row_block * 16 + g < QT * G && token_a < rows_total;
     const bool valid_b = row_block * 16 + g + 8 < QT * G && token_b < rows_total;
     // A block of padding rows only (the tile's last rows, or with decode rows
-    // most blocks) stages and synchronizes but skips the products.
+    // most blocks) makes every call of the others and skips the products.
     const bool computes = row_block * 16 < QT * G && first_token + row_block * 16 / G < rows_total;
 
     // Produced affine history: the producers stage every K/V tile, so the MMA
@@ -1202,13 +1202,14 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     int parity = 0;
 
     // The products of one staged unit: S = Q K^T over the key piece's
-    // columns; after the tile's last piece, the softmax and O += P V.
+    // columns; after the tile's last piece, the score exchange, the softmax
+    // and O += P V.
     auto absorb_unit = [&](Tile current, int piece, const u8 *k_base, const u8 *v_base) {
         if (piece == 0) {
 #pragma unroll
             for (int n = 0; n < KEYS / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
         }
-        if (!SPLIT_SCORES || piece == span_piece) {
+        if (computes && (!SPLIT_SCORES || piece == span_piece)) {
 #pragma unroll
         for (int index = 0; index < SPAN / 16; ++index) {
             const int step = SPLIT_SCORES ? span_step + index : index;
@@ -1262,6 +1263,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             }
             parity = (parity + 1) % PARITIES;
         }
+        if (!computes) return;
 
         if (current.span != cached_span) {
             cached_span = current.span;
@@ -1363,7 +1365,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                 const int i = (column0 / WINDOW) * units + j;
                 const int b = i % STAGES;
                 named_sync(FULL + b, THREADS);
-                if (computes) absorb_unit(current, piece, k_tile(b), v_tile(b));
+                absorb_unit(current, piece, k_tile(b), v_tile(b));
                 if (i + STAGES < staged) named_arrive(EMPTY + b, THREADS);
                 advance(current, piece);
             }
@@ -1415,7 +1417,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                         advance(fetch, fetch_piece);
                     }
                     seismic_cp_async_commit();
-                    if (computes) absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
+                    absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
                     advance(current, piece);
                 }
                 __syncthreads();
@@ -1451,7 +1453,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     }
 #endif
 
-                    if (computes) absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
+                    absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
                     __syncthreads();
                     advance(current, piece);
                 }

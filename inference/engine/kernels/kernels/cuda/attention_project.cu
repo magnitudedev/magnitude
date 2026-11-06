@@ -96,18 +96,25 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
     const unsigned long long kblocks = D / 64;
     unsigned long long group = Shape::tile_group();
     const unsigned long long groups[4] = {
-        projection::gemv_groups<Shape>(s.rows[0]), projection::gemv_groups<Shape>(s.rows[1]),
-        projection::gemv_groups<Shape>(s.rows[2]), projection::gemv_groups<Shape>(s.rows[3])};
+        projection::gemv_segment_groups<Shape>(s.rows[0]), projection::gemv_segment_groups<Shape>(s.rows[1]),
+        projection::gemv_segment_groups<Shape>(s.rows[2]), projection::gemv_segment_groups<Shape>(s.rows[3])};
     const int segment = projection::locate_segment(group, groups);
+    // Every warp runs `x` (block-collective at M = 1), including a group past
+    // the last segment, which has no rows.
+    const auto x = projection::source_after_dependency(pro, row, M, D, staged);
+    // A zeroed segment's group zeroes its rows and is otherwise past the last
+    // segment.
     if (project_mode != 0 && segment < 2) {
-        seismic_dependency_start();
-        project_zero(s, segment, M, 0, M, group * Shape::TPW * 16, Shape::TPW * 16,
-                     threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
+        const auto zeroed = [&] {
+            const auto source = x();
+            project_zero(s, segment, M, 0, M, group * Shape::TPW * 16, Shape::TPW * 16,
+                         threadIdx.x % (32 * Shape::KSPLIT), 32 * Shape::KSPLIT);
+            return source;
+        };
+        projection::gemv_segment_ready<Shape>(shared, zeroed, M, kblocks, 0, 0, s.value, projection::NoWeight{},
+                                              s.out[3]);
         return;
     }
-    // Every other warp runs `x` (block-collective at M = 1), including a
-    // group past the last segment, which has no rows.
-    const auto x = projection::source_after_dependency(pro, row, M, D, staged);
     switch (segment) {
     case 0:
         projection::gemv_segment_ready<Shape>(shared, x, M, kblocks, group, s.rows[0], s.query,

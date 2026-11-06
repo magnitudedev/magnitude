@@ -219,43 +219,58 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
             let hidden = f32_tensor(&device, &[m as u64, d as u64], &hidden_values);
             let norm = f32_tensor(&device, &[d as u64], &norm_values);
             for mapping in mappings(m, |mapping| projection.admits(&device, mapping)) {
+                seismic_native_tests::progress(format_args!(
+                    "attention project {formats:?} M={m} {mapping:?}"
+                ));
                 let (x, slack) = operand_rows(&normed, d, mapping, Some(formats[0]));
                 let expected: Vec<(Vec<f64>, Vec<f64>)> = weights
                     .iter()
                     .zip([query, keys, keys])
                     .map(|(weight, n)| rounded_segment(&x, &slack, weight, m, n, d, mapping))
                     .collect();
-                let results = projection
-                    .kernel(&device, mapping)
-                    .call(attention_project::Args {
-                        hidden: &hidden,
-                        input_norm: &norm,
-                        query_weight: &weights[0].tensor,
-                        gate_weight: &gate,
-                        key_weight: &weights[1].tensor,
-                        value_weight: &weights[2].tensor,
-                        epsilon: EPSILON,
-                        project_mode: 0,
-                        query_scale: &f32_tensor(&device, &[0], &[]),
-                        gate_scale: &f32_tensor(&device, &[0], &[]),
-                        key_scale: &f32_tensor(&device, &[0], &[]),
-                        value_scale: &f32_tensor(&device, &[0], &[]),
-                        query_bound: &f32_tensor(&device, &[0], &[]),
-                        gate_bound: &f32_tensor(&device, &[0], &[]),
-                        key_bound: &f32_tensor(&device, &[0], &[]),
-                        value_bound: &f32_tensor(&device, &[0], &[]),
-                    })
-                    .unwrap();
+                let project = |project_mode| {
+                    projection
+                        .kernel(&device, mapping)
+                        .call(attention_project::Args {
+                            hidden: &hidden,
+                            input_norm: &norm,
+                            query_weight: &weights[0].tensor,
+                            gate_weight: &gate,
+                            key_weight: &weights[1].tensor,
+                            value_weight: &weights[2].tensor,
+                            epsilon: EPSILON,
+                            project_mode,
+                            query_scale: &f32_tensor(&device, &[0], &[]),
+                            gate_scale: &f32_tensor(&device, &[0], &[]),
+                            key_scale: &f32_tensor(&device, &[0], &[]),
+                            value_scale: &f32_tensor(&device, &[0], &[]),
+                            query_bound: &f32_tensor(&device, &[0], &[]),
+                            gate_bound: &f32_tensor(&device, &[0], &[]),
+                            key_bound: &f32_tensor(&device, &[0], &[]),
+                            value_bound: &f32_tensor(&device, &[0], &[]),
+                        })
+                        .unwrap()
+                };
+                let results = project(0);
+                let zeroed = project(1);
                 for (name, tensor, (values, tolerance)) in [
                     ("query", &results.r0, &expected[0]),
                     ("key", &results.r2, &expected[1]),
                     ("value", &results.r3, &expected[2]),
+                    ("key beside zeroed segments", &zeroed.r2, &expected[1]),
+                    ("value beside zeroed segments", &zeroed.r3, &expected[2]),
                 ] {
                     check(
                         &format!("attention project {name} {formats:?} M={m} {mapping:?}"),
                         &read_bf16(tensor),
                         values,
                         tolerance,
+                    );
+                }
+                for (name, tensor) in [("query", &zeroed.r0), ("gate", &zeroed.r1)] {
+                    assert!(
+                        read_bf16(tensor).iter().all(|&value| value == 0.0),
+                        "zeroed {name} {formats:?} M={m} {mapping:?}"
                     );
                 }
             }

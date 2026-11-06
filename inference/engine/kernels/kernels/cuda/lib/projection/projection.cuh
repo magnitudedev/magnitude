@@ -636,9 +636,11 @@ __device__ __forceinline__ void gemv_finish(float (&acc)[2][TPW][NB][4], u32 M, 
 // returns the activation source, which reads its A operands in place
 // (`pair`); it runs once the first superblock's weight loads are issued, so
 // it may wait for the previous launch (`seismic_dependency_wait`) while they
-// are in flight. A group past the segment (tile0 >= tiles) loads nothing but
-// still runs `ready()`, which may be block-collective. `reduce` is the
-// group's reduction area, `barrier` its named barrier. With STAGING (the
+// are in flight. Every group makes the same calls, so every warp reaches the
+// block-collective `ready()` and the group's named barrier: a group past the
+// segment (tile0 >= tiles) owns no superblocks, so it loads and multiplies
+// nothing and its epilogue stores nothing. `reduce` is the group's reduction
+// area, `barrier` its named barrier. With STAGING (the
 // launch's shared `staging` area holds the group's tiles: `gemv_staging`)
 // an unpaired staged weight (`GemvStaged`) reads its coefficients from the
 // group's copy of its tiles' fields, issued with the first superblock's
@@ -671,7 +673,7 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
                     acc[stream][i][nb][e] = 0.0f;
     const u64 superblocks = (kblocks + 3) / 4;
     const u64 begin = superblocks * part / KSPLIT;
-    const u64 end = superblocks * (part + 1) / KSPLIT;
+    const u64 end = tile0 < tiles ? superblocks * (part + 1) / KSPLIT : begin;
     // Codes and packed coefficients of one superblock of the group's tiles.
     struct Stage {
         typename WA::Super ra[TPW];
@@ -710,12 +712,10 @@ __device__ __forceinline__ void gemv_mma_group(const Ready &ready, u32 M, u64 kb
             if (tile0 + i < tiles)
                 wa.stage(tile0 + i, kblocks, staging + i * staged_tile, part * 32 + lane, KSPLIT * 32);
     }
-    if (tile0 < tiles && begin < end)
+    if (begin < end)
         load(current, begin);
     const auto pro = ready();
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
-    if (tile0 >= tiles)
-        return;
     if constexpr (STAGED) {
         seismic_cp_async_wait_all();
         barrier.sync(KSPLIT * 32);
@@ -840,7 +840,7 @@ __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u6
                     acc[stream][i][nb][e] = 0.0f;
     const u64 superblocks = (kblocks + 3) / 4;
     const u64 begin = superblocks * part / KSPLIT;
-    const u64 end = superblocks * (part + 1) / KSPLIT;
+    const u64 end = tile0 < tiles ? superblocks * (part + 1) / KSPLIT : begin;
     struct Stage {
         typename WA::EntryRaw ra[TPW][4];
         typename WB::EntryRaw rb[TPW][4];
@@ -864,12 +864,10 @@ __device__ __forceinline__ void gemv_entries_group(const Ready &ready, u32 M, u6
             }
     };
     Stage stage;
-    if (tile0 < tiles && begin < end)
+    if (begin < end)
         load(stage, begin);
     const auto pro = ready();
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
-    if (tile0 >= tiles)
-        return;
     for (u64 sb = begin; sb < end; ++sb) {
 #pragma unroll
         for (int q = 0; q < 4; ++q) {
@@ -929,7 +927,7 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
                     acc[stream][i][nb][e] = 0.0f;
     const u64 superblocks = (kblocks + 3) / 4;
     const u64 begin = superblocks * part / KSPLIT;
-    const u64 end = superblocks * (part + 1) / KSPLIT;
+    const u64 end = tile0 < tiles ? superblocks * (part + 1) / KSPLIT : begin;
     struct Stage {
         typename WA::Record ra[TPW];
         typename WA::Record rb[TPW];
@@ -951,8 +949,6 @@ __device__ __forceinline__ void gemv_records_group(const Ready &ready, u32 M, u6
     }
     const auto pro = ready();
     static_assert(decltype(ready())::FACTORS == 0, "a GEMV reads its operands in place");
-    if (tile0 >= tiles)
-        return;
     barrier.sync(KSPLIT * 32);
     // One record of one tile and stream into its accumulators.
     auto accumulate = [&](float (&sum)[NB][4], const typename WA::Record &record, u64 sb) {
@@ -1072,6 +1068,15 @@ template <class Shape> __device__ __forceinline__ u64 gemv_groups(u64 rows) {
 // Shape::GROUPS tile groups).
 template <class Shape> __host__ __device__ constexpr u64 gemv_grid(u64 rows) {
     return (((rows + 15) / 16 + Shape::TPW - 1) / Shape::TPW + Shape::GROUPS - 1) / Shape::GROUPS;
+}
+
+// Tile groups of a segment of `rows` rows in a segmented GEMV whose segments
+// select their weights by branch: whole blocks (`gemv_grid`), so a block runs
+// one segment and all its warps reach its barriers (the source row's) through
+// the same instructions. The groups past the segment's rows own no tiles; the
+// launch's grid is the sum of its segments' `gemv_grid`.
+template <class Shape> __device__ __forceinline__ u64 gemv_segment_groups(u64 rows) {
+    return gemv_grid<Shape>(rows) * Shape::GROUPS;
 }
 
 // How many blocks of a GEMV launch of weights WA (and WB) share an SM
