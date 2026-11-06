@@ -1000,6 +1000,31 @@ fn staged_causal_reconciliation_advances_after_finished_prefill() {
 }
 
 #[test]
+fn a_reply_that_reaches_the_context_end_owes_no_row_past_it() {
+    // The successor sampled from the last context row is accepted but never
+    // needs a row of its own, so the generation owes no reconciliation for it.
+    let mut configured = options();
+    configured.context_limit = 4;
+    let generation = resident(
+        Generation::new(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            configured,
+            None,
+        )
+        .unwrap(),
+    );
+    let generation = prefill(generation, 10);
+    let (generation, _) = resolve(start(generation, 4), &[11], None);
+    let (generation, _) = resolve(start(generation, 4), &[12], None);
+    assert_eq!(generation.finish_reason(), Some(FinishReason::Context));
+    assert_eq!(generation.resident_position(), 4);
+    assert_eq!(generation.accepted_position(), 5);
+    assert_eq!(generation.pending_reconciliation(), None);
+    assert!(generation.start_reconciliation(4).is_err());
+}
+
+#[test]
 fn ignored_end_of_generation_masks_stop_tokens_from_every_selection() {
     let mut configured = options();
     configured.end_of_generation = EndOfGeneration::Suppress;
