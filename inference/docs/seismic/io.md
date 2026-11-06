@@ -34,6 +34,7 @@
     - each ended job's wait: device time, time behind speculative pieces, and time behind demand.
   - Rate while busy and mean depth while busy are derived from these totals.
   - The scheduler keeps the record, so it is the same on every backend. Each volume's book and each job's wait live in the scheduler's queue, under the lock it already holds wherever a piece is taken or ends, so counting takes no lock of its own. A look (`accounting::totals`) takes that lock once.
+  - A piece ends at the instant its read returns. Its read lands at once, never waiting for the queue's lock: where another holds it, the piece is left for the lock's next holder, which ends every left piece before it looks at the queue.
   - Liveness (`engine_work`) reads the pieces ended from it.
   - A streamed model's per-step record (`StepCost::storage`) is the span of each volume's totals over the step.
 

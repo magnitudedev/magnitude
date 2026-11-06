@@ -25,7 +25,7 @@ impl Job {
     /// ranges they serve fail [`Error::Withdrawn`], and it ends with its
     /// pieces in flight (its hook runs, its waiters wake).
     pub fn withdraw(&self) {
-        let Some(queued) = self.engine.queue.lock().expect("read queue").withdraw(self.id) else {
+        let Some(queued) = self.engine.queue().withdraw(self.id) else {
             return;
         };
         let withdrawn = Arc::new(Error::Withdrawn);
@@ -43,7 +43,7 @@ impl Job {
 
     /// Read the job's pieces no less urgently than `priority`.
     pub fn promote(&self, priority: Priority) {
-        let woken = self.engine.queue.lock().expect("read queue").promote(self.id, priority);
+        let woken = self.engine.queue().promote(self.id, priority);
         for _ in 0..woken {
             self.engine.work.notify_one();
         }

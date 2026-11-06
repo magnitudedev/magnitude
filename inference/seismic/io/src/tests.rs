@@ -3,7 +3,7 @@ use crate::accounting::{Book, Wait};
 #[cfg(unix)]
 use crate::disk::drop_pages;
 use crate::disk::{decide, full_rate, grid, Bound, Point, Registered, VolumeReads, LEAST_READ, WIDEST_WINDOW};
-use crate::scheduler::{pieces, Buffers, Engine, JobState, Part, Piece, Queue, Queued, Span, VolumeFlight};
+use crate::scheduler::{pieces, Engine, JobState, Part, Piece, Queue, Queued, Span, VolumeFlight};
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::File;
@@ -11,7 +11,7 @@ use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr::NonNull;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// A volume's bound is the process's one, shared by every reader of the
@@ -580,13 +580,7 @@ fn a_reader_reads_its_sources_file_after_the_path_is_replaced() {
 #[test]
 fn a_withdrawal_returns_the_bytes_it_left_unread() {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
-    let engine = ENGINE.get_or_init(|| Engine {
-        queue: Mutex::new(Queue::default()),
-        work: Condvar::new(),
-        workers: Mutex::new(0),
-        flights: Mutex::new(Vec::new()),
-        buffers: Buffers::default(),
-    });
+    let engine = ENGINE.get_or_init(Engine::new);
     let (mut queued, state) = queued(4);
     let piece = |start: u64, range: usize| Piece {
         start,
@@ -594,9 +588,9 @@ fn a_withdrawal_returns_the_bytes_it_left_unread() {
         parts: vec![Part { range, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }],
     };
     queued.pieces = (0..4).map(|at| piece(at * 3 * LEAST_READ, at as usize)).collect();
-    let (id, _) = engine.queue.lock().unwrap().push(queued, Priority::Load);
+    let (id, _) = engine.queue().push(queued, Priority::Load);
     let job = Job { id, state: state.clone(), engine };
-    let taken = engine.queue.lock().unwrap().take().expect("a piece to take");
+    let taken = engine.queue().take().expect("a piece to take");
     job.withdraw();
     assert!(job.wait_until(Instant::now()).is_none(), "the taken piece reads on");
     // The taken piece's end, as its worker ends it.
@@ -606,6 +600,26 @@ fn a_withdrawal_returns_the_bytes_it_left_unread() {
     assert!(failed.iter().all(|(_, error)| matches!(**error, Error::Withdrawn)));
     job.withdraw();
     drop(job);
+}
+
+/// A read that returns while another holds the queue's lock lands without
+/// waiting for it: the piece is left, and the lock's next holder ends it at
+/// the instant its read returned, before it looks at the queue.
+#[test]
+fn a_read_returning_under_a_held_lock_is_ended_by_its_next_holder() {
+    let engine = Engine::new();
+    let (mut queued, _state) = queued(1);
+    queued.pieces = [Piece { start: 0, end: LEAST_READ, parts: vec![Part { range: 0, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }] }].into();
+    engine.queue().push(queued, Priority::Load);
+    let taken = engine.queue().take().expect("a piece to take");
+    let returned = taken.returned(Instant::now());
+    let held = engine.queue();
+    engine.read_returned(returned);
+    assert_eq!(held.volumes[&taken.volume.id].bytes, LEAST_READ, "ended while another held the lock");
+    drop(held);
+    let mut queue = engine.queue();
+    let flight = queue.volumes.get_mut(&taken.volume.id).unwrap();
+    assert_eq!((flight.bytes, flight.book.requests()), (0, 1), "the next holder ended it");
 }
 
 /// A job dropped before it is waited for withdraws or finishes first:
@@ -975,10 +989,10 @@ fn a_volume_holds_at_most_its_window_in_flight() {
     assert_eq!(other, (Volume(0), 0), "2 + 2 passes the window; 2 + 1 would not, but waits");
     assert!(taken(&mut queue).is_none());
     assert!(urgent_state.started.get().is_some(), "its first piece was taken");
-    assert!(queue.ended(&urgent_first, Instant::now()), "a piece was held back");
+    assert!(queue.ended(urgent_first.returned(Instant::now())), "a piece was held back");
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 2)));
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 8)), "2 + 1 is within the window");
-    assert!(!queue.ended(&other_piece, Instant::now()));
+    assert!(!queue.ended(other_piece.returned(Instant::now())));
     // A piece wider than the window is read alone.
     let (mut wide, _) = queued(0);
     wide.volume = VolumeReads { id: Volume(2), ..narrow };

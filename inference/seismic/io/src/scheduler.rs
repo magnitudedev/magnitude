@@ -156,7 +156,7 @@ pub(crate) unsafe fn queue(file: &Arc<SourceFile>, volume: &VolumeReads, outstan
     // One worker per piece the volume's window has room for: a worker
     // woken with no piece it may take would only contend for the queue
     // with the submitter's next job.
-    let (id, woken) = engine.queue.lock().expect("read queue").push(
+    let (id, woken) = engine.queue().push(
         Queued { state: state.clone(), file: file.clone(), volume: volume.clone(), pieces: pieces.into() },
         priority,
     );

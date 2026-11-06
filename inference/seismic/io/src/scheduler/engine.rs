@@ -1,4 +1,4 @@
-use super::queue::{Queue, Taken};
+use super::queue::{Queue, Returned};
 use super::Panic;
 use crate::disk::LEAST_READ;
 #[cfg(doc)]
@@ -7,7 +7,8 @@ use crate::{Buffer, Error, Totals, Volume};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::Instant;
 
 /// A reader's jobs submitted and not yet ended ([`Reader::outstanding`]).
@@ -61,7 +62,7 @@ pub fn engine_work() -> EngineWork {
         .iter()
         .filter_map(|flight| flight.lock().expect("a read worker's flight").clone())
         .collect();
-    let queue = engine.queue.lock().expect("read queue");
+    let queue = engine.queue();
     let ended = queue.volumes.values().map(|flight| flight.book.requests()).sum();
     let last_ended = queue.volumes.iter().filter_map(|(volume, flight)| Some((*volume, flight.book.last_ended()?))).collect();
     EngineWork { ended, reading, last_ended }
@@ -70,18 +71,28 @@ pub fn engine_work() -> EngineWork {
 /// The counts of `volume` at `now` ([`crate::accounting::totals`]), none
 /// before a piece of it was taken.
 pub(crate) fn totals(volume: Volume, now: Instant) -> Totals {
-    engine().queue.lock().expect("read queue").volumes.get_mut(&volume).map_or_else(Totals::default, |flight| flight.book.totals_at(now))
+    engine().queue().volumes.get_mut(&volume).map_or_else(Totals::default, |flight| flight.book.totals_at(now))
 }
 
 /// The piece a worker is reading, if any: held only to set, clear or copy
 /// it, never across a read.
 type InFlight = Arc<Mutex<Option<Flight>>>;
 
-/// The process's pool: its queue, the condition its workers wait on, how
-/// many it has started, each one's piece in flight, and the buffers pieces
-/// that do not land straight are read into.
+/// The process's pool: its queue, the pieces whose reads returned while
+/// another held it, the condition its workers wait on, how many it has
+/// started, each one's piece in flight, and the buffers pieces that do not
+/// land straight are read into.
 pub(crate) struct Engine {
-    pub(crate) queue: Mutex<Queue>,
+    /// Held only through [`Engine::queue`], which ends `returned` first.
+    queue: Mutex<Queue>,
+    /// Pieces whose reads returned while the queue's lock was held, each
+    /// ended by the lock's next holder before it looks at the queue: a
+    /// returning read lands without waiting for the lock.
+    returned: Mutex<Vec<Returned>>,
+    /// How many `returned` holds, set under its lock, so a holder that finds
+    /// none takes no lock for them: one left as a holder looked is ended by
+    /// its worker's own next look at the queue.
+    left: AtomicUsize,
     pub(crate) work: Condvar,
     pub(crate) workers: Mutex<usize>,
     /// Each worker's piece in flight ([`engine_work`]).
@@ -98,16 +109,68 @@ pub(crate) fn deepen(count: usize) -> Result<(), Error> {
 /// ([`Engine::deepen`]).
 pub(crate) fn engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
-    ENGINE.get_or_init(|| Engine {
-        queue: Mutex::new(Queue::default()),
-        work: Condvar::new(),
-        workers: Mutex::new(0),
-        flights: Mutex::new(Vec::new()),
-        buffers: Buffers::default(),
-    })
+    ENGINE.get_or_init(Engine::new)
 }
 
 impl Engine {
+    /// A pool with no workers and nothing queued.
+    pub(crate) fn new() -> Self {
+        Engine {
+            queue: Mutex::new(Queue::default()),
+            returned: Mutex::new(Vec::new()),
+            left: AtomicUsize::new(0),
+            work: Condvar::new(),
+            workers: Mutex::new(0),
+            flights: Mutex::new(Vec::new()),
+            buffers: Buffers::default(),
+        }
+    }
+
+    /// The queue, every piece whose read returned ended in it first.
+    pub(crate) fn queue(&self) -> MutexGuard<'_, Queue> {
+        let mut queue = self.queue.lock().expect("read queue");
+        self.end_returned(&mut queue);
+        queue
+    }
+
+    /// End `returned` now if the queue's lock is free, or leave it for the
+    /// lock's next holder to end ([`Engine::queue`]).
+    pub(crate) fn read_returned(&self, returned: Returned) {
+        match self.queue.try_lock() {
+            Ok(mut queue) => {
+                self.end_returned(&mut queue);
+                self.end(&mut queue, returned);
+            }
+            Err(TryLockError::WouldBlock) => {
+                let mut left = self.returned.lock().expect("returned reads");
+                left.push(returned);
+                self.left.store(left.len(), Ordering::Release);
+            }
+            Err(TryLockError::Poisoned(_)) => panic!("read queue poisoned"),
+        }
+    }
+
+    /// End in `queue` the pieces whose reads returned while its lock was
+    /// held, in the order they were left.
+    fn end_returned(&self, queue: &mut Queue) {
+        if self.left.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut returned = self.returned.lock().expect("returned reads");
+        self.left.store(0, Ordering::Relaxed);
+        for returned in returned.drain(..) {
+            self.end(queue, returned);
+        }
+    }
+
+    /// End `returned` in `queue`: room it frees for a held-back piece wakes
+    /// a worker to take it.
+    fn end(&self, queue: &mut Queue, returned: Returned) {
+        if queue.ended(returned) {
+            self.work.notify_one();
+        }
+    }
+
     /// Start workers until the pool holds `count`: a reader of a volume
     /// that needs them reads at its full window or is not opened.
     pub(crate) fn deepen(&'static self, count: usize) -> Result<(), Error> {
@@ -133,12 +196,13 @@ impl Engine {
 fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
     loop {
         let taken = {
-            let mut queue = engine.queue.lock().expect("read queue");
+            let mut queue = engine.queue();
             loop {
                 if let Some(taken) = queue.take() {
                     break taken;
                 }
                 queue = engine.work.wait(queue).expect("read queue");
+                engine.end_returned(&mut queue);
             }
         };
         let piece = &taken.piece;
@@ -168,16 +232,15 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
         }));
         // The piece leaves its volume's flight as its read returns, before
         // its job's end runs the job's hook (a landing), which reads
-        // nothing: the window and the book count reads alone. Room it frees
-        // for a held-back piece wakes a worker to take it. It is counted
-        // ended before it stops being reported in flight ([`engine_work`]).
+        // nothing: the window and the book count reads alone, at the instant
+        // the read returned. Where another holds the queue's lock the piece
+        // is left for the lock's next holder to end, and lands without
+        // waiting for it. It is counted ended, or left to be, before it stops
+        // being reported in flight ([`engine_work`]).
         let now = Instant::now();
         crate::timeline::note_at(now, crate::timeline::Kind::Read, 0, (piece.start as i64, (piece.end - piece.start) as i64, 0));
-        let held_back = engine.queue.lock().expect("read queue").ended(&taken, now);
+        engine.read_returned(taken.returned(now));
         *flight.lock().expect("a read worker's flight") = None;
-        if held_back {
-            engine.work.notify_one();
-        }
         match read {
             Ok(failed) => taken.state.pieces_ended(1, failed, None),
             Err(payload) => taken.state.pieces_ended(1, [], Some(Panic::new(payload))),

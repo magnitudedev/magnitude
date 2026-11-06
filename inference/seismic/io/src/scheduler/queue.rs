@@ -139,6 +139,23 @@ pub(crate) struct Taken {
     pub(crate) class: Priority,
 }
 
+impl Taken {
+    /// This piece, its read returned at `at`, to end ([`Queue::ended`]).
+    pub(crate) fn returned(&self, at: Instant) -> Returned {
+        Returned { id: self.id, volume: self.volume.id, class: self.class, bytes: self.piece.end - self.piece.start, at }
+    }
+}
+
+/// A taken piece whose read returned at `at`: what ending it counts.
+#[derive(Clone, Copy)]
+pub(crate) struct Returned {
+    id: u64,
+    volume: Volume,
+    class: Priority,
+    bytes: u64,
+    at: Instant,
+}
+
 /// The jobs with pieces not yet taken, most urgent first: by priority, then
 /// by submission; each volume's reads in flight and its book; and each
 /// job's wait. Every count of a piece taken or ended is kept here, under
@@ -273,15 +290,15 @@ impl Queue {
         Some(taken)
     }
 
-    /// `taken`'s piece ended at `now`, counted in its volume's book and its
-    /// job's wait: whether a piece of the volume was held back, which may
-    /// now be taken.
-    pub(crate) fn ended(&mut self, taken: &Taken, now: Instant) -> bool {
-        let bytes = taken.piece.end - taken.piece.start;
-        let flight = self.volumes.get_mut(&taken.volume.id).expect("an ended piece was in flight");
+    /// `returned`'s piece ended as its read returned, counted in its
+    /// volume's book and its job's wait: whether a piece of the volume was
+    /// held back, which may now be taken.
+    pub(crate) fn ended(&mut self, returned: Returned) -> bool {
+        let Returned { id, volume, class, bytes, at } = returned;
+        let flight = self.volumes.get_mut(&volume).expect("an ended piece was in flight");
         flight.bytes -= bytes;
-        flight.book.ended(taken.class, bytes, now);
-        settle(&mut self.waits, taken.id, |wait| wait.ended(&mut flight.book, now));
+        flight.book.ended(class, bytes, at);
+        settle(&mut self.waits, id, |wait| wait.ended(&mut flight.book, at));
         std::mem::take(&mut flight.held_back)
     }
 
