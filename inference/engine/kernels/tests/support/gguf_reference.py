@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Reference dequantization of GGUF tensor types, from gguf-py (`gguf.quants`,
-the version `inference/evaluation/references` pins), for the engine's import
-tests. Q1_0, which gguf-py does not dequantize, is a port of ggml-quants.c
-`dequantize_row_q1_0`.
+at the revision the `inference/evaluation` workspace pins), for the engine's
+import tests.
 
-`vectors DIR` writes one `<TYPE>.bin` per weight type: seeded random blocks
-of the codes a GGUF file can hold whose reference values are all finite,
-then those values. The file is the
+`vectors DIR` writes one `<TYPE>.bin` per weight type the engine imports on
+its own: seeded random blocks of the codes a GGUF file can hold whose
+reference values are all finite, then those values. The file is the
 little-endian u32 block count, the blocks' bytes, and their f32 values.
 `engine/kernels/tests/import_residency.rs` checks the registry's conversion
 and decode of every type against them.
@@ -31,29 +30,22 @@ BLOCKS = 16
 # Types that are not weight formats: activation-side blocks no producer
 # writes as tensors, and the dense and integer types.
 NOT_WEIGHTS = {T.Q8_1, T.Q8_K, T.F64, T.I8, T.I16, T.I32, T.I64, T.F32, T.F16, T.BF16}
-
-
-def dequantize_q1_0(data):
-    # ggml-quants.c dequantize_row_q1_0: d (f16), then 128 bits, value j is
-    # d when bit j is set, else -d.
-    blocks = data.reshape(-1, 18)
-    d = blocks[:, :2].copy().view("<f2").astype(np.float32)
-    bits = np.unpackbits(blocks[:, 2:], axis=1, bitorder="little").astype(bool)
-    return np.where(bits, d, -d).reshape(-1)
+# Weight types without vectors of their own: F8_E4M3, which the engine imports
+# only under a UE8M0 scale grid (`import_residency.rs` assembles those blocks),
+# and Q2_0, which it does not import.
+NOT_VECTORED = {T.F8_E4M3, T.Q2_0}
 
 
 def reference(data, qtype):
     # Random blocks may hold NaN or infinite scales; `vectors` draws again.
     with np.errstate(invalid="ignore", over="ignore"):
-        if qtype == T.Q1_0:
-            return dequantize_q1_0(data)
         return dequantize(data, qtype).astype(np.float32).reshape(-1)
 
 
 def vectors(directory):
     directory.mkdir(parents=True, exist_ok=True)
     for qtype in T:
-        if qtype in NOT_WEIGHTS:
+        if qtype in NOT_WEIGHTS or qtype in NOT_VECTORED:
             continue
         values_per_block, bytes_per_block = GGML_QUANT_SIZES[qtype]
         rng = np.random.default_rng(zlib.crc32(qtype.name.encode()))

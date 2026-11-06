@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 
+from magnitude_references.families.deepseek41 import DeepSeek41Reference
 from magnitude_references.families.gemma4 import Gemma4Reference
 from magnitude_references.families.lfm2 import Lfm2Reference
 from magnitude_references.families.lfm3 import Lfm3Reference
@@ -19,6 +20,7 @@ from magnitude_references.model import Reference, Weights
 # GGUF `general.architecture` -> (family name, reference). The family name is the record's `family`
 # and the logits producer `reference:<family>`.
 REFERENCES: dict[str, tuple[str, type[Reference]]] = {
+    "deepseek41": ("deepseek41", DeepSeek41Reference),
     "llama": ("llama", LlamaReference),
     "lfm2": ("lfm2", Lfm2Reference),
     "lfm2moe": ("lfm2", Lfm2Reference),

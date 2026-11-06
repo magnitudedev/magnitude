@@ -2,10 +2,9 @@
 
 Typed headers read from a local file or from immutable Hugging Face revisions by HTTP byte range,
 tensor bytes from either, exact dequantization to float32, and a streaming writer that keeps every
-metadata value's GGUF type. Dequantization uses the NumPy decoders of `gguf` 0.19.0, whose
-`quants.py` is identical to gguf-py at the pinned llama.cpp revision `18443257a30c` (it only lacks
-one assertion); the quantized formats are defined by ggml, so this is the format's own decoder and
-is independent of the engine under test.
+metadata value's GGUF type. Dequantization uses the NumPy decoders of gguf-py at llama.cpp v0.9.0
+(`cd959bae99ff`, pinned by the workspace, the converter's revision); the quantized formats are
+defined by ggml, so this is the format's own decoder and is independent of the engine under test.
 """
 from __future__ import annotations
 

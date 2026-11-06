@@ -34,8 +34,8 @@ import torch
 
 from magnitude_references.families.qwen35 import Qwen35Reference
 from magnitude_references.gguf import Package
-from magnitude_references.model import (Rotary, Weights, attention, default_inv_freq, heads, linear, rms_norm, silu,
-                                        visibility)
+from magnitude_references.model import (Rotary, Weights, attention, default_inv_freq, heads, linear, lower_index_top,
+                                        rms_norm, silu, visibility)
 
 
 def ngram_rows(tokens: torch.Tensor, context: int, heads_per_order: int, multipliers: list[int], sizes: list[int],
@@ -74,11 +74,6 @@ def dilated_causal_conv(u: torch.Tensor, kernel: torch.Tensor, dilation: int) ->
     reach = dilation * (taps - 1)
     padded = torch.nn.functional.pad(u, (0, 0, reach, 0))
     return sum(padded[:, k * dilation:k * dilation + u.shape[1]] * kernel[:, k] for k in range(taps))
-
-
-def lower_index_top(scores: torch.Tensor, count: int) -> torch.Tensor:
-    """Indices of the `count` largest scores along the last axis, ties to the lower index."""
-    return torch.sort(scores, dim=-1, descending=True, stable=True).indices[..., :count]
 
 
 class Qwen4ExpReference(Qwen35Reference):

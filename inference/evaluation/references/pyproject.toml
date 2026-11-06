@@ -6,8 +6,9 @@ build-backend = "hatchling.build"
 name = "magnitude-references"
 version = "0.1.0"
 requires-python = ">=3.12"
-# magnitude-rig for the build identity of local runs (record.build) and the results store.
-dependencies = ["numpy==2.5.3", "gguf==0.19.0", "torch==2.14.0", "magnitude-rig"]
+# magnitude-rig for the build identity of local runs (record.build) and the results store; sympy for
+# DeepSeek V4.1's engram.py, which `deepseek41_released` runs.
+dependencies = ["numpy==2.5.3", "gguf", "torch==2.14.0", "sympy==1.14.0", "magnitude-rig"]
 
 [project.optional-dependencies]
 # Validation of the references themselves against released modeling code and checkpoints.

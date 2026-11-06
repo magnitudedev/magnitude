@@ -23,10 +23,20 @@ from magnitude_references.gguf import Package, TensorInfo, dequantize
 
 F32 = torch.float32
 QUERY_BLOCK = 1024  # attention query rows per score block
+# F8_E4M3 weights with UE8M0 block exponents (`inference/docs/precision.md`, "UE8M0-scaled FP8 weights")
+SCALE_ENCODING = "magnitude.scale_encoding"
+UE8M0 = "ue8m0"
+MAX_UE8M0 = 246  # the largest byte whose E4M3 products are exact in float32
 
 
 class Weights:
-    """Float32 tensors of a GGUF package by GGUF name, dequantized on demand."""
+    """Float32 tensors of a GGUF package by GGUF name, dequantized on demand.
+
+    A stored tensor's value includes its `<base>.scale` companion: the NVFP4 second-level scale, or,
+    for an F8_E4M3 tensor of a file declaring `magnitude.scale_encoding = "ue8m0"`, one UE8M0 byte b
+    (I8) per block, value = code * 2^(b - 127). The block grid is the one the two shapes define (32x32
+    for dense DeepSeek weights, 1x32 for the Engram table). Both products are exact in float32 (UE8M0
+    bytes above 246 are refused)."""
 
     def __init__(self, package: Package, device: torch.device, cache: bool):
         self.package, self.device, self.cache = package, device, cache
@@ -42,13 +52,46 @@ class Weights:
     def __call__(self, name: str) -> torch.Tensor:
         if name in self.values:
             return self.values[name]
-        value = torch.from_numpy(self.package.tensor(name)).to(self.device)
+        value = self.scaled(name, torch.from_numpy(self.package.tensor(name)).to(self.device))
         self.read.add(name)
-        if (scale := self.global_scale(name)) is not None:
-            value = value * scale
         if self.cache:
             self.values[name] = value
         return value
+
+    def scaled(self, name: str, value: torch.Tensor, rows: torch.Tensor | None = None,
+               expert: int | None = None) -> torch.Tensor:
+        """Stored values of `name` (only its `rows`, or only its `expert`'s matrix, when given) times their
+        companion scale."""
+        if (scale := self.global_scale(name)) is not None:
+            return value * (scale if expert is None else scale[expert])
+        if self.package.info(name).type != GGMLQuantizationType.F8_E4M3:
+            return value
+        return value * self.block_scale(name, rows)
+
+    def block_scale(self, name: str, rows: torch.Tensor | None) -> torch.Tensor:
+        """The UE8M0 factors of an F8_E4M3 matrix, expanded to its elements ([rows, cols])."""
+        encoding = self.package.metadata.get(SCALE_ENCODING)
+        if encoding is None or encoding.value != UE8M0:
+            raise ValueError(f"{name}: F8_E4M3 needs {SCALE_ENCODING} = {UE8M0}, the file declares {encoding}")
+        scale_name = name.removesuffix(".weight") + ".scale"
+        info, scale = self.package.info(name), self.package.info(scale_name)
+        if len(info.shape) != 2 or scale.type != GGMLQuantizationType.I8 or len(scale.shape) != 2:
+            raise ValueError(f"{name}: a block-scaled matrix needs an I8 matrix {scale_name}, got {scale}")
+        (total, cols), (grid_rows, grid_cols) = info.array_shape, scale.array_shape
+        block_rows, block_cols = total // grid_rows, cols // grid_cols
+        if block_rows * grid_rows != total or block_cols * grid_cols != cols:
+            raise ValueError(f"{name}: {scale_name} {scale.array_shape} does not tile {info.array_shape}")
+        codes = self.package.raw(scale_name).view(np.uint8).reshape(grid_rows, grid_cols)
+        if codes.size and (largest := int(codes.max())) > MAX_UE8M0:
+            raise ValueError(f"{scale_name}: UE8M0 byte {largest} is above {MAX_UE8M0}, where products leave float32")
+        exponents = codes.astype(np.int32) - 127
+        if rows is None:
+            exponents = exponents.repeat(block_rows, axis=0)
+        else:
+            exponents = exponents[rows.cpu().numpy() // block_rows]
+        self.read.add(scale_name)
+        factors = np.ldexp(np.float32(1), exponents).astype(np.float32)  # exact powers of two
+        return torch.from_numpy(factors.repeat(block_cols, axis=1)).to(self.device)
 
     def global_scale(self, name: str) -> torch.Tensor | None:
         """An NVFP4 tensor's second-level scale (`<base>.scale`: [1], or [experts] for stacked experts).
@@ -73,10 +116,8 @@ class Weights:
         per_expert = info.nbytes // info.shape[2]
         raw = self.package.raw(name)[index * per_expert:(index + 1) * per_expert]
         single = TensorInfo(name, info.shape[:2], info.type, 0)
-        value = torch.from_numpy(dequantize(single, raw)).to(self.device)
+        value = self.scaled(name, torch.from_numpy(dequantize(single, raw)).to(self.device), expert=index)
         self.read.add(name)
-        if (scale := self.global_scale(name)) is not None:
-            value = value * scale[index]
         if self.cache:
             self.values[key] = value
         return value
@@ -93,9 +134,8 @@ class Weights:
         row_bytes = info.nbytes // info.shape[1]
         selected = np.concatenate([raw[int(r) * row_bytes:(int(r) + 1) * row_bytes] for r in unique.tolist()])
         table = torch.from_numpy(dequantize(TensorInfo(name, (info.shape[0], len(unique)), info.type, 0), selected)).to(self.device)
+        table = self.scaled(name, table, unique)
         self.read.add(name)
-        if (scale := self.global_scale(name)) is not None:
-            table = table * scale
         return table[inverse.to(self.device)].reshape(*indices.shape, info.shape[0])
 
     def unread(self) -> list[str]:
@@ -200,6 +240,16 @@ class Rotary:
         width = self.cos.shape[-1]
         return torch.cat((self.apply(x[..., :width]), x[..., width:]), dim=-1)
 
+    def apply_pairs(self, x: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+        """x [..., T, D] with D == table width, rotated as adjacent pairs (2j, 2j+1) by frequency j (the
+        complex-number view); `inverse` rotates by the conjugate."""
+        pairs = x.shape[-1] // 2
+        cos, sin = self.cos[..., :pairs], self.sin[..., :pairs]
+        if inverse:
+            sin = -sin
+        even, odd = x[..., 0::2], x[..., 1::2]
+        return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
+
 
 def unpermute_rows(weight: torch.Tensor, head_count: int) -> torch.Tensor:
     """Inverse of llama.cpp's `LlamaModel.permute` / `_unpermute_for_rope` (used for NORM-rope GGUFs):
@@ -231,10 +281,12 @@ def visibility(query_positions: torch.Tensor, key_positions: torch.Tensor, *, ca
     return visible
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, visible: torch.Tensor, scale: float) -> torch.Tensor:
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, visible: torch.Tensor, scale: float,
+              sinks: torch.Tensor | None = None) -> torch.Tensor:
     """Grouped-query softmax attention in float32.
 
-    q [B, Hq, T, D], k [B, Hk, S, D], v [B, Hk, S, Dv], visible [T, S] (or [B, T, S]).
+    q [B, Hq, T, D], k [B, Hk, S, D], v [B, Hk, S, Dv], visible [T, S] (or [B, T, S]). `sinks` [Hq]
+    adds exp(sink_h) to head h's softmax denominator (a logit with a zero value).
     Returns [B, T, Hq * Dv] (heads concatenated per row).
     """
     batch, heads, rows, _ = q.shape
@@ -251,7 +303,9 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, visible: torch.
         end = min(start + QUERY_BLOCK, rows)
         scores = torch.matmul(q[:, :, start:end], k.transpose(-1, -2)) * scale
         scores = scores.masked_fill(~mask[:, None, start:end], float("-inf"))
-        out.append(torch.matmul(torch.softmax(scores, dim=-1), v))
+        if sinks is not None:
+            scores = torch.cat((scores, sinks.view(1, heads, 1, 1).expand(batch, heads, end - start, 1)), dim=-1)
+        out.append(torch.matmul(torch.softmax(scores, dim=-1)[..., :v.shape[-2]], v))
     return torch.cat(out, dim=2).transpose(1, 2).reshape(batch, rows, heads * v.shape[-1])
 
 
@@ -268,6 +322,11 @@ def heads(x: torch.Tensor, count: int) -> torch.Tensor:
 def route_top_k(scores: torch.Tensor, k: int) -> torch.Tensor:
     """Indices of the k largest scores per row (torch.topk, as transformers selects)."""
     return torch.topk(scores, k, dim=-1).indices
+
+
+def lower_index_top(scores: torch.Tensor, count: int) -> torch.Tensor:
+    """Indices of the `count` largest scores along the last axis, ties to the lower index."""
+    return torch.sort(scores, dim=-1, descending=True, stable=True).indices[..., :count]
 
 
 def mixture(x: torch.Tensor, selected: torch.Tensor, weights: torch.Tensor, expert) -> torch.Tensor:

@@ -12,7 +12,7 @@ dependencies = [
   "httpx==0.28.1",
   "psutil>=7",
   "pydantic==2.13.5",
-  "gguf==0.19.0",
+  "gguf",
   "huggingface-hub>=1.27,<2",
   "tokenizers>=0.22,<1",
 ]

@@ -20,6 +20,8 @@ magnitude-fixtures = { workspace = true }
 magnitude-references = { workspace = true }
 magnitude-bench = { workspace = true }
 magnitude-rig = { workspace = true }
+# gguf-py of llama.cpp v0.9.0, the revision the converter builds on: released gguf 0.19.0 lacks F8_E4M3 (43)
+gguf = { git = "https://github.com/ggml-org/llama.cpp", rev = "cd959bae99ff4bed22bef2604f45241c09bbb8c8", subdirectory = "gguf-py" }
 
 [dependency-groups]
 dev = ["pytest>=9.1.1", "pytest-asyncio>=1"]

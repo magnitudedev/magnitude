@@ -6,7 +6,8 @@ compares logits on seeded random prompts: it checks the forward pass against the
 code. The prompts are arbitrary because both sides compute the same function of them; this is a
 numerical equivalence check of two implementations, never a quality measurement. A family transformers
 lacks (`qwen4exp`) is checked the same way against mlx_vlm, run by an interpreter that has it
-(`mlx_released.py`). `check_weights`
+(`mlx_released.py`), and `deepseek41` against DeepSeek's own inference code (`deepseek41_released.py`).
+`check_weights`
 compares the reference's weights, after undoing the converter's transforms, with the original
 checkpoint tensors: it checks the GGUF mapping (the differences are the file's quantization error; a
 mapping error shows as a relative error near 1).
@@ -90,8 +91,13 @@ def check_hf(reference, count: int, length: int, seed: int, mlx_python: Path | N
         tokens = reference.check_prompts(tokens)
     with torch.no_grad():
         ours = reference.forward(tokens)
-        theirs = (mlx_logits(reference, tokens, mlx_python) if released == "mlx_vlm"
-                  else hf_model(reference)(input_ids=tokens, use_cache=False).logits.to(F32))
+        if released == "mlx_vlm":
+            theirs = mlx_logits(reference, tokens, mlx_python)
+        elif released == "deepseek":
+            from magnitude_references import deepseek41_released
+            theirs = deepseek41_released.logits(reference, tokens.cpu()).to(tokens.device)
+        else:
+            theirs = hf_model(reference)(input_ids=tokens, use_cache=False).logits.to(F32)
     difference = (ours - theirs).abs()
     scale = float(theirs.abs().max())
     report = {
