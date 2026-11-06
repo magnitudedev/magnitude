@@ -43,7 +43,7 @@ use magnitude_executor::{
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
     held_storage, resident_layout, scaled_source_element, stored_weights, AssessmentMemoryCharge,
-    ChargedDraft, DraftedCharge, ExecutionPath, ExecutionPlanDraft, HeldCharge, KernelCache,
+    ChargedDraft, DraftedCharge, ExpertBankPlan, ExecutionPath, ExecutionPlanDraft, HeldCharge, KernelCache,
 };
 use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, ScaledActivations};
 use magnitude_scheduler::ServiceLimits;
@@ -427,8 +427,9 @@ pub fn finish_model_assessment(
             domains, residency, ..
         }) => ModelExecution::Fits {
             residency: match residency {
-                FitResidency::Streamed(shares) => {
-                    let at = |held| streamed_performance(&setup.measurements, preparation, draft, &request, held);
+                FitResidency::Streamed(bank) => {
+                    let shares = ExpertShares::of(&bank);
+                    let at = |held| streamed_performance(&setup.measurements, preparation, draft, &bank, &request, held);
                     ModelResidency::Streamed {
                         performance: at(shares.held(shares.slots()))?,
                         floor_performance: at(shares.held(shares.floor()))?,
@@ -479,6 +480,7 @@ fn streamed_performance(
     measurements: &Measurements,
     preparation: &PreparedExecutionAssessment,
     draft: &ExecutionPlanDraft,
+    bank: &ExpertBankPlan,
     request: &AssessmentRequest,
     held: magnitude_executor::assessment::HeldSlots,
 ) -> Result<Performance, ModelAssessmentError> {
@@ -488,7 +490,7 @@ fn streamed_performance(
         Measurements::Measured { costs, streamed, .. } => match streamed {
             Priced::Pending(_) => Ok(Performance::Pending),
             Priced::Unavailable(reason) => Ok(Performance::Unavailable { reason: reason.clone() }),
-            Priced::Measured(figures) => streamed_estimate(costs, figures, preparation, draft, request, held),
+            Priced::Measured(figures) => streamed_estimate(costs, figures, preparation, draft, bank, request, held),
         },
     }
 }
@@ -499,16 +501,17 @@ fn streamed_performance(
 /// step model ([`StreamedLayers::step_seconds`]) at the request's rows (a
 /// row a sequence), their file reads along the model store's read line, on
 /// `C` the resident step's estimate there (`preparation` is the resident
-/// plan's): the plan's structure and the machine's stored figures alone.
+/// plan's, `draft` its plan), `bank` the fit's: the plan's structure and
+/// the machine's stored figures alone.
 pub fn streamed_estimate(
     costs: &ExecutorCosts,
     figures: &StreamedFigures,
     preparation: &PreparedExecutionAssessment,
     draft: &ExecutionPlanDraft,
+    bank: &ExpertBankPlan,
     request: &AssessmentRequest,
     held: magnitude_executor::assessment::HeldSlots,
 ) -> Result<Performance, ModelAssessmentError> {
-    let bank = draft.load().expert_bank().expect("a streamed fit's plan has an expert bank");
     let layers = match StreamedLayers::of_bank(bank, costs, figures) {
         Ok(layers) => layers,
         Err(reason) => return Ok(Performance::Unavailable { reason: format!("the streamed layers: {reason}") }),

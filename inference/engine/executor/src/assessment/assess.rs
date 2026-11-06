@@ -72,8 +72,10 @@ pub struct ExecutionFit {
 pub enum Residency {
     /// Every weight in memory.
     Resident,
-    /// The routed experts streamed through an expert bank.
-    Streamed(ExpertShares),
+    /// The routed experts streamed through this expert bank, the bank of
+    /// the plan that fits: what the fit classed streamed is what its
+    /// shares ([`ExpertShares::of`]) and speed are read from.
+    Streamed(crate::planning::ExpertBankPlan),
 }
 
 impl Residency {
@@ -82,16 +84,7 @@ impl Residency {
     pub fn of(draft: &ExecutionPlanDraft) -> Self {
         match draft.load().expert_bank().filter(|bank| !bank.whole()) {
             None => Self::Resident,
-            Some(bank) => Self::Streamed(ExpertShares::new(
-                bank.floor(),
-                bank.slots,
-                bank.widest(),
-                match bank.host() {
-                    crate::planning::HostTier::Linked(_) if bank.host_slots > 0 => ColdSource::HostTier { slots: bank.host_slots },
-                    crate::planning::HostTier::Linked(_) => ColdSource::File(FileOnly::NoHostRoom),
-                    crate::planning::HostTier::Unified => ColdSource::File(FileOnly::Unified),
-                },
-            )),
+            Some(bank) => Self::Streamed(bank.clone()),
         }
     }
 }
@@ -136,6 +129,21 @@ pub enum FileOnly {
 }
 
 impl ExpertShares {
+    /// The shares of a streamed `bank`, which holds fewer than every
+    /// expert: its floor, its slots and where its cold experts lie.
+    pub fn of(bank: &crate::planning::ExpertBankPlan) -> Self {
+        Self::new(
+            bank.floor(),
+            bank.slots,
+            bank.widest(),
+            match bank.host() {
+                crate::planning::HostTier::Linked(_) if bank.host_slots > 0 => ColdSource::HostTier { slots: bank.host_slots },
+                crate::planning::HostTier::Linked(_) => ColdSource::File(FileOnly::NoHostRoom),
+                crate::planning::HostTier::Unified => ColdSource::File(FileOnly::Unified),
+            },
+        )
+    }
+
     /// The shares of a bank of `slots` of `experts` experts, at least
     /// `floor`. A plan whose bank breaks `floor ≤ slots < experts` is a
     /// planning defect.

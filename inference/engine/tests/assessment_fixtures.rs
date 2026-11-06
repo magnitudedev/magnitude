@@ -18,7 +18,7 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     AssessmentFitVerdict, ConveyorCarrier, HeldCharges, PlanError,
-    assessment::{AssessmentError, ColdSource, Residency, execution_memory_charge},
+    assessment::{AssessmentError, ColdSource, ExpertShares, Residency, execution_memory_charge},
     platform::{DeviceRequest, DomainRole, MemoryReserves},
 };
 use magnitude_scheduler::ServiceLimits;
@@ -777,9 +777,10 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
         .unwrap()
         .unwrap();
     assert_eq!(replanned.draft().load().expert_bank().unwrap().host_slots, ceiling);
-    let Residency::Streamed(shares) = Residency::of(replanned.draft()) else {
+    let Residency::Streamed(bank) = Residency::of(replanned.draft()) else {
         panic!("a capped load streams");
     };
+    let shares = ExpertShares::of(&bank);
     assert_eq!(shares.cold(), &ColdSource::HostTier { slots: ceiling });
     assert_eq!(shares.held(shares.floor()).host as u64, ceiling);
     // The host RAM the load holds beside the tier's floor.
@@ -824,6 +825,42 @@ fn a_bank_shrunk_to_fit_keeps_its_host_tier() {
     };
     assert!(shares.slots() < shares.experts().get(), "{shares:?}");
     assert!(matches!(shares.cold(), ColdSource::HostTier { .. }), "{shares:?}");
+}
+
+/// A streamed fit is priced on the expert bank it was classed streamed
+/// by. The pair that failed a priced catalog on an RTX 3090: planning finds
+/// no bank within the device's stable capacity and holds the experts whole
+/// (a draft with no bank), then the fit, short of room for that plan, holds
+/// its experts in a bank the allocation domain's bound admits
+/// (`with_held_experts`). Here: Qwen3.6 35B planned on the M4 Pro with 1 GB
+/// of room, which no bank fits, then fitted with 4 GB less room than its
+/// resident plan, measured on synthetic costs and figures: streamed, its
+/// speed estimated on the held plan's bank.
+#[test]
+fn a_streamed_fit_is_priced_on_the_bank_it_was_held_in() {
+    use magnitude_executor::assessment::{Priced, ReadLine, StreamedFigures, synthetic};
+    let scratch = Scratch::new("streamed-own-bank");
+    let package = qwen36_35b(&scratch);
+    let (_, _, resident) = assess_qwen36_35b(&package, MemoryReserves::standard());
+    let ModelExecution::Fits { domains, .. } = resident else {
+        panic!("Qwen3.6 35B fits the M4 Pro resident: {resident:?}");
+    };
+    let allocation = domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
+    let room = |bytes| m4_pro_setup(host_room(allocation.capacity_bytes, bytes), ModelPolicy::default(), standard_service_limits());
+    let prepared = prepare_model_assessment(&package, &room(1_000_000_000).structure).unwrap_or_else(|error| panic!("operational failure: {error}"));
+    let PreparedModelAssessment::Planned { draft, .. } = &prepared else {
+        panic!("Qwen3.6 35B is planned");
+    };
+    assert!(draft.load().expert_bank().is_none(), "no bank fits 1 GB: the experts are held whole");
+    let mut setup = room(allocation.required_bytes - 4_000_000_000);
+    let figures = StreamedFigures { read: ReadLine::new(1e-4, 1. / 3e9).unwrap(), memory: None, site: None, convert: 1. / 100e9 };
+    setup.measurements = Measurements::Measured { costs: Arc::new(synthetic::costs()), records: Arc::default(), pending: false, streamed: Priced::Measured(figures) };
+    let assessed = finish_model_assessment(&prepared, &setup, &[], PROFILE_SEQUENCES).unwrap_or_else(|error| panic!("operational failure: {error}"));
+    let ModelAssessment::Assessed { execution: ModelExecution::Fits { residency: ModelResidency::Streamed { performance, floor_performance, .. }, .. }, .. } = assessed else {
+        panic!("Qwen3.6 35B fits streamed with 4 GB less room: {assessed:?}");
+    };
+    assert!(matches!(performance, Performance::Estimated(_)), "{performance:?}");
+    assert!(matches!(floor_performance, Performance::Estimated(_)), "{floor_performance:?}");
 }
 
 /// The standard reserves, but host RAM of stable `capacity` (a domain's

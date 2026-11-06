@@ -32,6 +32,8 @@ pub mod step;
 pub mod streamed;
 pub mod streaming;
 pub mod streaming_costs;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod synthetic;
 
 pub use assess::{
     assess_execution_fit, decode_demand, decode_pricing, estimate_execution, execution_memory_charge, execution_memory_charge_with_undrafted, undrafted_memory_charge, StructuralCharge,

@@ -2077,10 +2077,13 @@ fn estimated(
     // are priced where that tier served them, not where a plan's tier
     // would (the mean of its steps' host slots; none without a tier).
     let host = window_host_slots(cell)?;
+    // The bank the plan streams its experts through, whose slots are priced
+    // at each count: none where the plan holds them whole.
+    let bank = draft.load().expert_bank().filter(|bank| !bank.whole()).ok_or("the plan holds its experts whole")?;
     let mut by_slots = Vec::new();
     for slots in 1..=costs.experts {
         let held = magnitude_executor::assessment::HeldSlots { slots, host };
-        let performance = streamed_estimate(machine, figures, execution, draft, &request, held)
+        let performance = streamed_estimate(machine, figures, execution, draft, bank, &request, held)
             .map_err(|error| error.to_string())?;
         let Performance::Estimated(estimates) = performance else {
             return Err(unavailable(format!("at {slots} slots: {performance:?}")));
