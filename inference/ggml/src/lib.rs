@@ -11,7 +11,7 @@ pub mod tables;
 pub enum Encoding {
     // Numeric IDs, block element counts, and serialized block sizes below are
     // pinned to ggml/llama.cpp commit
-    // 5e6c0e18b6b11f109411401239b3b0ef61058dae:
+    // cd959bae99ff4bed22bef2604f45241c09bbb8c8 (v0.9.0):
     //   ggml/include/ggml.h (`enum ggml_type`)
     //   ggml/src/ggml-common.h (`QK_*` and `block_*` definitions)
     // Every type a GGUF file can store is listed, so any valid header
@@ -53,11 +53,15 @@ pub enum Encoding {
     Mxfp4 = 39,
     Nvfp4 = 40,
     Q1_0 = 41,
+    Q2_0 = 42,
+    /// OCP E4M3, one byte a value with no block scale; a weight's scales, when it has them,
+    /// are a tensor of their own.
+    F8E4M3 = 43,
 }
 
 impl Encoding {
     /// Every encoding, in ggml id order.
-    pub const ALL: [Self; 34] = [
+    pub const ALL: [Self; 36] = [
         Self::F32,
         Self::F16,
         Self::Q4_0,
@@ -92,6 +96,8 @@ impl Encoding {
         Self::Mxfp4,
         Self::Nvfp4,
         Self::Q1_0,
+        Self::Q2_0,
+        Self::F8E4M3,
     ];
 
     /// The encoding of ggml type id `id`; `None` for an id no GGUF file may
@@ -137,6 +143,8 @@ impl Encoding {
             Self::Mxfp4 => "MXFP4",
             Self::Nvfp4 => "NVFP4",
             Self::Q1_0 => "Q1_0",
+            Self::Q2_0 => "Q2_0",
+            Self::F8E4M3 => "F8_E4M3",
         }
     }
 
@@ -149,7 +157,8 @@ impl Encoding {
             | Self::I8
             | Self::I16
             | Self::I32
-            | Self::I64 => 1,
+            | Self::I64
+            | Self::F8E4M3 => 1,
             Self::Q4_0
             | Self::Q4_1
             | Self::Q5_0
@@ -158,7 +167,7 @@ impl Encoding {
             | Self::Q8_1
             | Self::Iq4Nl
             | Self::Mxfp4 => 32,
-            Self::Nvfp4 => 64,
+            Self::Nvfp4 | Self::Q2_0 => 64,
             Self::Q1_0 => 128,
             Self::Q2K
             | Self::Q3K
@@ -181,11 +190,11 @@ impl Encoding {
 
     pub const fn block_bytes(self) -> u64 {
         match self {
-            Self::I8 => 1,
+            Self::I8 | Self::F8E4M3 => 1,
             Self::F16 | Self::BF16 | Self::I16 => 2,
             Self::F32 | Self::I32 => 4,
             Self::F64 | Self::I64 => 8,
-            Self::Q4_0 | Self::Iq4Nl | Self::Q1_0 => 18,
+            Self::Q4_0 | Self::Iq4Nl | Self::Q1_0 | Self::Q2_0 => 18,
             Self::Q4_1 => 20,
             Self::Q5_0 => 22,
             Self::Q5_1 => 24,

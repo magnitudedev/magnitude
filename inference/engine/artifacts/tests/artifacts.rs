@@ -347,7 +347,7 @@ fn bf16_is_a_dense_two_byte_container_encoding() {
 #[test]
 fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
     // Pinned source of truth: ggml/llama.cpp
-    // 5e6c0e18b6b11f109411401239b3b0ef61058dae, specifically
+    // cd959bae99ff4bed22bef2604f45241c09bbb8c8 (v0.9.0), specifically
     // `ggml/include/ggml.h` and `ggml/src/ggml-common.h`.
     let cases = [
         (Encoding::F32, 0, 1, 4),
@@ -384,6 +384,8 @@ fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
         (Encoding::Mxfp4, 39, 32, 17),
         (Encoding::Nvfp4, 40, 64, 36),
         (Encoding::Q1_0, 41, 128, 18),
+        (Encoding::Q2_0, 42, 64, 18),
+        (Encoding::F8E4M3, 43, 1, 1),
     ];
     assert_eq!(
         cases.map(|(encoding, ..)| encoding),
@@ -412,7 +414,7 @@ fn audited_encoding_ids_and_block_geometry_match_pinned_ggml() {
 /// it is named with its tensor count, and the rest of the directory is still read.
 #[test]
 fn removed_or_unknown_encoding_ids_are_reported_with_the_rest_of_the_directory() {
-    for type_id in [4, 5, 31, 32, 33, 36, 37, 38, 42, 200, u32::MAX] {
+    for type_id in [4, 5, 31, 32, 33, 36, 37, 38, 44, 200, u32::MAX] {
         let error = gguf::read_directory(&mut Cursor::new(container(
             false,
             &[("weight", vec![32], type_id, 0), ("norm", vec![32], 0, 32)],

@@ -777,6 +777,7 @@ enum FileTypeKind {
     MostlyNvfp4,
     MostlyQ1_0,
     MostlyQ2_0,
+    MostlyF8E4M3,
 }
 
 /// What a file's weights are stored as: its declared `general.file_type`, unless its tensors
@@ -847,7 +848,9 @@ impl Quantization {
                 Encoding::F64 | Encoding::I64 => "64-bit",
                 Encoding::F32 | Encoding::I32 => "32-bit",
                 Encoding::F16 | Encoding::BF16 | Encoding::I16 => "16-bit",
-                Encoding::Q8_0 | Encoding::Q8_1 | Encoding::Q8K | Encoding::I8 => "8-bit",
+                Encoding::Q8_0 | Encoding::Q8_1 | Encoding::Q8K | Encoding::I8 | Encoding::F8E4M3 => {
+                    "8-bit"
+                }
                 Encoding::Q6K => "6-bit",
                 Encoding::Q5_0 | Encoding::Q5_1 | Encoding::Q5K => "5-bit",
                 Encoding::Q4_0
@@ -862,7 +865,8 @@ impl Quantization {
                 | Encoding::Iq2Xxs
                 | Encoding::Iq2Xs
                 | Encoding::Iq2S
-                | Encoding::Tq2_0 => "2-bit",
+                | Encoding::Tq2_0
+                | Encoding::Q2_0 => "2-bit",
                 Encoding::Iq1S | Encoding::Iq1M | Encoding::Tq1_0 | Encoding::Q1_0 => "1-bit",
             },
         }
@@ -943,6 +947,7 @@ impl FileTypeKind {
             39 => Self::MostlyNvfp4,
             40 => Self::MostlyQ1_0,
             41 => Self::MostlyQ2_0,
+            42 => Self::MostlyF8E4M3,
             _ => return None,
         })
     }
@@ -954,6 +959,7 @@ impl FileTypeKind {
             Self::MostlyBf16 => "BF16",
             Self::MostlyQ1_0 => "Q1_0",
             Self::MostlyQ2_0 => "Q2_0",
+            Self::MostlyF8E4M3 => "F8_E4M3",
             Self::MostlyQ4_0 => "Q4_0",
             Self::MostlyQ4_1 => "Q4_1",
             Self::MostlyQ5_0 => "Q5_0",
@@ -1022,6 +1028,7 @@ impl FileTypeKind {
             Self::MostlyNvfp4 => 40,
             Self::MostlyQ1_0 => 41,
             Self::MostlyQ2_0 => 42,
+            Self::MostlyF8E4M3 => 43,
         }
     }
 
@@ -1029,7 +1036,7 @@ impl FileTypeKind {
         match self {
             Self::AllF32 => "32-bit",
             Self::MostlyF16 | Self::MostlyBf16 => "16-bit",
-            Self::MostlyQ8_0 => "8-bit",
+            Self::MostlyQ8_0 | Self::MostlyF8E4M3 => "8-bit",
             Self::MostlyQ6K => "6-bit",
             Self::MostlyQ5_0 | Self::MostlyQ5_1 | Self::MostlyQ5KSmall | Self::MostlyQ5KMedium => {
                 "5-bit"
@@ -1075,6 +1082,7 @@ pub fn quantization_label(quantization: &str) -> Option<&'static str> {
         "BF16" => "BF16",
         "Q1_0" => "Q1_0",
         "Q2_0" => "Q2_0",
+        "F8_E4M3" => "F8_E4M3",
         "Q4_0" => "Q4_0",
         "Q4_1" => "Q4_1",
         "Q5_0" => "Q5_0",
@@ -1490,7 +1498,7 @@ mod tests {
         assert_eq!(guessed.name(), "(guessed) all F32");
         assert_eq!(guessed.bit_width(), "unknown");
         assert!(FileType::from_raw(GUESSED_FILE_TYPE | 15).is_err());
-        // llama.cpp's `llama_ftype`: 38 MXFP4_MOE, 39 NVFP4, 40 Q1_0, 41 Q2_0.
+        // llama.cpp's `llama_ftype`: 38 MXFP4_MOE, 39 NVFP4, 40 Q1_0, 41 Q2_0, 42 F8_E4M3.
         for (raw, name, bits) in [
             (36, "TQ1_0 - 1.69 bpw ternary", "1-bit"),
             (37, "TQ2_0 - 2.06 bpw ternary", "2-bit"),
@@ -1498,11 +1506,12 @@ mod tests {
             (39, "NVFP4", "4-bit"),
             (40, "Q1_0", "1-bit"),
             (41, "Q2_0", "2-bit"),
+            (42, "F8_E4M3", "8-bit"),
         ] {
             let file_type = FileType::from_raw(raw).unwrap();
             assert_eq!((file_type.name().as_str(), file_type.bit_width()), (name, bits), "{raw}");
         }
-        assert!(FileType::from_raw(42).is_err());
+        assert!(FileType::from_raw(43).is_err());
     }
 
     /// A one-layer header declaring `file_type`, with these tensors (GGML-order dimensions,

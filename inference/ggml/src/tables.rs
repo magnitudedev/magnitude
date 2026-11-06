@@ -1,5 +1,5 @@
 //! ggml's lookup tables, transcribed from `ggml/src/ggml-common.h` at ggml/llama.cpp
-//! commit 5e6c0e18b6b11f109411401239b3b0ef61058dae (the commit `Encoding` pins): the
+//! commit cd959bae99ff4bed22bef2604f45241c09bbb8c8 (v0.9.0, the commit `Encoding` pins): the
 //! tables of the formats Magnitude reads. The reference vectors from gguf-py
 //! (`engine/kernels/tests/support/gguf_reference.py`) check them through every
 //! format that decodes with them.
@@ -3393,7 +3393,7 @@ pub const KVALUES_IQ4NL: [i8; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
 
-/// ggml `kvalues_mxfp4`.
+/// ggml `kvalues_fp4` (`kvalues_mxfp4`), shared by MXFP4 and NVFP4.
 pub const KVALUES_MXFP4: [i8; 16] = [
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 ];
