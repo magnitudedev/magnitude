@@ -3,7 +3,7 @@
 use super::{
     ArtifactComponent, ArtifactComponentKind, AssessmentMemoryCharge, CapabilityPlan,
     ComponentPlan, ComponentSelection, HostTier, MAX_DRAFT_PROPOSALS, ModelLoadPlan, PlannedMethod,
-    ProgramPlan, ReadoutClassChoice, ResourceLimits, ResourcePlan, TargetGraphBounds, WeightPlan,
+    ProgramPlan, ReadoutClassChoice, ResourceLimits, ResourcePlan, UndraftedBounds, WeightPlan,
 };
 use crate::{
     ExecutionPath, UnstreamedExperts,
@@ -722,16 +722,17 @@ impl HeldCharge for AssessmentMemoryCharge {
     }
 }
 
-/// A drafted plan's charge, with the bounds of its target family without
-/// its drafter's writes, from the same certification
+/// A drafted plan's charge, with the bounds its certification gives of the
+/// target's plan alone (`UndraftedBounds`: its target family without the
+/// drafter's writes, and the vision family both hold)
 /// (`crate::assessment::execution_memory_charge_with_undrafted`): what
 /// prices the drafter by the target's plan alone at the same holding of
-/// experts (`crate::assessment::undrafted_memory_charge`). The undrafted
-/// family is of the plan's structure, so a bank's slots leave it as it is.
+/// experts (`crate::assessment::undrafted_memory_charge`). Those families
+/// are of the plan's structure, so a bank's slots leave them as they are.
 #[derive(Clone, Debug)]
 pub struct DraftedCharge {
     pub charge: AssessmentMemoryCharge,
-    pub undrafted: TargetGraphBounds,
+    pub undrafted: UndraftedBounds,
 }
 
 impl HeldCharge for DraftedCharge {
@@ -831,9 +832,9 @@ impl<C: HeldCharge> ChargedDraft<C> {
 }
 
 impl ChargedDraft<DraftedCharge> {
-    /// The bounds of this draft's target family without its drafter's
-    /// writes ([`DraftedCharge`]).
-    pub fn undrafted(&self) -> &TargetGraphBounds {
+    /// The bounds this draft's certification gives of its target's plan
+    /// alone ([`DraftedCharge`]).
+    pub fn undrafted(&self) -> &UndraftedBounds {
         &self.charge.undrafted
     }
 }

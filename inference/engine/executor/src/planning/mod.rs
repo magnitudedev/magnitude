@@ -17,7 +17,7 @@ mod weights;
 pub use assessment::{
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, CONVERSATION_CHECKPOINTS,
-    DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, TargetGraphBounds, measurement_process_bytes,
+    DeviceProcessBytes, HostProcessBytes, SealedGraphHostBytes, TargetGraphBounds, UndraftedBounds, VisionGraphBounds, measurement_process_bytes,
 };
 pub(crate) use assessment::fit_depth;
 pub use bank::{

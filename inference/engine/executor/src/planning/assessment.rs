@@ -457,6 +457,27 @@ impl TargetGraphBounds {
     }
 }
 
+/// A projector's vision family's checked bounds. No drafter changes the
+/// vision program, so a drafted plan and its target's plan alone hold the
+/// same family ([`UndraftedBounds`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisionGraphBounds {
+    /// Its pools at the startup slots.
+    pub charge: NativeGraphCharge,
+    /// The constants its binding allocates.
+    pub binding_constant_bytes: u64,
+}
+
+/// What a drafted plan's certification gives of its target's plan alone at
+/// the same holding of experts: its target family without the drafter's
+/// writes, and the vision family both hold. Every other family of the target
+/// alone is its own ([`AssessmentGraphResourceBounds::of_target`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UndraftedBounds {
+    pub target: TargetGraphBounds,
+    pub vision: Option<VisionGraphBounds>,
+}
+
 /// Checked graph-pool demand and distinct bound constants from the same class
 /// enumeration and slot multipliers as native preparation: an upper bound for
 /// every graph pool a clean load commits on the selected backend. Deriving
@@ -503,7 +524,8 @@ impl AssessmentGraphResourceBounds {
         let target =
             crate::programs::native_target_graph::checked_target_family(backend, load, &definition.decoder, state, plan.target(), limits)?;
         let target = TargetGraphBounds::of(target, limits.startup_slots().target)?;
-        Self::of_target(definition, load, &plan, state, method, limits, backend, target)
+        let vision = Self::vision(definition, load, &plan, limits, backend)?;
+        Self::of_target(definition, load, &plan, state, method, limits, backend, target, vision)
     }
 
     /// [`Self::derive`], with the bounds of the same target's family
@@ -519,7 +541,7 @@ impl AssessmentGraphResourceBounds {
         codec: KvCodec,
         limits: super::ResourceLimits,
         backend: BackendName,
-    ) -> Result<(Self, TargetGraphBounds), GraphError> {
+    ) -> Result<(Self, UndraftedBounds), GraphError> {
         let plan = Self::program_plan(definition, load, method, codec)?;
         let [target, undrafted] = crate::programs::native_target_graph::checked_target_and_undrafted(
             backend,
@@ -531,8 +553,40 @@ impl AssessmentGraphResourceBounds {
         )?;
         let slots = limits.startup_slots().target;
         let target = TargetGraphBounds::of(target, slots)?;
-        let bounds = Self::of_target(definition, load, &plan, state, method, limits, backend, target)?;
-        Ok((bounds, TargetGraphBounds::of(undrafted, slots)?))
+        let vision = Self::vision(definition, load, &plan, limits, backend)?;
+        let bounds = Self::of_target(definition, load, &plan, state, method, limits, backend, target, vision.clone())?;
+        Ok((bounds, UndraftedBounds { target: TargetGraphBounds::of(undrafted, slots)?, vision }))
+    }
+
+    /// The bounds of `plan`'s vision family, of a projector's load.
+    fn vision(
+        definition: &ModelDefinition,
+        load: &ModelLoadPlan,
+        plan: &super::ProgramPlan,
+        limits: super::ResourceLimits,
+        backend: BackendName,
+    ) -> Result<Option<VisionGraphBounds>, GraphError> {
+        match (plan.vision(), definition.vision.as_ref()) {
+            (Some(vision_plan), Some(vision_definition)) => {
+                let patch_rows = crate::programs::native_vision::image_patch_classes(
+                    limits.max_image_cells,
+                    vision_definition,
+                )?;
+                let vision_graph = crate::programs::native_vision::checked_vision_family_resources(
+                    backend,
+                    load,
+                    vision_definition,
+                    vision_plan,
+                    patch_rows,
+                )?;
+                Ok(Some(VisionGraphBounds {
+                    charge: NativeGraphCharge::serial(vision_graph.storage, limits.startup_slots().vision)?,
+                    binding_constant_bytes: vision_graph.binding_constant_bytes,
+                }))
+            }
+            (None, None) => Ok(None),
+            _ => Err("vision program and definition disagree".into()),
+        }
     }
 
     /// The program plan the graphs are of, which must draft by `method`.
@@ -554,7 +608,8 @@ impl AssessmentGraphResourceBounds {
     }
 
     /// The bounds of a load of `plan` (its [`Self::program_plan`]) whose
-    /// target family's are `target`: every other family's certified here.
+    /// target and vision families' are `target` and `vision`: every other
+    /// family's certified here.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn of_target(
         definition: &ModelDefinition,
@@ -565,6 +620,7 @@ impl AssessmentGraphResourceBounds {
         limits: super::ResourceLimits,
         backend: BackendName,
         target: TargetGraphBounds,
+        vision: Option<VisionGraphBounds>,
     ) -> Result<Self, GraphError> {
         // The same startup slots a load commits: one request's need.
         let slots = limits.startup_slots();
@@ -667,26 +723,9 @@ impl AssessmentGraphResourceBounds {
                 (None, None, None) => (None, 0, 0),
                 _ => return Err("drafter program and state disagree".into()),
             };
-        let (vision, vision_constant_bytes) = match (plan.vision(), definition.vision.as_ref()) {
-            (Some(vision_plan), Some(vision_definition)) => {
-                let patch_rows = crate::programs::native_vision::image_patch_classes(
-                    limits.max_image_cells,
-                    vision_definition,
-                )?;
-                let vision_graph = crate::programs::native_vision::checked_vision_family_resources(
-                    backend,
-                    load,
-                    vision_definition,
-                    vision_plan,
-                    patch_rows,
-                )?;
-                (
-                    Some(NativeGraphCharge::serial(vision_graph.storage, slots.vision)?),
-                    vision_graph.binding_constant_bytes,
-                )
-            }
-            (None, None) => (None, 0),
-            _ => return Err("vision program and definition disagree".into()),
+        let (vision, vision_constant_bytes) = match vision {
+            Some(VisionGraphBounds { charge, binding_constant_bytes }) => (Some(charge), binding_constant_bytes),
+            None => (None, 0),
         };
         let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
             .into_iter()

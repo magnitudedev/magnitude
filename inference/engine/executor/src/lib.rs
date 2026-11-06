@@ -118,7 +118,7 @@ pub use operators::vision::{VisionEntry, VisionKernel};
 pub use planning::{
     growth_target,
     ArtifactComponent, ArtifactComponentKind, AssessmentFit, AssessmentFitVerdict,
-    AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds, TargetGraphBounds,
+    AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds, TargetGraphBounds, UndraftedBounds, VisionGraphBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, BackendPlan,
     BankAllocation, BankBinding, BankTier, ConveyorCarrier, ExpertBankPlan, Holding, StoredStack,
     CONVERSATION_CHECKPOINTS, CPU_IMAGE_CELLS, CapabilityPlan, ComponentPlan, ComponentSelection,

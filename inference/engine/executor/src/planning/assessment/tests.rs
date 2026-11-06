@@ -783,12 +783,12 @@ fn assert_undrafted_is_the_target_alone(
         crate::ResourceCapacity { domain_bytes: 512 << 20, tensor_operations: crate::TensorOperations::Absent },
     )
     .unwrap();
-    let target =
+    let alone =
         AssessmentGraphResourceBounds::derive(definition, &plain, &plain_state, PlannedMethod::Plain, KvCodec::Dense, limits, backend)
-            .unwrap()
-            .target;
-    assert_ne!(bounds.target, target, "the fixture's drafter writes from its target's graphs");
-    assert_eq!(undrafted, target);
+            .unwrap();
+    assert_ne!(bounds.target, alone.target, "the fixture's drafter writes from its target's graphs");
+    assert_eq!(undrafted.target, alone.target);
+    assert_eq!(undrafted.vision.map(|vision| vision.charge), alone.vision);
 }
 
 /// A draft head of its own width that reads the target's history and is

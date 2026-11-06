@@ -16,7 +16,7 @@ use crate::platform::{DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, ChargedDraft, DeviceProcessBytes, ExecutionPlanDraft, HeldCharge, HeldCharges,
-    HostProcessBytes, ResourceCapacity, ResourcePlanner, TargetGraphBounds,
+    HostProcessBytes, ResourceCapacity, ResourcePlanner, UndraftedBounds,
 };
 use magnitude_family_contracts::ModelDefinition;
 use seismic::{DeviceTopology, Executor, Status, StoreId};
@@ -261,25 +261,26 @@ pub fn execution_memory_charge(
     StructuralCharge::of(definition, draft)?.charge(definition, draft)
 }
 
-/// [`execution_memory_charge`], with the bounds of the draft's target
-/// family without its drafter's writes ([`StructuralCharge::with_undrafted`]).
+/// [`execution_memory_charge`], with the bounds its certification gives of
+/// the draft's target alone ([`StructuralCharge::with_undrafted`]).
 pub fn execution_memory_charge_with_undrafted(
     definition: &ModelDefinition,
     draft: &ExecutionPlanDraft,
-) -> Result<(AssessmentMemoryCharge, TargetGraphBounds), AssessmentError> {
+) -> Result<(AssessmentMemoryCharge, UndraftedBounds), AssessmentError> {
     let (structure, undrafted) = StructuralCharge::with_undrafted(definition, draft)?;
     Ok((structure.charge(definition, draft)?, undrafted))
 }
 
 /// The standard workload's checked memory charge of the target's plan
 /// alone, `plain`, at its drafted plan's holding of experts, whose target
-/// family is that plan's undrafted one ([`StructuralCharge::undrafted`]).
+/// and vision families are that plan's `undrafted` ones
+/// ([`StructuralCharge::undrafted`]).
 pub fn undrafted_memory_charge(
     definition: &ModelDefinition,
     plain: &ExecutionPlanDraft,
-    target: TargetGraphBounds,
+    undrafted: UndraftedBounds,
 ) -> Result<AssessmentMemoryCharge, AssessmentError> {
-    StructuralCharge::undrafted(definition, plain, target)?.charge(definition, plain)
+    StructuralCharge::undrafted(definition, plain, undrafted)?.charge(definition, plain)
 }
 
 /// The terms of a draft's charge that its expert bank's slots leave as they
@@ -328,7 +329,7 @@ impl StructuralCharge {
     pub fn with_undrafted(
         definition: &ModelDefinition,
         draft: &ExecutionPlanDraft,
-    ) -> Result<(Self, TargetGraphBounds), AssessmentError> {
+    ) -> Result<(Self, UndraftedBounds), AssessmentError> {
         Self::with_graph(definition, draft, |state| {
             let policy = draft.policy();
             AssessmentGraphResourceBounds::derive_with_undrafted(
@@ -345,14 +346,13 @@ impl StructuralCharge {
 
     /// The structure of `plain`'s charge, the target's plan alone at a
     /// drafted plan's holding of its experts
-    /// (`ExecutionPlanDraft::holding_as`), whose target family's bounds are
-    /// `target`, the drafted plan's undrafted family
-    /// ([`Self::with_undrafted`]): every other family of `plain` is
-    /// certified here, the target's not again.
+    /// (`ExecutionPlanDraft::holding_as`), whose target and vision families'
+    /// bounds are the drafted plan's `undrafted` ([`Self::with_undrafted`]):
+    /// every other family of `plain` is certified here, those not again.
     pub fn undrafted(
         definition: &ModelDefinition,
         plain: &ExecutionPlanDraft,
-        target: TargetGraphBounds,
+        undrafted: UndraftedBounds,
     ) -> Result<Self, AssessmentError> {
         Self::with_graph(definition, plain, |state| {
             let policy = plain.policy();
@@ -364,7 +364,8 @@ impl StructuralCharge {
                 policy.method(),
                 policy.limits(),
                 plain.device().backend(),
-                target,
+                undrafted.target,
+                undrafted.vision,
             )
             .map(|graph| (graph, ()))
         })
