@@ -13,9 +13,21 @@
 //! Each term is a slope, measured over enough of its unit that the granule
 //! resolves it to [`SPAN`]ths: one-node graphs (a graph and a node each)
 //! and chains of [`CHAIN`] nodes (a graph and that many nodes), each
-//! instantiated in batches until what the free memory fell by spans
-//! [`SPAN`] granules. Every graph stays instantiated until all are
+//! instantiated in batches until what the process holds on the device grew
+//! by [`SPAN`] granules. Every graph stays instantiated until all are
 //! measured.
+//!
+//! What a slope reads is the memory the device holds for this process, as
+//! NVML counts it ([`Holdings`]), never the device's free memory: other
+//! programs move that, and on a device whose memory is the host's (GB10)
+//! so does every allocation and page the system makes, so a measurement
+//! beside other work read 3.96 MB a one-node graph and nothing a chain, a
+//! negative term. Where NVML counts no process (no NVML: Windows) it reads
+//! what the device holds of everyone's, and says so. Either reading can
+//! still move under the measurement (another thread of the process, a
+//! graph the process destroyed whose memory the driver hands on), so each
+//! slope is measured twice, interleaved, and a measurement whose repeats
+//! differ by more than its resolution is refused rather than kept.
 
 use crate::driver::{self, Edge, KernelNodeParams};
 use crate::executor::Device;
@@ -113,6 +125,31 @@ fn prepared(device: &Device, graph: driver::Graph) -> Result<driver::GraphExec, 
     Ok(exec)
 }
 
+/// What the device holds that a slope reads: this process's memory on it as
+/// NVML counts it, or, where NVML counts no process, everything it holds.
+enum Holdings {
+    Process(crate::nvml::NvmlDevice, u32),
+    Device,
+}
+
+impl Holdings {
+    fn of(device: &Device) -> Result<Self, ExecutionError> {
+        let uuid = crate::profile::describe(device.ordinal()).map_err(failure)?.uuid;
+        let pid = std::process::id();
+        Ok(match crate::nvml::NvmlDevice::open(uuid) {
+            Some(nvml) if nvml.process_bytes(pid).is_ok() => Self::Process(nvml, pid),
+            _ => Self::Device,
+        })
+    }
+
+    fn read(&self, device: &Device) -> Result<u64, ExecutionError> {
+        match self {
+            Self::Process(nvml, pid) => nvml.process_bytes(*pid).map_err(failure),
+            Self::Device => device.memory_info().map(|info| info.total_bytes - info.free_bytes),
+        }
+    }
+}
+
 fn measure(device: &Device) -> Result<GraphCost, ExecutionError> {
     let context = device.context();
     let granule = driver::allocation_granularity(context).map_err(failure)?;
@@ -121,30 +158,48 @@ fn measure(device: &Device) -> Result<GraphCost, ExecutionError> {
     let mut word = [0u8; 8];
     let mut parameters = [word.as_mut_ptr().cast::<c_void>()];
     let launch = node(function, &mut parameters);
-    let free = || device.memory_info().map(|info| info.free_bytes);
+    let holdings = Holdings::of(device)?;
+    let held = || holdings.read(device);
     let mut kept = Vec::new();
     // What each graph of `count` nodes takes, a slope over as many as span
-    // `SPAN` granules: the free memory's fall over them, per graph.
+    // `SPAN` granules: what the holdings grew by over them, per graph.
     let mut slope = |count: u64| -> Result<f64, ExecutionError> {
-        let before = free()?;
+        let before = held()?;
         let mut graphs = 0u64;
-        while before.saturating_sub(free()?) < SPAN * granule && graphs * count < MOST_UNITS {
+        while held()?.saturating_sub(before) < SPAN * granule && graphs * count < MOST_UNITS {
             kept.push(prepared(device, chain(context, &launch, count)?)?);
             graphs += 1;
         }
-        // Free memory that fell by a span before any graph was taken by
-        // other work: nothing here measures a graph.
+        // Holdings that grew by a span before any graph was taken by other
+        // work: nothing here measures a graph.
         if graphs == 0 {
-            return Err(failure("the device's free memory fell before any graph was instantiated"));
+            return Err(failure("the device's holdings grew before any graph was instantiated"));
         }
-        Ok(before.saturating_sub(free()?) as f64 / graphs as f64)
+        Ok(held()?.saturating_sub(before) as f64 / graphs as f64)
     };
-    let single = slope(1)?;
-    let chained = slope(CHAIN)?;
+    let first = (slope(1)?, slope(CHAIN)?);
+    let second = (slope(1)?, slope(CHAIN)?);
     drop(kept);
     drop(module);
+    let (single, chained) = agreed(first, second, granule)?;
     let (graph, launch) = terms(single, chained)?;
     Ok(GraphCost::Pooled { graph, launch, granule })
+}
+
+/// The slopes of two interleaved measurements, `(one-node graph, chain)`
+/// each, as one: their means, where each pair agrees within what a span
+/// resolves (a [`SPAN`]th of the larger, and at least a granule over the
+/// units the larger of a pair's slopes took a span in). Repeats that differ
+/// by more read memory something else moved: refused.
+fn agreed(first: (f64, f64), second: (f64, f64), granule: u64) -> Result<(f64, f64), ExecutionError> {
+    let agree = |a: f64, b: f64| (a - b).abs() <= a.max(b) / SPAN as f64 + granule as f64 / SPAN as f64;
+    if !(agree(first.0, second.0) && agree(first.1, second.1)) {
+        return Err(failure(format!(
+            "the device's memory moved under the measurement: a one-node graph read {} then {} bytes, a chain {} then {}",
+            first.0, second.0, first.1, second.1
+        )));
+    }
+    Ok(((first.0 + second.0) / 2., (first.1 + second.1) / 2.))
 }
 
 /// The bytes of a graph and of a node, from what a one-node graph and a
@@ -173,6 +228,47 @@ mod tests {
         assert_eq!(terms(98_000.0, chain).unwrap(), (90_000, 8_000));
         assert!(terms(chain, 98_000.0).is_err());
         assert!(terms(1_000.0, chain).is_err());
+    }
+
+    /// Repeats that agree within a span's resolution are one measurement;
+    /// repeats that differ by more are refused, as the reading a39d0c took
+    /// beside another program's work (3.96 MB a one-node graph).
+    #[test]
+    fn repeats_that_disagree_are_refused() {
+        let granule = 2 << 20;
+        let chain = 100_000.0 + CHAIN as f64 * 8_000.0;
+        assert_eq!(agreed((100_000.0, chain), (104_000.0, chain), granule).unwrap(), (102_000.0, chain));
+        assert!(agreed((3_964_118.9, 0.0), (100_000.0, chain), granule).is_err());
+        assert!(agreed((100_000.0, chain), (100_000.0, chain / 2.0), granule).is_err());
+    }
+
+    /// A measurement after other work on the same device (graphs
+    /// instantiated and destroyed, whose memory the driver keeps, and
+    /// memory allocated and freed) reads what one before it did, within a
+    /// span's resolution, or is refused: never another cost.
+    #[test]
+    fn a_measurement_after_other_work_reads_the_same_cost_or_none() {
+        let Some((_exclusive, opened)) = crate::test_device() else {
+            return;
+        };
+        let device = opened.service;
+        let first = measure(&device).unwrap();
+        let context = device.context();
+        let (source, entry) = KERNEL;
+        let (_module, function) = driver::load_module(context, source.as_bytes(), entry).unwrap();
+        let mut word = [0u8; 8];
+        let mut parameters = [word.as_mut_ptr().cast::<c_void>()];
+        let launch = node(function, &mut parameters);
+        let other = (0..256).map(|count| prepared(&device, chain(context, &launch, 1 + count % 64).unwrap()).unwrap()).collect::<Vec<_>>();
+        drop(other);
+        let buffers = (0..8).map(|_| device.allocate_within(64 << 20, 256, None).unwrap()).collect::<Vec<_>>();
+        drop(buffers);
+        let (GraphCost::Pooled { graph, launch, granule }, Ok(GraphCost::Pooled { graph: again, launch: launched, .. })) = (first, measure(&device)) else {
+            eprintln!("the measurement after other work was refused");
+            return;
+        };
+        let close = |a: u64, b: u64| a.abs_diff(b) as f64 <= a.max(b) as f64 / SPAN as f64 + granule as f64 / SPAN as f64;
+        assert!(close(graph, again) && close(launch, launched), "{first:?} then {graph}/{launch} vs {again}/{launched}");
     }
 
     /// Graphs unlike the calibration's, as a class's are: many graphs of
