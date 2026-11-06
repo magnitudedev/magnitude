@@ -1,23 +1,25 @@
-//! The read engine: the jobs callers submit, cut into pieces, and the
-//! process's pool of workers that reads them most urgent first ("The read
-//! engine", "How reads share the engine").
+//! The read engine: the requests callers make, cut into pieces, each
+//! volume's link that alone decides which of its pieces are in flight
+//! ("Order and depth"), and the process's pool of workers that reads them.
 
 use crate::disk::{SourceFile, VolumeReads};
 use crate::{Destination, Error};
+use std::cmp::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 mod engine;
-mod job;
+mod handle;
 mod queue;
 
 pub use engine::{engine_work, EngineWork, Flight, Outstanding};
-pub use job::Job;
+pub use handle::{Ending, Handle};
 
 pub(crate) use engine::{deepen, totals, Buffers};
-pub(crate) use job::JobState;
+pub(crate) use handle::RequestState;
 pub(crate) use queue::{pieces, Piece, Queued, Span};
 #[cfg(test)]
-pub(crate) use {engine::Engine, queue::{Part, Queue, VolumeFlight}};
+pub(crate) use {engine::Engine, queue::{Part, Queue}};
 
 use engine::engine;
 
@@ -28,34 +30,86 @@ use engine::engine;
 /// while `λ · D` (≈ 790 KB) exceeds the gap read.
 const COALESCE_GAP: u64 = 128 * 1024;
 
-/// How urgently a job's pieces are read: every piece of a more urgent job
-/// before any of a less urgent one. A volume's accounting is kept by it
-/// ([`crate::accounting::Class`]).
+/// When a request's consumer would wait from: an instant, or none (a load
+/// or a fill, which no consumer waits on at any instant), after every
+/// dated one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Priority {
-    /// A step waits for the bytes.
-    Demand,
-    /// A step is expected to need them.
-    Prefetch,
-    /// A load waits for them, no step: read behind every step's reads, so
-    /// a model loading never delays a running one's, whose prefetch is
-    /// bounded by its staging while a load reads gigabytes.
-    Load,
+pub enum Deadline {
+    At(Instant),
+    None,
 }
 
-impl Priority {
-    pub const ALL: [Self; 3] = [Self::Demand, Self::Prefetch, Self::Load];
+/// What a request is for, as its link orders it ("Order and depth"): its
+/// deadline, and its value, the bytes of due reads it is expected to spare
+/// (a read ahead right with probability `p` spares its `p · b`; within one
+/// link that is its seconds saved, `p · b / R`, at the link's one rate),
+/// which only orders requests of one deadline. A request is **due** once
+/// its deadline has come: a consumer waits on it now. More urgent orders
+/// first: the earlier deadline, then the greater value.
+#[derive(Clone, Copy, Debug)]
+pub struct Want {
+    deadline: Deadline,
+    value: f64,
+}
 
-    /// Whether no step waits on its bytes: what a demand read waits behind
-    /// as speculative ([`crate::Waits`]).
-    pub(crate) fn speculative(self) -> bool {
-        self != Self::Demand
+impl Want {
+    /// Due now: a consumer waits on it.
+    pub fn now() -> Self {
+        Self::at(Instant::now(), 0.)
+    }
+
+    /// Wanted from `deadline`, worth `value`.
+    pub fn at(deadline: Instant, value: f64) -> Self {
+        Self::new(Deadline::At(deadline), value)
+    }
+
+    /// Wanted at no instant (a load, a fill), worth `value`.
+    pub fn undated(value: f64) -> Self {
+        Self::new(Deadline::None, value)
+    }
+
+    fn new(deadline: Deadline, value: f64) -> Self {
+        assert!(value.is_finite() && value >= 0., "a want's value is a measure of bytes, {value}");
+        Self { deadline, value }
+    }
+
+    pub fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    /// Whether a consumer waits on it at `now`: its deadline has come.
+    pub fn due(&self, now: Instant) -> bool {
+        matches!(self.deadline, Deadline::At(at) if at <= now)
     }
 }
 
-/// One range of a job: `length` bytes at `offset` of the reader's file,
-/// landed at `at` bytes into `into`, which the job holds until its last
-/// piece has ended ([`crate::Reader::submit`]).
+impl Ord for Want {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.deadline.cmp(&other.deadline).then_with(|| other.value.total_cmp(&self.value))
+    }
+}
+
+impl PartialOrd for Want {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Want {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Want {}
+
+/// One range of a request: `length` bytes at `offset` of the reader's
+/// file, landed at `at` bytes into `into`, which the request holds until
+/// its last piece has ended ([`crate::Reader::request`]).
 #[derive(Clone)]
 pub struct Range {
     pub offset: u64,
@@ -76,18 +130,18 @@ impl std::fmt::Debug for Range {
     }
 }
 
-/// How a job ended.
+/// How a request ended.
 #[derive(Clone, Debug)]
 pub enum Ended {
     /// Every piece was read, or failed: the ranges that did not land, each
-    /// (its index in the job) with the error that kept it from landing.
+    /// (its index in the request) with the error that kept it from landing.
     Read { failed: Vec<(usize, Arc<Error>)> },
     /// A worker panicked reading one of its pieces: a defect, which its
     /// observer resumes ([`Panic::resume`]).
     Panicked(Panic),
 }
 
-/// A read worker's panic, carried to its job's observers. Its payload
+/// A read worker's panic, carried to its request's observers. Its payload
 /// unwinds on the first to resume it.
 #[derive(Clone)]
 pub struct Panic(Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>>);
@@ -98,12 +152,12 @@ impl Panic {
     }
 
     /// Unwind with the worker's panic: its payload, or, where another
-    /// observer of the job resumed that, a panic naming it.
+    /// observer of the request resumed that, a panic naming it.
     pub fn resume(&self) -> ! {
         let payload = self.0.lock().expect("a read worker's panic").take();
         match payload {
             Some(payload) => std::panic::resume_unwind(payload),
-            None => panic!("a read worker panicked; another observer of its job resumed the panic"),
+            None => panic!("a read worker panicked; another observer of its request resumed the panic"),
         }
     }
 }
@@ -118,13 +172,13 @@ impl std::fmt::Debug for Panic {
     }
 }
 
-/// Queue `ranges` of `file` for the pool at `priority`, read as `volume`
-/// says, counted in `outstanding` until the job ends: a reader's job
-/// ([`crate::Reader::submit`]), or a probe's lone request.
+/// Queue `ranges` of `file` on its volume's link for `want`, cut as
+/// `volume` says, counted in `outstanding` until the request ends: a
+/// reader's request ([`crate::Reader::request`]), or a probe's lone one.
 ///
 /// # Safety
-/// As [`crate::Reader::submit`].
-pub(crate) unsafe fn queue(file: &Arc<SourceFile>, volume: &VolumeReads, outstanding: &Arc<std::sync::atomic::AtomicUsize>, ranges: Vec<Range>, priority: Priority) -> Result<Job, Error> {
+/// As [`crate::Reader::request`].
+pub(crate) unsafe fn request(file: &Arc<SourceFile>, volume: &VolumeReads, outstanding: &Arc<std::sync::atomic::AtomicUsize>, ranges: Vec<Range>, want: Want) -> Result<Handle, Error> {
     let engine = engine();
     let outside = Arc::new(Error::Invalid("read outside the file".into()));
     let mut failed = Vec::new();
@@ -146,22 +200,14 @@ pub(crate) unsafe fn queue(file: &Arc<SourceFile>, volume: &VolumeReads, outstan
         }
     }
     order.sort_by_key(|(_, span)| span.offset);
-    let read = match priority {
-        Priority::Demand => volume.choice.demand_read,
-        _ => volume.choice.read,
-    };
+    let read = volume.shape.read(want.due(Instant::now()));
     let pieces = pieces(&order, file.size, read);
     outstanding.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let state = JobState::new(pieces.len(), failed, outstanding.clone(), ranges);
-    // One worker per piece the volume's window has room for: a worker
-    // woken with no piece it may take would only contend for the queue
-    // with the submitter's next job.
-    let (id, woken) = engine.queue().push(
-        Queued { state: state.clone(), file: file.clone(), volume: volume.clone(), pieces: pieces.into() },
-        priority,
-    );
-    for _ in 0..woken {
-        engine.work.notify_one();
-    }
-    Ok(Job { id, state, engine })
+    let state = RequestState::new(pieces.len(), failed, outstanding.clone(), ranges);
+    // One worker per piece the link may start now: a worker woken with no
+    // piece it may take would only contend for the queue with the
+    // submitter's next request.
+    let (id, woken) = engine.queue().push(Queued { state: state.clone(), file: file.clone(), volume: volume.clone(), pieces: pieces.into() }, want);
+    engine.wake(woken);
+    Ok(Handle { id, ending: handle::Ending(state), engine })
 }

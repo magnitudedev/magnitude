@@ -4,7 +4,7 @@
 //! splits them into pieces its workers read in parallel, each landing
 //! straight in its staging record.
 
-use seismic_io::{Reader, CachePolicy, Ended, Job, Panic, Priority, Range};
+use seismic_io::{Reader, CachePolicy, Ended, Ending, Handle, Panic, Range, Want};
 use seismic::Tensor;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::time::Instant;
 /// The records of a host-shared tensor that reads land in: `count` records
 /// of `bytes` each, its whole extent, each one contiguous range where the
 /// tensor lays it, checked once when they are made. Shared: each clone,
-/// and each read's job, holds the one destination they lie in.
+/// and each read's request, holds the one destination they lie in.
 #[derive(Clone)]
 pub(crate) struct Records(Arc<Region>);
 
@@ -26,8 +26,8 @@ struct Region {
 }
 
 // SAFETY: `base` addresses host-shared memory that `tensor`, held beside
-// it, keeps alive; the host writes it only through the read engine's jobs
-// (`ExpertSource::submit`) and record copies (`Records::copy_record`).
+// it, keeps alive; the host writes it only through the read engine's
+// requests (`ExpertSource::request`) and record copies (`Records::copy_record`).
 unsafe impl Send for Region {}
 unsafe impl Sync for Region {}
 
@@ -190,30 +190,36 @@ impl Read {
     }
 }
 
-/// How a submitted job ended.
+/// How a ticket's reads ended.
 #[derive(Clone, Debug)]
 pub(super) enum Outcome {
     /// Every read landed in staging.
     Read,
     /// A read failed with an I/O error from the source: why.
     Failed(String),
-    /// A read worker panicked running the job: a defect, which the watcher
-    /// raises as its own.
+    /// A read worker panicked running a request: a defect, which the
+    /// watcher raises as its own.
     Panicked(Panic),
 }
 
-/// A submitted job: one read engine job per model file it reads, each
-/// holding the staging it lands in until it has ended.
+/// Reads made of the source: one read engine request per model file it
+/// reads, each holding the staging it lands in until it has ended. It owns
+/// its requests until it cancels them ([`Ticket::cancel`]); dropping it
+/// cancels what no worker has taken and waits for what one has, so no read
+/// lands in staging once its ticket is gone.
 pub(super) struct Ticket {
-    /// Each file's job, and the reads it serves in their order: (the read's
-    /// index among the ticket's, file, offset, bytes).
-    jobs: Vec<(Job, Vec<(usize, usize, u64, usize)>)>,
+    /// Each file's request while the ticket owns it, its end, and the reads
+    /// it serves in their order: (the read's index among the ticket's,
+    /// file, offset, bytes).
+    requests: Vec<(Option<Handle>, Ending, Vec<(usize, usize, u64, usize)>)>,
 }
 
 impl Drop for Ticket {
-    /// What no worker has taken reads nothing ([`Ticket::withdraw`]).
     fn drop(&mut self) {
-        self.withdraw();
+        self.cancel();
+        for (_, ending, _) in &self.requests {
+            ending.wait();
+        }
     }
 }
 
@@ -221,7 +227,7 @@ impl Ticket {
     /// The outcome, waiting for it until `deadline`; `None` while a read
     /// runs. The first failed read is its outcome.
     pub fn wait_until(&self, deadline: Instant) -> Option<Outcome> {
-        self.outcome(|job| job.wait_until(deadline))
+        self.outcome(|ending| ending.wait_until(deadline))
     }
 
     /// Whether a read of the ticket still runs: it has not ended.
@@ -231,43 +237,45 @@ impl Ticket {
 
     /// The outcome, waiting for it.
     pub fn wait(&self) -> Outcome {
-        self.outcome(|job| Some(job.wait())).expect("a waited job ends")
+        self.outcome(|ending| Some(ending.wait())).expect("a waited request ends")
     }
 
-    /// The outcome of the jobs as `ended` finds them, none while one runs.
-    fn outcome(&self, ended: impl Fn(&Job) -> Option<Ended>) -> Option<Outcome> {
-        let endeds = self.jobs.iter().map(|(job, _)| ended(job)).collect::<Option<Vec<_>>>()?;
-        let reads = self.jobs.iter().map(|(_, reads)| reads.clone()).collect::<Vec<_>>();
+    /// The outcome of the requests as `ended` finds them, none while one
+    /// runs.
+    fn outcome(&self, ended: impl Fn(&Ending) -> Option<Ended>) -> Option<Outcome> {
+        let endeds = self.requests.iter().map(|(_, ending, _)| ended(ending)).collect::<Option<Vec<_>>>()?;
+        let reads = self.requests.iter().map(|(.., reads)| reads.clone()).collect::<Vec<_>>();
         Some(outcome_of(&endeds, &reads).0)
     }
 
-    /// Its jobs' submissions: the ids their read timeline events carry.
-    pub fn jobs(&self) -> impl Iterator<Item = u64> + '_ {
-        self.jobs.iter().map(|(job, _)| job.id())
+    /// Its requests' submissions: the ids their read timeline events carry.
+    pub fn requests(&self) -> impl Iterator<Item = u64> + '_ {
+        self.requests.iter().filter_map(|(handle, ..)| handle.as_ref().map(Handle::id))
     }
 
     /// Run `hook` with the outcome, and the indices of the ticket's reads
-    /// that failed (every one after a panic), once every job has ended, on
-    /// the thread that ends the last (a read worker), or at once where every
-    /// one has: after every job's end is set, so whatever the hook wakes
-    /// finds the ticket no longer running. It must not wait for a read.
+    /// that failed (every one after a panic), once every request has ended,
+    /// on the thread that ends the last (a read worker, or the canceller),
+    /// or at once where every one has: after every request's end is set, so
+    /// whatever the hook wakes finds the ticket no longer running. It must
+    /// not wait for a read.
     pub fn on_end(&self, hook: impl FnOnce(Outcome, &[usize]) + Send + 'static) {
         type Hook = Box<dyn FnOnce(Outcome, &[usize]) + Send>;
-        struct Ending {
+        struct Ends {
             ended: Vec<Option<Ended>>,
             hook: Option<Hook>,
         }
-        if self.jobs.is_empty() {
+        if self.requests.is_empty() {
             return hook(Outcome::Read, &[]);
         }
-        let reads = std::sync::Arc::new(self.jobs.iter().map(|(_, reads)| reads.clone()).collect::<Vec<_>>());
-        let ending = std::sync::Arc::new(std::sync::Mutex::new(Ending {
-            ended: vec![None; self.jobs.len()],
+        let reads = std::sync::Arc::new(self.requests.iter().map(|(.., reads)| reads.clone()).collect::<Vec<_>>());
+        let ending = std::sync::Arc::new(std::sync::Mutex::new(Ends {
+            ended: vec![None; self.requests.len()],
             hook: Some(Box::new(hook)),
         }));
-        for (index, (job, _)) in self.jobs.iter().enumerate() {
+        for (index, (_, request, _)) in self.requests.iter().enumerate() {
             let (ending, reads) = (ending.clone(), reads.clone());
-            job.on_end(move |ended| {
+            request.on_end(move |ended| {
                 let mut ending = ending.lock().expect("a ticket's end");
                 ending.ended[index] = Some(ended.clone());
                 let Some(ended) = ending.ended.iter().cloned().collect::<Option<Vec<_>>>() else {
@@ -281,32 +289,40 @@ impl Ticket {
         }
     }
 
-    /// When a worker takes each job's first piece, each set then
-    /// (`seismic_io::Job::started`): the ticket's reads start at
-    /// the earliest.
+    /// When a worker takes each request's first piece, each set then
+    /// (`seismic_io::Ending::started`): the ticket's reads start at the
+    /// earliest.
     pub fn started(&self) -> Vec<std::sync::Arc<std::sync::OnceLock<Instant>>> {
-        self.jobs.iter().map(|(job, _)| job.started()).collect()
+        self.requests.iter().map(|(_, ending, _)| ending.started()).collect()
     }
 
-    /// Read every job no less urgently than `priority` (never demoted).
-    pub fn promote(&self, priority: Priority) {
-        for (job, _) in &self.jobs {
-            job.promote(priority);
+    /// Order the reads not yet taken by `want` from now
+    /// (`seismic_io::Handle::reprice`): none once cancelled.
+    pub fn reprice(&self, want: Want) {
+        for handle in self.requests.iter().filter_map(|(handle, ..)| handle.as_ref()) {
+            handle.reprice(want);
         }
     }
 
-    /// Withdraw each job's pieces no worker has taken: they read nothing and
-    /// the reads they serve fail as withdrawn
-    /// (`seismic_io::Error::Withdrawn`); pieces in flight read on.
-    pub fn withdraw(&self) {
-        self.jobs.iter().for_each(|(job, _)| job.withdraw());
+    /// Cancel the reads no worker has taken: they read nothing and the
+    /// reads they serve fail as cancelled (`seismic_io::Error::Cancelled`);
+    /// those in flight read on, and the ticket observes their end.
+    pub fn cancel(&mut self) {
+        for (handle, ..) in &mut self.requests {
+            drop(handle.take());
+        }
+    }
+
+    /// Whether it was cancelled.
+    pub fn cancelled(&self) -> bool {
+        self.requests.iter().any(|(handle, ..)| handle.is_none())
     }
 }
 
-/// The outcome of a ticket whose jobs ended as `ended`, each serving
+/// The outcome of a ticket whose requests ended as `ended`, each serving
 /// `reads` (index among the ticket's, file, offset, bytes) in its order:
-/// the first failed read in job order, or a panic; and the indices of the
-/// ticket's reads that failed.
+/// the first failed read in request order, or a panic; and the indices of
+/// the ticket's reads that failed.
 fn outcome_of(ended: &[Ended], reads: &[Vec<(usize, usize, u64, usize)>]) -> (Outcome, Vec<usize>) {
     let mut outcome = Outcome::Read;
     let mut failed_reads = Vec::new();
@@ -364,21 +380,21 @@ impl ExpertSource {
     pub(crate) fn reads(&self) -> impl Fn() -> crate::watched::Reads + Send + 'static {
         let outstanding = self.files.iter().map(Reader::outstanding).collect::<Vec<_>>();
         move || crate::watched::Reads {
-            outstanding: outstanding.iter().any(|reader| reader.jobs() > 0),
+            outstanding: outstanding.iter().any(|reader| reader.requests() > 0),
             engine: seismic_io::engine_work(),
         }
     }
 
-    /// The bytes in flight that keep its widest volume at full rate
-    /// (`Reader::window`).
-    pub fn window(&self) -> u64 {
-        self.files.iter().map(Reader::window).max().expect("a model has a file")
+    /// The bytes in flight at which its widest volume's link reads at its
+    /// full rate (`Reader::knee`): below them the link lacks work.
+    pub fn knee(&self) -> u64 {
+        self.files.iter().map(Reader::knee).max().expect("a model has a file")
     }
 
-    /// Queue `reads` on the read engine at `priority`: [`Priority::Demand`]
-    /// for a request's misses, [`Priority::Prefetch`] for the next layer's
-    /// hints. Fails only when the engine takes no job.
-    pub fn submit(&self, reads: Vec<Read>, priority: Priority) -> Result<Ticket, String> {
+    /// Request `reads` of the read engine for `want`: due now for a step's
+    /// misses, at its layer's estimated start for a hint, undated for the
+    /// tier's fill. Fails only when the engine takes no request.
+    pub fn request(&self, reads: Vec<Read>, want: Want) -> Result<Ticket, String> {
         assert!(reads.iter().all(|read| read.file < self.files.len()), "a read of a file the source has not open");
         // Each file's ranges, each landing in the records its read holds,
         // and the reads they serve.
@@ -389,19 +405,21 @@ impl ExpertSource {
             let at = read.into.offset(read.record) as usize;
             ranges.push(Range { offset: read.offset, length: read.bytes, into: read.into.0, at });
         }
-        let mut jobs = Vec::new();
+        let mut requests = Vec::new();
         for (file, (ranges, served)) in self.files.iter().zip(by_file) {
             if ranges.is_empty() {
                 continue;
             }
-            // SAFETY: each staging record is the request's alone while its
-            // job runs: the device reads it only after the watcher publishes
-            // it, once the job has ended.
-            let job = unsafe { file.submit(ranges, priority) }
+            // SAFETY: each staging record is the read's alone while its
+            // request runs: the device reads it only after the watcher
+            // publishes it, once the request has ended, which the ticket
+            // observes however it is cancelled or dropped.
+            let handle = unsafe { file.request(ranges, want) }
                 .map_err(|error| format!("expert source: {error}"))?;
-            jobs.push((job, served));
+            let ending = handle.ending();
+            requests.push((Some(handle), ending, served));
         }
-        Ok(Ticket { jobs })
+        Ok(Ticket { requests })
     }
 }
 
@@ -411,9 +429,9 @@ mod tests {
     use seismic::{BackendName, Element};
 
     /// Each read lands its range in its staging record; a range outside
-    /// the file fails its job, and the jobs after it read.
+    /// the file fails its request, and the requests after it read.
     #[test]
-    fn reads_land_in_staging_and_a_failed_one_fails_its_job_alone() {
+    fn reads_land_in_staging_and_a_failed_one_fails_its_request_alone() {
         let device = seismic::Devices::discover(&[])
             .unwrap()
             .open_backend(BackendName::Cpu)
@@ -425,9 +443,9 @@ mod tests {
         let staging = Tensor::shared(&device, Element::i32(), &[2, 32]).unwrap();
         let records = Records::new(staging.clone(), 128, 2).unwrap();
         let read = |offset: u64, record: u64| Read::new(0, offset, 128, &records, record);
-        let demand = Priority::Demand;
-        let failed = source.submit(vec![read(bytes.len() as u64 - 64, 0)], demand).unwrap();
-        let landed = source.submit(vec![read(1000, 0), read(40_000, 1)], demand).unwrap();
+        let demand = Want::now();
+        let failed = source.request(vec![read(bytes.len() as u64 - 64, 0)], demand).unwrap();
+        let landed = source.request(vec![read(1000, 0), read(40_000, 1)], demand).unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         assert!(matches!(failed.wait_until(deadline), Some(Outcome::Failed(_))));
         assert!(matches!(landed.wait_until(deadline), Some(Outcome::Read)));
@@ -467,7 +485,7 @@ mod tests {
         let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![128], records: 2 }).unwrap();
         // Reversed: record 0 takes the file's second half.
         let landed = source
-            .submit(vec![Read::new(0, RECORD, RECORD, &records, 0), Read::new(0, 0, RECORD, &records, 1)], Priority::Demand)
+            .request(vec![Read::new(0, RECORD, RECORD, &records, 0), Read::new(0, 0, RECORD, &records, 1)], Want::now())
             .unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(30);
         assert!(matches!(landed.wait_until(deadline), Some(Outcome::Read)));
@@ -506,7 +524,7 @@ mod tests {
         let bytes = (0..RECORD).map(|index| (index % 251) as u8).collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
         let source = ExpertSource::open(std::slice::from_ref(&path), &seismic_io::Urgent { parts: vec![RECORD], records: 1 }).unwrap();
-        let landed = source.submit(vec![Read::new(0, 0, RECORD, &records, COUNT - 1)], Priority::Demand).unwrap();
+        let landed = source.request(vec![Read::new(0, 0, RECORD, &records, COUNT - 1)], Want::now()).unwrap();
         assert!(matches!(landed.wait_until(Instant::now() + std::time::Duration::from_secs(30)), Some(Outcome::Read)));
         // SAFETY: the job has ended, and no device work touches the record.
         assert!(unsafe { records.record(COUNT - 1, RECORD) } == bytes);
@@ -630,7 +648,7 @@ mod tests {
     fn prompt_rate(reader: &Reader, sink: &[usize], read: usize, layers: &PromptReads, ended: impl Fn() + Clone + Send + 'static) -> f64 {
         let bytes: usize = layers.iter().flatten().flatten().map(|&(_, length)| length).sum();
         let began = Instant::now();
-        let mut behind: Vec<Job> = Vec::new();
+        let mut behind: Vec<Handle> = Vec::new();
         for (index, layer) in layers.iter().enumerate() {
             let jobs = layer
                 .iter()
@@ -648,7 +666,7 @@ mod tests {
                         })
                         .collect();
                     // SAFETY: the slot is this job's alone until the layer two on waits on it.
-                    let job = unsafe { reader.submit(ranges, Priority::Demand) }.unwrap();
+                    let job = unsafe { reader.request(ranges, Want::now()) }.unwrap();
                     let ended = ended.clone();
                     job.on_end(move |_| ended());
                     job
@@ -738,7 +756,7 @@ mod tests {
     /// - each job's end holding its last piece's window through 180 µs of
     ///   work on the read worker, as a decode landing's conversion does;
     /// - another reader of the volume, a bank fill's: one expert a job at
-    ///   [`Priority::Load`], 8 queued at all times.
+    ///   [`Want::undated(0.)`], 8 queued at all times.
     #[test]
     #[ignore = "times reads into a CUDA device's reserved bank beside a served prompt's host work, on a real model file (`MAGNITUDE_ARTIFACTS`)"]
     fn a_prompts_reads_beside_a_served_prompts_host_work() {
@@ -813,7 +831,7 @@ mod tests {
                 let began = Instant::now();
                 for slot in (0..QUEUED).cycle() {
                     if jobs.len() == QUEUED {
-                        let job: Job = jobs.pop_front().unwrap();
+                        let job: Handle = jobs.pop_front().unwrap();
                         assert!(matches!(job.wait(), Ended::Read { failed } if failed.is_empty()));
                     }
                     if stop.load(Ordering::Acquire) {
@@ -833,7 +851,7 @@ mod tests {
                         })
                         .collect();
                     // SAFETY: the slot is this job's alone until the slot's next turn waits on it.
-                    jobs.push_back(unsafe { reader.submit(ranges, Priority::Load) }.unwrap());
+                    jobs.push_back(unsafe { reader.request(ranges, Want::undated(0.)) }.unwrap());
                 }
                 for job in jobs {
                     job.wait();

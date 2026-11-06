@@ -35,7 +35,7 @@ use super::Step;
 use crate::experts::landing::{Answer, Converting, DeviceLanding, DeviceWords, Ended, Landing};
 use crate::experts::source::{Outcome, Read, Ticket};
 use crate::experts::staging::{Staged, StagingPool};
-use seismic_io::Priority;
+use seismic_io::Want;
 use magnitude_kernels::constants;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -109,11 +109,11 @@ pub(super) struct Posting {
     pub(super) join: Arc<Join>,
 }
 
-/// Submit `reads` at `priority` from `table`, joined to the claim of what they
-/// land into ([`Join`]): the one way the watcher reads experts into
-/// staging. Fails only where the read engine takes no request.
-pub(super) fn post(table: &ReadTable, reads: Vec<Read>, priority: Priority) -> Result<Posting, String> {
-    let ticket = table.source().submit(reads, priority)?;
+/// Request `reads` from `table`, wanted as `want`, joined to the claim of
+/// what they land into ([`Join`]): the one way the watcher reads experts
+/// into staging. Fails only where the read engine takes no request.
+pub(super) fn post(table: &ReadTable, reads: Vec<Read>, want: Want) -> Result<Posting, String> {
+    let ticket = table.source().request(reads, want)?;
     let join = Arc::new(Join(Mutex::new(Parties::Reading(Vec::new()))));
     let ended = join.clone();
     ticket.on_end(move |outcome, failed| ended.read_ended(outcome, failed));
@@ -297,10 +297,10 @@ enum Need {
     /// ticket, shared with the request's other landings, which ends before
     /// any of them; `device` where the device converts it.
     Due { ticket: Arc<Ticket>, read: Step, device: Option<Arc<DeviceLanding>> },
-    /// Read ahead of demand, by its own ticket (withdrawn once it can only
-    /// be wrong): a hint's, at [`Priority::Prefetch`], when the route at
-    /// `hinted` hinted it, or, with none, the tier's fill's, at
-    /// [`Priority::Load`].
+    /// Read ahead of demand, by its own ticket (cancelled once it can only
+    /// be wrong): a hint's, wanted from its layer's estimated start
+    /// (`HintPrice::want`), when the route at `hinted` hinted it, or, with
+    /// none, the tier's fill's, undated.
     Ahead { ticket: Ticket, hinted: Option<At> },
 }
 
@@ -389,7 +389,7 @@ pub(super) struct Prefetch {
     /// its ring row was read for.
     rings: Vec<[i32; crate::planning::HINT_LEADS as usize]>,
     /// Per layer, the last step whose route there its ring showed
-    /// ([`Self::withdraw_passed`]).
+    /// ([`Self::cancel_passed`]).
     routed: Vec<Step>,
 }
 
@@ -421,7 +421,7 @@ impl Prefetch {
         device: Option<(Arc<DeviceWords>, crate::experts::ExchangeTable, Point)>,
         shared: &Arc<Shared>,
     ) {
-        let ends = landings.iter().map(|_| (Ended::new(shared.events()), Urgency::new(Priority::Demand))).collect::<Vec<_>>();
+        let ends = landings.iter().map(|_| (Ended::new(shared.events()), Urgency::waited())).collect::<Vec<_>>();
         let converted = ends
             .iter()
             .map(|(ended, _)| device.as_ref().map(|(words, file, at)| Arc::new(DeviceLanding::new(words.clone(), file.clone(), *at, ended.clone(), shared.landings.clone()))))
@@ -464,7 +464,7 @@ impl Prefetch {
         let reading = match &inbound.need {
             Need::Due { .. } => {
                 noted(0);
-                inbound.urgency.promote(Priority::Demand);
+                inbound.urgency.hasten();
                 return Some(Reading::Unpredicted);
             }
             Need::Ahead { hinted: Some(hinted), .. } => Reading::Hint(*hinted),
@@ -475,28 +475,28 @@ impl Prefetch {
             return None;
         }
         noted(if matches!(reading, Reading::Hint(_)) { 1 } else { 2 });
-        inbound.ticket().promote(Priority::Demand);
-        inbound.urgency.promote(Priority::Demand);
+        inbound.ticket().reprice(Want::now());
+        inbound.urgency.hasten();
         Some(reading)
     }
 
-    /// Withdraw what every hint no request hastened has not started reading,
+    /// Cancel what every hint no request hastened has not started reading,
     /// once it can only be wrong: its target is at or before `served` (the
     /// request the service just served), its step has ended, or the device
     /// has routed past its target with no request there (the layer after's
     /// ring shows it, and a route's request is published before the next
     /// layer's ring, so one absent then was never made: every expert of that
-    /// layer resolved without it). A withdrawn hint reads nothing more, so it
+    /// layer resolved without it). A cancelled hint reads nothing more, so it
     /// takes no source time from demand; its read ends failed, which frees
     /// its staging and tier records ([`Self::settle`]), and a later request
     /// for its expert reads it anew. A store seen out of that order only
     /// costs that read.
-    pub(super) fn withdraw_passed(&self, core: &Core, steps: &super::steps::Steps, served: Option<(Step, usize)>) {
-        for (&(target, _), inbound) in &self.inbound {
-            let Need::Ahead { ticket, hinted: Some(hinted) } = &inbound.need else {
+    pub(super) fn cancel_passed(&mut self, core: &Core, steps: &super::steps::Steps, served: Option<(Step, usize)>) {
+        for (&(target, _), inbound) in &mut self.inbound {
+            let Need::Ahead { ticket, hinted: Some(hinted) } = &mut inbound.need else {
                 continue;
             };
-            if inbound.urgency.get() != Priority::Prefetch {
+            if inbound.urgency.is_waited() || ticket.cancelled() {
                 continue;
             }
             let issued = hinted.point.sequence;
@@ -504,7 +504,7 @@ impl Prefetch {
                 || steps.ended(issued)
                 || (self.routed.get(target + 1).is_some_and(|&routed| routed >= issued) && !core.layers[target].file.requested(issued, 0));
             if passed {
-                ticket.withdraw();
+                ticket.cancel();
             }
         }
     }
@@ -643,7 +643,7 @@ impl Prefetch {
                     continue;
                 };
                 self.routed[layer] = self.routed[layer].max(sequence);
-                self.withdraw_passed(core, &shared.steps, None);
+                self.cancel_passed(core, &shared.steps, None);
                 // Those of a step whose request there was noticed name a
                 // layer the device has passed.
                 if served[target] >= sequence {
@@ -691,13 +691,13 @@ impl Prefetch {
     /// nothing holds or lands it; one a longer lead's hint reads lands
     /// already) whose rank's precision at its lead pays for its read
     /// (`Telemetry::pays`) is read into a
-    /// staging record beyond the demand reserve at [`Priority::Prefetch`],
-    /// landing into a ready tier record, in the ring's
-    /// order, best ranked first (`publish_hints`): the read engine serves a
-    /// priority's jobs in submission order, so the likeliest hints are read
-    /// first, and where the staging beyond the demand reserve or the ready
-    /// tier records fall short, the hints
-    /// left are the least likely. Its candidates, each with whether it was
+    /// staging record beyond the demand reserve, wanted from its layer's
+    /// estimated start and worth its expected bytes spared
+    /// (`HintPrice::want`), landing into a ready tier record, in the ring's
+    /// order, best ranked first (`publish_hints`): the hints of one ring
+    /// share a deadline, which the link orders by value, and where the
+    /// staging beyond the demand reserve or the ready tier records fall
+    /// short, the hints left are the least likely. Its candidates, each with whether it was
     /// read and its rank, are counted with their step (`Telemetry::hinted`).
     fn admit(&mut self, core: &mut Core, shared: &Arc<Shared>, target: usize, lead: usize, hinted: &[(usize, usize)], issued: At) {
         let sequence = issued.point.sequence;
@@ -728,6 +728,7 @@ impl Prefetch {
         let demand = core.extents.reserve.saturating_sub(self.staging.records().saturating_sub(request));
         let price = shared.telemetry.price(lead);
         let mut short = false;
+        let now = Instant::now();
         for &(expert, rank) in &ranked {
             let free = if recording { self.staging.free() } else { 0 };
             let noted = |fate: Fate, of: ShortOf| {
@@ -743,7 +744,8 @@ impl Prefetch {
                 noted(Fate::Refused, ShortOf::Nothing);
                 continue;
             }
-            match self.read_ahead(core, shared, (target, expert), Priority::Prefetch, Some(issued), (request, demand)) {
+            let want = |bytes| price.want(rank, target - issued.point.layer, bytes, now);
+            match self.read_ahead(core, shared, (target, expert), want, Some(issued), (request, demand)) {
                 Ok(bytes) => {
                     shared.telemetry.hint(bytes);
                     noted(Fate::Read, ShortOf::Nothing);
@@ -768,8 +770,8 @@ impl Prefetch {
     /// reused first, a tie, never used yet, each layer's alike), is landed
     /// into a tier record beyond the tier's reserve (`Extents::reserve`,
     /// or every expert still lacked, where fewer: `HostRecords::claim`), so
-    /// it displaces nothing the tier keeps: read into a staging record at
-    /// [`Priority::Load`], below every step's reads, as a hint's read lands, so a
+    /// it displaces nothing the tier keeps: read into a staging record
+    /// undated, behind every step's reads, as a hint's read lands, so a
     /// request that waits for one hastens its read. `carried`
     /// names the experts a prompt group's conveyor carries, which land
     /// through it (`Scratch::carries`): no expert is read twice.
@@ -781,11 +783,11 @@ impl Prefetch {
     /// most reused when they are filled, which its misses' landings then
     /// displace by reuse as they rank. One rule fills both.
     ///
-    /// How many it reads at once: by the read engine's law
-    /// (`seismic_io`) a demand read waits for at most the
-    /// volume's window of bytes its workers already hold, however much less
-    /// urgent work is queued, so the depth of the fill's queue costs no step
-    /// anything; and its reads keep the engine busy at its rate only while
+    /// How many it reads at once: by the read engine's law (`seismic_io`,
+    /// "Order and depth") a due read waits for at most the bytes read ahead
+    /// already in flight, however much less urgent work is queued, so the
+    /// depth of the fill's queue costs no step anything; and its reads keep
+    /// the link busy at its rate only while
     /// its queue holds the reads that cover the latency `λ` of each next
     /// one and the watcher's turn to submit it, which no bound below the
     /// staging they land into guarantees. So the fill reads into every
@@ -803,7 +805,7 @@ impl Prefetch {
             if self.staging.free() <= keep {
                 break;
             }
-            match self.read_ahead(core, shared, staged, Priority::Load, None, (keep, reserve)) {
+            match self.read_ahead(core, shared, staged, |_| Want::undated(0.), None, (keep, reserve)) {
                 Ok(_) => {}
                 // Refused, or its group's tier holds no record for it now:
                 // the fill goes on to the next.
@@ -825,8 +827,8 @@ impl Prefetch {
     }
 
     /// Read `staged` ahead, a hint's where `hinted` names the route that
-    /// hinted it, else the fill's: into a staging record at `priority`, of
-    /// those free beyond `staging`, landing into a
+    /// hinted it, else the fill's: into a staging record wanted as `want`
+    /// gives for its bytes, of those free beyond `staging`, landing into a
     /// tier record of its group the tier takes for it leaving `tier` ready
     /// (`Directory::claim_landing`), tracked inbound, so a step that waits
     /// for it hastens its read and its landing to demand
@@ -837,7 +839,7 @@ impl Prefetch {
         core: &mut Core,
         shared: &Arc<Shared>,
         staged: Staged,
-        priority: Priority,
+        want: impl FnOnce(u64) -> Want,
         hinted: Option<At>,
         (staging, tier): (usize, usize),
     ) -> Result<u64, Short> {
@@ -853,13 +855,14 @@ impl Prefetch {
         let reads = core.table.reads(target, expert, record);
         let bytes = reads.iter().map(crate::experts::source::Read::bytes).sum::<u64>();
         let landing = core.landing(grant, record);
-        match post(&core.table, reads, priority) {
+        let want = want(bytes);
+        match post(&core.table, reads, want) {
             Ok(Posting { ticket, join }) => {
-                for job in ticket.jobs() {
-                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead"), job, (target as i64, expert as i64, priority as i64));
+                for request in ticket.requests() {
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead"), request, (target as i64, expert as i64, i64::from(want.deadline() == seismic_io::Deadline::None)));
                 }
                 let ended = Ended::new(shared.events());
-                let urgency = Urgency::new(priority);
+                let urgency = Urgency::ahead(want);
                 let (end, serving, urgent) = (ended.clone(), shared.clone(), urgency.clone());
                 // A read ahead's end: read, its landing is submitted, whose
                 // end maps its tier record; failed, it fails nothing (a step
@@ -883,7 +886,7 @@ impl Prefetch {
                 self.arrive(staged, Inbound { record, tier, need: Need::Ahead { ticket, hinted }, ended, urgency });
                 Ok(bytes)
             }
-            // The engine took no job: the read stages and lands nothing and
+            // The engine took no request: the read stages and lands nothing and
             // fails nothing (a demand for the expert reads it again, and
             // fails its own step if that read fails).
             Err(_) => {

@@ -34,7 +34,6 @@ use super::compute::Urgency;
 use super::host_records::Grant;
 use super::source::Records;
 use super::watcher::Step;
-use seismic_io::Priority;
 use magnitude_kernels::{SlotTable, constants};
 use seismic::cpu::repack::RowConversion;
 
@@ -336,7 +335,7 @@ pub(in crate::experts) struct Converting {
     /// Each piece: its tensor, and its (stored, tier) byte ranges.
     pieces: Vec<(usize, (std::ops::Range<usize>, std::ops::Range<usize>))>,
     then: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    /// How urgently its pieces run (`compute::Job::priority`): a step's
+    /// How urgently its pieces run (`compute::Job::want`): a step's
     /// miss's, or a hint's until a request names its expert.
     urgency: std::sync::Arc<Urgency>,
     /// The load's landings' account; when it was submitted and when a
@@ -367,9 +366,9 @@ pub(in crate::experts) struct LandingTerms {
 }
 
 /// The landings' account over a load, by their urgency as they ended
-/// (`Priority::Demand`: a step waited for it; else a hint's no request
-/// named), and the landings that waited for a record past grace and how
-/// long; logged as the watcher stops.
+/// (waited: a step waited for it; else a hint's no request named), and the
+/// landings that waited for a record past grace and how long; logged as
+/// the watcher stops.
 #[derive(Default)]
 pub(in crate::experts) struct LandingAccount {
     demand: LandingTerms,
@@ -494,9 +493,9 @@ impl super::compute::Job for Converting {
     /// Every piece is converted, so the record's bytes are whole: map it
     /// ([`Grant::map`]), then answer.
     fn end(&self) {
-        let terms = match self.urgency.get() {
-            Priority::Demand => &self.account.demand,
-            _ => &self.account.hinted,
+        let terms = match self.urgency.is_waited() {
+            true => &self.account.demand,
+            false => &self.account.hinted,
         };
         let began = *self.began.get().expect("a landing's end follows its pieces");
         LandingAccount::add(&terms.queued, began - self.submitted);
@@ -510,7 +509,7 @@ impl super::compute::Job for Converting {
         }
     }
 
-    fn priority(&self) -> Priority {
+    fn want(&self) -> seismic_io::Want {
         self.urgency.get()
     }
 }

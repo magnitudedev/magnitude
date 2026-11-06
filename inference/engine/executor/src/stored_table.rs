@@ -37,7 +37,7 @@
 use crate::device_table::KeptRows;
 use crate::planning::DirectoryForm;
 use crate::slot_directory::SlotDirectory;
-use seismic_io::{Reader, Ended, Priority, Range};
+use seismic_io::{Reader, Ended, Range, Want};
 use seismic::cpu::repack::RowConversion;
 use seismic::Element;
 use std::collections::{BTreeMap, BTreeSet};
@@ -816,8 +816,8 @@ impl Shared {
             })
             .collect();
         // SAFETY: the ranges are distinct rows of `stored`, which nothing
-        // reads until the job has ended.
-        let ended = unsafe { self.source.submit(ranges, Priority::Demand) }
+        // reads until the request has ended.
+        let ended = unsafe { self.source.request(ranges, Want::now()) }
             .map_err(|error| format!("stored table rows: {error}"))?
             .wait();
         let unread = match ended {
@@ -831,7 +831,7 @@ impl Shared {
             errors.push(format!("table row {}: {error}", absent[index]));
         }
         let mut converted = vec![0u8; self.slot_bytes];
-        // SAFETY: the job that read into `stored` has ended.
+        // SAFETY: the request that read into `stored` has ended.
         let stored = unsafe { stored.bytes() };
         for (index, row) in stored.chunks_exact(self.row_bytes).enumerate() {
             if !read[index] {

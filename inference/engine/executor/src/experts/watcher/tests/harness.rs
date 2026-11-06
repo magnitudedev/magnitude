@@ -10,7 +10,6 @@ pub(super) use crate::experts::map::{LandingMap, MapView, StampedMap};
 pub(super) use crate::experts::source::{ExpertSource, Outcome, Read, Records, Ticket};
 pub(super) use crate::operation::LaunchWork;
 pub(super) use crate::planning::{Placer, RegionWords};
-pub(super) use seismic_io::Priority;
 pub(super) use magnitude_kernels::constants;
 pub(super) use seismic::{BackendName, Element, Tensor};
 pub(super) use std::time::{Duration, Instant};
@@ -682,7 +681,7 @@ impl AheadLine {
         const ENDED: u8 = 2;
         while !self.done.load(Ordering::Acquire) {
             let read = Read::new(0, 0, Ahead::FILE, &self.records.lock().unwrap(), 0);
-            let ticket = self.source.submit(vec![read], Priority::Demand).unwrap();
+            let ticket = self.source.request(vec![read], seismic_io::Want::now()).unwrap();
             let (line, state) = (self.clone(), Arc::new(AtomicU8::new(REGISTERING)));
             let ending = state.clone();
             ticket.on_end(move |_, _| {

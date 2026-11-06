@@ -56,7 +56,7 @@ use crate::experts::conveyor::{Conveyor, ConveyorLanding, Serving, State, readin
 use crate::experts::directory::{BankRecord, HostRecord, Point};
 use crate::experts::landing::Converting;
 use crate::experts::staging::Staged;
-use seismic_io::Priority;
+use seismic_io::Want;
 use magnitude_kernels::constants;
 use std::time::Instant;
 
@@ -676,7 +676,7 @@ impl Scratch {
         self.land_conveyed(core, shared, settled.landed);
         let mut failed = settled.failed;
         self.claim_lent(core);
-        let window = core.table.source().window();
+        let knee = core.table.source().knee();
         for index in 0..self.tiers.len() {
             let layer = self.tiers[index].layer;
             // What the earlier tiers of the layer's form still lack: their
@@ -711,10 +711,10 @@ impl Scratch {
                 }
                 // A scratch slot no step uses before the expert's round
                 // converts it carries it first, at no conveyor record, while
-                // the drive lacks a window of work: past that a read only
-                // queues, ahead of whatever the device turns out to need
-                // sooner.
-                let short_of_work = self.conveyor.reads_in_flight() as u64 * core.layers[layer].expert_bytes() < window;
+                // the drive lacks work, its reads in flight short of its
+                // link's knee: past that a read only queues, ahead of
+                // whatever the device turns out to need sooner.
+                let short_of_work = self.conveyor.reads_in_flight() as u64 * core.layers[layer].expert_bytes() < knee;
                 let lent = if short_of_work { self.lendable_slot(core, index, expert) } else { None };
                 let record = match lent {
                     Some(slot) => self.conveyor.slot_record(slot),
@@ -738,7 +738,7 @@ impl Scratch {
                     }
                 };
                 let reads = core.reads_to(layer, expert, &self.conveyor, record);
-                match core.table.source().submit(reads, Priority::Demand) {
+                match core.table.source().request(reads, Want::now()) {
                     Ok(ticket) => {
                         // Its end is an event: a round may await it.
                         let events = shared.events().clone();
@@ -911,7 +911,7 @@ impl Scratch {
             // which no read lands in until this landing ends; the tier
             // record was ready (no step reads it) when taken.
             let converting = unsafe {
-                Converting::new(landing, Urgency::new(Priority::Demand), shared.landings.clone(), ended.clone(), || {})
+                Converting::new(landing, Urgency::waited(), shared.landings.clone(), ended.clone(), || {})
             };
             shared.compute.submit(std::sync::Arc::new(converting));
             let read = self.tiers.iter().find(|tier| tier.layer == layer).and_then(|tier| tier.reader[expert]);

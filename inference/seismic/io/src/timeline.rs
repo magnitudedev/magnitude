@@ -15,19 +15,20 @@ use std::time::Instant;
 /// a caller's kinds carry whatever its fields say ([`note`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
-    /// A job queued: `a` its priority (0 demand, 1 prefetch, 2 load), `b`
-    /// its pieces, `c` its bytes.
+    /// A request queued: `a` 0 where it is due, 1 where not, `b` its
+    /// pieces, `c` its bytes.
     Submit,
-    /// A piece taken: `a` its file offset, `b` its bytes, `c` the volume's
+    /// A piece taken: `a` its file offset, `b` its bytes, `c` its link's
     /// bytes in flight before it.
     Take,
     /// A piece's read returned, its bytes leaving the volume's flight: `a`
     /// its offset, `b` its bytes.
     Read,
-    /// A job promoted: `a` its new priority.
-    Promote,
-    /// A job withdrawn: `a` its pieces not taken.
-    Withdraw,
+    /// A request repriced: `a` 0 where it is now due, 1 where not, `b` its
+    /// pieces not taken.
+    Reprice,
+    /// A request cancelled: `a` its pieces not taken.
+    Cancel,
     /// A caller's event, named by the caller.
     Noted(&'static str),
 }
@@ -38,8 +39,8 @@ impl Kind {
             Kind::Submit => "submit",
             Kind::Take => "take",
             Kind::Read => "read",
-            Kind::Promote => "promote",
-            Kind::Withdraw => "withdraw",
+            Kind::Reprice => "reprice",
+            Kind::Cancel => "cancel",
             Kind::Noted(name) => name,
         }
     }

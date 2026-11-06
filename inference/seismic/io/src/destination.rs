@@ -3,7 +3,7 @@
 use std::ptr::NonNull;
 
 /// Memory a read lands in: a stable region of bytes, whose alignment is its
-/// base address's. A job holds each of its ranges' destinations
+/// base address's. A request holds each of its ranges' destinations
 /// ([`crate::Range`]) until its last piece has ended, whatever becomes of
 /// its handle, so a read into memory already freed has no expression.
 ///
@@ -38,8 +38,8 @@ impl Buffer {
     /// Its bytes.
     ///
     /// # Safety
-    /// No job that reads into it is in flight: each has ended
-    /// ([`crate::Job::wait`]).
+    /// No request that reads into it is in flight: each has ended
+    /// ([`crate::Handle::wait`]).
     pub unsafe fn bytes(&self) -> &[u8] {
         // SAFETY: `length` initialized bytes it owns, written by no read now.
         unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.length) }

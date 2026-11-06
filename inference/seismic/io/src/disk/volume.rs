@@ -1,37 +1,79 @@
 use super::file::SourceFile;
 use super::platform::{evict, uncached, volume_key};
-use super::probe::{Urgent, VolumeLines, LEAST_READ, WIDEST_WINDOW};
+use super::probe::{Curve, Urgent, VolumeLines, LEAST_READ, WIDEST_WINDOW};
 use super::OpenFile;
-use crate::{Volume, Error, Priority};
-use std::collections::{BTreeMap, HashMap};
+use crate::{Error, Volume};
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// How a reader reads the volume its file lies on: as the volume's probe
-/// chose for its urgent request ([`VolumeChoice`]), within what the volume's
-/// readers share.
+/// How a reader reads the volume its file lies on: its link's shape, as the
+/// volume's curve gives it for the reader's request ([`VolumeLines::shape`]).
 #[derive(Clone, Debug)]
 pub(crate) struct VolumeReads {
     pub(crate) id: Volume,
-    pub(crate) choice: VolumeChoice,
-    /// The volume's own bound on the bytes in flight a less urgent piece
-    /// joins, whichever reader submits it: the narrowest window of its live
-    /// urgent readers ([`Bound`]).
-    pub(crate) background: Arc<Bound>,
+    pub(crate) shape: Shape,
 }
 
-/// How a volume is read for an urgent request, as its probe chose ("A
-/// volume's window"): what the measurement job keeps ([`probe_volume`]),
-/// which a load adopts ([`adopt_volume`]). The pool reads it in reads of at
-/// most `read` bytes, a demand job's in reads of at most `demand_read`, the
-/// size its lone record reads soonest at; a demand piece joins the bytes in
-/// flight up to `demand`, the full rate's window, and any other piece only
-/// up to `window`, the urgent request's, so a demand read waits behind no
-/// more of the less urgent reads than its point of least `T` allows; its
-/// reads at that rate occupy `cores` of the host's processors (the cores its
-/// threads ran, in seconds a second).
+/// A link's depths, in bytes in flight, and its read sizes ("A volume's
+/// curve", "Order and depth"): due pieces join the due bytes in flight up
+/// to `due`; a piece read ahead joins those read ahead up to `knee` (the
+/// speculation depth) and, beside a due piece, everything in flight up to
+/// `overlap`. Due pieces are cut at `due_read`, the others at `ahead_read`.
+/// Its reads at once occupy `cores` of the host's processors (the cores
+/// its threads ran, in seconds a second).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct VolumeChoice {
+pub struct Shape {
+    pub due: u64,
+    pub knee: u64,
+    pub overlap: u64,
+    pub ahead_read: u64,
+    pub due_read: u64,
+    pub cores: f64,
+}
+
+impl std::fmt::Display for Shape {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "due {} KiB in {} KiB reads, ahead {} KiB in {} KiB reads, overlap {} KiB, {:.2} cores",
+            self.due >> 10,
+            self.due_read >> 10,
+            self.knee >> 10,
+            self.ahead_read >> 10,
+            self.overlap >> 10,
+            self.cores,
+        )
+    }
+}
+
+impl Shape {
+    /// How a volume is read before any probe of it: at the least read size
+    /// and every depth the widest window, every piece at the most any device
+    /// measured needs (the declared bounds of the search), which takes no
+    /// measurement.
+    pub(crate) const PENDING: Self = Self { due: WIDEST_WINDOW, knee: WIDEST_WINDOW, overlap: WIDEST_WINDOW, ahead_read: LEAST_READ, due_read: LEAST_READ, cores: 0. };
+
+    /// The size a piece is cut at, due or not.
+    pub(crate) fn read(&self, due: bool) -> u64 {
+        if due { self.due_read } else { self.ahead_read }
+    }
+
+    /// The workers that hold its deepest flight, due and read ahead at
+    /// once, in pieces of the least size: as many as its pieces in flight
+    /// can be (a range smaller than a read is a piece of its own).
+    pub(crate) fn workers(&self) -> usize {
+        (self.due + self.knee).div_ceil(LEAST_READ) as usize
+    }
+}
+
+/// How the rule before the curve read a volume for a request: five figures
+/// a load reads as they were while the job probes the curve ("A volume's
+/// curve"). Pieces were cut at `read` bytes, a demand request's at
+/// `demand_read`; a demand piece joined the bytes in flight up to `demand`,
+/// any other up to `window`; its reads occupied `cores`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EarlierChoice {
     pub window: u64,
     pub demand: u64,
     pub read: u64,
@@ -39,24 +81,22 @@ pub struct VolumeChoice {
     pub cores: f64,
 }
 
-impl VolumeChoice {
-    /// The rule a choice is made by, a term of a stored choice's key, so a
-    /// choice made by another is probed again: 3, a demand window the widest
-    /// at the full rate and a lone request timed through the read engine
-    /// (the first rule took the narrowest window and timed lone reads by
-    /// threads).
+impl EarlierChoice {
+    /// The rule's schema, a term of its stored choice's key.
     pub const SCHEMA: u64 = 3;
 
-    /// The rule before [`SCHEMA`](Self::SCHEMA), whose stored choice a load
-    /// reads while the job probes the current one: none, the first rule,
-    /// whose records carry no schema term. Named beside the current rule so
-    /// a new rule names its predecessor with it.
-    pub const EARLIER_SCHEMA: Option<u64> = None;
+    /// Its figures as a link's shape: a demand piece is due, any other read
+    /// ahead, which joined every byte in flight up to `window`.
+    pub(crate) fn shape(&self) -> Shape {
+        Shape { due: self.demand, knee: self.window, overlap: self.window, ahead_read: self.read, due_read: self.demand_read, cores: self.cores }
+    }
+}
 
-    /// How a volume is read before any probe of it: at the least read size
-    /// and the widest window, every piece at the most any device measured
-    /// needs (the declared bounds of the search), which takes no measurement.
-    const PENDING: Self = Self { window: WIDEST_WINDOW, demand: WIDEST_WINDOW, read: LEAST_READ, demand_read: LEAST_READ, cores: 0. };
+impl Curve {
+    /// The rule a curve is kept by, a term of a stored curve's key, so a
+    /// curve probed by another is probed again: 4, every point and lone time
+    /// kept, windows from one read ([`EarlierChoice`] the rule before).
+    pub const SCHEMA: u64 = 4;
 }
 
 /// Each volume's lines, by volume.
@@ -66,20 +106,27 @@ fn volume_lines(file: &File) -> Result<(Volume, Arc<Mutex<VolumeLines>>), Error>
     Ok((key, VOLUMES.get_or_init(Default::default).lock().expect("volumes").entry(key).or_default().clone()))
 }
 
-/// Read `source`'s volume for `urgent` as `choice` from now on.
-pub fn adopt_volume(source: &impl AsRef<OpenFile>, urgent: Option<&Urgent>, choice: VolumeChoice) -> Result<(), Error> {
+/// Read `source`'s volume by `curve`, probed for `urgent`, from now on:
+/// for `urgent`, and for every request that adopted nothing.
+pub fn adopt_volume(source: &impl AsRef<OpenFile>, urgent: Option<&Urgent>, curve: &Curve) -> Result<(), Error> {
     let source = source.as_ref();
-    let (key, lines) = volume_lines(source.file())?;
-    let mut lines = lines.lock().expect("a volume's lines");
-    let volume = lines.volume(key, choice);
-    lines.chosen.insert(urgent.cloned(), volume);
+    let (_, lines) = volume_lines(source.file())?;
+    lines.lock().expect("a volume's lines").adopt(urgent, curve, source.size());
+    Ok(())
+}
+
+/// Read `source`'s volume for `urgent` by the rule before the curve's
+/// `choice` until a curve is adopted for it.
+pub fn adopt_earlier(source: &impl AsRef<OpenFile>, urgent: Option<&Urgent>, choice: EarlierChoice) -> Result<(), Error> {
+    let (_, lines) = volume_lines(source.as_ref().file())?;
+    lines.lock().expect("a volume's lines").adopt_earlier(urgent, choice);
     Ok(())
 }
 
 /// Probe `source`'s volume for `urgent`, reading it and evicting the file's
 /// pages to time its storage: run only where nothing waits on it (the
-/// measurement job, a tool), and read as it chose from now on.
-pub fn probe_volume(source: &impl AsRef<OpenFile>, urgent: Option<&Urgent>) -> Result<VolumeChoice, Error> {
+/// measurement job, a tool), and read by its curve from now on.
+pub fn probe_volume(source: &impl AsRef<OpenFile>, urgent: Option<&Urgent>) -> Result<Curve, Error> {
     let source = source.as_ref();
     let (key, lines) = volume_lines(source.file())?;
     // Held across the probe: no probe shares the storage with another of
@@ -87,44 +134,27 @@ pub fn probe_volume(source: &impl AsRef<OpenFile>, urgent: Option<&Urgent>) -> R
     let mut lines = lines.lock().expect("a volume's lines");
     let probed = Arc::new(SourceFile { path: source.path().into(), size: source.size(), through: uncached(source.file())? });
     evict(source.file(), source.size())?;
-    let choice = lines.choose(key, &probed, urgent)?;
-    let volume = lines.volume(key, choice);
-    lines.chosen.insert(urgent.cloned(), volume);
-    Ok(choice)
+    lines.probe(key, &probed, urgent)
 }
 
 impl VolumeReads {
-    /// How `file` is read for `urgent`: as its volume's choice for it, or
-    /// [`VolumeChoice::PENDING`]. A reader measures nothing.
+    /// How `file` is read for `urgent`: by its volume's shape for it. A
+    /// reader measures nothing.
     pub(crate) fn of(file: &File, urgent: Option<&Urgent>) -> Result<Self, Error> {
-        let (key, lines) = volume_lines(file)?;
-        let lines = lines.lock().expect("a volume's lines");
-        Ok(lines.chosen.get(&urgent.cloned()).cloned().unwrap_or_else(|| lines.volume(key, VolumeChoice::PENDING)))
-    }
-
-    /// The workers that hold the volume's widest window in flight in pieces
-    /// of the least size: as many as its pieces in flight can be (a range
-    /// smaller than a read is a piece of its own).
-    pub(crate) fn workers(&self) -> usize {
-        self.choice.demand.max(self.choice.window).div_ceil(LEAST_READ) as usize
-    }
-
-    /// The bytes in flight a piece of a job at `priority` may join: a
-    /// demand piece its reader's full-rate window, any other its reader's
-    /// window within the volume's own bound, so a load's import beside a
-    /// serving reader puts no more ahead of a decode request than its `T`
-    /// allows.
-    pub(crate) fn window_for(&self, priority: Priority) -> u64 {
-        match priority {
-            Priority::Demand => self.choice.demand,
-            Priority::Prefetch | Priority::Load => self.choice.window.min(self.background.least()),
-        }
+        let (id, lines) = volume_lines(file)?;
+        let shape = lines.lock().expect("a volume's lines").shape(urgent);
+        Ok(Self { id, shape })
     }
 }
 
+/// How `source`'s volume is read for `urgent` now: its link's shape.
+pub fn link_shape(source: &impl AsRef<OpenFile>, urgent: Option<&Urgent>) -> Result<Shape, Error> {
+    Ok(VolumeReads::of(source.as_ref().file(), urgent)?.shape)
+}
+
 /// The cores the read engine's workers occupy reading the volumes `sources`
-/// lie on for `urgent`, each at its full rate at once: each distinct
-/// volume's, as its probe measured them ("A volume's window").
+/// lie on for `urgent`, each at its deepest at once: each distinct
+/// volume's, as its probe measured them ("A volume's curve").
 pub fn read_cores<'a, S: AsRef<OpenFile> + 'a>(sources: impl IntoIterator<Item = &'a S>, urgent: &Urgent) -> Result<f64, Error> {
     let mut volumes = Vec::<VolumeReads>::new();
     for source in sources {
@@ -133,65 +163,5 @@ pub fn read_cores<'a, S: AsRef<OpenFile> + 'a>(sources: impl IntoIterator<Item =
             volumes.push(volume);
         }
     }
-    Ok(volumes.iter().map(|volume| volume.choice.cores).sum())
-}
-
-/// A volume's bound on its less urgent bytes in flight: the narrowest
-/// window of its live urgent readers, none (`u64::MAX`) while it has none.
-/// Each urgent reader holds its window in it from when it is opened until
-/// its last clone drops ([`Registered`]), so a load unloaded throttles no
-/// later one.
-#[derive(Debug)]
-pub(crate) struct Bound {
-    /// The live readers' windows, each with how many hold it.
-    live: Mutex<BTreeMap<u64, usize>>,
-    /// The least of them, read without the lock by every piece taken.
-    least: std::sync::atomic::AtomicU64,
-}
-
-impl Default for Bound {
-    fn default() -> Self {
-        Self { live: Mutex::default(), least: std::sync::atomic::AtomicU64::new(u64::MAX) }
-    }
-}
-
-impl Bound {
-    fn least(&self) -> u64 {
-        self.least.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// `change` the live windows, then their least.
-    fn update(&self, change: impl FnOnce(&mut BTreeMap<u64, usize>)) {
-        let mut live = self.live.lock().expect("a volume's bound");
-        change(&mut live);
-        let least = live.keys().next().copied().unwrap_or(u64::MAX);
-        self.least.store(least, std::sync::atomic::Ordering::Release);
-    }
-}
-
-/// An urgent reader's window, held in its volume's bound until it drops.
-#[derive(Debug)]
-pub(crate) struct Registered {
-    bound: Arc<Bound>,
-    window: u64,
-}
-
-impl Registered {
-    pub(crate) fn new(bound: Arc<Bound>, window: u64) -> Self {
-        bound.update(|live| *live.entry(window).or_default() += 1);
-        Self { bound, window }
-    }
-}
-
-impl Drop for Registered {
-    fn drop(&mut self) {
-        let window = self.window;
-        self.bound.update(|live| {
-            let count = live.get_mut(&window).expect("a registered window is live");
-            *count -= 1;
-            if *count == 0 {
-                live.remove(&window);
-            }
-        });
-    }
+    Ok(volumes.iter().map(|volume| volume.shape.cores).sum())
 }

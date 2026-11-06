@@ -237,10 +237,10 @@ impl Look {
             let reading = landings.len() as i64;
             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("decided"), sequence, (layer as i64, reading, 0));
             let submitted = Instant::now();
-            let posting = prefetch::post(&self.table, reads, seismic_io::Priority::Demand);
+            let posting = prefetch::post(&self.table, reads, seismic_io::Want::now());
             if let Ok(posting) = &posting {
-                for job in posting.ticket.jobs() {
-                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, sequence as i64, reading));
+                for request in posting.ticket.requests() {
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), request, (layer as i64, sequence as i64, reading));
                 }
             }
             PostedRead { landings, submitted, posting }
@@ -396,7 +396,7 @@ fn parked_landing(
 
 /// Give up a posted read's `landings` at `layer`, each (expert, staging
 /// record), whose tier records were never claimed: their experts are
-/// lacked again, the read's pieces not yet taken are withdrawn where it
+/// lacked again, the read's pieces not yet taken are cancelled where it
 /// lands nothing else, and their staging frees as the read ends
 /// (`Join::claimed`), at once where the read engine took none. Until then
 /// the records stay taken, so the load's traffic is not quiet
@@ -417,8 +417,8 @@ fn give_up(core: &mut Core, prefetch: &Prefetch, shared: &Shared, layer: usize, 
     match read {
         None => free(),
         Some((mut ticket, join)) => {
-            if Arc::get_mut(&mut ticket).is_some() {
-                ticket.withdraw();
+            if let Some(ticket) = Arc::get_mut(&mut ticket) {
+                ticket.cancel();
             }
             join.claimed(move |_, _, _| {
                 // Every request of the ticket has ended: dropping it waits
@@ -580,10 +580,10 @@ impl Decode {
                 answer: waits.answer,
             };
             let naming = Naming { layer, sequence: waits.at.point.sequence, named: waits.named };
-            match prefetch::post(&core.table, reads, seismic_io::Priority::Demand) {
+            match prefetch::post(&core.table, reads, seismic_io::Want::now()) {
                 Ok(Posting { ticket, join }) => {
-                    for job in ticket.jobs() {
-                        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, naming.sequence as i64, -1));
+                    for request in ticket.requests() {
+                        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), request, (layer as i64, naming.sequence as i64, -1));
                     }
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), naming.sequence, (layer as i64, expert as i64, 5));
                     prefetch::account(&ticket, &join, naming, None, shared);
@@ -712,9 +712,9 @@ impl Decode {
         let short = read.as_ref().map_or(0, |(_, grants): &(PostedRead, Vec<Option<Grant>>)| grants.iter().filter(|grant| grant.is_none()).count());
         seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("claimed"), sequence, (layer as i64, read.as_ref().map_or(0, |(read, _)| read.landings.len()) as i64, short as i64));
         // Its own hints hastened, the device is at this layer: the hints of
-        // layers it has begun or passed read nothing more. Withdrawing them
-        // frees no record now (a withdrawn read frees its own as it ends).
-        prefetch.withdraw_passed(core, &shared.steps, Some((sequence, layer)));
+        // layers it has begun or passed read nothing more. Cancelling them
+        // frees no record now (a cancelled read frees its own as it ends).
+        prefetch.cancel_passed(core, &shared.steps, Some((sequence, layer)));
         // The next request's victims, prepared now its reads are in flight
         // where this one took any or they are of an earlier step: a claim
         // then takes the first still free, scanning nothing while its step

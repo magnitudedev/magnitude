@@ -1,9 +1,9 @@
 //! Files on storage volumes, opened for reads: how each is read (direct
 //! past the file cache, or through it), each volume's identity and probe
-//! ("A volume's window", [`probe_volume`]), and the reader a caller submits
-//! jobs through.
+//! ("A volume's curve", [`probe_volume`]), and the reader a caller makes
+//! requests through.
 
-use crate::scheduler::{self, Ended, Job, Outstanding, Priority, Range};
+use crate::scheduler::{self, Ended, Handle, Outstanding, Range, Want};
 use crate::{Destination, Error};
 use std::fs::File;
 use std::io;
@@ -17,19 +17,17 @@ mod probe;
 mod volume;
 
 pub use platform::cached_pages;
-pub use probe::Urgent;
-pub use volume::{adopt_volume, probe_volume, read_cores, VolumeChoice};
+pub use probe::{Curve, Lone, Point, Urgent};
+pub use volume::{adopt_earlier, adopt_volume, link_shape, probe_volume, read_cores, EarlierChoice, Shape};
 
 pub(crate) use file::{SourceFile, Through};
 pub(crate) use probe::LEAST_READ;
-pub(crate) use volume::{Registered, VolumeReads};
+pub(crate) use volume::VolumeReads;
 
 #[cfg(all(test, unix))]
 pub(crate) use platform::drop_pages;
 #[cfg(test)]
-pub(crate) use probe::{decide, full_rate, grid, Point, WIDEST_WINDOW};
-#[cfg(any(doc, test))]
-pub(crate) use volume::Bound;
+pub(crate) use probe::{full_rate, grid, overlap, WIDEST_WINDOW};
 
 use platform::{evict, open_cached, uncached};
 
@@ -129,16 +127,13 @@ pub enum CachePolicy {
     Cached,
 }
 
-/// A file opened for reads by one [`CachePolicy`], read as its urgent
-/// request needs ([`Urgent`]).
+/// A file opened for reads by one [`CachePolicy`], its due pieces cut as
+/// its urgent request needs ([`Urgent`]).
 #[derive(Debug, Clone)]
 pub struct Reader {
     pub(crate) file: Arc<SourceFile>,
     pub(crate) volume: VolumeReads,
-    /// An urgent reader's window in its volume's bound while any clone of
-    /// it lives ([`Bound`]).
-    _registered: Option<Arc<Registered>>,
-    /// Its jobs submitted and not yet ended ([`Self::outstanding`]).
+    /// Its requests made and not yet ended ([`Self::outstanding`]).
     outstanding: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -166,8 +161,8 @@ impl Reader {
 
     /// The file `source` has open, read by `policy`: its descriptor shared
     /// where cached, the same file opened again past the cache where not;
-    /// read as its volume's choice for `urgent` says, whatever its policy;
-    /// starting the pool's workers it needs ("A volume's window").
+    /// read as its volume's shape for `urgent` says, whatever its policy;
+    /// starting the pool's workers it needs ("A volume's curve").
     fn reading(source: &OpenFile, policy: CachePolicy, urgent: Option<&Urgent>) -> Result<Self, Error> {
         let file = source.file();
         let through = match policy {
@@ -176,17 +171,11 @@ impl Reader {
         };
         let path: Arc<Path> = source.path().into();
         let volume = VolumeReads::of(file, urgent)?;
-        scheduler::deepen(volume.workers())?;
-        let registered = urgent.map(|_| Arc::new(Registered::new(volume.background.clone(), volume.choice.window)));
-        Ok(Self {
-            file: Arc::new(SourceFile { path, size: source.size(), through }),
-            volume,
-            _registered: registered,
-            outstanding: Arc::default(),
-        })
+        scheduler::deepen(volume.shape.workers())?;
+        Ok(Self { file: Arc::new(SourceFile { path, size: source.size(), through }), volume, outstanding: Arc::default() })
     }
 
-    /// Its jobs submitted and not yet ended, as a handle that reads them
+    /// Its requests made and not yet ended, as a handle that reads them
     /// while the reader lives on elsewhere: while any is, a waiter on one
     /// waits on the engine, whose work [`crate::engine_work`] reports.
     pub fn outstanding(&self) -> Outstanding {
@@ -197,11 +186,10 @@ impl Reader {
         self.file.size
     }
 
-    /// The most bytes in flight a less urgent piece joins: what a demand read
-    /// waits behind of them ("A volume's window", "How reads share the
-    /// engine").
-    pub fn window(&self) -> u64 {
-        self.volume.choice.window
+    /// The bytes in flight at which its link reads at its full rate (its
+    /// knee, "A volume's curve"): below them the link lacks work.
+    pub fn knee(&self) -> u64 {
+        self.volume.shape.knee
     }
 
     /// The volume its file lies on, whose counts every reader of it shares
@@ -227,26 +215,27 @@ impl Reader {
     }
 
     /// `length` bytes from `offset`, read in order as a stream: each read
-    /// of the stream is one [`Priority::Load`] job into the caller's
-    /// buffer, so the stream holds none of the bytes itself.
+    /// of the stream is one undated request into the caller's buffer, so
+    /// the stream holds none of the bytes itself.
     pub fn range(&self, offset: u64, length: u64) -> RangeReader<'_> {
         RangeReader { reader: self, offset, remaining: length }
     }
 
-    /// Queue `ranges` for the pool at `priority`, behind every piece of a
-    /// job at least as urgent submitted before it. A range outside the file
-    /// fails at once; one past its destination's region is a defect, and
-    /// panics. The job holds every range's destination until its last piece
-    /// has ended.
+    /// Request `ranges` of its volume's link for `want`. A range outside
+    /// the file fails at once; one past its destination's region is a
+    /// defect, and panics. The request holds every range's destination until
+    /// its last piece has ended, whatever becomes of its handle.
     ///
     /// # Safety
     /// Each range's bytes of its destination are disjoint from every other
-    /// range's of the job and of any job in flight, and from every byte the
-    /// caller touches, until the job has ended: its [`Job::wait`] returned,
-    /// or it was dropped (which withdraws it and waits).
-    pub unsafe fn submit(&self, ranges: Vec<Range>, priority: Priority) -> Result<Job, Error> {
+    /// range's of the request and of any request in flight, and from every
+    /// byte the caller touches, until the request has ended: its
+    /// [`Handle::wait`] returned, or its hook ran ([`Handle::on_end`]).
+    /// Dropping the handle cancels the pieces not yet taken and does not
+    /// wait for those in flight.
+    pub unsafe fn request(&self, ranges: Vec<Range>, want: Want) -> Result<Handle, Error> {
         // SAFETY: the caller's.
-        unsafe { scheduler::queue(&self.file, &self.volume, &self.outstanding, ranges, priority) }
+        unsafe { scheduler::request(&self.file, &self.volume, &self.outstanding, ranges, want) }
     }
 }
 
@@ -258,16 +247,16 @@ pub struct RangeReader<'a> {
 }
 
 /// A caller's buffer as a read's destination, for a read the caller waits
-/// out before the borrow ends ([`RangeReader`]): no job outlives the read
-/// that writes it.
+/// out before the borrow ends ([`RangeReader`]): no request outlives the
+/// read that writes it.
 struct Borrowed(NonNull<u8>, usize);
 
-// SAFETY: the buffer is the borrower's alone while its one job runs.
+// SAFETY: the buffer is the borrower's alone while its one request runs.
 unsafe impl Send for Borrowed {}
 unsafe impl Sync for Borrowed {}
 
-// SAFETY: the borrow it is made from outlasts every write to it: its job
-// ends before `RangeReader::read` returns.
+// SAFETY: the borrow it is made from outlasts every write to it: its
+// request ends before `RangeReader::read` returns.
 unsafe impl Destination for Borrowed {
     fn region(&self) -> (NonNull<u8>, usize) {
         (self.0, self.1)
@@ -282,13 +271,13 @@ impl io::Read for RangeReader<'_> {
         };
         let range = Range { offset: self.offset, length, into: Arc::new(Borrowed(sink, length)), at: 0 };
         // SAFETY: `buffer` is the caller's, `length` writable bytes of it,
-        // touched by nothing else until the job ends (`wait`).
+        // touched by nothing else until the request ends (`wait`).
         // An error keeps its kind and itself as the source.
-        let job = unsafe { self.reader.submit(vec![range], Priority::Load) }.map_err(|error| match error {
+        let request = unsafe { self.reader.request(vec![range], Want::undated(0.)) }.map_err(|error| match error {
             Error::Io(error) => error,
             error => io::Error::other(error),
         })?;
-        match job.wait() {
+        match request.wait() {
             Ended::Read { failed } => {
                 if let Some((_, error)) = failed.into_iter().next() {
                     let kind = match &*error {

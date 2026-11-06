@@ -1,18 +1,17 @@
 //! How the read engine serves several record reads at once: the measurement
 //! behind the law a streamed decode's timeline prices its reads by
-//! (`seismic_io`, "How reads share the engine"). Each job reads one record of `bytes` at a random
+//! (`seismic_io`, "How reads share the engine"). Each request reads one record of `bytes` at a random
 //! offset of a real model file, uncached, each pass after its pages are
-//! evicted: `k` jobs submitted at once, and `k` jobs one after another,
+//! evicted: `k` requests made at once, and `k` one after another,
 //! each waited for, at each record size; every time the fastest of
 //! `REPEATS`. Against three laws: `k · (λ + b/D)` (reads served one after
 //! another), `λ + k · b/D` (latencies overlapped), and `⌈k b / W⌉ · λ +
-//! k · b/D` (a latency a window of `W` bytes in flight, the volume's
-//! window).
+//! k · b/D` (a latency a window of `W` bytes in flight, the link's knee).
 //! The file is the target of the catalog acquisition object
 //! `MAGNITUDE_ARTIFACTS` names. Run alone on the device, with
 //! `-p seismic-io --release --test read_law -- --ignored --nocapture`.
 
-use seismic_io::{Buffer, CachePolicy, Priority, Range, Reader};
+use seismic_io::{Buffer, CachePolicy, Range, Reader, Want};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -44,14 +43,14 @@ fn pass(reader: &Reader, sinks: &Arc<Buffer>, offsets: &mut Offsets, k: usize, b
     let began = Instant::now();
     if together {
         // SAFETY: each sink is its own record of the allocation.
-        let jobs = ranges.into_iter().map(|range| unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap()).collect::<Vec<_>>();
-        for job in jobs {
-            job.wait();
+        let requests = ranges.into_iter().map(|range| unsafe { reader.request(vec![range], Want::now()) }.unwrap()).collect::<Vec<_>>();
+        for request in requests {
+            request.wait();
         }
     } else {
         for range in ranges {
             // SAFETY: as above.
-            unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap().wait();
+            unsafe { reader.request(vec![range], Want::now()) }.unwrap().wait();
         }
     }
     began.elapsed().as_secs_f64()
@@ -65,7 +64,7 @@ fn the_engine_serves_record_reads_by_its_law() {
     let target = acquisition["target"].as_str().expect("the acquisition object names its target");
     seismic_io::probe_volume(&seismic_io::OpenFile::open(target).unwrap(), None).unwrap();
     let reader = Reader::open(target, CachePolicy::Uncached).unwrap();
-    let window = reader.window();
+    let window = reader.knee();
     let mut offsets = Offsets(0x5eed);
     for bytes in [262_144usize, 1_900_544, 8_388_608] {
         let sinks = Arc::new(Buffer::new(at(32, bytes)));

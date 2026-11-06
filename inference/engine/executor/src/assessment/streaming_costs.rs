@@ -1286,22 +1286,24 @@ impl GraphMemory {
     }
 }
 
-/// A volume's stored choice, by the rule that made it: the current
-/// ([`VolumeChoice::SCHEMA`](seismic_io::VolumeChoice::SCHEMA)),
-/// or the one before it, which a load reads as it was while the job probes
-/// the current one, so no load waits on the probe or reads meanwhile at the
-/// pre-probe bounds (a 32 MiB window for hints, where the earlier choice held
-/// GB10's to 1 MiB).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A volume's stored curve, or the rule before it's choice: the current
+/// ([`Curve::SCHEMA`](seismic_io::Curve::SCHEMA)), or the one before it,
+/// which a load reads as it was while the job probes the current one, so
+/// no load waits on the probe or reads meanwhile at the pre-probe bounds (a
+/// 32 MiB depth for hints, where the earlier choice held GB10's to 1 MiB).
+#[derive(Clone, Debug, PartialEq)]
 pub enum StoredVolume {
-    Current(seismic_io::VolumeChoice),
-    Earlier(seismic_io::VolumeChoice),
+    Current(seismic_io::Curve),
+    Earlier(seismic_io::EarlierChoice),
 }
 
-/// How a volume is read (`seismic_io::VolumeChoice`), a requested
-/// point (`PointRequest::Volume`) keyed by the volume and its urgent request:
+/// How a volume is read (`seismic_io::Curve`), a requested point
+/// (`PointRequest::Volume`) keyed by the volume and its urgent request:
 /// the job probes it, and a load adopts what the records hold, so no load
-/// reads or evicts a file to time it.
+/// reads or evicts a file to time it. Each point of the curve is three
+/// terms (its rate, spread and cores, keyed by its read size and window),
+/// each lone time two (its seconds and their error, keyed by its read
+/// size).
 pub struct VolumeCosts;
 
 impl VolumeCosts {
@@ -1310,25 +1312,25 @@ impl VolumeCosts {
         urgent.as_ref().map(|(parts, records)| seismic_io::Urgent { parts: parts.clone(), records: *records })
     }
 
-    /// A term's key under `schema`: the choice's rule ([`VolumeChoice::SCHEMA`](seismic_io::VolumeChoice::SCHEMA)),
-    /// or none for the first rule, whose records have no such term.
-    fn key(identity: &seismic::Identity, file: &Path, urgent: Option<&seismic_io::Urgent>, schema: Option<u64>, term: &str) -> Result<PointKey, ExecutorCostsError> {
+    /// A term's key under `schema`, at `at` (its read size and window, as
+    /// the term has them): the rule's ([`Curve::SCHEMA`](seismic_io::Curve::SCHEMA)
+    /// or [`EarlierChoice::SCHEMA`](seismic_io::EarlierChoice::SCHEMA)).
+    fn key(identity: &seismic::Identity, file: &Path, urgent: Option<&seismic_io::Urgent>, schema: u64, term: &str, at: &[(&str, u64)]) -> Result<PointKey, ExecutorCostsError> {
         let volume = seismic::volume_identity(file).map_err(|cause| failed("volume identity")(&cause))?;
         let mut configuration = named(&[("volume_device", volume.device)]);
         configuration.insert(format!("volume_{}", volume.uuid.as_deref().unwrap_or("unnamed")), 1);
-        if let Some(schema) = schema {
-            configuration.insert("schema".into(), schema);
-        }
+        configuration.insert("schema".into(), schema);
         if let Some(urgent) = urgent {
             configuration.insert("records".into(), urgent.records);
             configuration.extend(urgent.parts.iter().enumerate().map(|(part, &bytes)| (format!("part_{part}"), bytes)));
         }
-        Ok(PointKey { executor: identity.clone(), kernels: Vec::new(), configuration, point: named(&[(term, 1)]) })
+        let mut point = named(&[(term, 1)]);
+        point.extend(at.iter().map(|&(name, value)| (name.to_owned(), value)));
+        Ok(PointKey { executor: identity.clone(), kernels: Vec::new(), configuration, point })
     }
 
-    /// The choice `store` records of `file`'s volume: by the current rule,
-    /// else by the rule before it ([`StoredVolume`]), none until the job
-    /// probed it.
+    /// The curve `store` records of `file`'s volume, whole; else the rule
+    /// before it's choice ([`StoredVolume`]); none until the job probed it.
     pub fn stored(
         topology: &DeviceTopology,
         executor: &Executor,
@@ -1337,21 +1339,39 @@ impl VolumeCosts {
         store: &dyn RecordStore<PointKey>,
     ) -> Result<Option<StoredVolume>, ExecutorCostsError> {
         let identity = executor_identity(topology, executor)?;
-        let choice = |schema: Option<u64>| -> Result<Option<seismic_io::VolumeChoice>, ExecutorCostsError> {
-            let term = |term: &str| measured(store, &Self::key(&identity, file, urgent, schema, term)?, "volume record");
-            let (window, demand, read, demand_read, cores) = (term("window")?, term("demand")?, term("read")?, term("demand_read")?, term("cores")?);
-            let (Some(window), Some(demand), Some(read), Some(demand_read), Some(cores)) = (window, demand, read, demand_read, cores) else {
-                return Ok(None);
+        let term = |schema: u64, term: &str, at: &[(&str, u64)]| measured(store, &Self::key(&identity, file, urgent, schema, term, at)?, "volume record");
+        let (grid, lone) = seismic_io::Curve::grid(urgent);
+        let schema = seismic_io::Curve::SCHEMA;
+        let mut points = Vec::with_capacity(grid.len());
+        for (read, window) in grid {
+            let at = [("read", read), ("window", window)];
+            let (Some(rate), Some(spread), Some(cores)) = (term(schema, "rate", &at)?, term(schema, "spread", &at)?, term(schema, "cores", &at)?) else {
+                points.clear();
+                break;
             };
-            Ok(Some(seismic_io::VolumeChoice { window: window as u64, demand: demand as u64, read: read as u64, demand_read: demand_read as u64, cores }))
-        };
-        if let Some(current) = choice(Some(seismic_io::VolumeChoice::SCHEMA))? {
-            return Ok(Some(StoredVolume::Current(current)));
+            points.push(seismic_io::Point { read, window, rate, spread, cores });
         }
-        Ok(choice(seismic_io::VolumeChoice::EARLIER_SCHEMA)?.map(StoredVolume::Earlier))
+        let mut lones = Vec::with_capacity(lone.len());
+        for read in lone {
+            let at = [("read", read)];
+            let (Some(seconds), Some(error)) = (term(schema, "lone", &at)?, term(schema, "lone_error", &at)?) else {
+                points.clear();
+                break;
+            };
+            lones.push(seismic_io::Lone { read, seconds, error });
+        }
+        if !points.is_empty() {
+            return Ok(Some(StoredVolume::Current(seismic_io::Curve { points, lone: lones })));
+        }
+        let schema = seismic_io::EarlierChoice::SCHEMA;
+        let (window, demand, read, demand_read, cores) = (term(schema, "window", &[])?, term(schema, "demand", &[])?, term(schema, "read", &[])?, term(schema, "demand_read", &[])?, term(schema, "cores", &[])?);
+        let (Some(window), Some(demand), Some(read), Some(demand_read), Some(cores)) = (window, demand, read, demand_read, cores) else {
+            return Ok(None);
+        };
+        Ok(Some(StoredVolume::Earlier(seismic_io::EarlierChoice { window: window as u64, demand: demand as u64, read: read as u64, demand_read: demand_read as u64, cores })))
     }
 
-    /// Probe `file`'s volume in the job, its choice stored.
+    /// Probe `file`'s volume in the job, its curve stored.
     pub(super) fn measure(
         device: &Device,
         file: &Path,
@@ -1361,11 +1381,16 @@ impl VolumeCosts {
         let error = failed("volume probe");
         let identity = executor_identity(device.topology(), device.info())?;
         let source = magnitude_artifacts::FileSource::open(file).map_err(|cause| error(&cause))?;
-        let choice = seismic_io::probe_volume(&source, urgent).map_err(|cause| error(&cause))?;
-        let terms = [("window", choice.window as f64), ("demand", choice.demand as f64), ("read", choice.read as f64), ("demand_read", choice.demand_read as f64), ("cores", choice.cores)];
-        for (term, value) in terms {
+        let curve = seismic_io::probe_volume(&source, urgent).map_err(|cause| error(&cause))?;
+        let schema = seismic_io::Curve::SCHEMA;
+        let points = curve.points.iter().flat_map(|point| {
+            let at = vec![("read", point.read), ("window", point.window)];
+            [("rate", point.rate), ("spread", point.spread), ("cores", point.cores)].map(|(term, value)| (term, at.clone(), value))
+        });
+        let lone = curve.lone.iter().flat_map(|lone| [("lone", lone.seconds), ("lone_error", lone.error)].map(|(term, value)| (term, vec![("read", lone.read)], value)));
+        for (term, at, value) in points.chain(lone) {
             let timing = Timing { median: value, interval: None, samples: 1 };
-            store.store(&Self::key(&identity, file, urgent, Some(seismic_io::VolumeChoice::SCHEMA), term)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
+            store.store(&Self::key(&identity, file, urgent, schema, term, &at)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
         }
         Ok(())
     }

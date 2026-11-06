@@ -2,8 +2,8 @@ use super::*;
 use crate::accounting::{Book, Wait};
 #[cfg(unix)]
 use crate::disk::drop_pages;
-use crate::disk::{decide, full_rate, grid, Bound, Point, Registered, VolumeReads, LEAST_READ, WIDEST_WINDOW};
-use crate::scheduler::{pieces, Engine, JobState, Part, Piece, Queue, Queued, Span, VolumeFlight};
+use crate::disk::{full_rate, grid, overlap, Shape, VolumeReads, LEAST_READ, WIDEST_WINDOW};
+use crate::scheduler::{pieces, Engine, Part, Piece, Queue, Queued, RequestState, Span};
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::File;
@@ -14,15 +14,20 @@ use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// A volume's bound is the process's one, shared by every reader of the
-/// volume (`Bound`): an urgent reader a test opens on the temporary
-/// directory's volume narrows every other test's bound there while it
-/// lives. A test that opens one, or reads the bound, holds the volume.
+/// A volume's curve is the process's one, shared by every reader of the
+/// volume: a test that probes or adopts one on the temporary directory's
+/// volume shapes every reader opened there after it. A test that probes
+/// or adopts, or reads the bulk it depends on, holds the volume.
 static TEMPORARY_VOLUME: Mutex<()> = Mutex::new(());
 
 /// Hold [`TEMPORARY_VOLUME`] for this test.
 fn temporary_volume() -> std::sync::MutexGuard<'static, ()> {
     TEMPORARY_VOLUME.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wanted an hour from now: not due while a test runs.
+fn ahead() -> Want {
+    Want::at(Instant::now() + Duration::from_secs(3600), 0.)
 }
 
 fn temporary(name: &str, bytes: &[u8]) -> PathBuf {
@@ -34,36 +39,36 @@ fn temporary(name: &str, bytes: &[u8]) -> PathBuf {
     path
 }
 
-/// A demand read beside bulk from other readers of its volume (two
-/// loads keeping 4 MiB jobs queued and an urgent reader keeping its
-/// hints queued) waits behind at most the pieces in flight, never behind
+/// A due read beside bulk from other readers of its volume (two loads
+/// keeping 4 MiB requests queued and an urgent reader keeping its reads
+/// ahead queued) waits behind at most the pieces in flight, never behind
 /// the bulk queued: within 0.5 s each, on any device a test runs on (a
 /// 4 KiB read behind a few MiB in flight). On an RTX 3090 host: p50
 /// 0.16 ms, max 0.41; beside 136 busy threads on its 34 cores, max 9.8.
 #[test]
-fn a_demand_read_beside_bulk_waits_only_for_the_pieces_in_flight() {
+fn a_due_read_beside_bulk_waits_only_for_the_pieces_in_flight() {
     let _volume = temporary_volume();
     let path = temporary("demand-beside-bulk", &vec![5u8; 16 << 20]);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let urgent = Urgent { parts: vec![4096], records: 1 };
-    let flood = |reader: Reader, priority: Priority, length: usize| {
+    let flood = |reader: Reader, want: fn() -> Want, length: usize| {
         let stop = stop.clone();
         std::thread::spawn(move || {
             let sink = Arc::new(Buffer::new(length));
             let mut at = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let range = Range { offset: at, length, into: sink.clone(), at: 0 };
-                // SAFETY: the sink is this thread's alone, one job at a time, waited for here.
-                let ended = unsafe { reader.submit(vec![range], priority) }.unwrap().wait();
+                // SAFETY: the sink is this thread's alone, one request at a time, waited for here.
+                let ended = unsafe { reader.request(vec![range], want()) }.unwrap().wait();
                 assert!(matches!(ended, Ended::Read { ref failed } if failed.is_empty()), "{ended:?}");
                 at = (at + length as u64) % (reader.size() - length as u64);
             }
         })
     };
     let floods = [
-        flood(Reader::open(&path, CachePolicy::Uncached).unwrap(), Priority::Load, 4 << 20),
-        flood(Reader::open(&path, CachePolicy::Uncached).unwrap(), Priority::Load, 4 << 20),
-        flood(Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap(), Priority::Prefetch, 1 << 20),
+        flood(Reader::open(&path, CachePolicy::Uncached).unwrap(), || Want::undated(0.), 4 << 20),
+        flood(Reader::open(&path, CachePolicy::Uncached).unwrap(), || Want::undated(0.), 4 << 20),
+        flood(Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap(), ahead, 1 << 20),
     ];
     let reader = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -72,8 +77,8 @@ fn a_demand_read_beside_bulk_waits_only_for_the_pieces_in_flight() {
         .map(|sample| {
             let range = Range { offset: (sample * 7919 * 4096) % (reader.size() - 4096), length: 4096, into: sink.clone(), at: 0 };
             let began = Instant::now();
-            // SAFETY: the sink is read by one job at a time, waited for here.
-            let ended = unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap().wait();
+            // SAFETY: the sink is read by one request at a time, waited for here.
+            let ended = unsafe { reader.request(vec![range], Want::now()) }.unwrap().wait();
             assert!(matches!(ended, Ended::Read { ref failed } if failed.is_empty()), "{ended:?}");
             began.elapsed().as_secs_f64() * 1e3
         })
@@ -83,10 +88,10 @@ fn a_demand_read_beside_bulk_waits_only_for_the_pieces_in_flight() {
         thread.join().unwrap();
     }
     std::fs::remove_file(path).unwrap();
-    assert!(longest < 500., "a demand read waited {longest:.1} ms behind bulk");
+    assert!(longest < 500., "a due read waited {longest:.1} ms behind bulk");
 }
 
-/// Each range of `ranges`, `(offset, length)`, read as one demand job
+/// Each range of `ranges`, `(offset, length)`, read as one due request
 /// into a buffer of its own: its bytes, or the error that kept them
 /// from landing.
 fn read(source: &Reader, ranges: &[(u64, usize)]) -> Vec<Result<Vec<u8>, String>> {
@@ -104,9 +109,9 @@ fn read(source: &Reader, ranges: &[(u64, usize)]) -> Vec<Result<Vec<u8>, String>
             at: 0,
         })
         .collect();
-    let ended = unsafe { source.submit(landing, Priority::Demand) }.unwrap().wait();
+    let ended = unsafe { source.request(landing, Want::now()) }.unwrap().wait();
     let Ended::Read { failed } = ended else {
-        panic!("the job ended {ended:?}")
+        panic!("the request ended {ended:?}")
     };
     let failed = failed.into_iter().collect::<HashMap<_, _>>();
     buffers
@@ -114,7 +119,7 @@ fn read(source: &Reader, ranges: &[(u64, usize)]) -> Vec<Result<Vec<u8>, String>
         .enumerate()
         .map(|(index, buffer)| match failed.get(&index) {
             Some(error) => Err(error.to_string()),
-            // SAFETY: the job has ended.
+            // SAFETY: the request has ended.
             None => Ok(unsafe { buffer.bytes() }.to_vec()),
         })
         .collect()
@@ -156,9 +161,8 @@ fn ranges_read_as_stored_whatever_their_alignment_and_order() {
     std::fs::remove_file(path).unwrap();
 }
 
-/// A read's end is its volume's last, whoever reads next, and a piece in
-/// flight states its volume's window for its class: what a waiter on a read
-/// judges the volume's progress by.
+/// A read's end is its volume's last, whoever reads next: what a waiter on
+/// a read judges the volume's progress by.
 #[test]
 fn the_engines_work_shows_each_volumes_last_end() {
     let path = temporary("last-end", &vec![4u8; 4 * LEAST_READ as usize]);
@@ -166,26 +170,26 @@ fn the_engines_work_shows_each_volumes_last_end() {
     let began = Instant::now();
     let sink = Arc::new(Buffer::new(LEAST_READ as usize));
     let range = Range { offset: 0, length: LEAST_READ as usize, into: sink, at: 0 };
-    // SAFETY: the sink is this job's alone, waited for here.
-    let ended = unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap().wait();
+    // SAFETY: the sink is this request's alone, waited for here.
+    let ended = unsafe { reader.request(vec![range], Want::now()) }.unwrap().wait();
     assert!(matches!(ended, Ended::Read { ref failed } if failed.is_empty()), "{ended:?}");
     let last = *engine_work().last_ended.get(&reader.volume()).expect("the volume ended a piece");
     assert!(last >= began && last <= Instant::now(), "the end is the read's");
     std::fs::remove_file(&path).unwrap();
 }
 
-/// A job's hook runs once, with how it ended: registered before it
-/// ends, on the thread that ends it; registered after, at once. A job of
-/// no piece ends at its submission. Each hook is waited for through what
-/// it sends, never through time.
+/// A request's hook runs once, with how it ended: registered before it
+/// ends, on the thread that ends it; registered after, at once. A request
+/// of no piece ends at its submission. Each hook is waited for through
+/// what it sends, never through time.
 #[test]
-fn a_jobs_hook_runs_once_with_how_it_ended() {
+fn a_requests_hook_runs_once_with_how_it_ended() {
     let path = temporary("hook", &vec![3u8; 4 * LEAST_READ as usize]);
     let reader = Reader::open(&path, CachePolicy::Uncached).unwrap();
     let sink = Arc::new(Buffer::new(3 * LEAST_READ as usize));
     let range = Range { offset: 0, length: 3 * LEAST_READ as usize, into: sink.clone(), at: 0 };
     let (sent, ran) = std::sync::mpsc::channel::<Ended>();
-    let job = unsafe { reader.submit(vec![range], Priority::Demand) }.unwrap();
+    let job = unsafe { reader.request(vec![range], Want::now()) }.unwrap();
     let send = sent.clone();
     job.on_end(move |ended| send.send(ended.clone()).unwrap());
     assert!(matches!(job.wait(), Ended::Read { .. }));
@@ -194,49 +198,51 @@ fn a_jobs_hook_runs_once_with_how_it_ended() {
     job.on_end(move |ended| send.send(ended.clone()).unwrap());
     assert!(ran.try_recv().is_ok(), "a hook after the end runs at once");
     let outside = Range { offset: 8 * LEAST_READ, length: 1, into: sink, at: 0 };
-    let failed = unsafe { reader.submit(vec![outside], Priority::Demand) }.unwrap();
+    let failed = unsafe { reader.request(vec![outside], Want::now()) }.unwrap();
     failed.on_end(move |ended| sent.send(ended.clone()).unwrap());
-    assert!(matches!(ran.try_recv().unwrap(), Ended::Read { failed } if failed.len() == 1), "a job of no piece ended at its submission");
+    assert!(matches!(ran.try_recv().unwrap(), Ended::Read { failed } if failed.len() == 1), "a request of no piece ended at its submission");
     assert!(ran.try_recv().is_err(), "each hook ran once");
     drop((job, failed));
     std::fs::remove_file(path).unwrap();
 }
 
-/// The job's end is set before its hook is announced: whatever a hook
-/// wakes finds the job ended. The interleaving that hung the suite
-/// (residency woken by a conveyor read's hook, finding the read still
+/// The request's end is set before its hook is announced: whatever a
+/// hook wakes finds the request ended. The interleaving that hung the
+/// suite (residency woken by a conveyor read's hook, finding the read still
 /// in flight and staying asked, with no event left to wake it) is driven
-/// by construction: the hook itself asks whether the job runs, the
-/// question a woken `Conveyor::quiet` asks through `Ticket::running`.
-/// It finds it ended, for a job a worker ends, for one withdrawn, and
-/// for one of no piece.
+/// by construction: the hook itself asks whether the request runs, the
+/// question a woken `Conveyor::quiet` asks through `Ticket::running`. It
+/// finds it ended, for a request a worker ends, for one of no piece, and
+/// for one cancelled (asked through its reader's requests outstanding, as
+/// the handle is being dropped).
 #[test]
-fn a_hook_finds_its_job_ended() {
+fn a_hook_finds_its_request_ended() {
     let path = temporary("ended-first", &vec![4u8; 4 * LEAST_READ as usize]);
     let reader = Reader::open(&path, CachePolicy::Uncached).unwrap();
     let sink = Arc::new(Buffer::new(LEAST_READ as usize));
     let (sent, ran) = std::sync::mpsc::channel::<bool>();
-    // Whether the job runs, asked from inside its hook.
-    let ask = |job: Arc<Job>, sent: std::sync::mpsc::Sender<bool>| {
-        let asked = job.clone();
-        job.on_end(move |_| sent.send(asked.wait_until(Instant::now()).is_none()).unwrap());
+    // Whether the request runs, asked from inside its hook.
+    let ask = |request: Arc<Handle>, sent: std::sync::mpsc::Sender<bool>| {
+        let asked = request.clone();
+        request.on_end(move |_| sent.send(asked.wait_until(Instant::now()).is_none()).unwrap());
     };
     let range = |sink: &Arc<Buffer>, offset| Range { offset, length: LEAST_READ as usize, into: sink.clone(), at: 0 };
     // Ended by the worker that reads its piece.
-    let read = Arc::new(unsafe { reader.submit(vec![range(&sink, 0)], Priority::Demand) }.unwrap());
+    let read = Arc::new(unsafe { reader.request(vec![range(&sink, 0)], Want::now()) }.unwrap());
     ask(read.clone(), sent.clone());
     assert!(!ran.recv().unwrap(), "a hook saw its read still running");
     // Ended at its submission (no piece in the file).
-    let outside = Arc::new(unsafe { reader.submit(vec![range(&sink, 8 * LEAST_READ)], Priority::Demand) }.unwrap());
+    let outside = Arc::new(unsafe { reader.request(vec![range(&sink, 8 * LEAST_READ)], Want::now()) }.unwrap());
     ask(outside.clone(), sent.clone());
     assert!(!ran.recv().unwrap());
-    // Ended by its withdrawal, its hook registered first.
+    // Ended by its cancellation, its hook registered first.
     let late = Arc::new(Buffer::new(LEAST_READ as usize));
-    let withdrawn = Arc::new(unsafe { reader.submit(vec![range(&late, LEAST_READ)], Priority::Load) }.unwrap());
-    ask(withdrawn.clone(), sent);
-    withdrawn.withdraw();
+    let cancelled = unsafe { reader.request(vec![range(&late, LEAST_READ)], Want::undated(0.)) }.unwrap();
+    let outstanding = reader.outstanding();
+    cancelled.on_end(move |_| sent.send(outstanding.requests() > 0).unwrap());
+    drop(cancelled);
     assert!(!ran.recv().unwrap());
-    drop((read, outside, withdrawn));
+    drop((read, outside));
     std::fs::remove_file(path).unwrap();
 }
 
@@ -346,10 +352,10 @@ fn a_failed_read_fails_only_the_ranges_it_serves() {
     std::fs::remove_file(path).unwrap();
 }
 
-/// A job whose piece fails ends with its ranges failed; a job submitted
+/// A request whose piece fails ends with its ranges failed; a request made
 /// beside it lands every range.
 #[test]
-fn a_failed_piece_fails_only_its_job() {
+fn a_failed_piece_fails_only_its_request() {
     let bytes = (0..16 * LEAST_READ as usize)
         .map(|index| (index * 13 % 241) as u8)
         .collect::<Vec<_>>();
@@ -372,10 +378,10 @@ fn a_failed_piece_fails_only_its_job() {
     let (failing, landing) = unsafe {
         (
             source
-                .submit(vec![range(10 * LEAST_READ, &short)], Priority::Demand)
+                .request(vec![range(10 * LEAST_READ, &short)], Want::now())
                 .unwrap(),
             source
-                .submit(vec![range(LEAST_READ + 5, &whole)], Priority::Demand)
+                .request(vec![range(LEAST_READ + 5, &whole)], Want::now())
                 .unwrap(),
         )
     };
@@ -383,7 +389,7 @@ fn a_failed_piece_fails_only_its_job() {
     assert!(matches!(landing.wait(), Ended::Read { failed } if failed.is_empty()));
     drop((failing, landing));
     let at = LEAST_READ as usize + 5;
-    // SAFETY: both jobs have ended.
+    // SAFETY: both requests have ended.
     let whole = unsafe { whole.bytes() };
     assert_eq!(whole, &bytes[at..at + whole.len()]);
     std::fs::remove_file(path).unwrap();
@@ -458,23 +464,24 @@ fn reads_coalesce_then_split_into_pieces() {
     assert_eq!(parts(&pieces[4]), [(3, 0, skip)]);
 }
 
-/// A device of its own, read as named, sharing nothing.
-fn volume(device: u64, window: u64, demand: u64, read: u64) -> VolumeReads {
-    let choice = VolumeChoice { window, demand, read, demand_read: read, cores: 0. };
-    VolumeReads { id: Volume(device), choice, background: Arc::default() }
+/// A link of its own, sharing nothing: due depth, speculation depth and
+/// overlap depth `(due, knee, overlap)`, its pieces cut at `read`.
+fn volume(device: u64, (due, knee, overlap): (u64, u64, u64), read: u64) -> VolumeReads {
+    VolumeReads { id: Volume(device), shape: Shape { due, knee, overlap, ahead_read: read, due_read: read, cores: 0. } }
 }
 
-/// A queued job of its own, `pieces` pieces long.
-fn queued(pieces: usize) -> (Queued, Arc<JobState>) {
-    let state = JobState::new(pieces, Vec::new(), Arc::default(), Vec::new());
+/// A queued request of its own, `pieces` pieces long, on a link of no
+/// bound.
+fn queued(pieces: usize) -> (Queued, Arc<RequestState>) {
+    let state = RequestState::new(pieces, Vec::new(), Arc::default(), Vec::new());
     let path = std::env::current_exe().unwrap();
     let file = Reader::open(path, CachePolicy::Uncached)
         .unwrap()
         .file;
-    let job = Queued {
+    let request = Queued {
         state: state.clone(),
         file,
-        volume: volume(0, u64::MAX, u64::MAX, LEAST_READ),
+        volume: volume(0, (u64::MAX, u64::MAX, u64::MAX), LEAST_READ),
         pieces: (0..pieces as u64)
             .map(|index| Piece {
                 start: index,
@@ -483,62 +490,75 @@ fn queued(pieces: usize) -> (Queued, Arc<JobState>) {
             })
             .collect(),
     };
-    (job, state)
+    (request, state)
 }
 
-/// Pieces are taken by priority, then by submission, then in their
-/// job's order; a promotion moves a job ahead and never behind.
+/// A queued request on `volume`'s link of pieces `[start, end)`.
+fn queued_on(volume: &VolumeReads, spans: &[(u64, u64)]) -> Queued {
+    let (mut request, _) = queued(0);
+    request.volume = volume.clone();
+    request.pieces = spans.iter().map(|&(start, end)| Piece { start, end, parts: Vec::new() }).collect();
+    request
+}
+
+/// Pieces are taken by want (the earlier deadline, then the greater value
+/// of one deadline, an undated request after every dated one), then by
+/// submission, then in their request's order; a reprice moves a request
+/// ahead, or behind.
 #[test]
 fn pieces_are_taken_most_urgent_first() {
     let mut queue = Queue::default();
     let mut states = Vec::new();
-    let push = |queue: &mut Queue, states: &mut Vec<Arc<JobState>>, priority, pieces| {
-        let (job, state) = queued(pieces);
+    let push = |queue: &mut Queue, states: &mut Vec<Arc<RequestState>>, want, pieces| {
+        let (request, state) = queued(pieces);
         states.push(state);
-        queue.push(job, priority).0
+        queue.push(request, want).0
     };
-    // A load's job, though submitted first, is read behind every step's.
-    push(&mut queue, &mut states, Priority::Load, 1);
-    push(&mut queue, &mut states, Priority::Prefetch, 1);
-    push(&mut queue, &mut states, Priority::Prefetch, 2);
-    push(&mut queue, &mut states, Priority::Demand, 1);
-    let later = push(&mut queue, &mut states, Priority::Prefetch, 1);
-    // Each take as (the job's index in submission, the piece).
-    let take = |queue: &mut Queue, states: &[Arc<JobState>]| {
+    let later = Instant::now() + Duration::from_secs(3600);
+    let at = |seconds: u64, value: f64| Want::at(later + Duration::from_secs(seconds), value);
+    // A load's request, though submitted first, is read behind every dated one.
+    push(&mut queue, &mut states, Want::undated(0.), 1);
+    push(&mut queue, &mut states, at(2, 0.), 1);
+    push(&mut queue, &mut states, at(1, 1.), 2);
+    push(&mut queue, &mut states, at(1, 5.), 1);
+    push(&mut queue, &mut states, Want::now(), 1);
+    let last = push(&mut queue, &mut states, at(3, 0.), 1);
+    let demoted = push(&mut queue, &mut states, at(0, 0.), 1);
+    // Each take as (the request's index in submission, the piece).
+    let take = |queue: &mut Queue, states: &[Arc<RequestState>]| {
         let taken = queue.take().unwrap();
-        let job = states.iter().position(|known| Arc::ptr_eq(known, &taken.state));
-        (job.unwrap(), taken.piece.start)
+        let request = states.iter().position(|known| Arc::ptr_eq(known, &taken.state));
+        (request.unwrap(), taken.piece.start)
     };
-    assert_eq!(take(&mut queue, &states), (3, 0));
-    queue.promote(later, Priority::Demand);
-    assert_eq!(take(&mut queue, &states), (4, 0));
-    // A demand job is not demoted: it stays ahead of every prefetch.
-    let demand = push(&mut queue, &mut states, Priority::Demand, 1);
-    queue.promote(demand, Priority::Prefetch);
-    assert_eq!(take(&mut queue, &states), (5, 0));
-    assert_eq!(take(&mut queue, &states), (1, 0));
+    assert_eq!(take(&mut queue, &states), (4, 0), "due first");
+    queue.reprice(last, Want::now());
+    queue.reprice(demoted, Want::undated(0.));
+    assert_eq!(take(&mut queue, &states), (5, 0), "repriced to now: due");
+    assert_eq!(take(&mut queue, &states), (3, 0), "of one deadline, the greater value");
     assert_eq!(take(&mut queue, &states), (2, 0));
     assert_eq!(take(&mut queue, &states), (2, 1));
+    assert_eq!(take(&mut queue, &states), (1, 0));
     assert_eq!(take(&mut queue, &states), (0, 0));
+    assert_eq!(take(&mut queue, &states), (6, 0), "repriced undated: behind the earlier undated one");
     assert!(queue.take().is_none());
 }
 
-/// A withdrawn job gives up the pieces no worker took, a started one
-/// too, once; and a job with no piece ends at once.
+/// A cancelled request gives up the pieces no worker took, a started one
+/// too, once; and a request with no piece ends at once.
 #[test]
-fn a_job_withdraws_the_pieces_no_worker_took() {
+fn a_cancel_gives_up_the_pieces_no_worker_took() {
     let mut queue = Queue::default();
-    let (started, _) = queue.push(queued(3).0, Priority::Demand);
+    let (started, _) = queue.push(queued(3).0, Want::now());
     let (untouched, _) = queued(2);
-    let (untouched, _) = queue.push(untouched, Priority::Demand);
+    let (untouched, _) = queue.push(untouched, Want::now());
     queue.take().unwrap();
-    assert_eq!(queue.withdraw(started).unwrap().pieces.len(), 2);
-    assert!(queue.withdraw(started).is_none());
-    assert_eq!(queue.withdraw(untouched).unwrap().pieces.len(), 2);
-    assert!(queue.withdraw(untouched).is_none());
+    assert_eq!(queue.cancel(started).unwrap().pieces.len(), 2);
+    assert!(queue.cancel(started).is_none());
+    assert_eq!(queue.cancel(untouched).unwrap().pieces.len(), 2);
+    assert!(queue.cancel(untouched).is_none());
     assert!(queue.take().is_none());
     let (empty, state) = queued(0);
-    queue.push(empty, Priority::Demand);
+    queue.push(empty, Want::now());
     assert!(matches!(
         state.progress.lock().unwrap().ended,
         Some(Ended::Read { ref failed }) if failed.is_empty()
@@ -572,13 +592,13 @@ fn a_reader_reads_its_sources_file_after_the_path_is_replaced() {
     std::fs::remove_file(path).unwrap();
 }
 
-/// A withdrawal returns the bytes of the ranges its untaken pieces served,
-/// exactly those that end withdrawn; a piece in flight reads on and is
-/// not returned. Driven on an engine of its own with no worker, so which
-/// pieces are in flight is the test's: of four pieces, one taken (as a
-/// worker takes it), three withdrawn; the taken one's end ends the job.
+/// A dropped handle's pieces no worker took never read: the ranges they
+/// served, exactly those, end cancelled, and no worker takes them; a piece
+/// in flight reads on, and its end ends the request. Driven on an engine
+/// of its own with no worker, so which pieces are in flight is the test's:
+/// of four pieces, one taken (as a worker takes it), three cancelled.
 #[test]
-fn a_withdrawal_returns_the_bytes_it_left_unread() {
+fn a_dropped_handles_unstarted_pieces_never_read() {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     let engine = ENGINE.get_or_init(Engine::new);
     let (mut queued, state) = queued(4);
@@ -588,18 +608,17 @@ fn a_withdrawal_returns_the_bytes_it_left_unread() {
         parts: vec![Part { range, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }],
     };
     queued.pieces = (0..4).map(|at| piece(at * 3 * LEAST_READ, at as usize)).collect();
-    let (id, _) = engine.queue().push(queued, Priority::Load);
-    let job = Job { id, state: state.clone(), engine };
+    let (id, _) = engine.queue().push(queued, Want::undated(0.));
+    let handle = Handle { id, ending: crate::scheduler::Ending(state.clone()), engine };
     let taken = engine.queue().take().expect("a piece to take");
-    job.withdraw();
-    assert!(job.wait_until(Instant::now()).is_none(), "the taken piece reads on");
+    drop(handle);
+    assert!(engine.queue().take().is_none(), "a cancelled piece was taken");
+    assert!(state.progress.lock().unwrap().ended.is_none(), "the taken piece reads on");
     // The taken piece's end, as its worker ends it.
     taken.state.pieces_ended(1, [], None);
-    let Ended::Read { failed } = job.wait() else { panic!("a withdrawn job reads on") };
-    assert_eq!(failed.iter().map(|(range, _)| *range).collect::<Vec<_>>(), [1, 2, 3], "the ranges that ended withdrawn");
-    assert!(failed.iter().all(|(_, error)| matches!(**error, Error::Withdrawn)));
-    job.withdraw();
-    drop(job);
+    let Some(Ended::Read { failed }) = state.progress.lock().unwrap().ended.clone() else { panic!("a cancelled request reads on") };
+    assert_eq!(failed.iter().map(|(range, _)| *range).collect::<Vec<_>>(), [1, 2, 3], "the ranges that ended cancelled");
+    assert!(failed.iter().all(|(_, error)| matches!(**error, Error::Cancelled)));
 }
 
 /// A read that returns while another holds the queue's lock lands without
@@ -610,141 +629,173 @@ fn a_read_returning_under_a_held_lock_is_ended_by_its_next_holder() {
     let engine = Engine::new();
     let (mut queued, _state) = queued(1);
     queued.pieces = [Piece { start: 0, end: LEAST_READ, parts: vec![Part { range: 0, from: 0, length: LEAST_READ as usize, sink: NonNull::dangling() }] }].into();
-    engine.queue().push(queued, Priority::Load);
+    engine.queue().push(queued, Want::undated(0.));
     let taken = engine.queue().take().expect("a piece to take");
     let returned = taken.returned(Instant::now());
     let held = engine.queue();
     engine.read_returned(returned);
-    assert_eq!(held.volumes[&taken.volume.id].bytes, LEAST_READ, "ended while another held the lock");
+    assert_eq!(held.links[&taken.volume.id].ahead, LEAST_READ, "ended while another held the lock");
     drop(held);
-    let mut queue = engine.queue();
-    let flight = queue.volumes.get_mut(&taken.volume.id).unwrap();
-    assert_eq!((flight.bytes, flight.book.requests()), (0, 1), "the next holder ended it");
+    let queue = engine.queue();
+    let link = &queue.links[&taken.volume.id];
+    assert_eq!((link.ahead, link.book.requests()), (0, 1), "the next holder ended it");
 }
 
-/// A job dropped before it is waited for withdraws or finishes first:
-/// a withdrawn job lands nothing.
+/// A request whose handle drops before it is waited for is cancelled or
+/// finishes, and lands nothing past its end: what a worker had taken
+/// reads on, whole.
 #[test]
-fn a_dropped_job_withdraws_or_finishes() {
+fn a_dropped_request_is_cancelled_or_finishes() {
     let bytes = vec![7u8; 4 * LEAST_READ as usize];
     let path = temporary("cancel", &bytes);
     let source = Reader::open(&path, CachePolicy::Uncached).unwrap();
     let sink = Arc::new(Buffer::new(LEAST_READ as usize));
-    let job = unsafe {
-        source.submit(
-            vec![Range {
-                offset: 0,
-                length: LEAST_READ as usize,
-                into: sink.clone(),
-                at: 0,
-            }],
-            Priority::Prefetch,
-        )
-    }
-    .unwrap();
-    drop(job);
-    // Withdrawn before a worker took its one piece, or read whole by
+    let range = Range { offset: 0, length: LEAST_READ as usize, into: sink.clone(), at: 0 };
+    let request = unsafe { source.request(vec![range], ahead()) }.unwrap();
+    let (sent, ended) = std::sync::mpsc::channel();
+    request.on_end(move |_| sent.send(()).unwrap());
+    drop(request);
+    ended.recv().unwrap();
+    // Cancelled before a worker took its one piece, or read whole by
     // then.
-    // SAFETY: the job has ended.
+    // SAFETY: the request has ended.
     let sink = unsafe { sink.bytes() };
     assert!(sink.iter().all(|byte| *byte == 0) || sink.iter().all(|byte| *byte == 7));
     std::fs::remove_file(path).unwrap();
 }
 
+/// A request's reader reads by the rule before's figures where only those
+/// are adopted for it (whatever curve its volume holds for other requests),
+/// and by the curve once it holds the request's lone times.
 #[test]
-fn a_reader_reads_at_the_bounds_until_its_volume_adopts_a_choice() {
+fn a_reader_reads_by_the_earlier_choice_until_the_curve_holds_its_request() {
+    let _volume = temporary_volume();
     let path = temporary("adopted", &[5u8; 4096]);
     let source = OpenFile::open(&path).unwrap();
     // A key its own, as a volume's other tests choose for `None`.
     let urgent = Urgent { parts: vec![4096, 8192, 12288], records: 3 };
-    let pending = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
-    assert_eq!((pending.window(), pending.volume.choice.read), (WIDEST_WINDOW, LEAST_READ), "nothing was measured");
-    let choice = VolumeChoice { window: 4 << 20, demand: 8 << 20, read: 256 << 10, demand_read: 1 << 20, cores: 1.5 };
-    adopt_volume(&source, Some(&urgent), choice).unwrap();
-    let adopted = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap();
-    assert_eq!((adopted.window(), adopted.volume.choice.demand, adopted.volume.choice.read), (4 << 20, 8 << 20, 256 << 10));
+    let earlier = EarlierChoice { window: 4 << 20, demand: 8 << 20, read: 256 << 10, demand_read: 1 << 20, cores: 1.5 };
+    adopt_earlier(&source, Some(&urgent), earlier).unwrap();
+    let adopted = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap().volume.shape;
+    assert_eq!((adopted.due, adopted.knee, adopted.overlap, adopted.ahead_read, adopted.due_read), (8 << 20, 4 << 20, 4 << 20, 256 << 10, 1 << 20));
     assert_eq!(read_cores([&source], &urgent).unwrap(), 1.5);
+    let point = |window: u64, rate: f64| Point { read: LEAST_READ, window, rate: rate * 1e9, spread: 0.01e9, cores: 2. };
+    let curve = Curve { points: vec![point(LEAST_READ, 0.4), point(4 * LEAST_READ, 1.5), point(16 * LEAST_READ, 3.)], lone: vec![Lone { read: LEAST_READ, seconds: 1e-3, error: 1e-5 }] };
+    adopt_volume(&source, Some(&urgent), &curve).unwrap();
+    let probed = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap().volume.shape;
+    assert_eq!(probed, Shape::of(&curve.points, Some(&curve.lone)), "the curve, once it holds the request");
+    assert_eq!(read_cores([&source], &urgent).unwrap(), 2.);
     std::fs::remove_file(path).unwrap();
 }
 
-/// A prefetch withdrawn behind demand ends with what it had in flight,
-/// its range failed `Withdrawn` unless every piece of it was taken, and
-/// the demand ahead of it lands whole.
+/// A read ahead cancelled behind a due one ends with what it had in
+/// flight, its range failed `Cancelled` unless every piece of it was taken,
+/// and the due read ahead of it lands whole.
 #[test]
-fn a_withdrawn_prefetch_ends_with_what_it_had_in_flight_and_demand_lands() {
-    // Probed on a file of its own, so the file read is four windows long.
-    let probed = temporary("withdraw-window", &[5u8; 4096]);
+fn a_cancelled_read_ahead_ends_with_what_it_had_in_flight_and_the_due_one_lands() {
+    let _volume = temporary_volume();
+    let probed = temporary("cancel-knee", &[5u8; 4096]);
     probe_volume(&OpenFile::open(&probed).unwrap(), None).unwrap();
-    let window = Reader::open(&probed, CachePolicy::Uncached).unwrap().window();
+    let knee = Reader::open(&probed, CachePolicy::Uncached).unwrap().knee();
     std::fs::remove_file(probed).unwrap();
-    let bytes = vec![5u8; 4 * window as usize];
-    let path = temporary("withdraw", &bytes);
+    let bytes = vec![5u8; 4 * knee as usize];
+    let path = temporary("cancel-ahead", &bytes);
     let source = Reader::open(&path, CachePolicy::Uncached).unwrap();
-    let demand = Arc::new(Buffer::new(bytes.len()));
-    let ahead = Arc::new(Buffer::new(2 * LEAST_READ as usize));
+    let due = Arc::new(Buffer::new(bytes.len()));
+    let read_ahead = Arc::new(Buffer::new(2 * LEAST_READ as usize));
     let range = |sink: &Arc<Buffer>| Range { offset: 0, length: sink.region().1, into: sink.clone(), at: 0 };
-    // SAFETY: each sink is its job's alone, which ends before it is read.
-    let demanded = unsafe { source.submit(vec![range(&demand)], Priority::Demand) }.unwrap();
-    let prefetch = unsafe { source.submit(vec![range(&ahead)], Priority::Prefetch) }.unwrap();
-    prefetch.withdraw();
-    let ended = prefetch.wait();
-    match &ended {
-        // SAFETY: the job has ended.
-        Ended::Read { failed } if failed.is_empty() => assert!(unsafe { ahead.bytes() }.iter().all(|byte| *byte == 5)),
-        Ended::Read { failed } => assert!(failed.len() == 1 && matches!(*failed[0].1, Error::Withdrawn)),
+    // SAFETY: each sink is its request's alone, which ends before it is read.
+    let demanded = unsafe { source.request(vec![range(&due)], Want::now()) }.unwrap();
+    let ahead = unsafe { source.request(vec![range(&read_ahead)], ahead()) }.unwrap();
+    let (sent, ended) = std::sync::mpsc::channel();
+    ahead.on_end(move |ended| sent.send(ended.clone()).unwrap());
+    drop(ahead);
+    match ended.recv().unwrap() {
+        // SAFETY: the request has ended.
+        Ended::Read { failed } if failed.is_empty() => assert!(unsafe { read_ahead.bytes() }.iter().all(|byte| *byte == 5)),
+        Ended::Read { failed } => assert!(failed.len() == 1 && matches!(*failed[0].1, Error::Cancelled)),
         Ended::Panicked(panic) => panic.resume(),
     }
-    prefetch.withdraw();
     assert!(matches!(demanded.wait(), Ended::Read { failed } if failed.is_empty()));
-    // SAFETY: the job has ended.
-    assert!(unsafe { demand.bytes() }.iter().all(|byte| *byte == 5));
+    // SAFETY: the request has ended.
+    assert!(unsafe { due.bytes() }.iter().all(|byte| *byte == 5));
     std::fs::remove_file(path).unwrap();
 }
 
-/// Demand reads hold the widest window at the full rate: past the knee a
-/// wider one costs a read alone nothing, and serving needs it (GB10's
-/// medians: 9.66 GB/s at 4 MiB, then flat through 32); a narrower window
-/// short of the rate, or a wider one slower past its noise, is not taken;
-/// of reads tied at the widest, the least.
+/// Due reads hold the widest window at the full rate of their line: past
+/// the knee a wider one costs a read alone nothing, and serving needs it
+/// (GB10's medians: 9.66 GB/s at 4 MiB, then flat through 32); a narrower
+/// window short of the rate, or a wider one slower past its noise, is not
+/// taken.
 #[test]
-fn demand_reads_hold_the_widest_window_at_the_full_rate() {
+fn due_reads_hold_the_widest_window_at_the_full_rate() {
     let mib = 1024 * 1024;
-    let point = |read: u64, window: u64, rate: f64| Point { read, window, rate: rate * 1e9, spread: 0.05e9, cores: 1. };
-    let line = [point(LEAST_READ, 4 * mib, 9.66), point(LEAST_READ, 8 * mib, 10.09), point(LEAST_READ, 16 * mib, 10.12), point(LEAST_READ, 32 * mib, 10.10)];
+    let point = |window: u64, rate: f64| Point { read: LEAST_READ, window, rate: rate * 1e9, spread: 0.05e9, cores: 1. };
+    let line = [point(4 * mib, 9.66), point(8 * mib, 10.09), point(16 * mib, 10.12), point(32 * mib, 10.10)];
     assert_eq!(full_rate(&line).window, 32 * mib);
-    let falling = [point(LEAST_READ, 8 * mib, 10.09), point(LEAST_READ, 16 * mib, 10.12), point(LEAST_READ, 32 * mib, 9.2)];
+    let falling = [point(8 * mib, 10.09), point(16 * mib, 10.12), point(32 * mib, 9.2)];
     assert_eq!(full_rate(&falling).window, 16 * mib);
-    let reads = [point(2 * LEAST_READ, 32 * mib, 10.1), point(LEAST_READ, 32 * mib, 10.1)];
-    assert_eq!(full_rate(&reads).read, LEAST_READ);
 }
 
-/// A request is served at the point of least `T`, priced from the
-/// curve: GB10's medians and its lone
-/// experts by read size put a decode request of
-/// 8 records at 4 MiB in 128 KiB reads, where 16 MiB in 2 MiB reads
-/// reads 10% faster but waits 0.8 ms more; a near tie takes the narrower
-/// window, then the least read; a reader's widest range bounds its read
-/// sizes.
+/// A recorded curve's lines at each depth, GB/s, as (read, window) points
+/// with a spread of 2% (a few percent past the knee, "A volume's curve").
+fn recorded(lines: &[(u64, &[(u64, f64)])]) -> Vec<Point> {
+    lines
+        .iter()
+        .flat_map(|&(read, line)| line.iter().map(move |&(depth, rate)| Point { read, window: depth * read, rate: rate * 1e9, spread: 0.02 * rate * 1e9, cores: 1. }))
+        .collect()
+}
+
+/// The link's depths and read sizes from recorded curves (uncached reads at
+/// random offsets of Qwen3.6 35B's file, by depth): the M4 Max's internal
+/// drive reaches its best (6.73 GB/s) only 64 deep in 256 KiB reads and 128
+/// deep in 128 KiB ones, 16 MiB either way, so it reads ahead 16 MiB deep in
+/// the wider; its overlap is a 256 KiB piece's lone time at the best rate,
+/// 1.6 MB. The M4 Pro's flattens at 4.02 GB/s 8 deep in 256 KiB reads,
+/// 128 KiB ones never reach it: 2 MiB ahead, an overlap of 0.69 MB. GB10's
+/// 128 KiB line reaches 10.09 GB/s at 8 MiB and is flat after: it reads
+/// ahead 8 MiB deep and due at the line's widest, 32 MiB, and a lone piece
+/// (299 µs) overlaps 3 MB, past which no due read's own pieces wait.
 #[test]
-fn a_request_is_served_at_the_point_of_least_time() {
+fn a_links_depths_come_from_its_curve() {
     let mib = 1024 * 1024;
-    let point = |read: u64, window: u64, rate: f64| Point { read, window, rate: rate * 1e9, spread: 0.01e9, cores: 1. };
-    let points = [
-        point(LEAST_READ, 2 * mib, 6.02),
-        point(LEAST_READ, 4 * mib, 9.66),
-        point(LEAST_READ, 8 * mib, 10.09),
-        point(16 * LEAST_READ, 8 * mib, 10.09),
-        point(16 * LEAST_READ, 16 * mib, 10.62),
-    ];
-    let lone = HashMap::from([(LEAST_READ, (0.634e-3, 0.02e-3)), (16 * LEAST_READ, (0.699e-3, 0.02e-3))]);
+    let max = recorded(&[
+        (LEAST_READ, &[(1, 0.71), (2, 1.37), (4, 2.41), (8, 3.70), (16, 5.11), (32, 5.99), (64, 6.38), (128, 6.58)]),
+        (2 * LEAST_READ, &[(1, 1.12), (2, 2.01), (4, 3.30), (8, 4.70), (16, 5.86), (32, 6.41), (64, 6.68), (128, 6.73)]),
+    ]);
+    let shape = Shape::of(&max, None);
+    assert_eq!((shape.ahead_read, shape.knee, shape.due_read), (2 * LEAST_READ, 16 * mib, 2 * LEAST_READ));
+    assert_eq!(shape.overlap, (262_144. / 1.12e9 * 6.73e9) as u64);
+    let pro = recorded(&[
+        (LEAST_READ, &[(1, 1.01), (2, 1.86), (4, 2.66), (8, 3.30), (16, 3.67), (32, 3.69), (128, 3.66)]),
+        (2 * LEAST_READ, &[(1, 1.60), (2, 2.65), (4, 3.23), (8, 4.02), (16, 4.05), (32, 4.08), (128, 4.08)]),
+    ]);
+    let shape = Shape::of(&pro, None);
+    assert_eq!((shape.ahead_read, shape.knee), (2 * LEAST_READ, 2 * mib));
+    assert_eq!(shape.overlap, (262_144. / 1.60e9 * 4.08e9) as u64);
+    let gb10 = recorded(&[(LEAST_READ, &[(1, 0.438), (16, 6.02), (32, 9.66), (64, 10.09), (128, 10.12), (256, 10.10)])]);
+    let lone = [Lone { read: LEAST_READ, seconds: 0.634e-3, error: 0.02e-3 }];
+    let shape = Shape::of(&gb10, Some(&lone));
+    assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (LEAST_READ, 8 * mib, LEAST_READ, 32 * mib));
+    assert!((3_000_000..3_100_000).contains(&shape.overlap), "{}", shape.overlap);
+    assert_eq!(overlap(&[Point { read: LEAST_READ, window: LEAST_READ, rate: 1e12, spread: 0., cores: 0. }], 1e9), LEAST_READ, "at least a piece");
+}
+
+/// A request's due pieces are cut at the size its lone record is served
+/// soonest at, whatever the size read ahead; read sizes run to the least
+/// holding the widest range.
+#[test]
+fn due_pieces_are_cut_at_the_size_a_lone_request_is_soonest() {
+    let points = recorded(&[
+        (LEAST_READ, &[(1, 0.5), (8, 3.), (64, 6.)]),
+        (8 * LEAST_READ, &[(1, 2.), (8, 6.)]),
+    ]);
+    let lone = [Lone { read: LEAST_READ, seconds: 0.7e-3, error: 1e-5 }, Lone { read: 8 * LEAST_READ, seconds: 0.6e-3, error: 1e-5 }];
+    let shape = Shape::of(&points, Some(&lone));
+    assert_eq!((shape.ahead_read, shape.due_read), (8 * LEAST_READ, 8 * LEAST_READ));
+    let lone = [Lone { read: LEAST_READ, seconds: 0.5e-3, error: 1e-5 }, Lone { read: 8 * LEAST_READ, seconds: 0.6e-3, error: 1e-5 }];
+    assert_eq!(Shape::of(&points, Some(&lone)).due_read, LEAST_READ);
     let urgent = Urgent { parts: vec![589_824, 589_824, 720_896], records: 8 };
-    let chosen = decide(&points, &lone, &urgent);
-    assert_eq!((chosen.read, chosen.window), (LEAST_READ, 4 * mib));
-    // Two points whose times are within their noise: the narrower window.
-    let tied = [point(LEAST_READ, 4 * mib, 9.66), point(LEAST_READ, 8 * mib, 18.0)];
-    let lone = HashMap::from([(LEAST_READ, (0.5e-3, 1e-3))]);
-    assert_eq!(decide(&tied, &lone, &urgent).window, 4 * mib);
-    // Read sizes run to the least holding the widest range.
     assert_eq!(urgent.reads(), vec![LEAST_READ, 2 * LEAST_READ, 4 * LEAST_READ, 8 * LEAST_READ]);
     assert_eq!(Urgent { parts: vec![4096], records: 1 }.reads(), vec![LEAST_READ]);
 }
@@ -759,133 +810,96 @@ fn a_range_past_the_widest_window_probes_only_sizes_a_window_holds() {
     assert!(reads.iter().all(|read| grid.iter().any(|(probed, _)| probed == read)));
 }
 
-/// A demand piece joins the bytes in flight up to the full rate's window,
-/// any other piece only up to the urgent request's: behind two bytes in
-/// flight of a window of 4 (and a demand window of 8), a demand piece of
-/// 4 is taken where a hint's is held back.
+/// Nothing read ahead starts while a due piece is queued, however much
+/// room its own depths leave: behind a due piece in flight at the due depth
+/// (4 of 4), a second due piece waits, and a read ahead of 2 waits behind
+/// it though speculation (8) and overlap (8) hold it; once the first ends,
+/// the second due piece goes first, then the read ahead.
 #[test]
-fn a_demand_piece_joins_up_to_the_full_rate_window_and_others_to_the_urgent_one() {
-    let volume = volume(9, 4, 8, 4);
-    let piece = |start: u64, end: u64| Piece { start, end, parts: Vec::new() };
-    for (priority, taken) in [(Priority::Prefetch, false), (Priority::Load, false), (Priority::Demand, true)] {
-        let mut queue = Queue::default();
-        queue.volumes.insert(volume.id, VolumeFlight { bytes: 2, ..VolumeFlight::new(Instant::now()) });
-        let (mut job, _) = queued(0);
-        job.volume = volume.clone();
-        job.pieces = [piece(0, 4)].into();
-        queue.push(job, priority);
-        assert_eq!(queue.take().is_some(), taken, "{priority:?}");
-    }
+fn a_piece_read_ahead_never_starts_while_a_due_one_is_queued() {
+    let link = volume(9, (4, 8, 8), 4);
+    let mut queue = Queue::default();
+    queue.push(queued_on(&link, &[(0, 4), (4, 8)]), Want::now());
+    queue.push(queued_on(&link, &[(8, 10)]), ahead());
+    let first = queue.take().expect("a due piece");
+    assert!(first.due);
+    assert!(queue.take().is_none(), "a read ahead started while a due piece was queued");
+    queue.ended(first.returned(Instant::now()));
+    let second = queue.take().expect("the second due piece");
+    assert_eq!((second.piece.start, second.due), (4, true));
+    let ahead = queue.take().expect("the read ahead, beside due work within the overlap");
+    assert_eq!((ahead.piece.start, ahead.due), (8, false));
 }
 
-/// A hint a step comes to wait on joins as demand once promoted: held
-/// back at the urgent window behind a demand piece, it is taken at the
-/// full rate's window from its promotion, and a worker is woken for it.
+/// Beside due work a piece read ahead starts only within the overlap
+/// depth of everything in flight, and with none due in flight up to the
+/// speculation depth: behind a due piece of 4 (overlap 6, speculation 8),
+/// one read ahead of 2 starts and a second waits; once the due piece ends,
+/// the rest start up to the speculation depth. Another link is held by
+/// none of it.
 #[test]
-fn a_promoted_job_joins_at_its_new_prioritys_window() {
-    let volume = volume(13, 4, 8, 4);
-    let piece = |start: u64, end: u64| Piece { start, end, parts: Vec::new() };
+fn beside_due_work_a_piece_read_ahead_starts_only_within_the_overlap() {
+    let link = volume(10, (8, 8, 6), 4);
     let mut queue = Queue::default();
-    let (mut held, _) = queued(0);
-    held.volume = volume.clone();
-    held.pieces = [piece(0, 2)].into();
-    queue.push(held, Priority::Demand);
+    queue.push(queued_on(&link, &[(0, 4)]), Want::now());
+    let due = queue.take().unwrap();
+    queue.push(queued_on(&link, &[(4, 6), (6, 8), (8, 10), (10, 12), (12, 14)]), ahead());
+    assert_eq!(queue.take().map(|taken| taken.piece.start), Some(4), "4 + 2 is within the overlap");
+    assert!(queue.take().is_none(), "4 + 2 + 2 passes the overlap");
+    let other = volume(11, (8, 8, 6), 4);
+    queue.push(queued_on(&other, &[(0, 2)]), ahead());
+    assert_eq!(queue.take().map(|taken| (taken.volume.id, taken.piece.start)), Some((Volume(11), 0)), "another link's room is its own");
+    queue.ended(due.returned(Instant::now()));
+    assert_eq!(queue.take().map(|taken| taken.piece.start), Some(6));
+    assert_eq!(queue.take().map(|taken| taken.piece.start), Some(8));
+    assert_eq!(queue.take().map(|taken| taken.piece.start), Some(10), "8 of 8 read ahead");
+    assert!(queue.take().is_none(), "past the speculation depth");
+}
+
+/// Due pieces join the due bytes in flight up to the due depth, whatever
+/// is read ahead: a due piece arriving at a link full of reads ahead starts
+/// at once, which bounds its wait by what was in flight.
+#[test]
+fn a_due_piece_starts_beside_a_full_speculation_depth() {
+    let link = volume(12, (4, 8, 8), 4);
+    let mut queue = Queue::default();
+    queue.push(queued_on(&link, &[(0, 4), (4, 8), (8, 12)]), ahead());
+    assert!(queue.take().is_some() && queue.take().is_some());
+    assert!(queue.take().is_none(), "8 of 8 read ahead");
+    queue.push(queued_on(&link, &[(12, 16), (16, 20)]), Want::now());
+    assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.due)), Some((12, true)));
+    assert!(queue.take().is_none(), "4 of 4 due, and a due piece queued");
+}
+
+/// A read ahead a consumer comes to wait on starts as due once repriced:
+/// held back beside a due piece past the overlap, it starts at the due
+/// depth from its reprice, and a worker is woken for it.
+#[test]
+fn a_repriced_request_starts_at_its_new_depth() {
+    let link = volume(13, (8, 4, 4), 4);
+    let mut queue = Queue::default();
+    queue.push(queued_on(&link, &[(0, 2)]), Want::now());
     assert!(queue.take().is_some());
-    let (mut hint, _) = queued(0);
-    hint.volume = volume;
-    hint.pieces = [piece(2, 6)].into();
-    let (id, woken) = queue.push(hint, Priority::Prefetch);
+    let (id, woken) = queue.push(queued_on(&link, &[(2, 6)]), ahead());
     assert_eq!(woken, 0);
-    assert!(queue.take().is_none(), "past the urgent window");
-    assert_eq!(queue.promote(id, Priority::Demand), 1);
-    assert!(queue.take().is_some(), "within the full rate's");
+    assert!(queue.take().is_none(), "past the overlap");
+    assert_eq!(queue.reprice(id, Want::now()), 1);
+    assert!(queue.take().is_some_and(|taken| taken.due), "within the due depth");
 }
 
-/// A load's import beside a serving reader puts no more ahead of its
-/// decode request than the request's window: a bulk reader of the
-/// volume (window 8) takes a load piece only within the volume's bound
-/// (4, the urgent window chosen on it), so the urgent request's wait,
-/// and its `T`, is what it was alone.
+/// A request wakes a worker for each of its pieces its link may start:
+/// none where its depth is full, one where nothing is in flight even for a
+/// piece past it.
 #[test]
-fn a_load_beside_a_serving_reader_does_not_raise_the_urgent_requests_time() {
-    let bound = Arc::<Bound>::default();
-    let serving = Registered::new(bound.clone(), 4);
-    let bulk = VolumeReads { background: bound.clone(), ..volume(11, 8, 8, 4) };
-    let piece = |start: u64, end: u64| Piece { start, end, parts: Vec::new() };
+fn a_request_wakes_a_worker_for_each_piece_its_link_may_start() {
+    let link = volume(7, (4, 4, 4), 2);
     let mut queue = Queue::default();
-    queue.volumes.insert(bulk.id, VolumeFlight { bytes: 2, ..VolumeFlight::new(Instant::now()) });
-    let (mut job, _) = queued(0);
-    job.volume = bulk.clone();
-    job.pieces = [piece(0, 4)].into();
-    queue.push(job, Priority::Load);
-    assert!(queue.take().is_none(), "a load piece joined past the urgent window");
-    // Its demand pieces still read at its full-rate window.
-    let (mut job, _) = queued(0);
-    job.volume = bulk.clone();
-    job.pieces = [piece(0, 4)].into();
-    queue.push(job, Priority::Demand);
-    assert!(queue.take().is_some());
-    drop(serving);
-    assert_eq!(bulk.window_for(Priority::Load), 8);
-}
-
-/// Through the readers themselves: an urgent reader opened on a volume
-/// bounds a bulk reader's less urgent pieces by its window while it
-/// lives (and its clones do), and once it drops, a bulk piece joins at
-/// its full window again.
-#[test]
-fn an_urgent_reader_dropped_frees_its_volumes_bulk_pieces() {
-    let _volume = temporary_volume();
-    let path = temporary("bound", &vec![3u8; 1 << 20]);
-    let bulk = Reader::open(&path, CachePolicy::Uncached).unwrap();
-    let urgent = Reader::open_urgent(&path, CachePolicy::Uncached, &Urgent { parts: vec![4096], records: 1 }).unwrap();
-    let clone = urgent.clone();
-    assert_eq!(bulk.volume.window_for(Priority::Load), bulk.volume.choice.window.min(urgent.window()));
-    drop(urgent);
-    assert_eq!(bulk.volume.window_for(Priority::Load), bulk.volume.choice.window.min(clone.window()), "a clone holds its window");
-    drop(clone);
-    assert_eq!(bulk.volume.window_for(Priority::Load), bulk.volume.choice.window);
-    std::fs::remove_file(path).unwrap();
-}
-
-/// The bound is the least window of the volume's live urgent readers:
-/// two readers' windows hold it at the narrower; one dropping leaves the
-/// other's; the last dropping frees a bulk piece to its full window.
-#[test]
-fn an_urgent_readers_window_bounds_its_volume_only_while_it_lives() {
-    let bound = Arc::<Bound>::default();
-    let bulk = VolumeReads { background: bound.clone(), ..volume(12, 8, 8, 4) };
-    assert_eq!(bulk.window_for(Priority::Load), 8, "no urgent reader: the full window");
-    let narrow = Registered::new(bound.clone(), 2);
-    let wide = Registered::new(bound.clone(), 4);
-    let again = Registered::new(bound.clone(), 2);
-    assert_eq!(bulk.window_for(Priority::Prefetch), 2);
-    drop(narrow);
-    assert_eq!(bulk.window_for(Priority::Prefetch), 2, "a window held twice stays until both drop");
-    drop(again);
-    assert_eq!(bulk.window_for(Priority::Prefetch), 4);
-    drop(wide);
-    assert_eq!(bulk.window_for(Priority::Load), 8, "a bulk piece joins at its full window again");
-    assert_eq!(bulk.window_for(Priority::Demand), 8);
-}
-
-/// A job wakes a worker for each of its pieces its volume's window has
-/// room for: none where it is full, one where nothing is in flight even
-/// for a piece past the window.
-#[test]
-fn a_job_wakes_a_worker_for_each_piece_its_window_has_room_for() {
-    let volume = volume(7, 4, 4, 2);
-    let piece = |start: u64, end: u64| Piece { start, end, parts: Vec::new() };
-    let mut queue = Queue::default();
-    let (mut job, _) = queued(0);
-    job.volume = volume.clone();
-    job.pieces = [piece(0, 2), piece(2, 4), piece(4, 6)].into();
-    assert_eq!(queue.room(&job, Priority::Demand), 2);
-    job.pieces = [piece(0, 9)].into();
-    assert_eq!(queue.room(&job, Priority::Demand), 1, "a piece past the window is taken alone");
-    queue.volumes.insert(volume.id, VolumeFlight { bytes: 3, ..VolumeFlight::new(Instant::now()) });
-    job.pieces = [piece(0, 2)].into();
-    assert_eq!(queue.room(&job, Priority::Demand), 0, "a full window wakes none");
+    assert_eq!(queue.push(queued_on(&link, &[(0, 2), (2, 4), (4, 6)]), Want::now()).1, 2);
+    let mut other = Queue::default();
+    assert_eq!(other.push(queued_on(&link, &[(0, 9)]), Want::now()).1, 1, "a piece past the depth is taken alone");
+    queue.take().unwrap();
+    queue.take().unwrap();
+    assert_eq!(queue.push(queued_on(&link, &[(6, 8)]), Want::now()).1, 0, "a full depth wakes none");
 }
 
 /// Whether two counts of seconds agree, to rounding.
@@ -893,110 +907,101 @@ fn close(left: f64, right: f64) -> bool {
     (left - right).abs() < 1e-9
 }
 
-/// A volume's book counts, per class, the time a piece of it was in
-/// flight (the union of overlapping pieces' spans), its pieces in flight
-/// integrated over time (their sum), and each piece's bytes at its end; the
-/// device's busy time is the union over every class, none while idle. A look
-/// counts the time running to its instant and consumes nothing: a later look
-/// counts it again, with what followed.
+/// A volume's book counts, for due pieces and pieces read ahead, the time
+/// a piece of the kind was in flight (the union of overlapping pieces'
+/// spans), its pieces in flight integrated over time (their sum), and each
+/// piece's bytes at its end; the device's busy time is the union over both,
+/// none while idle. A look counts the time running to its instant and
+/// consumes nothing: a later look counts it again, with what followed.
 #[test]
-fn a_volumes_book_counts_busy_time_depth_and_bytes_by_class() {
+fn a_volumes_book_counts_busy_time_depth_and_bytes_due_and_ahead() {
     let at = Instant::now();
     let mut book = Book::new(at);
     let ms = |ms: u64| at + Duration::from_millis(ms);
-    book.began(Priority::Demand, ms(0));
-    book.began(Priority::Prefetch, ms(2));
-    book.ended(Priority::Demand, 1_000_000, ms(4));
-    // A look while the prefetch piece is in flight: counted to 5 ms.
+    book.began(true, ms(0));
+    book.began(false, ms(2));
+    book.ended(true, 1_000_000, ms(4));
+    // A look while the piece read ahead is in flight: counted to 5 ms.
     let middle = book.totals_at(ms(5));
     assert!(close(middle.busy, 0.005) && close(middle.depth, 0.007), "{middle:?}");
-    let demand = middle.class(Priority::Demand);
-    assert_eq!((demand.bytes, demand.requests), (1_000_000, 1));
-    assert!(close(demand.busy, 0.004) && close(demand.depth, 0.004), "{demand:?}");
-    let prefetch = middle.class(Priority::Prefetch);
-    assert_eq!((prefetch.bytes, prefetch.requests), (0, 0), "a piece's bytes count at its end");
-    assert!(close(prefetch.busy, 0.003) && close(prefetch.depth, 0.003), "{prefetch:?}");
-    book.ended(Priority::Prefetch, 500_000, ms(8));
+    let due = middle.due;
+    assert_eq!((due.bytes, due.requests), (1_000_000, 1));
+    assert!(close(due.busy, 0.004) && close(due.depth, 0.004), "{due:?}");
+    let ahead = middle.ahead;
+    assert_eq!((ahead.bytes, ahead.requests), (0, 0), "a piece's bytes count at its end");
+    assert!(close(ahead.busy, 0.003) && close(ahead.depth, 0.003), "{ahead:?}");
+    book.ended(false, 500_000, ms(8));
     // Idle 8 to 30 ms: no busy time.
-    book.began(Priority::Load, ms(30));
-    book.ended(Priority::Load, 250_000, ms(34));
+    book.began(false, ms(30));
+    book.ended(false, 250_000, ms(34));
     let later = book.totals_at(ms(40));
     assert!(close(later.busy, 0.012) && close(later.depth, 0.014), "{later:?}");
     assert_eq!((later.bytes(), later.requests()), (1_750_000, 3));
-    assert!(close(later.class(Priority::Prefetch).busy, 0.006) && close(later.class(Priority::Load).busy, 0.004), "{later:?}");
+    assert!(close(later.ahead.busy, 0.010) && close(later.due.busy, 0.004), "{later:?}");
     let span = later.since(&middle);
     assert!(close(span.busy, 0.007) && span.bytes() == 750_000, "{span:?}");
     assert_eq!(book.totals_at(ms(40)), later, "a look takes nothing");
 }
 
-/// A demand job's wait from its submission to its last piece's end is its
-/// device time (a piece of it in flight) and its time waiting, split by what
-/// the device held meanwhile: behind a speculative piece while one was in
-/// flight, behind demand otherwise; counted at its class once its last piece
-/// has ended.
+/// A due request's wait from its submission to its last piece's end is
+/// its device time (a piece of it in flight) and its time waiting, split by
+/// what the device held meanwhile: behind a piece read ahead while one was
+/// in flight, behind due pieces otherwise; counted as due once its last
+/// piece has ended.
 #[test]
-fn a_demand_jobs_wait_splits_by_what_it_waited_behind() {
+fn a_due_requests_wait_splits_by_what_it_waited_behind() {
     let at = Instant::now();
     let mut book = Book::new(at);
     let ms = |ms: u64| at + Duration::from_millis(ms);
-    // A load's piece in flight, then another job's demand piece.
-    book.began(Priority::Load, ms(0));
-    let mut wait = Wait::new(2, Priority::Demand, &mut book, ms(0));
-    book.ended(Priority::Load, 1, ms(3));
-    book.began(Priority::Demand, ms(3));
-    // Its first piece: 3 ms behind the load's, 2 behind the demand piece.
-    book.began(Priority::Demand, ms(5));
-    wait.taken(Priority::Demand, &mut book, ms(5));
-    book.ended(Priority::Demand, 1, ms(7));
-    assert!(!wait.ended(&mut book, ms(7)), "a job with a piece queued has not ended");
-    assert_eq!(book.totals_at(ms(7)).class(Priority::Demand).waits.jobs, 0, "a job with a piece queued has not ended");
-    // Its second piece, behind demand alone.
-    book.began(Priority::Demand, ms(9));
-    wait.taken(Priority::Demand, &mut book, ms(9));
-    book.ended(Priority::Demand, 1, ms(10));
-    book.ended(Priority::Demand, 1, ms(12));
+    // A piece read ahead in flight, then another request's due piece.
+    book.began(false, ms(0));
+    let mut wait = Wait::new(2, true, &mut book, ms(0));
+    book.ended(false, 1, ms(3));
+    book.began(true, ms(3));
+    // Its first piece: 3 ms behind the read ahead, 2 behind the due piece.
+    book.began(true, ms(5));
+    wait.taken(true, &mut book, ms(5));
+    book.ended(true, 1, ms(7));
+    assert!(!wait.ended(&mut book, ms(7)), "a request with a piece queued has not ended");
+    assert_eq!(book.totals_at(ms(7)).due.waits.requests, 0, "a request with a piece queued has not ended");
+    // Its second piece, behind due pieces alone.
+    book.began(true, ms(9));
+    wait.taken(true, &mut book, ms(9));
+    book.ended(true, 1, ms(10));
+    book.ended(true, 1, ms(12));
     assert!(wait.ended(&mut book, ms(12)), "its last piece ended it");
-    let waits = book.totals_at(ms(12)).class(Priority::Demand).waits;
-    assert_eq!(waits.jobs, 1);
-    assert!(close(waits.behind_speculative, 0.003) && close(waits.behind_demand, 0.004) && close(waits.device, 0.005), "{waits:?}");
+    let waits = book.totals_at(ms(12)).due.waits;
+    assert_eq!(waits.requests, 1);
+    assert!(close(waits.behind_ahead, 0.003) && close(waits.behind_due, 0.004) && close(waits.device, 0.005), "{waits:?}");
 }
 
-/// A volume holds at most its window's bytes in flight, or one piece
-/// past it: its most urgent piece that would pass the window holds back
-/// the volume's others, even smaller ones, while another volume's less
-/// urgent pieces are taken; one ending says a held-back piece may be.
+/// A link holds at most its due depth of due bytes in flight, or one piece
+/// past it: its most urgent piece that would pass it holds back the link's
+/// others, even smaller ones, while another link's less urgent pieces are
+/// taken; one ending says the link has a piece that may now be.
 #[test]
-fn a_volume_holds_at_most_its_window_in_flight() {
-    let narrow = volume(1, 3, 3, 2);
-    let piece = |start: u64, end: u64| Piece { start, end, parts: Vec::new() };
+fn a_link_holds_at_most_its_due_depth_in_flight() {
+    let narrow = volume(1, (3, 3, 3), 2);
     let mut queue = Queue::default();
-    let (mut urgent, _) = queued(0);
-    urgent.volume = narrow.clone();
-    urgent.pieces = [piece(0, 2), piece(2, 4)].into();
-    let (mut small, _) = queued(0);
-    small.volume = narrow.clone();
-    small.pieces = [piece(8, 9)].into();
-    let (other, _) = queued(1);
+    let urgent = queued_on(&narrow, &[(0, 2), (2, 4)]);
     let urgent_state = urgent.state.clone();
-    queue.push(urgent, Priority::Demand);
-    queue.push(small, Priority::Prefetch);
-    queue.push(other, Priority::Load);
-    // Each piece taken, with its device and start.
+    queue.push(urgent, Want::now());
+    queue.push(queued_on(&narrow, &[(8, 9)]), Want::now());
+    let (other, _) = queued(1);
+    queue.push(other, Want::undated(0.));
+    // Each piece taken, with its link and start.
     let taken = |queue: &mut Queue| queue.take().map(|taken| ((taken.volume.id, taken.piece.start), taken));
     let (first, urgent_first) = taken(&mut queue).unwrap();
     assert_eq!(first, (Volume(1), 0));
     let (other, other_piece) = taken(&mut queue).unwrap();
-    assert_eq!(other, (Volume(0), 0), "2 + 2 passes the window; 2 + 1 would not, but waits");
+    assert_eq!(other, (Volume(0), 0), "2 + 2 passes the due depth; 2 + 1 would not, but waits");
     assert!(taken(&mut queue).is_none());
     assert!(urgent_state.started.get().is_some(), "its first piece was taken");
     assert!(queue.ended(urgent_first.returned(Instant::now())), "a piece was held back");
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 2)));
-    assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 8)), "2 + 1 is within the window");
+    assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(1), 8)), "2 + 1 is within the due depth");
     assert!(!queue.ended(other_piece.returned(Instant::now())));
-    // A piece wider than the window is read alone.
-    let (mut wide, _) = queued(0);
-    wide.volume = VolumeReads { id: Volume(2), ..narrow };
-    wide.pieces = [piece(0, 5)].into();
-    queue.push(wide, Priority::Demand);
+    // A piece wider than the depth is read alone.
+    queue.push(queued_on(&VolumeReads { id: Volume(2), ..narrow }, &[(0, 5)]), Want::now());
     assert_eq!(taken(&mut queue).map(|taken| taken.0), Some((Volume(2), 0)));
 }

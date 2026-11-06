@@ -40,7 +40,7 @@
 
 use super::site::{WorkerTurn, Site, SiteLayer};
 use super::source::Records;
-use seismic_io::Priority;
+use seismic_io::Want;
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -50,34 +50,45 @@ use std::thread::JoinHandle;
 /// Host work cut into pieces: each piece runs once, on any worker, in any
 /// order and concurrently with the others; then [`Self::end`] runs once,
 /// on the worker that completed the last piece. A worker takes its next
-/// piece from the most urgent job ([`Self::priority`], read as it takes
-/// one), in submission order among the equally urgent: the read engine's
-/// order, so a step's miss converts ahead of a hint's.
+/// piece from the most urgent job ([`Self::want`], read as it takes one,
+/// by `Want`'s order), in submission order among the equally urgent: the
+/// read engine's order, so a step's miss converts ahead of a hint's.
 pub(in crate::experts) trait Job: Send + Sync {
     fn pieces(&self) -> usize;
     fn piece(&self, index: usize);
     fn end(&self);
-    fn priority(&self) -> Priority;
+    fn want(&self) -> Want;
 }
 
-/// A job's urgency, which only rises: shared by its submitter, who may
-/// promote it while it waits (a hint's landing, once a request names its
-/// expert), and the job. More urgent is less, by `Priority`'s own order.
-pub(in crate::experts) struct Urgency(Mutex<Priority>);
+/// A job's want, which only grows more urgent, and whether a step waits
+/// on it: shared by its submitter, who may hasten it while it waits (a
+/// hint's landing, once a request names its expert), and the job.
+pub(in crate::experts) struct Urgency(Mutex<(Want, bool)>);
 
 impl Urgency {
-    pub(in crate::experts) fn new(priority: Priority) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(priority)))
+    /// A step's own: due now, waited on.
+    pub(in crate::experts) fn waited() -> Arc<Self> {
+        Arc::new(Self(Mutex::new((Want::now(), true))))
     }
 
-    pub(in crate::experts) fn get(&self) -> Priority {
-        *self.0.lock().expect("a job's urgency")
+    /// Ahead of any step's wait, wanted as `want`.
+    pub(in crate::experts) fn ahead(want: Want) -> Arc<Self> {
+        Arc::new(Self(Mutex::new((want, false))))
     }
 
-    /// At least `priority` from now.
-    pub(in crate::experts) fn promote(&self, priority: Priority) {
+    pub(in crate::experts) fn get(&self) -> Want {
+        self.0.lock().expect("a job's urgency").0
+    }
+
+    /// Whether a step waits on it.
+    pub(in crate::experts) fn is_waited(&self) -> bool {
+        self.0.lock().expect("a job's urgency").1
+    }
+
+    /// A step waits on it from now: due, if not due before.
+    pub(in crate::experts) fn hasten(&self) {
         let mut urgency = self.0.lock().expect("a job's urgency");
-        *urgency = (*urgency).min(priority);
+        *urgency = (urgency.0.min(Want::now()), true);
     }
 }
 
@@ -641,7 +652,7 @@ fn piece(inner: &Inner) -> bool {
         let queued = jobs.len();
         jobs.retain(|job| job.next.load(Ordering::Acquire) < job.pieces);
         inner.queued.fetch_sub(queued - jobs.len(), Ordering::AcqRel);
-        let Some(urgent) = jobs.iter().min_by_key(|job| job.job.priority()).cloned() else { return false };
+        let Some(urgent) = jobs.iter().min_by_key(|job| job.job.want()).cloned() else { return false };
         let index = urgent.next.fetch_add(1, Ordering::AcqRel);
         (urgent, index)
     };

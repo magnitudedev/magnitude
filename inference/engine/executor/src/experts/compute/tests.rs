@@ -1,5 +1,5 @@
 use super::*;
-use seismic_io::Priority;
+use seismic_io::Want;
 use std::time::{Duration, Instant};
 
 /// Recorded topologies (lscpu, 2026-11-03): each node's cores, core `c`'s
@@ -157,16 +157,16 @@ struct Counted {
 
 impl Counted {
     fn new(pieces: usize) -> Arc<Self> {
-        Self::ordered(pieces, Priority::Demand, Arc::default())
+        Self::ordered(pieces, None, Arc::default())
     }
 
-    fn ordered(pieces: usize, priority: Priority, order: Arc<AtomicUsize>) -> Arc<Self> {
+    fn ordered(pieces: usize, ahead: Option<Want>, order: Arc<AtomicUsize>) -> Arc<Self> {
         Arc::new(Self {
             pieces,
             runs: (0..pieces).map(|_| AtomicUsize::new(0)).collect(),
             ended: AtomicUsize::new(0),
             at_end: AtomicUsize::new(0),
-            urgency: Urgency::new(priority),
+            urgency: ahead.map_or_else(Urgency::waited, Urgency::ahead),
             order,
             ended_at: AtomicUsize::new(usize::MAX),
         })
@@ -186,7 +186,7 @@ impl Job for Counted {
         self.ended_at.store(self.order.fetch_add(1, Ordering::AcqRel), Ordering::Release);
         self.ended.fetch_add(1, Ordering::AcqRel);
     }
-    fn priority(&self) -> Priority {
+    fn want(&self) -> Want {
         self.urgency.get()
     }
 }
@@ -241,8 +241,8 @@ fn a_panicking_piece_is_recorded_and_the_worker_serves_on() {
             panic!("a piece's defect");
         }
         fn end(&self) {}
-        fn priority(&self) -> Priority {
-            Priority::Demand
+        fn want(&self) -> Want {
+            Want::now()
         }
     }
     let compute = HostCompute::start(Vec::new(), &ComputeThreads::placeable(1)).unwrap();
@@ -255,10 +255,10 @@ fn a_panicking_piece_is_recorded_and_the_worker_serves_on() {
     until(|| after.ended.load(Ordering::Acquire) == 1);
 }
 
-/// A worker takes the most urgent job's pieces first, a job promoted while
+/// A worker takes the most urgent job's pieces first, a job hastened while
 /// it waits among them, and the equally urgent in submission order: on one
-/// worker, held busy while the queue fills, the jobs end demand first (the
-/// promoted hint in its submission place among them), then the hints.
+/// worker, held busy while the queue fills, the jobs end due first by
+/// deadline (the hastened hint due from its hastening), then the hints.
 #[test]
 fn the_most_urgent_job_runs_first_in_submission_order() {
     struct Gate(Arc<std::sync::Barrier>);
@@ -270,8 +270,8 @@ fn the_most_urgent_job_runs_first_in_submission_order() {
             self.0.wait();
         }
         fn end(&self) {}
-        fn priority(&self) -> Priority {
-            Priority::Demand
+        fn want(&self) -> Want {
+            Want::now()
         }
     }
     let compute = HostCompute::start(Vec::new(), &ComputeThreads::placeable(1)).unwrap();
@@ -281,16 +281,21 @@ fn the_most_urgent_job_runs_first_in_submission_order() {
     // The worker holds the gate's one piece.
     until(|| handle.inner.jobs.lock().unwrap().iter().all(|job| job.next.load(Ordering::Acquire) == 1));
     let order = Arc::new(AtomicUsize::new(0));
-    let kinds = [Priority::Prefetch, Priority::Demand, Priority::Prefetch, Priority::Prefetch, Priority::Demand];
-    let jobs = kinds.map(|priority| Counted::ordered(2, priority, order.clone()));
+    let ahead = Some(Want::at(std::time::Instant::now() + std::time::Duration::from_secs(3600), 0.));
+    let kinds = [ahead, None, ahead, ahead, None];
+    let jobs = kinds.map(|ahead| Counted::ordered(2, ahead, order.clone()));
     for job in &jobs {
         handle.submit(job.clone());
     }
-    jobs[2].urgency.promote(Priority::Demand);
-    jobs[1].urgency.promote(Priority::Prefetch);
-    assert_eq!(jobs[1].urgency.get(), Priority::Demand, "urgency only rises");
+    let due = jobs[1].urgency.get();
+    jobs[2].urgency.hasten();
+    jobs[1].urgency.hasten();
+    assert_eq!(jobs[1].urgency.get(), due, "a due job is not made later");
+    assert!(jobs[2].urgency.is_waited() && !jobs[3].urgency.is_waited());
     gate.wait();
     until(|| jobs.iter().all(|job| job.ended.load(Ordering::Acquire) == 1));
     let ends = jobs.each_ref().map(|job| job.ended_at.load(Ordering::Acquire));
-    assert_eq!(ends, [3, 0, 1, 4, 2]);
+    // The due jobs by deadline (the hastened one due last), then those not
+    // due in submission order.
+    assert_eq!(ends, [3, 0, 2, 4, 1]);
 }

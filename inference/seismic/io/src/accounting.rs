@@ -3,15 +3,15 @@
 //! ([`Totals::since`]), so readers never take counts from each other.
 //!
 //! Per volume: the seconds it held any piece in flight (its busy time) and
-//! its pieces in flight integrated over time (its depth); per class
-//! ([`Priority`]): the bytes and requests (pieces) that ended, read or
-//! failed, the seconds a piece of the class was in flight and the class's
-//! depth, and each ended job's wait. A job's wait, from its submission to
-//! its last piece's end, is its volume time (any piece of it in flight)
-//! and its time waiting (none in flight, one queued), which is split by
-//! what the volume held meanwhile: behind speculative pieces (a
-//! [`Priority::Prefetch`] or [`Priority::Load`] piece in flight), or behind
-//! demand otherwise (only demand pieces in flight, or a worker not yet
+//! its pieces in flight integrated over time (its depth); for due pieces
+//! and for pieces read ahead (not due when a worker took them, [`Want`]):
+//! the bytes and requests (pieces) that ended, read or failed, the seconds
+//! a piece of the kind was in flight and its depth, and each ended
+//! request's wait. A request's wait, from its submission to its last
+//! piece's end, is its volume time (any piece of it in flight) and its time
+//! waiting (none in flight, one queued), which is split by what the volume
+//! held meanwhile: behind pieces read ahead (one in flight), or behind due
+//! pieces otherwise (only due pieces in flight, or a worker not yet
 //! woken). The busy time's rate is its bytes over its busy time
 //! ([`Totals::rate`]), and the depth over the busy time its mean depth
 //! while busy ([`Totals::depth_while_busy`]). The record is the same on
@@ -20,7 +20,9 @@
 //! or ends, so counting takes no lock of its own; a look ([`totals`])
 //! takes that lock once.
 
-use crate::{Priority, Volume};
+#[cfg(doc)]
+use crate::Want;
+use crate::Volume;
 use std::time::Instant;
 
 /// The counts of `volume` now, the time running counted to now: none
@@ -35,11 +37,11 @@ pub fn totals(volume: Volume) -> Totals {
 pub(crate) struct Book {
     /// Until when the integrals are counted.
     at: Instant,
-    /// Each class's pieces in flight.
-    flight: [usize; 3],
-    /// The seconds a speculative piece was in flight, which a waiting job's
-    /// time behind speculative pieces is the difference of ([`Wait`]).
-    speculative: f64,
+    /// The due pieces in flight, and those read ahead.
+    flight: [usize; 2],
+    /// The seconds a piece read ahead was in flight, which a waiting
+    /// request's time behind them is the difference of ([`Wait`]).
+    ahead: f64,
     /// When a piece last ended, none before one did.
     last_ended: Option<Instant>,
     totals: Totals,
@@ -53,48 +55,55 @@ pub struct Totals {
     pub busy: f64,
     /// The pieces in flight, integrated over time (piece-seconds).
     pub depth: f64,
-    /// By class, in [`Priority::ALL`]'s order.
-    pub classes: [Class; 3],
+    /// Of the pieces due when a worker took them, and of those read ahead.
+    pub due: Class,
+    pub ahead: Class,
 }
 
-/// A class's counts on a volume ([`Totals`]).
+/// The counts of due pieces, or of pieces read ahead, on a volume
+/// ([`Totals`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Class {
     /// The bytes and pieces that ended, read or failed.
     pub bytes: u64,
     pub requests: u64,
-    /// The seconds a piece of the class was in flight, and its pieces in
+    /// The seconds a piece of the kind was in flight, and its pieces in
     /// flight integrated over time.
     pub busy: f64,
     pub depth: f64,
-    /// The waits of its jobs that ended, each counted at its class when its
-    /// last piece was taken.
+    /// The waits of the requests that ended, each counted by whether its
+    /// last piece was due when taken.
     pub waits: Waits,
 }
 
-/// Jobs' waits from submission to their last piece's end, split as the
-/// module documentation says.
+/// Requests' waits from submission to their last piece's end, split as
+/// the module documentation says.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Waits {
-    pub jobs: u64,
-    pub behind_speculative: f64,
-    pub behind_demand: f64,
+    pub requests: u64,
+    pub behind_ahead: f64,
+    pub behind_due: f64,
     pub device: f64,
 }
 
 impl Totals {
-    pub fn class(&self, priority: Priority) -> &Class {
-        &self.classes[priority as usize]
+    /// Both kinds, due first.
+    fn kinds(&self) -> [&Class; 2] {
+        [&self.due, &self.ahead]
     }
 
-    /// Every class's bytes.
+    fn kind_mut(&mut self, due: bool) -> &mut Class {
+        if due { &mut self.due } else { &mut self.ahead }
+    }
+
+    /// Every piece's bytes.
     pub fn bytes(&self) -> u64 {
-        self.classes.iter().map(|class| class.bytes).sum()
+        self.kinds().iter().map(|kind| kind.bytes).sum()
     }
 
-    /// Every class's requests.
+    /// Every piece.
     pub fn requests(&self) -> u64 {
-        self.classes.iter().map(|class| class.requests).sum()
+        self.kinds().iter().map(|kind| kind.requests).sum()
     }
 
     /// The bytes a second while busy, none before it was.
@@ -116,16 +125,17 @@ impl Totals {
             busy: now.busy - then.busy,
             depth: now.depth - then.depth,
             waits: Waits {
-                jobs: now.waits.jobs - then.waits.jobs,
-                behind_speculative: now.waits.behind_speculative - then.waits.behind_speculative,
-                behind_demand: now.waits.behind_demand - then.waits.behind_demand,
+                requests: now.waits.requests - then.waits.requests,
+                behind_ahead: now.waits.behind_ahead - then.waits.behind_ahead,
+                behind_due: now.waits.behind_due - then.waits.behind_due,
                 device: now.waits.device - then.waits.device,
             },
         };
         Self {
             busy: self.busy - earlier.busy,
             depth: self.depth - earlier.depth,
-            classes: std::array::from_fn(|at| class(&self.classes[at], &earlier.classes[at])),
+            due: class(&self.due, &earlier.due),
+            ahead: class(&self.ahead, &earlier.ahead),
         }
     }
 }
@@ -133,7 +143,7 @@ impl Totals {
 impl Book {
     /// A volume's book, counted from `now`.
     pub(crate) fn new(now: Instant) -> Self {
-        Self { at: now, flight: [0; 3], speculative: 0., last_ended: None, totals: Totals::default() }
+        Self { at: now, flight: [0; 2], ahead: 0., last_ended: None, totals: Totals::default() }
     }
 
     /// Its counts at `now`, the time running counted to then.
@@ -142,8 +152,7 @@ impl Book {
         self.totals
     }
 
-    /// The pieces that ended, of every class: no integral, so counted
-    /// without advancing.
+    /// The pieces that ended: no integral, so counted without advancing.
     pub(crate) fn requests(&self) -> u64 {
         self.totals.requests()
     }
@@ -153,36 +162,36 @@ impl Book {
         self.last_ended
     }
 
-    /// A piece of `class` was taken at `now`.
-    pub(crate) fn began(&mut self, class: Priority, now: Instant) {
+    /// A piece, due when taken or not, was taken at `now`.
+    pub(crate) fn began(&mut self, due: bool, now: Instant) {
         self.advance(now);
-        self.flight[class as usize] += 1;
+        self.flight[usize::from(!due)] += 1;
     }
 
-    /// A piece of `class` and `bytes` ended at `now`.
-    pub(crate) fn ended(&mut self, class: Priority, bytes: u64, now: Instant) {
+    /// A piece of `bytes`, due when taken or not, ended at `now`.
+    pub(crate) fn ended(&mut self, due: bool, bytes: u64, now: Instant) {
         self.advance(now);
         // Instants taken on several threads may reach the queue's lock out of
         // order: the latest end stands.
         self.last_ended = self.last_ended.max(Some(now));
-        let flight = &mut self.flight[class as usize];
+        let flight = &mut self.flight[usize::from(!due)];
         *flight = flight.checked_sub(1).expect("an ended piece was in flight");
-        let counted = &mut self.totals.classes[class as usize];
+        let counted = self.totals.kind_mut(due);
         counted.bytes += bytes;
         counted.requests += 1;
     }
 
-    /// The seconds a speculative piece was in flight, to `now`.
-    fn speculative(&mut self, now: Instant) -> f64 {
+    /// The seconds a piece read ahead was in flight, to `now`.
+    fn ahead(&mut self, now: Instant) -> f64 {
         self.advance(now);
-        self.speculative
+        self.ahead
     }
 
-    fn waited(&mut self, class: Priority, waits: Waits) {
-        let counted = &mut self.totals.classes[class as usize].waits;
-        counted.jobs += 1;
-        counted.behind_speculative += waits.behind_speculative;
-        counted.behind_demand += waits.behind_demand;
+    fn waited(&mut self, due: bool, waits: Waits) {
+        let counted = &mut self.totals.kind_mut(due).waits;
+        counted.requests += 1;
+        counted.behind_ahead += waits.behind_ahead;
+        counted.behind_due += waits.behind_due;
         counted.device += waits.device;
     }
 
@@ -198,59 +207,60 @@ impl Book {
         }
         self.totals.busy += seconds;
         self.totals.depth += pieces as f64 * seconds;
-        for (class, &flight) in Priority::ALL.iter().zip(&self.flight) {
+        for (due, flight) in [(true, self.flight[0]), (false, self.flight[1])] {
             if flight > 0 {
-                let counted = &mut self.totals.classes[*class as usize];
+                let counted = self.totals.kind_mut(due);
                 counted.busy += seconds;
                 counted.depth += flight as f64 * seconds;
             }
         }
-        if Priority::ALL.iter().zip(&self.flight).any(|(class, flight)| class.speculative() && *flight > 0) {
-            self.speculative += seconds;
+        if self.flight[1] > 0 {
+            self.ahead += seconds;
         }
     }
 }
 
-/// One job's wait as its pieces are taken and end ([`Waits`]), kept by the
-/// scheduler under its queue's lock beside its volume's book and counted
-/// in it when its last piece has ended.
+/// One request's wait as its pieces are taken and end ([`Waits`]), kept by
+/// the scheduler under its queue's lock beside its volume's book and
+/// counted in it when its last piece has ended.
 #[derive(Debug)]
 pub(crate) struct Wait {
-    /// Since when it waits or is served, and the volume's speculative
-    /// seconds then.
+    /// Since when it waits or is served, and the volume's seconds of pieces
+    /// read ahead then.
     since: Instant,
-    speculative: f64,
+    ahead: f64,
     queued: usize,
     in_flight: usize,
-    class: Priority,
+    /// Whether its last piece taken was due.
+    due: bool,
     waits: Waits,
 }
 
 impl Wait {
-    /// A job of `pieces` pieces at `class` of the volume `book` counts,
-    /// submitted at `now`.
-    pub(crate) fn new(pieces: usize, class: Priority, book: &mut Book, now: Instant) -> Self {
-        Self { since: now, speculative: book.speculative(now), queued: pieces, in_flight: 0, class, waits: Waits::default() }
+    /// A request of `pieces` pieces, due or not, of the volume `book`
+    /// counts, submitted at `now`.
+    pub(crate) fn new(pieces: usize, due: bool, book: &mut Book, now: Instant) -> Self {
+        Self { since: now, ahead: book.ahead(now), queued: pieces, in_flight: 0, due, waits: Waits::default() }
     }
 
     /// The time waiting since it last was served (or submitted), to `now`.
     fn waited(&mut self, book: &mut Book, now: Instant) {
-        let speculative = book.speculative(now);
+        let ahead = book.ahead(now);
         let seconds = now.saturating_duration_since(self.since).as_secs_f64();
-        let behind = (speculative - self.speculative).clamp(0., seconds);
-        self.waits.behind_speculative += behind;
-        self.waits.behind_demand += seconds - behind;
+        let behind = (ahead - self.ahead).clamp(0., seconds);
+        self.waits.behind_ahead += behind;
+        self.waits.behind_due += seconds - behind;
         self.since = now;
     }
 
-    /// One of its pieces was taken at `now`, at `class`.
-    pub(crate) fn taken(&mut self, class: Priority, book: &mut Book, now: Instant) {
+    /// One of its pieces, due or not, was taken at `now`.
+    pub(crate) fn taken(&mut self, due: bool, book: &mut Book, now: Instant) {
         if self.in_flight == 0 {
             self.waited(book, now);
         }
         self.queued -= 1;
         self.in_flight += 1;
-        self.class = class;
+        self.due = due;
     }
 
     /// One of its pieces in flight ended at `now`: whether that ended the
@@ -262,13 +272,13 @@ impl Wait {
         }
         self.waits.device += now.saturating_duration_since(self.since).as_secs_f64();
         self.since = now;
-        self.speculative = book.speculative(now);
+        self.ahead = book.ahead(now);
         self.counted(book)
     }
 
-    /// Its queued pieces were withdrawn at `now`: whether that ended the
-    /// job (none was in flight), its wait now counted in `book`.
-    pub(crate) fn withdrawn(&mut self, book: &mut Book, now: Instant) -> bool {
+    /// Its queued pieces were cancelled at `now`: whether that ended the
+    /// request (none was in flight), its wait now counted in `book`.
+    pub(crate) fn cancelled(&mut self, book: &mut Book, now: Instant) -> bool {
         self.queued = 0;
         if self.in_flight > 0 {
             return false;
@@ -282,7 +292,7 @@ impl Wait {
     fn counted(&self, book: &mut Book) -> bool {
         let ended = self.queued == 0;
         if ended {
-            book.waited(self.class, self.waits);
+            book.waited(self.due, self.waits);
         }
         ended
     }

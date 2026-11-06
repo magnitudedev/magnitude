@@ -437,6 +437,11 @@ impl Recent {
         window
     }
 
+    /// The window's mean decode step, in seconds; none before one is timed.
+    fn mean_step(&self) -> Option<f64> {
+        (!self.steps.is_empty()).then(|| self.seconds / self.steps.len() as f64)
+    }
+
     /// The share of the window's time the volume was busy, at most all of
     /// it (the volume's own busy time, `seismic_io::accounting`).
     /// All of it until a whole window of decode time is measured since the
@@ -489,11 +494,14 @@ impl Ranks {
 }
 
 /// What a hint's read is priced by at one admission ([`Telemetry::price`]):
-/// each rank's precision (every rank a ring may name, [`Ranks::precision`])
-/// and the volume's busy share.
+/// each rank's precision (every rank a ring may name, [`Ranks::precision`]),
+/// the volume's busy share, and a streamed layer's time in the latest
+/// decode steps (their mean over their streamed layers; none before one is
+/// timed).
 pub(super) struct HintPrice {
     precision: Vec<f64>,
     busy: f64,
+    layer: Option<f64>,
 }
 
 impl HintPrice {
@@ -501,6 +509,19 @@ impl HintPrice {
     /// rank is a row's choice's, each of which is priced.
     pub(super) fn pays(&self, rank: usize) -> bool {
         pays(self.precision[rank], self.busy)
+    }
+
+    /// What a hint at rank `rank` of `bytes` is wanted as on its read's link
+    /// (`seismic_io::Want`), its layer `ahead` streamed layers past the
+    /// device's at `now`: from that layer's estimated start, `ahead` layer
+    /// times after `now`, worth the bytes it is expected to spare a due
+    /// read, `p · b`; undated before a decode step is timed.
+    pub(super) fn want(&self, rank: usize, ahead: usize, bytes: u64, now: std::time::Instant) -> seismic_io::Want {
+        let value = self.precision[rank] * bytes as f64;
+        match self.layer {
+            Some(layer) => seismic_io::Want::at(now + std::time::Duration::from_secs_f64(layer * ahead as f64), value),
+            None => seismic_io::Want::undated(value),
+        }
     }
 }
 
@@ -1775,15 +1796,16 @@ impl Telemetry {
     }
 
     /// What a hint at lead `lead` is priced by now ([`HintPrice`]): each of
-    /// the lead's ranks' precision and the volume's busy share over the
-    /// latest decode time ([`Recent::ranks`], [`Recent::busy`]), read
-    /// once for an admission.
+    /// the lead's ranks' precision, the volume's busy share and a streamed
+    /// layer's time over the latest decode time ([`Recent::ranks`],
+    /// [`Recent::busy`], [`Recent::mean_step`]), read once for an admission.
     pub(super) fn price(&self, lead: usize) -> HintPrice {
         let recorded = self.lock();
         let costs = &recorded.costs;
         let window = costs.recent.ranks();
         let ranks = (0..self.routing.selected).map(|rank| window.precision(lead, rank)).collect();
-        HintPrice { precision: ranks, busy: costs.recent.busy() }
+        let layer = costs.recent.mean_step().map(|step| step / self.routing.maps.len() as f64);
+        HintPrice { precision: ranks, busy: costs.recent.busy(), layer }
     }
 
     /// Count a hint read of `bytes`.

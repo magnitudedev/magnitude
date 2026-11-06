@@ -12,7 +12,7 @@
 mod measure;
 
 use measure::{lone, rates, uncached, Model, Rates, Rng, Sinks, ALIGN, SPLITS};
-use seismic_io::{CachePolicy, Priority, Range, Reader};
+use seismic_io::{CachePolicy, Range, Reader, Want};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -121,13 +121,13 @@ fn prompt_experts(model: &Model, rng: &mut Rng, experts: usize) -> Vec<Vec<Vec<(
 }
 
 /// The engine reading a prompt's experts as a prompt's conveyor does: one
-/// demand job per expert, two layers in flight. Bytes a second.
+/// due request per expert, two layers in flight. Bytes a second.
 fn engine_prompt(reader: &Reader, layers: &[Vec<Vec<(u64, usize)>>], record: usize) -> f64 {
     let experts = layers[0].len();
     let sinks = [Sinks::new(experts, record), Sinks::new(experts, record)];
     let bytes: usize = layers.iter().flatten().flatten().map(|&(_, length)| length).sum();
     let began = Instant::now();
-    let mut behind: Vec<seismic_io::Job> = Vec::new();
+    let mut behind: Vec<seismic_io::Handle> = Vec::new();
     for (index, layer) in layers.iter().enumerate() {
         let jobs = layer
             .iter()
@@ -143,7 +143,7 @@ fn engine_prompt(reader: &Reader, layers: &[Vec<Vec<(u64, usize)>>], record: usi
                         range
                     })
                     .collect();
-                unsafe { reader.submit(ranges, Priority::Demand) }.unwrap()
+                unsafe { reader.request(ranges, Want::now()) }.unwrap()
             })
             .collect::<Vec<_>>();
         for job in std::mem::replace(&mut behind, jobs) {
@@ -207,29 +207,24 @@ fn a_prompt_reads_at_the_volumes_rate() {
     let model = acquired();
     let urgent = model.urgent();
     let source = seismic_io::OpenFile::open(&model.path).unwrap();
-    let probed = seismic_io::probe_volume(&source, Some(&urgent)).unwrap();
-    eprintln!(
-        "choice: window {} KiB, demand {} KiB, read {} KiB, demand read {} KiB",
-        probed.window >> 10,
-        probed.demand >> 10,
-        probed.read >> 10,
-        probed.demand_read >> 10
-    );
+    seismic_io::probe_volume(&source, Some(&urgent)).unwrap();
+    let probed = seismic_io::link_shape(&source, Some(&urgent)).unwrap();
+    eprintln!("link: {probed}");
     // Layers store their experts in unequal quantizations: each sink holds the widest.
     let record = model.layers.iter().map(|layer| layer.iter().map(|&(_, per)| per as usize).sum::<usize>()).max().unwrap();
     let experts = (model.experts as usize * 3 / 4).min(190);
     let mut rng = Rng(0x9a0b);
     let gb = |rate: f64| rate / 1e9;
     let reader = Reader::of_urgent(&source, CachePolicy::Uncached, &urgent).unwrap();
-    let pieces = prompt_pieces(&prompt_experts(&model, &mut rng, experts), probed.demand_read);
+    let pieces = prompt_pieces(&prompt_experts(&model, &mut rng, experts), probed.due_read);
     let mean = pieces.iter().map(|&(_, length)| length as f64).sum::<f64>() / pieces.len() as f64;
-    let depth = ((probed.demand as f64 / mean).round() as usize).max(1);
+    let depth = ((probed.due as f64 / mean).round() as usize).max(1);
     reader.evict_cached().unwrap();
     let layers = prompt_experts(&model, &mut rng, experts);
     eprintln!("engine: {:.2} GB/s", gb(engine_prompt(&reader, &layers, record)));
     reader.evict_cached().unwrap();
     let layers = prompt_experts(&model, &mut rng, experts);
-    eprintln!("raw, the same pieces (mean {:.0} KiB) at depth {depth}: {:.2} GB/s", mean / 1024., gb(raw_prompt(&model, &layers, probed.demand_read, depth)));
+    eprintln!("raw, the same pieces (mean {:.0} KiB) at depth {depth}: {:.2} GB/s", mean / 1024., gb(raw_prompt(&model, &layers, probed.due_read, depth)));
 }
 
 #[test]

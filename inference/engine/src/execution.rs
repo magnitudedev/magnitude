@@ -1311,26 +1311,27 @@ fn adopt_volumes(
     for (source, urgent) in volumes(artifact, bank)? {
         let urgent = urgent.as_ref();
         let stored = VolumeCosts::stored(device.topology(), device.info(), source.path(), urgent, &records).map_err(|error| error.to_string())?;
-        let (choice, rule) = match stored {
-            Some(StoredVolume::Current(choice)) => (Some(choice), "current"),
-            Some(StoredVolume::Earlier(choice)) => (Some(choice), "earlier"),
-            None => (None, "unprobed"),
-        };
         let reads = if urgent.is_some() { "decode" } else { "loads" };
-        match choice {
-            Some(choice) => tracing::info!(
-                "volume of {} for {reads}: {rule} rule's choice, window {} KiB, demand {} KiB, read {} KiB, demand read {} KiB",
-                source.path().display(),
-                choice.window >> 10,
-                choice.demand >> 10,
-                choice.read >> 10,
-                choice.demand_read >> 10,
-            ),
+        match &stored {
+            Some(StoredVolume::Current(curve)) => {
+                tracing::info!("volume of {} for {reads}: its curve, {} points", source.path().display(), curve.points.len());
+                seismic_io::adopt_volume(&*source, urgent, curve).map_err(|error| error.to_string())?;
+            }
+            Some(StoredVolume::Earlier(choice)) => {
+                tracing::info!(
+                    "volume of {} for {reads}: earlier rule's choice, window {} KiB, demand {} KiB, read {} KiB, demand read {} KiB",
+                    source.path().display(),
+                    choice.window >> 10,
+                    choice.demand >> 10,
+                    choice.read >> 10,
+                    choice.demand_read >> 10,
+                );
+                seismic_io::adopt_earlier(&*source, urgent, *choice).map_err(|error| error.to_string())?;
+            }
             None => tracing::info!("volume of {} for {reads}: unprobed, read at the probe's bounds", source.path().display()),
         }
-        if let Some(choice) = choice {
-            seismic_io::adopt_volume(&*source, urgent, choice).map_err(|error| error.to_string())?;
-        }
+        let shape = seismic_io::link_shape(&*source, urgent).map_err(|error| error.to_string())?;
+        tracing::info!("volume of {} for {reads}: link {shape}", source.path().display());
         // An earlier rule's choice stands until the job probes the current one.
         if !matches!(stored, Some(StoredVolume::Current(_))) {
             requests.push(volume_request(&source, urgent));

@@ -5,7 +5,7 @@
 //! or woken threads, the engine ([`lone`]). The suite runs them once on a
 //! synthetic file; the timed runs read a real model's file.
 
-use seismic_io::{Buffer, CachePolicy, Destination, Priority, Range, Reader, Urgent, VolumeChoice};
+use seismic_io::{Buffer, CachePolicy, Destination, EarlierChoice, Range, Reader, Urgent, Want};
 use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -138,7 +138,7 @@ fn raw(model: &Model, bytes: u64, depth: usize, seconds: f64) -> f64 {
 }
 
 /// The engine: `steps` decode-like steps, each `records` records of
-/// `record` bytes at random offsets in jobs of `per_job`, all submitted at
+/// `record` bytes at random offsets in requests of `per_job`, all made at
 /// once, then waited for: the mean step's seconds.
 fn engine(reader: &Reader, sinks: &Sinks, record: usize, rng: &mut Rng, records: usize, per_job: usize, steps: usize) -> f64 {
     let mut total = 0.0;
@@ -149,7 +149,7 @@ fn engine(reader: &Reader, sinks: &Sinks, record: usize, rng: &mut Rng, records:
         let began = Instant::now();
         let jobs = ranges
             .chunks(per_job)
-            .map(|chunk| unsafe { reader.submit(chunk.to_vec(), Priority::Demand) }.unwrap())
+            .map(|chunk| unsafe { reader.request(chunk.to_vec(), Want::now()) }.unwrap())
             .collect::<Vec<_>>();
         for job in jobs {
             assert!(matches!(job.wait(), seismic_io::Ended::Read { failed } if failed.is_empty()));
@@ -177,17 +177,11 @@ pub fn rates(model: &Model, rates: &Rates) -> Vec<(String, f64)> {
     let urgent = model.urgent();
     let source = seismic_io::OpenFile::open(&model.path).unwrap();
     let opened = Instant::now();
-    let choice = seismic_io::probe_volume(&source, Some(&urgent)).unwrap();
+    seismic_io::probe_volume(&source, Some(&urgent)).unwrap();
     let probed = opened.elapsed();
     let reader = Reader::open_urgent(&model.path, CachePolicy::Uncached, &urgent).unwrap();
-    let cores = seismic_io::read_cores([&source], &urgent).unwrap();
-    eprintln!(
-        "probe: {:.0} ms, window {} KiB (demand {} KiB), read {} KiB, {cores:.2} cores",
-        probed.as_secs_f64() * 1e3,
-        choice.window >> 10,
-        choice.demand >> 10,
-        choice.read >> 10,
-    );
+    let shape = seismic_io::link_shape(&source, Some(&urgent)).unwrap();
+    eprintln!("probe: {:.0} ms, link {shape}", probed.as_secs_f64() * 1e3);
     let record = model.record();
     let widest = rates.batches.iter().map(|&(records, _)| records).max().unwrap_or(1);
     let sinks = Sinks::new(widest, record);
@@ -386,7 +380,7 @@ pub fn lone(model: &Model, samples: usize, workers: usize) -> Vec<(String, f64)>
                         .map(|(index, (offset, length))| Range { offset, length, into: sinks.destination(), at: sinks.at(index) })
                         .collect();
                     let began = Instant::now();
-                    let ended = unsafe { reader.submit(ranges, Priority::Demand) }.unwrap().wait();
+                    let ended = unsafe { reader.request(ranges, Want::now()) }.unwrap().wait();
                     assert!(matches!(ended, seismic_io::Ended::Read { failed } if failed.is_empty()));
                     began.elapsed().as_secs_f64()
                 })
@@ -394,12 +388,12 @@ pub fn lone(model: &Model, samples: usize, workers: usize) -> Vec<(String, f64)>
         );
         lines.push((format!("lone {kind}, the engine"), time));
     }
-    // The engine's demand read size, each at a probe's windows: the sizes the
-    // threads above were split at, through the engine's own queue and buffers.
+    // The engine's due read size, each at fixed depths: the sizes the threads
+    // above were split at, through the engine's own queue and buffers.
     let source = seismic_io::OpenFile::open(&model.path).unwrap();
     for demand_read in SPLITS.into_iter().flatten() {
-        let choice = VolumeChoice { window: 4 << 20, demand: 8 << 20, read: 128 << 10, demand_read, cores: 1. };
-        seismic_io::adopt_volume(&source, Some(&model.urgent()), choice).unwrap();
+        let choice = EarlierChoice { window: 4 << 20, demand: 8 << 20, read: 128 << 10, demand_read, cores: 1. };
+        seismic_io::adopt_earlier(&source, Some(&model.urgent()), choice).unwrap();
         let sized = Reader::of_urgent(&source, CachePolicy::Uncached, &model.urgent()).unwrap();
         for (kind, request) in &kinds {
             evicted();
@@ -412,7 +406,7 @@ pub fn lone(model: &Model, samples: usize, workers: usize) -> Vec<(String, f64)>
                             .map(|(index, (offset, length))| Range { offset, length, into: sinks.destination(), at: sinks.at(index) })
                             .collect();
                         let began = Instant::now();
-                        let ended = unsafe { sized.submit(ranges, Priority::Demand) }.unwrap().wait();
+                        let ended = unsafe { sized.request(ranges, Want::now()) }.unwrap().wait();
                         assert!(matches!(ended, seismic_io::Ended::Read { failed } if failed.is_empty()));
                         began.elapsed().as_secs_f64()
                     })

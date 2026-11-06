@@ -11,20 +11,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::Instant;
 
-/// A reader's jobs submitted and not yet ended ([`Reader::outstanding`]).
+/// A reader's requests made and not yet ended ([`Reader::outstanding`]).
 #[derive(Clone)]
 pub struct Outstanding(pub(crate) Arc<std::sync::atomic::AtomicUsize>);
 
 impl Outstanding {
-    /// How many of the reader's jobs have not yet ended.
-    pub fn jobs(&self) -> usize {
+    /// How many of the reader's requests have not yet ended.
+    pub fn requests(&self) -> usize {
         self.0.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
 /// A piece a worker of the engine is reading: its file and the volume it
-/// lies on, its bytes there, the bytes its volume's window holds in flight
-/// for its class, and since when.
+/// lies on, its bytes there, the depth its link holds pieces of its kind
+/// to (the due depth for a due piece, the knee for one read ahead), and
+/// since when.
 #[derive(Clone, Debug)]
 pub struct Flight {
     pub path: Arc<Path>,
@@ -63,15 +64,15 @@ pub fn engine_work() -> EngineWork {
         .filter_map(|flight| flight.lock().expect("a read worker's flight").clone())
         .collect();
     let queue = engine.queue();
-    let ended = queue.volumes.values().map(|flight| flight.book.requests()).sum();
-    let last_ended = queue.volumes.iter().filter_map(|(volume, flight)| Some((*volume, flight.book.last_ended()?))).collect();
+    let ended = queue.links.values().map(|link| link.book.requests()).sum();
+    let last_ended = queue.links.iter().filter_map(|(volume, link)| Some((*volume, link.book.last_ended()?))).collect();
     EngineWork { ended, reading, last_ended }
 }
 
 /// The counts of `volume` at `now` ([`crate::accounting::totals`]), none
 /// before a piece of it was taken.
 pub(crate) fn totals(volume: Volume, now: Instant) -> Totals {
-    engine().queue().volumes.get_mut(&volume).map_or_else(Totals::default, |flight| flight.book.totals_at(now))
+    engine().queue().links.get_mut(&volume).map_or_else(Totals::default, |link| link.book.totals_at(now))
 }
 
 /// The piece a worker is reading, if any: held only to set, clear or copy
@@ -163,16 +164,23 @@ impl Engine {
         }
     }
 
-    /// End `returned` in `queue`: room it frees for a held-back piece wakes
-    /// a worker to take it.
+    /// End `returned` in `queue`: room it frees on a link with a request
+    /// queued wakes a worker to take its next piece.
     fn end(&self, queue: &mut Queue, returned: Returned) {
         if queue.ended(returned) {
             self.work.notify_one();
         }
     }
 
+    /// Wake `count` workers.
+    pub(crate) fn wake(&self, count: usize) {
+        for _ in 0..count {
+            self.work.notify_one();
+        }
+    }
+
     /// Start workers until the pool holds `count`: a reader of a volume
-    /// that needs them reads at its full window or is not opened.
+    /// that needs them reads at its link's depths or is not opened.
     pub(crate) fn deepen(&'static self, count: usize) -> Result<(), Error> {
         let mut workers = self.workers.lock().expect("read workers");
         while *workers < count {
@@ -191,14 +199,18 @@ impl Engine {
     }
 }
 
-/// A worker: the most urgent piece it may take, read, until the process
-/// ends.
+/// A worker: the most urgent piece a link may start, read, until the
+/// process ends. One that takes a piece wakes another while a link may
+/// start more, so what a change frees fills one worker after another.
 fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
     loop {
         let taken = {
             let mut queue = engine.queue();
             loop {
                 if let Some(taken) = queue.take() {
+                    if queue.ready() {
+                        engine.work.notify_one();
+                    }
                     break taken;
                 }
                 queue = engine.work.wait(queue).expect("read queue");
@@ -211,10 +223,10 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
             volume: taken.volume.id,
             offset: piece.start,
             bytes: piece.end - piece.start,
-            window: taken.volume.window_for(taken.class),
+            window: if taken.due { taken.volume.shape.due } else { taken.volume.shape.knee },
             since: Instant::now(),
         });
-        // A panic is the job's, whose observer resumes it: the worker serves
+        // A panic is the request's, whose observer resumes it: the worker serves
         // on. A piece serving several parts that fails may have failed in bytes
         // only some of them need, or in a gap between them none needs: each
         // part's own span is read again, and only those that fail fail.
@@ -230,9 +242,9 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
                 })
                 .collect(),
         }));
-        // The piece leaves its volume's flight as its read returns, before
-        // its job's end runs the job's hook (a landing), which reads
-        // nothing: the window and the book count reads alone, at the instant
+        // The piece leaves its link's flight as its read returns, before its
+        // request's end runs the request's hook (a landing), which reads
+        // nothing: the depths and the book count reads alone, at the instant
         // the read returned. Where another holds the queue's lock the piece
         // is left for the lock's next holder to end, and lands without
         // waiting for it. It is counted ended, or left to be, before it stops
@@ -251,7 +263,7 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
 /// The buffers pieces that do not land straight are read into, kept for
 /// the pieces after them, each the least power of two of [`LEAST_READ`]s
 /// that holds its piece and reused only for a piece of that size. Those in
-/// use hold at most a volume's window (or one read) of each size, since no
+/// use hold at most a link's depths (or one read) of each size, since no
 /// more is in flight, so those kept never hold more.
 #[derive(Default)]
 pub(crate) struct Buffers(Mutex<HashMap<usize, Vec<Buffer>>>);
