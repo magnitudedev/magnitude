@@ -518,6 +518,76 @@ struct ImportProgress {
     observer: ImportObserver,
 }
 
+/// The component whose import brought a weight into a residency cache: the
+/// target's, at load, or an optional component's, by its loader
+/// ([`ComponentLoader`]). A weight a later component finds in the cache
+/// stays the importer's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Importer {
+    Target,
+    Head,
+    Vision,
+}
+
+/// A completed import in a residency cache: the weight, its importer, and
+/// its storage's bytes as imported (`ResidentWeight::storage_bytes`), a
+/// streamed table's stagings at the floor's class; those it holds beyond it
+/// for a group's class are the group's.
+struct Imported {
+    weight: ResidentWeight,
+    importer: Importer,
+    bytes: u64,
+}
+
+/// A residency cache's completed imports, each with its importer, so every
+/// importer's bytes are its own imports' and never what is left of another's.
+/// One cache, shared: the store imports into it, and a component it imported
+/// reads its own bytes from it after the store is gone
+/// ([`crate::ResidentTarget`]).
+#[derive(Clone, Default)]
+pub(crate) struct Imports(Rc<RefCell<HashMap<ResidencyKey, Imported>>>);
+
+impl Imports {
+    fn get(&self, key: &ResidencyKey) -> Option<ResidentWeight> {
+        self.0.borrow().get(key).map(|imported| imported.weight.clone())
+    }
+
+    /// Cache `weight`, `importer`'s import: its bytes as imported.
+    fn insert(&self, key: ResidencyKey, weight: ResidentWeight, importer: Importer) -> u64 {
+        let bytes = weight.storage_bytes();
+        self.0.borrow_mut().insert(key, Imported { weight, importer, bytes });
+        bytes
+    }
+
+    /// The bytes of `importer`'s imports, as imported. Tied roles share one
+    /// key and one allocation; a failed component import may leave a
+    /// partial set, which this still counts exactly.
+    pub(crate) fn bytes(&self, importer: Importer) -> Result<u64, &'static str> {
+        self.0
+            .borrow()
+            .values()
+            .filter(|imported| imported.importer == importer)
+            .try_fold(0u64, |bytes, imported| bytes.checked_add(imported.bytes).ok_or("resident cache charge overflows"))
+    }
+
+    /// Drop `importer`'s imports; every other importer's stay resident with
+    /// their storage identity.
+    fn release(&self, importer: Importer) {
+        self.0.borrow_mut().retain(|_, imported| imported.importer != importer);
+    }
+
+    fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// Visit every tensor of the cached imports.
+    fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
+        for imported in self.0.borrow().values() {
+            imported.weight.visit_storage(visit);
+        }
+    }
+}
+
 /// Sole cache and importer for one planned device. Resident components are
 /// assembled from this store before their numerical programs are bound.
 pub struct ResidencyStore {
@@ -525,7 +595,10 @@ pub struct ResidencyStore {
     programs: Rc<crate::native::AttestedPrograms>,
     execution: ExecutionPlan,
     domain: ResourceDomainId,
-    resident: HashMap<ResidencyKey, ResidentWeight>,
+    resident: Imports,
+    /// Whose import the store makes now: the target's until an optional
+    /// component's loader takes it.
+    importer: Importer,
     mapped_import: MappedImportReport,
     import_progress: Option<ImportProgress>,
     /// Where the rows steps name of streamed tables are kept, when they are.
@@ -557,7 +630,8 @@ impl ResidencyStore {
             programs,
             execution,
             domain,
-            resident: HashMap::new(),
+            resident: Imports::default(),
+            importer: Importer::Target,
             mapped_import: MappedImportReport::default(),
             import_progress: None,
             kept_table_rows: None,
@@ -573,9 +647,8 @@ impl ResidencyStore {
         key: ResidencyKey,
         weight: ResidentWeight,
     ) -> Result<(), WeightImportError> {
-        let storage_bytes = weight.storage_bytes();
-        self.resident.insert(key, weight);
-        self.imported(storage_bytes)
+        let bytes = self.resident.insert(key, weight, self.importer);
+        self.imported(bytes)
     }
 
     /// Count `storage_bytes` toward the import in progress.
@@ -603,25 +676,17 @@ impl ResidencyStore {
         self.resident.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.resident.is_empty()
-    }
-
-    /// Charges of completed resident imports held by this cache. Tied roles
-    /// share one key and one allocation; a failed component import may leave
-    /// a partial set, which this observation still counts exactly.
-    pub fn resident_bytes(&self) -> Result<u64, &'static str> {
-        self.resident.values().try_fold(0u64, |bytes, weight| {
-            bytes
-                .checked_add(weight.storage_bytes())
-                .ok_or("resident cache charge overflows")
-        })
+        self.len() == 0
     }
 
     /// Visit every tensor of the completed resident imports.
     pub(crate) fn visit_storage(&self, visit: &mut dyn FnMut(&Tensor)) {
-        for weight in self.resident.values() {
-            weight.visit_storage(visit);
-        }
+        self.resident.visit_storage(visit);
+    }
+
+    /// The cache this store imports into.
+    pub(crate) fn imports(&self) -> Imports {
+        self.resident.clone()
     }
 
     pub fn mapped_import_report(&self) -> MappedImportReport {
@@ -667,7 +732,7 @@ impl ResidencyStore {
             resident: plan.resident,
         };
         if let Some(weight) = self.resident.get(&key) {
-            return Ok(Some(weight.clone()));
+            return Ok(Some(weight));
         }
         let weight = match plan.stored_in_slots() {
             false => {
@@ -895,7 +960,7 @@ impl ResidencyStore {
             resident: planned.resident,
         };
         if let Some(weight) = self.resident.get(&key) {
-            return Ok(weight.clone());
+            return Ok(weight);
         }
         let source = ImportArtifactTensor::from_gguf(artifact, descriptor)?;
         let stored = source.stored();
@@ -1062,7 +1127,7 @@ impl ResidencyStore {
                     "resident tensor has a conflicting logical descriptor",
                 ));
             }
-            return Ok(ImportPreparation::Resident(weight.clone()));
+            return Ok(ImportPreparation::Resident(weight));
         }
         let tensor = if self.device.backend() == seismic::BackendName::Metal {
             // SAFETY: the attested import's only result is this tensor. Both
@@ -1459,16 +1524,31 @@ impl<T: Clone> ComponentLoader<T> {
         self.store.borrow().visit_storage(visit);
     }
 
-    pub fn resident_bytes(&self) -> Result<u64, &'static str> {
-        self.store.borrow().resident_bytes()
+    /// The bytes of the imports the component brought into its cache, as
+    /// imported: none of another component's it found there.
+    pub fn own_bytes(&self) -> Result<u64, &'static str> {
+        let store = self.store.borrow();
+        store.resident.bytes(store.importer)
+    }
+
+    /// Drop the imports the component brought into its cache; another
+    /// component's it found there stay resident with their storage identity.
+    pub fn unload(&self) {
+        if matches!(&*self.cached.borrow(), Some(Ok(_))) {
+            *self.cached.borrow_mut() = None;
+        }
+        let store = self.store.borrow();
+        store.resident.release(store.importer);
     }
 
     fn new(
-        store: ResidencyStore,
+        mut store: ResidencyStore,
         definition: Rc<magnitude_family_contracts::ModelDefinition>,
         package: std::sync::Arc<magnitude_artifacts::Package>,
         import: ComponentImport<T>,
+        importer: Importer,
     ) -> Self {
+        store.importer = importer;
         Self {
             store: RefCell::new(store),
             definition,
@@ -1501,29 +1581,6 @@ impl<T: Clone> ComponentLoader<T> {
 }
 
 impl ComponentLoader<crate::ResidentHead> {
-    /// Drop only imports introduced by the head. Target weights sharing the
-    /// cache stay resident and retain their original storage identity.
-    pub fn unload(&self) {
-        let loaded = matches!(&*self.cached.borrow(), Some(Ok(_)));
-        if loaded {
-            *self.cached.borrow_mut() = None;
-        }
-        let mut store = self.store.borrow_mut();
-        let target = store
-            .execution
-            .load()
-            .target()
-            .iter()
-            .map(|weight| ResidencyKey {
-                artifact: weight.component.identity,
-                name: weight.descriptor.name.clone(),
-                transforms: weight.descriptor.transforms.clone(),
-                resident: weight.resident,
-            })
-            .collect::<HashSet<_>>();
-        store.resident.retain(|key, _| target.contains(key));
-    }
-
     pub fn binding_constant_bytes(&self) -> Result<u64, String> {
         self.store
             .borrow()
@@ -1546,19 +1603,12 @@ impl ComponentLoader<crate::ResidentHead> {
             definition,
             package,
             ResidencyStore::load_head,
+            Importer::Head,
         ))
     }
 }
 
 impl ComponentLoader<crate::ResidentVision> {
-    pub fn unload(&self) {
-        let loaded = matches!(&*self.cached.borrow(), Some(Ok(_)));
-        if loaded {
-            *self.cached.borrow_mut() = None;
-        }
-        self.store.borrow_mut().resident.clear();
-    }
-
     pub fn vision(
         store: ResidencyStore,
         definition: Rc<magnitude_family_contracts::ModelDefinition>,
@@ -1574,6 +1624,7 @@ impl ComponentLoader<crate::ResidentVision> {
             definition,
             package,
             ResidencyStore::load_vision,
+            Importer::Vision,
         ))
     }
 }
@@ -1918,5 +1969,45 @@ mod tests {
             ..target.clone()
         };
         assert_ne!(target, first_rows);
+    }
+
+    /// Each importer's bytes are its own imports', as imported, never what
+    /// is left of another's: a head finding the target's weights in the
+    /// cache it inherits counts none of them, and releasing its imports
+    /// keeps every one of the target's.
+    #[test]
+    fn each_importers_bytes_are_its_own_imports() {
+        let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let weight = |name: &str, elements: u64| {
+            let key = ResidencyKey {
+                artifact: magnitude_artifacts::ArtifactIdentity([0; 32]),
+                name: name.into(),
+                transforms: Vec::new(),
+                resident: Element::f32(),
+            };
+            let weight = ResidentWeight {
+                descriptor: WeightDescriptor { name: name.into(), shape: vec![elements], transforms: Vec::new() },
+                tensor: Tensor::zeros(&device, Element::f32(), &[elements]).unwrap(),
+                scale: None,
+                bound: None,
+                table: ResidentTable::Whole,
+            };
+            (key, weight)
+        };
+        let imports = Imports::default();
+        let mut owned = [0u64; 2];
+        for (name, elements, importer) in [("embedding", 64, Importer::Target), ("output", 32, Importer::Target), ("draft", 16, Importer::Head)] {
+            let (key, weight) = weight(name, elements);
+            let bytes = weight.tensor.charged_bytes();
+            assert_eq!(imports.insert(key, weight, importer), bytes);
+            owned[usize::from(importer == Importer::Head)] += bytes;
+        }
+        assert_eq!(imports.bytes(Importer::Target), Ok(owned[0]));
+        assert_eq!(imports.bytes(Importer::Head), Ok(owned[1]));
+        assert_eq!(imports.bytes(Importer::Vision), Ok(0));
+        imports.release(Importer::Head);
+        assert_eq!(imports.bytes(Importer::Head), Ok(0));
+        assert_eq!(imports.bytes(Importer::Target), Ok(owned[0]));
+        assert!(imports.get(&weight("embedding", 64).0).is_some(), "the target's imports stay resident");
     }
 }

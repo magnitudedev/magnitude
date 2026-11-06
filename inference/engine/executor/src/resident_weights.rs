@@ -165,10 +165,11 @@ pub struct ResidentTarget {
     /// The expert bank of a load that streams its routed experts: it holds
     /// the banked expert stacks, which `sublayers` does not.
     pub(crate) bank: Option<std::sync::Arc<crate::experts::ExpertBank>>,
-    /// The resident imports' bytes, each allocation once
-    /// ([`Self::cached_bytes`]): counted once the imports are made, which
-    /// nothing changes after.
-    imported: u64,
+    /// The residency cache that imported the target: its target imports'
+    /// bytes, as imported, are the target's resident imports' (a streamed
+    /// table's stagings at the floor's class; those it holds beyond it for
+    /// a group's class are the group's, `DeviceTable::hold_places`).
+    imports: crate::residency::Imports,
 }
 
 /// The target's vocabulary projection, as its plan places it.
@@ -243,32 +244,11 @@ impl ResidentTarget {
     }
 
     /// Every allocation the target holds: its expert bank's and its
-    /// resident imports' ([`Self::cached_bytes`]).
+    /// resident imports' ([`Self::imports`]).
     pub(crate) fn storage_bytes(&self) -> Result<u64, &'static str> {
         let bank = self.bank.as_ref().map_or(Ok(0), |bank| bank.storage_bytes())?;
-        bank.checked_add(self.cached_bytes()?).ok_or("resident target charge overflows")
-    }
-
-    /// The target's resident imports, each allocation once: what the
-    /// residency cache holds of it, which a head loader inheriting the
-    /// cache shares (its expert bank is no import of the cache).
-    pub(crate) fn cached_bytes(&self) -> Result<u64, &'static str> {
-        Ok(self.imported)
-    }
-
-    /// [`Self::cached_bytes`] counted from the imports.
-    fn import_bytes(&self) -> Result<u64, &'static str> {
-        let mut seen = Vec::<&seismic::Tensor>::new();
-        let mut total = Some(0u64);
-        self.visit_weights(|weight| {
-            let tensor = weight.tensor();
-            if seen.iter().any(|other| other.shares_allocation(tensor)) {
-                return;
-            }
-            total = total.and_then(|bytes| bytes.checked_add(weight.storage_bytes()));
-            seen.push(tensor);
-        });
-        total.ok_or("resident target charge overflows")
+        let imported = self.imports.bytes(crate::residency::Importer::Target)?;
+        bank.checked_add(imported).ok_or("resident target charge overflows")
     }
 
     /// Visit every allocation the target holds: its weights' and its
@@ -383,7 +363,7 @@ pub(crate) fn import_target(
             })
         })
         .transpose()?;
-    let mut resident = ResidentTarget {
+    Ok(ResidentTarget {
         embedding,
         blocks: decoder.blocks.len(),
         sublayers,
@@ -392,10 +372,8 @@ pub(crate) fn import_target(
         fusion,
         per_layer,
         bank: residency.open_expert_bank(target)?,
-        imported: 0,
-    };
-    resident.imported = resident.import_bytes().map_err(invalid)?;
-    Ok(resident)
+        imports: residency.imports(),
+    })
 }
 
 /// Import `scope`'s projection in the one form the finalized plan stores it

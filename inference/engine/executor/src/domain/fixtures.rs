@@ -439,13 +439,13 @@ fn with_bank((mut domain, bindings): Fixture, backend: seismic::BackendName, row
         .unwrap_or_else(|error| panic!("{backend:?}: the device reserves the bank: {error}"));
     domain.family.bank = Some(FakeBank::new(tensor, resizer));
     domain.refresh_memory().unwrap();
-    let static_bytes = domain.static_holding_bytes().unwrap();
-    domain.static_holding = Some(
+    let bytes = domain.holding_bytes().unwrap();
+    domain.holding = Some(
         domain
             .memory
             .borrow_mut()
             .heap_mut()
-            .insert(static_bytes, HoldingClass::Model)
+            .insert(bytes, HoldingClass::Model)
             .unwrap(),
     );
     domain.refresh_memory().unwrap();

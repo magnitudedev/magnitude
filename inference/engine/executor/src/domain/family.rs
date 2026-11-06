@@ -484,13 +484,6 @@ pub trait ProgramFamily: 'static {
         Ok(0)
     }
 
-    /// Of [`Self::target_weight_bytes`], the target's resident imports: what
-    /// the residency cache a head loader inherits holds of the target (an
-    /// expert bank is none of it).
-    fn target_cached_bytes(&self) -> Result<u64, &'static str> {
-        Ok(0)
-    }
-
     /// Physical allocations classified as model storage, including constants.
     fn visit_model_storage(&self, _visit: &mut dyn FnMut(&seismic::Tensor)) {}
 
@@ -785,10 +778,6 @@ impl ProgramFamily for NativeFamily {
 
     fn target_weight_bytes(&self) -> Result<u64, &'static str> {
         self.resident.storage_bytes()
-    }
-
-    fn target_cached_bytes(&self) -> Result<u64, &'static str> {
-        self.resident.cached_bytes()
     }
 
     fn visit_model_storage(&self, visit: &mut dyn FnMut(&seismic::Tensor)) {

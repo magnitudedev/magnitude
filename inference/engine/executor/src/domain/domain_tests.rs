@@ -756,13 +756,13 @@ fn pending_target_state_is_classified_as_in_flight() {
 #[test]
 fn fresh_memory_observation_reconciles_released_state_backing() {
     let (mut domain, mut bindings) = fixture(None);
-    let static_bytes = domain.static_holding_bytes().unwrap();
-    domain.static_holding = Some(
+    let bytes = domain.holding_bytes().unwrap();
+    domain.holding = Some(
         domain
             .memory
             .borrow_mut()
             .heap_mut()
-            .insert(static_bytes, HoldingClass::Model)
+            .insert(bytes, HoldingClass::Model)
             .unwrap(),
     );
     domain.refresh_memory().unwrap();
@@ -966,26 +966,6 @@ fn finish(domain: &mut ExecutorDomain<TestFamily>) -> crate::BankResized {
         if let Some((finished, _)) = domain.advance_expert_bank(unwatched()).unwrap() {
             return finished;
         }
-    }
-}
-
-/// A head's own weights are what the residency cache it inherits holds
-/// beyond the target's imports: a streamed target's bank, charged to the
-/// target but never an import of the cache, does not count against them
-/// (counted, a head beside a streamed target refused the load).
-#[test]
-fn a_heads_own_weights_leave_out_the_targets_bank() {
-    for backend in bank_backends() {
-        let (domain, _) = banked(backend, 4, 2);
-        let charged = domain.family.target_weight_bytes().unwrap();
-        let imports = domain.family.target_cached_bytes().unwrap();
-        assert!(charged > 0, "the bank is charged to the target");
-        assert_eq!(imports, 0, "the bank is no import of the cache");
-        // A cache of the target's imports and a head of half what the bank
-        // charges, which counting the bank would take for inherited.
-        let head = charged / 2;
-        assert_eq!(super::beyond_inherited(imports + head, imports), Ok(head));
-        assert!(super::beyond_inherited(imports + head, charged + imports).is_err());
     }
 }
 
@@ -1283,7 +1263,7 @@ fn a_paying_growth_stops_at_the_line() {
 /// the owner's thread, once the device work before it completes, and an
 /// observation a claim takes meanwhile reads the lower charge before any
 /// advance reports it. The update still classifies within the charge (the
-/// static holding read after it), so no request fails because the bank
+/// holding read after it), so no request fails because the bank
 /// resized; every byte stays classified.
 #[test]
 fn a_holding_update_beside_a_shrinks_release_classifies_within_the_charge() {
@@ -1292,16 +1272,41 @@ fn a_holding_update_beside_a_shrinks_release_classifies_within_the_charge() {
         let row = bank_row(&domain);
         let optional = seismic::Tensor::zeros(domain.domain.device(), seismic::Element::bool(), &[row]).unwrap();
         domain.family.optional = Some(optional);
-        domain.sync_optional_holding().unwrap();
+        domain.refresh_memory().unwrap();
         assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         // The first advance installs; the release is the bank's own thread's.
         assert!(domain.advance_expert_bank(unwatched()).unwrap().is_none());
         domain.family.bank.as_ref().unwrap().release_now();
         // A claim's observation, which no holding follows.
         domain.memory.borrow_mut().refresh().unwrap();
-        domain.sync_optional_holding().unwrap();
+        domain.refresh_memory().unwrap();
         assert_eq!(domain.memory().standing().unwrap().unattributed_bytes, 0);
         assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { from: 4, to: 3, released, .. } if released == row));
+    }
+}
+
+/// A release on the domain's thread of storage an optional component's
+/// part of the holding counts, and then a classification of the charge it
+/// lowered before anything else reads the optional part: every part of the
+/// holding is read with that charge, so nothing it released stays
+/// classified above it (the optional part held from the observation before
+/// a release once took the holding past the charge it was read against).
+#[test]
+fn a_release_the_optional_part_counts_classifies_within_the_charge_after_it() {
+    for backend in bank_backends() {
+        let (mut domain, _) = banked(backend, 4, 4);
+        let row = bank_row(&domain);
+        let optional = seismic::Tensor::zeros(domain.domain.device(), seismic::Element::bool(), &[row]).unwrap();
+        let charged = optional.charged_bytes();
+        domain.family.optional = Some(optional);
+        domain.refresh_memory().unwrap();
+        let held = domain.memory().standing().unwrap();
+        assert_eq!(held.unattributed_bytes, 0);
+        domain.family.optional = None;
+        domain.refresh_memory().unwrap();
+        let released = domain.memory().standing().unwrap();
+        assert_eq!(released.unattributed_bytes, 0);
+        assert_eq!(held.classified_bytes - released.classified_bytes, charged);
     }
 }
 

@@ -337,7 +337,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if let Some(loader) = &self.vision_loader {
             loader.unload();
         }
-        self.sync_optional_holding()?;
+        self.refresh_memory().map_err(|error| error.to_string())?;
         let after = self
             .domain
             .device()
@@ -377,7 +377,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let vision_weights = self
             .vision_loader
             .as_ref()
-            .map(|loader| loader.resident_bytes())
+            .map(|loader| loader.own_bytes())
             .transpose()?
             .unwrap_or(0);
         let optional_weights = head_weights
@@ -1409,8 +1409,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// optional component not bound yet (the head's, the projector's, each
     /// imported at its first use, [`Self::component_growth`]), so that use
     /// finds the room the plan charged it. A bound component's weights are
-    /// the ledger's optional holding (`sync_optional_holding`, which holds
-    /// only completed imports), so each is charged once, here or there. None
+    /// the ledger's holding (`classify_memory`, which holds only completed
+    /// imports), so each is charged once, here or there. None
     /// in another store (a discrete device's host memory). The memory the
     /// device's graph budget costs is held: its live slots' holds charge it
     /// to the ledger.

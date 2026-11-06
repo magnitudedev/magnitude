@@ -46,15 +46,6 @@ pub mod fixtures;
 #[cfg(test)]
 mod domain_tests;
 
-/// What a residency cache of `cached` bytes holds beyond the `inherited`
-/// bytes of imports it shares with another component: the component's own.
-/// A cache holding less than what it inherits omits one of its allocations.
-fn beyond_inherited(cached: u64, inherited: u64) -> Result<u64, &'static str> {
-    cached
-        .checked_sub(inherited)
-        .ok_or("head residency cache omits a target allocation")
-}
-
 pub use family::{
     BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, Growth, GrowthDecided, GrowthOffer, HostResidency,
     NativeFamily,
@@ -567,8 +558,9 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     domain: ResourceDomain,
     /// The device's heap, carried over from the startup claims.
     memory: RefCell<DeviceHeap>,
-    static_holding: Option<HoldingId>,
-    optional_holding: Option<HoldingId>,
+    /// The one holding of everything the load holds beside its claims
+    /// ([`Self::classify_memory`]).
+    holding: Option<HoldingId>,
     target_store: Rc<StateStore>,
     head_store: Option<Rc<StateStore>>,
     family: F,
@@ -1346,8 +1338,8 @@ impl ExecutorDomain<NativeFamily> {
             .borrow_mut()
             .heap_mut()
             .insert(0, HoldingClass::Model)
-            .map_err(|error| format!("static memory holding rejected: {error:?}"))?;
-        self.static_holding = Some(holding);
+            .map_err(|error| format!("memory holding rejected: {error:?}"))?;
+        self.holding = Some(holding);
         self.refresh_memory().map_err(|error| error.to_string())?;
         Ok(holding)
     }
@@ -1431,11 +1423,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .is_some_and(|head| head.history == magnitude_family_contracts::HeadHistory::Target)
     }
 
-    /// Return every byte that remains resident as part of the model's static
-    /// footprint.  This is the single accounting path used both when the
-    /// holding is first registered and whenever lazy state/program binding
-    /// changes the footprint.
-    fn static_holding_bytes(&self) -> Result<u64, String> {
+    /// Every byte the domain's holding classifies ([`Self::classify_memory`]):
+    /// the static storage's ([`Self::static_bytes`]) and the optional
+    /// components' ([`Self::optional_bytes`]), read together.
+    fn holding_bytes(&self) -> Result<u64, String> {
+        self.static_bytes()?
+            .checked_add(self.optional_bytes()?)
+            .ok_or_else(|| "memory holding byte count overflow".to_owned())
+    }
+
+    /// Every byte that remains resident as part of the model's static
+    /// footprint.
+    fn static_bytes(&self) -> Result<u64, String> {
         let mut bytes = self
             .resources
             .committed_bytes()
@@ -1481,57 +1480,32 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(bytes)
     }
 
-    /// The head's own resident weights: what the residency cache its loader
-    /// inherits from the target holds beyond the target's imports
-    /// (`target_cached_bytes`; the target's expert bank is none of them).
+    /// The head's own resident weights: the imports its loader brought into
+    /// the residency cache it inherits from the target, as imported
+    /// (`ComponentLoader::own_bytes`), none of the target's it found there.
     /// None without a head.
     pub(super) fn head_weight_bytes(&self) -> Result<u64, String> {
         match &self.head_loader {
             None => Ok(0),
-            Some(loader) => Ok(beyond_inherited(loader.resident_bytes()?, self.family.target_cached_bytes()?)?),
+            Some(loader) => Ok(loader.own_bytes()?),
         }
     }
 
-    /// Classify the optional components' storage, against a charge read now
-    /// with every holding whose charge can fall off this thread reconciled
-    /// after it ([`Self::refresh_memory`]): a shrink's release lowers the
-    /// bank's charge whenever its device work completes, and an observation
-    /// any claim took meanwhile would otherwise leave the static holding
-    /// classified above the charge it reads.
-    pub(super) fn sync_optional_holding(&mut self) -> Result<(), String> {
-        self.refresh_memory().map_err(|error| error.to_string())?;
+    /// The optional components' storage: the head's own resident weights,
+    /// the projector's, and their bound graph constants.
+    fn optional_bytes(&self) -> Result<u64, String> {
         let head_weights = self.head_weight_bytes()?;
         let vision_weights = self
             .vision_loader
             .as_ref()
-            .map(|loader| loader.resident_bytes())
+            .map(|loader| loader.own_bytes())
             .transpose()?
             .unwrap_or(0);
         let bound_constants = self.family.optional_constant_bytes()?;
-        let bytes = head_weights
+        head_weights
             .checked_add(vision_weights)
             .and_then(|weights| weights.checked_add(bound_constants))
-            .ok_or_else(|| "optional holding byte count overflow".to_owned())?;
-        let mut memory = self.memory.borrow_mut();
-        let heap = memory.heap_mut();
-        match (self.optional_holding, bytes) {
-            (Some(id), 0) => {
-                heap.remove(id)
-                    .map_err(|error| format!("optional holding release rejected: {error:?}"))?;
-                self.optional_holding = None;
-            }
-            (Some(id), bytes) => heap
-                .resize(id, bytes)
-                .map_err(|error| format!("optional holding update rejected: {error:?}"))?,
-            (None, 0) => {}
-            (None, bytes) => {
-                let id = heap
-                    .insert(bytes, HoldingClass::Dormant)
-                    .map_err(|error| format!("optional holding rejected: {error:?}"))?;
-                self.optional_holding = Some(id);
-            }
-        }
-        Ok(())
+            .ok_or_else(|| "optional component byte count overflow".to_owned())
     }
 
     /// Observe every domain the device uses from a reading taken now, set
@@ -1562,17 +1536,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.classify_memory()
     }
 
-    /// Classify the charge just read by the growth's claim and the static
-    /// holding.
+    /// Classify the charge just read by the growth's claim and the one
+    /// holding of everything else the load holds ([`Self::holding_bytes`]).
     ///
-    /// The static holding is classified only here, against the charge just
-    /// read, its live charges read after the charge while the expert bank
-    /// holds every rise of its charge off this thread
-    /// (`ElasticBank::hold_rises`): what remains off this thread is a
-    /// release (an expert bank shrink's, once the device work before it
-    /// completes; a released slab an outside view retained), which only
-    /// ever lowers its charge, so the holding is never classified above
-    /// the charge it is read against.
+    /// Every byte of the holding is read here, in one pass after the charge,
+    /// so no part of it stands from an earlier reading: after a release on
+    /// this thread (a prompt group's buffers and stagings dropped, an
+    /// optional component unloaded) the holding reads nothing the charge no
+    /// longer holds. Off this thread, the expert bank holds every rise of
+    /// its charge (`ElasticBank::hold_rises`) while the charge and its
+    /// classification are read; what remains off it is a release (an expert
+    /// bank shrink's, once the device work before it completes; idle graph
+    /// slots'; an allocation an outside view retained), which the holding
+    /// stops reading no later than the charge stops holding it. So the
+    /// holding is never classified above the charge it is read against, and
+    /// one that is breaks an invariant.
     fn classify_memory(&self) -> Result<(), DomainError> {
         // In the heap a running growth's bytes are counted once: what it backed is in the
         // charge just read, so its claim holds only the rest, read under the same hold of the
@@ -1584,15 +1562,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .reduce_reserved(claim.id, claim.kind, rest)
                 .map_err(|error| DomainError::invariant(format!("a growth's claim: {error:?}")))?;
         }
-        if let Some(holding) = self.static_holding {
-            let bytes = self.static_holding_bytes().map_err(DomainError::Input)?;
+        if let Some(holding) = self.holding {
+            let bytes = self.holding_bytes().map_err(DomainError::invariant)?;
             self.memory
                 .borrow_mut()
                 .heap_mut()
                 .resize(holding, bytes)
-                .map_err(|error| {
-                    DomainError::Input(format!("static memory holding update rejected: {error:?}"))
-                })?;
+                .map_err(|error| DomainError::invariant(format!("the memory holding exceeds the charge it is read against: {error:?}")))?;
         }
         Ok(())
     }
@@ -2161,7 +2137,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         bound?;
         self.refresh_memory()?;
-        self.sync_optional_holding().map_err(DomainError::Input)?;
         self.can_reserve(&requirements)
             .map_err(DomainError::Capacity)?;
         let reads_target = requirements.lane == ReservationLane::Head && self.head_reads_target();
@@ -2378,8 +2353,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resources,
             domain: ResourceDomain::new(id, memory.device().clone()),
             memory: RefCell::new(memory),
-            static_holding: None,
-            optional_holding: None,
+            holding: None,
             target_store: Rc::clone(&target_state),
             head_store: head_state.as_ref().map(|state| Rc::clone(state)),
             family,
