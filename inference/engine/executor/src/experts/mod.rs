@@ -62,6 +62,7 @@ mod site;
 mod source;
 mod staging;
 mod watcher;
+mod yielding;
 
 pub use bank::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
 pub(crate) use directory::Ranks;

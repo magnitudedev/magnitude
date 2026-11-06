@@ -75,8 +75,9 @@
 
 use super::directory::RoutedRead;
 use super::watcher::Step;
+use super::yielding::Yielding;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, MutexGuard};
 
 /// The half-lives, in steps, the ranking measures its reads by, ascending.
 const HALF_LIVES: [f64; 10] = [0., 1., 2., 4., 8., 16., 32., 64., 128., 256.];
@@ -366,8 +367,12 @@ pub struct Reuse {
 }
 
 /// The one ranking, shared by its feed (`Stack`, which reads it in the
-/// device's order) and everything that ranks by it (the directory).
-pub type Ranking = Arc<Mutex<Reuse>>;
+/// device's order, one hold a read) and everything that ranks by it (the
+/// directory, whose demand claims a parked request waits on): the feed is
+/// its background, so a claim waits at most one read's hold, never the
+/// whole feed (a read of each of a decode step's streamed layers).
+#[derive(Clone)]
+pub struct Ranking(Arc<Yielding<Reuse>>);
 
 /// Each group's records: its member layers' shares.
 fn records(groups: &[usize], slots: &[usize]) -> Vec<usize> {
@@ -398,12 +403,18 @@ impl Reuse {
 
     /// [`Self::new`], shared.
     pub fn ranking(experts: &[usize], groups: &[usize], slots: Vec<usize>) -> Ranking {
-        Arc::new(Mutex::new(Self::new(experts, groups, slots)))
+        Ranking(Arc::new(Yielding::new(Self::new(experts, groups, slots))))
     }
 
-    /// The ranking `ranking` holds now.
+    /// The ranking `ranking` holds now, held ahead of its feed.
     pub fn of(ranking: &Ranking) -> MutexGuard<'_, Self> {
-        ranking.lock().expect("the reuse ranking")
+        ranking.0.hold("the reuse ranking")
+    }
+
+    /// The ranking `ranking` holds now, for its feed's next read: once no
+    /// other holder waits for it ([`Ranking`]).
+    pub fn feeding(ranking: &Ranking) -> MutexGuard<'_, Self> {
+        ranking.0.background("the reuse ranking")
     }
 
     /// The measure the live candidate is of.

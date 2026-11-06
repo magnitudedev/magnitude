@@ -275,7 +275,7 @@ impl Stack {
     /// the experts' ascending order.
     fn rank(&mut self, read: &RoutedRead, routed: Vec<(usize, u32)>) -> Vec<usize> {
         let (experts, choices): (Vec<usize>, Vec<u32>) = routed.into_iter().unzip();
-        Reuse::of(&self.ranking).read(&RoutedRead { experts, ..read.clone() }, &choices)
+        Reuse::feeding(&self.ranking).read(&RoutedRead { experts, ..read.clone() }, &choices)
     }
 
     pub fn curve(&self) -> &MissCurve {
