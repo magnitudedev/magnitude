@@ -918,7 +918,8 @@ fn a_group_claims_its_lent_records_and_returns_them_empty() {
     harness.commit_seeds(&step);
     step.complete().unwrap();
     harness.request(&[3]).complete().unwrap();
-    assert!(harness.in_tier(0, 3).is_some(), "the returned records take a landing");
+    // The returned records take a landing, mapped as residency learns it.
+    harness.tiering(0, &[3]);
 }
 
 /// A bank imported whole into the one store keeps every expert where a

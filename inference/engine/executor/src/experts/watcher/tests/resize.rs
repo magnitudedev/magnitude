@@ -320,7 +320,8 @@ fn a_host_tier_grows_by_its_records_alone() {
     let step = harness.request(&[1]);
     let grown = STAGING as i32 + 1;
     assert_eq!(harness.answer(0, step.sequence(), 0), (grown, Some(Answer::Answered)), "the grown record");
-    assert_eq!(harness.in_tier(0, 1), Some(grown));
+    // Residency maps the landing as it learns it, which may follow the answer.
+    eventually("expert 1 never mapped to the grown record", || harness.in_tier(0, 1) == Some(grown));
     assert!(harness.in_tier(0, 0).is_some(), "expert 0 kept");
     step.complete().unwrap();
 }

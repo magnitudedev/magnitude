@@ -372,10 +372,12 @@ mod tests {
         }
         // Measured before the calibration, whose destroyed graphs' memory
         // the driver would hand these; kept while it measures, so it takes
-        // fresh memory too.
-        let before = device.memory_info().unwrap().free_bytes;
+        // fresh memory too. Read as the calibration reads: the process's own
+        // holdings, which no other process's work moves.
+        let holdings = Holdings::of(&device).unwrap();
+        let before = holdings.read(&device).unwrap();
         let _instantiated = graphs.into_iter().map(|graph| prepared(&device, graph).unwrap()).collect::<Vec<_>>();
-        let taken = before - device.memory_info().unwrap().free_bytes;
+        let taken = holdings.read(&device).unwrap() - before;
         let cost = measure(&device).unwrap();
         let GraphCost::Pooled { granule, .. } = cost else {
             panic!("CUDA prices graphs pooled: {cost:?}");
