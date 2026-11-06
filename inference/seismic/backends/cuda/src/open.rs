@@ -28,7 +28,9 @@ pub fn open(ordinal: u32, accounts: MemoryAccounts) -> Result<OpenedCuda, Execut
 /// use, whatever other programs hold. Elsewhere (Linux) it is the whole
 /// device's free memory, which other programs' allocations lower, so the
 /// figure is NVML's total less its reserve less what this process's context
-/// took, the fall in NVML's device-wide free memory across opening it.
+/// holds, as NVML counts the process once its context, its first, exists:
+/// never a fall in the device's free memory, which other programs move
+/// while the context opens.
 pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, ExecutionError> {
     #[cfg(target_os = "windows")]
     {
@@ -45,17 +47,14 @@ pub fn usable_memory_bytes(ordinal: u32, uuid: [u8; 16]) -> Result<u64, Executio
             .primary_context_active(ordinal as std::ffi::c_int)
             .map_err(|error| ExecutionError::SubmissionFailed(error.to_string()))?;
         let nvml = fresh.then(|| crate::nvml::NvmlDevice::open(uuid)).flatten();
-        let before = nvml.as_ref().and_then(|nvml| nvml.sample());
         let context = context(ordinal)?;
         let free = crate::executor::memory_info(&context)?.free_bytes;
-        let after = nvml.as_ref().and_then(|nvml| nvml.sample());
-        drop(context);
-        let accounting = before.zip(after).map(|(before, after)| DeviceAccounting {
-            total: after.total,
-            reserved: after.reserved,
-            free_before_context: before.free,
-            free_after_context: after.free,
+        let accounting = nvml.as_ref().and_then(|nvml| {
+            let sample = nvml.sample()?;
+            let context = nvml.process_bytes(std::process::id()).ok()?;
+            Some(DeviceAccounting { total: sample.total, reserved: sample.reserved, context })
         });
+        drop(context);
         Ok(usable_capacity(free, accounting))
     }
 }
@@ -76,8 +75,8 @@ fn context(ordinal: u32) -> Result<std::sync::Arc<crate::driver::Context>, Execu
 struct DeviceAccounting {
     total: u64,
     reserved: u64,
-    free_before_context: u64,
-    free_after_context: u64,
+    /// What this process's context holds, as NVML counts the process.
+    context: u64,
 }
 
 /// Usable capacity from the free memory the opened context reports and,
@@ -92,13 +91,10 @@ fn usable_capacity(free_with_context: u64, accounting: Option<DeviceAccounting>)
     let Some(accounting) = accounting else {
         return free_with_context;
     };
-    let context = accounting
-        .free_before_context
-        .saturating_sub(accounting.free_after_context);
     accounting
         .total
         .saturating_sub(accounting.reserved)
-        .saturating_sub(context)
+        .saturating_sub(accounting.context)
         .max(free_with_context)
 }
 
@@ -120,33 +116,27 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    fn a10g(others: u64) -> DeviceAccounting {
-        let (total, reserved, context) = (23_028 * MIB, 439 * MIB, 262 * MIB);
-        let free = total - reserved - others;
-        DeviceAccounting {
-            total,
-            reserved,
-            free_before_context: free,
-            free_after_context: free - context,
-        }
+    fn a10g() -> DeviceAccounting {
+        DeviceAccounting { total: 23_028 * MIB, reserved: 439 * MIB, context: 262 * MIB }
+    }
+
+    /// What the device's free memory reads with the context open, while
+    /// other programs hold `others`.
+    fn free(others: u64) -> u64 {
+        (23_028 - 439 - 262) * MIB - others
     }
 
     #[test]
     fn capacity_is_total_less_reserve_less_context() {
-        let accounting = a10g(0);
-        assert_eq!(
-            usable_capacity(accounting.free_after_context, Some(accounting)),
-            (23_028 - 439 - 262) * MIB
-        );
+        assert_eq!(usable_capacity(free(0), Some(a10g())), (23_028 - 439 - 262) * MIB);
     }
 
+    /// Other programs' memory, held before the context opens or taken and
+    /// freed while it does, changes neither the context's count nor the
+    /// capacity: the count is the process's own.
     #[test]
     fn other_programs_do_not_change_capacity() {
-        let held = a10g(5 << 30);
-        assert_eq!(
-            usable_capacity(held.free_after_context, Some(held)),
-            usable_capacity(a10g(0).free_after_context, Some(a10g(0)))
-        );
+        assert_eq!(usable_capacity(free(5 << 30), Some(a10g())), usable_capacity(free(0), Some(a10g())));
     }
 
     #[test]
@@ -154,18 +144,10 @@ mod tests {
         assert_eq!(usable_capacity(17_000 * MIB, None), 17_000 * MIB);
     }
 
+    /// A misreported count never leaves less than the process can take now.
     #[test]
     fn capacity_is_never_below_free_memory() {
-        let mut racing = a10g(0);
-        racing.free_after_context -= 4 << 30;
-        let free = racing.free_after_context + (4 << 30);
-        assert_eq!(usable_capacity(free, Some(racing)), free);
-    }
-
-    #[test]
-    fn memory_freed_while_opening_does_not_underflow() {
-        let mut racing = a10g(0);
-        racing.free_after_context = racing.free_before_context + MIB;
-        assert_eq!(usable_capacity(0, Some(racing)), (23_028 - 439) * MIB);
+        let overcounted = DeviceAccounting { context: 4 << 30, ..a10g() };
+        assert_eq!(usable_capacity(free(0), Some(overcounted)), free(0));
     }
 }

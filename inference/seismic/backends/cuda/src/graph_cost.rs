@@ -32,7 +32,7 @@
 use crate::driver::{self, Edge, KernelNodeParams};
 use crate::executor::Device;
 use seismic_compiler::errors::ExecutionError;
-use seismic_compiler::graph_cost::GraphCost;
+use seismic_compiler::graph_cost::{GraphCensus, GraphCost};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
@@ -82,6 +82,74 @@ pub(crate) fn census_bytes(device: &Device, census: seismic_compiler::graph_cost
     let costs = COSTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let cost = costs.get(&device.ordinal()).copied().unwrap_or(UNMEASURED);
     cost.bytes(census).map_or(u64::MAX, |bytes| bytes.device)
+}
+
+/// The driver memory a device's instantiated graphs hold: the graphs and
+/// launches of every live graph priced at the device's cost
+/// ([`census_bytes`]), rounded to the granule once over them all, as the
+/// driver takes it. Never read from the device's memory, which other work
+/// moves. Each graph instantiated or dropped moves it by the change in that
+/// price, which the device account holds as one charge.
+pub(crate) struct GraphPool {
+    account: std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount>,
+    context: std::sync::Arc<driver::Context>,
+    state: Mutex<Pooled>,
+    held: std::sync::atomic::AtomicU64,
+}
+
+/// The live graphs' census and the charge that holds their price.
+struct Pooled {
+    census: GraphCensus,
+    charge: Option<Box<dyn seismic_compiler::executable::MemoryHold>>,
+}
+
+impl GraphPool {
+    pub(crate) fn new(
+        account: std::sync::Arc<dyn seismic_compiler::executable::MemoryAccount>,
+        context: std::sync::Arc<driver::Context>,
+    ) -> Self {
+        Self { account, context, state: Mutex::new(Pooled { census: GraphCensus::default(), charge: None }), held: 0.into() }
+    }
+
+    /// What the live graphs hold now.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.held.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A graph of `census` instantiated on `device`.
+    pub(crate) fn instantiated(&self, device: &Device, census: GraphCensus) -> Result<(), ExecutionError> {
+        self.moved(device, |live| live.plus(census))
+    }
+
+    /// A graph of `census` dropped on `device`.
+    pub(crate) fn dropped(&self, device: &Device, census: GraphCensus) {
+        self.moved(device, |live| {
+            let left = |live: u64, dropped: u64| live.checked_sub(dropped).expect("a dropped graph was counted live");
+            Some(GraphCensus { graphs: left(live.graphs, census.graphs), launches: left(live.launches, census.launches), ..live })
+        })
+        .expect("fewer live graphs price within what more did");
+    }
+
+    fn moved(&self, device: &Device, change: impl FnOnce(GraphCensus) -> Option<GraphCensus>) -> Result<(), ExecutionError> {
+        let mut pooled = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let census = change(pooled.census).ok_or_else(|| failure("the live graphs' census overflows"))?;
+        let price = census_bytes(device, census);
+        if price == u64::MAX {
+            return Err(failure("the live graphs' census prices past the address range"));
+        }
+        let was = self.held.swap(price, std::sync::atomic::Ordering::Relaxed);
+        pooled.census = census;
+        // The new charge before the old one ends, so the account never shows
+        // less than either.
+        let charge = self.account.record(price);
+        drop(pooled.charge.replace(charge));
+        if price > was {
+            self.context.driver_allocated(price - was);
+        } else {
+            self.context.driver_freed(was - price);
+        }
+        Ok(())
+    }
 }
 
 fn failure(error: impl std::fmt::Debug) -> ExecutionError {
@@ -218,7 +286,6 @@ fn terms(single: f64, chained: f64) -> Result<(u64, u64), ExecutionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_compiler::graph_cost::GraphCensus;
 
     /// The terms of a graph and a node are what the slopes imply, and slopes
     /// that imply a negative term are refused.

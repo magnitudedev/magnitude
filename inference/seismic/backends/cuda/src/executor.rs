@@ -19,7 +19,6 @@ use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use seismic_reservation::{time_backing, Backing, BackingPhase, Reserved, Resizer};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// A native stream of the device: the one its native work runs on.
@@ -50,7 +49,7 @@ pub struct Device {
     /// The fill stream ([`NativeStream::Fill`]).
     fill: Arc<Stream>,
     blocks: Arc<Blocks>,
-    graph_bytes: Arc<AtomicU64>,
+    graphs: Arc<crate::graph_cost::GraphPool>,
     /// The word a graph's word nodes name as it is recorded, before a
     /// replay binds its run's own ([`Self::placeholder_word`]).
     placeholder: Arc<crate::direct::HostWord>,
@@ -98,13 +97,14 @@ impl Device {
             );
         }
         let placeholder = Arc::new(crate::direct::HostWord::on(&context, &accounts.upload)?);
+        let graphs = Arc::new(crate::graph_cost::GraphPool::new(accounts.device.clone(), context.clone()));
         Ok(Self {
             context,
             accounts,
             stream,
             fill,
             blocks,
-            graph_bytes: Arc::new(AtomicU64::new(0)),
+            graphs,
             placeholder,
         })
     }
@@ -149,7 +149,7 @@ impl Device {
     /// and the instantiated graphs' driver memory. Held by this process,
     /// charged to no allocation.
     pub fn held_beyond_ranges(&self) -> u64 {
-        self.blocks.unallocated_bytes() + self.graph_bytes.load(Ordering::Relaxed)
+        self.blocks.unallocated_bytes() + self.graphs.bytes()
     }
 
     /// The word every graph's word nodes name as it is recorded, held from
@@ -159,9 +159,10 @@ impl Device {
         &self.placeholder
     }
 
-    /// The device's count of instantiated graphs' driver memory.
-    pub(crate) fn graph_bytes(&self) -> &Arc<AtomicU64> {
-        &self.graph_bytes
+    /// What the device's instantiated graphs hold
+    /// ([`crate::graph_cost::GraphPool`]).
+    pub(crate) fn graphs(&self) -> &Arc<crate::graph_cost::GraphPool> {
+        &self.graphs
     }
 
     pub(crate) fn context(&self) -> &Arc<Context> {

@@ -472,11 +472,10 @@ impl DirectGraphBuilder {
 
     /// Instantiate the graph and upload it to the device
     /// (`GraphExec::upload`), so its first launch does no setup. The driver
-    /// memory both take, which no allocation charges, is measured as the
-    /// change in the device's free memory across them and counted as memory
-    /// the device holds until the graph is dropped. The driver has taken it
-    /// once the graph exists, so it is recorded to the device account, never
-    /// refused.
+    /// memory both take, which no allocation charges, is its census priced
+    /// with every live graph's ([`crate::graph_cost::GraphPool`]), held until
+    /// the graph is dropped. The driver has taken it once the graph exists,
+    /// so it is recorded to the device account, never refused.
     pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
         let census = GraphCensus::graph(self.launches).ok_or_else(|| {
             ExecutionError::SubmissionFailed("a graph's census overflows".into())
@@ -488,21 +487,15 @@ impl DirectGraphBuilder {
             crate::executor::OUT_OF_MEMORY => ExecutionError::AllocationCapacity { required: required.into(), available: 0 },
             _ => submission(error),
         };
-        let before = self.device.memory_info()?.free_bytes;
         let exec = self.graph.instantiate().map_err(refused)?;
         for (node, _) in self.enabled.iter().enumerate().filter(|(_, enabled)| !**enabled) {
             exec.set_enabled(self.graph.node(node), false).map_err(submission)?;
         }
         exec.upload(self.device.stream()).map_err(refused)?;
-        let device_bytes = before.saturating_sub(self.device.memory_info()?.free_bytes);
-        let context = self.device.context().clone();
-        let launched = Event::new(&context).map_err(submission)?;
-        let charge = self.device.accounts().device.record(device_bytes);
-        let held = self.device.graph_bytes().clone();
-        held.fetch_add(device_bytes, std::sync::atomic::Ordering::Relaxed);
-        context.driver_allocated(device_bytes);
+        let launched = Event::new(self.device.context()).map_err(submission)?;
+        self.device.graphs().instantiated(&self.device, census)?;
         Ok(DirectGraph {
-            _charge: charge,
+            device: self.device.clone(),
             exec,
             launched,
             sampled: Vec::new(),
@@ -511,10 +504,7 @@ impl DirectGraphBuilder {
             formed: self.formed,
             enabled: self.enabled,
             words: self.words,
-            device_bytes,
             census,
-            held,
-            context,
         })
     }
 }
@@ -542,13 +532,10 @@ pub struct DirectGraph {
     enabled: Vec<bool>,
     /// Each word-operation node as the executable binds it now.
     words: Vec<WordNode>,
-    device_bytes: u64,
     /// What the graph is made of, as its driver memory follows it.
     census: GraphCensus,
-    held: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    _charge: Box<dyn seismic_compiler::executable::MemoryHold>,
-    /// The context whose driver memory the instantiation added to.
-    context: std::sync::Arc<driver::Context>,
+    /// The device whose graph pool holds its driver memory.
+    device: Device,
 }
 
 impl DirectGraph {
@@ -663,9 +650,7 @@ impl DirectGraph {
 
 impl Drop for DirectGraph {
     fn drop(&mut self) {
-        self.held
-            .fetch_sub(self.device_bytes, std::sync::atomic::Ordering::Relaxed);
-        self.context.driver_freed(self.device_bytes);
+        self.device.graphs().dropped(&self.device, self.census);
     }
 }
 
