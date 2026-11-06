@@ -175,11 +175,13 @@ impl Decode {
     /// rest a tier record is now past its grace for, in the order they
     /// waited: each read now and answered as it lands (or revived from
     /// staging); one of a step that ended (retired, or failed) is dropped,
-    /// as its launches returned. True when any was answered, landed or
-    /// dropped.
+    /// as its launches returned. The landings that ended are learned first
+    /// (`Prefetch::settle`), so a miss waits for its read ahead's landing
+    /// alone, never for residency's next turn to learn it. True when any
+    /// landing was learned, or any miss answered, landed or dropped.
     pub(super) fn resume(&mut self, serving: Serving<'_>) -> bool {
         let Serving { core, prefetch, shared } = serving;
-        let mut progressed = false;
+        let mut progressed = !self.waiting.is_empty() && prefetch.settle(&mut core.directory);
         let mut waiting = std::mem::take(&mut self.waiting);
         waiting.retain(|waits| {
             let (layer, sequence) = (waits.at.point.layer, waits.at.point.sequence);
