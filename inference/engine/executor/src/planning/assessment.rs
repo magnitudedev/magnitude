@@ -107,7 +107,10 @@ impl DeviceProcessCosts {
     /// already excludes it: measured on the device at discovery, and under
     /// WDDM the free figure read after the context exists, which also
     /// excludes WDDM's own share. It is not charged again. Kernel modules
-    /// showed no device cost. Vulkan: the device's creation (67–74 MB)
+    /// showed no device cost. Their stack is the driver's per-thread stack
+    /// reservation, which every context makes when it is retained
+    /// (`seismic_cuda`'s reserved stack), so the capacity excludes it too.
+    /// Vulkan: the device's creation (67–74 MB)
     /// takes from the heap or budget that is the capacity, and the driver
     /// objects beyond the charge grow with the kernels (at most 7.5 MB each
     /// on Windows, 3.5 MB on Linux).

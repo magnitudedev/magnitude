@@ -87,6 +87,8 @@ driver! {
     primary_context_state: unsafe extern "system" fn(c_int, *mut c_uint, *mut c_int) -> ResultCode => "cuDevicePrimaryCtxGetState",
     context_get: unsafe extern "system" fn(*mut Handle) -> ResultCode => "cuCtxGetCurrent",
     context_set: unsafe extern "system" fn(Handle) -> ResultCode => "cuCtxSetCurrent",
+    context_get_limit: unsafe extern "system" fn(*mut usize, c_int) -> ResultCode => "cuCtxGetLimit",
+    context_set_limit: unsafe extern "system" fn(c_int, usize) -> ResultCode => "cuCtxSetLimit",
     stream_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuStreamCreate",
     stream_destroy: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamDestroy_v2",
     stream_synchronize: unsafe extern "system" fn(Handle) -> ResultCode => "cuStreamSynchronize",
@@ -300,7 +302,70 @@ impl Context {
             }
         }
         context.transfer = transfer;
+        context.raise_stack(RESERVED_STACK_BYTES)?;
         Ok(Arc::new(context))
+    }
+
+    /// Raises the per-thread stack the driver reserves for this device in
+    /// this process to at least `bytes`, returning the device memory the
+    /// raise took. The driver reserves stack for every thread the device
+    /// can hold at once and grows it, never shrinks it, at the first launch
+    /// of a function that needs more; raising it here makes that growth
+    /// happen at a known moment instead.
+    fn raise_stack(&self, bytes: usize) -> Result<u64, DriverError> {
+        let _serial = STACK_RESERVATION
+            .lock()
+            .expect("the stack reservation lock is never poisoned");
+        let _current = self.enter()?;
+        let driver = &self.driver;
+        let mut limit = 0usize;
+        unsafe {
+            driver.check(
+                (driver.context_get_limit)(&mut limit, CU_LIMIT_STACK_SIZE),
+                "stack limit query",
+            )?;
+        }
+        if limit >= bytes {
+            return Ok(0);
+        }
+        let free = || {
+            let (mut free, mut total) = (0usize, 0usize);
+            unsafe {
+                driver
+                    .check((driver.memory_info)(&mut free, &mut total), "memory info")
+                    .map(|()| free as u64)
+            }
+        };
+        let before = free()?;
+        unsafe {
+            driver.check(
+                (driver.context_set_limit)(CU_LIMIT_STACK_SIZE, bytes),
+                "stack limit raise",
+            )?;
+        }
+        Ok(before.saturating_sub(free()?))
+    }
+
+    /// Reserves the stack `function` needs before it first runs. What a
+    /// reservation beyond `RESERVED_STACK_BYTES` takes is device memory no
+    /// allocation charges: it is recorded to the device account and held
+    /// for the life of the process, as the driver keeps it.
+    pub(crate) fn reserve_function_stack(&self, function: Handle) -> Result<(), DriverError> {
+        let mut local = 0;
+        {
+            let _current = self.enter()?;
+            unsafe {
+                self.driver.check(
+                    (self.driver.function_attribute)(&mut local, LOCAL_SIZE_BYTES, function),
+                    "native function attribute",
+                )?;
+            }
+        }
+        let taken = self.raise_stack(usize::try_from(local).unwrap_or(0))?;
+        if taken > 0 {
+            stack_growth(self.ordinal).record(taken, self.device_account.get());
+        }
+        Ok(())
     }
 
     pub fn ordinal(&self) -> c_int {
@@ -339,6 +404,62 @@ impl Drop for Context {
             (self.driver.primary_context_release)(self.ordinal);
         }
     }
+}
+
+/// `CU_LIMIT_STACK_SIZE`.
+const CU_LIMIT_STACK_SIZE: c_int = 0;
+/// `CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES`: a function's per-thread local
+/// memory, its stack frame included.
+const LOCAL_SIZE_BYTES: c_int = 3;
+
+/// The per-thread stack every context of the process reserves when it is
+/// retained, before anything measures the device: the usable capacity then
+/// already excludes it, and the engine's kernels, whose frames reach 1,528
+/// bytes on Ada and Ampere, never grow it.
+pub(crate) const RESERVED_STACK_BYTES: usize = 2048;
+
+static STACK_RESERVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Device memory the process's stack reservation took beyond
+/// `RESERVED_STACK_BYTES`, per device ordinal, with the charges recorded for
+/// it.
+#[derive(Default)]
+pub(crate) struct StackGrowth {
+    bytes: std::sync::atomic::AtomicU64,
+    charges: std::sync::Mutex<Vec<Box<dyn seismic_compiler::executable::MemoryHold>>>,
+}
+
+impl StackGrowth {
+    fn record(
+        &self,
+        bytes: u64,
+        account: Option<&Arc<dyn seismic_compiler::executable::MemoryAccount>>,
+    ) {
+        self.bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        if let Some(account) = account {
+            self.charges
+                .lock()
+                .expect("the stack charge lock is never poisoned")
+                .push(account.record(bytes));
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn stack_growth(ordinal: c_int) -> Arc<StackGrowth> {
+    static GROWTH: OnceLock<std::sync::Mutex<std::collections::HashMap<c_int, Arc<StackGrowth>>>> =
+        OnceLock::new();
+    GROWTH
+        .get_or_init(Default::default)
+        .lock()
+        .expect("the stack growth registry lock is never poisoned")
+        .entry(ordinal)
+        .or_default()
+        .clone()
 }
 
 /// `CU_STREAM_NON_BLOCKING`: a stream that never synchronizes with the
@@ -1500,6 +1621,9 @@ pub(crate) fn load_module(
             )
             .map_err(JitError::Driver)?;
     }
+    context
+        .reserve_function_stack(function)
+        .map_err(JitError::Driver)?;
     Ok((module, function))
 }
 
@@ -1518,6 +1642,10 @@ pub(crate) fn module_function(module: &Module, entry: &str) -> Result<Handle, Ji
             )
             .map_err(JitError::Driver)?;
     }
+    module
+        .context
+        .reserve_function_stack(function)
+        .map_err(JitError::Driver)?;
     Ok(function)
 }
 
@@ -1610,4 +1738,65 @@ pub(crate) fn occupancy_max_active_blocks(
         code: -1,
         description: "driver returned a negative active-block count".into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stack_limit(context: &Context) -> usize {
+        let _current = context.enter().unwrap();
+        let mut limit = 0usize;
+        unsafe {
+            context
+                .driver
+                .check(
+                    (context.driver.context_get_limit)(&mut limit, CU_LIMIT_STACK_SIZE),
+                    "stack limit query",
+                )
+                .unwrap();
+        }
+        limit
+    }
+
+    /// A retained context reserves `RESERVED_STACK_BYTES` per thread before
+    /// anything measures the device, and a function whose frame is larger
+    /// raises the reservation when it is loaded, not at its first launch,
+    /// and holds what the raise took. Hosts without a CUDA device or NVRTC
+    /// run nothing.
+    #[test]
+    fn a_function_beyond_the_reserved_stack_raises_it_at_load_and_holds_the_growth() {
+        let Ok(driver) = Driver::load() else { return };
+        let mut devices = 0;
+        if unsafe { (driver.device_count)(&mut devices) } != 0 || devices == 0 {
+            return;
+        }
+        let context = Context::retain(driver.clone(), 0).unwrap();
+        let reserved = stack_limit(&context);
+        assert!(reserved >= RESERVED_STACK_BYTES);
+        let architecture =
+            driver.attribute(75, 0).unwrap() as u32 * 10 + driver.attribute(76, 0).unwrap() as u32;
+        let words = RESERVED_STACK_BYTES / 2;
+        let source = format!(
+            "extern \"C\" __global__ void deep(int* out, int seed) {{ volatile int frame[{words}]; \
+             for (int i = 0; i < {words}; i++) frame[i] = i * seed; \
+             out[threadIdx.x] = frame[(seed + threadIdx.x) % {words}]; }}"
+        );
+        let Ok(cubin) = crate::nvrtc::compile_cubin_named(&source, "deep.cu", architecture, &[]) else {
+            return;
+        };
+        let held = stack_growth(0).bytes();
+        let (_module, function) = load_module(&context, &cubin.image, "deep").unwrap();
+        let local = function_attribute(&context, function, LOCAL_SIZE_BYTES).unwrap() as usize;
+        assert!(local > reserved, "the fixture's frame ({local} B) exceeds the reservation");
+        assert!(stack_limit(&context) >= local);
+        let threads = driver.attribute(16, 0).unwrap() as u64 * driver.attribute(39, 0).unwrap() as u64;
+        let expected = (local - reserved) as u64 * threads;
+        let grown = stack_growth(0).bytes() - held;
+        eprintln!("reserved {reserved} B, frame {local} B, raise took {grown} bytes for {expected} expected");
+        assert!(
+            grown + (8 << 20) >= expected && grown <= expected + (64 << 20),
+            "the raise took {grown} bytes; the reservation grew by {expected}"
+        );
+    }
 }

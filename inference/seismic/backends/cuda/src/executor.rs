@@ -27,6 +27,7 @@ pub struct Device {
     stream: Arc<Stream>,
     blocks: Arc<Blocks>,
     graph_bytes: Arc<AtomicU64>,
+    stack_growth: Arc<crate::driver::StackGrowth>,
 }
 
 /// One `cuMemGetInfo` sample.
@@ -81,6 +82,7 @@ impl Device {
             stream,
             blocks,
             graph_bytes: Arc::new(AtomicU64::new(0)),
+            stack_growth: crate::driver::stack_growth(ordinal),
         })
     }
     pub fn ordinal(&self) -> u32 {
@@ -123,11 +125,14 @@ impl Device {
             .map(Buffer::device)
     }
 
-    /// Device memory held beyond the live ranges: the blocks' free space
-    /// and the instantiated graphs' driver memory. Held by this process,
+    /// Device memory held beyond the live ranges: the blocks' free space,
+    /// the instantiated graphs' driver memory and the stack the driver
+    /// reserved beyond what every context reserves. Held by this process,
     /// charged to no allocation.
     pub fn held_beyond_ranges(&self) -> u64 {
-        self.blocks.unallocated_bytes() + self.graph_bytes.load(Ordering::Relaxed)
+        self.blocks.unallocated_bytes()
+            + self.graph_bytes.load(Ordering::Relaxed)
+            + self.stack_growth.bytes()
     }
 
     /// The device's count of instantiated graphs' driver memory.
