@@ -7,11 +7,11 @@ use magnitude_kernels::dense_expand;
 use seismic::{BackendName, Device, Element, Layout, NativeSpecialization, OperandRecipe, Tensor};
 use seismic_lang::registry::bf16_round;
 
+/// The CUDA device, opened with the test binary's one store of compiled
+/// programs ([`seismic_native_tests::devices`]): a form a test prepares again,
+/// for another row count, mode or mapping, compiles once in the process.
 pub fn cuda() -> Option<Device> {
-    seismic::Devices::discover(&[])
-        .ok()?
-        .open_backend(BackendName::Cuda)
-        .ok()
+    seismic_native_tests::devices(&[BackendName::Cuda]).into_iter().next()
 }
 
 #[path = "../gguf_formats/mod.rs"]
