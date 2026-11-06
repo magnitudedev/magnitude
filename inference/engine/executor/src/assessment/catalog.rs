@@ -343,7 +343,7 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
                 .and_then(|floor| load.with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host))
                 .unwrap_or_else(|error| panic!("{name}: its bank plans on {}: {error}", backend.as_str()));
             let bank = banked.expert_bank().expect("a banked load has a bank");
-            for group in &bank.groups {
+            for group in bank.groups() {
                 for (_, tensor) in group.record.iter() {
                     let form = (
                         backend,

@@ -435,7 +435,7 @@ pub enum AssessmentFitVerdict {
 /// it builds every graph a load prepares, so it fails with
 /// `GraphError::KernelDomain` exactly when the model's program calls a kernel
 /// outside its domain on the backend.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssessmentGraphResourceBounds {
     pub target: NativeGraphCharge,
     pub readout: NativeGraphCharge,

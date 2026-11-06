@@ -411,7 +411,7 @@ pub struct ResourceBytes {
 /// charges once at the largest family's workspace. Its activations, each a
 /// launch in flight, hold what `graphs` holds at their count of the
 /// device's graph budget (`seismic::LaunchGraphs::held`).
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeGraphCharge {
     pub workspace_bytes: u64,
     pub output_bytes: u64,

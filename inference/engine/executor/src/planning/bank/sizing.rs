@@ -220,7 +220,7 @@ impl ExpertBankPlan {
         self.record_tensors().try_fold(self.widest().get(), |most, (group, kind, tensor)| {
             let record = tensor.record_bytes()?;
             let held = self.reserved_records(group, kind, tensor, crate::planning::BankTier::Bank)?;
-            let reservation = self.reservation.of_records(held);
+            let reservation = self.reservation().of_records(held);
             let backed = reservation.most_backed(max_allocation) / record;
             let backing = |records: u64| {
                 records

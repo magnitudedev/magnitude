@@ -141,7 +141,7 @@ impl ExpertBank {
         let lender = &layout.groups[lent.lender.group].records;
         let forms = plan.layer_scratch_forms();
         let scratch = plan
-            .layers
+            .layers()
             .iter()
             .zip(&forms)
             .enumerate()
@@ -257,7 +257,7 @@ fn watch(
         .map(|tensors| host_views(plan, &tensors, |group| counts.landed_records(group, start)))
         .transpose()?
         .map(|views| {
-            plan.groups
+            plan.groups()
                 .iter()
                 .zip(views)
                 .map(|(planned, views)| {
@@ -295,8 +295,8 @@ fn watch(
     // memory, beside the conveyor), its slots carry experts too.
     let addressed = matches!(plan.conveyor().carrier, ConveyorCarrier::Bank(_));
     for (index, layer) in layout.layers.iter().enumerate() {
-        let group = plan.layers[index].group;
-        let stored = plan.groups[group]
+        let group = plan.layers()[index].group;
+        let stored = plan.groups()[group]
             .record
             .iter()
             .zip(stacks[index].iter())
@@ -318,10 +318,10 @@ fn watch(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let experts = plan.layers[index].experts;
+        let experts = plan.layers()[index].experts;
         let slots = addressed
             .then(|| {
-                plan.groups[group]
+                plan.groups()[group]
                     .record
                     .iter()
                     .map(|(kind, _)| {
@@ -352,7 +352,7 @@ fn watch(
         landing_maps.push(landing);
         watched.push(Layer {
             group,
-            experts: usize::try_from(plan.layers[index].experts).map_err(|_| "experts exceed the host")?,
+            experts: usize::try_from(plan.layers()[index].experts).map_err(|_| "experts exceed the host")?,
             map: view,
             file: ExchangeTable::new(layer.file.clone(), plan.binding(index)?.words.file(), steps.pulse())?,
             scratch: ExchangeTable::new(layer.scratch.clone(), plan.binding(index)?.words.scratch(), steps.pulse())?,
@@ -404,7 +404,7 @@ fn watch(
     // place.
     let conveyor = plan.conveyor();
     let lending = |lender: &Lender| {
-        let lent = &plan.groups[lender.group].record;
+        let lent = &plan.groups()[lender.group].record;
         Ok::<_, String>(Lending {
             group: lender.group,
             records: usize::try_from(lender.records).map_err(|_| "lent records exceed the host")?,
@@ -440,7 +440,7 @@ fn watch(
                 .map(|transfer| super::copies::Copies::new(transfer, steps.events().clone()))
                 .map_err(|error| format!("the device's transfers: {error}"))?;
             let groups = plan
-                .groups
+                .groups()
                 .iter()
                 .enumerate()
                 .map(|(group, planned)| {
@@ -463,7 +463,7 @@ fn watch(
     let carrier = Carrier {
         records: usize::try_from(conveyor.conveyor.records).map_err(|_| "conveyor records exceed the host")?,
         slots: if addressed {
-            usize::try_from(plan.layers.iter().map(|layer| layer.experts).max().unwrap_or(0)).map_err(|_| "scratch slots exceed the host")?
+            usize::try_from(plan.layers().widest().get()).map_err(|_| "scratch slots exceed the host")?
         } else {
             0
         },

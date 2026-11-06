@@ -31,7 +31,7 @@ impl ExpertBankPlan {
     /// The bank's counts ([`BankCounts`]), derived from the plan as it is
     /// now. Why a charge does not fit `u64`.
     pub fn counts(&self) -> Result<BankCounts, String> {
-        let groups = 0..self.groups.len();
+        let groups = 0..self.groups().len();
         let slots = (0..=self.ceiling)
             .map(|slots| {
                 Ok(Held {

@@ -77,12 +77,12 @@ fn the_directory_names_map_words_at_the_plans_homes() {
     let floor = resident.bank_floor(&definition, 1, crate::FlightDepth::PIPELINED, reservation, host).unwrap();
     let load = resident.with_expert_bank(&definition, floor, 1, crate::FlightDepth::PIPELINED, reservation, host).unwrap();
     let plan = load.expert_bank().unwrap();
-    let records = (0..plan.groups.len()).map(|group| plan.records(group) as usize).collect::<Vec<_>>();
-    let groups = plan.layers.iter().map(|layer| layer.group).collect::<Vec<_>>();
-    let experts = plan.layers.iter().map(|layer| layer.experts as usize).collect::<Vec<_>>();
+    let records = (0..plan.groups().len()).map(|group| plan.records(group) as usize).collect::<Vec<_>>();
+    let groups = plan.layers().iter().map(|layer| layer.group).collect::<Vec<_>>();
+    let experts = plan.layers().iter().map(|layer| layer.experts as usize).collect::<Vec<_>>();
     let directory = Directory::new(&records, &groups, &experts, HostTier::replay(vec![0; records.len()]));
-    assert!(plan.layers.len() > 1);
-    for layer in 0..plan.layers.len() {
+    assert!(plan.layers().len() > 1);
+    for layer in 0..plan.layers().len() {
         assert_eq!(directory.home(layer) as u64, plan.home(layer), "layer {layer}");
     }
 }

@@ -176,10 +176,10 @@ impl ExpertPass {
     /// price.
     pub fn of_bank(bank: &crate::planning::ExpertBankPlan, costs: ExecutorCosts) -> Result<Self, AssessmentError> {
         let layers = bank
-            .layers
+            .layers()
             .iter()
             .map(|layer| {
-                let records = &bank.groups[layer.group].record;
+                let records = &bank.groups()[layer.group].record;
                 let bytes = records
                     .iter()
                     .map(|(_, record)| {

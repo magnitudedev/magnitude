@@ -541,7 +541,7 @@ impl MoveCosts {
     /// Each group of `plan` whose shrink can move records, with its form:
     /// what a load requests the move lines of (`PointRequest::Moves`).
     pub fn forms(plan: &ExpertBankPlan) -> impl Iterator<Item = (usize, MoveForm)> + '_ {
-        plan.groups
+        plan.groups()
             .iter()
             .enumerate()
             .map(|(group, members)| (group, MoveForm { record: members.record, moves: plan.move_records(group) }))
@@ -792,13 +792,13 @@ impl ConvertCosts {
         let groups = Self::forms(plan)
             .map(|form| Ok(Self::stored(topology, executor, form, store)?.record_seconds))
             .collect::<Result<Vec<_>, CeilingError>>()?;
-        Ok(plan.layers.iter().map(|layer| groups[layer.group]).collect())
+        Ok(plan.layers().iter().map(|layer| groups[layer.group]).collect())
     }
 
     /// Each group's form of `plan`'s bank, in group order: what the convert
     /// ceilings are requested by (`PointRequest::Convert`).
     pub fn forms(plan: &ExpertBankPlan) -> impl Iterator<Item = ConvertForm> + '_ {
-        plan.groups.iter().map(|members| ConvertForm { record: members.record })
+        plan.groups().iter().map(|members| ConvertForm { record: members.record })
     }
 }
 

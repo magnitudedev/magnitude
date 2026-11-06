@@ -51,7 +51,7 @@ const INPUT_NODE: u32 = u32::MAX;
 /// Host heap a structure holds: the bytes it asked the allocator for and in
 /// how many allocations. The allocator's own rounding and bookkeeping of
 /// each allocation are not part of `bytes`; `rounding` bounds them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostHeap {
     pub bytes: u64,
     pub allocations: u64,

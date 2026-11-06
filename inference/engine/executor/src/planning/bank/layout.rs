@@ -625,8 +625,8 @@ impl ExpertBankPlan {
         let words = |count: u64| Ok((Element::i32(), vec![count]));
         match part {
             BankPart::Step => words(constants::STEP_WORDS),
-            BankPart::SlotMap => Ok((Element::i32(), vec![self.layers[layer].experts, constants::MAP_WORDS])),
-            BankPart::GroupReads => words(self.layers[layer].experts),
+            BankPart::SlotMap => Ok((Element::i32(), vec![self.layers()[layer].experts, constants::MAP_WORDS])),
+            BankPart::GroupReads => words(self.layers()[layer].experts),
             // The load's flags of each place, which every layer's request
             // counts into in turn: the widest layer's.
             BankPart::ScratchFlags => words(self.widest().get()),
@@ -637,11 +637,11 @@ impl ExpertBankPlan {
                 let words = binding()?.words;
                 Ok((Element::i32(), vec![words.flight, words.routing_words()]))
             }
-            BankPart::Map => Ok((Element::i32(), vec![self.group_experts(self.layers[layer].group), constants::MAP_WORDS])),
+            BankPart::Map => Ok((Element::i32(), vec![self.group_experts(self.layers()[layer].group), constants::MAP_WORDS])),
             BankPart::TierMap | BankPart::Tier { .. } if self.tier_reservation().is_none() => {
                 Err(format!("bank part {part:?} of a bank without a host tier"))
             }
-            BankPart::TierMap => words(self.layers[layer].experts),
+            BankPart::TierMap => words(self.layers()[layer].experts),
             BankPart::SiteTable | BankPart::SiteRows | BankPart::SiteOutput if !self.sited(layer) =>
             {
                 Err(format!("bank part {part:?} of a layer without a CPU site"))
@@ -660,7 +660,7 @@ impl ExpertBankPlan {
                 let tensor = record
                     .get(kind)
                     .ok_or_else(|| format!("bank part {part:?} of a record without it"))?;
-                Ok((tensor.resident, vec![self.host_extent(self.layers[layer].group), tensor.matrix[0], tensor.matrix[1]]))
+                Ok((tensor.resident, vec![self.host_extent(self.layers()[layer].group), tensor.matrix[0], tensor.matrix[1]]))
             }
             BankPart::Resident => words(1),
             BankPart::Policy => words(constants::POLICY_WORDS),
@@ -724,7 +724,7 @@ impl ExpertBankPlan {
     /// size ([`Self::host_slots`]) beside its fill, each slot filled as it
     /// joins (`ExpertBank::back_host`).
     pub fn layout(&self) -> Result<BankLayout<BankAllocation>, String> {
-        let bindings = (0..self.layers.len()).map(|layer| self.binding(layer)).collect::<Result<Vec<_>, _>>()?;
+        let bindings = (0..self.layers().len()).map(|layer| self.binding(layer)).collect::<Result<Vec<_>, _>>()?;
         let shape = |layer: usize, part: BankPart| self.shape_of(layer, part, || Ok(bindings[layer]));
         let words = |layer: usize, part: BankPart| {
             let (element, extents) = shape(layer, part)?;
@@ -738,7 +738,7 @@ impl ExpertBankPlan {
             Ok::<_, String>(BankAllocation::Device { element, extents })
         };
         let groups = self
-            .groups
+            .groups()
             .iter()
             .enumerate()
             .map(|(index, group)| {
@@ -747,7 +747,7 @@ impl ExpertBankPlan {
                     records: group.record.try_map(|kind, tensor| {
                         Ok::<_, String>(BankAllocation::Reserved {
                             kind: crate::planning::BankTier::Bank,
-                            contract: self.host.contract(crate::planning::BankTier::Bank),
+                            contract: self.host().contract(crate::planning::BankTier::Bank),
                             element: tensor.resident,
                             records: self.records(index),
                             matrix: tensor.matrix,
@@ -765,7 +765,7 @@ impl ExpertBankPlan {
             })
             .collect::<Result<Vec<_>, String>>()?;
         let layers = self
-            .layers
+            .layers()
             .iter()
             .enumerate()
             .map(|(index, layer)| {
@@ -827,14 +827,14 @@ impl ExpertBankPlan {
             })
             .collect();
         let host = self.tier_reservation().map(|_| {
-            self.groups
+            self.groups()
                 .iter()
                 .enumerate()
                 .map(|(index, group)| {
                     group.record.try_map(|kind, tensor| {
                         Ok::<_, String>(BankAllocation::Reserved {
                             kind: crate::planning::BankTier::Host,
-                            contract: self.host.contract(crate::planning::BankTier::Host),
+                            contract: self.host().contract(crate::planning::BankTier::Host),
                             element: tensor.resident,
                             records: self.host_extent(index),
                             matrix: tensor.matrix,
@@ -894,7 +894,7 @@ impl ExpertBankPlan {
                 vec![place; usize::try_from(places.get()).map_err(|_| "chain places exceed the host")?]
             },
             flags: words(0, BankPart::ScratchFlags)?,
-            layers: (0..self.layers.len())
+            layers: (0..self.layers().len())
                 .map(|layer| Ok(PlacedLayer { group_reads: words(layer, BankPart::GroupReads)? }))
                 .collect::<Result<Vec<_>, String>>()?,
         })

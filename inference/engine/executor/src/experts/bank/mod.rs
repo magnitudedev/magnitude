@@ -196,10 +196,10 @@ impl ExpertBank {
         import: &mut dyn FnMut(&crate::WeightPlan, &Tensor) -> Result<(), String>,
     ) -> Result<(), String> {
         let plan = &self.plan;
-        for (index, layer) in plan.layers.iter().enumerate() {
+        for (index, layer) in plan.layers().iter().enumerate() {
             let records = &self.layout.groups[layer.group].records;
             for (((_, record), (_, records)), (_, resident)) in
-                plan.groups[layer.group].record.iter().zip(records.iter()).zip(layer.resident.iter())
+                plan.groups()[layer.group].record.iter().zip(records.iter()).zip(layer.resident.iter())
             {
                 let stack = records
                     .region(
@@ -298,7 +298,7 @@ impl ExpertBank {
         // file holds.
         let (held, alone) = self.watcher.shared().holdings();
         let mut disk_bytes = 0u64;
-        for ((layer, &held), &alone) in self.plan.layers.iter().zip(&held).zip(&alone) {
+        for ((layer, &held), &alone) in self.plan.layers().iter().zip(&held).zip(&alone) {
             disk_bytes += (layer.experts - held as u64 - alone as u64) * self.stored_bytes_of(layer.group)?;
         }
         Ok(ExpertResidency {
@@ -330,7 +330,7 @@ impl ExpertBank {
     /// The bytes the model file stores one expert of group `group` in,
     /// summed over its record's routed tensors.
     fn stored_bytes_of(&self, group: usize) -> Result<u64, DomainError> {
-        self.plan.groups[group]
+        self.plan.groups()[group]
             .record
             .iter()
             .try_fold(0u64, |sum, (_, tensor)| Ok::<_, String>(sum + tensor.stored_bytes()?))
@@ -363,7 +363,7 @@ impl ExpertBank {
         if resident {
             self.resident_decodes.fetch_add(decodes, Ordering::Relaxed);
         }
-        let merges = self.plan.layers.iter().map(|layer| layer.scope).zip(merges).collect();
+        let merges = self.plan.layers().iter().map(|layer| layer.scope).zip(merges).collect();
         Ok((steps, merges, ChainServing { resident, grouped }))
     }
 
@@ -419,7 +419,7 @@ impl ExpertBank {
     /// of its rows starting at batch row `first`: the streamed layers there
     /// name their requests' rows within it.
     pub(crate) fn window(&self, sequence: u64, block: usize, first: u64) -> Result<(), String> {
-        let from = self.plan.layers.iter().position(|layer| layer.sublayer().block as usize >= block);
+        let from = self.plan.layers().iter().position(|layer| layer.sublayer().block as usize >= block);
         if let Some(layer) = from {
             let first = usize::try_from(first).map_err(|_| "a window's first row exceeds the host")?;
             self.watcher.shared().window(sequence, layer, first);
@@ -708,7 +708,7 @@ fn host_views(
             let committed = committed(group);
             tensors
                 .iter()
-                .zip(plan.groups[group].record.iter())
+                .zip(plan.groups()[group].record.iter())
                 .map(|((_, tensor), (_, record))| {
                     let view = tensor
                         .region(record.resident, &[committed, record.matrix[0], record.matrix[1]], 0)
@@ -783,7 +783,7 @@ fn placed_words(plan: &ExpertBankPlan, placed: &PlacedAllocations<Tensor>) -> Re
 /// Each layer's slot map, its view of its group's map: its experts from the
 /// map word of its expert 0 (`ExpertBankPlan::home`).
 fn slot_maps(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Result<Vec<Tensor>, String> {
-    plan.layers
+    plan.layers()
         .iter()
         .enumerate()
         .map(|(index, layer)| {
@@ -800,7 +800,7 @@ fn slot_maps(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Result<Vec<T
 /// its group's records' view of its experts from its home record
 /// (`ExpertBankPlan::home`), as its slot map is its map's.
 fn homes(plan: &ExpertBankPlan, layout: &BankLayout<Tensor>) -> Result<Vec<RecordTensors<Tensor>>, String> {
-    plan.layers
+    plan.layers()
         .iter()
         .enumerate()
         .map(|(index, layer)| {

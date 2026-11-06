@@ -548,7 +548,7 @@ fn scores(
                 assert_eq!(whole, Some(false), "{backend:?}: the capped load banks part of its experts")
             }
         }
-        let site = plan.is_some_and(|plan| !plan.whole() && (0..plan.layers.len()).any(|layer| plan.sited(layer)));
+        let site = plan.is_some_and(|plan| !plan.whole() && (0..plan.layers().len()).any(|layer| plan.sited(layer)));
         let waited = filled == Filled::Waited && !matches!(banked, Banked::Resident);
         if waited {
             // The tier fills from the bank's open on: nothing stays only on
@@ -640,7 +640,7 @@ fn test_measures(domain: &ExecutorDomain, sited: bool, device_landed: bool) -> c
     };
     let convert = match device_landed {
         true => {
-            let groups = domain.expert_bank_plan().expect("a device-landed load has a bank").groups.len();
+            let groups = domain.expert_bank_plan().expect("a device-landed load has a bank").groups().len();
             Priced::Measured(Some(vec![RecordLine::new(1e-9, 1e-9).expect("a line"); groups].into()))
         }
         false => Priced::Pending(pending()),
@@ -825,7 +825,7 @@ fn shrunk_bank_scores_as_resident(
     let decode = |banked: Banked, lookahead: bool| {
         let (mut domain, mut bindings, _) = load(catalog, &definition, &package, metal, limits(2, lookahead, 1, 1), banked);
         if matches!(banked, Banked::Whole) {
-            assert_eq!(domain.expert_bank_plan().map(|bank| bank.groups.len()), Some(groups), "{test}: the bank's groups");
+            assert_eq!(domain.expert_bank_plan().map(|bank| bank.groups().len()), Some(groups), "{test}: the bank's groups");
         }
         let request = RequestId(1);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();

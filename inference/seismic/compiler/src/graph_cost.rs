@@ -34,7 +34,7 @@ pub const fn argument_bytes(backend: BackendName, buffers: u64, words: u64) -> u
 /// it: the graphs, their launches, and every launch's argument bytes in the
 /// backend's layout, with the largest one launch's. A set's census adds its members' (the largest
 /// one's is theirs at most).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GraphCensus {
     pub graphs: u64,
     pub launches: u64,
@@ -119,7 +119,7 @@ impl GraphCensus {
 /// launch's graphs, the union of every launch's, each layout's graph for
 /// the most runs of it any one launch makes, and what a chain of launches
 /// replays beyond each launch's own ([`Self::held`]).
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaunchGraphs {
     pub decode: GraphCensus,
     pub union: GraphCensus,

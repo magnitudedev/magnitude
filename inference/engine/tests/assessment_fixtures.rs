@@ -573,7 +573,7 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
         panic!("Qwen3.6 35B is planned streamed on the RTX 3090 under the cap");
     };
     let bank = draft.load().expert_bank().expect("a capped load streams").clone();
-    assert!(!bank.reservation.host_addressed);
+    assert!(!bank.reservation().host_addressed);
     let conveyor = bank.conveyor();
     let ConveyorCarrier::HostTier(lender) = conveyor.carrier else {
         panic!("a discrete device's conveyor lies in its host tier");
@@ -585,7 +585,7 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
             .load()
             .clone()
             .unbanked()
-            .with_expert_bank(&definition, slots, bank.places, bank.flights, bank.reservation, bank.host)
+            .with_expert_bank(&definition, slots, bank.places, bank.flights, bank.reservation(), bank.host())
             .unwrap()
             .weight_bytes()
             .unwrap()
@@ -684,7 +684,7 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
             .load()
             .clone()
             .unbanked()
-            .with_expert_bank(&definition, slots, bank.places, bank.flights, bank.reservation, bank.host)
+            .with_expert_bank(&definition, slots, bank.places, bank.flights, bank.reservation(), bank.host())
             .unwrap()
             .weight_bytes()
             .unwrap()
@@ -733,7 +733,7 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
         PreparedModelAssessment::Unsupported { unsupported, .. } => panic!("Qwen3.6 35B streams on the RTX 3090 under the cap: {unsupported:?}"),
     };
     let bank = draft.load().expert_bank().expect("a capped load streams");
-    assert!((0..bank.groups.len()).all(|group| bank.host_records(group, bank.host_slots) >= bank.landing_records()));
+    assert!((0..bank.groups().len()).all(|group| bank.host_records(group, bank.host_slots) >= bank.landing_records()));
     let mut reserves = serde_json::to_value(MemoryReserves::standard()).unwrap();
     reserves["host"]["planning"]["floor_bytes"] = (u64::MAX / 4).into();
     let roomless = prepare(serde_json::from_value(reserves).unwrap());
@@ -926,7 +926,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
             .load()
             .clone()
             .unbanked()
-            .with_expert_bank(definition, slots, bank.places, bank.flights, bank.reservation, bank.host)
+            .with_expert_bank(definition, slots, bank.places, bank.flights, bank.reservation(), bank.host())
             .unwrap()
             .weight_bytes()
             .unwrap()

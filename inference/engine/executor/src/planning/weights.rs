@@ -1414,7 +1414,7 @@ impl ModelLoadPlan {
                 // not its floor. Its own table replaces the ordinary table.
                 let committed = table.record_bytes.get().checked_mul(table.records.get())
                     .ok_or("stored table backing overflows")?;
-                let charges = bank.reservation.charges(bank.host.contract(crate::planning::BankTier::Bank), seismic::ReservedRecords::of(table.record_bytes), table.records.get(), committed)
+                let charges = bank.reservation().charges(bank.host().contract(crate::planning::BankTier::Bank), seismic::ReservedRecords::of(table.record_bytes), table.records.get(), committed)
                     .ok_or("stored table demand overflows")?;
                 let mut demand = ClaimDemand::reservation(crate::planning::BankTier::Bank, charges);
                 demand.shared = demand.shared.checked_add(bytes.checked_sub(weight.resident_bytes)

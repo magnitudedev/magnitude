@@ -56,8 +56,8 @@ fn site_layer(
     let Some(sited) = &layout.layers[index].sited else {
         return Err(format!("streamed layer {index}'s entries serve a CPU site its bank allocates none for"));
     };
-    let group = plan.layers[index].group;
-    let records = plan.groups[group].record;
+    let group = plan.layers()[index].group;
+    let records = plan.groups()[group].record;
     let mut views = tiers[group].iter().map(|tensor| tensor.records.clone());
     let mut tensor = |record: crate::planning::RecordTensor| -> Result<SiteRecords, String> {
         let [rows, columns] = record.matrix.map(|extent| extent as usize);

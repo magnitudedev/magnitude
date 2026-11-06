@@ -132,7 +132,7 @@ impl ServedBank {
         match holding {
             BankHolding::Experts => Ok(counts.resident_charge(at)),
             BankHolding::Host => Ok(counts.host_charge(at)),
-            BankHolding::Table { table } => self.tables[table].plan.charge(self.bank.plan.reservation, at).map_err(DomainError::invariant),
+            BankHolding::Table { table } => self.tables[table].plan.charge(self.bank.plan.reservation(), at).map_err(DomainError::invariant),
         }
     }
 
@@ -275,7 +275,7 @@ impl ServedBank {
             let line = record.reads.measured().map_err(|error| DomainError::invariant(format!("the read line: {error}")))?;
             for (index, table) in self.tables.iter().enumerate() {
                 let (records, curve) = (table.table.records(), table.table.curve());
-                let charge = |records| table.plan.charge(plan.reservation, records);
+                let charge = |records| table.plan.charge(plan.reservation(), records);
                 let bytes = |to| Ok(charge(to)? - charge(records)?);
                 let bound = table.plan.records.get().min(curve.saturation());
                 let Some(to) = target(records, bound, &bytes)? else {

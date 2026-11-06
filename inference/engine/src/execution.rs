@@ -210,7 +210,7 @@ fn plan_on_device(
              weights {weights} bytes, {slot} more a slot",
             bank.slots,
             bank.widest(),
-            bank.groups.len(),
+            bank.groups().len(),
         );
     }
     tracing::info!(

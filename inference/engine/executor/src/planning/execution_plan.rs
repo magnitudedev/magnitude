@@ -238,10 +238,10 @@ impl ExecutionPlanDraft {
         let Some(bank) = self.load.expert_bank() else {
             return Ok(Vec::new());
         };
-        (0..bank.layers.len())
+        (0..bank.layers().len())
             .map(|layer| {
-                let scope = bank.layers[layer].scope;
-                let index = bank.layers[layer].sublayer();
+                let scope = bank.layers()[layer].scope;
+                let index = bank.layers()[layer].sublayer();
                 let (slot, binding) = self
                     .programs
                     .target()

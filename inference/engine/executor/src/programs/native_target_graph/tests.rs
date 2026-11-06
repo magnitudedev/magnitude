@@ -227,10 +227,9 @@ mod shared_graph_tests {
     fn a_blocks_streamed_layer_is_its_feed_forwards_own_or_branch() {
         let (_, load) = streamed_fixture_load();
         let bank = load.expert_bank().unwrap();
-        let own = (0..bank.layers.len()).map(|layer| (block_layer(bank, layer_block(bank, layer)).unwrap(), layer)).collect::<Vec<_>>();
-        let mut branched = bank.clone();
+        let own = (0..bank.layers().len()).map(|layer| (block_layer(bank, layer_block(bank, layer)).unwrap(), layer)).collect::<Vec<_>>();
         let layers = bank
-            .layers
+            .layers()
             .iter()
             .cloned()
             .map(|mut layer| {
@@ -241,7 +240,7 @@ mod shared_graph_tests {
                 layer
             })
             .collect();
-        branched.layers = crate::planning::BankLayers::new(layers).unwrap();
+        let branched = bank.clone().with_layers(crate::planning::BankLayers::new(layers).unwrap());
         for (found, layer) in own {
             assert_eq!(found, layer);
             let block = layer_block(&branched, layer);
@@ -251,7 +250,7 @@ mod shared_graph_tests {
     }
 
     fn layer_block(bank: &crate::ExpertBankPlan, layer: usize) -> usize {
-        match bank.layers[layer].scope {
+        match bank.layers()[layer].scope {
             WeightScope::TargetSublayer(sublayer) | WeightScope::TargetBranch { sublayer, .. } => sublayer.block as usize,
             scope => panic!("{scope:?} is no block's"),
         }

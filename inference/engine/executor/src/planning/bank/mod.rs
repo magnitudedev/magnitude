@@ -136,8 +136,12 @@ impl StoredStack {
 /// A streamed load's expert bank.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpertBankPlan {
-    /// `K`: the experts a row selects.
-    pub selected: u64,
+    /// Its structure and the lending derived from it (`conveyor::Structured`):
+    /// the experts a row selects, its record reservation, its host tier, its
+    /// groups and layers ([`Self::selected`], [`Self::reservation`],
+    /// [`Self::host`], [`Self::groups`], [`Self::layers`]), with its conveyor
+    /// and scratch ([`Self::conveyor`], [`Self::scratch`]).
+    structured: conveyor::Structured,
     /// `S`: the committed records each routed layer adds to its group, at
     /// least the floor ([`Self::floor`], which may be none: each group then
     /// holds its least records, [`Self::least_records`]) and at most its
@@ -149,24 +153,6 @@ pub struct ExpertBankPlan {
     /// cap bounds of its weights (`ExecutionPlanDraft::with_held_experts`),
     /// the one owner of the slots' upper bound; at least `slots`.
     pub ceiling: u64,
-    /// How the device reserves each record tensor: the granule its
-    /// committed bytes are backed and charged in, and whether the host can
-    /// read into them in place (what reading the conveyor into records lent
-    /// it needs, [`Self::conveyor`]).
-    pub reservation: seismic::Reservation,
-    /// How the host tier is held on the device (`platform::host_tier`): a
-    /// bank streams only beside one, so a device without one holds its
-    /// experts resident or is refused (`UnstreamedExperts::Untiered`), and
-    /// every bank has a store its conveyor lies in. The tier is every miss's first store,
-    /// inclusive of the bank, in the bank's own form: each group's record
-    /// tensors again, resident as the device holds them, reserved in the
-    /// tier's storage for every expert of the group's layers
-    /// ([`Self::host_extent`]) and committed by host slots
-    /// ([`Self::host_records`]), so the host lands file misses into it and
-    /// the device reads it in place; where it lies across a link the host
-    /// also promotes from it by a pure copy on the copy engine
-    /// (`watcher::promotions`), and nothing is written back.
-    pub host: HostTier,
     /// The host slots of the tier's load-time size: as many as the host's
     /// memory admits beside the load, up to every expert
     /// (`ExecutionPlanDraft::with_host_tier`), which the bank backs from
@@ -186,18 +172,12 @@ pub struct ExpertBankPlan {
     /// The in-flight depth its steps fly at: the routed kernels' `FLIGHT`
     /// ([`FlightDepth::steps`]) and every exchange table's slots follow it.
     pub flights: FlightDepth,
-    pub groups: Vec<BankGroup>,
-    /// Every streamed routed layer, in decoder order.
-    pub layers: BankLayers,
     /// The stored tables whose slots the bank holds beside its experts, the
     /// load's one elastic owner pricing each by what it saves: every one of
     /// the load's the device can hold so.
     pub tables: Vec<BankTable>,
     /// Which layers hold a CPU site's words and buffers ([`Self::sited`]).
     pub sites: BankSites,
-    /// Its conveyor and scratch, derived from its structure as the plan is
-    /// made ([`Self::conveyor`], [`Self::scratch`]).
-    lending: conveyor::Lending,
 }
 
 impl BankLayer {
@@ -420,7 +400,7 @@ impl ExpertBankPlan {
     /// reads its files for (`seismic_io::Urgent`).
     pub fn urgent(&self) -> Result<seismic_io::Urgent, String> {
         let mut widest = None::<(u64, Vec<u64>)>;
-        for group in &self.groups {
+        for group in self.groups() {
             let record = &group.record;
             let parts = record.gate.iter().chain([&record.up, &record.down]).map(|tensor| tensor.stored_bytes()).collect::<Result<Vec<_>, _>>()?;
             let bytes = parts.iter().sum::<u64>();
@@ -429,7 +409,7 @@ impl ExpertBankPlan {
             }
         }
         let (_, parts) = widest.ok_or("a bank of no group")?;
-        Ok(seismic_io::Urgent { parts, records: self.selected })
+        Ok(seismic_io::Urgent { parts, records: self.selected() })
     }
 }
 
@@ -444,10 +424,10 @@ impl ExpertBankPlan {
         &self,
         artifact: &magnitude_artifacts::gguf::GgufArtifact,
     ) -> Result<Vec<RecordTensors<StoredStack>>, String> {
-        self.layers
+        self.layers()
             .iter()
             .map(|layer| {
-                let record = &self.groups[layer.group].record;
+                let record = &self.groups()[layer.group].record;
                 layer.resident.as_ref().try_map(|kind, weight| {
                     let stored = crate::residency::Stored::from_gguf(artifact, &weight.descriptor)
                         .map_err(|error| error.to_string())?;
@@ -511,8 +491,8 @@ impl ExpertBankPlan {
     /// then charged for. A site is served only where the plan may hold one
     /// ([`Self::sited`]).
     pub fn with_sites(self, sites: Vec<LayerSite>) -> Result<Self, String> {
-        if sites.len() != self.layers.len() {
-            return Err(format!("{} layers' sites admitted for a bank of {} layers", sites.len(), self.layers.len()));
+        if sites.len() != self.layers().len() {
+            return Err(format!("{} layers' sites admitted for a bank of {} layers", sites.len(), self.layers().len()));
         }
         if let Some(layer) = (0..sites.len()).find(|&layer| matches!(sites[layer], LayerSite::Served | LayerSite::Pending) && !self.sited(layer)) {
             return Err(format!("a CPU site admitted for streamed layer {layer}, which can hold none"));
@@ -522,17 +502,17 @@ impl ExpertBankPlan {
 
     /// The binding of streamed layer `layer`'s bank entries.
     pub fn binding(&self, layer: usize) -> Result<BankBinding, String> {
-        let group = self.layers[layer].group;
+        let group = self.layers()[layer].group;
         // Every lead binds a layer routing over the next layer's experts
         // (`routed_route_streamed`'s EN); the last layer names its own.
-        let next = &self.layers[self.lead_layer(layer, 0)];
+        let next = &self.layers()[self.lead_layer(layer, 0)];
         let conveyor = &self.conveyor().conveyor;
         Ok(BankBinding {
-            record: self.groups[group].record,
+            record: self.groups()[group].record,
             records: self.records(group),
-            experts: self.layers[layer].experts,
+            experts: self.layers()[layer].experts,
             next_experts: next.experts,
-            selected: self.selected,
+            selected: self.selected(),
             staging: self.staging_records(),
             round_records: self.round_records(),
             widest: self.widest().get(),
@@ -564,12 +544,12 @@ impl ExpertBankPlan {
 
     /// The experts of each of group `group`'s layers, in its order.
     fn member_experts(&self, group: usize) -> impl Iterator<Item = u64> + '_ {
-        self.groups[group].layers.iter().map(|&layer| self.layers[layer].experts)
+        self.groups()[group].layers.iter().map(|&layer| self.layers()[layer].experts)
     }
 
     /// The most experts of group `group`'s member layers.
     fn widest_member(&self, group: usize) -> u64 {
-        self.groups[group].layers.max_of(|&layer| self.layers[layer].experts)
+        self.groups()[group].layers.max_of(|&layer| self.layers()[layer].experts)
     }
 
     /// The records a layer of `experts` experts holds at `slots` slots:
@@ -591,7 +571,7 @@ impl ExpertBankPlan {
     /// The most experts of any streamed layer: what every buffer the layers
     /// share in turn is sized to, each layer binding its leading view.
     pub fn widest(&self) -> NonZeroU64 {
-        self.layers.widest()
+        self.layers().widest()
     }
 
     /// The record form every streamed layer shares (`with_expert_bank`).
@@ -614,8 +594,8 @@ impl ExpertBankPlan {
     pub fn hints(&self, layer: usize, lead: usize) -> Option<usize> {
         let target = layer + 1 + lead;
         (lead < HINT_LEADS as usize
-            && target < self.layers.len()
-            && self.layers[target].experts == self.layers[layer + 1].experts)
+            && target < self.layers().len()
+            && self.layers()[target].experts == self.layers()[layer + 1].experts)
             .then_some(target)
     }
 
@@ -661,13 +641,13 @@ impl ExpertBankPlan {
     /// The reservation of the host tier's own records, where the bank has
     /// a tier ([`HostTier::tier`]: a linked one; unified memory has none).
     pub fn tier_reservation(&self) -> Option<seismic::Reservation> {
-        self.host.tier()
+        self.host().tier()
     }
 
     /// Who places into the bank ([`HostTier::placer`]): the device, unless
     /// the bank is unified memory's one store.
     pub fn placer(&self) -> Placer {
-        self.host.placer()
+        self.host().placer()
     }
 
     /// The reserved storage `holding` lies in: the bank's records and
@@ -697,7 +677,7 @@ impl ExpertBankPlan {
         self.record_tensors().try_fold(0u64, |total, (group, kind, tensor)| {
             let held = self.reserved_records(group, kind, tensor, crate::planning::BankTier::Bank)?;
             held.record.get().checked_mul(self.records_at(group, slots))
-                .and_then(|bytes| self.reservation.charge(held, self.records(group), bytes))
+                .and_then(|bytes| self.reservation().charge(held, self.records(group), bytes))
                 .and_then(|charge| total.checked_add(charge))
                 .ok_or_else(|| "bank record charge overflows".to_owned())
         })
@@ -708,7 +688,7 @@ impl ExpertBankPlan {
     /// so a one-row request always finds these, and a wider request's misses
     /// past them land as each record frees.
     pub fn demand_records(&self) -> u64 {
-        self.selected
+        self.selected()
     }
 
     /// Staging records hints may hold beyond the demand reserve: 2K, twice
@@ -720,7 +700,7 @@ impl ExpertBankPlan {
     /// hints, 40–51% of whose reads go unused, it would grow the wrong
     /// thing.
     pub fn hint_records(&self) -> u64 {
-        2 * self.selected
+        2 * self.selected()
     }
 
     /// The tier records each group keeps ready or graced, holding no expert
@@ -787,7 +767,7 @@ impl ExpertBankPlan {
     /// records never fall as the slots grow, so those slots are a prefix of
     /// `0..=widest`, of which none always is one.
     fn needed_slots(&self) -> u64 {
-        let least = |slots: u64| (0..self.groups.len()).all(|group| self.records_at(group, slots) == self.least_records(group));
+        let least = |slots: u64| (0..self.groups().len()).all(|group| self.records_at(group, slots) == self.least_records(group));
         // The first slots past it: a prefix's end, found by halving.
         let (mut needed, mut past) = (0, self.widest().get() + 1);
         while past - needed > 1 {
@@ -815,14 +795,14 @@ impl ExpertBankPlan {
     /// Group `group`'s experts: every member layer's, its map's extent
     /// (`BankPart::Map`).
     pub fn group_experts(&self, group: usize) -> u64 {
-        self.groups[group].layers.iter().map(|&member| self.layers[member].experts).sum()
+        self.groups()[group].layers.iter().map(|&member| self.layers()[member].experts).sum()
     }
 
     /// The home record of expert 0 of streamed layer `layer` in its group
     /// ([`layer_homes`]); the same word of the group's map (`BankPart::Map`)
     /// is the layer's expert 0's.
     pub fn home(&self, layer: usize) -> u64 {
-        layer_homes(self.layers.iter().map(|layer| (layer.group, layer.experts)))[layer]
+        layer_homes(self.layers().iter().map(|layer| (layer.group, layer.experts)))[layer]
     }
 
     /// What one more slot commits at most: a record of every layer. The
@@ -835,8 +815,8 @@ impl ExpertBankPlan {
 
     /// `record` of each routed tensor, summed over every layer.
     fn slot_sum(&self, record: fn(&RecordTensor) -> Result<u64, String>) -> Result<u64, String> {
-        self.layers.iter().try_fold(0u64, |total, layer| {
-            Self::record_sum(&self.groups[layer.group].record, record).and_then(|bytes| {
+        self.layers().iter().try_fold(0u64, |total, layer| {
+            Self::record_sum(&self.groups()[layer.group].record, record).and_then(|bytes| {
                 total
                     .checked_add(bytes)
                     .ok_or_else(|| "bank slot bytes overflow".to_owned())
@@ -854,7 +834,7 @@ impl ExpertBankPlan {
     /// Every record tensor: its group, its routed tensor, and its record
     /// form.
     fn record_tensors(&self) -> impl Iterator<Item = (usize, RoutedTensor, RecordTensor)> + '_ {
-        self.groups
+        self.groups()
             .iter()
             .enumerate()
             .flat_map(|(group, each)| each.record.iter().map(move |(kind, tensor)| (group, kind, *tensor)))
@@ -877,7 +857,7 @@ impl ExpertBankPlan {
             BankAllocation::Reserved { kind: crate::planning::BankTier::Host, .. } => {
                 self.tier_reservation().ok_or_else(|| "host-reserved records without a host tier".to_owned())
             }
-            _ => Ok(self.reservation),
+            _ => Ok(self.reservation()),
         }
     }
 
@@ -897,8 +877,8 @@ impl ExpertBankPlan {
     /// What layer `layer`'s banked expert stack of each routed tensor
     /// charges for its records: its slots' (`ModelLoadPlan::with_expert_bank`).
     pub fn banked_bytes(&self, layer: usize) -> Result<RecordTensors<u64>, String> {
-        let slots = Self::layer_slots(self.slots, self.layers[layer].experts);
-        self.groups[self.layers[layer].group].record.try_map(|_, tensor| {
+        let slots = Self::layer_slots(self.slots, self.layers()[layer].experts);
+        self.groups()[self.layers()[layer].group].record.try_map(|_, tensor| {
             tensor
                 .record_bytes()?
                 .checked_mul(slots)
@@ -918,7 +898,7 @@ impl ExpertBankPlan {
     /// per-expert scales): everything else its layout holds.
     pub fn storage_beyond_records(&self) -> Result<ClaimDemand, String> {
         let mut demand = self.storage_demand()?;
-        for (index, layer) in self.layers.iter().enumerate() {
+        for (index, layer) in self.layers().iter().enumerate() {
             let records = self.banked_bytes(index)?;
             for ((_, plan), (_, bytes)) in layer.resident.iter().zip(records.iter()) {
                 demand.reserved = demand.reserved.checked_sub(*bytes)
@@ -930,10 +910,20 @@ impl ExpertBankPlan {
         Ok(demand)
     }
 
+    /// The plan with its streamed layers replaced by `layers`, its
+    /// structure's lending derived again ([`conveyor::Structured::new`]).
+    #[cfg(test)]
+    pub(crate) fn with_layers(self, layers: BankLayers) -> Self {
+        let (selected, reservation, host, groups, _) = self.structured.into_parts();
+        let structured = conveyor::Structured::new(selected, reservation, host, groups, layers)
+            .expect("the layers keep the bank's lending");
+        Self { structured, ..self }
+    }
+
     /// The layer whose weights are of `scope` and its index, when the bank
     /// holds its experts.
     pub fn layer(&self, scope: WeightScope) -> Option<(usize, &BankLayer)> {
-        self.layers
+        self.layers()
             .iter()
             .enumerate()
             .find(|(_, layer)| layer.scope == scope)
@@ -943,7 +933,7 @@ impl ExpertBankPlan {
     /// sublayer), its own or its parallel branch's, and its index, when the
     /// bank holds its experts.
     pub fn feed_forward(&self, scope: WeightScope) -> Option<(usize, &BankLayer)> {
-        self.layers.iter().enumerate().find(|(_, layer)| match (layer.scope, scope) {
+        self.layers().iter().enumerate().find(|(_, layer)| match (layer.scope, scope) {
             (WeightScope::TargetBranch { sublayer, .. }, WeightScope::TargetSublayer(of)) => sublayer == of,
             (own, of) => own == of,
         })

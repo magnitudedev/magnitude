@@ -475,7 +475,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
 
     /// The layer's experts: its slot map's extent.
     pub(crate) fn experts(&self) -> u64 {
-        self.bank.layers[self.index].experts
+        self.bank.layers()[self.index].experts
     }
 
     /// The layer's decode route and resolve by its routed form.
@@ -485,7 +485,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
 
     /// The rows of the layer's group's map (`GM`, `BankPart::Map`).
     pub(crate) fn map_words(&self) -> u64 {
-        self.bank.group_experts(self.bank.layers[self.index].group)
+        self.bank.group_experts(self.bank.layers()[self.index].group)
     }
 
     /// What the route's tier port binds of `ports` (`TM`, and the tier map,
@@ -1052,7 +1052,7 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
         // the scratch fills, so the copy's destination is disjoint from its
         // source by construction. A lender with no record past them seeds
         // nothing.
-        let first = self.bank.seeded_from(self.bank.layers[self.index].group);
+        let first = self.bank.seeded_from(self.bank.layers()[self.index].group);
         let seeded = binding.records.checked_sub(first).ok_or("a bank group's lent records exceed its records")?;
         if seeded == 0 {
             return Ok(scratch.up.tensor().clone());
@@ -1155,7 +1155,7 @@ impl<'a, G: GraphDraft + 'a> StreamedLayer<'_, 'a, G> {
                 hinted[lead] = hinted[earlier].clone();
                 continue;
             }
-            let predicted = &self.bank.layers[layer];
+            let predicted = &self.bank.layers()[layer];
             for (port, hint) in hinted[lead].iter_mut().zip(&predicted.hinted) {
                 if hint.element.is_some() {
                     *port = weight(graph, self.load, predicted.scope, hint.kind, weights)?;
@@ -1163,7 +1163,7 @@ impl<'a, G: GraphDraft + 'a> StreamedLayer<'_, 'a, G> {
             }
         }
         if let Some(next) = self.bank.hints(self.index, 0) {
-            policy = bank_port(graph, self.bank, self.bank.layers[next].scope, BankPart::Policy, self.ports)?
+            policy = bank_port(graph, self.bank, self.bank.layers()[next].scope, BankPart::Policy, self.ports)?
                 .tensor()
                 .clone();
         }

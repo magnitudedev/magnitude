@@ -155,7 +155,7 @@ pub fn load(load: Load) -> Result<(), String> {
             }
             for (table, plan) in bank.tables.iter().enumerate() {
                 let (name, value) = metadata(magnitude_executor::BankHolding::Table { table },
-                    plan.floor, plan.floor, plan.records.get(), &|at| plan.charge(bank.reservation, at))?;
+                    plan.floor, plan.floor, plan.records.get(), &|at| plan.charge(bank.reservation(), at))?;
                 holdings.insert(name, value);
             }
             Ok::<_, String>(json!({

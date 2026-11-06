@@ -402,7 +402,7 @@ pub(crate) fn streamed_hint<'p>(
     Ok((0..HINT_LEADS as usize)
         .map(|lead| bank.lead_layer(index, lead))
         .filter(|&layer| layer != index)
-        .map(|layer| (bank.layers[layer].scope, bank.layers[layer].hinted.as_slice()))
+        .map(|layer| (bank.layers()[layer].scope, bank.layers()[layer].hinted.as_slice()))
         .collect())
 }
 

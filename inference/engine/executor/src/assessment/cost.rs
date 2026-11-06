@@ -327,7 +327,7 @@ impl BankLines {
     /// where their pool is built.
     pub fn of_bank(plan: &ExpertBankPlan) -> Result<Arc<[Self]>, HostLinesError> {
         let groups = plan
-            .groups
+            .groups()
             .iter()
             .enumerate()
             .map(|(group, members)| {
@@ -340,7 +340,7 @@ impl BankLines {
                 Ok(Self { cpu: None, record_bytes })
             })
             .collect::<Result<Vec<_>, HostLinesError>>()?;
-        Ok(plan.layers.iter().map(|layer| groups[layer.group]).collect())
+        Ok(plan.layers().iter().map(|layer| groups[layer.group]).collect())
     }
 }
 
@@ -393,7 +393,7 @@ impl HostLines {
             "a host memory line prices exactly a bank with a host tier"
         );
         let memory = plan
-            .groups
+            .groups()
             .iter()
             .enumerate()
             .map(|(group, members)| {
@@ -411,7 +411,7 @@ impl HostLines {
             })
             .collect::<Result<Vec<_>, HostLinesError>>()?;
         Ok(plan
-            .layers
+            .layers()
             .iter()
             .zip(bank)
             .map(|(layer, bank)| Self { cpu: bank.cpu, memory: memory[layer.group], file: None, convert: None, record_bytes: bank.record_bytes })

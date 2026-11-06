@@ -300,7 +300,7 @@ fn predicted_layers(
     };
     bank.predicted(layer)
         .map(|predicted| {
-            let predicted = &bank.layers[predicted];
+            let predicted = &bank.layers()[predicted];
             let (WeightScope::TargetSublayer(SublayerIndex { block, .. })
             | WeightScope::TargetBranch {
                 sublayer: SublayerIndex { block, .. },
@@ -330,9 +330,9 @@ fn hinted_by(load: &ModelLoadPlan, index: usize) -> Result<Option<u32>, String> 
         return Ok(None);
     }
     let (WeightScope::TargetSublayer(SublayerIndex { block, .. })
-    | WeightScope::TargetBranch { sublayer: SublayerIndex { block, .. }, .. }) = bank.layers[layer - 1].scope
+    | WeightScope::TargetBranch { sublayer: SublayerIndex { block, .. }, .. }) = bank.layers()[layer - 1].scope
     else {
-        return Err(format!("a streamed layer {:?} is not a target sublayer", bank.layers[layer - 1].scope));
+        return Err(format!("a streamed layer {:?} is not a target sublayer", bank.layers()[layer - 1].scope));
     };
     index
         .checked_sub(block as usize)

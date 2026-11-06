@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// term is exact for the graphs counted: a plan's heap follows from its
 /// layout's topology (`NativeGraphLayout::plan_heap`), and so do the
 /// lengths of the vectors its prepared graph owns.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SealedGraphsHeap {
     pub graphs: usize,
     /// The sealed plans (`NativeGraphPlan::host_heap`).
@@ -46,7 +46,7 @@ impl SealedGraphsHeap {
 /// sealed one. Where blocks of one shape read layer scales, which the plan
 /// does not know, they are apart: what holds a load to a budget reads
 /// `at_most`, and what is held to the load's own holding reads `at_least`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlannedSealedGraphs {
     /// No load seals more: every block that reads a layer scale counted
     /// with plans of its own (`UnreadScales::Distinct`).

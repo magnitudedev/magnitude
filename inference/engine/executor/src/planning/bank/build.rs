@@ -1,5 +1,5 @@
 use super::{BankGroup, BankLayer, BankLayers, BankSites, BankTable, ExpertBankPlan, HintWeight, HostTier, NonEmpty, RecordForm, RoutedTensor, routed_experts};
-use super::conveyor::BankStructure;
+use super::conveyor;
 use super::records::{record_tensor, routed_layers};
 use super::table::stored_table_heads;
 use crate::error::{PlanError, UnstreamedExperts};
@@ -136,23 +136,17 @@ impl ModelLoadPlan {
         // A conveyor or a scratch no record of its lender holds whole is
         // refused here, so every sizing past this may rely on them
         // (`ExpertBankPlan::prompt_records`).
-        let lending = BankStructure { groups: &groups, layers: &layers, selected, reservation, host }
-            .lending()
+        let structured = conveyor::Structured::new(selected, reservation, host, groups, layers)
             .map_err(PlanError::InvalidDefinition)?;
         let bank = ExpertBankPlan {
-            selected,
+            structured,
             slots,
             ceiling: slots,
-            reservation,
-            host,
             host_slots: 0,
             places,
             flights,
-            groups,
-            layers,
             tables,
             sites: BankSites::Unadmitted,
-            lending,
         };
         if slots < bank.floor() || slots > bank.widest().get() {
             return Err(PlanError::Topology(

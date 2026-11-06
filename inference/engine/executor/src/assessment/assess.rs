@@ -86,7 +86,7 @@ impl Residency {
                 bank.floor(),
                 bank.slots,
                 bank.widest(),
-                match bank.host {
+                match bank.host() {
                     crate::planning::HostTier::Linked(_) if bank.host_slots > 0 => ColdSource::HostTier { slots: bank.host_slots },
                     crate::planning::HostTier::Linked(_) => ColdSource::File(FileOnly::NoHostRoom),
                     crate::planning::HostTier::Unified => ColdSource::File(FileOnly::Unified),

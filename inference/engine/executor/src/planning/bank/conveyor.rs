@@ -129,6 +129,42 @@ pub(super) struct Lending {
     scratch: ScratchPlan,
 }
 
+/// A bank's structure with the lending derived from it: made only by
+/// [`Self::new`], which derives the lending, and never changed after, so its
+/// conveyor and scratch are always its structure's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Structured {
+    selected: u64,
+    reservation: seismic::Reservation,
+    host: HostTier,
+    groups: Vec<BankGroup>,
+    layers: BankLayers,
+    lending: Lending,
+}
+
+impl Structured {
+    /// The structure of `groups` over `layers`, `selected` experts a row,
+    /// records reserved as `reservation`, beside `host`, and its lending
+    /// ([`BankStructure::lending`]), or why no lender holds its conveyor or
+    /// its scratch whole.
+    pub(super) fn new(
+        selected: u64,
+        reservation: seismic::Reservation,
+        host: HostTier,
+        groups: Vec<BankGroup>,
+        layers: BankLayers,
+    ) -> Result<Self, String> {
+        let lending = BankStructure { groups: &groups, layers: &layers, selected, reservation, host }.lending()?;
+        Ok(Self { selected, reservation, host, groups, layers, lending })
+    }
+
+    /// Its parts, which [`Self::new`] makes a structure of again.
+    #[cfg(test)]
+    pub(super) fn into_parts(self) -> (u64, seismic::Reservation, HostTier, Vec<BankGroup>, BankLayers) {
+        (self.selected, self.reservation, self.host, self.groups, self.layers)
+    }
+}
+
 /// The part of a bank's plan its lending derives from: its groups and
 /// layers, the experts a row selects, its record reservation and its host
 /// tier, none of which changes once the plan is made.
@@ -144,13 +180,53 @@ pub(super) struct BankStructure<'a> {
 impl ExpertBankPlan {
     /// The structure its lending derives from ([`BankStructure`]).
     pub(super) fn structure(&self) -> BankStructure<'_> {
+        let structured = &self.structured;
         BankStructure {
-            groups: &self.groups,
-            layers: &self.layers,
-            selected: self.selected,
-            reservation: self.reservation,
-            host: self.host,
+            groups: &structured.groups,
+            layers: &structured.layers,
+            selected: structured.selected,
+            reservation: structured.reservation,
+            host: structured.host,
         }
+    }
+
+    /// `K`: the experts a row selects.
+    pub fn selected(&self) -> u64 {
+        self.structured.selected
+    }
+
+    /// How the device reserves each record tensor: the granule its
+    /// committed bytes are backed and charged in, and whether the host can
+    /// read into them in place (what reading the conveyor into records lent
+    /// it needs, [`Self::conveyor`]).
+    pub fn reservation(&self) -> seismic::Reservation {
+        self.structured.reservation
+    }
+
+    /// How the host tier is held on the device (`platform::host_tier`): a
+    /// bank streams only beside one, so a device without one holds its
+    /// experts resident or is refused (`UnstreamedExperts::Untiered`), and
+    /// every bank has a store its conveyor lies in. The tier is every miss's first store,
+    /// inclusive of the bank, in the bank's own form: each group's record
+    /// tensors again, resident as the device holds them, reserved in the
+    /// tier's storage for every expert of the group's layers
+    /// ([`Self::host_extent`]) and committed by host slots
+    /// ([`Self::host_records`]), so the host lands file misses into it and
+    /// the device reads it in place; where it lies across a link the host
+    /// also promotes from it by a pure copy on the copy engine
+    /// (`watcher::promotions`), and nothing is written back.
+    pub fn host(&self) -> HostTier {
+        self.structured.host
+    }
+
+    /// Its groups of layers of one record form.
+    pub fn groups(&self) -> &[BankGroup] {
+        &self.structured.groups
+    }
+
+    /// Every streamed routed layer, in decoder order.
+    pub fn layers(&self) -> &BankLayers {
+        &self.structured.layers
     }
 
     /// [`BankStructure::conveyor_records`].
@@ -176,18 +252,18 @@ impl ExpertBankPlan {
     /// together, from its bottom records ([`Self::scratch`]), so its lent
     /// records are both's.
     pub fn conveyor(&self) -> &ConveyorPlan {
-        &self.lending.conveyor
+        &self.structured.lending.conveyor
     }
 
     /// Where the scratch lies ([`BankStructure::scratch`]).
     pub fn scratch(&self) -> &ScratchPlan {
-        &self.lending.scratch
+        &self.structured.lending.scratch
     }
 
     /// The group whose records carry the conveyor and the scratch
     /// ([`BankStructure::lender_group`]).
     pub(super) fn lender_group(&self) -> usize {
-        self.lending.scratch.lender.group
+        self.structured.lending.scratch.lender.group
     }
 
     /// The first record of group `group` a prompt group's seeds take, and

@@ -605,10 +605,10 @@ impl AttestedPrograms {
     /// first layer's bank entries': every layer of a group shares its
     /// binding.
     pub(crate) fn expert_bank_moves(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<super::BankMoves>, String> {
-        plan.groups
+        plan.groups()
             .iter()
             .map(|group| {
-                let layer = &plan.layers[group.layers[0]];
+                let layer = &plan.layers()[group.layers[0]];
                 let (scope, index) = (layer.scope, layer.sublayer());
                 self.target
                     .blocks
@@ -627,7 +627,7 @@ impl AttestedPrograms {
     pub fn sited_layers(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<crate::planning::LayerSite>, String> {
         use crate::planning::LayerSite;
         let sites = self.expert_bank_sites(plan)?;
-        plan.layers
+        plan.layers()
             .iter()
             .zip(sites)
             .map(|(layer, site)| {
@@ -647,7 +647,7 @@ impl AttestedPrograms {
     /// (`ExpertBankKernels::site`: its form and its admission),
     /// else none.
     pub(crate) fn expert_bank_sites(&self, plan: &crate::ExpertBankPlan) -> Result<Vec<Option<super::BankSite>>, String> {
-        plan.layers
+        plan.layers()
             .iter()
             .map(|layer| {
                 let (scope, index) = (layer.scope, layer.sublayer());

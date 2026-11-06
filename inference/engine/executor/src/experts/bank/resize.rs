@@ -480,7 +480,7 @@ impl ExpertBank {
         let join = {
             let plan = plan.clone();
             move |at: u64| -> Result<Join, String> {
-                let counts = (0..plan.groups.len()).map(|group| records(&plan, group, at));
+                let counts = (0..plan.groups().len()).map(|group| records(&plan, group, at));
                 match &landed {
                     None => Ok(Join::Bank {
                         records: counts
@@ -607,11 +607,11 @@ impl ExpertBank {
     fn landed_cuts(&self, (shallowest, deepest): (u64, u64)) -> Result<Candidates, DomainError> {
         assert!(deepest <= shallowest, "a shrink's deepest cut {deepest} lies below its shallowest {shallowest}");
         let slots = |slots: u64| usize::try_from(slots).map_err(|_| DomainError::invariant("bank slots exceed the host"));
-        for group in 0..self.plan.groups.len() {
+        for group in 0..self.plan.groups().len() {
             u32::try_from(self.counts.landed_records(group, shallowest))
                 .map_err(|_| DomainError::invariant("the records the host lands into exceed u32"))?;
         }
-        let (counts, groups) = (self.counts.clone(), self.plan.groups.len());
+        let (counts, groups) = (self.counts.clone(), self.plan.groups().len());
         Ok(Candidates {
             shallowest: slots(shallowest)?,
             deepest: slots(deepest)?,
@@ -719,7 +719,7 @@ impl ExpertBank {
 
     /// Each group's records at `slots` slots.
     fn committed_records(&self, slots: u64) -> Result<Vec<usize>, DomainError> {
-        (0..self.plan.groups.len())
+        (0..self.plan.groups().len())
             .map(|group| {
                 usize::try_from(self.counts.records_at(group, slots))
                     .map_err(|_| DomainError::invariant("bank records exceed the host"))
@@ -735,8 +735,8 @@ impl ExpertBank {
 
     /// Each record tensor's group, in resizer order.
     fn record_groups(&self) -> Vec<usize> {
-        (0..self.plan.groups.len())
-            .flat_map(|group| std::iter::repeat_n(group, self.plan.groups[group].record.form().tensors().len()))
+        (0..self.plan.groups().len())
+            .flat_map(|group| std::iter::repeat_n(group, self.plan.groups()[group].record.form().tensors().len()))
             .collect()
     }
 
@@ -883,7 +883,7 @@ impl ExpertBank {
             // grow with the slots, so the shallowest candidate's fitting the
             // host fits them all.
             self.committed_records(shallowest)?;
-            let (counts, groups) = (self.counts.clone(), self.plan.groups.len());
+            let (counts, groups) = (self.counts.clone(), self.plan.groups().len());
             let candidates = Candidates {
                 shallowest: count(shallowest)?,
                 deepest: count(deepest)?,
