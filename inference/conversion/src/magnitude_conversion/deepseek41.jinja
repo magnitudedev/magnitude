@@ -1,0 +1,166 @@
+{#- DeepSeek V4.1's chat format, translated from the checkpoint's own encoding (deepseek-ai/DeepSeek-V4.1-Flash-1017
+    at 1bae0e10, encoding/encoding.py, encode_messages). Arguments: enable_thinking (default true; false is the
+    encoding's "chat" mode), reasoning_effort (an integer 1-100, or "low" 50, "high" 75, "max" 100; default "high")
+    and drop_thinking (default true). Top-level tools attach to a leading system message, or to a new empty one, as
+    in DeepSeek's own port (deepseek-ai/DeepSeek-V4.1-Flash, chat_template.jinja). -#}
+{%- set thinking = enable_thinking is not defined or enable_thinking is none or enable_thinking -%}
+{%- set drop_requested = drop_thinking is not defined or drop_thinking is none or drop_thinking -%}
+{%- set effort = "high" if reasoning_effort is not defined or reasoning_effort is none else reasoning_effort -%}
+{#- encoding.py:448-474 -#}
+{%- if effort is string and effort == "low" -%}{%- set budget = 50 -%}
+{%- elif effort is string and effort == "high" -%}{%- set budget = 75 -%}
+{%- elif effort is string and effort == "max" -%}{%- set budget = 100 -%}
+{%- elif effort is integer and effort is not boolean and effort >= 1 and effort <= 100 -%}{%- set budget = effort -%}
+{%- else -%}{{- raise_exception("Invalid reasoning effort: an integer within [1, 100] or one of low, high, max") -}}
+{%- endif -%}
+
+{#- Text content: a string, or its text parts joined by blank lines (encoding.py:387-393, :655). -#}
+{%- macro text(content) -%}
+    {%- if content is string -%}{{- content -}}
+    {%- elif content is not none and content is not mapping and content is iterable -%}
+        {%- set parts = namespace(texts=[]) -%}
+        {%- for part in content -%}
+            {%- if part.type != "text" -%}{{- raise_exception("Only text content parts are supported") -}}{%- endif -%}
+            {%- set parts.texts = parts.texts + [part.text] -%}
+        {%- endfor -%}
+        {{- parts.texts | join("\n\n") -}}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. A run of user and tool messages is one user turn of text and tool-result blocks (encoding.py:184-230). It
+    starts a new turn only with a text block (:562-582). -#}
+{%- set merged = namespace(list=[], blocks=[], spoken=false, open=false) -%}
+{%- for m in messages -%}
+    {%- if m.role == "user" or m.role == "tool" -%}
+        {%- if not merged.open -%}
+            {%- set merged.blocks = [] -%}
+            {%- set merged.spoken = false -%}
+            {%- set merged.open = true -%}
+        {%- endif -%}
+        {%- if m.role == "user" -%}
+            {%- set merged.blocks = merged.blocks + [{"tool": false, "text": text(m.content)}] -%}
+            {%- set merged.spoken = true -%}
+        {%- else -%}
+            {%- set merged.blocks = merged.blocks + [{"tool": true, "id": m.tool_call_id or "", "text": text(m.content)}] -%}
+        {%- endif -%}
+    {%- else -%}
+        {%- if merged.open -%}
+            {%- set merged.list = merged.list + [{"role": "user", "blocks": merged.blocks, "spoken": merged.spoken}] -%}
+            {%- set merged.open = false -%}
+        {%- endif -%}
+        {%- if m.role == "system" or m.role == "latest_reminder" -%}
+            {%- set merged.list = merged.list + [{"role": m.role, "content": text(m.content)}] -%}
+        {%- elif m.role == "assistant" -%}
+            {%- set merged.list = merged.list + [{"role": "assistant", "content": text(m.content), "reasoning": m.reasoning_content or "", "calls": m.tool_calls or []}] -%}
+        {%- else -%}
+            {{- raise_exception("Unknown role: " ~ m.role) -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if merged.open -%}
+    {%- set merged.list = merged.list + [{"role": "user", "blocks": merged.blocks, "spoken": merged.spoken}] -%}
+{%- endif -%}
+{%- set has_tools = tools is defined and tools is not none and tools | length > 0 -%}
+{%- if has_tools and (merged.list | length == 0 or merged.list[0].role != "system") -%}
+    {%- set merged.list = [{"role": "system", "content": ""}] + merged.list -%}
+{%- endif -%}
+{%- set msgs = merged.list -%}
+
+{#- 2. The last user turn: a spoken user turn, or a system message after the first (encoding.py:562-582). Declared
+    tools keep every turn's reasoning (:785-788). -#}
+{%- set state = namespace(last_user=-1) -%}
+{%- for m in msgs -%}
+    {%- if (m.role == "user" and m.spoken) or (m.role == "system" and loop.index0 > 0) -%}
+        {%- set state.last_user = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set drop = drop_requested and not has_tools -%}
+
+{#- 3. Each message (encoding.py:585-742). -#}
+{{- "<｜begin▁of▁sentence｜>" -}}
+{%- set calls = namespace(ids=[], named=false) -%}
+{%- for m in msgs -%}
+    {%- set i = loop.index0 -%}
+    {%- if i == 0 and (thinking or m.role == "system") -%}{{- "<｜System｜>" -}}{%- endif -%}
+    {%- if i == 0 and thinking -%}
+        {{- "Reasoning Effort: " ~ budget ~ " (range 1-100, the higher the value, the more thorough the reasoning)\n\n" -}}
+    {%- endif -%}
+    {%- if m.role == "system" -%}
+        {%- if i > 0 -%}{{- "<｜System｜>" -}}{%- endif -%}
+        {{- m.content -}}
+        {%- if i == 0 and has_tools -%}
+            {%- set schemas = namespace(list=[]) -%}
+            {%- for tool in tools -%}{%- set schemas.list = schemas.list + [tool.function | tojson] -%}{%- endfor -%}
+            {{- "\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n" -}}
+            {{- schemas.list | join("\n") -}}
+            {{- "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n" -}}
+        {%- endif -%}
+    {%- elif m.role == "user" -%}
+        {{- "<｜User｜>" -}}
+        {#- Tool results in the order of the latest assistant's calls, stably (encoding.py:233-266). -#}
+        {%- set results = namespace(list=[], count=0) -%}
+        {%- for b in m.blocks if b.tool -%}{%- set results.count = results.count + 1 -%}{%- endfor -%}
+        {%- if results.count > 1 and calls.named -%}
+            {%- for rank in range(calls.ids | length) -%}
+                {%- for b in m.blocks if b.tool -%}
+                    {%- set order = namespace(rank=0) -%}
+                    {%- for id in calls.ids -%}
+                        {%- if id and id == b.id -%}{%- set order.rank = loop.index0 -%}{%- endif -%}
+                    {%- endfor -%}
+                    {%- if order.rank == rank -%}{%- set results.list = results.list + [b] -%}{%- endif -%}
+                {%- endfor -%}
+            {%- endfor -%}
+        {%- else -%}
+            {%- for b in m.blocks if b.tool -%}{%- set results.list = results.list + [b] -%}{%- endfor -%}
+        {%- endif -%}
+        {%- set out = namespace(parts=[], next=0) -%}
+        {%- for b in m.blocks -%}
+            {%- if b.tool -%}
+                {%- set out.parts = out.parts + ["<tool_result>" ~ results.list[out.next].text ~ "</tool_result>"] -%}
+                {%- set out.next = out.next + 1 -%}
+            {%- else -%}
+                {%- set out.parts = out.parts + [b.text] -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {{- out.parts | join("\n\n") -}}
+    {%- elif m.role == "latest_reminder" -%}
+        {{- "<｜latest_reminder｜>" ~ m.content -}}
+    {%- else -%}
+        {%- if thinking and (not drop or i > state.last_user) -%}{{- m.reasoning ~ "</think>" -}}{%- endif -%}
+        {{- m.content -}}
+        {%- if m.calls | length > 0 -%}
+            {#- DSML calls (encoding.py:524-555, :669-683). -#}
+            {%- set invokes = namespace(list=[]) -%}
+            {%- for call in m.calls -%}
+                {%- set arguments = call.function.arguments -%}
+                {%- if arguments is not mapping -%}{%- set arguments = {"arguments": arguments} -%}{%- endif -%}
+                {%- set parameters = namespace(list=[]) -%}
+                {%- for key, value in arguments.items() -%}
+                    {%- if value is string -%}
+                        {%- set parameters.list = parameters.list + ["<｜DSML｜ parameter name=\"" ~ key ~ "\" string=\"true\">" ~ value ~ "</｜DSML｜ parameter>"] -%}
+                    {%- else -%}
+                        {%- set parameters.list = parameters.list + ["<｜DSML｜ parameter name=\"" ~ key ~ "\" string=\"false\">" ~ (value | tojson) ~ "</｜DSML｜ parameter>"] -%}
+                    {%- endif -%}
+                {%- endfor -%}
+                {%- set invokes.list = invokes.list + ["<｜DSML｜ invoke name=\"" ~ call.function.name ~ "\">\n" ~ (parameters.list | join("\n")) ~ "\n</｜DSML｜ invoke>"] -%}
+            {%- endfor -%}
+            {{- "\n\n<｜DSML｜ calls>\n" ~ (invokes.list | join("\n")) ~ "\n</｜DSML｜ calls>" -}}
+            {%- set calls.ids = [] -%}
+            {%- set calls.named = false -%}
+            {%- for call in m.calls -%}
+                {%- set calls.ids = calls.ids + [call.id or ""] -%}
+                {%- if call.id -%}{%- set calls.named = true -%}{%- endif -%}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- "<｜end▁of▁sentence｜>" -}}
+    {%- endif -%}
+    {#- The assistant header after a turn that an assistant reply follows, or that ends the prompt. -#}
+    {%- if loop.last -%}
+        {%- set answered = add_generation_prompt is defined and add_generation_prompt -%}
+    {%- else -%}
+        {%- set answered = msgs[i + 1].role in ["assistant", "latest_reminder"] -%}
+    {%- endif -%}
+    {%- if answered and (m.role == "user" or (m.role == "system" and i > 0)) -%}
+        {{- "<｜Assistant｜>" ~ ("<think>" if thinking and (not drop or i >= state.last_user) else "</think>") -}}
+    {%- endif -%}
+{%- endfor -%}

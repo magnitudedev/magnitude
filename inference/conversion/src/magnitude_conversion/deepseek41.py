@@ -39,6 +39,9 @@ UE8M0 = "ue8m0"
 MAX_UE8M0 = 246  # the largest byte whose E4M3 products are exact in F32 (`inference/docs/precision.md`)
 ALIGNMENT = 4096
 _EXPERT_SCALE = re.compile(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.scale$")
+# The checkpoint states its chat format only as Python (`encoding/encoding.py`), which no GGUF reader runs. The text
+# file carries its Jinja translation.
+CHAT_TEMPLATE = (Path(__file__).parent / "deepseek41.jinja").read_text(encoding="utf-8")
 
 
 def scale_name(weight_name: str) -> str:
@@ -228,6 +231,12 @@ class DeepseekV41(_NativeFp8, DeepseekV41Model):
 
     def _tensor_part(self, name: str) -> Path:
         return super()._tensor_part(self._source_name.get(name, name))
+
+    def set_vocab(self):
+        super().set_vocab()
+        # The encoding defines the format, so its translation replaces any template the checkpoint ships
+        self.gguf_writer.remove_key(gguf.Keys.Tokenizer.CHAT_TEMPLATE)
+        self.gguf_writer.add_chat_template(CHAT_TEMPLATE)
 
     def _engram_layers(self) -> tuple[list[int], list[int]]:
         """(source ids, ids in this file) of the Engram layers this file holds."""
