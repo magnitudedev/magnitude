@@ -2300,16 +2300,22 @@ fn external_bindings_are_checked_at_attach() {
 /// `gated_sum` by the portable body (the reference interpreter).
 fn portable_gated_sum(values: &[f32]) -> f32 {
     use seismic_lang::{
-        checked::{SourceFile, SourceSet, check_source},
+        checked::{SourceFile, SourceSet},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
         types::DType,
     };
-    let module = check_source(SourceSet::new(vec![SourceFile {
-        path: "conditional.seismic".into(),
-        text: include_str!("../fixtures/conditional.seismic").into(),
-    }]))
+    // Its native declarations' sources are read beside it.
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let fixtures = std::path::Path::new(&manifest).join("fixtures");
+    let module = seismic_lang::source::check_beside(
+        SourceSet::new(vec![SourceFile {
+            path: "conditional.seismic".into(),
+            text: include_str!("../fixtures/conditional.seismic").into(),
+        }]),
+        &fixtures,
+    )
     .expect("the conditional fixture checks");
     let logical = module
         .entry(
