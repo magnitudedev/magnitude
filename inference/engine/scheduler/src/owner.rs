@@ -762,6 +762,17 @@ impl Ladder {
         !self.owed && !self.pending.any() && !self.deferred && !self.covered
     }
 
+    /// A walk down the rungs begins: what it finds covered is its own.
+    fn walk(&mut self) {
+        self.covered = false;
+    }
+
+    /// Whether the model unloads: Reclaim in `condition` outlasted the clock
+    /// at `now` with nothing of the ladder in motion.
+    fn unload_due(&self, condition: MemoryCondition, now: u64) -> bool {
+        self.settled() && condition.should_unload(now)
+    }
+
     /// At a flight boundary: whether a release was deferred to it, which is
     /// tried again now.
     fn retry_deferred(&mut self) -> bool {
@@ -1851,17 +1862,13 @@ trait MemoryStep: MemoryHost + Sized {
         // last rung (`release::Rung`): while a flight holds the bindings, the
         // releases owed to it have not run yet, while one is pending it has
         // not finished, and one deferred for a gap is tried again at the next
-        // boundary, so the decision waits for them.
+        // boundary, so the decision waits for them. What the host has yet to
+        // show released is awaited, never released again: only a reading,
+        // the witness's fall or more taken than is credited, moves the
+        // ladder past it (`MemoryPace`).
         let now = self.now();
-        // Reclaim outlasted the clock on what was released: the bank is asked
-        // again on the reading alone (`MemoryPace::lapse_credit`).
-        if self.memory().ladder.covered && self.memory().condition.should_unload(now) {
-            self.domain().lapse_expert_reclaim_credit();
-            self.memory().condition = self.memory().condition.released(now);
-            self.memory().ladder.covered = false;
-            self.memory().ladder.owed = true;
-        }
-        if self.memory().ladder.settled() && self.memory().condition.should_unload(now) {
+        let condition = self.memory().condition;
+        if self.memory().ladder.unload_due(condition, now) {
             self.unload();
             return Ok(true);
         }
@@ -2201,7 +2208,7 @@ trait MemoryStep: MemoryHost + Sized {
     /// every request waiting on memory to become resident is refused.
     fn release_for_reclaim(&mut self, bindings: &mut StateBindings) -> Result<bool, RequestError> {
         let mut released = false;
-        self.memory().ladder.covered = false;
+        self.memory().ladder.walk();
         let held = self.held_prefixes();
         while self.reclaim_needed()?
             && self
@@ -4534,7 +4541,7 @@ mod pending_retention_tests {
 
 #[cfg(test)]
 mod ladder_tests {
-    use super::{Ladder, Release, RoomOwed};
+    use super::{Ladder, MEMORY_ESCALATION_NS, MemoryCondition, Release, RoomOwed};
 
     /// A probe with no resize under way owes the claim one decision, taken
     /// at the first boundary that can decide it, however many observations
@@ -4598,6 +4605,37 @@ mod ladder_tests {
         let mut ladder = Ladder::default();
         ladder.released(Release::Covered);
         assert!(!ladder.settled());
+    }
+
+    /// A release the host has yet to show is waited on however long
+    /// Reclaim lasts: the clock neither unloads the model nor asks the bank
+    /// again for what it released (Metal unwires a released slab 0.47 s to
+    /// over 3 s after its release, past the 1 s clock), so one deficit is
+    /// released once.
+    #[test]
+    fn a_release_the_host_has_yet_to_show_is_never_released_again() {
+        let mut ladder = Ladder::default();
+        ladder.released(Release::Covered);
+        let condition = MemoryCondition::Reclaim { since: 0 };
+        for now in [0, MEMORY_ESCALATION_NS, 3 * MEMORY_ESCALATION_NS] {
+            assert!(!ladder.unload_due(condition, now), "at {now} ns");
+        }
+    }
+
+    /// More taken than is credited is real pressure however the credited
+    /// release fares: the next walk finds it short and, every rung spent,
+    /// the model unloads once Reclaim outlasts the clock.
+    #[test]
+    fn pressure_past_a_release_the_host_never_shows_unloads() {
+        let mut ladder = Ladder::default();
+        ladder.released(Release::Covered);
+        let condition = MemoryCondition::Reclaim { since: 0 };
+        assert!(!ladder.unload_due(condition, MEMORY_ESCALATION_NS));
+        // A reading short past the credit walks the rungs again, to the last.
+        ladder.walk();
+        ladder.released(Release::Nothing);
+        assert!(!ladder.unload_due(condition, MEMORY_ESCALATION_NS - 1));
+        assert!(ladder.unload_due(condition, MEMORY_ESCALATION_NS));
     }
 }
 

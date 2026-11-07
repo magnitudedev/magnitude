@@ -993,11 +993,16 @@ impl ResizeHeld {
 /// available memory, counting it, rises only as a release shows and falls
 /// only as the host takes. So no lag makes a release answer the same
 /// pressure twice, and a release that lands in a span in which the host
-/// takes as much is seen, not credited until the credit lapses: a shrink
+/// takes as much is seen, not credited: a shrink
 /// covers what the reading is below the planning line, plus what the host
 /// takes until the next shrink takes effect, less what is unseen and what the
 /// process released since the reading. What that covers is awaited, not
-/// released again ([`Shortfall::Covered`]). Where no witness is read, a
+/// released again ([`Shortfall::Covered`]), however long the host takes to
+/// show it: the pace alone decides when a release has answered its deficit,
+/// and no clock releases for it a second time. A release the witness never
+/// drops stays credited while memory is short; more taken than is credited
+/// is short past it, so pressure still escalates down the ladder to the
+/// model's unload. Where no witness is read, a
 /// release is taken as shown at the reading after it. A span across a fall
 /// of the charge measures no taking.
 ///
@@ -1254,18 +1259,6 @@ impl MemoryPace {
         match projected(below, pace.rate, self.horizon()).saturating_sub(released) {
             0 => Shortfall::Covered,
             short => Shortfall::Short(short),
-        }
-    }
-
-    /// Reclaim outlasted the unload clock on what is unseen: everything
-    /// released is taken as shown, and the next decision stands on its
-    /// reading alone. A release whose pages the system keeps counting for
-    /// the process (its footprint never falls by it) would be awaited
-    /// forever without this.
-    fn lapse_credit(&mut self) {
-        for pace in self.domains.values_mut() {
-            pace.available -= pace.unseen;
-            pace.unseen = 0;
         }
     }
 

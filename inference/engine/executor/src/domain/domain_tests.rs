@@ -1441,8 +1441,7 @@ fn only_what_the_witness_has_yet_to_drop_is_credited() {
 }
 
 /// A release after the reading a decision uses is credited too; a reading
-/// above the line ends what is owed, so pressure after it stands alone; and a
-/// lapsed credit leaves the reading alone.
+/// above the line ends what is owed, so pressure after it stands alone.
 #[test]
 fn the_credit_counts_releases_after_the_reading_until_memory_is_above_the_line() {
     let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
@@ -1460,8 +1459,26 @@ fn the_credit_counts_releases_after_the_reading_until_memory_is_above_the_line()
     assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Short(PACE_GB), "the old release is not credited again");
     read_pace(&mut pace, store, 9 * PACE_GB, 16 * PACE_GB, 17 * PACE_GB, interval);
     assert_eq!(pace.shortfall(store, 16 * PACE_GB), Shortfall::Covered);
-    pace.lapse_credit();
-    assert_eq!(pace.shortfall(store, 16 * PACE_GB), Shortfall::Short(PACE_GB));
+}
+
+/// A release the witness never drops is awaited, never released again,
+/// however many readings it stays unseen; what the host takes past it is
+/// short, so pressure escalates past a release the host never shows.
+#[test]
+fn a_release_the_host_never_shows_yields_to_more_taken() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let interval = Duration::from_secs(3600);
+    let mut pace = MemoryPace::new();
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 20 * PACE_GB), Shortfall::Short(3 * PACE_GB));
+    // 3 GB released; the witness never falls by it.
+    for reading in 0..30 {
+        read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB, interval);
+        assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Covered, "reading {reading} after the release");
+    }
+    // The host takes a GB more.
+    read_pace(&mut pace, store, 6 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB, interval);
+    assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Short(PACE_GB));
 }
 
 /// The process's own release, unseen, is no taking by the host, and the
@@ -1483,7 +1500,7 @@ fn a_release_ends_the_measured_taking_until_a_span_after_it() {
 
 /// A release that lands in a span in which the host takes as much is seen by
 /// its witness's fall, not credited: the readings after it, flat below the
-/// line, are short by the whole deficit, not covered until the credit lapses.
+/// line, are short by the whole deficit, not covered.
 /// (On a GB10 under a press, a 0.97 GB release landed as the press fell; the
 /// load then read itself 0.65 GB below the line for 0.9 s and released
 /// nothing.)

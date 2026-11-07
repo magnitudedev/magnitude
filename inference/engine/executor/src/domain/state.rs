@@ -879,9 +879,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// first slot a reserved buffer released was not unwired within 3 s).
     /// The count is the host's, the process's own wired size counting none
     /// of the residency set's: another program wiring memory in the span
-    /// holds a release unseen until the credit lapses, and one unwiring
-    /// shows it early. Any other device's allocations are pages of the
-    /// process, so its footprint (`seismic::ProcessMemory`), which the
+    /// holds a release unseen, credited until the host takes more than it,
+    /// and one unwiring shows it early. Any other device's allocations are
+    /// pages of the process, so its footprint (`seismic::ProcessMemory`), which the
     /// system frees as they leave it (a GB10's fell by each bank slot within
     /// its release). None where the system reports neither.
     fn host_witness(&self, readings: &[crate::platform::DomainReading]) -> Option<u64> {
@@ -1474,11 +1474,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let mut read = shortfalls.iter().flatten();
         read.clone().any(|shortfall| *shortfall == super::Shortfall::Covered)
             && !read.any(|shortfall| matches!(shortfall, super::Shortfall::Short(_)))
-    }
-
-    /// Take everything released as shown (`MemoryPace::lapse_credit`).
-    pub fn lapse_expert_reclaim_credit(&self) {
-        self.pace.borrow_mut().lapse_credit();
     }
 
     /// The store `kind` storage is placed in first; none where the
