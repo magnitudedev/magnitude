@@ -65,9 +65,10 @@ struct StreamPartial {
 // tile % tiles of down | inject (`tiles` a stream). It normalizes only its
 // stream, from that stream's square sums (the first row tile of a stream
 // publishes its inverses), so no threadgroup repeats another stream's norm,
-// and its outputs are F32 partial sums over the stream's packets. The last
-// threadgroup to arrive adds every output's S partials in stream order and
-// applies the epilogues.
+// and its outputs are F32 partial sums over the stream's packets. Each row
+// tile has its own arrival counter: the last of its S threadgroups to arrive
+// adds the tile's outputs' S partials in stream order and applies the
+// epilogues, so no one threadgroup adds every output after the launch.
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV
 template <uint ROWS, uint LANES>
 kernel void stream_mix_down_gemv(STREAM_MIX_DOWN_ARGUMENTS,
@@ -109,10 +110,15 @@ kernel void stream_mix_down_gemv(STREAM_MIX_DOWN_ARGUMENTS,
     }
     threadgroup uint last;
     const uint thread_index = sg * 32 + lane, threads = simdgroups * 32;
-    if (!arrive::last(arrivals, streams * tiles, &last, thread_index))
+    if (!arrive::last(arrivals + local, streams, &last, thread_index))
         return;
-    for (uint item = thread_index; item < rows * outputs; item += threads) {
-        const uint m = item / outputs, n = item % outputs;
+    // The tile's outputs: rows [first_output, first_output + count) of
+    // down | inject.
+    const uint first_output = local < t0 ? local * per : low_rows + (local - t0) * per;
+    const uint end = local < t0 ? min(first_output + per, low_rows) : min(first_output + per, outputs);
+    const uint count = end - first_output;
+    for (uint item = thread_index; item < rows * count; item += threads) {
+        const uint m = item / count, n = first_output + item % count;
         float sum = 0.0f;
         for (uint s = 0; s < streams; ++s)
             sum += partials[(ulong(m) * streams + s) * outputs + n];

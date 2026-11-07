@@ -97,10 +97,12 @@ fn repeat_rows[M, H, S](rows: &tensor[M, H] f32, scales: &tensor[S] f32) -> tens
 # Metal: the projection library's row classes (`lib/projection`). The GEMV
 # class splits K by stream: a threadgroup normalizes one stream (the first
 # row tile of each publishes its inverses) and projects it over a row tile
-# of down | inject into F32 partial sums, which the last threadgroup to
-# arrive adds in stream order through the epilogues. The batched GEMV (to 16
-# rows) reduces every stream's square sum in each threadgroup and normalizes
-# while staging; the first threadgroup publishes the inverses. Past 16 rows
+# of down | inject into F32 partial sums, which the last of a row tile's S
+# threadgroups to arrive adds in stream order through the epilogues (a
+# counter a row tile: a tile has at least one output, so outputs bound
+# them). The batched GEMV (to 16 rows) reduces every stream's square sum in
+# each threadgroup and normalizes while staging; the first threadgroup
+# publishes the inverses. Past 16 rows
 # `stage` publishes the normalized streams in A to scratch with the
 # inverses, one threadgroup per row and stream, and the GEMM reads them.
 native stream_mix_down for metal from "metal/stream_mix_down.metal":
@@ -109,7 +111,7 @@ native stream_mix_down for metal from "metal/stream_mix_down.metal":
     where H % 32 == 0 and C <= 1
     scratch normalized bytes (M * S * H * 2) when M > 16
     scratch partials bytes (M * S * (LR + C * S) * 4) when M < BATCH_FROM
-    scratch arrivals bytes (4) sync when M < BATCH_FROM
+    scratch arrivals bytes ((LR + C * S) * 4) sync when M < BATCH_FROM
     launch stream_mix_down_gemv when M < BATCH_FROM:
         params (SIMDGROUPS in [16, 8, 4, 2, 32] default 4, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32, 8] default 16)
         threadgroups (S * (ceil_div(LR, SIMDGROUPS * ROWS * 32 / LANES)
