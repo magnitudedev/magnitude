@@ -427,6 +427,7 @@ mod resource_template_tests {
             &state,
             plan.target(),
             limits,
+            crate::PassLaunches::whole_chain(limits),
         )
         .unwrap();
         let family = certificate.resources.storage.workspace;
@@ -605,7 +606,8 @@ mod resource_template_tests {
                 ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
             let certificate =
-                certify_target_family(backend, &load, &definition.decoder, &state, plan.target(), limits).unwrap();
+                certify_target_family(backend, &load, &definition.decoder, &state, plan.target(), limits, crate::PassLaunches::whole_chain(limits))
+                    .unwrap();
             let chained = &certificate.graphs.chained;
             if backend.graphs_update_in_flight() {
                 assert!(chained.is_empty(), "{backend:?}");
@@ -742,6 +744,7 @@ mod resource_template_tests {
                     &state,
                     plan.target(),
                     limits,
+                    crate::PassLaunches::whole_chain(limits),
                 )
                 .unwrap();
                 let geometry = &definition.decoder;

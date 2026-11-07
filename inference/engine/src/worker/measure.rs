@@ -375,7 +375,7 @@ pub fn measure_machine(
     };
     let records = KernelCache::measurement_records(&request.kernels);
     let (topology, executor) = (device.topology(), device.info());
-    let costs = ExecutorCosts::stored(topology, executor, &records).is_ok_and(|walked| walked.outstanding());
+    let costs = ExecutorCosts::stored(topology, executor, &records).ok().and_then(|walked| walked.outstanding());
     let outstanding = PointRequests::new(&request.kernels).outstanding(topology, executor, &request.storage, &records, costs);
     let outstanding = match outstanding {
         Ok(outstanding) => outstanding,

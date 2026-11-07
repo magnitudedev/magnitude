@@ -394,7 +394,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
     // Startup warms the optional head. Measure the unloaded baseline so both
     // cycles exercise the same lazy rebind and release lifecycle.
     domain
-        .release_idle_optional_components(&mut bindings)
+        .release_idle_optional_components(&mut bindings, &magnitude_executor::OptionalComponent::ALL)
         .unwrap();
     let baseline = charge(&domain);
     let mut first_cycle = None;
@@ -438,7 +438,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         assert!(charge(&domain) > baseline);
         let before = charge(&domain);
         let released = domain
-            .release_idle_optional_components(&mut bindings)
+            .release_idle_optional_components(&mut bindings, &magnitude_executor::OptionalComponent::ALL)
             .unwrap();
         let after = charge(&domain);
         assert!(released > 0, "optional component held no physical charge");

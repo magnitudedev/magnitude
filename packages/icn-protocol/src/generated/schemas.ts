@@ -3740,7 +3740,7 @@ export const StreamingResize = S.Union(
 export type StreamingResize = S.Schema.Type<typeof StreamingResize>
 export type StreamingResizeEncoded = S.Schema.Encoded<typeof StreamingResize>
 
-export const StreamingShrinkCause = S.Union(S.Literal("reclaim"), S.Literal("live_claim"), S.Literal("measurement"))
+export const StreamingShrinkCause = S.Union(S.Literal("reclaim"), S.Literal("live_claim"), S.Literal("rebalance"), S.Literal("measurement"))
 export type StreamingShrinkCause = S.Schema.Type<typeof StreamingShrinkCause>
 export type StreamingShrinkCauseEncoded = S.Schema.Encoded<typeof StreamingShrinkCause>
 

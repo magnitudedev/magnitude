@@ -71,11 +71,19 @@ or its identity, so a model never loaded has the same estimate as one loaded man
 - **What is measured is fixed per backend.** The measurement job's standing requests are the
   executor's cost walk, what its recorded graphs hold, the model store's read line, the device's
   convert at one reference record form, and, where a bank can have a host tier (a discrete device),
-  the host memory's read line with every CPU reading and a CPU site's lines at one reference form. They are measured first in every job, in one
-  10 s allocation with the walk's points (each point an equal part of the time left; nothing starts
-  past the deadline). Loads' own requests (CPU sites, shrink moves, their forms' converts, tier
-  copies, volume windows) are runtime: the job measures them after the standing requests, and no
-  estimate reads them.
+  the host memory's read line with every CPU reading and a CPU site's lines at one reference form.
+  They are measured first in every job, in one 10 s allocation with the walk's points (each point an
+  equal part of the time left; nothing starts past the deadline). Every load, banked or not, plans
+  and serves only on the executor's costs, waiting once per machine for the walk's required figures
+  (the probe, the launch graph's times and the composition chain), every later figure priced from
+  those read until it is. The walk keeps its order: the launch graph's host times wait for every
+  compile to end, so they follow the points measured while the kernels form, and the costs complete
+  as the formation ends either way. The job walks to the last required figure, then measures what a
+  streamed load's bank is priced by (the read line, the convert, a host tier's lines), then the rest
+  of the walk: a fresh machine's first job, which ends inside the walk, prices a streamed bank, and
+  the walk's later figures, priced closer without them, follow. Loads' own requests (CPU sites, shrink moves, their forms' converts, tier copies, volume
+  windows) are runtime: the job measures them after the standing requests, and no estimate reads
+  them.
 - **Storage.** The model store's volume is priced by one read line, `λ + b/D`: the job reads a
   probe file it keeps in the store (256 MiB, written once) past the file cache, timing full reads
   (32 readers of 1 MiB at once: `1/D`) and lone 128 KiB reads (`λ`, what one takes past its bytes

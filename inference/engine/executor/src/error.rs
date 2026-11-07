@@ -68,6 +68,11 @@ pub enum PlanError {
     WeightCap { cap: u64, needed: u64 },
     /// The load's routed experts cannot be streamed.
     Unstreamed(UnstreamedExperts),
+    /// The plan's settle has no prices for its holdings
+    /// (`planning::PlanPrices`): the machine's standing figures are not
+    /// measured yet (`pending`), or cannot be, with why. A load of it waits
+    /// for the measurement job, as its assessment does.
+    Unpriced { pending: bool, reason: String },
 }
 
 /// Why a load's routed experts cannot be streamed through an expert bank.
@@ -185,6 +190,8 @@ impl fmt::Display for PlanError {
                  its expert bank at its minimum, the records its steps need at once"
             ),
             Self::Unstreamed(reason) => write!(formatter, "experts cannot stream: {reason}"),
+            Self::Unpriced { pending: true, reason } => write!(formatter, "the plan's prices are pending: {reason}"),
+            Self::Unpriced { pending: false, reason } => write!(formatter, "the plan has no prices: {reason}"),
         }
     }
 }

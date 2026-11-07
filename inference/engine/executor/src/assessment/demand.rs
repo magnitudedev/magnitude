@@ -7,6 +7,20 @@
 //! load plans native preparation uses, and from the state layout the memory
 //! terms use for state and history bytes.
 //!
+//! A plan that banks its experts decodes its streamed layers in their
+//! streamed form (`operators::routed::streamed`) while its bank lacks any
+//! expert, which its demand is: each such layer's route resolves and hints
+//! (`routed_route_streamed`, `routed_select_streamed`), the first sets the
+//! run's step word (`routed_step`), each waits on its route's grid for its
+//! absent choices (`routed_tier_wait`), and a layer with a CPU site requests
+//! the CPU's choices (`routed_site_request`) and combines with its answer
+//! (`routed_output_project` and `routed_output_sited`, or the general
+//! form's down), all at any misses, none included. Where the backend's
+//! parks are submission boundaries (`BackendName::parks_in_kernels`), each
+//! tier wait's park, site request's publication and sited combine's park
+//! ends one ([`DecodeDemand::boundaries`]). A plan that holds its experts
+//! whole decodes its resident forms alone.
+//!
 //! Matmul FLOPs are 2 × the weight's logical elements per row (a multiply
 //! and an add per weight), of a routed tensor the selected experts' slabs.
 //! Attention FLOPs per row and token read are 2 · KV · G · (W_k + W_v): each
@@ -15,7 +29,7 @@
 //! their arithmetic per state element is the kernels', which no plan
 //! states.
 
-use super::launches::{operand_recipe, Declarations, Kernel, Launches};
+use super::launches::{operand_recipe, Declarations, Kernel, Launches, Words};
 use super::AssessmentError;
 use crate::operators::attention::graph::selected_segments;
 use crate::operators::gated_delta::graph::StepForm;
@@ -175,7 +189,22 @@ pub struct Call {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodeDemand {
     pub calls: Vec<Call>,
+    /// The submissions the step's calls end beyond its own: its streamed
+    /// layers' parks and publications where the backend's parks are
+    /// submission boundaries, each a submit and a wait beside device time.
+    pub boundaries: u64,
 }
+
+/// The words a banked plan's decode is encoded under, its streamed form: no
+/// layer's group whole (`POLICY_WHOLE` clear) and none resolved
+/// (`POLICY_RESOLVED` clear, the next layer's too), as while its bank lacks
+/// experts its host tier does not hold settled. A plan holding its experts
+/// whole binds no word.
+const STREAMED: &Words = &[
+    ("policy", magnitude_kernels::constants::POLICY_WHOLE, false),
+    ("policy", magnitude_kernels::constants::POLICY_RESOLVED, false),
+    ("next_policy", magnitude_kernels::constants::POLICY_RESOLVED, false),
+];
 
 fn demand_error(message: impl Into<String>) -> AssessmentError {
     AssessmentError::Demand(message.into())
@@ -330,10 +359,13 @@ fn join(parts: impl IntoIterator<Item = Work>) -> Result<Work, AssessmentError> 
 /// The step as it accumulates.
 struct Step<'a> {
     declarations: &'a Declarations,
+    /// The words its calls are encoded under ([`STREAMED`] of a banked plan).
+    words: &'static Words,
     /// Each entry's launches at each operand recipe and stated dimensions,
     /// resolved once.
     resolved: HashMap<(&'static str, OperandRecipe, Vec<(&'static str, u64)>), Launches>,
     calls: Vec<Call>,
+    boundaries: u64,
 }
 
 /// The operand recipe of the weights `work` reads, whole or as experts.
@@ -359,13 +391,21 @@ impl Step<'_> {
         let launches = match self.resolved.get(&key) {
             Some(launches) => launches.clone(),
             None => {
-                let launches = self.declarations.launches(kernel, key.1, dimensions)?;
+                let launches = self.declarations.launches(kernel, key.1, dimensions, self.words)?;
                 self.resolved.insert(key, launches.clone());
                 launches
             }
         };
         self.calls.push(Call { launches, work });
         Ok(())
+    }
+
+    /// A park or publication of a streamed layer: a submission boundary
+    /// where the backend's parks are, nothing where kernels wait in place.
+    fn park(&mut self) {
+        if !self.declarations.backend().parks_in_kernels() {
+            self.boundaries += 1;
+        }
     }
 }
 
@@ -641,13 +681,77 @@ fn sources(load: &ModelLoadPlan, scope: WeightScope) -> [(&'static str, u64); 1]
     [("XS", streamed::source_rows(load, scope))]
 }
 
+/// The routing of the routed layer of `scope` doing `work`: `resident` of a
+/// layer the load holds whole; of a streamed one its streamed form
+/// (`operators::routed::streamed`): the run's step word where the layer
+/// sets it (`routed_step`), its route `streamed` at its `AHEAD`, reading
+/// beside `work` the hinted weights of each layer it predicts
+/// (`ExpertBankPlan::predicted`), its tier wait on the route's grid
+/// (`routed_tier_wait`), after its park, and where the layer has a CPU site
+/// its request (`routed_site_request`), before its publication.
+fn route(
+    step: &mut Step<'_>,
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    resident: Kernel,
+    streamed: Kernel,
+    work: Work,
+) -> Result<(), AssessmentError> {
+    let Some((bank, index)) = streamed::served(load, scope) else {
+        return step.call(resident, work);
+    };
+    if bank.sets_step(index) {
+        step.call(Kernel::of::<kernels::routed_step::Entry>(), Work::default())?;
+    }
+    let layers = bank.layers();
+    let hinted = bank
+        .predicted(index)
+        .flat_map(|target| {
+            let layer = &layers[target];
+            layer.hinted.iter().filter_map(move |hint| hint.element.map(|element| (layer.scope, hint.kind, element)))
+        })
+        .map(|(scope, kind, element)| planned(load, scope, kind, element))
+        .collect::<Result<Vec<_>, _>>()?;
+    step.call_with(streamed, &[("AHEAD", bank.ahead(index))], join([work, projection(&hinted)?])?)?;
+    step.park();
+    step.call(Kernel::of::<kernels::routed_tier_wait::Entry>(), Work::default())?;
+    if bank.sited(index) {
+        step.call(Kernel::of::<kernels::routed_site_request::Entry>(), Work::default())?;
+        step.park();
+    }
+    Ok(())
+}
+
+/// The combine of the routed layer of `scope` doing `work`: of a layer
+/// with a CPU site, its streamed form's projections (`project`) and their
+/// sum (`sited`) after its park, which waits for the CPU's answer; of any
+/// other, `resident`. Each reads its choices by the layer's sources.
+fn combine(
+    step: &mut Step<'_>,
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    [resident, project, sited]: [Kernel; 3],
+    work: Work,
+) -> Result<(), AssessmentError> {
+    let sources = sources(load, scope);
+    match streamed::served(load, scope).filter(|(bank, index)| bank.sited(*index)) {
+        None => step.call_with(resident, &sources, work),
+        Some(_) => {
+            step.call_with(project, &sources, work)?;
+            step.park();
+            step.call(sited, Work::default())
+        }
+    }
+}
+
 /// `operators::routed::graph` at decode rows in `scope`: the shared
 /// expert's expansion (`dense_expand`, or `dense_up` up-only) and down
 /// projection onto the sum's root (`dense_output`), selection
 /// (`routed_select`), the latent projections (`project_rows`,
 /// `dense_output`), and the selected experts' expansion (`routed_gate_up`,
-/// or `routed_up` up-only) and down projection (`routed_down`). Its input
-/// is the caller's.
+/// or `routed_up` up-only) and down projection (`routed_down`), a streamed
+/// layer's selection and down in its streamed form ([`route`],
+/// [`combine`]). Its input is the caller's.
 fn general_routed(
     step: &mut Step<'_>,
     load: &ModelLoadPlan,
@@ -670,8 +774,12 @@ fn general_routed(
             projection(&[weight(WeightKind::SharedDown, down)?])?,
         )?;
     }
-    step.call(
+    route(
+        step,
+        load,
+        scope,
         Kernel::of::<kernels::routed_select::Entry>(),
+        Kernel::of::<kernels::routed_select_streamed::Entry>(),
         projection(&[weight(WeightKind::Router, binding.router)?])?,
     )?;
     if let Some((down, up)) = binding.latent {
@@ -702,9 +810,15 @@ fn general_routed(
             ..Work::default()
         },
     )?;
-    step.call_with(
-        Kernel::of::<kernels::routed_down::Entry>(),
-        &sources,
+    combine(
+        step,
+        load,
+        scope,
+        [
+            Kernel::of::<kernels::routed_down::Entry>(),
+            Kernel::of::<kernels::routed_down_project::Entry>(),
+            Kernel::of::<kernels::routed_down_sited::Entry>(),
+        ],
         Work {
             experts: Some(chosen(&[weight(
                 WeightKind::ExpertDown,
@@ -864,8 +978,13 @@ impl DecodeDemand {
         let target = program.target();
         let mut step = Step {
             declarations,
+            words: match load.expert_bank() {
+                Some(_) => STREAMED,
+                None => &[],
+            },
             resolved: HashMap::new(),
             calls: Vec::new(),
+            boundaries: 0,
         };
 
         let embedding = target.embedding();
@@ -1111,7 +1230,9 @@ impl DecodeDemand {
                 // (`routed_expand`); or routing with the shared expert's
                 // gate/up (`routed_route_shared`), then the choices'
                 // (`routed_gate_up`). Then the choices' and the shared
-                // expert's down projections (`routed_output`).
+                // expert's down projections (`routed_output`). A streamed
+                // layer routes and combines in its streamed form ([`route`],
+                // [`combine`]).
                 FeedForwardProgramSlot::Routed(binding) => {
                     input(&mut step, scope, binding.norm)?;
                     let router = projection(&[weight(WeightKind::Router, binding.router)?])?;
@@ -1141,8 +1262,12 @@ impl DecodeDemand {
                             )?;
                         }
                         DecodeForm::SharedRoute => {
-                            step.call(
+                            route(
+                                &mut step,
+                                load,
+                                scope,
                                 Kernel::of::<kernels::routed_route_shared::Entry>(),
+                                Kernel::of::<kernels::routed_route_streamed::Entry>(),
                                 join([router, shared])?,
                             )?;
                             step.call_with(
@@ -1160,9 +1285,15 @@ impl DecodeDemand {
                         )?),
                         ..Work::default()
                     };
-                    step.call_with(
-                        Kernel::of::<kernels::routed_output::Entry>(),
-                        &sources,
+                    combine(
+                        &mut step,
+                        load,
+                        scope,
+                        [
+                            Kernel::of::<kernels::routed_output::Entry>(),
+                            Kernel::of::<kernels::routed_output_project::Entry>(),
+                            Kernel::of::<kernels::routed_output_sited::Entry>(),
+                        ],
                         join([
                             down,
                             projection(&[weight(WeightKind::SharedDown, binding.shared_down)?])?,
@@ -1319,7 +1450,7 @@ impl DecodeDemand {
                     .ok_or_else(|| demand_error("logits bytes overflow"))?,
             ),
         )?;
-        Ok(Self { calls: step.calls })
+        Ok(Self { calls: step.calls, boundaries: step.boundaries })
     }
 }
 

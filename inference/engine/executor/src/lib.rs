@@ -11,6 +11,7 @@ mod device_resources;
 mod device_table;
 pub mod diagnostics;
 pub mod watched;
+pub mod workload;
 mod domain;
 #[cfg(any(test, feature = "fixtures"))]
 pub use domain::fixtures;
@@ -63,8 +64,8 @@ pub use device_resources::{
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, ClaimRefusal, Growth, GrowthDecided, GrowthOffer, TableResidency, DeviceHeap, DomainError, Reclaimed, DomainRequirements, DomainReservation, ExecutorDomain,
-    ExpertMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, ShrinkCause, TierFill, ResidentStep,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, ClaimRefusal, BankCurve, Reach, BankGrant, BankRelease, OwnerHoldings, ServingSettlement, SizeStep, TableResidency, DeviceHeap, DomainError, Reclaimed, DomainRequirements, DomainReservation, ExecutorDomain,
+    ExpertMeasures, LoadCosts, LoadMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, ShrinkCause, TierFill, DecodeStep,
     HeadFlight, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
     ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
@@ -128,8 +129,8 @@ pub use planning::{
     ChargedDraft, EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, DraftedCharge, HeldCharge, HeldCharges,
     FeedForwardProgramSlot, FlightDepth, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     HostTablePlan, ImportProgramSlot, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,
-    MixerProgramSlot, ModelLoadPlan, NGramBinding, NoBank, NativeGraphCharge, ParallelBinding,
-    PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
+    MixerProgramSlot, ModelLoadPlan, NGramBinding, NoBank, PlanRoom, SettleRoom, NativeGraphCharge, ParallelBinding,
+    PassLaunches, PlanPrices, PlanSteps, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
     ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding, ResolvedPolicy,
     ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding,
     ScalableWeight, SealedGraphHostBytes, SelectionBinding, SelectionShape, SelectorBinding,

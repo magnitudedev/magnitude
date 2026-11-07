@@ -53,6 +53,37 @@ pub struct ResourceLimits {
     pub conversations: NonZeroUsize,
 }
 
+/// The most launches of a prompt group one merged-expert pass covers: its
+/// rows are a launch region's times these. It sizes the pass's merged
+/// experts and row table, which every group shares, and the pass graphs
+/// sealed at each length up to it; a group of more launches runs several
+/// passes. It is a priced holding (`domain::value::Holding::PassRows`): one
+/// launch is the least that is a pass, and each larger count is worth the
+/// prefill seconds its fewer passes save. The arena the launches' own graphs
+/// fix still bounds it (`group_pass_rows`), as do the chain's places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PassLaunches(NonZeroUsize);
+
+impl PassLaunches {
+    /// One launch a pass: the least that is a pass, and what a prompt
+    /// group's routed layers run when nothing more is granted.
+    pub const FLOOR: Self = Self(NonZeroUsize::MIN);
+
+    pub const fn new(launches: NonZeroUsize) -> Self {
+        Self(launches)
+    }
+
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+
+    /// As many launches as `limits`' chain holds: a pass over a whole
+    /// group, the most a pass can cover.
+    pub const fn whole_chain(limits: ResourceLimits) -> Self {
+        Self(limits.chain_capacity)
+    }
+}
+
 /// The most merged cells one image encodes, whatever its model declares and
 /// whatever its device: about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger
 /// image is resized down to it.

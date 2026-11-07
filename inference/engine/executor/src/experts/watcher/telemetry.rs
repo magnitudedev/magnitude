@@ -1244,11 +1244,7 @@ impl Telemetry {
                 Fed::Decode { counted } => stack.read(&read, counted),
                 Fed::Group { steps, merged, choices } => {
                     let depths = stack.read_group(&read, &choices);
-                    self.lock().facts.unions[read.layer] = Some(GroupUnion {
-                        steps,
-                        merged,
-                        experts: depths.into_iter().zip(choices).collect(),
-                    });
+                    self.lock().facts.unions[read.layer] = Some(GroupUnion::new(steps, merged, depths.into_iter().zip(choices).collect()));
                 }
             }
         }

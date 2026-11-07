@@ -33,15 +33,6 @@ pub(crate) fn releasing<E>(from: u64, floor: u64, bytes: u64, charge: impl Fn(u6
 /// where the holding is saturated or one more does not fit. A commitment's
 /// bytes never fall as it grows, so it is found by halving: `bytes` is
 /// asked `O(log(saturation − from))` times.
-///
-/// Whether the step is taken is the domain's (`expert_bank_growths`): where
-/// what `to` saves exceeds the holding's last resize. Two gaps of that rule:
-/// the decode's priced step is not monotone in the slots (its window lays
-/// misses out in whole steps, and the bank's slots change where a host-held
-/// miss is placed), so at a boundary where `to` saves too little a smaller
-/// step that would pay is not taken, and nothing grows; and the resize a
-/// holding last held, of one size, prices a resize of another until that
-/// one is measured.
 pub fn growth_target<E>(
     from: u64,
     saturation: u64,

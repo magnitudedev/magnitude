@@ -852,7 +852,10 @@ mod tests {
             move |wakes| {
                 let (domain, bindings) = banked(backend, 4, 4);
                 let owner = Owner::new(domain, bindings, limits, Arc::new(wakes) as Arc<dyn Wakes>)?;
-                Ok(Box::new(ExecutionOwner::new(owner, Arc::new(Plain), None)) as Box<dyn Driven<Stopped = UnloadCause>>)
+                // Priced by no kernel cache: every input unavailable.
+                let request = magnitude_executor::platform::DeviceRequest::Backend(backend);
+                let (pricing, _) = crate::execution::LoadPricing::fixture(request, true, None);
+                Ok(Box::new(ExecutionOwner::new(owner, Arc::new(Plain), pricing)) as Box<dyn Driven<Stopped = UnloadCause>>)
             },
             usize::MAX,
         );

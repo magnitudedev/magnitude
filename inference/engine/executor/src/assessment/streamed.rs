@@ -21,8 +21,13 @@
 //!   device's convert, all measured by the measurement job
 //!   ([`StreamedFigures`]).
 //! - **The step** is the one step model's ([`super::step`]) on `C`, the
-//!   resident plan's step, with no read ahead: a hint saves only what it
-//!   lands before its layer, which no stored figure prices.
+//!   step's compute in the form its holding decodes in ([`FormSeconds`]),
+//!   with no read ahead: a hint saves only what it lands before its layer,
+//!   which no stored figure prices. A bank holding every streamed layer's
+//!   experts decodes the resident forms and misses nothing
+//!   ([`StreamedLayers::whole`]); any smaller one the streamed forms, whose
+//!   route, tier wait and CPU site entries cost at any misses, none
+//!   included, so the last slot that makes the bank whole saves them too.
 //!
 //! A load prices its experts' decisions on the same step ([`DecodePrice`]):
 //! the same generic model counted as one more step of what its own decode
@@ -242,6 +247,17 @@ impl LiveDecode {
     }
 }
 
+/// A banked plan's decode step compute in each form it decodes in
+/// (`estimate::form_seconds`): `resident` while its bank holds every
+/// streamed layer's experts and decode runs the resident forms, `streamed`
+/// otherwise, the streamed forms' entries and their submission boundaries
+/// beside them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FormSeconds {
+    pub resident: f64,
+    pub streamed: f64,
+}
+
 /// A streamed plan's layers as the estimate prices them: each layer's `E`,
 /// the plan's `k`, and each layer's lines.
 pub struct StreamedLayers {
@@ -284,14 +300,34 @@ impl StreamedLayers {
         Self { experts, choices, models, lines }
     }
 
+    /// Whether holding `held` makes the bank whole: its slots hold every
+    /// streamed layer's experts, so decode runs the resident forms and
+    /// misses nothing. The one decision of which form a holding decodes in.
+    pub fn whole(&self, held: HeldSlots) -> bool {
+        self.experts.iter().all(|&experts| held.slots as u64 >= experts)
+    }
+
+    /// `C` of the form holding `held` decodes in ([`Self::whole`]).
+    pub fn compute(&self, held: HeldSlots, compute: FormSeconds) -> f64 {
+        match self.whole(held) {
+            true => compute.resident,
+            false => compute.streamed,
+        }
+    }
+
     /// `T` of a decode step of `rows` rows holding `held` of each layer's
-    /// experts, on a resident step of `compute_seconds` (`C`), its file
-    /// reads along `read`, its misses the generic model's ([`MissModel`]),
-    /// a load's beside its own decode (`live`): each layer's misses and
-    /// requests as whole counts over a period of the widest layer's `E`
-    /// steps, each spread as evenly as integers allow, priced by the one step
-    /// model, each distinct step of the period once.
-    pub fn step_seconds(&self, live: Option<&LiveDecode>, read: ReadLine, held: HeldSlots, rows: f64, compute_seconds: f64) -> StreamedStep {
+    /// experts, on `compute` (`C` of each form): a whole bank's
+    /// ([`Self::whole`]) the resident form's alone; any other's the streamed
+    /// form's, its file reads along `read`, its misses the generic model's
+    /// ([`MissModel`]), a load's beside its own decode (`live`): each
+    /// layer's misses and requests as whole counts over a period of the
+    /// widest layer's `E` steps, each spread as evenly as integers allow,
+    /// priced by the one step model, each distinct step of the period once.
+    pub fn step_seconds(&self, live: Option<&LiveDecode>, read: ReadLine, held: HeldSlots, rows: f64, compute: FormSeconds) -> StreamedStep {
+        let compute_seconds = self.compute(held, compute);
+        if self.whole(held) {
+            return StreamedStep { compute_seconds, exposed_seconds: 0., total_seconds: compute_seconds };
+        }
         let period = self.experts.iter().copied().max().expect("a streamed plan streams a layer") as usize;
         let layers = self
             .experts
@@ -345,37 +381,50 @@ fn landing(host: &HostLines, byte_seconds: f64) -> Result<Option<FileLine>, Inva
 
 /// A load's decode step as its experts' decisions price it at any holding:
 /// its layers', on the generic model beside what its counted decode read
-/// ([`LiveDecode`]), at that decode's rows, on `C`, the resident step of those
-/// rows at its context, its file read along the model store's read line: the
-/// one step assessment prices ([`StreamedLayers::step_seconds`]).
+/// ([`LiveDecode`]), at that decode's rows, on `C`, the step of those rows
+/// at its context in each form, its file read along the model store's read
+/// line: the one step assessment prices ([`StreamedLayers::step_seconds`]).
 pub struct DecodePrice {
     layers: StreamedLayers,
-    live: LiveDecode,
+    /// The decode the load counted; none before it counted a step, when the
+    /// generic model alone prices it ([`Self::prior`]).
+    live: Option<LiveDecode>,
+    rows: f64,
     read: ReadLine,
-    compute_seconds: f64,
+    compute: FormSeconds,
 }
 
 impl DecodePrice {
-    /// `live`'s decode on `layers`, its resident step `compute_seconds`
-    /// (`C` at `live`'s rows and context).
-    pub fn new(layers: StreamedLayers, live: LiveDecode, read: ReadLine, compute_seconds: f64) -> Self {
+    /// `live`'s decode on `layers`, its step's compute `compute` (`C` of
+    /// each form at `live`'s rows and context).
+    pub fn new(layers: StreamedLayers, live: LiveDecode, read: ReadLine, compute: FormSeconds) -> Self {
         assert_eq!(layers.experts.len(), live.layers.len(), "a decode's reads are of its streamed layers");
-        Self { layers, live, read, compute_seconds }
+        Self { layers, rows: live.rows, live: Some(live), read, compute }
+    }
+
+    /// The decode before the load counted a step: the generic model's misses
+    /// alone ([`MissModel`]), at `rows` rows on `compute` of them, the price
+    /// assessment gives the same layers from headers and the machine's
+    /// figures, which the load's own reads replace once it counts them
+    /// ([`Self::new`]).
+    pub fn prior(layers: StreamedLayers, rows: f64, read: ReadLine, compute: FormSeconds) -> Self {
+        Self { layers, live: None, rows, read, compute }
     }
 
     /// The step holding `held`.
     pub fn step(&self, held: HeldSlots) -> StreamedStep {
-        self.layers.step_seconds(Some(&self.live), self.read, held, self.live.rows, self.compute_seconds)
+        self.layers.step_seconds(self.live.as_ref(), self.read, held, self.rows, self.compute)
+    }
+
+    /// `C` of the form holding `held` decodes in, of `compute`
+    /// ([`StreamedLayers::compute`]).
+    pub fn compute(&self, held: HeldSlots, compute: FormSeconds) -> f64 {
+        self.layers.compute(held, compute)
     }
 
     /// What holding `to` rather than `from` saves a step, in seconds.
     pub fn saving(&self, from: HeldSlots, to: HeldSlots) -> f64 {
         self.step(from).total_seconds - self.step(to).total_seconds
-    }
-
-    /// The decode steps counted: what a saving a step is over.
-    pub fn steps(&self) -> u64 {
-        self.live.steps
     }
 
     /// The model store's read line its file reads take.
@@ -386,7 +435,7 @@ impl DecodePrice {
     /// The fewest slots at which the decode's own reads stop falling; none
     /// before it found a read in its stack.
     pub fn saturation(&self) -> Option<u64> {
-        self.live.saturation()
+        self.live.as_ref().and_then(LiveDecode::saturation)
     }
 }
 
@@ -443,6 +492,25 @@ mod tests {
         assert!(tiered.iter().all(|load| load.file == 0));
         assert_eq!(tiered.iter().map(|load| load.tier).sum::<u64>(), misses);
         assert!(period(HeldSlots::bank(32)).iter().all(|load| load.tier + load.file == 0));
+    }
+
+    /// The last slot that makes a bank whole saves the streamed form's own
+    /// compute beside its misses: at every expert but one the step runs the
+    /// streamed form, at every expert the resident form and misses nothing.
+    #[test]
+    fn a_whole_bank_saves_the_streamed_forms_compute() {
+        let lines = ExpertLines::reference(1_000_000);
+        let layers = StreamedLayers::new(vec![32, 32], 4, std::sync::Arc::from([lines, lines]));
+        let read = crate::domain::fixtures::READ;
+        let compute = FormSeconds { resident: 0.010, streamed: 0.0115 };
+        let step = |slots| layers.step_seconds(None, read, HeldSlots::bank(slots), 1., compute).total_seconds;
+        assert_eq!(step(32), compute.resident, "a whole bank decodes the resident forms and misses nothing");
+        assert!(
+            step(31) - step(32) >= compute.streamed - compute.resident,
+            "{} s at 31 slots, {} s at 32",
+            step(31),
+            step(32)
+        );
     }
 
     /// A file miss lands at the convert's rate only with no host tier.

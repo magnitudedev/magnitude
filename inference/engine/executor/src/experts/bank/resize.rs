@@ -1,6 +1,6 @@
 use super::{ExpertBank, host_views};
 use crate::planning::{BankTier, ExpertBankPlan, Placer};
-use crate::experts::watcher::{Candidates, MoveBudget};
+use crate::experts::watcher::Candidates;
 use crate::domain::{BankHolding, BankResized, BankStep, DomainError, MemoryMoment, ResizeTimes, RunningBegun, RunningPressure, Trip};
 use crate::CompletionWake;
 use std::time::{Duration, Instant};
@@ -867,34 +867,20 @@ impl ExpertBank {
         commitment.moves.take().map_or(Ok(()), |moves| moves.wait().map_err(failed))
     }
 
-    /// The device bytes a growth to `to` slots backs, what it claims before
-    /// it: each record tensor's charge at `to` slots past its charge at the
-    /// slots now (`BankCounts::resident_charge`), what its reservation backs anew
-    /// (the record tables formed over it are held already); no fewer at
-    /// more slots.
-    pub fn growth_bytes(&self, to: u64) -> u64 {
-        self.counts.resident_charge(to) - self.counts.resident_charge(self.slots())
-    }
-
-    /// [`ElasticBank::shrink`] from the nearest slots that release storage,
-    /// `shallowest`, toward `deepest`, those covering the deficit
-    /// (`ServedBank::releasing`), in a gap between flights, decided at
+    /// [`ElasticBank::shrink`] to `deepest` slots, the settled size past
+    /// the nearest that releases storage (`ServedBank::releasing`), in one
+    /// resize, in a gap between flights, decided at
     /// `decided`, its moves carried by `kernels`. The plan's
     /// evictions are published first; nothing is mapped to a record a move
     /// writes until the moves are queued ahead of every later step and the
     /// plan is committed. A plan dropped on an error before then leaves
     /// every kept expert where its bytes are; once queued, the moves' device
     /// failure fails every flight after them ([`ElasticBank::carried`]), so
-    /// nothing read from a record they failed to write is taken. With a
-    /// `budget`, the device seconds one resize's moves may take, the shrink
-    /// takes the most slots toward the deficit whose planned moves fit it, at least
-    /// `shallowest`, and a later boundary takes the rest; without one, the whole
-    /// deficit.
+    /// nothing read from a record they failed to write is taken.
     pub(super) fn shrink(
         &self,
         kernels: &[BankMoves],
-        (shallowest, deepest): (u64, u64),
-        budget: Option<MoveBudget>,
+        deepest: u64,
         decided: Instant,
         wake: CompletionWake,
     ) -> Result<BankStep, DomainError> {
@@ -912,20 +898,8 @@ impl ExpertBank {
         let planned = (|| {
             Self::observe_moves(&mut commitment)?;
             let queued = decided.elapsed();
-            let count = |slots: u64| usize::try_from(slots).map_err(|_| DomainError::invariant("bank slots exceed the host"));
-            // Every commitment from the nearest that releases storage to the
-            // deficit's: the budget takes the deepest whose moves fit,
-            // forming the records only of those it prices. A group's records
-            // grow with the slots, so the shallowest candidate's fitting the
-            // host fits them all.
-            self.committed_records(shallowest)?;
-            let (counts, groups) = (self.counts.clone(), self.plan.groups().len());
-            let candidates = Candidates {
-                shallowest: count(shallowest)?,
-                deepest: count(deepest)?,
-                records: Box::new(move |slots| (0..groups).map(|group| counts.records_at(group, slots as u64) as usize).collect()),
-            };
-            let plan = shared.plan_shrink(candidates, budget).map_err(DomainError::invariant)?;
+            let slots = usize::try_from(deepest).map_err(|_| DomainError::invariant("bank slots exceed the host"))?;
+            let plan = shared.plan_shrink(slots, self.committed_records(deepest)?).map_err(DomainError::invariant)?;
             let to = plan.slots() as u64;
             let moving = Instant::now();
             commitment.moves = self.carry_moves(plan.moves(), kernels)?;

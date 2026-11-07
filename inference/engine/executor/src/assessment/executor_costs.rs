@@ -564,6 +564,15 @@ impl ExecutorCosts {
         }
     }
 
+    /// What a prompt group's submission costs the host beyond a launch
+    /// chained behind another: a group's first launch is submitted and
+    /// waited for (`step_round_trip_seconds`), the rest of its chain queue
+    /// back to back behind it (`step_pipelined_seconds`). What each group
+    /// fewer saves a prompt; none where a chained launch costs no less.
+    pub fn group_submission_seconds(&self) -> f64 {
+        (self.step_round_trip_seconds.value - self.step_pipelined_seconds.value).max(0.0)
+    }
+
     /// The device seconds of one call inside a sealed graph.
     pub fn launch(&self) -> f64 {
         self.launch_seconds.value
@@ -789,10 +798,16 @@ pub enum StoredCosts {
 }
 
 impl StoredCosts {
-    /// Whether the walk has a point no record holds: the job has points of
-    /// it left to measure.
-    pub fn outstanding(&self) -> bool {
-        matches!(self, Self::Missing(_) | Self::Complete { pending: true, .. })
+    /// The first part of the walk with a point no record holds, which the
+    /// job has points of left to measure, and every part after it: the
+    /// required figures while one is unread, else the whole while a later
+    /// point is; none once every point is held.
+    pub fn outstanding(&self) -> Option<CostWalk> {
+        match self {
+            Self::Missing(_) => Some(CostWalk::Required),
+            Self::Complete { pending: true, .. } => Some(CostWalk::Whole),
+            Self::Complete { pending: false, .. } => None,
+        }
     }
 }
 
@@ -3458,6 +3473,7 @@ fn walk<T: Times>(
     topology: &DeviceTopology,
     executor: &Executor,
     times: &mut T,
+    part: CostWalk,
 ) -> Result<Walked<T::Missing>, Stop<T::Missing>> {
     let backend = executor.backend();
     let formats = &measured_formats(backend);
@@ -3474,6 +3490,7 @@ fn walk<T: Times>(
     let mut steps = plan(&routes, formats);
     // Each step is one point, after the probe.
     let points = 1 + steps.len();
+    let through = part.through(&steps);
     let walk = Walk {
         copy: programs.copy.identity()?,
         programs,
@@ -3494,7 +3511,7 @@ fn walk<T: Times>(
     let mut pending = false;
     let mut missing = None;
     let mut failures = Vec::new();
-    for index in 0..steps.len() {
+    for index in 0..through {
         // The formats' streaming rates are read in the order their pilots
         // price them furthest off ([`Read::overlap`]), once every pilot is
         // read: the order follows from records, so a start retraces it.
@@ -3542,13 +3559,37 @@ fn walk<T: Times>(
     })
 }
 
-/// The points the walk on `executor` visits, its probe among them:
-/// what a job counts of it ahead ([`Measured::left`]).
-pub(super) fn walk_points(topology: &DeviceTopology, executor: &Executor) -> Result<usize, ExecutorCostsError> {
+/// The points `part` of the walk on `executor` visits, its probe among
+/// them: what a job counts of it ahead ([`Measured::left`]).
+pub(super) fn walk_points(topology: &DeviceTopology, executor: &Executor, part: CostWalk) -> Result<usize, ExecutorCostsError> {
     let (routes, _) = Route::all(topology, executor)?;
     let routes = routes.iter().collect::<Vec<_>>();
     let steps = plan(&routes, &measured_formats(executor.backend()));
-    Ok(1 + steps.len())
+    Ok(1 + part.through(&steps))
+}
+
+/// How far a job walks the plan ([`plan`]): to its last figure the costs
+/// require ([`Required`]), which every load waits for once per machine, so
+/// the figures a streamed load's bank is priced by (the model store's read
+/// line, the device's convert) are measured next, ahead of the figures
+/// priced closer without them; or the whole plan, those read already
+/// loaded from their records. Ordered as walked: the required figures
+/// first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub enum CostWalk {
+    Required,
+    Whole,
+}
+
+impl CostWalk {
+    /// The steps of `steps` it walks: those through its last required one,
+    /// or all.
+    fn through(self, steps: &[Step]) -> usize {
+        match self {
+            Self::Required => steps.iter().rposition(|step| step.required()).map_or(0, |last| last + 1),
+            Self::Whole => steps.len(),
+        }
+    }
 }
 
 /// What every step of a walk reads from: the executor's programs, its
@@ -4326,8 +4367,8 @@ impl<'a, 'd> Walks<'a, 'd> {
     /// derived, or a placement the executor lacks), and why a step after
     /// the probe could not be read outside its points' timings (its figure
     /// stays priced).
-    pub(super) fn walk(&mut self) -> (Option<ExecutorCostsError>, Vec<ExecutorCostsError>) {
-        let walked = walk(&self.topology, &self.executor, &mut self.measured);
+    pub(super) fn walk(&mut self, part: CostWalk) -> (Option<ExecutorCostsError>, Vec<ExecutorCostsError>) {
+        let walked = walk(&self.topology, &self.executor, &mut self.measured, part);
         // No point after the walk is timed beside a release it began.
         self.measured.backings.settle();
         match walked {
@@ -4475,7 +4516,7 @@ pub(super) fn retraced(
     };
     // A failure outside a point's timing, which leaves its figure
     // derived, is the job's to report: it recurs at each of its walks.
-    match walk(topology, executor, &mut stored) {
+    match walk(topology, executor, &mut stored, CostWalk::Whole) {
         Ok(Walked { costs: Ok(costs), pending, .. }) => Ok(StoredCosts::Complete {
             costs,
             records: stored.read,

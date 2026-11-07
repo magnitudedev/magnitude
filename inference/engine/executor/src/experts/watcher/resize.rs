@@ -67,21 +67,6 @@ impl ShrinkPlan {
     }
 }
 
-/// What paces a shrink: the device seconds one resize's moves may take (a
-/// decode step's), and each group's move line, which prices its launches
-/// at the records it moves.
-pub(crate) struct MoveBudget {
-    pub seconds: f64,
-    pub lines: crate::assessment::MoveLines,
-}
-
-impl MoveBudget {
-    /// Whether moving `moved(g)` records of each group `g` fits.
-    pub fn fits(&self, moved: &dyn Fn(usize) -> u64) -> bool {
-        self.lines.seconds(moved) <= self.seconds
-    }
-}
-
 /// A shrink's candidate commitments: from `shallowest` slots down to
 /// `deepest` (the shrink's target), each group's records at a candidate's
 /// slots formed by `records` only for the candidates the watcher weighs.
@@ -114,9 +99,9 @@ impl Candidates {
 
 /// What the owner asks of the watcher between flights to resize the bank.
 pub(super) enum Ask {
-    /// Plan each group's commitment at the candidate `budget` paces, and
+    /// Plan each group's commitment at `records` (the bank at `slots`), and
     /// evict what it evicts.
-    Shrink { candidates: Candidates, budget: Option<MoveBudget> },
+    Shrink { slots: usize, records: Vec<usize> },
     /// Take a planned shrink's moves, which the device carries.
     Commit(ShrinkPlan),
     /// Shrink each group's records the host lands into at the deepest of
@@ -358,17 +343,14 @@ impl ResizeHandoff {
 }
 
 impl Shared {
-    /// Plan the bank's commitment at the deepest of `candidates` (its slots,
-    /// each group's records), shallowest first, whose moves fit `budget`,
-    /// or the shallowest where none does (`Directory::paced`); at the deepest
-    /// without a budget: between flights, every begun step ended and the
-    /// device past it. The watcher retires every fill (the conveyor returns
+    /// Plan the bank's commitment at `slots`, each group's `records` there,
+    /// between flights: every begun step ended and the device past it. The watcher retires every fill (the conveyor returns
     /// the lender's records), plans each shrinking group to keep its most
     /// recently read experts below its new commitment
     /// (`Directory::plan_shrink`), and evicts the rest: their slot map
     /// entries and directory records are cleared now.
-    pub fn plan_shrink(&self, candidates: Candidates, budget: Option<MoveBudget>) -> Result<ShrinkPlan, String> {
-        match self.ask(Ask::Shrink { candidates, budget })? {
+    pub fn plan_shrink(&self, slots: usize, records: Vec<usize>) -> Result<ShrinkPlan, String> {
+        match self.ask(Ask::Shrink { slots, records })? {
             Answer::Planned(plan) => Ok(plan),
             Answer::Done(_) | Answer::Cut(_) => unreachable!("a shrink is answered with its plan"),
         }
@@ -666,26 +648,13 @@ impl Residency {
     /// drained where it waits for them ([`Ask::waits`]).
     fn serve_resize(&mut self, asked: Ask, trip: impl Fn() -> Trip) -> Answer {
         match asked {
-            Ask::Shrink { candidates, budget } => {
+            Ask::Shrink { slots, records } => {
                 // Ranked by every step that ended before the gap it is asked
                 // in, whichever turn of this thread their ends fell in.
                 self.shared.telemetry.feed();
                 let ranking = self.core.directory.ranking();
                 let last_read = |layer, expert| Reuse::of(&ranking).last(layer, expert);
-                // The deepest candidate is the shrink's target.
-                let target = (candidates.records)(candidates.deepest);
-                let chosen = match budget {
-                    Some(budget) => self.core.directory.paced(
-                        candidates.count(),
-                        |index| (candidates.records)(candidates.slots(index)),
-                        |moved| budget.fits(moved),
-                        &last_read,
-                    ),
-                    None => candidates.count() - 1,
-                };
-                let slots = candidates.slots(chosen);
-                let records = (candidates.records)(slots);
-                let groups = plan(&mut self.core, &records, &target, last_read);
+                let groups = plan(&mut self.core, &records, last_read);
                 Answer::Planned(ShrinkPlan { slots, groups, trip: trip(), holds: Some(self.shared.clone()) })
             }
             Ask::Commit(mut plan) => {
@@ -816,17 +785,15 @@ fn deepest(candidates: &Candidates, floors: &[u32]) -> Option<(usize, Vec<u32>)>
 fn plan(
     core: &mut Core,
     records: &[usize],
-    target: &[usize],
     last_read: impl Fn(usize, usize) -> Option<super::Step>,
 ) -> Vec<Shrink> {
     let (directory, steps) = (&mut core.directory, &core.steps);
     steps.unbegun(|at| {
         records
             .iter()
-            .zip(target)
             .enumerate()
-            .map(|(group, (&records, &target))| {
-                let plan = directory.plan_shrink(group, records, target, &last_read);
+            .map(|(group, &records)| {
+                let plan = directory.plan_shrink(group, records, &last_read);
                 directory.evict(group, &plan, &last_read, at);
                 plan
             })

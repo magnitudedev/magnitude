@@ -27,6 +27,16 @@
 //! - launches: the backend's declared launches at N rows times the launch
 //!   cost.
 //!
+//! A step also pays each submission boundary its calls end beyond its own
+//! (a streamed layer's parks and publications where the backend's parks
+//! are boundaries, `DecodeDemand::boundaries`) at the executor's round trip
+//! beyond device time (`ExecutorCosts::step_round_trip_seconds`): one
+//! submit and wait. What a streamed layer's waits add beside it has no
+//! figure yet: a spinning wait's device time (a tier wait's or sited
+//! combine's kernel past its launch), the parks' keeper's latency in
+//! answering a park, and the submitting thread's work beginning each
+//! submission.
+//!
 //! Where it can be off, and in which direction: about ±15% typically, the
 //! spread of the composition ratio across models once format, layout,
 //! launch and composition are measured (spec §2.14, Expected error). The
@@ -146,12 +156,15 @@ pub struct StepSeconds {
     pub composition: f64,
     /// The host's step cost under the decode's lookahead policy.
     pub step: f64,
+    /// Its submission boundaries' round trips.
+    pub boundaries: f64,
 }
 
 impl StepSeconds {
-    /// The step's time: its calls composed, plus the step cost.
+    /// The step's time: its calls composed, plus the step cost and its
+    /// boundaries' round trips.
     pub fn total(&self) -> f64 {
-        self.composition * self.calls.iter().map(CallSeconds::total).sum::<f64>() + self.step
+        self.composition * self.calls.iter().map(CallSeconds::total).sum::<f64>() + self.step + self.boundaries
     }
 }
 
@@ -238,7 +251,7 @@ impl ExpertPass {
 /// The expected slabs `rows` rows read of `experts` slabs, each row
 /// choosing `selected` of them: every slab not chosen by any row is not
 /// read, E · (1 − (1 − k/E)^rows).
-fn expert_union(experts: u64, selected: u64, rows: u64) -> f64 {
+pub(crate) fn expert_union(experts: u64, selected: u64, rows: u64) -> f64 {
     let experts = experts as f64;
     let missed = 1.0 - selected as f64 / experts;
     experts * (1.0 - missed.powf(rows as f64))
@@ -252,7 +265,7 @@ fn call_seconds(
     depth: u32,
 ) -> Result<CallSeconds, AssessmentError> {
     let launches = call.launches.at(sequences)?;
-    work_seconds(&call.work, pricing, sequences, depth, launches)
+    work_seconds(&call.work, pricing, sequences, sequences, depth, launches)
 }
 
 /// The calls of `works`' time at one row and `depth` tokens alone, each a
@@ -268,20 +281,20 @@ pub(crate) fn calls_seconds(
         lookahead: false,
     };
     works.iter().try_fold(0.0, |seconds, work| {
-        Ok(seconds + work_seconds(work, &pricing, 1, depth, 1)?.total())
+        Ok(seconds + work_seconds(work, &pricing, 1, 1, depth, 1)?.total())
     })
 }
 
-/// The time of `work` at `sequences` sequences, one row each, dispatched
+/// The time of `work` at `rows` rows of `sequences` sequences, dispatched
 /// in `launches` launches.
 fn work_seconds(
     work: &Work,
     pricing: &Pricing<'_>,
+    rows: u64,
     sequences: u64,
     depth: u32,
     launches: u64,
 ) -> Result<CallSeconds, AssessmentError> {
-    let rows = sequences;
     let (rows_f, sequences) = (rows as f64, sequences as f64);
     let mut bytes = pricing.weights(&work.weights, 1.0);
     if let Some(experts) = &work.experts {
@@ -349,14 +362,49 @@ pub fn step_seconds(
             decode_rows()
         )));
     }
+    composed(demand, pricing, |call| call_seconds(call, pricing, sequences, depth))
+}
+
+/// `demand`'s calls, each `seconds`, composed into a step: plus the step
+/// cost and its boundaries' round trips.
+fn composed(
+    demand: &DecodeDemand,
+    pricing: &Pricing<'_>,
+    seconds: impl Fn(&Call) -> Result<CallSeconds, AssessmentError>,
+) -> Result<StepSeconds, AssessmentError> {
     Ok(StepSeconds {
-        calls: demand
-            .calls
-            .iter()
-            .map(|call| call_seconds(call, pricing, sequences, depth))
-            .collect::<Result<_, _>>()?,
+        calls: demand.calls.iter().map(seconds).collect::<Result<_, _>>()?,
         composition: pricing.costs.composition()?.value,
         step: pricing.costs.step_seconds(pricing.lookahead),
+        boundaries: demand.boundaries as f64 * pricing.costs.step_round_trip_seconds.value,
+    })
+}
+
+/// One launch of `rows` rows at `depth`: a decode step of a row a sequence
+/// within the decode row classes ([`step_seconds`]); beyond them a prefill
+/// launch of one sequence, its calls each one launch of their prefill form
+/// over the same work at `rows` rows, composed as a step is. What the
+/// prefill forms' kernels achieve beyond that work is not priced.
+pub fn launch_seconds(demand: &DecodeDemand, pricing: &Pricing<'_>, rows: u64, depth: u32) -> Result<StepSeconds, AssessmentError> {
+    if rows <= decode_rows() {
+        return step_seconds(demand, pricing, rows, depth);
+    }
+    composed(demand, pricing, |call| work_seconds(&call.work, pricing, rows, 1, depth, 1))
+}
+
+/// A banked plan's decode step at `depth` over `sequences` sequences in
+/// each form it decodes in ([`super::FormSeconds`]): `resident`'s demand,
+/// its experts held whole, and `streamed`'s, the plan as it banks them.
+pub fn form_seconds(
+    resident: &DecodeDemand,
+    streamed: &DecodeDemand,
+    pricing: &Pricing<'_>,
+    sequences: u64,
+    depth: u32,
+) -> Result<super::FormSeconds, AssessmentError> {
+    Ok(super::FormSeconds {
+        resident: step_seconds(resident, pricing, sequences, depth)?.total(),
+        streamed: step_seconds(streamed, pricing, sequences, depth)?.total(),
     })
 }
 
@@ -426,10 +474,12 @@ mod tests {
                 Kernel::of::<magnitude_kernels::dense_expand::Entry>(),
                 seismic::OperandRecipe::Rounded,
                 &[],
+                &[],
             )
             .unwrap();
         DecodeDemand {
             calls: vec![Call { launches, work }],
+            boundaries: 0,
         }
     }
 
@@ -509,6 +559,32 @@ mod tests {
         assert_eq!(call.total(), call.compute + call.launch);
         assert!(step_seconds(&demand, &pricing, 9, 1_000).is_err());
         assert!(step_seconds(&demand, &pricing, 0, 1_000).is_err());
+    }
+
+    /// A launch beyond the decode row classes is a prefill launch of one
+    /// sequence: its weights read once and its arithmetic per row, each call
+    /// one launch, and its history read once for the sequence while every
+    /// row computes over it.
+    #[test]
+    fn a_launch_beyond_the_decode_rows_is_one_sequences_prefill() {
+        let costs = crate::assessment::fixtures::costs();
+        let pricing = pricing(&costs);
+        let projection = call(projection());
+        let launch = only(launch_seconds(&projection, &pricing, 512, 1_000).unwrap());
+        assert_eq!(launch.bytes, 4e9 / 300e9);
+        assert_eq!(launch.compute, 512.0 * 8e9 / 20e12);
+        assert_eq!(launch.launches, 1);
+        assert_eq!(
+            launch_seconds(&projection, &pricing, 8, 1_000).unwrap().total(),
+            step_seconds(&projection, &pricing, 8, 1_000).unwrap().total()
+        );
+        let attention = call(Work {
+            history: Some(HistoryRead { layout: Some(KvCodec::Dense), bytes_per_token: 1024, flops_per_token: 4096, window: None }),
+            ..Work::default()
+        });
+        let launch = only(launch_seconds(&attention, &pricing, 512, 1_000).unwrap());
+        close(launch.bytes, 1_000.0 * 1024.0 / 200e9);
+        assert_eq!(launch.compute, 512.0 * 1_000.0 * 4096.0 / 20e12);
     }
 
     /// Each byte class is priced at its own rate: weights and rows at the

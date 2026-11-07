@@ -238,7 +238,7 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
     let requests = PointRequests::new(root);
     let storage = manifest.store().to_path_buf();
     let outstanding = || {
-        let costs = magnitude_executor::assessment::ExecutorCosts::stored(&topology, &selected.info, &records).is_ok_and(|walked| walked.outstanding());
+        let costs = magnitude_executor::assessment::ExecutorCosts::stored(&topology, &selected.info, &records).ok().and_then(|walked| walked.outstanding());
         requests.outstanding(&topology, &selected.info, &storage, &records, costs)
     };
     let mut left = outstanding()?;
@@ -329,6 +329,14 @@ impl<F: ProgramFamily> MemoryHost for Unrequested<'_, F> {
     }
 
     fn evict_prefix(&mut self, _: &BTreeSet<u64>) -> bool {
+        false
+    }
+
+    fn prefix_steps(&self, _: &magnitude_scheduler::workload::WorkloadRates) -> Vec<magnitude_scheduler::prefix_cache::PrefixStep> {
+        Vec::new()
+    }
+
+    fn evict_cached_prefix(&mut self, _: u64) -> bool {
         false
     }
 
@@ -765,7 +773,7 @@ pub fn tokens(ids: &[u32]) -> Vec<TokenId> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_executor::fixtures::{bank_backends, banked, count_decode, host_tier, misses_at, READ};
+    use magnitude_executor::fixtures::{bank_backends, banked, count_decode, host_tier, measure_load, misses_at};
 
     /// A capped load on a discrete-shaped device, its bank whole on the
     /// device and a host tier beside it, grows that tier across the
@@ -780,15 +788,7 @@ mod tests {
             host_tier(&mut domain, 4);
             let decode = misses_at(4, 100);
             count_decode(&mut domain, decode);
-            domain.measure_experts(magnitude_executor::ExpertMeasures {
-                lines: magnitude_executor::assessment::Priced::Measured(std::sync::Arc::from([])),
-                read: magnitude_executor::assessment::Priced::Measured(READ),
-                resident: magnitude_executor::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
-                pass: magnitude_executor::assessment::Priced::Pending("unpriced".into()),
-                moves: magnitude_executor::assessment::Priced::Pending("unmeasured".into()),
-                tier_copy: magnitude_executor::assessment::Priced::Measured(None),
-                convert: magnitude_executor::assessment::Priced::Measured(None),
-            }, &mut bindings).unwrap();
+            measure_load(&mut domain, &mut bindings);
             let host_slots = |domain: &magnitude_executor::ExecutorDomain<_>| {
                 domain.expert_residency().unwrap().unwrap().host.unwrap().slots
             };

@@ -2,7 +2,7 @@
 //! scheduler. Only the closed scheduler command vocabulary reaches it.
 
 use crate::error::UnloadCause;
-use crate::execution::{ExpertPricing, expert_measures};
+use crate::execution::{LoadPricing, load_measures};
 use magnitude_executor::ProgramFamily;
 use magnitude_generation::Method;
 use magnitude_scheduler::{
@@ -29,14 +29,13 @@ pub(crate) struct ExecutionOwner<F: ProgramFamily> {
     /// none of its teardown, can answer first and cut that teardown short.
     ended: Option<Owner<F>>,
     method: Arc<dyn Method>,
-    /// What prices the bank's experts, which prices them again, measuring
-    /// nothing, once the service stores new measurement records; none
-    /// without a bank.
-    pricing: Option<ExpertPricing>,
+    /// What prices the load, which prices it again, measuring nothing,
+    /// once the service stores new measurement records.
+    pricing: LoadPricing,
 }
 
 impl<F: ProgramFamily> ExecutionOwner<F> {
-    pub fn new(owner: Owner<F>, method: Arc<dyn Method>, pricing: Option<ExpertPricing>) -> Self {
+    pub fn new(owner: Owner<F>, method: Arc<dyn Method>, pricing: LoadPricing) -> Self {
         Self {
             execution: Execution::Serving(owner),
             ended: None,
@@ -123,11 +122,11 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
                 Ok(WorkerReply::Acknowledged)
             }
             WorkerCommand::Reprice => {
-                match (&mut self.execution, &mut self.pricing) {
-                    (Execution::Serving(owner), Some(pricing)) => owner.measure_experts(expert_measures(pricing)),
-                    // A model without a bank prices nothing of its experts, and an ending one
-                    // has nothing left to price.
-                    (Execution::Serving(_), None) | (Execution::Draining(..) | Execution::Stopped(_), _) => {}
+                match &mut self.execution {
+                    // The costs the load planned on, found pending again, end it.
+                    Execution::Serving(owner) => owner.measure_load(load_measures(&self.pricing)?),
+                    // An ending model has nothing left to price.
+                    Execution::Draining(..) | Execution::Stopped(_) => {}
                 }
                 Ok(WorkerReply::Acknowledged)
             }
@@ -200,14 +199,11 @@ impl<F: ProgramFamily> Driven for ExecutionOwner<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use magnitude_executor::{
-        fixtures, platform, CompletionWake, ComponentSelection, ExecutionPath,
-        ExecutionPlanner, KernelCache, PlannedMethod, RequestId,
-    };
+    use magnitude_executor::{fixtures, CompletionWake, KernelCache, RequestId};
     use magnitude_generation::Plain;
     use magnitude_executor::BankResize;
     use magnitude_scheduler::{publication::PublicationWake, worker::Wakes, ServiceLimits};
-    use seismic::measure::{Attempt, Reason};
+    use seismic::measure::Attempt;
 
     /// The owner's wakes, which a test that runs it itself needs none of.
     struct Unwoken;
@@ -238,44 +234,67 @@ mod tests {
         now
     }
 
-    /// A live load priced before its executor's costs were stored grows
-    /// nothing, however long memory stays free; once the measurement job
-    /// stores them (here its probe, which gives the executor's costs) and
-    /// the host asks it to reprice, the execution owner prices the bank
-    /// again from what is stored, and the bank grows. On Metal, which every
-    /// macOS host has: a device that does not open fails the test.
+    /// Store `device`'s required figures in the kernel cache at `cache` as
+    /// a machine's measurements, fixed rather than timed, so what the test
+    /// asserts of them holds on any host however loaded: each required
+    /// point the walk's retrace finds unrecorded stored at 1 ms, the launch
+    /// graph's host times 0.15 ms (each run waited for) and 0.05 ms (queued)
+    /// past its device time, so a group's submission costs 0.1 ms.
+    fn store_costs(device: &seismic::Device, cache: &std::path::Path) {
+        use magnitude_executor::assessment::{ExecutorCosts, StoredCosts};
+        use seismic::measure::{Record, RecordStore, Timing};
+        let records = KernelCache::measurement_records(cache);
+        loop {
+            let key = match ExecutorCosts::stored(device.topology(), device.info(), &records).unwrap() {
+                StoredCosts::Missing(key) => key,
+                StoredCosts::Complete { .. } => return,
+            };
+            let median = match key.point.get("timing") {
+                Some(&1) => 1.15e-3,
+                Some(&2) => 1.05e-3,
+                _ => 1e-3,
+            };
+            RecordStore::store(&records, &key, &Record::Measured(Timing { median, interval: None, samples: 1 })).unwrap();
+        }
+    }
+
+    /// Store the read line of the volume `cache` lies on as the
+    /// measurement job measures it.
+    fn store_read_line(device: &seismic::Device, cache: &std::path::Path) {
+        let mut measurer =
+            seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
+        magnitude_executor::assessment::requests::measure(
+            &mut measurer,
+            device,
+            &KernelCache::measurement_records(cache),
+            &[magnitude_executor::assessment::PointRequest::Storage { directory: cache.to_owned() }],
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            &mut |_| Attempt::Proceed,
+            &mut |_, _| {},
+        )
+        .unwrap();
+    }
+
+    /// A live load priced on its executor's costs, which every load waits
+    /// for, before the job stored the read line its streamed decode is
+    /// priced along, grows nothing, however long memory stays free; once
+    /// the measurement job stores it and the host asks it to reprice, the
+    /// execution owner prices the bank again from what is stored, and the
+    /// bank grows. On Metal, which every macOS host has: a device that does
+    /// not open fails the test.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "the required figures alone give the costs where the bank moves natively (Metal)")]
-    fn a_live_load_reprices_on_newly_stored_costs_and_grows() {
+    fn a_live_load_reprices_on_newly_stored_figures_and_grows() {
         let backend = seismic::BackendName::Metal;
         let (mut domain, bindings) = fixtures::banked(backend, 4, 2);
         let decode = fixtures::misses_at(3, 100);
         fixtures::count_decode(&mut domain, decode);
         // The pricing: the streamed fixture model planned on this device,
-        // its bank and resident plan, its costs kept in an empty cache.
-        let catalog = seismic::Devices::discover(&[]).unwrap();
-        let reserves = platform::MemoryReserves::of_machine(None);
-        let selected =
-            platform::select_device(&catalog, ExecutionPath::Native, platform::DeviceRequest::Backend(backend), &reserves)
-                .unwrap();
-        let device = catalog.open(catalog.resolve(selected.info.selector()).unwrap()).unwrap();
-        let definition = fixtures::qwen4exp_fixture_definition();
-        let manifest = fixtures::streamed_experts_manifest(&definition);
-        let resident = ExecutionPlanner::prepare(
-            &selected,
-            &manifest,
-            &definition,
-            ComponentSelection { head: false, vision: false },
-            ExecutionPath::Native,
-            PlannedMethod::Plain,
-            magnitude_state::KvCodec::Dense,
-            fixtures::limits(2, 1, false),
-        )
-        .unwrap();
-        let bank = resident.clone().with_bank::<magnitude_executor::AssessmentMemoryCharge>(&definition, None).unwrap().draft().load().expert_bank().cloned();
-        let bank = bank.expect("the streamed fixture plans an expert bank");
+        // its bank and resident plan, its costs kept in a cache that holds
+        // the executor's required figures, as a load's has once it plans.
         let cache = tempfile::tempdir().unwrap();
-        let pricing = ExpertPricing::unmeasured(cache.path().to_owned(), cache.path().to_owned(), definition, resident, device.clone(), bank);
+        let (pricing, device) = LoadPricing::fixture(magnitude_executor::platform::DeviceRequest::Backend(backend), true, Some(cache.path().to_owned()));
+        store_costs(&device, cache.path());
         let limits = ServiceLimits {
             prefill_tokens: 2,
             decode_tokens: 2,
@@ -284,39 +303,38 @@ mod tests {
             conversations: std::num::NonZeroUsize::MIN,
         };
         let mut owner = Owner::new(domain, bindings, limits, Arc::new(Unwoken)).unwrap();
-        // Priced as the load is once its warm-up ends: nothing is stored.
-        owner.measure_experts(expert_measures(&pricing));
-        let mut execution = ExecutionOwner::new(owner, Arc::new(Plain), Some(pricing));
-        // Memory stays free well past the growth's recovery wait: an
-        // unpriced bank grows nothing.
+        // Priced as the load is once its warm-up ends: the costs, no read line.
+        owner.measure_load(load_measures(&pricing).unwrap());
+        let mut execution = ExecutionOwner::new(owner, Arc::new(Plain), pricing);
+        // Memory stays free well past the growth's recovery wait: a bank
+        // whose decode is unpriced grows nothing.
         let now = observe(&mut execution, 0, 100);
-        assert_eq!(slots(&mut execution), (2, None), "an unpriced load grows nothing");
-        // The measurement job stores the executor's costs: its probe and the
-        // figures no other prices (the launch graph's times and the
-        // composition chain, the points of `calls`), the rest skipped.
-        let mut measurer =
-            seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
-        let mut probe = true;
-        magnitude_executor::assessment::requests::measure(
-            &mut measurer,
-            &device,
-            &KernelCache::measurement_records(cache.path()),
-            &[
-                magnitude_executor::assessment::PointRequest::Costs,
-                magnitude_executor::assessment::PointRequest::Storage { directory: cache.path().to_owned() },
-            ],
-            std::time::Instant::now() + std::time::Duration::from_secs(60),
-            &mut |key| match std::mem::take(&mut probe) || key.configuration.contains_key("calls") || key.configuration.contains_key("storage") {
-                true => Attempt::Proceed,
-                false => Attempt::Skip(Reason::new("not this test's point".to_owned())),
-            },
-            &mut |_, _| {},
-        )
-        .unwrap();
+        assert_eq!(slots(&mut execution), (2, None), "an unpriced bank grows nothing");
+        // The measurement job stores the store's read line.
+        store_read_line(&device, cache.path());
         assert!(matches!(execution.command(WorkerCommand::Reprice, now), Ok(WorkerReply::Acknowledged)));
         observe(&mut execution, now, 100);
         let (grown, resize) = slots(&mut execution);
         assert!(grown > 2, "the repriced bank grew: {grown} slots");
         assert!(matches!(resize, Some(BankResize::Grew { .. })), "{resize:?}");
+    }
+
+    /// A load without a bank chains its prompt as a base load does, priced
+    /// from the executor's costs as stored ([`store_costs`]), through the
+    /// path a load's worker prices it (`load_measures`): its prompt group
+    /// takes its chunks' places, each saving a group's submission, 0.1 ms.
+    #[test]
+    fn a_dense_load_chains_its_prompt_priced_from_stored_costs() {
+        use magnitude_executor::platform::DeviceRequest;
+        let (mut domain, mut bindings) = fixtures::chained(DeviceRequest::Automatic);
+        let cache = tempfile::tempdir().unwrap();
+        let (pricing, device) = LoadPricing::fixture(DeviceRequest::Automatic, false, Some(cache.path().to_owned()));
+        store_costs(&device, cache.path());
+        let measures = load_measures(&pricing).unwrap();
+        assert!(measures.experts.is_none(), "a load without a bank prices no experts");
+        let submission = measures.costs.as_ref().map(|costs| costs.submission).unwrap();
+        assert!((submission - 1e-4).abs() < 1e-9, "a group's submission is the round trip past a queued launch: {submission}");
+        domain.measure_load(measures, &mut bindings).unwrap();
+        assert_eq!(fixtures::group_places_opened((domain, bindings)), 3, "the group holds its chunks' places");
     }
 }

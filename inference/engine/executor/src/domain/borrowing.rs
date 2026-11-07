@@ -1,59 +1,44 @@
-//! The expert bank's room beyond the hold line: the one store's slots split
-//! into committed slots, held within what the host gives without displacing
-//! anyone (allocatable memory less the planning reserve, less the class room
-//! of the planned prompt places no group holds), and borrowed slots above
-//! them.
+//! The expert bank's borrowed room as the host's reading needs it: the
+//! bytes the one store's bank holds beyond the hold line, and what judges
+//! the host's displacement while it holds them.
 //!
-//! Borrowed slots come from two rooms. The places' room: the plan leaves a
-//! prompt group's class of its planned places free beside the bank
-//! (`AssessmentMemoryCharge::with_group_class`), and while no group holds
-//! it the bank may grow into it. And, where the host reports displacement,
-//! what the OS can obtain by compressing other programs' data
-//! (`platform::FitMode::Borrow`), the room a load reading obtainable memory
-//! would plan on: a bank that holds it decodes as fast as one that did,
-//! and gives it back before anything the load committed.
-//!
-//! Releases take borrowed slots first by construction: the committed count
-//! only ever falls to the slots the bank holds, so every slot released comes
-//! off the borrowed ones while any is left. The load gives borrowed room
-//! back on what [`BankRoom::owed`] says: a claim of the load's own that took
-//! it back (a prompt group's places among them), and, where the host
-//! reports displacement, all of it once the host shows displacement now
-//! (`platform::Serving`). The hold line's level decides only once none is
-//! left, as for any load.
-
-use crate::platform::{DisplacementBaseline, DomainReading, MemoryBand, Recovery};
+//! Whether a byte is borrowed is the memory heap's decision
+//! ([`super::value`]): a step takes borrowed room only where its rate per
+//! byte beats the borrow price, and what an ask or a claim of the load's
+//! own is owed the settle releases lowest rate per byte first, which the
+//! borrowed tail of the bank's slots is. What stays here is what the
+//! host's reading of host RAM needs to read the load's hold on that room
+//! (`platform::Serving`): the bytes held on it, which host RAM's headroom
+//! then counts within what the OS can obtain, and the displacement baseline
+//! that judges displacement now, from the bank's last growth on.
+use crate::platform::{DisplacementBaseline, DomainReading, Recovery};
 use std::time::Instant;
 
-/// Which room a growth of the bank's slots takes.
+/// Which room a growth of the bank's slots takes: what a claim of it reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Room {
-    /// Within the hold line, beside the class room no group holds.
+    /// Within the hold line.
     Committed,
-    /// Beyond it: the places' room, and where the host reports
-    /// displacement what the OS can obtain by displacing others.
+    /// Beyond it: where the host reports displacement, what the OS can
+    /// obtain by displacing others.
     Borrowed,
 }
 
-/// The one store's bank slots, committed and borrowed, and what the load's
-/// hold on the borrowed ones reads ([`BankRoom::lent`], [`BankRoom::baseline`]).
+/// The one store's bank's slots on borrowed room, and what judges the
+/// host's displacement while the bank holds them ([`BankRoom::lent`],
+/// [`BankRoom::baseline`]).
 #[derive(Clone, Debug)]
 pub struct BankRoom {
     /// Whether the host reports displacement: only there is room borrowed
-    /// beyond allocatable memory, and held on displacement now. Elsewhere
-    /// the bank borrows the places' room alone, which allocatable memory
-    /// counts, and the hold line's level holds it.
+    /// beyond allocatable memory.
     counted: bool,
     slot_bytes: u64,
-    /// The bank's slots now, and those of them within the hold line.
+    /// The bank's slots now, and those of them on borrowed room: its last
+    /// grown, released first as the bank's least valuable.
     slots: u64,
-    committed: u64,
-    /// The room a growth of the slots that runs takes.
-    growing: Option<Room>,
-    /// The borrowed bytes the load's claims may still take back; the rest
-    /// of what the bank borrowed it owes ([`Self::owed`]). A growth into
-    /// borrowed room lends its bytes as it begins.
-    lent: u64,
+    borrowed: u64,
+    /// The borrowed slots a growth that runs takes, as it began.
+    growing: Option<u64>,
     /// What displacement now is judged against, from the bank's last
     /// growth on.
     baseline: DisplacementBaseline,
@@ -64,17 +49,16 @@ pub struct BankRoom {
 }
 
 impl BankRoom {
-    /// A bank of `slots` slots of `slot_bytes` each, every one committed
-    /// (the plan sized them within the hold line), serving from `now` on a
-    /// host that reports displacement where `counted`.
+    /// A bank of `slots` slots of `slot_bytes` each, none borrowed (the
+    /// plan sized them within the hold line), serving from `now` on a host
+    /// that reports displacement where `counted`.
     pub fn new(counted: bool, slot_bytes: u64, slots: u64, now: Instant) -> Self {
         Self {
             counted,
             slot_bytes,
             slots,
-            committed: slots,
+            borrowed: 0,
             growing: None,
-            lent: 0,
             baseline: DisplacementBaseline::since(now),
             quiet: Recovery::new(),
             recovered: false,
@@ -83,29 +67,16 @@ impl BankRoom {
 
     /// The bytes of the bank's borrowed slots.
     pub fn borrowed(&self) -> u64 {
-        (self.slots - self.committed).saturating_mul(self.slot_bytes)
+        self.borrowed.saturating_mul(self.slot_bytes)
     }
 
-    /// The borrowed bytes the bank owes back: what the load's claims took
-    /// back of them, or all of them once the host showed displacement now.
-    pub fn owed(&self) -> u64 {
-        self.borrowed().saturating_sub(self.lent)
-    }
-
-    /// While the bank holds borrowed room beyond allocatable memory, or
-    /// grows into it: the bytes of it the load's claims may still take back
-    /// (`platform::Serving::lent`), which host RAM's hold then reads in
-    /// place of allocatable memory. None on a host that reports no
-    /// displacement, where allocatable memory counts all the bank borrows.
+    /// While the bank holds room borrowed beyond allocatable memory, or
+    /// grows into it, the bytes it holds there, which host RAM's hold then
+    /// counts within what the OS can obtain (`platform::Serving::lent`).
+    /// None on a host that reports no displacement, or holding none.
     pub fn lent(&self) -> Option<u64> {
-        let borrowing = self.borrowed() > 0 || self.growing == Some(Room::Borrowed);
-        (self.counted && borrowing).then_some(self.lent)
-    }
-
-    /// The borrowed bytes the load's claims may still take back, on any
-    /// host.
-    pub fn lends(&self) -> u64 {
-        self.lent
+        let growing = self.growing.unwrap_or(0);
+        (self.counted && self.borrowed + growing > 0).then(|| (self.borrowed + growing).saturating_mul(self.slot_bytes))
     }
 
     /// What displacement now is judged against: none while the bank grows.
@@ -121,54 +92,38 @@ impl BankRoom {
         self.growing.is_none() && (!self.counted || self.recovered)
     }
 
-    /// A growth of the slots into `room` began, backing `bytes`.
-    pub fn grow(&mut self, room: Room, bytes: u64) {
+    /// A growth of the slots began, `borrowed` of its bytes on borrowed
+    /// room.
+    pub fn grow(&mut self, borrowed: u64) {
         assert!(self.growing.is_none(), "invariant violated: a growth of the bank's slots began beside another");
-        self.growing = Some(room);
-        if room == Room::Borrowed {
-            self.lent = self.lent.saturating_add(bytes);
-        }
+        self.growing = Some(borrowed.div_ceil(self.slot_bytes));
     }
 
-    /// A growth of the slots ended at `now`, holding `slots` slots: the room
-    /// it took, the slots it joined to it (none where it stopped or was
-    /// refused before its first). Displacement now is judged from here on.
-    pub fn grown(&mut self, slots: u64, now: Instant) -> Room {
-        let room = self.growing.take().expect("invariant violated: a growth of the bank's slots ended that never began");
+    /// A growth of the slots ended at `now`, holding `slots` slots: of the
+    /// slots it joined, its last are those it borrowed. Displacement now is
+    /// judged from here on. Whether it borrowed any.
+    pub fn grown(&mut self, slots: u64, now: Instant) -> bool {
+        let growing = self.growing.take().expect("invariant violated: a growth of the bank's slots ended that never began");
         assert!(slots >= self.slots, "invariant violated: a growth left the bank fewer slots");
-        if room == Room::Committed {
-            self.committed += slots - self.slots;
-        }
+        let joined = (slots - self.slots).min(growing);
+        self.borrowed += joined;
         self.slots = slots;
-        self.lent = self.lent.min(self.borrowed());
         self.baseline = DisplacementBaseline::since(now);
-        room
+        joined > 0
     }
 
-    /// A shrink left the bank `slots` slots: its borrowed ones go first.
+    /// A shrink left the bank `slots` slots: its last, the borrowed, went
+    /// first.
     pub fn shrunk(&mut self, slots: u64) {
         assert!(slots <= self.slots, "invariant violated: a shrink left the bank more slots");
+        self.borrowed = self.borrowed.saturating_sub(self.slots - slots);
         self.slots = slots;
-        self.committed = self.committed.min(slots);
-        self.lent = self.lent.min(self.borrowed());
-    }
-
-    /// A claim of the load's own took `bytes` of host RAM while the bank
-    /// lends borrowed room, or wants them: the bank owes back as much of
-    /// what it lends. What it took back.
-    pub fn take_back(&mut self, bytes: u64) -> u64 {
-        let taken = bytes.min(self.lent);
-        self.lent -= taken;
-        taken
     }
 
     /// Fold in a reading of host RAM at `now`: its displacement windows into
     /// the baseline (none while the bank grows, whose backing displaces),
     /// and whether it showed displacement now or distress into the wait
-    /// before borrowing. A reading in the Reclaim band while the hold reads
-    /// borrowed room (`platform::Serving::lent`: displacement now, distress,
-    /// what the OS can obtain at the planning reserve, or nothing left lent)
-    /// takes all of it back.
+    /// before borrowing.
     pub fn observe(&mut self, reading: &DomainReading, now: Instant) {
         if self.growing.is_some() {
             return;
@@ -178,9 +133,6 @@ impl BankRoom {
         }
         let quiet = !reading.displacing && reading.distress.is_none();
         self.recovered = self.quiet.observe(quiet, now, |since, now| now.duration_since(since));
-        if reading.band == MemoryBand::Reclaim && self.lent().is_some() {
-            self.lent = 0;
-        }
     }
 }
 
@@ -188,7 +140,7 @@ impl BankRoom {
 mod tests {
     //! The split alone, over readings each test writes.
     use super::*;
-    use crate::platform::{DomainRole, DomainThresholds, MemoryConstraint, RECOVERY_STABLE_TIME};
+    use crate::platform::{DomainRole, DomainThresholds, MemoryBand, MemoryConstraint, RECOVERY_STABLE_TIME};
     use std::time::Duration;
 
     const SLOT: u64 = 100;
@@ -228,73 +180,48 @@ mod tests {
         (bank, now)
     }
 
-    /// Growths add to the room they took; releases take the borrowed slots
-    /// first, the committed ones only once none is left.
+    /// A growth's borrowed slots are its last joined; releases take them
+    /// first, and the hold reads what the bank holds on borrowed room.
     #[test]
-    fn releases_take_borrowed_slots_before_committed_ones() {
+    fn releases_take_borrowed_slots_first() {
         let (mut bank, now) = quiet_bank(true);
-        bank.grow(Room::Committed, 2 * SLOT);
-        assert_eq!(bank.grown(12, now), Room::Committed);
-        bank.grow(Room::Borrowed, 5 * SLOT);
-        assert_eq!(bank.lent(), Some(5 * SLOT), "a borrowing growth lends its bytes as it begins");
-        assert_eq!(bank.grown(17, now), Room::Borrowed);
-        assert_eq!((bank.borrowed(), bank.owed()), (5 * SLOT, 0));
+        bank.grow(0);
+        assert!(!bank.grown(12, now));
+        assert_eq!(bank.lent(), None, "nothing borrowed");
+        bank.grow(5 * SLOT);
+        assert_eq!(bank.lent(), Some(5 * SLOT), "a borrowing growth is held as it begins");
+        assert!(bank.grown(17, now));
         bank.shrunk(14);
         assert_eq!((bank.borrowed(), bank.lent()), (2 * SLOT, Some(2 * SLOT)), "three borrowed slots went first");
         bank.shrunk(9);
-        assert_eq!((bank.borrowed(), bank.lent()), (0, None), "then the committed ones");
-        bank.grow(Room::Committed, SLOT);
-        bank.grown(10, now);
-        assert_eq!(bank.borrowed(), 0, "a committed growth after it commits");
+        assert_eq!((bank.borrowed(), bank.lent()), (0, None), "then the rest");
     }
 
-    /// A claim of the load's takes back borrowed room up to what is lent,
-    /// which the bank then owes; displacement now takes all of it back.
+    /// Displacement now stops borrowing until the host stayed quiet, and a
+    /// growth that joined fewer slots than it borrowed for holds only those.
     #[test]
-    fn claims_and_displacement_now_take_borrowed_room_back() {
+    fn displacement_now_holds_borrowing_and_a_growth_holds_what_it_joined() {
         let (mut bank, now) = quiet_bank(true);
-        bank.grow(Room::Borrowed, 6 * SLOT);
-        bank.grown(16, now);
-        assert_eq!(bank.take_back(2 * SLOT), 2 * SLOT);
-        assert_eq!((bank.owed(), bank.lent()), (2 * SLOT, Some(4 * SLOT)));
-        assert_eq!(bank.take_back(9 * SLOT), 4 * SLOT, "no more than is lent");
-        let (mut bank, now) = quiet_bank(true);
-        bank.grow(Room::Borrowed, 6 * SLOT);
-        bank.grown(16, now);
+        bank.grow(6 * SLOT);
+        assert_eq!(bank.baseline(), None, "nothing is judged while the bank grows");
+        bank.observe(&reading(true), now);
+        assert!(!bank.borrows(), "no growth begins beside it");
+        bank.grown(13, now);
+        assert_eq!((bank.borrowed(), bank.lent()), (3 * SLOT, Some(3 * SLOT)));
         bank.observe(&reading(true), now + Duration::from_secs(1));
-        assert_eq!((bank.owed(), bank.lent()), (6 * SLOT, Some(0)), "displacement now: all of it");
-        assert!(!bank.borrows(), "and no borrowing until it stayed quiet");
+        assert!(!bank.borrows(), "no borrowing until it stayed quiet");
         bank.observe(&reading(false), now + Duration::from_secs(2));
-        assert!(!bank.borrows());
         bank.observe(&reading(false), now + Duration::from_secs(2) + RECOVERY_STABLE_TIME);
         assert!(bank.borrows(), "quiet for the stable time again");
     }
 
-    /// No displacement is judged while the bank grows, and a growth that
-    /// joined fewer slots than it lent for lends only what it borrowed.
+    /// Where the host reports no displacement, allocatable memory counts
+    /// all the bank holds: the hold reads nothing borrowed.
     #[test]
-    fn a_growth_is_not_displacement_now_and_lends_what_it_joined() {
-        let (mut bank, now) = quiet_bank(true);
-        bank.grow(Room::Borrowed, 6 * SLOT);
-        assert_eq!(bank.baseline(), None, "nothing is judged while the bank grows");
-        bank.observe(&reading(true), now);
-        assert_eq!(bank.lent(), Some(6 * SLOT), "its own backing displaces");
-        assert!(!bank.borrows(), "no growth begins beside it");
-        bank.grown(13, now);
-        assert_eq!((bank.borrowed(), bank.lent()), (3 * SLOT, Some(3 * SLOT)));
-    }
-
-    /// Where the host reports no displacement the bank borrows the places'
-    /// room alone, which allocatable memory counts: no wait, and the hold
-    /// line's level holds it.
-    #[test]
-    fn an_uncounted_host_borrows_the_places_room_on_the_level() {
+    fn an_uncounted_host_reads_no_borrowed_room() {
         let mut bank = BankRoom::new(false, SLOT, 10, Instant::now());
         assert!(bank.borrows(), "no displacement to wait out");
-        bank.grow(Room::Borrowed, 3 * SLOT);
-        assert_eq!(bank.lent(), None, "the hold line reads allocatable memory");
-        bank.grown(13, Instant::now());
-        assert_eq!(bank.take_back(SLOT), SLOT, "a group's places still take it back");
-        assert_eq!(bank.owed(), SLOT);
+        bank.grow(3 * SLOT);
+        assert_eq!(bank.lent(), None);
     }
 }

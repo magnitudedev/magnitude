@@ -14,5 +14,6 @@ mod release;
 pub mod round_driver;
 pub mod serving;
 pub mod worker;
+pub use magnitude_executor::workload;
 
 pub use policy::ServiceLimits;

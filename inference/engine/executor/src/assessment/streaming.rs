@@ -130,12 +130,25 @@ impl Stages<'_> {
 /// read and the choices the group's rows routed to it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupUnion {
-    pub steps: usize,
-    pub merged: usize,
-    pub experts: Vec<(usize, u32)>,
+    steps: usize,
+    merged: usize,
+    experts: Vec<(usize, u32)>,
+    /// Each count of choices the group's rows routed to an expert, and how
+    /// many experts it routed that many: what a pass over a group of any
+    /// size reads ([`Self::read`]), taken from `experts` once, not at each
+    /// of the many passes a group's pricing weighs.
+    routed: Vec<(u32, usize)>,
 }
 
 impl GroupUnion {
+    pub fn new(steps: usize, merged: usize, experts: Vec<(usize, u32)>) -> Self {
+        let mut routed = std::collections::BTreeMap::<u32, usize>::new();
+        for &(_, choices) in &experts {
+            *routed.entry(choices).or_default() += 1;
+        }
+        Self { steps, merged, experts, routed: routed.into_iter().collect() }
+    }
+
     /// The chance a group of `steps` steps reads an expert the group's rows
     /// routed `choices` choices to: its rows a share `r = steps /
     /// self.steps` of the group's, each of those choices among them with
@@ -159,15 +172,21 @@ impl GroupUnion {
             .fold((0., 0), |(expected, read), &(_, choices)| (expected + self.chance(steps, choices), read + 1))
     }
 
+    /// The experts a group of `steps` steps is expected to read of all the
+    /// group read ([`Self::deeper`] at no depth), by each count of choices.
+    fn read(&self, steps: usize) -> f64 {
+        self.routed.iter().map(|&(choices, experts)| experts as f64 * self.chance(steps, choices)).sum()
+    }
+
     /// The choices a group of `steps` steps routes: the group's a step.
     fn choices(&self, steps: usize) -> f64 {
-        let routed = self.experts.iter().map(|&(_, choices)| u64::from(choices)).sum::<u64>();
+        let routed = self.routed.iter().map(|&(choices, experts)| u64::from(choices) * experts as u64).sum::<u64>();
         routed as f64 * steps as f64 / self.steps as f64
     }
 
     /// One pass over `steps` steps' rows at streamed layer `layer`.
     fn pass(&self, pass: &ExpertPass, layer: usize, steps: usize) -> f64 {
-        pass.seconds(layer, self.deeper(steps, 0).0, self.choices(steps))
+        pass.seconds(layer, self.read(steps), self.choices(steps))
     }
 
     /// What a group of `steps` steps merging `merged` of them costs at
@@ -208,54 +227,6 @@ pub struct BankSlots {
     pub floor: u64,
     pub bytes: u64,
     pub host: u64,
-}
-
-/// A prompt group's places as its grant weighs them: the chunks in hand,
-/// the places held, the bytes a class of each count of places from those
-/// held to the chunks holds (`bytes[p − held]`, increasing), what a grant's
-/// bytes stay below now, and the seconds a group may run (the wait bound,
-/// `MemoryPace::wait_bound`; none before the host was seen taking memory).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Places<'a> {
-    pub chunks: usize,
-    pub held: usize,
-    pub bytes: &'a [u64],
-    pub room: u64,
-    pub wait: Option<f64>,
-}
-
-impl Places<'_> {
-    /// The most places whose class stays below `room` now, those held
-    /// always, and the room that class leaves (all of it at those held):
-    /// the one growth-room test of a group's places. A count `outlasts`
-    /// says runs longer than a group may is not admitted, nor any after it.
-    pub fn admitted(&self, outlasts: impl Fn(usize) -> bool) -> (usize, u64) {
-        let mut admitted = (self.held, self.room);
-        for (places, &bytes) in (self.held..).zip(self.bytes).skip(1) {
-            match self.room.checked_sub(bytes).filter(|&left| left > 0 && !outlasts(places)) {
-                Some(left) => admitted = (places, left),
-                None => break,
-            }
-        }
-        admitted
-    }
-}
-
-/// Decode while the prompt runs: the decode seconds owed each second the
-/// prompt runs (the scheduler's share), and the decode step on a bank of a
-/// count of slots.
-pub struct DecodeWaiting<'a, E> {
-    pub owed: f64,
-    pub step: &'a mut dyn FnMut(u64) -> Result<f64, E>,
-}
-
-/// What a grant decided: the places the chunks in hand are worth, and the
-/// slots the bank keeps for them (fewer than now when places win memory
-/// from slots).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PlaceGrant {
-    pub places: usize,
-    pub slots: u64,
 }
 
 impl GroupReads {
@@ -346,84 +317,17 @@ impl GroupReads {
             .collect()
     }
 
-    /// The seconds `chunks` chunks take in groups of `places` on a bank of
-    /// `slots` slots holding `now` beside a host tier of `host`: each
-    /// group's compute and what it leaves of its stages uncovered
-    /// ([`Stages::exposed`]), at its size.
-    fn seconds(&self, now: u64, slots: u64, host: u64, chunks: usize, places: usize, pass: Option<&ExpertPass>) -> f64 {
-        let group = |steps: usize| {
-            let layers = self.at(now, slots, host, steps, pass);
-            let compute = layers.iter().map(|layer| layer.compute_seconds).sum::<f64>() * steps as f64;
-            compute + self.stages(&layers).exposed(steps)
-        };
-        let rest = match chunks % places {
-            0 => 0.,
-            rest => group(rest),
-        };
-        (chunks / places) as f64 * group(places) + rest
-    }
-
-    /// The places of the chunks in hand, by value per byte: the first group
-    /// holds the most places `room` admits now: more places never cost it
-    /// more, and free memory is what the bank's own growth left as not
-    /// paying (the bank's growth takes the rest). Beyond them, each
-    /// further count of places runs the rest of the chunks once the bank has
-    /// given up the slots their bytes need past what that first grant leaves:
-    /// worth it when the reads its fewer groups save exceed what the slots
-    /// given up cost the prompt's groups (the group-read curve: an expert a
-    /// slot gave up is read from the file, or pulled from the host tier
-    /// where groups pull from it and it holds the expert) and the
-    /// decode running while they run (the load's priced step at fewer
-    /// slots, `DecodePrice`, for the decode seconds owed). Each count's groups are priced
-    /// at their size, their passes by `pass` where the executor's costs
-    /// are measured ([`Self::at`]). The count of least seconds wins, fewer
-    /// places on a tie; never below the bank's floor.
-    pub fn grant<E>(
-        &self,
-        slots: BankSlots,
-        places: Places<'_>,
-        pass: Option<&ExpertPass>,
-        mut decode: Option<DecodeWaiting<'_, E>>,
-    ) -> Result<PlaceGrant, E> {
-        let Places { chunks, held, bytes, wait, .. } = places;
-        // The wait bound: nothing is released while a group runs, so no
-        // group runs longer than pressure may wait for a release, on the
-        // slots it runs on; the counts from the first that would are never
-        // weighed.
-        let outlasts = |kept: u64, places: usize| {
-            wait.is_some_and(|wait| self.seconds(slots.now, kept, slots.host, places, places, pass) > wait)
-        };
-        let (now, left) = places.admitted(|places| outlasts(slots.now, places));
-        let first = self.seconds(slots.now, slots.now, slots.host, now.min(chunks), now, pass);
-        let alone = PlaceGrant { places: now, slots: slots.now };
-        let mut least = (self.seconds(slots.now, slots.now, slots.host, chunks, now, pass), alone);
-        let mut base = None;
-        for (places, &bytes) in (held..).zip(bytes).skip(now + 1 - held) {
-            let cut = bytes.saturating_add(1).saturating_sub(left).div_ceil(slots.bytes);
-            let Some(fewer) = slots
-                .now
-                .checked_sub(cut)
-                .filter(|&fewer| fewer >= slots.floor && !outlasts(fewer, places))
-            else {
-                break;
-            };
-            let rest = self.seconds(slots.now, fewer, slots.host, chunks.saturating_sub(now), places, pass);
-            let slower = match &mut decode {
-                Some(DecodeWaiting { owed, step }) => {
-                    let base = match base {
-                        Some(base) => base,
-                        None => *base.insert(step(slots.now)?),
-                    };
-                    *owed * rest * (step(fewer)? / base - 1.)
-                }
-                None => 0.,
-            };
-            let seconds = first + rest + slower;
-            if seconds < least.0 {
-                least = (seconds, PlaceGrant { places, slots: fewer });
-            }
-        }
-        Ok(least.1)
+    /// The seconds one group of `steps` chunks takes on the bank as it
+    /// holds now (`slots`): its compute and what it leaves of its stages
+    /// uncovered ([`Stages::exposed`]), the group-read curve's reads and
+    /// passes at its size ([`Self::at`]). What a prompt group's places are
+    /// worth, a place more saving what it takes off the prompt's groups
+    /// (`planning::grouped`), and how long a group runs, which the wait
+    /// bound holds.
+    pub fn group_seconds(&self, slots: BankSlots, steps: usize, pass: Option<&ExpertPass>) -> f64 {
+        let layers = self.at(slots.now, slots.now, slots.host, steps, pass);
+        let compute = layers.iter().map(|layer| layer.compute_seconds).sum::<f64>() * steps as f64;
+        compute + self.stages(&layers).exposed(steps)
     }
 }
 
@@ -469,7 +373,7 @@ mod tests {
                 vec![crate::assessment::Flops { format: bf16, flops: 1 }],
             ); 2],
         );
-        let union = GroupUnion { steps: 4, merged: 4, experts: (0..64).map(|expert| (expert, 2)).collect() };
+        let union = GroupUnion::new(4, 4, (0..64).map(|expert| (expert, 2)).collect());
         let unions = [&union, &union];
         let lines = lines(3_000_000, 2);
         let sets = |filed: u64| {
@@ -527,11 +431,7 @@ mod tests {
         layer.requests[*depths.iter().max().unwrap()] += 1;
         let cold = depths.iter().filter(|&&depth| depth >= 8).count() as u64;
         let terms = GroupLayerTerms { compute_seconds: 1e-3, filed: cold, tiered: 0 };
-        let union = GroupUnion {
-            steps,
-            merged: steps,
-            experts: depths.iter().map(|&depth| (depth, choices)).collect(),
-        };
+        let union = GroupUnion::new(steps, steps, depths.iter().map(|&depth| (depth, choices)).collect());
         let curve = MissCurve { steps: 1, layers: vec![layer; 2] };
         GroupReads::new(vec![terms; 2], vec![union; 2], lines(10_000_000, 2), curve, READ, false, Notice::Written).unwrap()
     }
@@ -539,26 +439,6 @@ mod tests {
     /// [`group`] of one step: every group of the grant at least as long.
     fn reads(depths: &[usize]) -> GroupReads {
         group(1, depths, 1)
-    }
-
-    /// 8 chunks from one place held; a class of `p` places holds 13 MB a
-    /// place past the first; 30 MB of room admits 3 now. A bank of 8 slots
-    /// of 20 MB, floor 2; no wait bound.
-    fn grant(reads: &GroupReads, decode: Option<(f64, fn(u64) -> f64)>) -> PlaceGrant {
-        grant_within(reads, decode, None)
-    }
-
-    fn grant_within(
-        reads: &GroupReads,
-        decode: Option<(f64, fn(u64) -> f64)>,
-        wait: Option<f64>,
-    ) -> PlaceGrant {
-        let bytes = (1..=8).map(|places| (places - 1) * 13_000_000).collect::<Vec<u64>>();
-        let slots = BankSlots { now: 8, floor: 2, bytes: 20_000_000, host: 0 };
-        let places = Places { chunks: 8, held: 1, bytes: &bytes, room: 30_000_000, wait };
-        let mut step = |slots: u64| Ok::<_, ()>(decode.unwrap().1(slots));
-        let decode = decode.map(|(owed, _)| DecodeWaiting { owed, step: &mut step });
-        reads.grant(slots, places, None, decode).unwrap()
     }
 
     /// A group reads, of the experts the last group read, each with the
@@ -569,7 +449,7 @@ mod tests {
     /// last group read cold at the slots, to the nearest expert.
     #[test]
     fn a_groups_reads_follow_its_size() {
-        let union = GroupUnion { steps: 4, merged: 4, experts: vec![(8, 1), (8, 4), (0, 2)] };
+        let union = GroupUnion::new(4, 4, vec![(8, 1), (8, 4), (0, 2)]);
         assert_eq!(union.deeper(2, 0), (0.5 + 0.9375 + 0.75, 3));
         assert_eq!(union.deeper(2, 8), (0.5 + 0.9375, 2));
         assert_eq!(union.deeper(4, 0), (3., 3));
@@ -614,7 +494,7 @@ mod tests {
                 vec![crate::assessment::Flops { format: bf16, flops: 1 }],
             )],
         );
-        let union = GroupUnion { steps: 4, merged: 4, experts: (0..64).map(|expert| (expert, 2)).collect() };
+        let union = GroupUnion::new(4, 4, (0..64).map(|expert| (expert, 2)).collect());
         let curve = MissCurve {
             steps: 1,
             layers: vec![crate::experts::LayerCurve { misses: vec![0; 65], requests: vec![0; 65], choices: 0 }],
@@ -639,40 +519,22 @@ mod tests {
         close(compute(8), 25e-6);
     }
 
-    /// The wait bound clips a grant: a group whose union the bank holds
-    /// runs its compute alone, 2 ms a place over two layers, so a bound of
-    /// 5 ms admits 2 of the 3 places room admits. A group of cold experts
-    /// runs its union's read and moves whatever its places (72.0 ms): a
-    /// bound above
-    /// it leaves the grant as unbounded, one below it holds the place held.
+    /// A prompt's places are worth the reads their fewer groups save: a
+    /// group of cold experts reads its union whatever its places, so 8
+    /// chunks take less the fewer groups they run in; a group whose union
+    /// the bank holds runs its compute alone, 2 ms a chunk over two layers,
+    /// whatever its places, so a place more saves nothing, and a group of 3
+    /// runs 6 ms, past a wait bound of 5 ms.
     #[test]
-    fn a_grant_is_clipped_by_the_wait_bound() {
-        let held = reads(&[0, 1, 2, 3, 4, 5, 6]);
-        assert_eq!(grant_within(&held, None, Some(5e-3)), PlaceGrant { places: 2, slots: 8 });
+    fn places_are_worth_the_group_reads_they_save() {
+        let slots = BankSlots { now: 8, floor: 2, bytes: 20_000_000, host: 0 };
         let cold = reads(&[8; 7]);
-        assert_eq!(grant_within(&cold, None, Some(0.08)), grant(&cold, None));
-        assert_eq!(grant_within(&cold, None, Some(0.07)), PlaceGrant { places: 1, slots: 8 });
-    }
-
-    /// Places win memory from slots where a group's experts are all cold:
-    /// one slot holds none of its union, and a group fewer saves a whole
-    /// union's read. The first group holds the 3 places room admits; the 5
-    /// chunks left run as one group once the bank gives up 3 slots (the
-    /// 52 MB of 5 places past the 4 MB the first leaves), and no more places
-    /// save more. Slots win where decode runs beside the prompt and each
-    /// slot given up slows its step by two thirds of a step, or where the
-    /// slots given up hold the group's union.
-    #[test]
-    fn places_and_slots_are_weighed_by_what_they_save() {
-        let cold = reads(&[8; 7]);
-        assert_eq!(grant(&cold, None), PlaceGrant { places: 5, slots: 5 });
-        let heavy = |slots: u64| 0.03 + 0.02 * (8 - slots) as f64;
-        assert_eq!(grant(&cold, Some((1., heavy))), PlaceGrant { places: 3, slots: 8 });
-        let light = |slots: u64| 0.03 + 0.001 * (8 - slots) as f64;
-        assert_eq!(grant(&cold, Some((1., light))), PlaceGrant { places: 5, slots: 5 });
+        let seconds = |reads: &GroupReads, places| crate::planning::grouped(8, places, |steps| reads.group_seconds(slots, steps, None));
+        assert!(seconds(&cold, 1) > seconds(&cold, 2) && seconds(&cold, 2) > seconds(&cold, 8));
         let held = reads(&[0, 1, 2, 3, 4, 5, 6]);
-        assert_eq!(grant(&held, None), PlaceGrant { places: 3, slots: 8 });
-        // No group counted, no grant priced.
+        assert!((seconds(&held, 1) - seconds(&held, 8)).abs() < 1e-12);
+        assert!((held.group_seconds(slots, 3, None) - 6e-3).abs() < 1e-12);
+        // No group counted, nothing priced.
         let curve = MissCurve { steps: 0, layers: Vec::new() };
         assert_eq!(GroupReads::new(Vec::new(), Vec::new(), lines(1, 0), curve, READ, false, Notice::Written), None);
     }

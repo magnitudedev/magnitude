@@ -17,7 +17,7 @@ use super::{
     },
     prefix_cache::{
         CachePoint, MIN_BRANCH_GAIN, MIN_PREFIX_HIT, PrefixCache, PrefixCacheCapacity, PrefixPath,
-        PrefixRetention,
+        PrefixRetention, PrefixStep,
     },
     protocol::{RequestSnapshot, RoomGrant, RoomGranter, RoomRefusal, WorkerReply},
     publication::{
@@ -29,9 +29,10 @@ use super::{
     round_driver::{RoundError, lower_round, reconcile_forward},
     serving::ServingCensus,
     worker::Wakes,
+    workload::WorkloadRates,
 };
 use magnitude_executor::{
-    BankResize, BankResized, BankStep, BankTier, DomainError, ExpertMeasures, InvariantError, MeasurementRoom,
+    BankResize, BankResized, BankStep, BankTier, DomainError, OwnerHoldings, LoadMeasures, InvariantError, MeasurementRoom,
     MemoryChargeReconciliation, MemoryMoment, NativeFamily,
     OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
     ProgramFamily, RequestId, ResourceKind, ResourcePlan, ShrinkCause, SlotRelease, StateBindings, SubmitError,
@@ -878,6 +879,9 @@ struct ActiveGroup<F: ProgramFamily> {
 struct Round {
     selection: Selection,
     started: u64,
+    /// The rows its forward and head operations carry: a prefill round's
+    /// tokens.
+    rows: usize,
     /// The requests whose work is in this round, moved out of the map.
     members: BTreeMap<RequestId, Member>,
     /// Groups not yet submitted, in order; reconciliation appends follow-ups.
@@ -933,27 +937,25 @@ pub struct BetweenFlights {
     deficits: Vec<MemoryDeficit>,
     /// What of the release ladder is still in motion.
     ladder: Ladder,
-    /// Memory was observed recovered while a flight held the bindings; a
-    /// growth step of the expert bank is considered once they return.
-    grow_owed: bool,
-    /// The offers of the last growth decision that began nothing, as they
-    /// were decided (`GrowthOffer::decided`): the same offers make the same
-    /// decision, so it is not made again until one differs.
-    declined: Option<Vec<magnitude_executor::GrowthDecided>>,
+    /// Memory was observed while a flight held the bindings: the heap is
+    /// settled once they return.
+    settle_owed: bool,
+    /// The last growth a settle granted that began nothing, as (holding,
+    /// store, from, to): a settle granting the same is not tried again
+    /// until it differs, as its rate per byte moves with the meter at
+    /// every reading while what it would claim does not.
+    declined: Option<(magnitude_executor::BankHolding, BankTier, u64, u64)>,
     /// Whether the measurement room's claim is owed a decision.
     room_owed: RoomOwed,
-    /// Whether memory has stayed free (`platform::Recovery`), on the
-    /// service clock: what the bank's growth waits on.
-    recovery: magnitude_executor::platform::Recovery<u64>,
     /// Each store's running expert bank resize this owner began: the stores
     /// resize on their own (`BankStep::Begun`).
     bank_began: [Option<BankBegun>; BankTier::COUNT],
     /// The measurement job's room claimed of the domain and not yet
     /// answered ([`Owner::claim_measurement_room`]).
     measurement_room: Option<RoomClaim>,
-    /// Costs the executor stored since the load priced its experts, which
-    /// price them from the next flight boundary on ([`Owner::measure_experts`]).
-    measures: Option<ExpertMeasures>,
+    /// Costs the executor stored since the load was priced, which price it
+    /// from the next flight boundary on ([`Owner::measure_load`]).
+    measures: Option<LoadMeasures>,
     next_observation: u64,
 }
 
@@ -982,10 +984,9 @@ impl BetweenFlights {
             condition: MemoryCondition::Normal,
             deficits: Vec::new(),
             ladder: Ladder::default(),
-            grow_owed: false,
+            settle_owed: false,
             declined: None,
             room_owed: RoomOwed::default(),
-            recovery: magnitude_executor::platform::Recovery::new(),
             bank_began: [None; BankTier::COUNT],
             measurement_room: None,
             measures: None,
@@ -1013,6 +1014,13 @@ pub trait MemoryHost {
     /// releases last.
     fn held_prefixes(&self) -> BTreeSet<u64>;
     fn evict_prefix(&mut self, held: &BTreeSet<u64>) -> bool;
+    /// The cached prefixes the heap may release, with their bytes and what
+    /// their hits save a second at `rates`, the least valuable first
+    /// (`PrefixCache::held_steps`).
+    fn prefix_steps(&self, rates: &WorkloadRates) -> Vec<PrefixStep>;
+    /// Evict the cached prefix `id` a settle released: whether it was still
+    /// cached and unused.
+    fn evict_cached_prefix(&mut self, id: u64) -> bool;
     /// Preempt eligible live requests, sparing `spared`, and with
     /// `resident_slot` those that free no bytes: whether any was.
     fn evict_victims(&mut self, spared: &[RequestId], resident_slot: bool) -> Result<bool, DomainError>;
@@ -1217,11 +1225,11 @@ impl<F: ProgramFamily> Owner<F> {
         self.service.memory.measurement_room = None;
     }
 
-    /// Price the load's experts by `measures` from the next flight boundary
-    /// on ([`between_flights`]), a later call's replacing an earlier one's
-    /// not yet applied: no step in flight is recorded or priced by measures
-    /// it did not run under.
-    pub fn measure_experts(&mut self, measures: ExpertMeasures) {
+    /// Price the load by `measures` from the next flight boundary on
+    /// ([`between_flights`]), a later call's replacing an earlier one's not
+    /// yet applied: no step in flight is recorded or priced by measures it
+    /// did not run under.
+    pub fn measure_load(&mut self, measures: LoadMeasures) {
         self.service.memory.measures = Some(measures);
     }
 
@@ -1311,6 +1319,7 @@ impl<F: ProgramFamily> Service<F> {
         members: Option<&mut BTreeMap<RequestId, Member>>,
     ) -> Result<(RequestId, PublicationReceiver), AdmissionError> {
         self.time(now).map_err(AdmissionError::Refused)?;
+        self.domain.served_request(!input.vision().is_empty());
         if generation.is_resident() || generation.usage().completion_tokens != 0 {
             return Err(AdmissionError::invariant("admission")(
                 "only a fresh generation can be admitted".into(),
@@ -1757,18 +1766,15 @@ trait MemoryStep: MemoryHost + Sized {
             let observation = memory_observation(self.domain().probe_memory(OBSERVATION_INTERVAL)).map_err(memory)?;
             let next = self.memory().condition.observe(observation, now);
             self.enter_memory_condition(next);
-            // The bank grows only once memory has stayed free, as a
-            // service reopens load admission.
-            let recovered = self.memory().recovery.observe(observation == MemoryObservation::Normal, now, |since, now| {
-                std::time::Duration::from_nanos(now - since)
-            });
-            self.memory().grow_owed = false;
+            // Each reading settles the heap afresh: its supply holds the
+            // reserve derived from the host's measured motion, so what it
+            // grants is room no wait would make safer.
+            self.memory().settle_owed = observation == MemoryObservation::Normal;
             if !matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
                 self.memory().ladder.owed = false;
                 self.memory().ladder.covered = false;
                 if observation == MemoryObservation::Normal {
                     self.reopen_memory_deficits().map_err(memory)?;
-                    self.memory().grow_owed = recovered;
                 }
             } else if observation == MemoryObservation::Reclaim {
                 // Releases are measured against a fresh reading; a Blind
@@ -1787,14 +1793,14 @@ trait MemoryStep: MemoryHost + Sized {
             self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
         }
         let mut bindings = bindings;
-        // A flight boundary: newly stored costs price the experts first, so
+        // A flight boundary: newly stored costs price the load first, so
         // every decision past it is made on them; the expert bank's resize
         // advances, and a finished one frees what waited on it.
         if let Some(bindings) = bindings.as_deref_mut() {
             // A refusal (the device would not take the tier copy's grid) is a device
             // fault the load ends on, the experts still priced as before.
             if let Some(measures) = self.memory().measures.take() {
-                self.domain().measure_experts(measures, bindings).map_err(classify_domain_error)?;
+                self.domain().measure_load(measures, bindings).map_err(classify_domain_error)?;
             }
             self.advance_expert_bank()?;
             self.advance_slot_release()?;
@@ -1807,27 +1813,13 @@ trait MemoryStep: MemoryHost + Sized {
                 self.memory().ladder.owed |= reclaim;
             }
         }
-        // A prompt's places that won memory from the bank's slots, and the
-        // borrowed room the load's claims took back, take it through the
-        // bank's shrink (`ExecutorDomain::places_shrink`), as a release
-        // waits, for no chain under way: a chain under way is cut beside
-        // (`ExpertBank::release_running`).
-        if let (None, Some(bindings)) = (self.domain().chain_holder(), bindings.as_deref_mut()) {
-            if let Some(bytes) = self.domain().places_shrink().map_err(classify_domain_error)? {
-                let before = self.domain().memory_moment();
-                let wake = self.completion();
-                let step = self.domain().shrink_expert_bank_by(bindings, bytes, wake);
-                if let BankStep::Begun(tier) = step.map_err(classify_domain_error)? {
-                    let begun = BankBegun { held: before, cause: BankBegunFor::Shrink(ShrinkCause::LiveClaim) };
-                    self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
-                }
-            }
-        }
         // The measurement job's claim takes its room through the bank's
         // shrink toward its floor, read at a probe no resize ran across
         // (`room_owed`), so each shrink is seen before the next is decided:
         // answered once the room is made, or once the floor leaves it short.
-        let ready = !self.memory().resizing() && self.domain().chain_holder().is_none() && bindings.is_some();
+        // A shrink deferred while a chain is under way waits for the next
+        // probe.
+        let ready = !self.memory().resizing() && bindings.is_some();
         let deciding = match self.memory().room_owed.take(ready) {
             true => self.domain().measurement_room().map_err(classify_domain_error)?,
             false => None,
@@ -1867,9 +1859,9 @@ trait MemoryStep: MemoryHost + Sized {
                 self.enter_memory_condition(next);
             }
         }
-        if let (true, Some(_)) = (self.memory().grow_owed, bindings) {
-            self.memory().grow_owed = false;
-            self.grow_expert_bank()?;
+        if let (true, Some(bindings)) = (self.memory().settle_owed, bindings) {
+            self.memory().settle_owed = false;
+            self.settle_memory(bindings)?;
         }
         // Unloading is the last step of the release order, past the ladder's
         // last rung (`release::Rung`): while a flight holds the bindings, the
@@ -1947,71 +1939,85 @@ trait MemoryStep: MemoryHost + Sized {
         Ok(())
     }
 
-    /// Begin one growth step of the expert bank: while memory is Normal and
-    /// no blocked request waits on memory (what is free is theirs first),
-    /// the first store's step that pays (`ExecutorDomain::expert_bank_growths`,
-    /// each step within what its store's claim admits). A store whose claim
-    /// is refused passes to the next, so a full device never holds back the
-    /// host tier; a Reclaim or Blind refusal is the memory observation it
-    /// is. Each step offered is logged with what came of it.
-    fn grow_expert_bank(&mut self) -> Result<(), RequestError> {
-        // A resize begun and not yet finished decides the next: none is
-        // made beside it.
+    /// Settle the memory heap (`ExecutorDomain::settle_memory`) on
+    /// `bindings` and apply it: the prefixes it released evicted, the idle
+    /// optional components it released unbound, then one bank resize: its
+    /// least valuable release first (what it gives back is what the
+    /// settle's growths and places are paid with), else its most valuable
+    /// growth, each to its settled size; the rest settle again at the next
+    /// reading. While memory is Normal and no blocked request waits on
+    /// memory (what is free is theirs first), and no resize runs (one begun
+    /// decides the next). A grant's claim refused in Reclaim or blind is
+    /// the memory observation it is.
+    fn settle_memory(&mut self, bindings: &mut StateBindings) -> Result<(), RequestError> {
         if self.memory().condition != MemoryCondition::Normal
             || !self.memory().deficits.is_empty()
             || self.memory().resizing()
         {
             return Ok(());
         }
-        // A decision made on these offers already began nothing.
-        let offers = self.domain().expert_bank_growths().map_err(classify_domain_error)?;
-        let decided = offers.iter().map(magnitude_executor::GrowthOffer::decided).collect::<Vec<_>>();
-        if self.memory().declined.as_ref() == Some(&decided) {
+        let rates = self.domain().serving_rates().map_err(classify_domain_error)?;
+        let prefixes = rates.map_or_else(Vec::new, |rates| self.prefix_steps(&rates));
+        let owner = OwnerHoldings { prefixes: prefixes.iter().map(|step| (step.bytes, step.seconds_per_second)).collect() };
+        let settled = self.domain().settle_memory(&owner).map_err(classify_domain_error)?;
+        // The settle releases the least valuable first, in the order given.
+        for step in &prefixes[..settled.prefixes] {
+            self.evict_cached_prefix(step.id);
+        }
+        if !settled.optional.is_empty() {
+            self.domain()
+                .release_idle_optional_components(bindings, &settled.optional)
+                .map_err(invariant("optional component release"))?;
+        }
+        if settled.prefixes > 0 || !settled.optional.is_empty() {
+            self.advance_epoch();
+        }
+        let before = self.domain().memory_moment();
+        let wake = self.completion();
+        if let Some(release) = settled.releases.first().copied() {
+            let magnitude_executor::BankRelease { holding, to, per_byte } = release;
+            // A shrink deferred (a chain under way, a step still running)
+            // is settled again at the next reading.
+            let step = self.domain().shrink_expert_bank_to(bindings, holding, to, wake).map_err(classify_domain_error)?;
+            tracing::info!(?holding, to, per_byte, ?step, "expert bank release settled");
+            // A holding worth more per byte won the bank's memory.
+            if let BankStep::Begun(tier) = step {
+                let begun = BankBegun { held: before, cause: BankBegunFor::Shrink(ShrinkCause::Rebalance) };
+                self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
+            }
             return Ok(());
         }
-        self.memory().declined = Some(decided);
-        for offer in offers {
-            let magnitude_executor::Growth { holding, kind, from, to, bytes, saving, justified } = offer.growth;
-            // One line a decision: the step offered, and what came of it.
-            let decided = |outcome: &dyn std::fmt::Display| {
-                tracing::info!(?holding, ?kind, from, to, justified, bytes, ?saving, %outcome, "expert bank growth decision");
-            };
-            if !offer.pays {
-                decided(&"not paying");
-                continue;
+        let Some(grant) = settled.grants.first().copied() else {
+            return Ok(());
+        };
+        let tried = Some((grant.holding, grant.kind, grant.from, grant.to));
+        if self.memory().declined == tried {
+            return Ok(());
+        }
+        self.memory().declined = tried;
+        let decided = |outcome: &dyn std::fmt::Display| {
+            let magnitude_executor::BankGrant { holding, kind, from, to, bytes, borrowed, per_byte } = grant;
+            tracing::info!(?holding, ?kind, from, to, bytes, borrowed, per_byte, %outcome, "expert bank growth settled");
+        };
+        match self.domain().grow_expert_bank(&grant, wake) {
+            Ok(BankStep::Begun(tier)) => {
+                decided(&"begun");
+                self.memory().declined = None;
+                let begun = BankBegun { held: before, cause: BankBegunFor::Growth };
+                self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
             }
-            let before = self.domain().memory_moment();
-            let wake = self.completion();
-            match self.domain().grow_expert_bank(kind, wake) {
-                Ok(BankStep::Begun(tier)) => {
-                    decided(&"begun");
-                    let begun = BankBegun { held: before, cause: BankBegunFor::Growth };
-                    self.memory().bank_begun(tier, begun).map_err(invariant("expert bank"))?;
-                    self.memory().declined = None;
-                    return Ok(());
-                }
-                // A growth waits for no gap, and every resize that runs is
-                // one this owner began (`bank_began`, which no decision is
-                // made beside): the offers decided these, and the same
-                // offers are not decided again.
-                Ok(step @ (BankStep::Running | BankStep::Deferred | BankStep::AtLimit)) => {
-                    decided(&format_args!("{step:?}"));
-                    return Ok(());
-                }
-                // Sized within what the claim admitted, a refusal is the
-                // machine's change since: the next decision reads its room
-                // afresh.
-                Err(DomainError::Capacity(refusal)) => decided(&format_args!(
-                    "refused: {} bytes required, {} available",
-                    refusal.required, refusal.available
-                )),
-                Err(error @ (DomainError::Reclaim(_) | DomainError::Blind(_))) => {
-                    decided(&format_args!("refused: {error}"));
-                    self.refused_for_memory(&error);
-                    return Ok(());
-                }
-                Err(error) => return Err(classify_domain_error(error)),
+            Ok(step) => decided(&format_args!("{step:?}")),
+            // Sized within what the claim admitted, a refusal is the
+            // machine's change since: the next reading settles afresh.
+            Err(DomainError::Capacity(refusal)) => decided(&format_args!(
+                "refused: {} bytes required, {} available",
+                refusal.required, refusal.available
+            )),
+            Err(error @ (DomainError::Reclaim(_) | DomainError::Blind(_))) => {
+                decided(&format_args!("refused: {error}"));
+                self.refused_for_memory(&error);
             }
+            Err(error) => return Err(classify_domain_error(error)),
         }
         Ok(())
     }
@@ -2181,8 +2187,8 @@ trait MemoryStep: MemoryHost + Sized {
             == MemoryObservation::Reclaim)
     }
 
-    /// Release once at the cheapest rung up to `through` that releases
-    /// anything ([`release::release_once`]): whether it released now;
+    /// Release once at the cheapest rung that releases anything, preemption
+    /// only where `preempt` ([`release::release_once`]): whether it released now;
     /// preemption spares `spared`, and with `resident_slot` takes requests
     /// that free no bytes, since what is short is a resident slot. A pending
     /// release (a bank resize) is recorded: no costlier rung runs, and the
@@ -2191,7 +2197,7 @@ trait MemoryStep: MemoryHost + Sized {
         &mut self,
         bindings: &mut StateBindings,
         cause: ReleaseCause,
-        through: Rung,
+        preempt: bool,
         held: &BTreeSet<u64>,
         spared: &[RequestId],
         resident_slot: bool,
@@ -2207,7 +2213,7 @@ trait MemoryStep: MemoryHost + Sized {
                 began: None,
                 slots_began: false,
             },
-            through,
+            preempt,
         )?;
         self.memory().ladder.released(release);
         Ok(release == Release::Released)
@@ -2225,7 +2231,7 @@ trait MemoryStep: MemoryHost + Sized {
         let held = self.held_prefixes();
         while self.reclaim_needed()?
             && self
-                .release_once(bindings, ReleaseCause::Reclaim, Rung::Preemption, &held, &[], false)
+                .release_once(bindings, ReleaseCause::Reclaim, true, &held, &[], false)
                 .map_err(classify_domain_error)?
         {
             released = true;
@@ -2620,9 +2626,15 @@ impl<F: ProgramFamily> Service<F> {
             self.scheduler.completed(selection, 0);
             return Ok(Selected::Retry);
         }
+        let rows = operations
+            .iter()
+            .filter(|operation| matches!(operation, Operation::Forward { .. } | Operation::Head { .. }))
+            .map(Operation::row_count)
+            .sum();
         Ok(Selected::Round(Round {
             selection,
             started: self.now,
+            rows,
             members,
             groups: group(&self.domain, operations).into_iter().collect(),
         }))
@@ -2914,7 +2926,7 @@ impl<F: ProgramFamily> Service<F> {
         let mut current = self.open_capacity(bindings, requirements);
         let held = self.held_entries(None);
         while matches!(current, Err(DomainError::Capacity(_)))
-            && self.release_once(bindings, ReleaseCause::LiveClaim, Rung::Preemption, &held, &[], true)?
+            && self.release_once(bindings, ReleaseCause::LiveClaim, true, &held, &[], true)?
         {
             current = self.open_capacity(bindings, requirements);
         }
@@ -3085,7 +3097,7 @@ impl<F: ProgramFamily> Service<F> {
         }
         while short(&current)
             && self
-                .release_once(bindings, ReleaseCause::LiveClaim, Rung::Optional, &held, &[], false)
+                .release_once(bindings, ReleaseCause::LiveClaim, false, &held, &[], false)
                 .map_err(classify_domain_error)?
         {
             current = self.fits(bindings, round, &group_);
@@ -3098,7 +3110,7 @@ impl<F: ProgramFamily> Service<F> {
             let selected = round.members.keys().copied().collect::<Vec<_>>();
             while short(&current)
                 && self
-                    .release_once(bindings, ReleaseCause::LiveClaim, Rung::Preemption, &held, &selected, false)
+                    .release_once(bindings, ReleaseCause::LiveClaim, true, &held, &selected, false)
                     .map_err(classify_domain_error)?
             {
                 current = self.fits(bindings, round, &group_);
@@ -3476,10 +3488,12 @@ impl<F: ProgramFamily> Service<F> {
         let Round {
             selection,
             started,
+            rows,
             members,
             ..
         } = round;
         let elapsed = self.now.saturating_sub(started);
+        self.domain.served_round(selection.phase() == Phase::Decode, rows, elapsed as f64 / 1e9);
         let count = selection.requests().len() as u64;
         let base = elapsed / count;
         let remainder = elapsed % count;
@@ -3963,6 +3977,27 @@ impl<H: MemoryHost> Releases for Releasing<'_, H> {
         }
         Ok(released)
     }
+
+    /// Idle state and graph slots save nothing; the bank's, the cached
+    /// prefixes' and the bound optional components' lowest held rate per
+    /// byte at the load's serving rates (`ExecutorDomain::bank_release_rate`,
+    /// `PrefixCache::held_steps`, `ExecutorDomain::lowest_optional`). An
+    /// optional component whose worth is unknown holds nothing priced: the
+    /// rung goes last of the priced ones.
+    fn rate(&mut self, rung: Rung) -> Result<Option<f64>, DomainError> {
+        match rung {
+            Rung::Surplus | Rung::Idle => Ok(Some(0.)),
+            Rung::Bank => self.host.domain().bank_release_rate(),
+            Rung::Optional => Ok(self.host.domain().lowest_optional()?.and_then(|(_, per_byte)| per_byte)),
+            Rung::Prefix => Ok(self.host.domain().serving_rates()?.and_then(|rates| {
+                self.host
+                    .prefix_steps(&rates)
+                    .first()
+                    .map(|step| step.seconds_per_second / step.bytes.max(1) as f64)
+            })),
+            Rung::Preemption => unreachable!("the ladder rates only its priced rungs"),
+        }
+    }
 }
 
 impl<H: MemoryHost> Releasing<'_, H> {
@@ -3990,24 +4025,6 @@ impl<H: MemoryHost> Releasing<'_, H> {
                     .map_err(release_invariant("idle state release"))?
                     != 0,
             ),
-            // Borrowed room goes back before anything the load committed:
-            // a step begun, or a resize running, releases at a later flight
-            // boundary.
-            Rung::Borrowed => match self.host.domain().borrowed_deficit() {
-                0 => Release::Nothing,
-                bytes => {
-                    let wake = self.host.completion();
-                    match self.host.domain().shrink_expert_bank_by(self.bindings, bytes, wake)? {
-                        BankStep::Begun(tier) => {
-                            self.began = Some(tier);
-                            Release::Pending(Pending::Bank)
-                        }
-                        BankStep::Running => Release::Pending(Pending::Bank),
-                        BankStep::Deferred => Release::Deferred,
-                        BankStep::AtLimit => Release::Nothing,
-                    }
-                }
-            },
             Rung::Bank if self.host.domain().expert_reclaim_covered() => Release::Covered,
             // A step begun, or a resize running, releases at a later flight
             // boundary; the bank's floor releases nothing.
@@ -4024,13 +4041,16 @@ impl<H: MemoryHost> Releasing<'_, H> {
                 }
             }
             Rung::Prefix => released(self.host.evict_prefix(self.held)),
-            Rung::Optional => released(
-                self.host
-                    .domain()
-                    .release_idle_optional_components(self.bindings)
-                    .map_err(release_invariant("optional component release"))?
-                    != 0,
-            ),
+            Rung::Optional => match self.host.domain().lowest_optional()? {
+                Some((component, _)) => released(
+                    self.host
+                        .domain()
+                        .release_idle_optional_components(self.bindings, &[component])
+                        .map_err(release_invariant("optional component release"))?
+                        != 0,
+                ),
+                None => Release::Nothing,
+            },
             Rung::Preemption => released(self.host.evict_victims(self.spared, self.resident_slot)?),
         })
     }
@@ -4065,6 +4085,14 @@ impl<F: ProgramFamily> MemoryHost for Service<F> {
 
     fn evict_prefix(&mut self, held: &BTreeSet<u64>) -> bool {
         self.prefix_cache.evict_one(held)
+    }
+
+    fn prefix_steps(&self, rates: &WorkloadRates) -> Vec<PrefixStep> {
+        self.prefix_cache.held_steps(self.domain.retained_entry_bytes(), rates, &self.held_entries(None))
+    }
+
+    fn evict_cached_prefix(&mut self, id: u64) -> bool {
+        self.prefix_cache.evict(id)
     }
 
     fn evict_victims(&mut self, spared: &[RequestId], resident_slot: bool) -> Result<bool, DomainError> {

@@ -125,3 +125,33 @@ pub fn costs() -> super::ExecutorCosts {
 pub fn kind(id: u32) -> seismic::NativeKind {
     seismic::NativeKind { backend: seismic::BackendName::Cpu, id }
 }
+
+/// Synthetic streamed figures: a model store read in 100 µs plus 5 GB/s,
+/// host memory at 50 GB/s, no CPU site, a convert at 100 GB/s.
+pub fn streamed_figures() -> super::StreamedFigures {
+    super::StreamedFigures {
+        read: super::ReadLine::new(100e-6, 1.0 / 5e9).expect("a synthetic read line is valid"),
+        memory: Some(1.0 / 50e9),
+        site: None,
+        convert: 1.0 / 100e9,
+    }
+}
+
+/// Synthetic plan prices: [`costs`], [`streamed_figures`], and a resident
+/// step of 10 ms, 100 µs a row and 10 ns a token of depth, its streamed
+/// form's what the banked plan's streamed form adds to its experts held
+/// whole on [`costs`] (`assessment::decode_step`).
+pub fn plan_prices() -> crate::PlanPrices {
+    crate::PlanPrices::new(
+        costs(),
+        streamed_figures(),
+        Box::new(|definition, banked| {
+            let forms = super::decode_step(definition, &banked.held_whole(definition)?, banked, costs())?;
+            Ok(Box::new(move |rows, depth| {
+                let forms = forms(rows, depth)?;
+                let resident = 10e-3 + f64::from(rows) * 100e-6 + f64::from(depth) * 10e-9;
+                Ok(super::FormSeconds { resident, streamed: resident + forms.streamed - forms.resident })
+            }))
+        }),
+    )
+}

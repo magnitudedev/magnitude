@@ -294,7 +294,7 @@ fn a_shrink_keeps_the_most_recent_experts_below_the_commitment() {
     directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
     // Records 0, 1 hold layer 0's experts 0, 1; records 2, 3 layer 1's.
     let reads = [[Some(5), Some(2)], [Some(7), Some(3)]];
-    let plan = directory.plan_shrink(0, 2, 2, |layer, expert| reads[layer][expert]);
+    let plan = directory.plan_shrink(0, 2, |layer, expert| reads[layer][expert]);
     assert_eq!(plan.evicted, [(1, 1), (0, 1)], "the least recent two leave");
     assert_eq!(plan.moved, [(1, 0, 2, 1)], "layer 1's expert 0 moves to the record left free");
     assert_eq!(
@@ -391,7 +391,7 @@ fn the_directory_keeps_the_host_tier_inclusive_of_the_bank() {
     assert!(directory.in_tier(0, 3) && !directory.host(0).holds_alone((0, 3)) && alone(&directory) == 1);
     // A shrink evicts 3: its banked copy is held alone.
     let last_read = |_: usize, expert: usize| Some(expert as Step);
-    let plan = directory.plan_shrink(0, 0, 0, last_read);
+    let plan = directory.plan_shrink(0, 0, last_read);
     assert_eq!(plan.evicted, [(0, 3)]);
     directory.evicted(0, &plan, last_read);
     assert!(directory.in_tier(0, 3) && alone(&directory) == 2);
@@ -651,7 +651,7 @@ fn victims_rank_by_reuse_with_recency_the_tie_break() {
     let measured = held(58);
     assert!(measured.half_life() > 0., "the reads measured a half-life");
     assert_eq!(evicted(held(58)), [(0, 59, 59)], "reuse");
-    let plan = measured.plan_shrink(0, 1, 1, |_, _| Some(59));
+    let plan = measured.plan_shrink(0, 1, |_, _| Some(59));
     assert_eq!((plan.evicted, plan.moved), (vec![(0, 59)], vec![]), "the shrink keeps the more reused");
 }
 
@@ -684,47 +684,6 @@ fn the_one_stores_ranking_prices_its_records() {
     assert_eq!(shared(&directory), 1, "shrunk with the store");
 }
 
-/// A whole bank of 64 records, each expert last read at its own step
-/// (`(expert · 37) mod 64`, so the kept experts lie across the records),
-/// shrunk by 32 slots: unpaced, one resize takes the whole deficit; paced
-/// to a budget of 4 records' bytes, each resize moves within it, the
-/// deficit is covered, and it takes ⌈the one resize's moved bytes /
-/// the budget⌉ resizes.
-#[test]
-fn a_paced_shrink_moves_within_its_budget_until_the_deficit_is_covered() {
-    const RECORD: u64 = 1 << 20;
-    let whole = || {
-        let mut directory = Directory::new(&[64], &[0], &[64], HostTier::replay(vec![0; 1]));
-        directory.place(at(1, 0), 0, &[], &(0..64).collect::<Vec<_>>(), |_| 0).unwrap();
-        directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
-        directory
-    };
-    let last_read = |_: usize, expert: usize| Some(((expert * 37) % 64) as Step);
-    let candidates = |from: usize| (32..from).rev().map(|records| vec![records]).collect::<Vec<_>>();
-    // Unpaced: a budget no resize's moves exceed takes the deepest.
-    let directory = whole();
-    let unpaced = candidates(64);
-    assert_eq!(directory.paced(unpaced.len(), |index| unpaced[index].clone(), |_| true, last_read), 31);
-    let moved = directory.plan_shrink(0, 32, 32, last_read).moved.len() as u64 * RECORD;
-    assert!(moved > 4 * RECORD, "the whole deficit moves more than one budget: {moved}");
-    let budget = 4 * RECORD;
-    let mut directory = whole();
-    let (mut records, mut resizes) = (64, 0);
-    while records > 32 {
-        let shrinks = candidates(records);
-        let fits = |moved: &dyn Fn(usize) -> u64| moved(0) * RECORD <= budget;
-        let chosen = &shrinks[directory.paced(shrinks.len(), |index| shrinks[index].clone(), fits, last_read)];
-        let plan = directory.plan_shrink(0, chosen[0], 32, last_read);
-        assert!(plan.moved.len() as u64 * RECORD <= budget, "a resize moves within its budget");
-        directory.evicted(0, &plan, last_read);
-        directory.committed(0, &plan);
-        records = chosen[0];
-        resizes += 1;
-    }
-    assert_eq!(directory.records(), [32], "the deficit is covered");
-    assert_eq!(resizes, moved.div_ceil(budget));
-}
-
 /// A grown bank beside a full host tier: the tier holds more experts
 /// alone than the bank's commitment leaves (its new record is free), so
 /// what only the file holds is each layer's experts neither the bank nor
@@ -746,40 +705,6 @@ fn a_grown_bank_beside_a_full_tier_leaves_the_rest_to_the_file() {
     assert_eq!((slots, held, alone), (3, 2, 2));
     assert!(alone > experts - slots, "the old count underflows here");
     assert_eq!(experts - held - alone, 0, "the file holds no expert alone");
-}
-
-/// A 95-slot deficit of a whole bank of 128 records, under every budget
-/// from none moved to all: the paced shrink prices the target and at most
-/// ⌈log2 95⌉ + 1 candidates, and picks the commitment the exhaustive
-/// search (every candidate priced, the deepest that fits) picks.
-#[test]
-fn a_paced_shrink_prices_log_many_candidates_and_picks_the_exhaustive_choice() {
-    const RECORD: u64 = 1 << 20;
-    let mut directory = Directory::new(&[128], &[0], &[128], HostTier::replay(vec![0; 1]));
-    directory.place(at(1, 0), 0, &[], &(0..128).collect::<Vec<_>>(), |_| 0).unwrap();
-    directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
-    let last_read = |_: usize, expert: usize| Some(((expert * 37) % 128) as Step);
-    // From one slot fewer to the 95-slot deficit's, shallowest first.
-    let shrinks = (33..128).rev().map(|records| vec![records]).collect::<Vec<_>>();
-    assert_eq!(shrinks.len(), 95);
-    let moved = |records: &[usize]| directory.plan_shrink(0, records[0], 33, last_read).moved.len() as u64 * RECORD;
-    let most = moved(&shrinks[94]);
-    for budget in (0..=most + RECORD).step_by(RECORD as usize) {
-        let exhaustive = shrinks.iter().rposition(|records| moved(records) <= budget).unwrap_or(0);
-        let priced = std::cell::Cell::new(0);
-        let chosen = directory.paced(
-            shrinks.len(),
-            |index| {
-                priced.set(priced.get() + 1);
-                shrinks[index].clone()
-            },
-            |moved: &dyn Fn(usize) -> u64| moved(0) * RECORD <= budget,
-            last_read,
-        );
-        assert_eq!(chosen, exhaustive, "budget {budget}");
-        // The target, then the shallowest, then one a halving.
-        assert!(priced.get() <= 1 + 1 + 95f64.log2().ceil() as usize, "{} priced", priced.get());
-    }
 }
 
 /// Two layers of one group of four records.

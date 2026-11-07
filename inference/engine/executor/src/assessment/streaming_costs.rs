@@ -18,8 +18,9 @@
 //!   `routed_move` launches (one per routed tensor) timed moving none and
 //!   the most one shrink moves, at most a move point's records (a move's
 //!   time grows by one copy pass per `LIST_ROWS` records, so the point holds
-//!   only what it moves). A shrink is paced by each moving group's
-//!   line at the records it moves ([`MoveCosts::of_bank`], [`MoveLines`]).
+//!   only what it moves). The heap charges a bank step's exchange each
+//!   moving group's line at the records it moves until a resize was timed
+//!   ([`MoveCosts::of_bank`], [`MoveLines`]).
 //! - **The convert's ceiling** ([`ConvertCosts`]), per bank group: a stored
 //!   record's conversion into its resident form by a scratch round's
 //!   `routed_convert` launches (one per routed tensor), from a conveyor and

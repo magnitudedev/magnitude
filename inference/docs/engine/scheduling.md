@@ -126,7 +126,11 @@ Apply these steps in order when preparation cannot fit:
 2. Release down the owner's one ladder (`scheduler/src/release.rs`), cheapest loss
    first and short of preemption: the expert bank's borrowed slots, surplus state
    backing, idle state, the expert bank toward its floor, retained prefixes (least recently used first), then the
-   optional components once no request is resident. Each release goes to the
+   optional components once no request is resident. A holding whose worth is not
+   priced yet (every holding before the load's serving rates are, a drafter before
+   its drafting is) is no cheap one: the serving settle never moves it (before the
+   load is priced a settle moves nothing), and the ladder releases it only once
+   nothing priced is left. Each release goes to the
    cheapest rung with anything left, so what a costlier release frees for a cheaper
    rung is released before the next costly one. A release that a later flight
    boundary finishes (idle graph slots, released off the submitting thread; an

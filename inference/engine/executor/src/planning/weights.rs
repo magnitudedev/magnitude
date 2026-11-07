@@ -917,6 +917,13 @@ impl ModelLoadPlan {
         self.bank.as_ref()
     }
 
+    /// The launches one merged-expert prompt pass of the load covers: its
+    /// bank's settled pass, or a whole chain's where its experts are held
+    /// whole.
+    pub fn pass(&self, limits: super::ResourceLimits) -> crate::PassLaunches {
+        self.bank.as_ref().map_or(crate::PassLaunches::whole_chain(limits), |bank| bank.pass)
+    }
+
     /// Every weight byte the load holds beside its host tier: each
     /// component's, and the expert bank's (what a weight cap bounds). The
     /// host tier's records are the host's room's, which bounds the tier as

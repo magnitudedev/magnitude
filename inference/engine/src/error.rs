@@ -272,6 +272,9 @@ pub enum PreviewError {
     MemoryObservationUnavailable { reason: String },
     /// The weight cap is below the load's least weights. Never retryable.
     WeightCap(WeightCapBelowWeights),
+    /// The plan prices its holdings on this machine's standing figures, which the measurement
+    /// job has not stored yet ([`PlanOutcome::PricesPending`]). Retryable once it has.
+    PricesPending { reason: String },
     Internal { reason: String },
 }
 
@@ -284,6 +287,7 @@ impl fmt::Display for PreviewError {
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
+            Self::PricesPending { reason } => write!(formatter, "the plan's prices are pending: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal preview failure: {reason}"),
         }
     }
@@ -321,6 +325,9 @@ pub enum LoadError {
     Configuration { reason: String },
     /// The weight cap is below the load's least weights. Never retryable.
     WeightCap(WeightCapBelowWeights),
+    /// The plan prices its holdings on this machine's standing figures, which the measurement
+    /// job has not stored yet ([`PlanOutcome::PricesPending`]). Retryable once it has.
+    PricesPending { reason: String },
     Internal { reason: String },
 }
 
@@ -333,6 +340,7 @@ impl LoadError {
                 | Self::MemoryObservationUnavailable { .. }
                 | Self::DeviceLost { .. }
                 | Self::WorkerLost { .. }
+                | Self::PricesPending { .. }
         )
     }
 }
@@ -358,6 +366,7 @@ impl fmt::Display for LoadError {
             Self::WorkerLost { reason } => write!(formatter, "worker lost during load: {reason}"),
             Self::Configuration { reason } => write!(formatter, "invalid engine configuration: {reason}"),
             Self::WeightCap(error) => error.fmt(formatter),
+            Self::PricesPending { reason } => write!(formatter, "the plan's prices are pending: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal load failure: {reason}"),
         }
     }
@@ -580,6 +589,7 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         | PlanError::UnportedScale(_)
         | PlanError::Unstreamed(_)) => unsupported(&error),
         PlanError::WeightCap { cap, needed } => PlanOutcome::WeightCap(WeightCapBelowWeights { cap, needed }),
+        PlanError::Unpriced { pending: true, reason } => PlanOutcome::PricesPending(reason),
         PlanError::KernelDomain(violation) => PlanOutcome::Unsupported(kernel_domain(
             violation.backend.as_str(),
             violation.entry,
@@ -587,7 +597,8 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         )),
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
-        | PlanError::Resource(_)) => PlanOutcome::Internal(error.to_string()),
+        | PlanError::Resource(_)
+        | PlanError::Unpriced { pending: false, .. }) => PlanOutcome::Internal(error.to_string()),
     }
 }
 
@@ -638,6 +649,10 @@ pub(crate) enum PlanOutcome {
     /// The caller's weight cap is below the load's least weights: no
     /// property of the model or the backend.
     WeightCap(WeightCapBelowWeights),
+    /// The plan prices its holdings on the machine's standing figures, which the measurement
+    /// job has not stored yet: no property of the model or the engine. The engine never waits
+    /// for them; whoever holds the device for the load waits without it.
+    PricesPending(String),
     Internal(String),
 }
 
@@ -702,6 +717,7 @@ impl From<PlanOutcome> for PreviewError {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
             PlanOutcome::WeightCap(error) => Self::WeightCap(error),
+            PlanOutcome::PricesPending(reason) => Self::PricesPending { reason },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }
@@ -712,6 +728,7 @@ impl From<PlanOutcome> for LoadError {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
             PlanOutcome::WeightCap(error) => Self::WeightCap(error),
+            PlanOutcome::PricesPending(reason) => Self::PricesPending { reason },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
     }

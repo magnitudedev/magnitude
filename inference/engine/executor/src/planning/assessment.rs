@@ -424,6 +424,18 @@ pub struct AssessmentFit {
     pub domains: Vec<DomainFit>,
 }
 
+impl AssessmentFit {
+    /// The bytes a plan's holdings settle within: its allocation domain's
+    /// stable room, its planning reserve aside (`StableRoom`).
+    pub fn settle_bound(&self) -> Result<u64, String> {
+        self.domains
+            .iter()
+            .find(|domain| domain.role == DomainRole::Allocation)
+            .map(|domain| domain.capacity_bytes - domain.reserve_bytes)
+            .ok_or_else(|| "the fit reaches no allocation domain".to_owned())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AssessmentFitVerdict {
     Fits,
@@ -568,7 +580,15 @@ impl AssessmentGraphResourceBounds {
     ) -> Result<Self, GraphError> {
         let plan = Self::program_plan(definition, load, method, codec)?;
         let target =
-            crate::programs::native_target_graph::checked_target_family(backend, load, &definition.decoder, state, plan.target(), limits)?;
+            crate::programs::native_target_graph::checked_target_family(
+                backend,
+                load,
+                &definition.decoder,
+                state,
+                plan.target(),
+                limits,
+                load.pass(limits),
+            )?;
         let target = TargetGraphBounds::of(target, limits.startup_slots().target)?;
         let vision = Self::vision(definition, load, &plan, limits, backend)?;
         Self::of_target(definition, load, &plan, state, method, limits, backend, target, vision)
@@ -596,6 +616,7 @@ impl AssessmentGraphResourceBounds {
             state,
             plan.target(),
             limits,
+            load.pass(limits),
         )?;
         let slots = limits.startup_slots().target;
         let target = TargetGraphBounds::of(target, slots)?;

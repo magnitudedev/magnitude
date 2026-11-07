@@ -340,6 +340,9 @@ fn load_class(error: &LoadError) -> Class {
             (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "device_lost", true)
         }
         LoadError::Device(_) => (StatusCode::CONFLICT, MODEL, "device_unavailable", true),
+        LoadError::PricesPending { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, SERVER, "prices_pending", true)
+        }
         LoadError::WorkerLost { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "worker_exited", true)
         }

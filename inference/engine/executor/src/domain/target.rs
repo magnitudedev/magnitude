@@ -683,7 +683,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             boundary,
             failures,
             experts,
-        } = output.complete(batch, super::recording(self.experts.as_ref(), core.work())).map_err(DomainError::Invariant)?;
+        } = output.complete(batch, super::recording(self.expert_measures(), core.work())).map_err(DomainError::Invariant)?;
         let interrupted = match experts {
             crate::programs::native_target::ExpertStepEnd::Ran => None,
             crate::programs::native_target::ExpertStepEnd::Interrupted(reason) => Some(reason),

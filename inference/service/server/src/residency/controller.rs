@@ -1,9 +1,11 @@
 //! Model residency on the engine worker (integration spec §10): the driver that loads models in
 //! an `inference-worker` process, and the instance operations the API serves.
 //!
-//! A load resolves the model through the shared resolved-configuration cache (§8.5), waits for
-//! memory admission, previews the load on the serving device in the service's device catalog (the
-//! admission check and the load plan), and loads exactly that device in a worker. The worker's
+//! A load resolves the model through the shared resolved-configuration cache (§8.5), previews the
+//! load on the serving device in the service's device catalog (the admission check and the load
+//! plan), waiting first, without the device, for the machine's standing figures its plan is priced
+//! on, takes its share of the device, waits for memory admission, previews again if it waited for
+//! either, and loads exactly that device in a worker. The worker's
 //! measured load progress drives the instance's stage and fraction; readiness is verified against
 //! the host's resolution before the instance is Ready, and the Ready instance records the device
 //! the worker opened.
@@ -199,7 +201,7 @@ impl ModelInstances {
             .await?;
         let preview = preview(&self.environment.catalog, &resolved)
             .await
-            .map_err(InventoryError::from)?;
+            .map_err(|error| InventoryError::from(preview_failure(error)))?;
         load_plan(&preview).map_err(InventoryError::from)
     }
 
@@ -446,12 +448,41 @@ fn residency_target(
 pub(super) async fn preview(
     catalog: &Arc<Devices>,
     resolved: &Arc<ResolvedConfiguration>,
-) -> Result<LoadPreview, ModelOperationFailure> {
+) -> Result<LoadPreview, PreviewError> {
     let catalog = Arc::clone(catalog);
     let resolved = Arc::clone(resolved);
-    magnitude_service_utils::blocking::run(move || resolved.manifest.preview(&catalog))
-        .await
-        .map_err(preview_failure)
+    magnitude_service_utils::blocking::run(move || resolved.manifest.preview(&catalog)).await
+}
+
+/// `preview`'s outcome once the measurement job has stored the machine's standing figures the
+/// plan is priced on. A load needs the device's share for its lifetime, and the job takes the
+/// device only when nothing holds it: so a preview whose prices are pending defers the load
+/// holding nothing of the device. `defer` asks the job for the figures, the job is told of the
+/// requests, and the preview is taken again after the next hold's end, the job's among them once
+/// it has stored what it measured; a preview still pending then asks again, so a job that ended
+/// without the figures (it failed, or measured another load's) is asked anew, never waited on
+/// forever.
+async fn priced<T, P, D>(
+    device: &DeviceLock,
+    mut preview: impl FnMut() -> P,
+    mut defer: impl FnMut() -> D,
+) -> Result<T, ModelOperationFailure>
+where
+    P: std::future::Future<Output = Result<T, PreviewError>>,
+    D: std::future::Future<Output = Result<(), ModelOperationFailure>>,
+{
+    let mut releases = device.releases();
+    loop {
+        match preview().await {
+            Err(PreviewError::PricesPending { reason }) => {
+                tracing::info!(%reason, "load waits for the machine's standing figures");
+                defer().await?;
+                device.requested();
+                releases.released().await;
+            }
+            previewed => return previewed.map_err(preview_failure),
+        }
+    }
 }
 
 pub(super) fn load_plan(preview: &LoadPreview) -> Result<ModelLoadPlan, ModelOperationFailure> {
@@ -486,6 +517,7 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
         PreviewError::Device(_) => ("device_unavailable", true),
         PreviewError::MemoryObservationUnavailable { .. } => ("memory_observation_unavailable", true),
         PreviewError::WeightCap(cap) => return ModelOperationFailure::WeightCap(*cap),
+        PreviewError::PricesPending { .. } => ("prices_pending", true),
         PreviewError::Internal { .. } => ("load_preview_failed", false),
     };
     ModelOperationFailure::new(code, error.to_string(), retryable)
@@ -513,6 +545,7 @@ fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailur
         LoadError::DeviceLost { .. } => "device_lost",
         LoadError::WorkerLost { .. } => "worker_exited",
         LoadError::Configuration { .. } => "invalid_model_configuration",
+        LoadError::PricesPending { .. } => "prices_pending",
         LoadError::Internal { .. } => "model_load_failed",
     };
     let message = match &error {
@@ -661,6 +694,24 @@ impl EngineResidency {
         Ok(spawned)
     }
 
+    /// Defer `instance_id`'s load until the machine's standing figures its plan is priced on are
+    /// stored: it shows `Queued`, gives up residency's share of the device, which a load after a
+    /// release kept, so the measurement job can take the device, and asks the job for the
+    /// figures of its model's store.
+    async fn defer_unpriced(
+        &self,
+        instance_id: &ModelInstanceId,
+        resolved: &Arc<ResolvedConfiguration>,
+    ) -> Result<(), ModelOperationFailure> {
+        self.progress(instance_id, ModelLoadStage::Queued, None);
+        self.demand.lock().expect("device demand").take();
+        let catalog = Arc::clone(&self.environment.catalog);
+        let resolved = Arc::clone(resolved);
+        magnitude_service_utils::blocking::run(move || resolved.manifest.request_prices(&catalog))
+            .await
+            .map_err(|reason| ModelOperationFailure::new("measurement_request_failed", reason, true))
+    }
+
     async fn load(
         &self,
         instance_id: &ModelInstanceId,
@@ -669,6 +720,16 @@ impl EngineResidency {
     ) -> Result<PreparedResidency<ResidentEngine>, ModelOperationFailure> {
         let environment = &self.environment;
         let resolved = environment.configurations.resolve(&configuration).await?;
+        // The preview stands unless the load waits for the device or for memory below, which
+        // change the room its plan settles into.
+        let mut previewed = Some(
+            priced(
+                &environment.device,
+                || preview(&environment.catalog, &resolved),
+                || self.defer_unpriced(instance_id, &resolved),
+            )
+            .await?,
+        );
         // The load shares the device through residency's demand: its workers hold the share
         // until each is proven retired, and residency until its demand ends. A load after a
         // release takes the share residency kept, so no job starts between them; the measurement
@@ -689,6 +750,7 @@ impl EngineResidency {
                         self.progress(instance_id, ModelLoadStage::Queued, None);
                         tracing::info!("load preempts the job holding the device and waits for its kill");
                         let device = environment.device.share().await;
+                        previewed = None;
                         self.progress(instance_id, ModelLoadStage::Preparing, None);
                         device
                     }
@@ -701,9 +763,13 @@ impl EngineResidency {
             self.progress(instance_id, ModelLoadStage::Queued, None);
             tracing::info!("load waits for system memory to recover from pressure");
             self.supervisor.admission().await;
+            previewed = None;
             self.progress(instance_id, ModelLoadStage::Preparing, None);
         }
-        let preview = preview(&environment.catalog, &resolved).await?;
+        let preview = match previewed {
+            Some(preview) => preview,
+            None => preview(&environment.catalog, &resolved).await.map_err(preview_failure)?,
+        };
         let plan = load_plan(&preview)?;
         self.progress(instance_id, ModelLoadStage::Preparing, Some(&plan));
 
@@ -1024,6 +1090,58 @@ mod tests {
         assert_eq!(failure.code(), magnitude_serving::error::WEIGHT_CAP_BELOW_WEIGHTS);
         assert!(!failure.retryable());
         assert!(failure.message().contains("2100000000") && failure.message().contains("2130136892"));
+    }
+
+    /// A load on a machine with none of the standing figures its plan is priced on stored is
+    /// deferred before it takes the device: it shows `Queued`, asks the measurement job for the
+    /// figures once and tells it so, and holds nothing of the device, which the job takes. Once
+    /// the job has stored them and released the device, the load proceeds with its preview.
+    #[tokio::test]
+    async fn an_unpriced_load_waits_without_the_device_until_its_figures_are_stored() {
+        use std::sync::atomic::AtomicBool;
+        let device = DeviceLock::default();
+        let stored = Arc::new(AtomicBool::new(false));
+        let (requests, previews) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+        let (shown, mut stages) = tokio::sync::mpsc::unbounded_channel();
+        let mut changes = device.changes();
+        let load = tokio::spawn({
+            let (device, stored, requests, previews) =
+                (device.clone(), Arc::clone(&stored), Arc::clone(&requests), Arc::clone(&previews));
+            async move {
+                priced(
+                    &device,
+                    || {
+                        previews.fetch_add(1, Ordering::Relaxed);
+                        let priced = stored.load(Ordering::Relaxed);
+                        async move {
+                            match priced {
+                                true => Ok("the plan"),
+                                false => Err(PreviewError::PricesPending { reason: "nothing is measured".into() }),
+                            }
+                        }
+                    },
+                    || {
+                        shown.send(ModelLoadStage::Queued).expect("stages");
+                        requests.fetch_add(1, Ordering::Relaxed);
+                        async { Ok(()) }
+                    },
+                )
+                .await
+            }
+        });
+        // The job is told of the load's requests, and takes the device the load left to it.
+        changes.changed().await;
+        assert_eq!(stages.recv().await, Some(ModelLoadStage::Queued));
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        let job = device.try_job().expect("a deferred load holds nothing of the device");
+        tokio::task::yield_now().await;
+        assert!(!load.is_finished(), "the load waits while the job measures");
+        stored.store(true, Ordering::Relaxed);
+        drop(job);
+        assert_eq!(load.await.expect("load").expect("priced"), "the plan");
+        assert_eq!(requests.load(Ordering::Relaxed), 1, "the figures are asked for once");
+        assert_eq!(previews.load(Ordering::Relaxed), 2, "the load previews again only once the job ended");
+        assert!(device.try_share().is_some(), "the load then takes its share");
     }
 
     fn snapshot(model: &str, assessment: serde_json::Value) -> ModelAssessmentsSnapshot {

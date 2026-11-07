@@ -238,7 +238,8 @@ pub fn selected(
     info: Executor,
     graph_cost: GraphPricing,
 ) -> Result<SelectedDevice, MemoryPolicyError> {
-    let placement = Fit::new(topology, status, reserves, HostRoom::Allocatable).placement(&info, Contract::DeviceOnly)?;
+    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable);
+    let placement = fit.placement(&info, Contract::DeviceOnly)?;
     let assessment_capacity_bytes = placement.stable_bytes;
     Ok(SelectedDevice {
         graph_cost,

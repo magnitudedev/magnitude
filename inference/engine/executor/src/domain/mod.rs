@@ -28,11 +28,15 @@ use magnitude_state::{
 };
 use seismic::Tensor;
 mod borrowing;
+pub(crate) mod value;
 mod draft;
 mod family;
 mod features;
 mod head;
 mod heap;
+mod holdings;
+mod serving_heap;
+pub use serving_heap::{BankGrant, BankRelease, OwnerHoldings, ServingSettlement};
 mod in_flight;
 mod input;
 mod ownership;
@@ -48,9 +52,9 @@ pub mod fixtures;
 mod domain_tests;
 
 pub use family::{
-    BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, Growth, GrowthDecided, GrowthOffer, HostResidency,
+    BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, BankCurve, Reach, SizeStep, HostResidency,
     NativeFamily,
-    ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, ShrinkCause, TierFill, TrafficHold, Trip,
+    ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, ShrinkCause, TierFill, TrafficHold, Trip,
 };
 pub use heap::{ClaimRefusal, DeviceHeap, Reclaimed, StatusReading, require_normal};
 pub use in_flight::{
@@ -584,22 +588,13 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// prefill chunks). Consumed by that group's provisioning and the steps
     /// queued behind it (`behind`).
     planned: Vec<Operation>,
-    /// The decode seconds owed each second the planned prompt chunks run,
-    /// while decode waits behind them (`plan_prompt`).
-    decode_owed: Option<f64>,
-    /// The places a prompt's chunks are worth beyond what memory gave its
-    /// group, and the slots the bank shrinks to for them (`grant_group`).
-    places_want: Option<state::PlacesWant>,
-    /// The class room of the chain's planned places no group holds
-    /// (`ExecutorDomain::refresh_unheld_class`): what the one store's bank's
-    /// committed growth leaves free.
-    unheld_class: u64,
+    /// The load's serving rates as it serves (`WorkloadMeter`), from its
+    /// priced decode's prior on ([`Self::serving_rates`]); none before the
+    /// bank is priced.
+    workload: Option<crate::workload::WorkloadMeter>,
     /// The service's measurement job's claim beside the model, which the
     /// bank's shrink makes room for (`ExecutorDomain::measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
-    /// The storage kind of the expert bank's last growth step: the other's
-    /// step comes first next (`ExecutorDomain::expert_bank_growths`).
-    grown_last: Option<crate::planning::BankTier>,
     /// Identity of the next target flight.
     next_flight: u64,
     host_turn: Option<in_flight::HostTurn>,
@@ -607,10 +602,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// outcome of theirs fails (`Outcome::WeightReadFailed`) until they
     /// close.
     poisoned: BTreeMap<RequestId, crate::WeightReadError>,
-    /// What the load measures of its experts once its warm-up ended
-    /// ([`Self::measure_experts`]); none before, so a warm-up's steps are
-    /// not counted.
-    experts: Option<ExpertMeasures>,
+    /// What the load is priced on once its warm-up ended
+    /// ([`Self::measure_load`]); none before, so a warm-up's steps are not
+    /// counted.
+    measures: Option<LoadMeasures>,
     /// The heap claim of the expert bank's running growth.
     bank_claim: Option<GrowthClaim>,
     /// What expert bank resizes held the submitting thread.
@@ -649,15 +644,62 @@ impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
     }
 }
 
-/// The resident decode launch of a number of rows at a depth,
-/// `(rows, depth)`, as the load's assessment estimates it on this executor
-/// (`assessment::step_seconds`, a row a sequence).
-pub type ResidentStep = dyn Fn(u32, u32) -> Result<f64, crate::assessment::AssessmentError>;
+/// A load's launch of a number of rows at a depth, `(rows, depth)`, in
+/// each form it decodes in, as the load's assessment estimates it on this
+/// executor (`assessment::decode_step`): a decode step of a row a sequence
+/// within the decode row classes, a prefill launch beyond them
+/// (`estimate::launch_seconds`). A load without a bank decodes in one form,
+/// both the same.
+pub type DecodeStep = dyn Fn(u32, u32) -> Result<crate::assessment::FormSeconds, crate::assessment::AssessmentError>;
+
+/// What every load prices its memory's decisions on
+/// ([`ExecutorDomain::measure_load`]).
+pub struct LoadMeasures {
+    /// The load's costs on its executor's: every load waits for the
+    /// executor's required figures before it serves, so they are never
+    /// pending here; unavailable, and why, where nothing keeps them (a load
+    /// without a kernel cache), when nothing the load would grow is worth
+    /// anything known.
+    pub costs: Result<LoadCosts, String>,
+    /// A banked load's measures of its experts; none of a load without a
+    /// bank, and only of one with.
+    pub experts: Option<ExpertMeasures>,
+}
+
+/// What a load's own decisions are priced on of its executor's costs.
+pub struct LoadCosts {
+    /// The launch in each form ([`DecodeStep`]): what the load's workload
+    /// prior is priced on (`ExecutorDomain::serving_prior`), and a bank's
+    /// growth and the drafter's worth.
+    pub step: Box<DecodeStep>,
+    /// What a prompt group's submission costs the host beyond a launch
+    /// chained behind another (`ExecutorCosts::group_submission_seconds`):
+    /// what each group fewer saves a prompt (`ExecutorDomain::group_seconds`).
+    pub submission: f64,
+}
+
+impl LoadCosts {
+    /// The costs of a load of `definition` planned as `planned`, as
+    /// `resident` before any bank, on `costs`: its launch in each form
+    /// (`assessment::decode_step`) and its groups' submission. The one
+    /// derivation every load is priced by.
+    pub fn of(
+        definition: &magnitude_family_contracts::ModelDefinition,
+        resident: &crate::ExecutionPlanDraft,
+        planned: &crate::ExecutionPlanDraft,
+        costs: &crate::assessment::ExecutorCosts,
+    ) -> Result<Self, crate::assessment::AssessmentError> {
+        Ok(Self {
+            step: crate::assessment::decode_step(definition, resident, planned, costs.clone())?,
+            submission: costs.group_submission_seconds(),
+        })
+    }
+}
 
 /// What every streamed load prices its experts' decisions on, each input in
 /// its state (`assessment::Priced`): a decision whose input is pending runs
 /// its policy that needs no cost until the measurement job stores it and the
-/// load prices again ([`ExecutorDomain::measure_experts`]). Its decode is
+/// load prices again ([`ExecutorDomain::measure_load`]). Its decode is
 /// priced on the generic miss model beside what the load's own decode read
 /// ([`ExecutorDomain::decode_price`]).
 pub struct ExpertMeasures {
@@ -671,16 +713,17 @@ pub struct ExpertMeasures {
     /// measurement job's (`assessment::StreamedFigures`), which also prices
     /// a stored table's records.
     pub read: crate::assessment::Priced<crate::assessment::ReadLine>,
-    /// What the bank's growth is priced on: until measured, nothing grows.
-    pub resident: crate::assessment::Priced<Box<ResidentStep>>,
     /// What a routed pass over each streamed layer's experts costs on this
     /// executor, which prices a prompt group's compute by its size
-    /// (`GroupReads::grant`): until measured, places weigh reads alone.
+    /// (`GroupReads::grant`), and before the load measured a group, the
+    /// routed seconds its places save (`ExecutorDomain::group_seconds`):
+    /// until measured, a measured group's places weigh its reads alone, and
+    /// before a group is measured its places are not priced.
     pub pass: crate::assessment::Priced<crate::assessment::ExpertPass>,
     /// Each bank group's shrink move line on this executor, at its own
-    /// record form and moves (`MoveCosts`), which pace a shrink to a decode
-    /// step: until measured, a shrink takes what memory is short of, its
-    /// deficit, in one resize.
+    /// record form and moves (`MoveCosts`): what a bank step's exchange is
+    /// charged for its moves before a resize of the bank was timed
+    /// (`bank_heap`).
     pub moves: crate::assessment::Priced<crate::assessment::MoveLines>,
     /// What a host tier's copy costs (`assessment::TierCopyCosts`): the
     /// blocks it takes over the link, the link's rate, and the device time
@@ -744,40 +787,64 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.execution.load().weight_owners()
     }
 
-    /// From now on, measure what the load's decode does of its experts by
-    /// `measures`, in place of what it measured by before: its warm-up has
-    /// ended, or the executor's stored costs have changed since. Between
-    /// flights (the bindings prove none is on the device), so every step is
-    /// recorded and priced by the measures it ran under, and the bank's
-    /// device-side pricing changes under no step in flight. Its one fallible
-    /// part, the tier copy's grid, is written before anything is priced: a
-    /// refusal is the caller's error and changes nothing.
-    pub fn measure_experts(
+    /// From now on, price the load by `measures`, and measure what its
+    /// decode does of its experts by them, in place of what it was priced
+    /// by before: its warm-up has ended, or the executor's stored costs have
+    /// changed since. Between flights (the bindings prove none is on the
+    /// device), so every step is recorded and priced by the measures it ran
+    /// under, and the bank's device-side pricing changes under no step in
+    /// flight. Its one fallible part, the tier copy's grid, is written
+    /// before anything is priced: a refusal is the caller's error and
+    /// changes nothing. Measures of experts a load without a bank holds, or
+    /// none of a bank's, are an invariant violation.
+    ///
+    /// The load's serving rates start at the prior the first measures with
+    /// a step price (`serving_rates`): a load priced while its costs were
+    /// pending takes no room for what they would price, and takes it once
+    /// it is priced again on them.
+    pub fn measure_load(
         &mut self,
-        measures: ExpertMeasures,
+        measures: LoadMeasures,
         _between_flights: &mut StateBindings,
     ) -> Result<(), DomainError> {
-        tracing::info!(
-            read = measures.read.why().unwrap_or("measured"),
-            lines = measures.lines.why().unwrap_or("measured"),
-            resident = measures.resident.why().unwrap_or("measured"),
-            pass = measures.pass.why().unwrap_or("measured"),
-            moves = measures.moves.why().unwrap_or("measured"),
-            tier_copy = measures.tier_copy.why().unwrap_or("measured"),
-            convert = measures.convert.why().unwrap_or("measured"),
-            "the experts are priced"
-        );
-        if let Some(bank) = self.family.expert_bank() {
-            if let Some(Some(costs)) = measures.tier_copy.measured() {
-                bank.tier_copy(costs)?;
+        match (&measures.experts, self.family.expert_bank()) {
+            (None, None) => {}
+            (Some(experts), Some(bank)) => {
+                tracing::info!(
+                    read = experts.read.why().unwrap_or("measured"),
+                    lines = experts.lines.why().unwrap_or("measured"),
+                    pass = experts.pass.why().unwrap_or("measured"),
+                    moves = experts.moves.why().unwrap_or("measured"),
+                    tier_copy = experts.tier_copy.why().unwrap_or("measured"),
+                    convert = experts.convert.why().unwrap_or("measured"),
+                    "the experts are priced"
+                );
+                if let Some(Some(costs)) = experts.tier_copy.measured() {
+                    bank.tier_copy(costs)?;
+                }
+                bank.price(experts.lines.measured().cloned(), experts.pass.measured().cloned());
+                if let Some(Some(lines)) = experts.convert.measured() {
+                    bank.device_convert(lines);
+                }
             }
-            bank.price(measures.lines.measured().cloned(), measures.pass.measured().cloned());
-            if let Some(Some(lines)) = measures.convert.measured() {
-                bank.device_convert(lines);
-            }
+            (None, Some(_)) => return Err(DomainError::invariant("a banked load priced without its experts' measures")),
+            (Some(_), None) => return Err(DomainError::invariant("expert measures of a load without a bank")),
         }
-        self.experts = Some(measures);
+        tracing::info!(costs = measures.costs.as_ref().err().map_or("measured", String::as_str), "the load is priced");
+        self.measures = Some(measures);
         Ok(())
+    }
+
+    /// The load's costs; none before [`Self::measure_load`], or where
+    /// nothing keeps them.
+    fn load_costs(&self) -> Option<&LoadCosts> {
+        self.measures.as_ref().and_then(|measures| measures.costs.as_ref().ok())
+    }
+
+    /// The measures of the load's experts; none before
+    /// [`Self::measure_load`], or without a bank.
+    fn expert_measures(&self) -> Option<&ExpertMeasures> {
+        self.measures.as_ref().and_then(|measures| measures.experts.as_ref())
     }
 
     /// Measure the host's landings slow from now on
@@ -815,37 +882,47 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Each streamed layer's lines in their state; none before
-    /// [`Self::measure_experts`].
+    /// [`Self::measure_load`].
     pub fn expert_lines(&self) -> Option<&crate::assessment::Priced<std::sync::Arc<[crate::assessment::ExpertLines]>>> {
-        self.experts.as_ref().map(|measures| &measures.lines)
+        self.expert_measures().map(|measures| &measures.lines)
     }
 
     /// The load's decode step as its experts' decisions price it now
     /// ([`crate::assessment::DecodePrice`]): its variant's routing
     /// calibrated by the decode it counted, at that decode's mean rows and
-    /// context, on the resident step of those rows there. None before its
-    /// lines, routing, read line and resident step are measured, or before
-    /// it counted a decode step.
+    /// context, on the step of those rows there in each form; before it
+    /// counted a step, the generic model's routing alone, at one row at the
+    /// start of its context (`DecodePrice::prior`), so every decision is
+    /// priced from the load's first boundary. None before its lines, read
+    /// line and step are measured.
     pub(crate) fn decode_price(&self) -> Result<Option<crate::assessment::DecodePrice>, DomainError> {
-        let (Some(measures), Some(bank)) = (self.experts.as_ref(), self.family.expert_bank()) else {
+        let (Some(measures), Some(bank)) = (self.measures.as_ref(), self.family.expert_bank()) else {
             return Ok(None);
         };
-        let measured = (measures.lines.measured(), measures.read.measured(), measures.resident.measured());
-        let (Some(lines), Some(&read), Some(resident)) = measured else {
+        let Some(experts) = measures.experts.as_ref() else {
             return Ok(None);
         };
-        let Some(live) = bank.live() else {
+        let measured = (experts.lines.measured(), experts.read.measured(), measures.costs.as_ref().ok().map(|costs| &costs.step));
+        let (Some(lines), Some(&read), Some(step)) = measured else {
             return Ok(None);
         };
-        let rows = live.rows.round() as u32;
-        let compute = resident(rows, live.depth).map_err(|error| DomainError::invariant(format!("the resident step: {error}")))?;
-        Ok(Some(crate::assessment::DecodePrice::new(bank.streamed_layers(lines.clone()), live, read, compute)))
+        let step = |rows: u32, depth: u32| {
+            step(rows, depth).map_err(|error| DomainError::invariant(format!("the decode step: {error}")))
+        };
+        let layers = bank.streamed_layers(lines.clone());
+        Ok(Some(match bank.live() {
+            Some(live) => {
+                let compute = step(live.rows.round() as u32, live.depth)?;
+                crate::assessment::DecodePrice::new(layers, live, read, compute)
+            }
+            None => crate::assessment::DecodePrice::prior(layers, 1., read, step(1, 0)?),
+        }))
     }
 
     /// What a routed pass over each streamed layer's experts costs, in its
-    /// state; none before [`Self::measure_experts`].
+    /// state; none before [`Self::measure_load`], or without a bank.
     pub fn expert_pass(&self) -> Option<&crate::assessment::Priced<crate::assessment::ExpertPass>> {
-        self.experts.as_ref().map(|measures| &measures.pass)
+        self.expert_measures().map(|measures| &measures.pass)
     }
 
     /// The epoch a launch submitted now is timed across ([`LaunchEpoch`]);
@@ -865,7 +942,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
 /// Whether a completed step of `work` has its decode counted by a load
 /// measuring its experts by `experts`: not before
-/// [`ExecutorDomain::measure_experts`], and only generation's (a prompt's
+/// [`ExecutorDomain::measure_load`], only a banked load's, and only generation's (a prompt's
 /// rows, even in the decode form, are no decode step its decisions price).
 fn recording(experts: Option<&ExpertMeasures>, work: crate::operation::LaunchWork) -> Option<crate::experts::Recording> {
     experts.filter(|_| work == crate::operation::LaunchWork::Generation).map(|_| crate::experts::Recording)
@@ -1002,36 +1079,25 @@ impl<'d> MemoryProbe<'d> {
         state::storage_store(device.topology(), device.info(), kind)
     }
 
-    /// What `store` is short of now: its level's shortfall
-    /// (`MemoryPace::shortfall`), against the process's charge of it now,
-    /// and in host RAM what the one store's expert bank owes back of the
-    /// room it borrowed (`BankRoom::owed`), the more of the two. While the
-    /// bank holds room borrowed beyond allocatable memory the level says
-    /// nothing of the hold line (`platform::Serving`): what the bank owes
-    /// alone.
-    fn shortfall(&self, store: seismic::StoreId) -> Shortfall {
-        let charged = self
-            .domain
+    /// What the process charges `store` now: its own claims there.
+    fn charged_in(&self, store: seismic::StoreId) -> u64 {
+        self.domain
             .device()
             .ledgers()
             .own_claims()
             .into_iter()
             .filter(|(of, _)| *of == store)
             .map(|(_, bytes)| bytes)
-            .sum();
-        let level = self.pace.borrow().shortfall(store, charged);
-        let memory = self.memory.borrow();
-        let host_ram = self.domain.device().topology().host_ram().id();
-        let Some(bank) = memory.bank_room().filter(|_| store == host_ram) else {
-            return level;
-        };
-        match (bank.owed(), bank.lent().is_some(), level) {
-            (0, true, _) => Shortfall::Above,
-            (owed, true, _) => Shortfall::Short(owed),
-            (owed, false, Shortfall::Short(bytes)) => Shortfall::Short(bytes.max(owed)),
-            (0, false, level) => level,
-            (owed, false, _) => Shortfall::Short(owed),
-        }
+            .sum()
+    }
+
+    /// What `store` is short of now: its level's shortfall
+    /// (`MemoryPace::shortfall`), against the process's charge of it now.
+    /// While the one store's bank holds borrowed room, host RAM's level
+    /// reads what the OS can obtain with it counted (`platform::Serving`):
+    /// what an ask takes of it is short like any.
+    fn shortfall(&self, store: seismic::StoreId) -> Shortfall {
+        self.pace.borrow().shortfall(store, self.charged_in(store))
     }
 
     /// What the process holds now (`MemoryMoment`).
@@ -1179,6 +1245,11 @@ impl ResizeHeld {
     fn runs(&self) -> bool {
         self.running.iter().any(Option::is_some)
     }
+
+    /// Whether a resize of `tier` storage runs.
+    fn runs_in(&self, tier: crate::planning::BankTier) -> bool {
+        self.running[tier.index()].is_some()
+    }
 }
 
 /// What the rest of the host does to each memory domain, measured from the
@@ -1291,6 +1362,17 @@ struct DomainPace {
     /// Whether the domain is host RAM: its margin is host RAM's
     /// ([`MemoryPace::margins`]).
     host: bool,
+    /// What the reading's hard limit leaves a claim where a driver's grant
+    /// bounds the domain (Metal's working set); none where none does.
+    grant_left: Option<u64>,
+    /// The line room borrowed beyond the hold line is held within, where
+    /// the bank borrows (`platform::StoreFit::borrowable_bytes`).
+    borrowable: Option<u64>,
+    /// The spans in which the rest of the host took more than the steady
+    /// fluctuation, since `first`: another program's asks.
+    takes: u32,
+    /// The domain's first probe.
+    first: Instant,
 }
 
 /// Available memory's fluctuation in steady state: the largest fall between
@@ -1414,6 +1496,7 @@ impl MemoryPace {
                 _ => 0,
             };
             let available = shown + unseen;
+            let mut took = false;
             let (base, rate) = match &before {
                 // A fall of the charge is a release the host may not show
                 // yet: the fall of available memory it makes is no taking,
@@ -1423,12 +1506,14 @@ impl MemoryPace {
                 Some(before) if charged < before.charged => ((at, available), 0.0),
                 Some(before) if at.duration_since(before.base.0) >= reading_interval => {
                     let (then, was) = before.base;
+                    took = was.saturating_sub(available) > before.fluctuation.largest;
                     ((at, available), was.saturating_sub(available) as f64 / at.duration_since(then).as_secs_f64())
                 }
                 Some(before) => (before.base, before.rate),
                 None => ((at, available), 0.0),
             };
             let fastest = before.as_ref().map_or(rate, |before| before.fastest.max(rate));
+            let (takes, first) = before.as_ref().map_or((0, at), |before| (before.takes + u32::from(took), before.first));
             let fluctuation = match reading.band {
                 MemoryBand::Reclaim => Fluctuation::default(),
                 MemoryBand::Normal => {
@@ -1453,6 +1538,10 @@ impl MemoryPace {
                     fastest,
                     fluctuation,
                     host: reading.identity == seismic::StoreIdentity::HostRam,
+                    grant_left: (reading.constraint == crate::platform::MemoryConstraint::Grant).then_some(reading.ceiling_bytes),
+                    borrowable: reading.borrowable_bytes,
+                    takes,
+                    first,
                 },
             );
         }
@@ -1523,8 +1612,47 @@ impl MemoryPace {
         }
     }
 
-    /// `store`'s available memory's fluctuation at the latest probe, which a
-    /// growth step leaves free; none before a probe of it.
+    /// The room a settle of the heap grants into in `store`, the process
+    /// charging it `charged` now ([`value::Supply`]); none before a probe
+    /// of it.
+    ///
+    /// Free room is the headroom above the planning line, which holds the
+    /// measured margin; what is owed is the shortfall below it
+    /// ([`Self::shortfall`]). Borrowed room is what the host gives beyond
+    /// that by compressing other programs' data, up to the borrowing line.
+    /// Its price, in serving seconds saved per second per byte, is what
+    /// holding a byte of it costs another program: each ask it makes waits
+    /// for the byte about `1 / fastest` seconds (a release hands it back at
+    /// the rate the host takes it), and asks come `takes / elapsed` times a
+    /// second, so `takes / (elapsed × fastest)`; zero while no ask was seen,
+    /// where borrowing harms no one. The device's hard limit is the grant
+    /// left where a grant bounds the domain. An exchange's gain is earned
+    /// over `horizon`, how long the settle's decision stands.
+    fn supply(&self, store: seismic::StoreId, charged: u64, horizon: Duration) -> Option<value::Supply> {
+        let pace = self.domains.get(&store)?;
+        let free = pace.thresholds.ceiling(pace.headroom);
+        let owed = match self.shortfall(store, charged) {
+            Shortfall::Short(bytes) => bytes,
+            Shortfall::Above | Shortfall::Covered => 0,
+        };
+        let borrowable = pace.borrowable.map_or(0, |line| pace.thresholds.ceiling(line).saturating_sub(free));
+        let elapsed = self.read.map_or(0.0, |read| read.duration_since(pace.first).as_secs_f64());
+        let borrow_price = match pace.takes {
+            0 => 0.0,
+            takes => f64::from(takes) / (elapsed.max(self.reading_interval.as_secs_f64()) * pace.fastest),
+        };
+        Some(value::Supply {
+            free,
+            owed,
+            borrowable,
+            borrow_price,
+            ceiling: pace.grant_left.unwrap_or(u64::MAX),
+            horizon,
+        })
+    }
+
+    /// `store`'s available memory's fluctuation at the latest probe, which
+    /// the reserve's margin holds; none before a probe of it.
     fn fluctuation(&self, store: seismic::StoreId) -> u64 {
         self.domains.get(&store).map_or(0, |pace| pace.fluctuation.largest)
     }
@@ -2569,15 +2697,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             target_timing: None,
             trace_host_steps: std::env::var_os("MAGNITUDE_TRACE_HOST_STEP").is_some(),
             planned: Vec::new(),
-            decode_owed: None,
-            places_want: None,
-            unheld_class: 0,
+            workload: None,
             measurement_claim: None,
-            grown_last: None,
             next_flight: 0,
             host_turn: None,
             poisoned: BTreeMap::new(),
-            experts: None,
+            measures: None,
             bank_claim: None,
             resize_held: ResizeHeld::default(),
             shrink_step: false,

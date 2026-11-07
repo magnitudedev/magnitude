@@ -682,6 +682,7 @@ impl AttestedPrograms {
             state,
             plan,
             limits,
+            load.pass(limits),
             workers,
         )
     }

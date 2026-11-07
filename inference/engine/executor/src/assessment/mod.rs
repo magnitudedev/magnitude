@@ -36,21 +36,21 @@ pub mod streaming_costs;
 pub mod synthetic;
 
 pub use assess::{
-    assess_execution_fit, decode_demand, decode_pricing, estimate_execution, execution_memory_charge, execution_memory_charge_with_undrafted, undrafted_memory_charge, StructuralCharge,
+    assess_execution_fit, decode_demand, decode_pricing, decode_step, estimate_execution, execution_memory_charge, execution_memory_charge_with_undrafted, undrafted_memory_charge, StructuralCharge,
     prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit, ExecutionAssessment,
     ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, PreparedExecutionAssessment, Residency,
 };
 pub use demand::{Bytes, Call, DecodeDemand, Experts, Flops, HistoryRead, Work};
 pub use estimate::{
-    estimate_decode, performance_depths, step_seconds, CallSeconds, ExpertPass, PerformanceEstimate, Pricing,
+    estimate_decode, form_seconds, performance_depths, step_seconds, CallSeconds, ExpertPass, PerformanceEstimate, Pricing,
     StepSeconds,
 };
 pub use executor_costs::{
-    ChainCost, Derived, ExecutorCosts, ExecutorCostsError, FormatRates, Held, HistoryCosts, HistoryLine,
+    ChainCost, CostWalk, Derived, ExecutorCosts, ExecutorCostsError, FormatRates, Held, HistoryCosts, HistoryLine,
     MatrixCosts, MeasuredCost, Measurement, OperandStorage, Placement, Placements, Required, RouteCosts, StoredCosts,
     WeightRate, HISTORY_LAYOUTS, MEASUREMENT_SECONDS,
 };
-pub use launches::{Declarations, Kernel, Launches};
+pub use launches::{Declarations, Kernel, Launches, Words};
 pub use cost::{
     BankLines, CpuLines, CpuLinesError, StoredCpuSite, ExpertLines, Exposed, GpuLines, Hits, HostLines, HostLinesError, LineError, Miss, Nanoseconds, Pass,
     PassLine, PricingError, RowCost, RowLine, Sample, ServedMisses, Site, SiteLines,
@@ -59,10 +59,10 @@ pub use priced::Priced;
 pub(crate) use streaming_costs::CpuForm;
 pub use requests::{PointRequest, PointRequests, SiteRequest, Waiter};
 pub use step::{LayerLoad, Lead, ReadAhead, StepInputs, StepTime};
-pub use streamed::{DecodePrice, LayerReads, LiveDecode, StreamedError, StreamedFigures, StreamedLayers};
+pub use streamed::{DecodePrice, FormSeconds, LayerReads, LiveDecode, StreamedError, StreamedFigures, StreamedLayers};
 pub use misses::{Anticipated, HeldSlots, HintCounts, LayerStep, StreamedStep, TableCurve, TableRange};
 pub use streaming::{
-    BankSlots, DecodeWaiting, GroupLayerTerms, GroupReads, GroupUnion, Notice, PlaceGrant, Places, Stages,
+    BankSlots, GroupLayerTerms, GroupReads, GroupUnion, Notice, Stages,
 };
 pub use streaming_costs::{
     CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, RecordLine,

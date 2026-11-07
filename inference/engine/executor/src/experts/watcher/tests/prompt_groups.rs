@@ -514,7 +514,7 @@ fn a_discrete_groups_scratch_claims_its_bank_records_and_returns_them_free() {
     eventually("the lent records never returned free", || !lent(0) && !lent(1));
     let shared = harness.watcher.shared();
     eventually("the group's reads were never ranked", || shared.telemetry.fed_all());
-    let plan = shared.plan_shrink(Candidates::one(3, vec![3]), None).unwrap();
+    let plan = shared.plan_shrink(3, vec![3]).unwrap();
     shared.commit_shrink(plan).unwrap();
     assert_eq!(shared.costs().records, [3]);
     let step = harness.prompt_step();

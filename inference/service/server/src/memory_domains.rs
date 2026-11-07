@@ -123,6 +123,7 @@ fn streaming_resize(resize: &BankResize) -> StreamingResize {
             cause: match cause {
                 ShrinkCause::Reclaim => StreamingShrinkCause::Reclaim,
                 ShrinkCause::LiveClaim => StreamingShrinkCause::LiveClaim,
+                ShrinkCause::Rebalance => StreamingShrinkCause::Rebalance,
                 ShrinkCause::Measurement => StreamingShrinkCause::Measurement,
             },
             to,

@@ -68,6 +68,7 @@ export const localModelFitFacts = (model: LocalModel): readonly ModelFact[] => {
 const SHRINK_CAUSES: Record<StreamingShrinkCause, string> = {
   reclaim: "under memory pressure",
   live_claim: "to make room for a request",
+  rebalance: "for memory worth more to serving",
   measurement: "to make room for measuring this machine",
 }
 

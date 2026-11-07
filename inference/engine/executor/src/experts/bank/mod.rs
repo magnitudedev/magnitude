@@ -25,16 +25,6 @@ use resize::{Commitment, HostTier};
 use crate::storage_thread::{Releases, StorageThread};
 pub(crate) use served::ServedBank;
 
-/// The bytes a shrink of the host tier releases, so that it holds the
-/// submitting thread no longer than a decode `step`, in seconds, at the
-/// `rate` the last such shrink released them. Without either (a rate no
-/// release measured yet, or a decode not yet priced), the least that
-/// releases storage, which measures the rate; the ladder takes the rest a
-/// shrink at a time, at the boundaries after it.
-fn landed_bytes(step: Option<f64>, rate: Option<f64>) -> u64 {
-    step.zip(rate).map_or(0, |(step, rate)| (rate * step) as u64)
-}
-
 /// The holdings the bank itself resizes (`BankHolding`): its experts'
 /// slots and its host tier's host slots. A stored table's records are the
 /// served bank's (`ServedBank`).

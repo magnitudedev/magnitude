@@ -12,7 +12,7 @@ fn a_dropped_shrink_plan_is_undone_for_every_holder_of_residency() {
     harness.promoted(0, &[0, 1, 2, 3]);
     let shared = harness.watcher.shared();
     let pending = || residency::lock(&harness.watcher.state).core.directory.shrink_pending();
-    let plan = shared.plan_shrink(Candidates::one(2, vec![2]), None).unwrap();
+    let plan = shared.plan_shrink(2, vec![2]).unwrap();
     assert!(pending(), "the plan holds the records it names");
     drop(plan);
     assert!(!pending(), "dropped, it holds none for the next holder of the lock");
@@ -52,12 +52,12 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     assert!(shared.in_gap());
     let running = harness.step();
     assert!(!shared.in_gap(), "no gap while a step runs");
-    assert!(shared.plan_shrink(Candidates::one(2, vec![2]), None).is_err(), "no resize while a step runs");
+    assert!(shared.plan_shrink(2, vec![2]).is_err(), "no resize while a step runs");
     drop(running);
     assert!(shared.in_gap(), "the step's end is a gap");
     // Experts 2 and 1 move into records 1 and 0, which 3 and 4 leave; the
     // plan evicts 3 and 4 and moves nothing yet.
-    let plan = shared.plan_shrink(Candidates::one(2, vec![2]), None).unwrap();
+    let plan = shared.plan_shrink(2, vec![2]).unwrap();
     assert_eq!(plan.moves().collect::<Vec<_>>(), [vec![(2, 1), (3, 0)]]);
     let map = &harness.layer.0;
     let mapped = || (1..=4).map(|expert| map.held(expert).map_or(-1, |record| record as i32)).collect::<Vec<_>>();
@@ -68,7 +68,7 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     assert_eq!(mapped(), [3, 2, -1, -1], "a dropped plan moves nothing");
     // Planned again, the kept move into the records the evictions freed, in
     // record order, the most valuable first: 2 into record 0, 1 into 1.
-    let plan = shared.plan_shrink(Candidates::one(2, vec![2]), None).unwrap();
+    let plan = shared.plan_shrink(2, vec![2]).unwrap();
     shared.commit_shrink(plan).unwrap();
     assert_eq!(mapped(), [1, 0, -1, -1]);
     let next = sequence + 2;

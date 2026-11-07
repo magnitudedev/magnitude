@@ -474,3 +474,105 @@ pub fn relaid_manifest(
     manifest.target.files[0].size = offset;
     manifest
 }
+
+/// Gemma 4 26B-A4B q4's routed shape, synthetic (no header of it is
+/// committed): 30 blocks of attention then a routed feed-forward of 128
+/// experts choosing 8, hidden 2,816, its experts' intermediate widened to
+/// 1,152 (the routed kernels take a width in whole 64s) so the Q4_0 stacks
+/// ([`gemma_moe_fixture_manifest`]) total about 21.0 GB, as the model's
+/// own bank (about 21.1 GB), the bank a 24 GB device holds whole beside
+/// little else. Its
+/// attention (8 query heads sharing 2 key-value heads of 128) and its
+/// 256-token vocabulary are small; a 16k context keeps its history about
+/// 0.5 GB, and its whole-context prompt group 32 launches of 512 rows.
+#[cfg(test)]
+pub fn gemma_moe_fixture_definition() -> ModelDefinition {
+    use magnitude_family_contracts::{ExpertSelection, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction};
+    const LAYERS: u64 = 30;
+    const EXPERTS: u64 = 128;
+    const SELECTED: u64 = 8;
+    const HIDDEN: u64 = 2816;
+    const INTERMEDIATE: u64 = 1152;
+    const HEADS: u64 = 8;
+    const KV_HEADS: u64 = 2;
+    const WIDTH: u64 = 128;
+    let mut definition = fixture_definition();
+    let decoder = &mut definition.decoder;
+    decoder.hidden = HIDDEN;
+    decoder.context_limit = 16_384;
+    let vocabulary = decoder.vocabulary;
+    let rms = |name: String, width| RmsNorm { weight: descriptor(&name, &[width]), epsilon: 1e-6 };
+    decoder.entry.embedding = descriptor("embedding", &[vocabulary, HIDDEN]);
+    decoder.exit.norm = ExitNorm::Rms(rms("output_norm".into(), HIDDEN));
+    decoder.exit.output = descriptor("output", &[vocabulary, HIDDEN]);
+    let block = |block: u64| {
+        let name = |part: &str| format!("blk.{block}.{part}");
+        let attention = Attention {
+            heads: HEADS,
+            kv_heads: KV_HEADS,
+            width: WIDTH,
+            query: descriptor(&name("attn_qg"), &[2 * HEADS * WIDTH, HIDDEN]),
+            gate: AttentionGate::Interleaved { function: GateFunction::Sigmoid },
+            query_norm: HeadNorm::Rms(rms(name("attn_q_norm"), WIDTH)),
+            key_value: KeyValue::Owned {
+                key: descriptor(&name("attn_k"), &[KV_HEADS * WIDTH, HIDDEN]),
+                value: ValueSource::Projected(descriptor(&name("attn_v"), &[KV_HEADS * WIDTH, HIDDEN])),
+                key_norm: HeadNorm::Rms(rms(name("attn_k_norm"), WIDTH)),
+                value_norm: ValueNorm::None,
+                domain: HistoryDomain::Token,
+            },
+            rotary: Rotary::Interleaved { width: WIDTH / 2, base: 10_000.0, sections: vec![WIDTH / 4], axis_pattern: vec![0] },
+            scale: 1.0 / (WIDTH as f64).sqrt(),
+            reads: HistoryReads::Visible,
+            media_rows: MediaRowAttention::Causal,
+            sinks: None,
+            output: descriptor(&name("attn_output"), &[HIDDEN, HEADS * WIDTH]),
+        };
+        let routed = RoutedFfn {
+            experts: EXPERTS,
+            selected: SELECTED,
+            intermediate: INTERMEDIATE,
+            router: Router {
+                weight: descriptor(&name("ffn_gate_inp"), &[EXPERTS, HIDDEN]),
+                input: RouterInput::Operator,
+                score: ScoreFunction::Softmax,
+                selection: ExpertSelection::TopK { bias: None },
+                normalization: RouteNormalization::Sum,
+                scale: 1.0,
+            },
+            expert_up: FeedForwardUp::Gated {
+                activation: ActivationFunction::Silu,
+                gate: descriptor(&name("ffn_gate_exps"), &[EXPERTS, INTERMEDIATE, HIDDEN]),
+                up: descriptor(&name("ffn_up_exps"), &[EXPERTS, INTERMEDIATE, HIDDEN]),
+            },
+            expert_down: descriptor(&name("ffn_down_exps"), &[EXPERTS, HIDDEN, INTERMEDIATE]),
+            expert_scale: None,
+            latent: None,
+            shared: None,
+        };
+        Block {
+            sublayers: vec![
+                Sublayer {
+                    input: InputNorm::Rms(rms(name("attn_norm"), HIDDEN)),
+                    op: Operator::Attention(Box::new(attention)),
+                    output: OutputForm::Residual,
+                },
+                Sublayer {
+                    input: InputNorm::Rms(rms(name("ffn_norm"), HIDDEN)),
+                    op: Operator::RoutedFfn(Box::new(routed)),
+                    output: OutputForm::Residual,
+                },
+            ],
+        }
+    };
+    decoder.blocks = (0..LAYERS).map(block).collect();
+    definition
+}
+
+/// [`gemma_moe_fixture_definition`]'s manifest: its expert stacks Q4_0
+/// blocks (18 bytes a 32-element block), everything else F16.
+#[cfg(test)]
+pub fn gemma_moe_fixture_manifest(definition: &ModelDefinition) -> PackageManifest {
+    let stacks = expert_stacks(definition).into_iter().flatten().collect::<Vec<_>>();
+    relaid_manifest(fixture_manifest(definition), &stacks, Encoding::Q4_0, 18)
+}

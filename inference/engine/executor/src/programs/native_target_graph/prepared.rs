@@ -476,6 +476,7 @@ impl PreparedTargetGraphs {
         state: &StateResourcePlan,
         plan: &TargetProgramPlan,
         limits: ResourceLimits,
+        pass: crate::PassLaunches,
         workers: &seismic::Workers,
     ) -> Result<Self, String> {
         // The plan was assessed for a device that forms tensor operations or
@@ -497,7 +498,7 @@ impl PreparedTargetGraphs {
             ));
         }
         let certificate =
-            certify_target_family(device.backend(), load, geometry, state, plan, limits)
+            certify_target_family(device.backend(), load, geometry, state, plan, limits, pass)
                 .map_err(|error| error.to_string())?;
         let TargetFamilyCertificate { outline, served, passes, group: certificate_group, .. } = certificate;
         let largest_rows = outline.largest_rows;

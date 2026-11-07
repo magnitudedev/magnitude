@@ -143,10 +143,10 @@ export const StreamingTierStatusSchema = Schema.Struct({
 export type StreamingTierStatus = typeof StreamingTierStatusSchema.Type
 
 /**
- * Why the engine shrank an expert bank's holding: memory pressure, a live claim, or room for
- * measuring this machine while the model was idle.
+ * Why the engine shrank an expert bank's holding: memory pressure, a live claim, something worth
+ * more to serving, or room for measuring this machine while the model was idle.
  */
-export const StreamingShrinkCauseSchema = Schema.Literal("reclaim", "live_claim", "measurement")
+export const StreamingShrinkCauseSchema = Schema.Literal("reclaim", "live_claim", "rebalance", "measurement")
 export type StreamingShrinkCause = typeof StreamingShrinkCauseSchema.Type
 
 /**

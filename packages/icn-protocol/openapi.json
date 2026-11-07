@@ -11610,6 +11610,7 @@
         "enum": [
           "reclaim",
           "live_claim",
+          "rebalance",
           "measurement"
         ]
       },

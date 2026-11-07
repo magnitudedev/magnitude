@@ -144,6 +144,12 @@ impl ModelLoadPlan {
             ceiling: slots,
             host_slots: 0,
             places,
+            pass: crate::PassLaunches::new(
+                usize::try_from(places)
+                    .ok()
+                    .and_then(std::num::NonZeroUsize::new)
+                    .ok_or(PlanError::Arithmetic("a bank's places are one to usize::MAX"))?,
+            ),
             flights,
             tables,
             sites: BankSites::Unadmitted,

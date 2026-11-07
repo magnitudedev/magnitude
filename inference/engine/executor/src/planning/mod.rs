@@ -11,6 +11,11 @@ mod execution_plan;
 mod imports;
 pub(crate) use imports::{ImportBacking, ImportPlan};
 mod programs;
+mod prices;
+pub use prices::{PlanPrices, PlanSteps};
+pub(crate) use prices::{BankPrices, Prior};
+mod prompt_room;
+pub(crate) use prompt_room::{grouped, pass_ladder, pass_rows_curve, places_curve, routed_group_seconds, routed_prompt_seconds};
 mod resources;
 mod weights;
 
@@ -37,7 +42,7 @@ pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, Co
 #[cfg(test)]
 pub(crate) use execution_plan::bank_substrate;
 pub use execution_plan::{
-    BackendPlan, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, DraftedCharge, HeldCharge, HeldCharges, NoBank, PlannedDevice,
+    BackendPlan, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, DraftedCharge, HeldCharge, HeldCharges, NoBank, PlanRoom, PlannedDevice, SettleRoom, StableRoom,
     ResolvedPolicy,
 };
 pub use programs::{
@@ -49,7 +54,7 @@ pub use programs::{
 };
 pub use resources::{
     CPU_IMAGE_CELLS, FlightDepth, GraphSlots, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
-    ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
+    PassLaunches, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
     max_image_cells, reads_decoded_history,
 };
@@ -805,6 +810,7 @@ pub(crate) mod tests {
                 &state,
                 draft.programs().target(),
                 limits,
+                crate::PassLaunches::whole_chain(limits),
             )
             .unwrap();
             assert_eq!(target.group_bytes(3).unwrap(), checked.group_bytes, "{backend:?}");

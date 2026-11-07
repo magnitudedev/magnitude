@@ -227,7 +227,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.input.remove(&request);
         self.target.remove(&request);
         self.poisoned.remove(&request);
-        self.places_want = self.places_want.filter(|want| want.request != request);
         Ok(())
     }
 
@@ -304,7 +303,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.target.remove(request);
             self.head.remove(request);
         }
-        self.places_want = self.places_want.filter(|want| !requests.contains(&want.request));
         Ok(bytes)
     }
 

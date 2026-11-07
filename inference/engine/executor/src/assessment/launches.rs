@@ -6,10 +6,12 @@
 //! preparation makes ([`crate::native::kernel_requests`]). A call names its
 //! entry by type ([`Kernel`]); its launches at `rows` rows are the
 //! declaration's launches in dispatch order whose `when` clause holds with
-//! every row dimension (`M`, `O`) at `rows`. Every other dimension a clause
-//! reads is a static of the load's request, or one the call states
-//! ([`Declarations::launches`]); a clause reading a name neither supplies
-//! is an error, never a default.
+//! every row dimension (`M`, `O`) at `rows`, and whose launch conditions
+//! (`if (w[i])`, `unless (w[i])`) hold under the host-written words the
+//! call's form states ([`Words`]). Every other dimension a clause reads is a
+//! static of the load's request, or one the call states
+//! ([`Declarations::launches`]); a clause or condition reading a name
+//! neither supplies is an error, never a default.
 
 use super::AssessmentError;
 use crate::{ModelLoadPlan, ProgramPlan, TuningLimits};
@@ -65,6 +67,13 @@ impl fmt::Debug for Kernel {
         formatter.write_str(self.name)
     }
 }
+
+/// The host-written words a form encodes its calls' launches under
+/// (`seismic::LaunchCondition`): each by its port's name and word index,
+/// with whether the form holds it set. A streamed layer's words are what
+/// decides which of its declared launches a run encodes; a form states
+/// every word its active launches are conditioned on.
+pub type Words = [(&'static str, u64, bool)];
 
 fn launch_error(message: impl Into<String>) -> AssessmentError {
     AssessmentError::Demand(message.into())
@@ -180,18 +189,21 @@ impl Declarations {
     }
 
     /// The launches of a call of `kernel` at operand recipe `recipe` (its
-    /// weights', `operand_recipe`) stating `dimensions`, at any row count.
+    /// weights', `operand_recipe`) stating `dimensions`, encoded under
+    /// `words`, at any row count.
     pub fn launches(
         &self,
         kernel: Kernel,
         recipe: OperandRecipe,
         dimensions: &[(&'static str, u64)],
+        words: &'static Words,
     ) -> Result<Launches, AssessmentError> {
         Ok(Launches {
             kernel,
             prepared: self.prepared(kernel, recipe)?,
             recipe,
             dimensions: dimensions.to_vec(),
+            words,
         })
     }
 }
@@ -219,11 +231,15 @@ pub struct Launches {
     prepared: Vec<Prepared>,
     recipe: OperandRecipe,
     dimensions: Vec<(&'static str, u64)>,
+    words: &'static Words,
 }
 
 impl PartialEq for Launches {
     fn eq(&self, other: &Self) -> bool {
-        self.kernel == other.kernel && self.recipe == other.recipe && self.dimensions == other.dimensions
+        self.kernel == other.kernel
+            && self.recipe == other.recipe
+            && self.dimensions == other.dimensions
+            && self.words == other.words
     }
 }
 
@@ -289,7 +305,27 @@ impl Launches {
                 Some(condition) => condition.holds(&dimension, &parameter).map_err(failed)?,
                 None => true,
             };
-            launches += u64::from(active);
+            if !active {
+                continue;
+            }
+            let mut encoded = true;
+            for condition in &launch.conditions {
+                let (_, _, set) = self
+                    .words
+                    .iter()
+                    .find(|(word, index, _)| *word == condition.word && *index == condition.index)
+                    .ok_or_else(|| {
+                        launch_error(format!(
+                            "`{name}`'s launch `{}` is conditioned on {}[{}], which its form does not state",
+                            launch.kernel, condition.word, condition.index
+                        ))
+                    })?;
+                encoded &= match condition.encoded {
+                    seismic::LaunchEncoding::WhileSet => *set,
+                    seismic::LaunchEncoding::WhileClear => !*set,
+                };
+            }
+            launches += u64::from(encoded);
         }
         Ok(launches)
     }

@@ -344,7 +344,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// one planning of a prompt's successors, for the scheduler's owner and
     /// the evaluation harness alike. `decode_owed` is the decode seconds
     /// owed each second they run while decode waits (none when it doesn't),
-    /// which their places are weighed with (`grant_group`). `chunks` forms
+    /// which sizes their group ([`Self::group_size`]). `chunks` forms
     /// the operations of at most the count it is given: the rest of a prompt
     /// group of [`Self::group_size`] chunks (decode waiting as there), or
     /// without chains the one chunk a pipelined successor runs. That
@@ -370,7 +370,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let planned = chunks(count)?;
         self.plan_successors(planned);
-        self.decode_owed = decode_owed;
         Ok(())
     }
 
@@ -425,7 +424,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Ok(());
             }
         };
-        let drained = drain_steps(steps, self.experts.as_ref());
+        let drained = drain_steps(steps, self.measures.as_ref().and_then(|measures| measures.experts.as_ref()));
         self.target.insert(holder, joined.abort());
         let released = self.release_state(&[holder]).map(|_bytes| ()).map_err(DomainError::invariant);
         // The first failure of both: the drained steps' fault, else the
@@ -928,13 +927,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Wait for the queued steps nobody will claim and drop them
     /// (`Queue::orphan`): every binding change does so first.
     pub(super) fn orphan_queue(&mut self, bindings: &mut StateBindings) -> Result<(), DomainError> {
-        self.queue.orphan(self.experts.as_ref(), bindings)
+        self.queue.orphan(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()), bindings)
     }
 
     /// Wait for every queued step and drop it, a chain under way with them
     /// (`Queue::drain`).
     pub(super) fn drain_queue(&mut self) -> Result<(), DomainError> {
-        self.queue.drain(self.experts.as_ref())
+        self.queue.drain(self.measures.as_ref().and_then(|measures| measures.experts.as_ref()))
     }
 
     /// The launch of `predicted` queued behind a step whose advances are

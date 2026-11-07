@@ -169,6 +169,12 @@ pub struct ExpertBankPlan {
     /// load, so the bank's static charge is the same whichever chain the
     /// plan admits.
     pub places: u64,
+    /// The launches one merged-expert prompt pass covers
+    /// ([`crate::PassLaunches`]): what the pass buffers and the pass graphs
+    /// are sized by, at most `places`. Built at every place; the plan's
+    /// settle sizes it by what its fewer passes save
+    /// (`ExecutionPlanDraft::with_largest_bank`).
+    pub pass: crate::PassLaunches,
     /// The in-flight depth its steps fly at: the routed kernels' `FLIGHT`
     /// ([`FlightDepth::steps`]) and every exchange table's slots follow it.
     pub flights: FlightDepth,

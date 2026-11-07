@@ -4,7 +4,7 @@
 //! drafter. Independent header checks (weight encodings, the family's
 //! interpretation, the tokenizer and the chat templates) each run and their
 //! refusals are reported together. An admitted target is planned through
-//! [`crate::planning::plan_execution`] (the production planning inputs)
+//! [`crate::planning::plan_ceiling`] (the production planning inputs)
 //! with its drafter, and the target's plan alone is charged beside it from
 //! its headers, which decides whether it runs here; a drafter that does not
 //! bind or plan is `Rejected` without affecting the target, which is then
@@ -22,7 +22,7 @@ use crate::error::{
 use crate::fingerprint::ModelFingerprint;
 use crate::host::{bind_draft, interpret_target, vocabulary_mismatch, InterpretedTarget};
 use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod};
-use crate::planning::{plan_backend, plan_execution, plan_resident, ExecutionPlanningError};
+use crate::planning::{plan_backend, plan_ceiling, plan_resident, ExecutionPlanningError};
 use magnitude_artifacts::{
     gguf::{Directory, FileHeaders, HeaderSource, TensorDescriptor},
     ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest, TemplatePayload,
@@ -34,16 +34,16 @@ use magnitude_chat::{
 };
 use magnitude_executor::{
     assessment::{
-        assess_execution_fit, decode_demand, decode_pricing, estimate_execution, performance_depths,
-        prepare_execution_assessment, step_seconds, undrafted_memory_charge, AssessmentError,
-        AssessmentRequest, Pricing,
+        assess_execution_fit, decode_pricing, decode_step, estimate_execution, performance_depths,
+        prepare_execution_assessment, undrafted_memory_charge, AssessmentError,
+        AssessmentRequest,
         DomainFit, ExecutionAssessment, ExecutionFit, ExecutionShortfall,
         ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
         PointRequests, Priced, Residency as FitResidency, StoredCosts, StreamedFigures, StreamedLayers,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
     held_storage, resident_layout, scaled_source_element, stored_weights, AssessmentMemoryCharge,
-    ChargedDraft, DraftedCharge, ExpertBankPlan, ExecutionPath, ExecutionPlanDraft, HeldCharge, KernelCache,
+    ChargedDraft, DraftedCharge, ExpertBankPlan, ExecutionPath, ExecutionPlanDraft, HeldCharge, KernelCache, PlanPrices,
 };
 use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, ScaledActivations};
 use magnitude_scheduler::ServiceLimits;
@@ -157,39 +157,7 @@ impl AssessmentStructure {
     /// cannot be derived from what is stored (a record store that cannot be
     /// read, or a required figure recorded unobtainable) are `Unavailable`.
     pub fn stored_measurements(&self, kernels: &Path, storage: &Path) -> Measurements {
-        let records = KernelCache::measurement_records(kernels);
-        match ExecutorCosts::stored(&self.topology, &self.selected.info, &records) {
-            Ok(StoredCosts::Complete {
-                costs,
-                records: mut cost_records,
-                pending,
-            }) => {
-                let (streamed, streamed_records) = StreamedFigures::stored(&self.topology, &self.selected.info, storage, &records);
-                cost_records.extend(streamed_records);
-                // The job has points left to measure: a later point of the
-                // standing requests, or a load's runtime request. Neither
-                // enters an estimate.
-                let pending = pending
-                    || match PointRequests::new(kernels).outstanding(&self.topology, &self.selected.info, storage, &records, pending) {
-                        Ok(outstanding) => !outstanding.is_empty(),
-                        Err(error) => {
-                            return Measurements::Unavailable {
-                                reason: format!("the point requests: {error}"),
-                            };
-                        }
-                    };
-                Measurements::Measured {
-                    costs: Arc::new(costs),
-                    records: Arc::new(cost_records),
-                    pending,
-                    streamed,
-                }
-            }
-            Ok(StoredCosts::Missing(_)) => Measurements::Pending,
-            Err(error) => Measurements::Unavailable {
-                reason: error.to_string(),
-            },
-        }
+        stored_measurements(&self.topology, &self.selected.info, kernels, storage)
     }
 
     /// The room a measurement job on the selected executor takes of its
@@ -198,6 +166,69 @@ impl AssessmentStructure {
     /// it first.
     pub fn measurement_room(&self) -> Result<u64, String> {
         ExecutorCosts::room(&self.topology, &self.selected.info).map_err(|error| error.to_string())
+    }
+}
+
+/// What the stored records give `info` of `topology` now
+/// ([`AssessmentStructure::stored_measurements`]): its costs from the
+/// kernel cache at `kernels` and the streamed figures of the model store at
+/// `storage`, opening no device and measuring nothing.
+pub fn stored_measurements(topology: &DeviceTopology, info: &seismic::Executor, kernels: &Path, storage: &Path) -> Measurements {
+    let records = KernelCache::measurement_records(kernels);
+    let walked = ExecutorCosts::stored(topology, info, &records);
+    let costs_outstanding = walked.as_ref().ok().and_then(StoredCosts::outstanding);
+    match walked {
+        Ok(StoredCosts::Complete {
+            costs,
+            records: mut cost_records,
+            pending,
+        }) => {
+            let (streamed, streamed_records) = StreamedFigures::stored(topology, info, storage, &records);
+            cost_records.extend(streamed_records);
+            // The job has points left to measure: a later point of the
+            // standing requests, or a load's runtime request. Neither
+            // enters an estimate.
+            let pending = pending
+                || match PointRequests::new(kernels).outstanding(topology, info, storage, &records, costs_outstanding) {
+                    Ok(outstanding) => !outstanding.is_empty(),
+                    Err(error) => {
+                        return Measurements::Unavailable {
+                            reason: format!("the point requests: {error}"),
+                        };
+                    }
+                };
+            Measurements::Measured {
+                costs: Arc::new(costs),
+                records: Arc::new(cost_records),
+                pending,
+                streamed,
+            }
+        }
+        Ok(StoredCosts::Missing(_)) => Measurements::Pending,
+        Err(error) => Measurements::Unavailable {
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// The prices a plan of `definition` as `plan` (its plan before any bank)
+/// settles its holdings on (`PlanPrices`): the executor's costs and the
+/// streamed figures `measurements` hold, and its decode on those costs in
+/// each form, `plan`'s and the banked plan's streamed form's
+/// (`assessment::decode_step`). Pending or unavailable as the measurements
+/// or their streamed figures are: a plan that holds a bank waits for them.
+pub fn plan_prices(measurements: &Measurements, plan: &ExecutionPlanDraft) -> Priced<PlanPrices> {
+    match measurements {
+        Measurements::Pending => Priced::Pending("the executor's costs are not measured yet".into()),
+        Measurements::Unavailable { reason } => Priced::Unavailable(reason.clone()),
+        Measurements::Measured { costs, streamed, .. } => streamed.as_ref().and_then(|figures| {
+            let (resident, steps) = (plan.clone(), ExecutorCosts::clone(costs));
+            Priced::Measured(PlanPrices::new(
+                ExecutorCosts::clone(costs),
+                *figures,
+                Box::new(move |definition, banked| decode_step(definition, &resident, banked, steps.clone())),
+            ))
+        }),
     }
 }
 
@@ -455,6 +486,7 @@ pub fn finish_model_assessment(
         &structure.topology,
         &structure.status,
         &request,
+        &plan_prices(&setup.measurements, draft),
     )
     .map_err(ModelAssessmentError::Assessment)?;
     let execution = match fit {
@@ -536,9 +568,9 @@ fn streamed_performance(
 /// the plan's streamed layers priced by the generic miss model and the one
 /// step model ([`StreamedLayers::step_seconds`]) at the request's rows (a
 /// row a sequence), their file reads along the model store's read line, on
-/// `C` the resident step's estimate there (`preparation` is the resident
-/// plan's, `draft` its plan), `bank` the fit's: the plan's structure and
-/// the machine's stored figures alone.
+/// `C` the step's estimate there in each form (`preparation` is the plan's,
+/// `draft` the plan, `PreparedExecutionAssessment::form_seconds`), `bank`
+/// the fit's: the plan's structure and the machine's stored figures alone.
 pub fn streamed_estimate(
     costs: &ExecutorCosts,
     figures: &StreamedFigures,
@@ -555,9 +587,9 @@ pub fn streamed_estimate(
     let pricing = decode_pricing(draft, costs);
     let mut estimates = Vec::new();
     for depth in performance_depths(request.context_limit, &request.performance_depths) {
-        let compute = step_seconds(preparation.demand(), &pricing, u64::from(request.sequences), depth)
-            .map_err(ModelAssessmentError::Assessment)?
-            .total();
+        let compute = preparation
+            .form_seconds(&pricing, u64::from(request.sequences), depth)
+            .map_err(ModelAssessmentError::Assessment)?;
         let step = layers.step_seconds(None, figures.read, held, f64::from(request.sequences), compute);
         estimates.push(PerformanceEstimate { context_tokens: depth, tokens_per_second: 1. / step.total_seconds });
     }
@@ -577,23 +609,6 @@ pub fn priced_costs(
         Ok(StoredCosts::Missing(point)) => Priced::Pending(format!("the executor's costs are not measured yet ({point:?})")),
         Err(error) => Priced::Unavailable(error.to_string()),
     }
-}
-
-/// The resident decode launch of a number of rows (a row a sequence) at a
-/// depth of `definition` planned as `resident` (its plan before any weight
-/// cap), on the executor's `costs` ([`priced_costs`]): what a streamed
-/// load's bank growth is priced on.
-/// Why there is none: the decode's demand cannot be derived.
-pub fn resident_step(
-    definition: &ModelDefinition,
-    resident: &ExecutionPlanDraft,
-    costs: ExecutorCosts,
-) -> Result<Box<magnitude_executor::ResidentStep>, String> {
-    let demand = decode_demand(definition, resident).map_err(|error| error.to_string())?;
-    let lookahead = decode_pricing(resident, &costs).lookahead;
-    Ok(Box::new(move |rows, depth| {
-        step_seconds(&demand, &Pricing { costs: &costs, lookahead }, u64::from(rows), depth).map(|step| step.total())
-    }))
 }
 
 /// Assess one package on the setup's selected device.
@@ -807,6 +822,7 @@ fn inventory(
         PlanOutcome::Unsupported(unsupported) => Ok(Err(unsupported)),
         PlanOutcome::WeightCap(error) => Err(ModelAssessmentError::WeightCap(error)),
         PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
+        PlanOutcome::PricesPending(reason) => unpriced(&reason),
     };
     let plan = match plan_backend(manifest, backend) {
         Ok(plan) => plan,
@@ -841,8 +857,15 @@ impl Refusal {
             PlanOutcome::Unsupported(unsupported) => Self::Unsupported(unsupported),
             PlanOutcome::WeightCap(error) => Self::Failed(ModelAssessmentError::WeightCap(error)),
             PlanOutcome::Internal(reason) => Self::Failed(ModelAssessmentError::Planning(reason)),
+            PlanOutcome::PricesPending(reason) => unpriced(&reason),
         }
     }
+}
+
+/// Assessment plans its structure and ceilings, never a priced settle (`with_bank`): no plan of
+/// its waits on the machine's prices.
+fn unpriced(reason: &str) -> ! {
+    unreachable!("an assessment plan settled on the machine's prices, which are pending: {reason}")
 }
 
 /// Plan `manifest` on the selected device, then its decode demand and
@@ -853,7 +876,7 @@ fn prepare_plan<C: HeldCharge>(
     selected: &SelectedDevice,
     context_limit: u32,
 ) -> Result<(ModelDefinition, ChargedDraft<C>, PreparedExecutionAssessment), Refusal> {
-    let planned = match plan_execution(&manifest, selected) {
+    let planned = match plan_ceiling(&manifest, selected) {
         Ok(planned) => planned,
         Err(ExecutionPlanningError::Plan(error)) => {
             return Err(Refusal::of(classify_plan(error, selected.info.backend())));

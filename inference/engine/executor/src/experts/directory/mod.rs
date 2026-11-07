@@ -1415,29 +1415,26 @@ impl Directory {
         self.bank.counts()
     }
 
-    /// How group `group` retires its records from `records` up, on its way
-    /// to `target` records (at most `records`), between flights (no fill
-    /// pending), changing nothing yet. The target keeps the group's most
-    /// reused experts, by their rank ([`Ranked`]) beside
+    /// How group `group` retires its records from `target` up, between
+    /// flights (no fill pending), changing nothing yet. The shrink keeps
+    /// the group's most reused experts, by their rank ([`Ranked`]) beside
     /// `last_read(layer, expert)` (the step that last read it, none before
-    /// any: least recent), as many as its records below `target` hold. Of the experts from
-    /// `records` up, each the target keeps moves to a record below `target`
-    /// (a free one, else one whose expert the target drops, least recent
-    /// first, which is evicted), and the rest are evicted: so a shrink
-    /// paced over several resizes moves each kept expert once, where its
-    /// last resize would. The evictions are taken first ([`Self::evict`]),
+    /// any: least recent), as many as its records below `target` hold. Of
+    /// the experts from `target` up, each it keeps moves to a record below
+    /// `target` (a free one, else one whose expert it drops, least recent
+    /// first, which is evicted), and the rest are evicted. The evictions
+    /// are taken first ([`Self::evict`]),
     /// then the device moves each move's bytes, then
     /// [`Self::commit_shrink`] takes the rest of the plan. Between flights
     /// the conveyor has returned what it was lent.
     pub fn plan_shrink(
         &self,
         group: usize,
-        records: usize,
         target: usize,
         last_read: impl Fn(usize, usize) -> Option<Step>,
     ) -> Shrink {
         let contents = self.bank.records(group);
-        assert!(target <= records && records <= contents.len(), "a shrink of {} records to {records}, then {target}", contents.len());
+        assert!(target <= contents.len(), "a shrink of {} records to {target}", contents.len());
         let held = contents
             .iter()
             .enumerate()
@@ -1458,7 +1455,7 @@ impl Directory {
         };
         held.sort_unstable_by(|a, b| b.cmp(a));
         let (kept, dropped) = held.split_at(target.min(held.len()));
-        let movers = kept.iter().filter(|held| held.1 >= records).collect::<Vec<_>>();
+        let movers = kept.iter().filter(|held| held.1 >= target).collect::<Vec<_>>();
         // Below the target, the free records, then those whose experts the
         // target drops, least recent first.
         let displaced = dropped
@@ -1471,10 +1468,10 @@ impl Directory {
             .filter(|&record| contents[record] == Record::Free)
             .chain(displaced.iter().map(|held| held.1));
         Shrink {
-            records,
+            records: target,
             evicted: dropped
                 .iter()
-                .filter(|held| held.1 >= records)
+                .filter(|held| held.1 >= target)
                 .chain(displaced.iter().copied())
                 .map(|&(Ranked { layer, expert, .. }, _)| (layer, expert))
                 .collect(),
@@ -1500,41 +1497,6 @@ impl Directory {
         for (layer, expert) in self.bank.shrinking(group, plan, at) {
             self.left_bank(layer, expert, last_read(layer, expert));
         }
-    }
-
-    /// Of `count` candidates, `candidate(i)` the records of every group of
-    /// the `i`th, shallowest first, the last the shrink's target, the deepest
-    /// whose moves toward the target ([`Self::plan_shrink`]'s, nothing
-    /// changed since), the records each group moves, `budget` fits, or the
-    /// shallowest where none does: one resize moves at most what its budget
-    /// allows, and takes at least its first step. A deeper candidate moves
-    /// no fewer records of any group, so the deepest that fits is found by
-    /// halving: it prices the target and O(log count) candidates, not all.
-    pub fn paced(
-        &self,
-        count: usize,
-        candidate: impl Fn(usize) -> Vec<usize>,
-        budget: impl Fn(&dyn Fn(usize) -> u64) -> bool,
-        last_read: impl Fn(usize, usize) -> Option<Step>,
-    ) -> usize {
-        let target = candidate(count.checked_sub(1).expect("a shrink has a target"));
-        let fits = |index: usize| -> bool {
-            let records = candidate(index);
-            budget(&|group| self.plan_shrink(group, records[group], target[group], &last_read).moved.len() as u64)
-        };
-        if !fits(0) {
-            return 0;
-        }
-        // The deepest known to fit, and the shallowest known not to.
-        let (mut fitting, mut over) = (0, count);
-        while over - fitting > 1 {
-            let middle = fitting + (over - fitting) / 2;
-            match fits(middle) {
-                true => fitting = middle,
-                false => over = middle,
-            }
-        }
-        fitting
     }
 
     /// The first record of group `group` a seed may take

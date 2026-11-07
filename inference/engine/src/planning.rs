@@ -62,15 +62,29 @@ pub(crate) fn select_load_device(
 /// Plan the manifest's model on the selected device: component selection,
 /// planned method, KV codec and resource limits resolved from the manifest,
 /// then `ExecutionPlanner::prepare`, then its expert bank under the model
-/// policy's weight cap, if any (`ExecutionPlanDraft::with_bank`). Opens no
-/// device and reads no payload. The draft comes with the memory charge its
-/// planning confirmed, each way of holding its experts charged as a `C`
-/// (`HeldCharge`).
+/// policy's weight cap, if any, as the plan's settle grants it on the
+/// machine's prices (`ExecutionPlanDraft::with_bank`, [`plan_banked`]).
+/// Opens no device and reads no payload. The draft comes with the memory
+/// charge its planning confirmed, each way of holding its experts charged
+/// as a `C` (`HeldCharge`).
 pub fn plan_execution<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
-    plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, resident))
+    plan_resident(manifest, selected).and_then(|resident| plan_banked(manifest, selected, resident))
+}
+
+/// [`plan_execution`]'s structure, whatever room the machine has: its
+/// experts held as its largest plan holds them under the model policy's
+/// weight cap (`ExecutionPlanDraft::with_ceiling_bank`), what metadata-only
+/// assessment prepares from the structure alone.
+pub fn plan_ceiling<C: HeldCharge>(
+    manifest: &ExecutionManifest,
+    selected: &SelectedDevice,
+) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
+    plan_resident(manifest, selected)?
+        .with_ceiling_bank(&manifest.definition, manifest.model.weight_cap)
+        .map_err(ExecutionPlanningError::Plan)
 }
 
 /// [`plan_execution`]'s plan before its expert bank: every expert resident.
@@ -93,13 +107,40 @@ pub fn plan_resident(
 }
 
 /// [`plan_execution`]'s plan from its `resident` plan: its expert bank,
-/// under the model policy's weight cap, if any, with its charge.
+/// under the model policy's weight cap, if any, with its charge, settled on
+/// the machine's prices (`assessment::plan_prices`): the records of its
+/// kernel cache, its model store's figures.
+///
+/// Every load, banked or not, is priced on its executor's costs as it
+/// serves, so none plans before the measurement job stored the costs'
+/// required figures: while they are pending the plan's prices are
+/// (`PlanError::Unpriced`), and the load waits for them holding nothing of
+/// the device, once per machine. Without a kernel cache nothing is measured
+/// for it, and its prices are unavailable.
 pub fn plan_banked<C: HeldCharge>(
     manifest: &ExecutionManifest,
+    selected: &SelectedDevice,
     resident: ExecutionPlanDraft,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
+    use crate::assessment::Measurements;
+    let measurements = match manifest.kernel_cache.as_deref() {
+        None => Measurements::Unavailable { reason: "the load keeps no kernel cache, which holds the machine's figures".into() },
+        Some(kernels) => crate::assessment::stored_measurements(
+            &selected.reading.topology,
+            &selected.info,
+            kernels,
+            manifest.store(),
+        ),
+    };
+    if let Measurements::Pending = measurements {
+        return Err(ExecutionPlanningError::Plan(PlanError::Unpriced {
+            pending: true,
+            reason: "the executor's costs are not measured yet".into(),
+        }));
+    }
+    let prices = crate::assessment::plan_prices(&measurements, &resident);
     resident
-        .with_bank(&manifest.definition, manifest.model.weight_cap)
+        .with_bank(&manifest.definition, manifest.model.weight_cap, &prices)
         .map_err(ExecutionPlanningError::Plan)
 }
 

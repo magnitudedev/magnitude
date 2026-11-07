@@ -1,87 +1,28 @@
-use crate::domain::BankHolding;
 use crate::CompletionWake;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use crate::experts::watcher::Join;
-use super::served::{Step, grown, shrunk};
+use super::served::sizes_up;
 use super::resize::{Cut, grow_by_slots};
 use crate::storage_thread::{Done, StorageThread};
 
-/// A landed shrink holds the thread at most a step at its latest
-/// measured rate: 10 GB/s over a 35 ms step is 350 MB; unmeasured, or
-/// with no step to hold it to, the least, which measures the rate.
-#[test]
-fn a_landed_shrink_releases_what_one_step_may_hold() {
-    assert_eq!(super::landed_bytes(Some(0.035), Some(1e10)), 350_000_000);
-    assert_eq!(super::landed_bytes(Some(0.035), None), 0);
-    assert_eq!(super::landed_bytes(None, Some(1e10)), 0);
-}
-
 use super::*;
 
-fn step(holding: BankHolding, bytes: u64, saves: Option<f64>) -> Step {
-    Step { holding, kind: crate::planning::BankTier::Bank, from: 0, to: 1, bytes, saves }
-}
-
-/// A shrink takes the step that saves least per byte, an unpriced one
-/// first and the experts on a tie; a growth, once every holding's
-/// resizes are measured, the priced step that saves most per byte, none
-/// when nothing is priced; before, the smallest step of a holding not
-/// yet measured, priced or not; the host tier's step before any.
+/// A holding's growth steps each back storage and take every size that
+/// storage holds: sizes whose charge does not rise join the step before
+/// them, so one resize to a settled size never stops inside a granule; an
+/// inclusive host tier's first step reaches past the bank's slots at once.
 #[test]
-fn the_owner_resizes_the_holding_by_what_a_byte_saves() {
-    let taken = |steps| shrunk(steps, &|_| 0).map(|step: Step| step.holding);
-    let bounded = |steps: Vec<Step>| steps.into_iter().map(|step| (step, 1)).collect::<Vec<_>>();
-    let added = |steps| grown(bounded(steps), &|_| true).map(|(step, _)| step.holding);
-    // A slot of 100 bytes saving 1 s; a table record of 10 bytes 0.5 s.
-    let priced = || vec![step(BankHolding::Experts, 100, Some(1.)), step(BankHolding::Table { table: 0 }, 10, Some(0.5))];
-    assert_eq!(taken(priced()), Some(BankHolding::Experts));
-    assert_eq!(added(priced()), Some(BankHolding::Table { table: 0 }));
-    let cheap = vec![step(BankHolding::Experts, 100, Some(1.)), step(BankHolding::Table { table: 0 }, 10, Some(0.05))];
-    assert_eq!(taken(cheap), Some(BankHolding::Table { table: 0 }));
-    let unmeasured = || vec![step(BankHolding::Experts, 100, None), step(BankHolding::Table { table: 0 }, 10, None)];
-    assert_eq!(taken(unmeasured()), Some(BankHolding::Experts));
-    assert_eq!(added(unmeasured()), None);
-    let table_unmeasured = vec![step(BankHolding::Experts, 100, Some(1.)), step(BankHolding::Table { table: 0 }, 10, None)];
-    assert_eq!(taken(table_unmeasured), Some(BankHolding::Table { table: 0 }));
-    assert_eq!(taken(Vec::new()), None);
-    // Holdings no resize has measured: the smallest of their steps, over
-    // any priced one; with none left, the priced rule.
-    let first = |steps, unmeasured: &[BankHolding]| {
-        grown(bounded(steps), &|holding| !unmeasured.contains(&holding)).map(|(step, _)| step.holding)
-    };
-    let host = |saves| step(BankHolding::Host, 50, saves);
-    let mixed = || vec![step(BankHolding::Experts, 100, Some(1.)), host(None), step(BankHolding::Table { table: 0 }, 10, Some(0.5))];
-    assert_eq!(first(mixed(), &[BankHolding::Host]), Some(BankHolding::Host));
-    assert_eq!(first(mixed(), &[BankHolding::Host, BankHolding::Experts]), Some(BankHolding::Host));
-    assert_eq!(first(unmeasured(), &[BankHolding::Experts, BankHolding::Table { table: 0 }]), Some(BankHolding::Table { table: 0 }));
-    assert_eq!(first(mixed(), &[]), Some(BankHolding::Host), "the tier's step, measured or not, priced by nothing");
-    let device = || vec![step(BankHolding::Experts, 100, Some(1.)), step(BankHolding::Table { table: 0 }, 10, Some(0.5))];
-    assert_eq!(first(device(), &[]), Some(BankHolding::Table { table: 0 }));
-}
-
-/// A shrink toward a store's deficit takes only that store's holdings:
-/// host RAM short, the host tier's step over a device slot that saves
-/// less, and once the tier is at its floor nothing, as no device slot
-/// gives host RAM back; with no store short, any.
-#[test]
-fn a_shrink_takes_only_the_short_stores_holdings() {
-    use crate::planning::BankTier::{Bank, Host};
-    let host = || Step { holding: BankHolding::Host, kind: Host, from: 0, to: 1, bytes: 100, saves: Some(1.) };
-    let slot = || step(BankHolding::Experts, 100, Some(0.1));
-    let host_short = |kind| match kind {
-        Host => 50,
-        _ => 0,
-    };
-    let taken = |steps, deficit: &dyn Fn(crate::planning::BankTier) -> u64| shrunk(steps, deficit).map(|step: Step| step.holding);
-    assert_eq!(taken(vec![slot(), host()], &host_short), Some(BankHolding::Host));
-    assert_eq!(taken(vec![slot()], &host_short), None, "the host tier at its floor");
-    assert_eq!(taken(vec![slot(), host()], &|_| 0), Some(BankHolding::Experts));
-    let device_short = |kind| match kind {
-        Bank => 50,
-        _ => 0,
-    };
-    assert_eq!(taken(vec![slot(), host()], &device_short), Some(BankHolding::Experts));
+fn growth_steps_end_where_the_charge_rises_again() {
+    // 32-byte granules of 10-byte slots.
+    let granules = |to: u64| Ok::<_, crate::domain::DomainError>((to * 10).div_ceil(32) * 32);
+    // From 2 slots (32 bytes): a third slot fits the granule held, free;
+    // 4 slots need 64 bytes, which hold up to 6; 7 need 96, up to 9; 10
+    // need 128.
+    assert_eq!(sizes_up(2, 2, 10, &granules).unwrap(), [(3, 0), (6, 32), (9, 32), (10, 32)]);
+    let steps = sizes_up(2, 5, 10, &granules).unwrap();
+    assert_eq!(steps.first(), Some(&(6, 32)), "the first step reaches past the least size");
+    assert!(sizes_up(4, 4, 4, &granules).unwrap().is_empty(), "at its bound");
 }
 
 /// A resize step that panics is reported to its holding, its wake

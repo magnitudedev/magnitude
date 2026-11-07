@@ -19,7 +19,7 @@ use super::{
     weights::{CheckedLandingEntries, activation},
 };
 use crate::{
-    ModelLoadPlan, ResourceLimits, StateResourcePlan, TargetProgramPlan,
+    ModelLoadPlan, PassLaunches, ResourceLimits, StateResourcePlan, TargetProgramPlan,
     operators::{
         block, paired_block,
         per_layer::graph::{
@@ -54,7 +54,7 @@ pub(crate) fn checked_target_family_storage(
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
 ) -> Result<CheckedGraphResources, GraphError> {
-    certify_target_family(backend, load, geometry, state, plan, limits)
+    certify_target_family(backend, load, geometry, state, plan, limits, PassLaunches::whole_chain(limits))
         .map(|certificate| certificate.resources)
 }
 
@@ -68,8 +68,9 @@ pub(crate) fn checked_target_family(
     state: &StateResourcePlan,
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
+    pass: PassLaunches,
 ) -> Result<CheckedTargetFamily, GraphError> {
-    certify_target_family(backend, load, geometry, state, plan, limits)?.checked(limits)
+    certify_target_family(backend, load, geometry, state, plan, limits, pass)?.checked(limits)
 }
 
 /// [`checked_target_family`] of `plan`'s family and of the same target's
@@ -81,8 +82,9 @@ pub(crate) fn checked_target_and_undrafted(
     state: &StateResourcePlan,
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
+    pass: PassLaunches,
 ) -> Result<[CheckedTargetFamily; 2], GraphError> {
-    let [target, undrafted] = certify_target_and_undrafted(backend, load, geometry, state, plan, limits)?;
+    let [target, undrafted] = certify_target_and_undrafted(backend, load, geometry, state, plan, limits, pass)?;
     Ok([target.checked(limits)?, undrafted.checked(limits)?])
 }
 
@@ -102,6 +104,33 @@ pub(crate) struct CheckedTargetFamily {
     /// places hold beside the floor's (`GroupRows::group_bytes`), granted
     /// when a group opens.
     pub group_bytes: u64,
+}
+
+/// The bytes the merged experts and row table of a prompt pass over `pass`
+/// launches hold: what the load forms once for every group's passes
+/// (`SplitValues::widest` over the split layers, `PreparedTargetGraphs`),
+/// so what a larger pass size (`Holding::PassRows`) adds is the difference.
+/// None without a split layer.
+pub(crate) fn pass_buffer_bytes(
+    load: &ModelLoadPlan,
+    geometry: &Decoder,
+    limits: ResourceLimits,
+    pass: PassLaunches,
+) -> Result<u64, String> {
+    let region = magnitude_batching::row_classes(limits.max_launch_rows)
+        .last()
+        .copied()
+        .ok_or_else(|| format!("target batch row bound {} has no row class", limits.max_launch_rows))?;
+    let rows = region as u64 * pass.get().min(limits.chain_capacity.get()) as u64;
+    let (mut experts, mut table) = (0u64, 0u64);
+    for index in 0..geometry.blocks.len() {
+        if let Some(routed) = block_split(load, geometry, index, limits)? {
+            let merged = crate::operators::routed::split::Merged::of(routed, geometry, rows)?;
+            experts = experts.max(super::extents_bytes([&merged.experts])?);
+            table = table.max(super::extents_bytes([&merged.table])?);
+        }
+    }
+    experts.checked_add(table).ok_or_else(|| "pass buffer bytes overflow".to_owned())
 }
 
 pub(super) struct TargetFamilyCertificate {
@@ -169,10 +198,11 @@ pub(super) fn certify_target_family(
     state: &StateResourcePlan,
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
+    pass: PassLaunches,
 ) -> Result<TargetFamilyCertificate, GraphError> {
     let outline = FamilyOutline::of(backend, load, geometry, state, plan, limits)?;
     FamilyLayouts::of_entries(backend, load, geometry, plan, &outline)?
-        .certify(outline, load, geometry, state, plan, limits)
+        .certify(outline, load, geometry, state, plan, limits, pass)
 }
 
 /// The family of `plan`, and the family of the same target without its
@@ -187,13 +217,14 @@ pub(super) fn certify_target_and_undrafted(
     state: &StateResourcePlan,
     plan: &TargetProgramPlan,
     limits: ResourceLimits,
+    pass: PassLaunches,
 ) -> Result<[TargetFamilyCertificate; 2], GraphError> {
     let outline = FamilyOutline::of(backend, load, geometry, state, plan, limits)?;
     let undrafted = outline.undrafted();
     let mut layouts = FamilyLayouts::of_entries(backend, load, geometry, plan, &outline)?;
     Ok([
-        layouts.certify(outline, load, geometry, state, plan, limits)?,
-        layouts.certify(undrafted, load, geometry, state, plan, limits)?,
+        layouts.certify(outline, load, geometry, state, plan, limits, pass)?,
+        layouts.certify(undrafted, load, geometry, state, plan, limits, pass)?,
     ])
 }
 
@@ -302,6 +333,7 @@ impl FamilyLayouts {
         state: &StateResourcePlan,
         plan: &TargetProgramPlan,
         limits: ResourceLimits,
+        pass: PassLaunches,
     ) -> Result<TargetFamilyCertificate, GraphError> {
         let backend = outline.backend;
         let FamilyOutline { ref row_classes, largest_rows, max_slots, max_segments, tap_width, ref tapped, .. } = outline;
@@ -421,8 +453,9 @@ impl FamilyLayouts {
         // Two phases: the launches' own graphs, which fix the arena the
         // group's pass must fit in (`group_pass_rows`); then the group's
         // graphs, of the pass's rows: its backs, pass and fills. Before the
-        // arena is fixed, a pass may cover the whole chain.
-        let chain = Passes { region: largest_rows, launches: limits.chain_capacity.get() };
+        // arena is fixed, a pass may cover the launches the load holds for
+        // it (`PassLaunches`), at most the chain's.
+        let chain = Passes { region: largest_rows, launches: pass.get().min(limits.chain_capacity.get()) };
         let mut blocks = vec![ShapeLayouts::new(); geometry.blocks.len()];
         for &index in &distinct_blocks {
             let shape = &outline.shapes[index];

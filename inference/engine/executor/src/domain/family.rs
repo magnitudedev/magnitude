@@ -49,14 +49,6 @@ pub trait ElasticBank {
     /// The slots each layer commits now: what its directory serves from.
     fn slots(&self) -> u64;
 
-    /// The device bytes the bank can still grow by: what a growth to its
-    /// ceiling (every expert, or what a weight cap bounds,
-    /// `ExpertBankPlan::ceiling`) backs beyond its slots now; none at it.
-    fn growth_shortfall(&self) -> Result<u64, super::DomainError>;
-
-    /// Whether the bank holds every expert.
-    fn whole(&self) -> bool;
-
     /// Starve the bank's host for `duration` from now: its pulse does not
     /// beat and no answer is written meanwhile, so a step's waits that spin
     /// then end before their answers (a test's). Whether it has a host to
@@ -114,29 +106,24 @@ pub trait ElasticBank {
     #[cfg(test)]
     fn resident_decodes(&self) -> u64;
 
-    /// Begin a shrink toward the floor, at a flight boundary, of the holding
-    /// whose bytes save the decode least of those held in storage short of
-    /// memory, by the slots (or table records, or host slots) covering that
-    /// storage's `deficit` bytes, at least one: one resize. A holding's
-    /// release lifts only the deficit of its own storage kind's domain (a
-    /// host tier's upload storage, host RAM; the rest the device's), so one
-    /// in storage with no deficit is not shrunk. Unless a resize
-    /// runs or every holding is at its floor, `between_flights`
-    /// first brings the device past every begun step (no step may run while
-    /// the watcher plans; one still running defers the shrink,
-    /// [`BankStep::Deferred`]), then the shrink's evictions are published, its
-    /// moves carried on the device in a submission of its own, its plan
-    /// committed without waiting for the moves (the device runs every later
-    /// flight after them), and its smaller storage prepared off this thread.
-    /// `wake` is completed once the preparation ends. Where the bank's
-    /// `moves` lines are measured, an experts' shrink is paced: it takes the
-    /// most slots whose moves fit one decode step, and a later boundary
-    /// takes the rest of the deficit.
+    /// Begin a shrink of `holding` toward `to` (its slots, host slots or
+    /// table records), the size the heap's settle released it to
+    /// (`ExecutorDomain::shrink_expert_bank`), at a flight boundary: one
+    /// resize. Unless a resize of its store runs or it is at `to`,
+    /// `between_flights` first brings the device past every begun step (no
+    /// step may run while the watcher plans; one still running defers the
+    /// shrink, [`BankStep::Deferred`]), then the shrink's evictions are
+    /// published, its moves carried on the device in a submission of its
+    /// own, its plan committed without waiting for the moves (the device
+    /// runs every later flight after them), and its smaller storage prepared
+    /// off this thread. `wake` is completed once the preparation ends. One
+    /// resize reaches `to`, unless a cut of the records the host lands into
+    /// falls below a record in flight, which stays in place: the cut stops
+    /// above it, and a later settle takes the rest.
     fn shrink(
         &self,
-        price: Option<&crate::assessment::DecodePrice>,
-        moves: Option<&crate::assessment::MoveLines>,
-        deficit: &dyn Fn(crate::planning::BankTier) -> u64,
+        holding: BankHolding,
+        to: u64,
         between_flights: &mut dyn FnMut() -> Result<(), super::DomainError>,
         wake: crate::CompletionWake,
     ) -> Result<BankStep, super::DomainError>;
@@ -146,22 +133,18 @@ pub trait ElasticBank {
     /// read from a record the moves did not write is ever taken.
     fn carried(&self) -> Result<(), super::DomainError>;
 
-    /// The next growth step ([`Growth`]) of the holdings in `kind` storage,
-    /// each store's own, each holding's to its target within `room` bytes,
-    /// the most the store's claim admits ([`crate::planning::growth_target`]): of a holding whose resizes
-    /// have held the submitting thread no measured time (`measured` false),
-    /// the smallest such step, which runs to measure it; else of the holding
-    /// whose priced step saves the decode most per byte. The host tier's
-    /// step, to every expert, comes first and is priced by nothing: it needs
-    /// no `price`, which every other holding's does. None once every holding is saturated, whole or
-    /// beyond the room.
-    fn growth(
-        &self,
-        price: Option<&crate::assessment::DecodePrice>,
-        measured: &dyn Fn(BankHolding) -> bool,
-        kind: crate::planning::BankTier,
-        room: u64,
-    ) -> Result<Option<Growth>, super::DomainError>;
+    /// Each holding's curve at its size now ([`BankCurve`]), every step
+    /// priced on `price`: the experts' slots and the host tier's host slots
+    /// by what the decode step saves (`DecodePrice::saving`), a table's
+    /// records by its curve's (`TableCurve::step_seconds`). A holding grows
+    /// at most to its ceiling and to where its misses stop falling, and
+    /// shrinks at most to its floor; the host tier offers nothing while its
+    /// backing to its planned slots runs. Without a `price` (before the
+    /// load measured its costs) a holding offers nothing and what it holds
+    /// saves nothing known. Each curve is priced only as far as `reach`
+    /// goes ([`Reach`]): a step's price is a decode step's model at two
+    /// sizes, and a decision that can move a few steps prices no others.
+    fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reach: Reach) -> Result<Vec<BankCurve>, super::DomainError>;
 
     /// What weighs a prompt group's places against the bank's slots
     /// (`GroupReads::grant`): the run's measured group reads and the bank's
@@ -178,20 +161,13 @@ pub trait ElasticBank {
     /// decode is priced on.
     fn streamed_layers(&self, lines: std::sync::Arc<[crate::assessment::ExpertLines]>) -> crate::assessment::StreamedLayers;
 
-    /// Begin the next growth step in `kind` storage ([`Self::growth`]'s, of
-    /// `measured` and `room`), at a flight boundary, unless a resize runs or
-    /// there is none: expert slots' and host slots' storage is backed off
-    /// this thread a slot at a time, each slot joining the bank as soon as it
-    /// is backed, beside running steps, `wake` completed once the growth
-    /// ends; table records' are backed now.
-    fn grow(
-        &self,
-        price: Option<&crate::assessment::DecodePrice>,
-        measured: &dyn Fn(BankHolding) -> bool,
-        kind: crate::planning::BankTier,
-        room: u64,
-        wake: crate::CompletionWake,
-    ) -> Result<BankStep, super::DomainError>;
+    /// Begin one growth of `holding` to `to`, the size the heap's settle
+    /// granted it ([`Self::curves`]), at a flight boundary, unless a resize
+    /// runs: expert slots' and host slots' storage is backed off this thread
+    /// a slot at a time, each slot joining the bank as soon as it is backed,
+    /// beside running steps, `wake` completed once the growth ends; table
+    /// records' are backed now.
+    fn grow(&self, holding: BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, super::DomainError>;
 
     /// What the running growth the domain began has backed so far, which Seismic charges
     /// already: its claim holds only the rest (`ExecutorDomain::refresh_memory`).
@@ -314,14 +290,31 @@ pub struct RunningBegun {
     pub moment: super::MemoryMoment,
 }
 
+/// A component a load binds beside its target that serving may release
+/// while no request is resident, and loads again at its next use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OptionalComponent {
+    /// The head that drafts.
+    Drafter,
+    /// The projector that encodes images.
+    Vision,
+}
+
+impl OptionalComponent {
+    pub const ALL: [Self; 2] = [Self::Drafter, Self::Vision];
+}
+
 /// Why the owner shrank the expert bank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ShrinkCause {
     /// Memory fell into the Reclaim band.
     Reclaim,
-    /// A live request's claim was short, or its prompt's places won the
-    /// memory from the bank's slots.
+    /// A live request's claim was short.
     LiveClaim,
+    /// A holding worth more per byte won the memory on the heap's one
+    /// price (`ExecutorDomain::settle_memory`): a prompt's places, an
+    /// optional component, or the bank's other tier.
+    Rebalance,
     /// The service's measurement job claimed room beside the model.
     Measurement,
 }
@@ -347,10 +340,12 @@ pub enum BankStep {
     Begun(crate::planning::BankTier),
     /// Another resize of the store this one is of runs: this one waits for it.
     Running,
-    /// A step still runs once the queue is drained, so there is no gap to
-    /// ask the watcher in, or every cut of the records the host lands into
-    /// falls below a record in flight, which it keeps in place: nothing
-    /// began, and the next boundary decides again.
+    /// No gap to resize in now: a chain under way holds the queue (a
+    /// shrink, which would orphan it), a step still runs once the queue is
+    /// drained, so there is no gap to ask the watcher in, or every cut of
+    /// the records the host lands into falls below a record in flight,
+    /// which it keeps in place: nothing began, and the next boundary
+    /// decides again.
     Deferred,
     /// The bank is at its floor (a shrink) or holds every expert (a growth).
     AtLimit,
@@ -388,54 +383,43 @@ impl BankResized {
     }
 }
 
-/// A holding's next growth step: from `from` to `to` (its slots, host
-/// slots or records, [`crate::planning::growth_target`]), the storage kind and bytes it
-/// backs (what the domain claims before it), and what it saves the decode
-/// the load counted, in seconds: the priced step at the holding's size less
-/// at `to` (`DecodePrice::saving` for the bank's or host tier's slots,
-/// `TableCurve::step_seconds` for a table's records), times the steps
-/// counted; none before the decode is priced.
+/// One step of a bank holding's curve: the size it takes the holding to
+/// (its slots, host slots or records), the bytes of storage it backs or
+/// releases, and what holding the larger side saves a decode step, in
+/// seconds.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Growth {
-    pub holding: BankHolding,
-    pub kind: crate::planning::BankTier,
-    pub from: u64,
+pub struct SizeStep {
     pub to: u64,
     pub bytes: u64,
-    pub saving: Option<f64>,
-    /// What a step with room enough reaches: where the load's priced decode
-    /// says the holding's misses stop falling, at most its ceiling
-    /// (`growth_target`'s bound).
-    pub justified: u64,
+    pub saves: f64,
 }
 
-/// A store's next growth step of the expert bank, and whether it pays
-/// (`ExecutorDomain::expert_bank_growths`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct GrowthOffer {
-    pub growth: Growth,
-    pub pays: bool,
-}
-
-impl GrowthOffer {
-    /// What its decision rests on: the step (its holding, store, sizes and
-    /// bytes) and whether it pays. Its saving's own value moves with every
-    /// step's record; whether it pays is what the decision reads of it.
-    pub fn decided(&self) -> GrowthDecided {
-        let Growth { holding, kind, from, to, bytes, .. } = self.growth;
-        GrowthDecided { holding, kind, from, to, bytes, pays: self.pays }
-    }
-}
-
-/// What a growth offer's decision rests on ([`GrowthOffer::decided`]).
+/// How far a decision can move a bank holding, in bytes: what it may
+/// release of what each holds (`held`, beyond which the bank adds what its
+/// own holdings offer, which they may take from each other by exchange) and
+/// grant beyond it (`offered`). A curve ([`BankCurve`]) steps each way until
+/// its steps' bytes reach that far, the step that crosses it included, so a
+/// settle sees every step it could move and the run each joins as far as
+/// room allows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GrowthDecided {
-    holding: BankHolding,
-    kind: crate::planning::BankTier,
-    from: u64,
-    to: u64,
-    bytes: u64,
-    pays: bool,
+pub struct Reach {
+    pub held: u64,
+    pub offered: u64,
+}
+
+/// A bank holding's curve at its size now (`at`), in the storage it lies in
+/// (`kind`): the steps it may release, the nearest first, each to the next
+/// size that releases storage, down to its floor; and the steps it may
+/// take, the nearest first, each to the next size that backs more, up to
+/// what its misses justify. The heap values each at the load's decode
+/// steps a second ([`super::value`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BankCurve {
+    pub holding: BankHolding,
+    pub kind: crate::planning::BankTier,
+    pub at: u64,
+    pub held: Vec<SizeStep>,
+    pub offered: Vec<SizeStep>,
 }
 
 /// What an elastic bank's owner resizes: its experts' slots, the records
@@ -506,7 +490,9 @@ pub trait ProgramFamily: 'static {
     fn head_is_bound(&self) -> bool;
     fn vision_is_bound(&self) -> bool;
     fn state_is_bound(&self) -> bool;
-    fn unbind_optional(&mut self);
+    /// Unbind `component`: released while idle, or its class's storage
+    /// was refused.
+    fn unbind_optional(&mut self, component: OptionalComponent);
     /// What the load's graphs cost serving so far: graphs recorded and
     /// replays that updated a graph's parameters, of its own plans alone
     /// beside other loads on the device (`seismic::Device::graph_replays`).
@@ -559,9 +545,6 @@ pub trait ProgramFamily: 'static {
     fn hold_bound_head(&self, _places: usize) -> Result<(), String> {
         Ok(())
     }
-
-    /// Unbind the head alone: its class's storage was refused.
-    fn unbind_head(&mut self) {}
 
     /// The load's elastic expert bank; none for a load whose experts are
     /// held whole.
@@ -810,15 +793,14 @@ impl ProgramFamily for NativeFamily {
         self.head_tables.iter().try_for_each(|table| table.hold_places(places))
     }
 
-    fn unbind_head(&mut self) {
-        self.head = None;
-        self.head_tables.clear();
-    }
-
-    fn unbind_optional(&mut self) {
-        self.head = None;
-        self.head_tables.clear();
-        self.vision = None;
+    fn unbind_optional(&mut self, component: OptionalComponent) {
+        match component {
+            OptionalComponent::Drafter => {
+                self.head = None;
+                self.head_tables.clear();
+            }
+            OptionalComponent::Vision => self.vision = None,
+        }
     }
 
     fn target_weight_bytes(&self) -> Result<u64, &'static str> {

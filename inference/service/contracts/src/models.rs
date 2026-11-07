@@ -964,6 +964,9 @@ pub enum StreamingShrinkCause {
     Reclaim,
     /// A live request's claim needed the memory.
     LiveClaim,
+    /// Something worth more to serving than the holding's slots took the
+    /// memory.
+    Rebalance,
     /// The service's measurement of this machine needed room beside the
     /// model while it was idle.
     Measurement,

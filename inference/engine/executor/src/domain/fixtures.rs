@@ -456,10 +456,20 @@ pub struct FakeDecode {
 /// none, beside the generic model counted as one step. Reads take 0.4 ms and 0.5 ms a MB ([`READ`]); an
 /// all-hit step 15 ms.
 pub fn misses_at(depth: usize, steps: u64) -> FakeDecode {
+    misses_by(steps, &[(depth, 4)])
+}
+
+/// [`misses_at`] with each step's reads spread over the stack: `reads` of
+/// each `(depth, reads)`, which a bank of `depth` slots misses and one of
+/// `depth + 1` hits. The misses stop falling past the deepest.
+pub fn misses_by(steps: u64, reads: &[(usize, u64)]) -> FakeDecode {
     let mut misses = [0; 5];
     let mut requests = [0; 5];
-    misses[depth] = steps * 4;
-    requests[depth] = steps;
+    for &(depth, count) in reads {
+        misses[depth] = steps * count;
+        requests[depth] = steps;
+    }
+    let depth = reads.iter().map(|&(depth, _)| depth).max().expect("a decode reads");
     FakeDecode {
         live: crate::assessment::LiveDecode {
             layers: vec![crate::assessment::LayerReads::of_depths(&misses, &requests)],
@@ -470,6 +480,13 @@ pub fn misses_at(depth: usize, steps: u64) -> FakeDecode {
         saturation: depth as u64 + 1,
     }
 }
+
+/// What a host slot of the fake bank saves a decode step, in seconds: its
+/// one streamed layer prices no tier read apart from a file read, so the
+/// fake gives each slot, a byte of upload storage, an attosecond: a holding
+/// that saves something, less per byte than any slot of device storage
+/// whose saving the price counts.
+pub const HOST_SLOT_SAVES: f64 = 1e-18;
 
 /// The fake decode's read line: 0.4 ms and 0.5 ms a MB.
 pub const READ: crate::assessment::ReadLine = match crate::assessment::ReadLine::new(4e-4, 1. / 2e9) {
@@ -504,15 +521,102 @@ pub fn shrink_settled<F: ProgramFamily>(
 /// steps' time.
 pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings, decode: FakeDecode) {
     count_decode(domain, decode);
-    domain.measure_experts(crate::ExpertMeasures {
+    measure_load(domain, bindings);
+}
+
+/// What a fixture's prompt group's submission costs beyond a chained
+/// launch: 50 µs, a host round trip's order.
+pub const SUBMISSION: f64 = 50e-6;
+
+/// The load measured its costs: a step of 15 ms in either form at every
+/// depth, a banked load's all-hit steps' time, and each prompt group's
+/// submission [`SUBMISSION`]; a banked load's experts on the fixtures' read
+/// line, its decode priced on whatever the fake bank counted, the generic
+/// model alone before any.
+pub fn measure_load(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings) {
+    let experts = domain.family.bank.is_some().then(|| crate::ExpertMeasures {
         lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
         read: crate::assessment::Priced::Measured(READ),
-        resident: crate::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
         pass: crate::assessment::Priced::Pending("unpriced".into()),
         moves: crate::assessment::Priced::Pending("unmeasured".into()),
         tier_copy: crate::assessment::Priced::Measured(None),
         convert: crate::assessment::Priced::Measured(None),
-    }, bindings).unwrap();
+    });
+    domain.measure_load(crate::LoadMeasures { costs: Ok(load_costs()), experts }, bindings).unwrap();
+}
+
+/// A fixture's costs: a step of 15 ms in either form at every depth, and
+/// each prompt group's submission [`SUBMISSION`].
+pub fn load_costs() -> crate::LoadCosts {
+    crate::LoadCosts {
+        step: Box::new(|_, _| Ok(crate::assessment::FormSeconds { resident: 0.015, streamed: 0.015 })),
+        submission: SUBMISSION,
+    }
+}
+
+/// A domain launching one-row prompt chunks in chains of up to three on
+/// the device `device_request` selects, its device's store read with a
+/// gigabyte of room ([`with_room`]): a load whose prompt groups take their
+/// places by their price once it is priced.
+pub fn chained(device_request: platform::DeviceRequest) -> Fixture {
+    let (mut domain, bindings) = fixture_of(tiny_definition(), limits(2, 3, false), None, false, device_request);
+    with_room(&mut domain, 1 << 30);
+    (domain, bindings)
+}
+
+/// A reading of `domain`'s device store with `room` bytes of headroom, in
+/// the Normal band, the host seen taking nothing.
+pub fn with_room<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, room: u64) {
+    let store = domain.domain.device().device_store();
+    domain.pace.borrow_mut().domains.insert(store, DomainPace {
+        role: DomainRole::Allocation,
+        headroom: room,
+        thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
+        charged: 0,
+        band: MemoryBand::Normal,
+        unseen: 0,
+        witness: None,
+        available: 0,
+        base: (std::time::Instant::now(), 0),
+        rate: 0.0,
+        fastest: 0.0,
+        fluctuation: Fluctuation::default(),
+        host: false,
+        grant_left: None,
+        borrowable: None,
+        takes: 0,
+        first: std::time::Instant::now(),
+    });
+}
+
+/// The places a prompt group of four one-row chunks opened on `fixture`
+/// holds, its first chunk submitted with the rest planned behind it.
+pub fn group_places_opened<F: ProgramFamily>((mut domain, mut bindings): (ExecutorDomain<F>, StateBindings)) -> usize {
+    let request = RequestId(80);
+    let chunk = |position: usize| Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        tokens: vec![crate::TokenId(1)],
+        position,
+        conditioning: None,
+        demand: crate::batching::Demand::NONE,
+        select: Vec::new(),
+        committed: 1,
+        prime: None,
+    };
+    domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+    assert!(domain.open_state(&mut bindings, request, None).unwrap().is_empty());
+    domain.plan_successors((1..4).map(chunk).collect());
+    let operations = vec![chunk(0)];
+    let ReservedResources::Target(reservation) = domain.reserve(&mut bindings, &operations).unwrap().into_resources() else {
+        panic!("a prompt chunk reserves a target group")
+    };
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("target submission failed: {}", failure.error()));
+    let places = domain.group_places().get();
+    domain.finish_target(flight).unwrap();
+    places
 }
 
 /// The bytes of a row of `domain`'s fake bank ([`banked`]).
@@ -751,12 +855,6 @@ pub struct FakeBank {
     /// Its charge's rises: none off the domain's thread, so held by none
     /// but the domain.
     rises: std::sync::Mutex<()>,
-    /// The device bytes it can still grow by to its ceiling
-    /// ([`ElasticBank::growth_shortfall`]), a test's: none unless set.
-    pub(crate) shortfall: u64,
-    /// Whether it holds every expert ([`ElasticBank::whole`]), a test's:
-    /// whole unless set; a fake at a weight cap's ceiling is not.
-    pub(crate) whole: bool,
     /// Whether its device refuses a tier copy's grid, a test's: it takes
     /// one unless set.
     pub(crate) refuse_tier_copy: bool,
@@ -794,8 +892,6 @@ impl FakeBank {
             last_resize: std::sync::Mutex::new(None),
             host_last_resize: std::sync::Mutex::new(None),
             rises: std::sync::Mutex::new(()),
-            shortfall: 0,
-            whole: true,
             refuse_tier_copy: false,
             tier_copy: std::sync::Mutex::new(None),
         }
@@ -859,16 +955,6 @@ impl ElasticBank for FakeBank {
         self.rises.lock().expect("the fake bank's charge rises")
     }
 
-    /// What the test set ([`FakeBank::shortfall`]): its growth is the
-    /// test's.
-    fn growth_shortfall(&self) -> Result<u64, DomainError> {
-        Ok(self.shortfall)
-    }
-
-    fn whole(&self) -> bool {
-        self.whole
-    }
-
     /// The fake's tier is filled as it opens.
     fn wait_tier_filled(&self) -> Result<(), DomainError> {
         Ok(())
@@ -930,73 +1016,62 @@ impl ElasticBank for FakeBank {
 
     fn price(&self, _lines: Option<std::sync::Arc<[crate::assessment::ExpertLines]>>, _pass: Option<crate::assessment::ExpertPass>) {}
 
+    /// Its slots shrink to `to`, at least one; its host tier releases
+    /// nothing.
     fn shrink(
         &self,
-        _price: Option<&crate::assessment::DecodePrice>,
-        _moves: Option<&crate::assessment::MoveLines>,
-        _deficit: &dyn Fn(crate::planning::BankTier) -> u64,
+        holding: crate::BankHolding,
+        to: u64,
         between_flights: &mut dyn FnMut() -> Result<(), DomainError>,
         wake: crate::CompletionWake,
     ) -> Result<BankStep, DomainError> {
         if self.running() {
             return Ok(BankStep::Running);
         }
-        if self.slots() <= 1 {
+        let to = to.max(1);
+        if holding != crate::BankHolding::Experts || to >= self.slots() {
             return Ok(BankStep::AtLimit);
         }
         between_flights()?;
         if !self.in_gap() {
             return Ok(BankStep::Deferred);
         }
-        self.begin(self.slots() - 1, wake)
+        self.begin(to, wake)
     }
 
     fn carried(&self) -> Result<(), DomainError> {
         Ok(())
     }
 
-    /// Device slots, rows of the bank's tensor, to the target within `room`
-    /// up to where its decode's misses stop falling (`growth_target`), each
-    /// saving what as many slots more of the bank save; or host slots, a
-    /// byte of upload storage each, toward the tier's ceiling within `room`,
-    /// priced by nothing, as `ServedBank::growth` steps them.
-    fn growth(
-        &self,
-        price: Option<&crate::assessment::DecodePrice>,
-        _measured: &dyn Fn(crate::BankHolding) -> bool,
-        kind: crate::planning::BankTier,
-        room: u64,
-    ) -> Result<Option<crate::Growth>, DomainError> {
-        let slots = self.slots();
-        let step = |from, bound, unit: u64| {
-            let to = crate::planning::growth_target(from, bound, room, |to| Ok::<_, ()>((to - from) * unit)).unwrap()?;
-            Some((from, to, (to - from) * unit))
-        };
-        if kind != crate::planning::BankTier::Bank {
-            let (holding, bound) = (crate::BankHolding::Host, self.host_ceiling);
-            let host = self.host.load(std::sync::atomic::Ordering::Relaxed);
-            return Ok(step(host, bound, 1)
-                .map(|(from, to, bytes)| crate::Growth { holding, kind, from, to, bytes, saving: None, justified: bound }));
-        }
-        let (Some(decode), Some(price)) = (&self.decode, price) else {
-            return Ok(None);
-        };
+    /// Device slots, rows of the bank's tensor, a row a step down to one
+    /// and up to where its decode's misses stop falling (every row before
+    /// it counted one), each saving what the price says a slot more saves;
+    /// and host slots, a byte of upload storage each, up to the tier's
+    /// ceiling, each saving [`HOST_SLOT_SAVES`], as `ServedBank::curves`
+    /// steps them, each as far as `reach` goes.
+    fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reach: crate::Reach) -> Result<Vec<crate::BankCurve>, DomainError> {
+        use crate::SizeStep;
         let rows = self.tensor.extents()[0];
-        let bound = rows.min(decode.saturation);
-        // A step's saving over the decode, as `ServedBank::growth` prices it.
-        let held = crate::assessment::HeldSlots::bank(slots as usize);
-        Ok(step(slots, bound, self.tensor.byte_len() / rows).map(|(from, to, bytes)| {
-            let above = crate::assessment::HeldSlots::bank((slots + to - from) as usize);
-            crate::Growth {
-                holding: crate::BankHolding::Experts,
-                kind,
-                from,
-                to,
-                bytes,
-                saving: Some(price.saving(held, above) * price.steps() as f64),
-                justified: bound,
-            }
-        }))
+        let unit = self.tensor.byte_len() / rows;
+        let at = self.slots();
+        let bound = match price {
+            Some(_) => self.decode.as_ref().map_or(rows, |decode| rows.min(decode.saturation)).max(at),
+            None => at,
+        };
+        let step = |slots: u64| price.map_or(0., |price| price.step(crate::assessment::HeldSlots::bank(slots as usize)).total_seconds);
+        // Steps of `unit` bytes each, until they reach `bytes`.
+        let within = |bytes: u64| bytes.div_ceil(unit.max(1)) as usize;
+        let held = (1..at).rev().take(within(reach.held)).map(|to| SizeStep { to, bytes: unit, saves: step(to) - step(to + 1) }).collect();
+        let offered = (at + 1..=bound).take(within(reach.offered)).map(|to| SizeStep { to, bytes: unit, saves: step(to - 1) - step(to) }).collect();
+        let (bank, host) = (crate::planning::BankTier::Bank, crate::planning::BankTier::Host);
+        let mut curves = vec![crate::BankCurve { holding: crate::BankHolding::Experts, kind: bank, at, held, offered }];
+        if self.host_ceiling > 0 {
+            let at = self.host.load(std::sync::atomic::Ordering::Relaxed);
+            let bound = price.map_or(at, |_| self.host_ceiling.max(at));
+            let offered = (at + 1..=bound).take(reach.offered as usize).map(|to| SizeStep { to, bytes: 1, saves: HOST_SLOT_SAVES }).collect();
+            curves.push(crate::BankCurve { holding: crate::BankHolding::Host, kind: host, at, held: vec![], offered });
+        }
+        Ok(curves)
     }
 
     fn group_reads(
@@ -1015,21 +1090,11 @@ impl ElasticBank for FakeBank {
         crate::assessment::StreamedLayers::new(vec![4], 4, std::sync::Arc::from([crate::assessment::ExpertLines::reference(1_000_000)]))
     }
 
-    fn grow(
-        &self,
-        price: Option<&crate::assessment::DecodePrice>,
-        measured: &dyn Fn(crate::BankHolding) -> bool,
-        kind: crate::planning::BankTier,
-        room: u64,
-        wake: crate::CompletionWake,
-    ) -> Result<BankStep, DomainError> {
+    fn grow(&self, holding: crate::BankHolding, to: u64, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
         if self.running() {
             return Ok(BankStep::Running);
         }
-        let Some(crate::Growth { to, .. }) = self.growth(price, measured, kind, room)? else {
-            return Ok(BankStep::AtLimit);
-        };
-        if kind == crate::planning::BankTier::Host {
+        if holding == crate::BankHolding::Host {
             let from = self.host.load(std::sync::atomic::Ordering::Relaxed);
             self.host.store(to, std::sync::atomic::Ordering::Relaxed);
             let now = std::time::Instant::now();
@@ -1211,7 +1276,7 @@ impl ProgramFamily for TestFamily {
     fn state_is_bound(&self) -> bool {
         true
     }
-    fn unbind_optional(&mut self) {}
+    fn unbind_optional(&mut self, _: super::OptionalComponent) {}
 
     fn target_weight_bytes(&self) -> Result<u64, &'static str> {
         self.bank.as_ref().map_or(Ok(0), |bank| {

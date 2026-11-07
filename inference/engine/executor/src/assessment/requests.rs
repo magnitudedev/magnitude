@@ -9,11 +9,14 @@
 //!   as it is next read ([`PointRequests::outstanding`]).
 //! - **Assessment's standing requests** ([`standing`]): the figures every
 //!   estimate is made from, fixed per backend and of no model: what its
-//!   graphs hold ([`PointRequest::GraphCost`]), the model store's read line ([`PointRequest::Storage`]), the host memory's line
-//!   and a CPU site's lines at its reference form ([`PointRequest::CpuSite`])
-//!   where a bank can have a host tier ([`PointRequest::HostMemory`]), the
+//!   graphs hold ([`PointRequest::GraphCost`]), the executor's costs
+//!   ([`PointRequest::Costs`]), whose required figures every load waits on,
+//!   then the model store's read line ([`PointRequest::Storage`]), the
 //!   device's convert at its reference form ([`PointRequest::Convert`]), and
-//!   the executor's costs ([`PointRequest::Costs`]). They are measured first,
+//!   the host memory's line ([`PointRequest::HostMemory`]) and a CPU site's
+//!   lines at its reference form ([`PointRequest::CpuSite`]) where a bank can
+//!   have a host tier, which a streamed load's bank is priced by, then the
+//!   rest of the walk. They are measured first,
 //!   whatever a load asks, so one job's time is allocated across them alone
 //!   and no load moves them later or earlier.
 //! - **Who waits** ([`Waiter`]): a load serving with a runtime decision
@@ -28,7 +31,7 @@
 //!   is left, and stops where its time ends: the next job resumes from the
 //!   records stored. No load measures, and no load waits on the job.
 
-use super::executor_costs::{executor_identity, walk_points, ExecutorCostsError, Measurement, Visit, Walks};
+use super::executor_costs::{executor_identity, walk_points, CostWalk, ExecutorCostsError, Measurement, Visit, Walks};
 use super::streaming_costs::{CpuCosts, CpuForm, CeilingError, ConvertCosts, ConvertForm, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, StorageCosts, TierCopyCosts, TierCopyError, GraphMemory, StoredVolume, VolumeCosts};
 use super::Priced;
 use crate::native::SiteForm;
@@ -52,9 +55,9 @@ pub enum PointRequest {
     /// (`CpuForm::reference`) where a bank can have a host tier, every
     /// streamed estimate's sited misses.
     CpuSite(CpuForm),
-    /// The executor's whole cost walk (`ExecutorCosts`): a standing
-    /// request, every estimate's input.
-    Costs,
+    /// The executor's cost walk (`ExecutorCosts`), to its required figures
+    /// or whole ([`CostWalk`]): standing requests, every estimate's input.
+    Costs(CostWalk),
     /// The read line of the volume `directory` lies on (`StorageCosts`): a
     /// standing request, every streamed estimate's file reads.
     Storage { directory: std::path::PathBuf },
@@ -86,13 +89,13 @@ impl PointRequest {
     /// A request whose records cannot be derived from otherwise (a walk's
     /// probe recorded unobtainable, a point recorded so, a store that cannot
     /// be read) has none: the job's measuring ends there as the derivation
-    /// does. The costs' is `costs_outstanding`, whether the walk of the
-    /// executor's costs ([`super::ExecutorCosts::stored`]), which its caller
-    /// walks once for whatever else it reads of them, has a point no record
-    /// holds.
-    pub fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>, costs_outstanding: bool) -> bool {
+    /// does. The costs' follows `costs_outstanding`, the first part of the
+    /// walk of the executor's costs ([`super::ExecutorCosts::stored`]) with a
+    /// point no record holds ([`super::StoredCosts::outstanding`]), which its
+    /// caller walks once for whatever else it reads of them.
+    pub fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>, costs_outstanding: Option<CostWalk>) -> bool {
         match self {
-            Self::Costs => costs_outstanding,
+            Self::Costs(part) => costs_outstanding.is_some_and(|first| first <= *part),
             Self::Storage { directory } => StorageCosts::outstanding(topology, executor, directory, store),
             Self::Moves(form) => {
                 matches!(MoveCosts::stored(topology, executor, *form, store), Err(MoveError::Unrecorded { .. }))
@@ -117,7 +120,7 @@ impl PointRequest {
     /// The points the job visits for it.
     fn points(&self, topology: &DeviceTopology, executor: &Executor) -> Result<usize, ExecutorCostsError> {
         match self {
-            Self::Costs => walk_points(topology, executor),
+            Self::Costs(part) => walk_points(topology, executor, *part),
             // Two points each: a line's ends, or a site's admission and its
             // pool's lines.
             Self::Storage { .. } | Self::Moves(_) | Self::Convert(_) | Self::HostMemory { .. } | Self::TierCopy | Self::Site(_) => Ok(2),
@@ -135,7 +138,7 @@ impl PointRequest {
     /// not be read outside its points' timings.
     fn measure(&self, walks: &mut Walks<'_, '_>) -> (Option<ExecutorCostsError>, Vec<ExecutorCostsError>) {
         match self {
-            Self::Costs => walks.walk(),
+            Self::Costs(part) => walks.walk(*part),
             Self::Storage { directory } => (StorageCosts::measure(directory, walks).err().map(|error| ExecutorCostsError(error.to_string())), Vec::new()),
             Self::Moves(form) => (form.measure(walks).err(), Vec::new()),
             Self::Convert(form) => (form.measure(walks).err(), Vec::new()),
@@ -247,20 +250,23 @@ impl SiteRequest {
     }
 }
 
-/// Whether the walk has a point no record holds.
+/// The first part of the walk with a point no record holds.
 #[cfg(test)]
-fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> bool {
-    super::executor_costs::retraced(topology, executor, store).is_ok_and(|stored| stored.outstanding())
+fn walk_outstanding(topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> Option<CostWalk> {
+    super::executor_costs::retraced(topology, executor, store).ok().and_then(|stored| stored.outstanding())
 }
 
 /// Assessment's standing requests on `executor`, in the order the job
 /// measures them: what its graphs hold, which its device read as it opened;
-/// the read line of the volume the model store `storage`
-/// lies on, the host memory's line with every CPU reading and a CPU site's
-/// lines at its reference form where a bank can have a host tier (a
-/// discrete device), the device's convert at its reference form, and the
-/// executor's costs. Each is
-/// of the machine alone, so what is measured is fixed per backend.
+/// the cost walk's required figures, which every load plans and serves on
+/// and waits for once per machine, so nothing is measured ahead of them;
+/// then what a streamed load's bank is priced by, each the first job
+/// reaches: the read line of the volume the model store `storage` lies on,
+/// the device's convert at its reference form, and the host memory's line
+/// with every CPU reading and a CPU site's lines at its reference form
+/// where a bank can have a host tier (a discrete device); then the rest of
+/// the walk, whose figures are priced closer without it. Each is of the
+/// machine alone, so what is measured is fixed per backend.
 pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) -> Result<Vec<PointRequest>, String> {
     let tiered = !topology.shared_ranges_lie_in_device_memory(executor);
     let memory = tiered
@@ -272,12 +278,12 @@ pub fn standing(topology: &DeviceTopology, executor: &Executor, storage: &Path) 
         false => None,
     };
     let convert = ConvertForm::reference(executor.backend()).map_err(|error| error.to_string())?;
-    Ok([PointRequest::GraphCost, PointRequest::Storage { directory: storage.to_owned() }]
+    Ok([PointRequest::GraphCost, PointRequest::Costs(CostWalk::Required), PointRequest::Storage { directory: storage.to_owned() }]
         .into_iter()
+        .chain(convert.map(PointRequest::Convert))
         .chain(memory)
         .chain(site.map(PointRequest::CpuSite))
-        .chain(convert.map(PointRequest::Convert))
-        .chain([PointRequest::Costs])
+        .chain([PointRequest::Costs(CostWalk::Whole)])
         .collect())
 }
 
@@ -374,7 +380,7 @@ impl PointRequests {
         executor: &Executor,
         storage: &Path,
         store: &dyn RecordStore<PointKey>,
-        costs_outstanding: bool,
+        costs_outstanding: Option<CostWalk>,
     ) -> Result<Vec<PointRequest>, String> {
         let identity = executor_identity(topology, executor).map_err(|error| error.to_string())?;
         let mut requests = standing(topology, executor, storage)?;
@@ -514,10 +520,10 @@ mod tests {
     }
 
     /// Assessment's standing requests are always waited on, and are of the
-    /// machine alone: with no load's request, the model store's read line,
-    /// then the host memory's line and the reference CPU site where a bank
-    /// can have a host tier, the reference convert where a device streams,
-    /// then the costs, while none is measured.
+    /// machine alone: with no load's request, the costs, then the reference
+    /// convert where a device streams, the model store's read line, and the
+    /// host memory's line and the reference CPU site where a bank can have a
+    /// host tier, while none is measured.
     #[test]
     fn the_standing_requests_are_the_machines() {
         let root = std::env::temp_dir().join(format!("point-requests-standing-{}", std::process::id()));
@@ -526,8 +532,8 @@ mod tests {
         let records = seismic::measure::HeldStore::default();
         let costs = walk_outstanding(&topology, &executor, &records);
         let outstanding = PointRequests::new(&root).outstanding(&topology, &executor, &storage, &records, costs).unwrap();
-        assert_eq!(outstanding.first(), Some(&PointRequest::Storage { directory: storage.clone() }));
-        assert_eq!(outstanding.last(), Some(&PointRequest::Costs));
+        assert_eq!(outstanding.first(), Some(&PointRequest::Costs(CostWalk::Required)));
+        assert!(outstanding.contains(&PointRequest::Storage { directory: storage.clone() }));
         let measured = standing(&topology, &executor, &storage).unwrap().into_iter().filter(|request| request.outstanding(&topology, &executor, &records, costs)).collect::<Vec<_>>();
         assert_eq!(outstanding, measured);
         // A device that streams measures every streamed estimate's landing:

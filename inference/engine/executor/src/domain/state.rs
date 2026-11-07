@@ -1,7 +1,6 @@
 //! state lifecycle for the executor domain.
 
 use super::*;
-use crate::assessment::{DecodeWaiting, Places};
 use crate::memory::{ClaimId, HoldingClass};
 use super::borrowing::Room;
 use crate::planning::graph_demand;
@@ -31,21 +30,6 @@ fn beside_bank_bytes(topology: &seismic::DeviceTopology, executor: &seismic::Exe
     Ok(bytes)
 }
 
-
-/// What a prompt's places are worth beyond what memory gave its group
-/// (`ExecutorDomain::grant_group`): `places` for `request`'s chunks in hand,
-/// and the slots the bank shrinks to for their bytes, at flight boundaries
-/// (`ExecutorDomain::places_shrink`). Its memory lands in a later group's
-/// room, so a later group of the request takes it rather than weighing
-/// again on a reading that may not show it yet. It holds until a group of
-/// the request holds those places or no more is in hand, or the request is
-/// released or closes; while it holds, the bank grows nothing.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct PlacesWant {
-    pub(super) request: RequestId,
-    pub(super) places: usize,
-    pub(super) slots: u64,
-}
 
 /// Where the room the service's measurement job claims beside the model
 /// stands at the latest probe (`ExecutorDomain::measurement_room`).
@@ -299,15 +283,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.head_store.as_ref().map(|store| store.compactions()),
         )
     }
-    /// Release bound optional components after the owner has drained all
-    /// requests; the queued steps, which draft with them, are orphaned
+    /// Whether no request is resident: only then may the optional
+    /// components, which its steps draft and encode with, be released.
+    pub(super) fn optional_idle(&self) -> bool {
+        self.target.is_empty() && self.head.is_empty() && self.input.is_empty()
+    }
+
+    /// Release the bound optional `components` after the owner has drained
+    /// all requests; the queued steps, which draft with them, are orphaned
     /// first. The measured ledger delta is the only released-byte credit;
     /// shared target tensors remain cached by the head loader.
     pub fn release_idle_optional_components(
         &mut self,
         bindings: &mut StateBindings,
+        components: &[super::OptionalComponent],
     ) -> Result<u64, String> {
-        if !self.target.is_empty() || !self.head.is_empty() || !self.input.is_empty() {
+        if !self.optional_idle() || components.is_empty() {
             return Ok(0);
         }
         self.orphan_queue(bindings)
@@ -317,12 +308,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .device()
             .device_ledger()
             .charged;
-        self.family.unbind_optional();
-        if let Some(loader) = &self.head_loader {
-            loader.unload();
-        }
-        if let Some(loader) = &self.vision_loader {
-            loader.unload();
+        for &component in components {
+            self.family.unbind_optional(component);
+            match component {
+                super::OptionalComponent::Drafter => self.head_loader.as_ref().map(|loader| loader.unload()),
+                super::OptionalComponent::Vision => self.vision_loader.as_ref().map(|loader| loader.unload()),
+            };
         }
         self.refresh_memory().map_err(|error| error.to_string())?;
         let after = self
@@ -871,7 +862,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let claim = match self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live) {
             Ok(claim) => claim,
             Err(refusal) => {
-                self.family.unbind_head();
+                self.family.unbind_optional(super::OptionalComponent::Drafter);
                 return Err(refusal.into());
             }
         };
@@ -879,7 +870,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.release_claim(claim);
         self.refresh_memory()?;
         held.map_err(|error| {
-            self.family.unbind_head();
+            self.family.unbind_optional(super::OptionalComponent::Drafter);
             DomainError::invariant(error)
         })
     }
@@ -1017,140 +1008,95 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Grant the prompt group opening with `operations` its class: the
     /// places of every graph slot its chain's launches take (`behind`, which
-    /// runs at most that many). The places its request's chunks in hand
-    /// (the group's planned chunks, within the load's chain capacity) are
-    /// worth ([`Self::weigh_places`]), or the most fewer whose class fits:
-    /// below what opportunistic growth may take now (`Places::admitted`, of
-    /// [`Self::opportunistic_room`]) and granted by the heap beside the
-    /// workload's unborn state, which refuses every growth in Reclaim. The
-    /// class held already serves any smaller one, and nothing shrinks here:
-    /// places worth the bank's memory leave a want its shrink serves
-    /// (`PlacesWant`). The one decision of a group's places; its pools'
-    /// slots and buffers are held together or not at all. A class's bytes
-    /// are its group buffers, its places' bank words, its pools' slots and
-    /// the graphs each slot makes as it is allocated, priced by the
-    /// device's graph cost beyond its budget (`graph_demand`).
+    /// runs at most that many). Its request's chunks in hand (the group's
+    /// planned chunks, within the load's chain capacity) offer their places
+    /// to the memory heap ([`Self::places_curve`]), settled beside the
+    /// bank's slots (`settle_places`): it holds the places the settle grants
+    /// that room admits now (`Places::admitted` of
+    /// [`Self::opportunistic_room`]), granted by the heap beside the
+    /// workload's unborn state, which refuses every growth in Reclaim. What
+    /// the settle grants beyond that is the bank's slots' memory, which the
+    /// owner's next settle shrinks the bank for. The class held already
+    /// serves any smaller one, and nothing shrinks here. The one decision of
+    /// a group's places; its pools' slots and buffers are held together or
+    /// not at all. A class's bytes are its group buffers, its places' bank
+    /// words, its pools' slots and the graphs each slot makes as it is
+    /// allocated, priced by the device's graph cost beyond its budget
+    /// (`graph_demand`).
     pub(super) fn grant_group(&mut self, operations: &[Operation]) -> Result<(), DomainError> {
-        self.retire_places_want(operations);
         let capacity = self.chain_capacity().get();
-        let (request, chunks) = match (operations, self.behind_within(operations, capacity)) {
-            ([operation], super::queue::Behind::Chain { chunks }) => {
-                // `behind_within` holds a chain within `capacity` launches.
-                (operation.request(), chunks.len() + 1)
-            }
+        let chunks = match (operations, self.behind_within(operations, capacity)) {
+            // `behind_within` holds a chain within `capacity` launches.
+            ([_], super::queue::Behind::Chain { chunks }) => chunks.len() + 1,
             _ => return Ok(()),
         };
         let floor = self.resources.group_places();
         let held = floor.get();
         let limits = self.execution.policy().limits();
         let (room, unborn) = self.opportunistic_room(seismic::Contract::DeviceOnly);
-        // The class room the plan left the chain's places beside the bank
-        // (`Self::refresh_unheld_class`) is theirs: the bank's committed
-        // growth leaves it free, and its borrowed growth into it the grant
-        // takes back. Beyond it, what the bank can still grow by is not the
-        // places' to take: a bank grows to its ceiling (every expert, or a
-        // weight cap's bound) before places grow into its room, and no
-        // further.
-        let shortfall = self.family.expert_bank().map(|bank| bank.growth_shortfall()).transpose()?.unwrap_or(0);
-        let theirs = self.unheld_class;
-        let room = room.map(|(room, margin)| {
-            let reserved = room.min(theirs);
-            (reserved + (room - reserved).saturating_sub(shortfall), margin)
-        });
         let wait = self.pace.borrow().wait_bound();
-        // The bytes of a class of each count of places from those held.
+        let (demands, bytes) = self.class_bytes(held, chunks)?;
+        let settled = self.settle_places(&bytes)?;
+        // What room admits now of what the settle granted.
+        let room = room.map_or(u64::MAX, |(room, _)| room);
+        let admitted = (held..)
+            .zip(&bytes)
+            .take_while(|&(places, &bytes)| places <= settled && (places == held || bytes < room))
+            .last()
+            .map_or(held, |(places, _)| places);
+        let counts = demands.iter().copied().zip(bytes.iter().copied()).enumerate()
+            .take(admitted.saturating_sub(held).saturating_add(1));
+        for (more, (demand, bytes)) in counts.skip(1).rev() {
+            let grown = floor.saturating_add(more);
+            let places = grown.get();
+            let claim = match self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live) {
+                Ok(claim) => claim,
+                Err(ClaimRefusal::Deficit { .. }) => continue,
+                // Nothing grows in Reclaim, nor blind.
+                Err(ClaimRefusal::Reclaim(_) | ClaimRefusal::Blind(_)) => return Ok(()),
+                Err(refusal) => return Err(refusal.into()),
+            };
+            // The pools' slots, then the buffers, each keeping what was
+            // held on a failure; the class is held only once both are.
+            let held = self
+                .resources
+                .grow_class(grown, limits.class_slots(places))
+                .and_then(|grown| self.family.hold_group(places).map(|()| grown))
+                .map(|grown| self.resources.hold_class(grown));
+            self.release_claim(claim);
+            if held.is_ok() {
+                let wait = wait.map_or("none".to_owned(), |wait| format!("{wait:.1} s"));
+                tracing::info!("prompt groups hold {places} places, {bytes} bytes more; wait bound {wait}");
+            }
+            self.refresh_memory()?;
+            return match held.map_err(|error| match error {
+                crate::resources::AllocationError::Tensor(error)
+                | crate::resources::AllocationError::Workflow(seismic::WorkflowError::TensorView(error)) => {
+                    growth_failure(error, bytes, "prompt group class")
+                }
+                error => DomainError::invariant(error.to_string()),
+            }) {
+                // The device refused the bytes: the class held serves.
+                Err(DomainError::Capacity(_)) => Ok(()),
+                held => held,
+            };
+        }
+        Ok(())
+    }
+
+    /// What growing the prompt-group class from `held` places to each count
+    /// up to `chunks` claims ([`Self::class_demand`]), and its bytes in the
+    /// bank's device store, `bytes[p − held]` for `p` places.
+    pub(super) fn class_bytes(&mut self, held: usize, chunks: usize) -> Result<(Vec<crate::memory::ClaimDemand>, Vec<u64>), DomainError> {
         let demands = (held..=chunks.max(held))
             .map(|places| self.class_demand(places))
             .collect::<Result<Vec<_>, DomainError>>()?;
         let device = self.domain.device();
-        let bytes = demands.iter()
+        let bytes = demands
+            .iter()
             .map(|&demand| beside_bank_bytes(device.topology(), device.info(), demand))
             .collect::<Result<Vec<_>, DomainError>>()?;
-        // Without a reading only the heap bounds a grant: nothing is short.
-        let places = Places {
-            chunks,
-            held,
-            bytes: &bytes,
-            room: room.map_or(u64::MAX, |(room, _)| room),
-            wait,
-        };
-        // The places' own room the one store's bank borrowed is taken back
-        // first, unweighed: the bank owes what the chunks' class lacks of
-        // the room now (`DeviceHeap::take_back`), which its release gives
-        // back before anything the load committed. It is taken once the
-        // grant is decided, so the class's own claim reads the room the
-        // bank lends as it stood (`platform::Serving::lent`).
-        let lacking = bytes[chunks.max(held) - held].saturating_sub(places.room);
-        let lent = self.memory.borrow().bank_room().map_or(0, super::borrowing::BankRoom::lends);
-        let taking = (lacking > 0 && lent > 0).then_some(lacking);
-        // A want the request's earlier group left holds until a group holds
-        // its places (`PlacesWant`); any other group weighs its own.
-        let want = self
-            .places_want
-            .filter(|want| want.request == request && want.places.min(chunks) > held);
-        let worth = match (want, taking) {
-            (Some(want), _) => want.places.min(chunks),
-            (None, None) => {
-                let (worth, slots) = self.weigh_places(places)?;
-                self.places_want = slots.map(|slots| PlacesWant { request, places: worth, slots });
-                worth
-            }
-            (None, Some(_)) => chunks,
-        };
-        // What room admits now; the rest waits for the bank's shrink.
-        let admitted = worth.min(places.admitted(|_| false).0);
-        let counts = demands.iter().copied().zip(bytes.iter().copied()).enumerate()
-            .take(admitted.saturating_sub(held).saturating_add(1));
-        let granted = 'grant: {
-            for (more, (demand, bytes)) in counts.skip(1).rev() {
-                let grown = floor.saturating_add(more);
-                let places = grown.get();
-                let claim = match self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live) {
-                    Ok(claim) => claim,
-                    Err(ClaimRefusal::Deficit { .. }) => continue,
-                    // Nothing grows in Reclaim, nor blind.
-                    Err(ClaimRefusal::Reclaim(_) | ClaimRefusal::Blind(_)) => break 'grant Ok(()),
-                    Err(refusal) => break 'grant Err(refusal.into()),
-                };
-                // The pools' slots, then the buffers, each keeping what was
-                // held on a failure; the class is held only once both are.
-                let held = self
-                    .resources
-                    .grow_class(grown, limits.class_slots(places))
-                    .and_then(|grown| self.family.hold_group(places).map(|()| grown))
-                    .map(|grown| self.resources.hold_class(grown));
-                self.release_claim(claim);
-                if held.is_ok() {
-                    self.retire_places_want(operations);
-                    if let Err(error) = self.refresh_unheld_class() {
-                        break 'grant Err(error);
-                    }
-                    let wait = wait.map_or("none".to_owned(), |wait| format!("{wait:.1} s"));
-                    tracing::info!(
-                        "prompt groups hold {places} places, {bytes} bytes more; wait bound {wait}"
-                    );
-                }
-                if let Err(error) = self.refresh_memory() {
-                    break 'grant Err(error);
-                }
-                break 'grant match held.map_err(|error| match error {
-                    crate::resources::AllocationError::Tensor(error)
-                    | crate::resources::AllocationError::Workflow(seismic::WorkflowError::TensorView(error)) => {
-                        growth_failure(error, bytes, "prompt group class")
-                    }
-                    error => DomainError::invariant(error.to_string()),
-                }) {
-                    // The device refused the bytes: the class held serves.
-                    Err(DomainError::Capacity(_)) => Ok(()),
-                    held => held,
-                };
-            }
-            Ok(())
-        };
-        if let Some(lacking) = taking {
-            self.memory.borrow_mut().take_back(lacking);
-        }
-        granted
+        Ok((demands, bytes))
     }
 
     /// What growing the prompt-group class from the places held to `places`
@@ -1174,112 +1120,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .ok_or_else(|| DomainError::invariant("a group's demand overflows"))
     }
 
-    /// Read again the class room of the chain's planned places that no
-    /// group holds: what growing the class held to the chain's capacity
-    /// claims beside the bank (`AssessmentMemoryCharge::group_class`, which
-    /// the plan left free beside it), none once a group holds them all. The
-    /// one store's bank's committed growth leaves it free, and its borrowed
-    /// growth into it a group's grant takes back ([`Self::grant_group`]).
-    /// Read as the load serves and whenever the class held changes.
-    pub(super) fn refresh_unheld_class(&mut self) -> Result<(), DomainError> {
-        let planned = self.chain_capacity().get();
-        self.unheld_class = match planned > self.resources.group_places().get() {
-            false => 0,
-            true => {
-                let demand = self.class_demand(planned)?;
-                let device = self.domain.device();
-                beside_bank_bytes(device.topology(), device.info(), demand)?
-            }
-        };
-        Ok(())
-    }
-
-    /// Retire the prompt's places want where it ends (`PlacesWant`): the
-    /// class held holds its places, or the group opening with `operations`
-    /// holds its request's last chunk in hand or none (its operation plans
-    /// no chunk after it: the last prompt chunk, or decode).
-    fn retire_places_want(&mut self, operations: &[Operation]) {
-        let held = self.resources.group_places().get();
-        self.places_want = self.places_want.filter(|want| {
-            want.places > held
-                && operations
-                    .iter()
-                    .filter(|operation| operation.request() == want.request)
-                    .all(|operation| self.planned_after(operation).is_some())
-        });
-    }
-
-    /// The places `places`' chunks in hand are worth, and the slots the
-    /// bank shrinks to for them when fewer than it holds: by value per byte
-    /// within the wait bound (`GroupReads::grant`), on the decode the
-    /// load prices while decode waits (`decode_owed`, `decode_price`),
-    /// each group's passes by the executor's costs where measured. Before
-    /// the load has measured its groups' reads, and on a load without a
-    /// bank, whose places compete with no slot, or with a whole bank, which
-    /// gives none up, every chunk, as a group runs to capacity until the
-    /// run has measured its layers (`Telemetry::group_size`).
-    fn weigh_places(&self, places: Places<'_>) -> Result<(usize, Option<u64>), DomainError> {
-        let chunks = places.chunks;
-        let Some(bank) = self.family.expert_bank() else {
-            return Ok((chunks, None));
-        };
-        // A whole bank gives up no slot for places: they grow only into
-        // room beside it.
-        if bank.whole() {
-            return Ok((chunks, None));
-        }
-        let Some((reads, slots)) = bank.group_reads()? else {
-            return Ok((chunks, None));
-        };
-        let pass = self.experts.as_ref().and_then(|measures| measures.pass.measured());
-        let grant = match (self.decode_owed, self.decode_owed.map(|_| self.decode_price()).transpose()?.flatten()) {
-            (Some(owed), Some(price)) => {
-                // The host tier beside the bank stays as it is.
-                let host = bank.residency()?.host.map_or(0, |host| host.slots);
-                let count = |value: u64| usize::try_from(value).map_err(|_| DomainError::invariant("bank slots exceed the host"));
-                let host = count(host)?;
-                // Decode runs beside the prompt's groups.
-                let mut step = |slots: u64| -> Result<f64, DomainError> {
-                    Ok(price.step(crate::assessment::HeldSlots { slots: count(slots)?, host }).total_seconds)
-                };
-                reads.grant(slots, places, pass, Some(DecodeWaiting { owed, step: &mut step }))?
-            }
-            _ => reads.grant::<DomainError>(slots, places, pass, None)?,
-        };
-        Ok((grant.places, (grant.slots < slots.now).then_some(grant.slots)))
-    }
-
-    /// The bytes the bank gives up now for the load's own claims: a
-    /// prompt's places that won the bank's memory (`PlacesWant`), its slots
-    /// beyond the want's; and the borrowed room the load's claims took back
-    /// (`BankRoom::owed`), a group's places among them. None where neither
-    /// is owed.
-    pub fn places_shrink(&self) -> Result<Option<u64>, DomainError> {
-        let owed = self.memory.borrow().bank_room().map_or(0, super::borrowing::BankRoom::owed);
-        let wanted = match (self.places_want, self.family.expert_bank(), self.execution.load().expert_bank()) {
-            (Some(want), Some(bank), Some(plan)) => bank
-                .slots()
-                .saturating_sub(want.slots)
-                .checked_mul(plan.slot_bytes().map_err(DomainError::invariant)?)
-                .ok_or_else(|| DomainError::invariant("the bank's shrink for places overflows"))?,
-            _ => 0,
-        };
-        Ok(Some(wanted.max(owed)).filter(|&bytes| bytes > 0))
-    }
-
-    /// What the release ladder's first rung gives back of the one store's
-    /// bank's borrowed room (`BankRoom`): what the bank's store is short of
-    /// ([`Self::expert_reclaim_deficit`], which counts what the load's
-    /// claims took back of it), up to the borrowed bytes, which every
-    /// shrink releases before a committed slot. None without borrowed room.
-    pub fn borrowed_deficit(&self) -> u64 {
-        let borrowed = self.memory.borrow().bank_room().map_or(0, super::borrowing::BankRoom::borrowed);
-        match borrowed {
-            0 => 0,
-            borrowed => self.expert_reclaim_deficit(crate::planning::BankTier::Bank.storage()).min(borrowed),
-        }
-    }
-
     /// Claim `bytes` of device memory for the service's measurement job
     /// beside the model, in place of any claim before: it is held out of
     /// what opportunistic growth may take ([`Self::opportunistic_room`],
@@ -1290,7 +1130,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// measures beside none of the load's copies or reads. A growth or the
     /// host tier's backing running ends at its next slot
     /// (`ElasticBank::stop_growths`), and none is
-    /// offered while the claim stands ([`Self::expert_bank_growths`]): held,
+    /// settled while the claim stands (`ExecutorDomain::settle_memory`): held,
     /// its slots would wait for the claim's release, which waits for its
     /// end.
     pub fn claim_measurement_room(&mut self, bytes: u64) {
@@ -1388,11 +1228,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`DeviceHeap::reserved_room`, the one test the claim then passes,
     /// beside the workload's unborn state), less its store's fluctuation
     /// (`MemoryPace::fluctuation`) and, in device storage's store, the
-    /// measurement job's claim; committed room less the class room of the
-    /// planned places the one store's bank has not borrowed yet, which is
-    /// theirs ([`Self::refresh_unheld_class`]). Refused in the Reclaim band,
-    /// or blind.
-    fn growth_room(&self, kind: crate::planning::BankTier, room: Room) -> Result<(u64, u64), ClaimRefusal> {
+    /// measurement job's claim. Refused in the Reclaim band, or blind.
+    pub(super) fn growth_room(&self, kind: crate::planning::BankTier, room: Room) -> Result<(u64, u64), ClaimRefusal> {
         let unborn = self.unborn(kind.storage());
         let mode = match room {
             Room::Committed => crate::platform::FitMode::Live,
@@ -1401,13 +1238,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let bytes = self.memory.borrow_mut().reserved_room(kind, unborn, mode)?;
         let fluctuation = self.store_of(kind.storage()).map_or(0, |store| self.pace.borrow().fluctuation(store));
         let claimed = self.measurement_beside(kind.storage());
-        let theirs = match (room, self.memory.borrow().bank_room()) {
-            (Room::Committed, Some(bank)) if kind == crate::planning::BankTier::Bank => {
-                self.unheld_class.saturating_sub(bank.borrowed())
-            }
-            _ => 0,
-        };
-        Ok((bytes.saturating_sub(fluctuation).saturating_sub(claimed).saturating_sub(theirs), unborn))
+        Ok((bytes.saturating_sub(fluctuation).saturating_sub(claimed), unborn))
     }
 
     /// The rooms a growth step of the expert bank in `kind` storage may take
@@ -1416,7 +1247,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// While the bank holds room borrowed beyond allocatable memory none is
     /// committed: allocatable memory then reads nothing of the hold line
     /// (`platform::Serving`). Any other store commits alone.
-    fn growth_rooms(&self, kind: crate::planning::BankTier) -> Vec<Room> {
+    pub(super) fn growth_rooms(&self, kind: crate::planning::BankTier) -> Vec<Room> {
         let memory = self.memory.borrow();
         match memory.bank_room().filter(|_| kind == crate::planning::BankTier::Bank) {
             None => vec![Room::Committed],
@@ -1425,36 +1256,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .filter_map(|(takes, room)| takes.then_some(room))
                 .collect(),
         }
-    }
-
-    /// The expert bank's next growth step in `kind` storage and the room it
-    /// takes, each room in turn ([`Self::growth_rooms`]): the first whose
-    /// room holds a step (`ElasticBank::growth`), a borrowed room only a
-    /// step of the experts' slots, which alone are split into committed and
-    /// borrowed; with the room's bytes and the unborn state its claim leaves
-    /// beside it. A room in the Reclaim band or blind holds none.
-    fn growth_step(
-        &self,
-        bank: &dyn super::ElasticBank,
-        price: Option<&crate::assessment::DecodePrice>,
-        measured: &dyn Fn(super::BankHolding) -> bool,
-        kind: crate::planning::BankTier,
-    ) -> Result<Option<(super::Growth, Room, u64, u64)>, DomainError> {
-        for room in self.growth_rooms(kind) {
-            let (bytes, unborn) = match self.growth_room(kind, room) {
-                Ok(room) => room,
-                // Nothing grows in Reclaim, nor blind.
-                Err(ClaimRefusal::Reclaim(_) | ClaimRefusal::Blind(_)) => continue,
-                Err(refusal) => return Err(refusal.into()),
-            };
-            let growth = bank
-                .growth(price, measured, kind, bytes)?
-                .filter(|growth| room == Room::Committed || growth.holding == super::BankHolding::Experts);
-            if let Some(growth) = growth {
-                return Ok(Some((growth, room, bytes, unborn)));
-            }
-        }
-        Ok(None)
     }
 
     /// What the plan charged in `kind` storage's store that is not held yet,
@@ -1470,7 +1271,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// in another store (a discrete device's host memory). The memory the
     /// device's graph budget costs is held: its live slots' holds charge it
     /// to the ledger.
-    fn unborn(&self, kind: seismic::Contract) -> u64 {
+    pub(super) fn unborn(&self, kind: seismic::Contract) -> u64 {
         if !self.beside_device(kind) {
             return 0;
         }
@@ -1571,177 +1372,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         assert!(starved, "a streamed load's host is starved");
     }
 
-    /// The release ladder's bank rung: one shrink step
-    /// ([`Self::shrink_expert_bank_of`]) covering what the latest probe says
-    /// each storage kind's domain is short until the next can take effect
-    /// (`MemoryPace::shortfall`): the ladder probes before each release.
-    pub fn shrink_expert_bank(
-        &mut self,
-        bindings: &mut StateBindings,
-        wake: crate::CompletionWake,
-    ) -> Result<super::BankStep, DomainError> {
-        let deficits = crate::planning::BankTier::ALL.map(|kind| (kind, self.expert_reclaim_deficit(kind.storage())));
-        let deficit = move |kind| deficits.iter().find(|(of, _)| *of == kind).map_or(0, |&(_, bytes)| bytes);
-        self.shrink_expert_bank_of(bindings, &deficit, wake)
-    }
-
-    /// [`Self::shrink_expert_bank_of`] covering `deficit` bytes of device
-    /// storage: what a prompt group's places take.
-    pub fn shrink_expert_bank_by(
-        &mut self,
-        bindings: &mut StateBindings,
-        deficit: u64,
-        wake: crate::CompletionWake,
-    ) -> Result<super::BankStep, DomainError> {
-        let device = move |kind| if kind == crate::planning::BankTier::Bank { deficit } else { 0 };
-        self.shrink_expert_bank_of(bindings, &device, wake)
-    }
-
-    /// Begin one shrink step of the bank toward the floor by the slots
-    /// covering `deficit` bytes of a holding's storage kind
-    /// (`ElasticBank::shrink`), the queued steps orphaned first, as they may
-    /// name records it retires; its memory is released at later flight
-    /// boundaries ([`Self::advance_expert_bank`]), `wake` completed as it
-    /// progresses. The shrink's step records no graph: the decode launch's
-    /// were recorded as its slots were made (`NativeGraphPool::grow`). A
-    /// load without an elastic bank is at its limit.
-    fn shrink_expert_bank_of(
-        &mut self,
-        bindings: &mut StateBindings,
-        deficit: &dyn Fn(crate::planning::BankTier) -> u64,
-        wake: crate::CompletionWake,
-    ) -> Result<super::BankStep, DomainError> {
-        let started = std::time::Instant::now();
-        let Some(bank) = self.family.expert_bank() else {
-            return Ok(super::BankStep::AtLimit);
-        };
-        let price = self.decode_price()?;
-        let moves = self.experts.as_ref().and_then(|measures| measures.moves.measured());
-        let step = bank.shrink(price.as_ref(), moves, deficit, &mut || self.queue.orphan(self.experts.as_ref(), bindings), wake)?;
-        match step {
-            super::BankStep::Begun(tier) => {
-                self.resize_held.begin(tier, started);
-                self.shrink_step = true;
-            }
-            _ => self.resize_held.hold(started, super::HeldSource::Decision),
-        }
-        Ok(step)
-    }
-
-    /// The storage kinds whose next growth step of the expert bank
-    /// (`ElasticBank::growth`, on the load's priced decode,
-    /// `decode_price`, each to its target within its store's room, `growth_target`)
-    /// pays, each store's own: a holding no resize has measured takes its
-    /// first step, which measures what a step holds the submitting thread;
-    /// after that, a step pays where what it saves the decode the load
-    /// counted exceeds what its holding's last resize
-    /// held the thread (`growth_target` names the rule's two gaps); one that
-    /// does not pay grows nothing. Each store's step is offered, paying or
-    /// not ([`super::GrowthOffer`]). Device memory and host memory are
-    /// separate rooms, so neither's step waits on the other's: they come in
-    /// turn, the kind after the last to grow first. Without a resident step
-    /// nothing grows in device memory, nor while a prompt's places want
-    /// device memory from the bank (`PlacesWant`) or the bank owes back
-    /// borrowed room (`BankRoom::owed`); the one store's step takes
-    /// committed room first, then borrowed room ([`Self::growth_rooms`]);
-    /// the host tier grows
-    /// regardless, its step always paying; nothing grows in a store the heap
-    /// reads in Reclaim or blind, nor at all beside the measurement job's
-    /// claim ([`Self::claim_measurement_room`]).
-    pub fn expert_bank_growths(&self) -> Result<Vec<super::GrowthOffer>, DomainError> {
-        let price = self.decode_price()?;
-        let Some(bank) = self.family.expert_bank().filter(|_| self.measurement_claim.is_none()) else {
-            return Ok(Vec::new());
-        };
-        let held = &self.resize_held.last;
-        let mut kinds = crate::planning::BankTier::ALL;
-        if self.grown_last == Some(crate::planning::BankTier::Bank) {
-            kinds.reverse();
-        }
-        let mut offers = Vec::new();
-        for kind in kinds {
-            // A prompt's places want device memory, or the load's claims took
-            // borrowed room back, which a device step would take; and a
-            // device step is priced on the decode.
-            let owes = self.memory.borrow().bank_room().is_some_and(|bank| bank.owed() > 0);
-            if kind == crate::planning::BankTier::Bank && (self.places_want.is_some() || owes || price.is_none()) {
-                continue;
-            }
-            let Some((growth, ..)) = self.growth_step(bank, price.as_ref(), &|holding| held.contains_key(&holding), kind)? else {
-                continue;
-            };
-            // The host tier grows to every expert wherever there is room:
-            // nothing prices it.
-            let pays = growth.holding == super::BankHolding::Host
-                || held.get(&growth.holding).is_none_or(|&held| growth.saving.is_some_and(|saved| saved > held));
-            offers.push(super::GrowthOffer { growth, pays });
-        }
-        Ok(offers)
-    }
-
-    /// Begin one growth step of the expert bank in `kind` storage
-    /// (`ElasticBank::grow`): its new bytes, which its reservation backs
-    /// with fresh pages of the device's store or host RAM
-    /// (`DeviceHeap::claim_reserved`), are claimed from the heap first, and
-    /// held until the growth finishes ([`Self::advance_expert_bank`]); a
-    /// heap that refuses the claim (`Reclaim`, `Capacity`, `Blind`) grows
-    /// nothing; the claim holds the step to what the device's grants leave
-    /// (Metal's working set), the step alone, as the bank's chunks are held
-    /// once. The step is sized within what that claim admits now
-    /// ([`Self::growth_room`]), so a refusal of it is the machine's change
-    /// between the two readings, which the next decision reads afresh:
-    /// where not even one slot fits, nothing grows.
-    pub fn grow_expert_bank(
-        &mut self,
-        kind: crate::planning::BankTier,
-        wake: crate::CompletionWake,
-    ) -> Result<super::BankStep, DomainError> {
-        let started = std::time::Instant::now();
-        let price = self.decode_price()?;
-        let Some(bank) = self.family.expert_bank() else {
-            return Ok(super::BankStep::AtLimit);
-        };
-        let held = &self.resize_held.last;
-        let measured = |holding| held.contains_key(&holding);
-        let Some((super::Growth { bytes, holding, .. }, taken, room, unborn)) = self.growth_step(bank, price.as_ref(), &measured, kind)? else {
-            return Ok(super::BankStep::AtLimit);
-        };
-        let mode = match taken {
-            Room::Committed => crate::platform::FitMode::Live,
-            Room::Borrowed => crate::platform::FitMode::Borrow,
-        };
-        let claim = self
-            .memory
-            .borrow_mut()
-            .claim_reserved(kind, bytes, unborn, HoldingClass::Model, mode)?;
-        let grown = bank.grow(price.as_ref(), &measured, kind, room, wake);
-        match grown {
-            Ok(super::BankStep::Begun(tier)) => {
-                // The experts' slots of the one store's bank are split by the
-                // room each growth took (`BankRoom`).
-                let memory = self.memory.get_mut();
-                if holding == super::BankHolding::Experts && kind == crate::planning::BankTier::Bank && memory.bank_room().is_some() {
-                    memory.grow_bank(taken, bytes);
-                }
-                self.bank_claim = Some(super::GrowthClaim { id: claim, kind, bytes });
-                self.grown_last = Some(kind);
-                self.resize_held.begin(tier, started);
-                Ok(super::BankStep::Begun(tier))
-            }
-            other => {
-                self.release_claim(claim);
-                other
-            }
-        }
-    }
-
     /// The model has loaded: the displacement its load caused is accepted,
     /// and its growth reads what can be taken without displacing more of
     /// another program's data from now on (`DeviceHeap::serve`).
     pub fn serve(&mut self) -> Result<(), DomainError> {
-        // The one store's bank splits its slots into committed and borrowed
-        // (`BankRoom`), every one committed as it serves: the plan sized
-        // them within the hold line.
+        // The one store's bank holds none of its slots on borrowed room as
+        // it serves (`BankRoom`): the plan sized them within the hold line.
         let bank = match (self.family.expert_bank(), self.execution.load().expert_bank()) {
             (Some(bank), Some(plan)) if plan.placer() == crate::planning::Placer::Bank => {
                 Some((bank.slots(), plan.slot_bytes().map_err(DomainError::invariant)?))
@@ -1751,8 +1387,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.memory
             .borrow_mut()
             .serve(bank)
-            .map_err(|error| DomainError::Blind(error.to_string()))?;
-        self.refresh_unheld_class()
+            .map_err(|error| DomainError::Blind(error.to_string()))
     }
 
     /// At a flight boundary: advance the expert bank's running resize
@@ -1858,9 +1493,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             true => SlotRelease::Began,
             false => SlotRelease::None,
         };
-        if buffers {
-            self.refresh_unheld_class()?;
-        }
         Ok((released, slots))
     }
 

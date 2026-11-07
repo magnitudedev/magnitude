@@ -56,6 +56,8 @@ pub struct DeviceLock {
     released: Arc<watch::Sender<u64>>,
     /// How many shares have waited on a job: each one preempts the job holding the device then.
     wanted: Arc<watch::Sender<u64>>,
+    /// Counts the point requests stored by loads that hold no share ([`Self::requested`]).
+    requested: Arc<watch::Sender<u64>>,
     /// The shares held, the idle resident model, and whether a measurement runs beside it.
     sharing: Arc<watch::Sender<Sharing>>,
 }
@@ -93,6 +95,7 @@ impl Default for DeviceLock {
             lock: Arc::default(),
             released: Arc::new(watch::Sender::new(0)),
             wanted: Arc::new(watch::Sender::new(0)),
+            requested: Arc::new(watch::Sender::new(0)),
             sharing: Arc::new(watch::Sender::new(Sharing::default())),
         }
     }
@@ -240,12 +243,14 @@ async fn changed<T>(receiver: &mut watch::Receiver<T>) {
     }
 }
 
-/// The device's changes a measurement owner waits for: a hold ended, or a resident model became
-/// idle that has not been (a load ended, and its model is resident). A request's lease and
-/// its end are none: the load they lease is the same. What changed in between is never missed:
-/// each is seen at the next wait.
+/// The device's changes a measurement owner waits for: a hold ended, a resident model became
+/// idle that has not been (a load ended, and its model is resident), or a load holding no share
+/// stored point requests ([`DeviceLock::requested`]). A request's lease and its end are none: the
+/// load they lease is the same. What changed in between is never missed: each is seen at the
+/// next wait.
 pub struct DeviceChanges {
     released: watch::Receiver<u64>,
+    requested: watch::Receiver<u64>,
     sharing: watch::Receiver<Sharing>,
     /// The load last seen idle.
     idle: Option<ModelInstanceId>,
@@ -257,6 +262,7 @@ impl DeviceChanges {
         loop {
             tokio::select! {
                 () = changed(&mut self.released) => return,
+                () = changed(&mut self.requested) => return,
                 () = changed(&mut self.sharing) => {
                     let idle = self.sharing.borrow().idle.as_ref().map(|idle| idle.instance.clone());
                     if idle.is_some() && idle != self.idle {
@@ -266,6 +272,17 @@ impl DeviceChanges {
                 }
             }
         }
+    }
+}
+
+/// The holds' ends, shares and jobs alike, that a waiter holding nothing of the device waits
+/// for: a job ending has stored what it measured. What ended in between is never missed.
+pub struct Releases(watch::Receiver<u64>);
+
+impl Releases {
+    /// Return at the next hold's end since the last; never once the lock is gone.
+    pub async fn released(&mut self) {
+        changed(&mut self.0).await;
     }
 }
 
@@ -411,9 +428,21 @@ impl DeviceLock {
         let idle = sharing.borrow().idle.as_ref().map(|idle| idle.instance.clone());
         DeviceChanges {
             released: self.released.subscribe(),
+            requested: self.requested.subscribe(),
             sharing,
             idle,
         }
+    }
+
+    /// A load that holds no share stored point requests: the measurement owner reads what is
+    /// stored again ([`DeviceChanges`]), as it does after a hold that stored them ends.
+    pub fn requested(&self) {
+        self.requested.send_modify(|requested| *requested = requested.wrapping_add(1));
+    }
+
+    /// The holds' ends from now on ([`Releases`]).
+    pub fn releases(&self) -> Releases {
+        Releases(self.released.subscribe())
     }
 
     /// Take the device for a job, without waiting: `None` while residency shares it or another

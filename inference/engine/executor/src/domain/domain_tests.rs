@@ -290,15 +290,19 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
     assert!(domain.target[&request].blocked_tails().is_empty());
 }
 
-/// A domain launching one-row prompt chunks in chains of up to three.
+/// [`chained`] on the device `Automatic` prefers, priced ([`measure_load`])
+/// where `priced`.
+fn chain_load(priced: bool) -> Fixture {
+    let (mut domain, mut bindings) = chained(platform::DeviceRequest::Automatic);
+    if priced {
+        measure_load(&mut domain, &mut bindings);
+    }
+    (domain, bindings)
+}
+
+/// [`chain_load`], priced.
 fn chain_fixture() -> Fixture {
-    fixture_of(
-        tiny_definition(),
-        limits(2, 3, false),
-        None,
-        false,
-        platform::DeviceRequest::Automatic,
-    )
+    chain_load(true)
 }
 
 /// Reserve and submit a group that must claim the front queued step.
@@ -367,49 +371,27 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
     assert_eq!(domain.group_places().get(), 1);
 }
 
-/// A bank short of its ceiling keeps the room it can grow into: a prompt's
-/// group grows its places only beyond it, so with the device's gigabyte of
-/// room all the bank's to grow into the group stays at its floor of one
-/// place, and with a bank at its ceiling the same group takes its chunks'
-/// places, whether the ceiling is every expert or a weight cap's short of
-/// them.
+/// A prompt group's places are granted by their price like any holding:
+/// with the device's gigabyte of room, a priced load's group takes its
+/// chunks' places, each saving a group's submission at the prior's
+/// requests a second, banked or not; an unpriced load's places are worth
+/// nothing known, and its group takes none, the room left free.
 #[test]
-fn places_grow_only_beyond_what_the_bank_can_grow_into() {
+fn a_group_takes_its_places_by_price() {
     for backend in bank_backends() {
-        let places = |shortfall: u64, whole: bool| {
+        let banked = |priced: bool| {
             let (mut domain, mut bindings) = banked_chain(backend, 4, 3);
-            let bank = domain.family.bank.as_mut().expect("the fixture holds a bank");
-            (bank.shortfall, bank.whole) = (shortfall, whole);
-            // A reading of the device's store with a gigabyte of room.
-            let store = domain.domain.device().device_store();
-            let room = 1 << 30;
-            domain.pace.borrow_mut().domains.insert(store, DomainPace {
-                role: DomainRole::Allocation,
-                headroom: room,
-                thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
-                charged: 0,
-                band: MemoryBand::Normal,
-                unseen: 0,
-                witness: None,
-                available: 0,
-                base: (std::time::Instant::now(), 0),
-                rate: 0.0,
-                fastest: 0.0,
-                fluctuation: Fluctuation::default(),
-                host: false,
-            });
-            let request = RequestId(80);
-            open(&mut domain, &mut bindings, request);
-            domain.plan_successors((1..4).map(|position| prefill(request, position)).collect());
-            let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
-            let places = domain.group_places().get();
-            let _ = finish_one(&mut domain, flight);
-            places
+            with_room(&mut domain, 1 << 30);
+            if priced {
+                measure_load(&mut domain, &mut bindings);
+            }
+            (domain, bindings)
         };
-        assert_eq!(places(0, true), 3, "{backend:?}: a whole bank leaves the group its chunks' places");
-        assert_eq!(places(0, false), 3, "{backend:?}: a bank at a weight cap's ceiling leaves the group its chunks' places");
-        assert_eq!(places(u64::MAX / 4, false), 1, "{backend:?}: a bank that can grow into the room keeps it");
+        assert_eq!(group_places_opened(banked(true)), 3, "{backend:?}: the group holds its chunks' places");
+        assert_eq!(group_places_opened(banked(false)), 1, "{backend:?}: an unpriced group takes no place");
     }
+    assert_eq!(group_places_opened(chain_load(true)), 3, "a load without a bank prices its places too");
+    assert_eq!(group_places_opened(chain_load(false)), 1, "an unpriced group takes no place");
 }
 
 /// A prompt chunk's readout exports at most its final row, so the places a
@@ -801,38 +783,48 @@ fn fresh_memory_observation_reads_released_state_backing() {
 fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
     let backend = bank_backends()[0];
     let (mut domain, mut bindings) = banked(backend, 4, 4);
-    let measures = |blocks| crate::ExpertMeasures {
-        lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
-        read: crate::assessment::Priced::Pending("unmeasured".into()),
-        resident: crate::assessment::Priced::Measured(Box::new(|_, _| Ok(0.015))),
-        pass: crate::assessment::Priced::Pending("unpriced".into()),
-        moves: crate::assessment::Priced::Pending("unmeasured".into()),
-        tier_copy: crate::assessment::Priced::Measured(Some(crate::assessment::TierCopyCosts {
-            blocks,
-            whole_seconds: 0.001,
-            stall_share: 0.1,
-        })),
-        convert: crate::assessment::Priced::Measured(None),
+    let measures = |blocks| crate::LoadMeasures {
+        costs: Ok(load_costs()),
+        experts: Some(crate::ExpertMeasures {
+            lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
+            read: crate::assessment::Priced::Pending("unmeasured".into()),
+            pass: crate::assessment::Priced::Pending("unpriced".into()),
+            moves: crate::assessment::Priced::Pending("unmeasured".into()),
+            tier_copy: crate::assessment::Priced::Measured(Some(crate::assessment::TierCopyCosts {
+                blocks,
+                whole_seconds: 0.001,
+                stall_share: 0.1,
+            })),
+            convert: crate::assessment::Priced::Measured(None),
+        }),
     };
-    domain.measure_experts(measures(8), &mut bindings).unwrap();
+    domain.measure_load(measures(8), &mut bindings).unwrap();
     domain.family.bank.as_mut().unwrap().refuse_tier_copy = true;
-    let refused = domain.measure_experts(measures(16), &mut bindings).unwrap_err();
+    let refused = domain.measure_load(measures(16), &mut bindings).unwrap_err();
     assert!(matches!(refused, DomainError::Invariant(_)), "{refused}");
     let bank = domain.family.bank.as_ref().unwrap();
     assert_eq!(bank.tier_copy.lock().unwrap().as_ref().map(|costs| costs.blocks), Some(8));
-    let kept = domain.experts.as_ref().unwrap().tier_copy.measured().cloned().flatten().map(|costs| costs.blocks);
+    let kept = domain.expert_measures().unwrap().tier_copy.measured().cloned().flatten().map(|costs| costs.blocks);
     assert_eq!(kept, Some(8));
 }
 
-/// The storage kinds whose bank growth step pays (`expert_bank_growths`),
-/// in turn.
-fn paying(domain: &ExecutorDomain<TestFamily>) -> Vec<crate::planning::BankTier> {
-    let offers = domain.expert_bank_growths().unwrap();
-    offers.into_iter().filter(|offer| offer.pays).map(|offer| offer.growth.kind).collect()
+/// The storage kinds the heap's settle grows (`settle_memory`) at a fresh
+/// probe, as the owner settles, the most valuable per byte first, with
+/// nothing of an owner's; none before the bank is priced.
+fn paying(domain: &mut ExecutorDomain<TestFamily>) -> Vec<crate::planning::BankTier> {
+    domain.probe_memory(std::time::Duration::from_millis(100)).unwrap();
+    let settled = domain.settle_memory(&crate::OwnerHoldings::default()).unwrap();
+    let mut kinds = Vec::new();
+    for grant in settled.grants {
+        if !kinds.contains(&grant.kind) {
+            kinds.push(grant.kind);
+        }
+    }
+    kinds
 }
 
 /// Whether the bank's device step pays.
-fn device_pays(domain: &ExecutorDomain<TestFamily>) -> bool {
+fn device_pays(domain: &mut ExecutorDomain<TestFamily>) -> bool {
     paying(domain).contains(&crate::planning::BankTier::Bank)
 }
 
@@ -875,8 +867,10 @@ fn a_growth_step_is_sized_within_what_the_heap_admits() {
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked(backend, 4, 1);
         let row = bank_row(&domain);
-        // Misses stop falling past the bank's 4 rows.
-        price_growth(&mut domain, &mut bindings, misses_at(4, 100));
+        // Of each step's 8 reads, 7 hit a bank of 3 slots and the last one of
+        // 4: the second and third slots save 7 reads a step together, more a
+        // slot than the fourth's one, so the two move apart from it.
+        price_growth(&mut domain, &mut bindings, misses_by(100, &[(2, 7), (3, 1)]));
         let device = crate::planning::BankTier::Bank;
         // What a growth may take: the free headroom's room, which a growth's
         // claim reads.
@@ -892,53 +886,75 @@ fn a_growth_step_is_sized_within_what_the_heap_admits() {
         );
         let claim = domain.memory.borrow_mut().claim_reserved(device, room, 0, HoldingClass::Live, crate::platform::FitMode::Live).unwrap();
         domain.memory.borrow_mut().release(claim);
-        assert!(device_pays(&domain));
-        assert_eq!(domain.grow_expert_bank(device, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank), "within the room");
+        assert!(device_pays(&mut domain));
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank), "within the room");
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 3, .. }), "two slots of the room");
         domain.memory.borrow_mut().release(held);
     }
 }
 
-/// Device memory and host memory grow each their own step in turn: where
-/// both pay, the store after the last to grow comes first, so a host tier
-/// fills while the device bank still grows. The tier's step holds what the
-/// bank's slots miss up to where the record's misses stop falling.
+/// Device memory and host memory grow by what each byte saves: the bank's
+/// slots, which save the decode step, before the host tier's records,
+/// which the fake prices at next to nothing ([`HOST_SLOT_SAVES`]); each in
+/// one resize to its settled size.
 #[test]
-fn both_stores_grow_in_turn_where_both_pay() {
+fn both_stores_grow_by_what_a_byte_saves() {
     use crate::planning::BankTier::{Bank as Device, Host};
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked(backend, 4, 1);
         domain.family.bank.as_mut().unwrap().host_ceiling = 4;
-        // Misses stop falling at 5 slots: the bank's 4 rows and a host slot.
-        price_growth(&mut domain, &mut bindings, misses_at(4, 100));
-        assert_eq!(paying(&domain), [Device, Host]);
-        assert_eq!(domain.grow_expert_bank(Host, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Host));
+        // Each step's reads hit a bank of the 4 rows and no fewer: every
+        // slot to 4 saves, and the misses stop falling there.
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100));
+        assert_eq!(paying(&mut domain), [Device, Host]);
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(Device));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { holding: crate::BankHolding::Experts, from: 1, to: 4, .. }));
+        assert_eq!(paying(&mut domain), [Host], "the bank saturated; the tier holds the rest");
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(Host));
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { holding: crate::BankHolding::Host, to: 4, .. }));
-        assert_eq!(paying(&domain), [Device], "the device's turn; the tier holds the rest");
-        assert_eq!(domain.grow_expert_bank(Device, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
-        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { holding: crate::BankHolding::Experts, to: 4, .. }));
-        assert!(domain.expert_bank_growths().unwrap().is_empty(), "both saturated");
+        assert!(paying(&mut domain).is_empty(), "both saturated");
     }
 }
 
-/// The host tier is the inclusive copy of every expert: its step to every
-/// expert pays wherever its store has room, before the decode prices the
-/// device's, and while a prompt's places want
-/// device memory, which holds the device's step alone.
+/// Before the load's costs price its bank nothing grows: the host tier's
+/// records, as the bank's slots, save nothing known.
 #[test]
-fn the_host_tier_grows_to_every_expert_unpriced_and_beside_a_places_want() {
-    use crate::planning::BankTier::{Bank as Device, Host};
+fn nothing_grows_before_the_bank_is_priced() {
+    for backend in bank_backends() {
+        let (mut domain, _bindings) = banked(backend, 4, 1);
+        domain.family.bank.as_mut().unwrap().host_ceiling = 6;
+        assert!(paying(&mut domain).is_empty(), "no costs: nothing priced");
+    }
+}
+
+/// Before the load counted a decode step its bank is priced on the generic
+/// model alone (`DecodePrice::prior`): it grows at once, in one resize to
+/// every slot the prior's misses justify.
+#[test]
+fn the_bank_grows_on_the_prior_before_a_decode_is_counted() {
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked(backend, 4, 1);
-        domain.family.bank.as_mut().unwrap().host_ceiling = 6;
-        assert_eq!(paying(&domain), [Host], "no record, no resident step: the tier alone");
-        domain.places_want = Some(super::state::PlacesWant { request: RequestId(80), places: 3, slots: 2 });
-        price_growth(&mut domain, &mut bindings, misses_at(4, 100));
-        assert_eq!(paying(&domain), [Host], "a want holds the device's step, not the tier's");
-        assert_eq!(domain.grow_expert_bank(Host, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Host));
-        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { holding: crate::BankHolding::Host, to: 6, .. }));
-        domain.places_want = None;
-        assert_eq!(paying(&domain), [Device], "the tier holds every expert");
+        measure_load(&mut domain, &mut bindings);
+        assert!(domain.family.expert_bank().unwrap().live().is_none(), "no decode counted");
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 4, .. }), "one growth to the settled size");
+    }
+}
+
+/// Regrowth after an ask is one growth to the settled size: the ask takes
+/// the bank down in one shrink to what covers it, and the next settle
+/// grows it back in one resize, not a slot a reading.
+#[test]
+fn regrowth_is_one_growth_to_the_settled_size() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 4);
+        // Each step's reads hit a bank of the 4 rows and no fewer.
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100));
+        let row = bank_row(&domain);
+        assert_eq!(domain.shrink_expert_bank_by(&mut bindings, 3 * row, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { from: 4, to: 1, .. }), "one shrink covers the ask");
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 4, .. }), "one growth back");
     }
 }
 
@@ -963,6 +979,10 @@ fn a_full_device_leaves_the_host_stores_room() {
         fastest: 0.0,
         fluctuation: Fluctuation::default(),
         host: false,
+        grant_left: None,
+        borrowable: None,
+        takes: 0,
+        first: std::time::Instant::now(),
     };
     let mut pace = MemoryPace::new();
     pace.domains.insert(device, domain(DomainRole::Allocation, 0));
@@ -989,9 +1009,9 @@ fn finish(domain: &mut ExecutorDomain<TestFamily>) -> crate::BankResized {
 /// sized target: the most slots within the store's room up to where the
 /// record's misses stop falling, never the bank's every row past them. The
 /// step measures what a resize holds the submitting thread. After that a
-/// step grows only where its decode time saved over the record's decode
-/// exceeds what the holding's last resize held the thread; one that does
-/// not pay grows nothing, and a saturated holding has no step.
+/// step grows only where what it saves over the settle's horizon covers
+/// what the holding's last resize held the thread; one that does not pay
+/// grows nothing, and a saturated holding has no step.
 #[test]
 fn a_holding_grows_once_unmeasured_then_only_where_its_saving_exceeds_its_resize() {
     for backend in bank_backends() {
@@ -1000,43 +1020,51 @@ fn a_holding_grows_once_unmeasured_then_only_where_its_saving_exceeds_its_resize
         // falling at 3 slots, of the bank's 4 rows.
         price_growth(&mut domain, &mut bindings, misses_at(2, 100));
         assert_eq!(domain.resize_held.last.get(&crate::BankHolding::Experts), None);
-        assert!(device_pays(&domain), "an unmeasured holding takes its first step");
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(device_pays(&mut domain), "an unmeasured holding takes its first step");
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 3, .. }), "the sized target");
         assert!(domain.resize_held.last.get(&crate::BankHolding::Experts).is_some_and(|&held| held < 0.4));
-        assert!(!device_pays(&domain), "saturated: a fourth slot saves nothing");
-        // Misses at 3 slots, none at 4: the fourth slot saves about 0.4 s, which
-        // outweighs the resize; a resize held longer than that is not paid.
+        assert!(!device_pays(&mut domain), "saturated: a fourth slot saves nothing");
+        // Misses at 3 slots, none at 4: the fourth slot saves the step's
+        // reads, seconds over the horizon, which outweigh the resize. A saving
+        // is less than the step it is taken from and the decode runs one step
+        // at a time, so it saves under a second a second: a resize held the
+        // horizon's 60 s is not paid.
         price_growth(&mut domain, &mut bindings, misses_at(3, 100));
-        assert!(device_pays(&domain), "0.4 s saved outweighs the resize");
-        domain.resize_held.last.insert(crate::BankHolding::Experts, 1.);
-        assert!(!device_pays(&domain), "a step that does not pay grows nothing");
+        assert!(device_pays(&mut domain), "the step's reads saved outweigh the resize");
+        domain.resize_held.last.insert(crate::BankHolding::Experts, 60.);
+        assert!(!device_pays(&mut domain), "a step that does not pay grows nothing");
     }
 }
 
-/// A load priced before the executor's costs were stored grows nothing;
-/// priced again once they are, on the same live domain, its bank grows by
-/// the rule as a load priced at its start would.
+/// A load priced on its executor's costs before the job stored the read
+/// line its decode is priced along grows nothing; priced again once it is,
+/// on the same live domain, its bank grows by the rule as a load priced at
+/// its start would.
 #[test]
-fn a_live_load_priced_again_on_newly_stored_costs_grows() {
+fn a_live_load_priced_again_on_newly_stored_figures_grows() {
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked(backend, 4, 2);
         let decode = misses_at(3, 100);
         count_decode(&mut domain, decode);
-        let unpriced = crate::ExpertMeasures {
-            lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
-            read: crate::assessment::Priced::Measured(crate::domain::fixtures::READ),
-            resident: crate::assessment::Priced::Pending("the executor's costs are not measured yet".into()),
-            pass: crate::assessment::Priced::Pending("unpriced".into()),
-            moves: crate::assessment::Priced::Pending("unmeasured".into()),
-            tier_copy: crate::assessment::Priced::Measured(None),
-            convert: crate::assessment::Priced::Measured(None),
+        // Priced on the executor's costs, before the job stored the model
+        // store's read line its decode is priced along.
+        let unpriced = crate::LoadMeasures {
+            costs: Ok(load_costs()),
+            experts: Some(crate::ExpertMeasures {
+                lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
+                read: crate::assessment::Priced::Pending("the store's read line is not measured yet".into()),
+                pass: crate::assessment::Priced::Pending("unpriced".into()),
+                moves: crate::assessment::Priced::Pending("unmeasured".into()),
+                tier_copy: crate::assessment::Priced::Measured(None),
+                convert: crate::assessment::Priced::Measured(None),
+            }),
         };
-        domain.measure_experts(unpriced, &mut bindings).unwrap();
-        assert!(!device_pays(&domain), "an unpriced load grows nothing");
+        domain.measure_load(unpriced, &mut bindings).unwrap();
+        assert!(!device_pays(&mut domain), "an unpriced load grows nothing");
         price_growth(&mut domain, &mut bindings, misses_at(3, 100));
-        assert!(device_pays(&domain));
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(device_pays(&mut domain));
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 4, .. }));
     }
 }
@@ -1085,11 +1113,11 @@ fn a_measurement_claim_shrinks_the_bank_and_holds_its_growth() {
         assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { from: 4, to: 3, released, .. } if released == row));
         // A fourth slot would save the decode about 0.4 s, but the claim holds
         // the room the shrink made: no step fits the room left.
-        assert!(!device_pays(&domain), "the claimed room is not the bank's");
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::AtLimit);
+        assert!(!device_pays(&mut domain), "the claimed room is not the bank's");
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::AtLimit);
         domain.release_measurement_room();
         assert_eq!(domain.measurement_room().unwrap(), None);
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank), "released, the bank grows again");
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank), "released, the bank grows again");
     }
 }
 
@@ -1103,40 +1131,19 @@ fn a_measurement_claim_stops_the_banks_growth() {
         let (mut domain, mut bindings) = banked(backend, 4, 2);
         price_growth(&mut domain, &mut bindings, misses_at(3, 100));
         assert_eq!(
-            domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(),
+            domain.grow_settled(unwatched()).unwrap(),
             BankStep::Begun(crate::planning::BankTier::Bank)
         );
         domain.claim_measurement_room(0);
         assert!(matches!(finish(&mut domain), crate::BankResized::Stopped { at: 2, .. }), "stopped before its first slot");
-        assert!(domain.expert_bank_growths().unwrap().is_empty(), "nothing grows beside the claim");
+        assert!(paying(&mut domain).is_empty(), "nothing grows beside the claim");
         domain.release_measurement_room();
-        assert!(device_pays(&domain), "released, the step pays again");
+        assert!(device_pays(&mut domain), "released, the step pays again");
         assert_eq!(
-            domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(),
+            domain.grow_settled(unwatched()).unwrap(),
             BankStep::Begun(crate::planning::BankTier::Bank)
         );
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 2, to: 4, .. }));
-    }
-}
-
-/// A prompt's places want holds the bank's growth while its prompt has
-/// chunks in hand, and is retired once the request's group holds none (it
-/// decodes): another request's group leaves it, its own decode ends it.
-#[test]
-fn a_places_want_ends_with_its_prompt() {
-    // Three slots of four: a fourth saves the decode its misses.
-    for backend in bank_backends() {
-        let (mut domain, mut bindings) = banked(backend, 4, 3);
-        price_growth(&mut domain, &mut bindings, misses_at(3, 100));
-        assert!(device_pays(&domain));
-        let (prompt, other) = (RequestId(80), RequestId(81));
-        domain.places_want = Some(super::state::PlacesWant { request: prompt, places: 3, slots: 2 });
-        assert!(domain.expert_bank_growths().unwrap().is_empty(), "a want holds the bank's growth");
-        domain.grant_group(&[forward(other, 0)]).unwrap();
-        assert!(domain.places_want.is_some(), "another request's group leaves the want");
-        domain.grant_group(&[forward(prompt, 4)]).unwrap();
-        assert!(domain.places_want.is_none(), "the prompt's own group past its chunks ends it");
-        assert!(device_pays(&domain));
     }
 }
 
@@ -1165,7 +1172,7 @@ fn a_launch_a_bank_resize_ran_across_is_not_timed() {
         let (timed, bindings) = step(&mut domain, bindings, 1, &quiet);
         assert!(timed, "a launch nothing ran across is timed");
         let grow = |domain: &mut ExecutorDomain<TestFamily>| {
-            assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+            assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         };
         let (timed, bindings) = step(&mut domain, bindings, 2, &grow);
         assert!(!timed, "a growth began across it");
@@ -1185,7 +1192,7 @@ fn a_growth_decided_mid_flight_joins_beside_the_running_steps() {
         let (mut domain, mut bindings) = banked(backend, 4, 2);
         price_growth(&mut domain, &mut bindings, misses_at(3, 100));
         domain.family.bank.as_ref().unwrap().running_steps(1);
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         assert!(domain.advance_expert_bank(unwatched()).unwrap().is_none(), "joined while a step runs");
         assert_eq!(domain.expert_bank_slots(), Some(4));
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 4, .. }));
@@ -1208,6 +1215,36 @@ fn a_shrink_with_a_step_still_running_is_deferred_to_the_gap() {
     }
 }
 
+/// A shrink decided while a prompt chain is under way (a settle's, at a
+/// reading between its chunks) is deferred, never orphaning the chunks its
+/// holder claims; once the chain ends it begins.
+#[test]
+fn a_shrink_during_a_chain_is_deferred_to_its_end() {
+    for backend in bank_backends() {
+        // Priced, with room beside the bank, the prompt's group takes its
+        // chunks' places and chains them (`a_group_takes_its_places_by_price`).
+        let (mut domain, mut bindings) = banked_chain(backend, 4, 4);
+        with_room(&mut domain, 1 << 30);
+        measure_load(&mut domain, &mut bindings);
+        let request = RequestId(80);
+        open(&mut domain, &mut bindings, request);
+        domain.plan_successors((1..4).map(|position| prefill(request, position)).collect());
+        let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+        let (pending, mut bindings) = finish_one(&mut domain, flight);
+        domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        assert_eq!(domain.chain_holder(), Some(request), "{backend:?}");
+        let shrink = |domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings| {
+            domain.shrink_expert_bank_to(bindings, crate::BankHolding::Experts, 3, unwatched()).unwrap()
+        };
+        assert_eq!(shrink(&mut domain, &mut bindings), BankStep::Deferred, "{backend:?}");
+        assert_eq!(domain.chain_holder(), Some(request), "{backend:?}: the chain keeps its chunks");
+        assert_eq!(domain.expert_bank_slots(), Some(4));
+        domain.release_chain().unwrap();
+        assert_eq!(shrink(&mut domain, &mut bindings), BankStep::Begun(crate::planning::BankTier::Bank), "{backend:?}");
+        assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { to: 3, .. }));
+    }
+}
+
 /// Under pipelined decode a growth breaks no lookahead: it waits for no gap,
 /// so a successor queues behind each flight while it runs, as without one.
 #[test]
@@ -1224,7 +1261,7 @@ fn a_growth_keeps_the_pipelined_lookahead() {
         // A growth begun while that chunk runs.
         price_growth(&mut domain, &mut bindings, misses_at(3, 100));
         domain.family.bank.as_ref().unwrap().running_steps(1);
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         domain.plan_successors(vec![prefill(request, 2)]);
         let flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 1)]);
         let (pending, _) = finish_one(&mut domain, flight);
@@ -1246,10 +1283,18 @@ fn a_paying_growth_stops_at_the_line() {
         price_growth(&mut domain, &mut bindings, misses_at(1, 100));
         assert_eq!(domain.shrink_expert_bank(&mut bindings, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         finish(&mut domain);
-        assert!(device_pays(&domain));
+        assert!(device_pays(&mut domain));
         let price = domain.decode_price().unwrap();
-        let crate::Growth { kind, bytes: step, .. } =
-            domain.family.expert_bank().unwrap().growth(price.as_ref(), &|_| true, crate::planning::BankTier::Bank, u64::MAX).unwrap().unwrap();
+        let kind = crate::planning::BankTier::Bank;
+        let bank = domain.family.expert_bank().unwrap();
+        let step = bank.curves(price.as_ref(), crate::Reach { held: 0, offered: 1 }).unwrap()[0].offered[0].bytes;
+        // A curve priced only as far as a reach goes is the whole curve's
+        // first steps, the step crossing the reach included.
+        let whole = bank.curves(price.as_ref(), crate::Reach { held: u64::MAX, offered: u64::MAX }).unwrap();
+        let near = bank.curves(price.as_ref(), crate::Reach { held: 2 * step - 1, offered: step + 1 }).unwrap();
+        assert_eq!((near[0].held.len(), near[0].offered.len()), (2.min(whole[0].held.len()), 2.min(whole[0].offered.len())));
+        assert_eq!(near[0].offered[..], whole[0].offered[..near[0].offered.len()]);
+        assert_eq!(near[0].held[..], whole[0].held[..near[0].held.len()]);
         // What the heap grants a growth now, by whichever constraint binds:
         // the free headroom's room, which a growth's claim reads.
         let available = domain.memory.borrow_mut().reserved_room(kind, 0, crate::platform::FitMode::Live).unwrap();
@@ -1261,13 +1306,13 @@ fn a_paying_growth_stops_at_the_line() {
         };
         let held = leaving(&domain, step / 2);
         assert!(matches!(
-            domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()),
+            domain.grow_settled(unwatched()),
             Ok(BankStep::AtLimit) | Err(DomainError::Reclaim(_))
         ));
         assert_eq!(domain.expert_bank_slots(), Some(1));
         domain.memory.borrow_mut().release(held);
         let held = leaving(&domain, 2 * step);
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { to: 2, .. }));
         domain.memory.borrow_mut().release(held);
     }
@@ -1344,14 +1389,14 @@ fn an_expert_bank_shrink_credits_what_seismic_releases() {
         assert_eq!(before - charged(&domain), 3 * row);
         // Without a priced decode there are no grounds to grow: the rule
         // grows nothing.
-        assert!(!device_pays(&domain));
+        assert!(!device_pays(&mut domain));
         // A growth step, priced on the measured resident step, backs exactly
         // what it claimed, the holding following: one step to every row, where
-        // the record's misses never stop falling short of them.
-        price_growth(&mut domain, &mut bindings, misses_at(4, 100));
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        // the record's misses stop falling.
+        price_growth(&mut domain, &mut bindings, misses_at(3, 100));
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
         assert!(matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 4, grown, .. } if grown == 3 * row));
-        assert_eq!(domain.grow_expert_bank(crate::planning::BankTier::Bank, unwatched()).unwrap(), BankStep::AtLimit);
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::AtLimit);
         domain.refresh_memory().unwrap();
         assert_eq!(charged(&domain), before);
     }
@@ -1536,6 +1581,10 @@ fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
         fastest: 0.0,
         fluctuation: Fluctuation::default(),
         host: false,
+        grant_left: None,
+        borrowable: None,
+        takes: 0,
+        first: std::time::Instant::now(),
     };
     let mut pace = MemoryPace::new();
     pace.domains.insert(short, domain(7 * GB));
@@ -1627,6 +1676,10 @@ fn the_wait_bound_is_the_reserve_between_the_lines_at_the_fastest_taking() {
         fastest,
         fluctuation: Fluctuation::default(),
         host: false,
+        grant_left: None,
+        borrowable: None,
+        takes: 0,
+        first: std::time::Instant::now(),
     };
     assert_eq!(domain(DomainRole::Allocation, 1e9).wait_bound(), Some(8.0));
     assert_eq!(domain(DomainRole::Allocation, 0.0).wait_bound(), None);
@@ -1658,6 +1711,10 @@ fn a_serving_load_measures_the_hosts_motion_and_its_release_latency() {
         fastest,
         fluctuation: Fluctuation { settled: None, largest: fluctuation },
         host,
+        grant_left: None,
+        borrowable: None,
+        takes: 0,
+        first: Instant::now(),
     };
     let none = PaceMotions { host: None, device: None, latency: None, release: None };
     let mut pace = MemoryPace::new();
@@ -2984,4 +3041,48 @@ fn selected_histories_follow_blocks_across_rollback() {
         bindings = returned;
     }
     assert_eq!(blocks(&domain, source), 4);
+}
+
+/// The supply a settle reads from the latest probe: free room above the
+/// planning line, the shortfall below it owed, borrowed room up to the
+/// line borrowing is held within, at no price while no other program was
+/// seen asking and at `takes / (elapsed × fastest)` once one was, and the
+/// grant's hard limit where one bounds the store.
+#[test]
+fn the_supply_reads_the_latest_probe() {
+    const GB: u64 = 1_000_000_000;
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let now = Instant::now();
+    let pace_of = |headroom: u64, takes: u32| DomainPace {
+        role: DomainRole::Allocation,
+        headroom,
+        thresholds: crate::platform::DomainThresholds { planning_bytes: 2 * GB, emergency_bytes: GB },
+        charged: 0,
+        band: if headroom > 2 * GB { MemoryBand::Normal } else { MemoryBand::Reclaim },
+        unseen: 0,
+        witness: None,
+        available: 0,
+        base: (now, 0),
+        rate: 0.0,
+        fastest: 4.0 * GB as f64,
+        fluctuation: Fluctuation::default(),
+        host: true,
+        grant_left: Some(30 * GB),
+        borrowable: Some(20 * GB),
+        takes,
+        first: now - Duration::from_secs(10),
+    };
+    let mut pace = MemoryPace::new();
+    pace.reading_interval = Duration::from_millis(100);
+    pace.read = Some(now);
+    pace.domains.insert(store, pace_of(5 * GB, 0));
+    let supply = pace.supply(store, 0, Duration::from_secs(60)).unwrap();
+    assert_eq!((supply.free, supply.owed, supply.borrowable, supply.ceiling), (3 * GB, 0, 15 * GB, 30 * GB));
+    assert_eq!(supply.borrow_price, 0.0, "no ask seen: borrowing harms no one");
+    assert_eq!(supply.horizon, Duration::from_secs(60));
+    // Two asks in 10 s, at 4 GB a second.
+    pace.domains.insert(store, pace_of(GB + GB / 2, 2));
+    let short = pace.supply(store, 0, Duration::from_secs(60)).unwrap();
+    assert_eq!((short.free, short.owed), (0, GB / 2));
+    assert!((short.borrow_price - 2.0 / (10.0 * 4.0 * GB as f64)).abs() < 1e-24);
 }

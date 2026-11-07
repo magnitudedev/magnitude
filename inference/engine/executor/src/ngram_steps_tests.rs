@@ -153,7 +153,7 @@ fn an_ngram_decoder_steps_on_host_and_selected_tokens() {
     let (directory, definition, package) = fixture("ngram-steps");
     let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
-        let (mut domain, mut bindings, _) =
+        let (mut domain, mut bindings, _, _) =
             load(&catalog, &definition, &package, backend, limits(2, true, 1, 0), Banked::Resident);
         let request = RequestId(1);
         domain
@@ -211,7 +211,7 @@ fn a_streamed_decoder_steps_twice_through_its_bank() {
     let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
         let selections = |banked| {
-            let (mut domain, mut bindings, _) = load(&catalog, &definition, &package, backend, limits(2, false, 1, 0), banked);
+            let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, false, 1, 0), banked);
             let request = RequestId(1);
             domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
             domain.open_state(&mut bindings, request, None).unwrap();
@@ -538,7 +538,7 @@ fn scores(
         .expect("the fixture's routed layers are gated");
     let mut scores = Vec::new();
     for banked in [Banked::Resident, banked] {
-        let (mut domain, mut bindings, _) = load(catalog, definition, package, backend, limits(2, false, 1, 1), banked);
+        let (mut domain, mut bindings, _, pricing) = load(catalog, definition, package, backend, limits(2, false, 1, 1), banked);
         let plan = domain.expert_bank_plan();
         let whole = plan.map(crate::ExpertBankPlan::whole);
         match banked {
@@ -568,7 +568,7 @@ fn scores(
         }
         if site || device_landed {
             domain
-                .measure_experts(test_measures(&domain, site, device_landed), &mut bindings)
+                .measure_load(test_measures(&domain, &pricing, site, device_landed), &mut bindings)
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
         }
         let request = RequestId(1);
@@ -612,8 +612,9 @@ fn scores(
     Scores { resident, banked, sited, site }
 }
 
-/// What a test's banked load is priced on, every other input pending, as a
-/// first load's are. A `sited` load's lines are each streamed layer's the
+/// What a test's banked load is priced on: its costs and the pass they
+/// price (`Pricing::measures`), every other input pending, as a first
+/// load's are. A `sited` load's lines are each streamed layer's the
 /// reference host's at its own record (`ExpertLines::reference`), at the
 /// layer's record bytes, where a one-row miss ends on the CPU (40 µs and a
 /// 4 µs handshake) before the link's 86 µs, so the route assigns misses to
@@ -621,7 +622,7 @@ fn scores(
 /// small for a link at their own bytes to lose to a handshake. A
 /// `device_landed` load's bank groups each convert at a line far under the
 /// host's landing (`Shared::slow_host_landing`).
-fn test_measures(domain: &ExecutorDomain, sited: bool, device_landed: bool) -> crate::ExpertMeasures {
+fn test_measures(domain: &ExecutorDomain, pricing: &Pricing, sited: bool, device_landed: bool) -> crate::LoadMeasures {
     use crate::assessment::{ExpertLines, HostLines, Priced, RecordLine};
     let pending = || "not measured by the test".to_owned();
     let lines = match sited {
@@ -645,14 +646,45 @@ fn test_measures(domain: &ExecutorDomain, sited: bool, device_landed: bool) -> c
         }
         false => Priced::Pending(pending()),
     };
-    crate::ExpertMeasures {
-        lines,
-        read: Priced::Pending(pending()),
-        resident: Priced::Pending(pending()),
-        pass: Priced::Pending(pending()),
-        moves: Priced::Pending(pending()),
-        tier_copy: Priced::Pending(pending()),
-        convert,
+    pricing.measures(lines, convert)
+}
+
+/// What a test load is priced on, as a load's worker prices it once its
+/// warm-up ends (`LoadCosts::of`): the executor's costs, which every load
+/// waits for before it serves (the synthetic costs here,
+/// `assessment::synthetic::costs`), and the load's plans.
+struct Pricing {
+    definition: Rc<ModelDefinition>,
+    /// The plan before any bank.
+    resident: crate::ExecutionPlanDraft,
+    /// The plan the load runs.
+    planned: crate::ExecutionPlanDraft,
+    costs: crate::assessment::ExecutorCosts,
+}
+
+impl Pricing {
+    /// The load's measures: its costs; a banked load's experts by `lines`
+    /// and `convert`, the routed pass the costs price, and every other
+    /// input pending, as the job has not stored it.
+    fn measures(
+        &self,
+        lines: crate::assessment::Priced<std::sync::Arc<[crate::assessment::ExpertLines]>>,
+        convert: crate::assessment::Priced<Option<std::sync::Arc<[crate::assessment::RecordLine]>>>,
+    ) -> crate::LoadMeasures {
+        use crate::assessment::{ExpertPass, Priced};
+        fn pending<T>() -> Priced<T> {
+            Priced::Pending("not measured by the test".to_owned())
+        }
+        let experts = self.planned.load().expert_bank().map(|bank| crate::ExpertMeasures {
+            lines,
+            read: pending(),
+            pass: Priced::Measured(ExpertPass::of_bank(bank, self.costs.clone()).expect("the synthetic costs price the bank's pass")),
+            moves: pending(),
+            tier_copy: pending(),
+            convert,
+        });
+        let costs = crate::LoadCosts::of(&self.definition, &self.resident, &self.planned, &self.costs).map_err(|error| error.to_string());
+        crate::LoadMeasures { costs, experts }
     }
 }
 
@@ -766,7 +798,7 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     assert!(available(&catalog, cuda), "the test runs on a host with a CUDA device");
     let test = "whole-bank-shrink-records";
     let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
-    let (mut domain, mut bindings, _) = load(&catalog, &definition, &package, cuda, limits(2, false, 1, 1), Banked::Whole);
+    let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, cuda, limits(2, false, 1, 1), Banked::Whole);
     let request = RequestId(1);
     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
     domain.open_state(&mut bindings, request, None).unwrap();
@@ -822,7 +854,7 @@ fn shrunk_bank_scores_as_resident(
     // device's selection, each step claiming the successor queued behind
     // the one before (unless a shrink orphaned it), as served decode runs.
     let decode = |banked: Banked, lookahead: bool| {
-        let (mut domain, mut bindings, _) = load(catalog, &definition, &package, metal, limits(2, lookahead, 1, 1), banked);
+        let (mut domain, mut bindings, _, _) = load(catalog, &definition, &package, metal, limits(2, lookahead, 1, 1), banked);
         if matches!(banked, Banked::Whole) {
             assert_eq!(domain.expert_bank_plan().map(|bank| bank.groups().len()), Some(groups), "{test}: the bank's groups");
         }
@@ -1015,7 +1047,7 @@ fn chained_prompts(
     chain_capacity: usize,
     banked: Banked,
 ) -> (Vec<(StepBits, Option<usize>)>, u64) {
-    let (mut domain, mut bindings, pass_rows) = load(
+    let (mut domain, mut bindings, pass_rows, _) = load(
         catalog,
         definition,
         package,
@@ -1290,7 +1322,7 @@ fn load(
     backend: seismic::BackendName,
     limits: ResourceLimits,
     banked: Banked,
-) -> (ExecutorDomain, crate::StateBindings, u64) {
+) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
     // A hung step reports every owner and every thread's stack on SIGUSR1,
     // as the rig asks a job past its estimate.
     crate::diagnostics::install();
@@ -1325,21 +1357,22 @@ fn load(
         limits,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    let resident = draft.clone();
     let draft = match banked {
         Banked::Resident => draft,
         Banked::Streamed { numerator, denominator } => {
             let resident = draft.allocation_bytes(definition).unwrap();
             draft
-                .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(resident * numerator / denominator))
+                .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(resident * numerator / denominator), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
                 .into_draft()
         }
-        Banked::Whole => draft.with_bank::<crate::AssessmentMemoryCharge>(definition, None).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft(),
+        Banked::Whole => draft.with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft(),
         Banked::Half => {
-            let whole = draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, None).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft();
+            let whole = draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft();
             let bank = whole.load().expert_bank().unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
             let cap = whole.load().weight_bytes().unwrap() - bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
-            draft.with_bank::<crate::AssessmentMemoryCharge>(definition, Some(cap)).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
+            draft.with_bank::<crate::AssessmentMemoryCharge>(definition, Some(cap), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
         }
     };
     let state = ResourcePlanner::state_plan(
@@ -1408,6 +1441,7 @@ fn load(
     let pass_rows = target_graphs.pass_rows();
     programs.install_target_graphs(target_graphs);
     programs.install_target_readout_graphs(target_readout_graphs);
+    let planned = draft.clone();
     let execution = Rc::new(draft.admit(resources_plan).unwrap());
     let identity = ResourceDomainId::new("ngram-steps").unwrap();
     let programs = Rc::new(programs);
@@ -1441,7 +1475,7 @@ fn load(
         device,
     )
     .unwrap();
-    let (domain, bindings) = ExecutorDomain::new(
+    let (mut domain, mut bindings) = ExecutorDomain::new(
         execution,
         definition.clone(),
         heap,
@@ -1454,7 +1488,16 @@ fn load(
         None,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    (domain, bindings, pass_rows)
+    // As a load ends: priced on the costs it waited for, then serving, its
+    // memory read as the owner reads it before its first round.
+    let pricing = Pricing { definition: definition.clone(), resident, planned, costs: crate::assessment::synthetic::costs() };
+    let pending = "not measured by the test";
+    domain
+        .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.into()), crate::assessment::Priced::Pending(pending.into())), &mut bindings)
+        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    domain.serve().unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    domain.probe_memory(std::time::Duration::from_millis(100)).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    (domain, bindings, pass_rows, pricing)
 }
 
 /// A streamed load's step whose host starves past every wait's patience
@@ -1478,7 +1521,7 @@ fn a_starved_step_is_interrupted_and_its_rerun_scores_as_unstarved() {
     let backends = [seismic::BackendName::Cuda, seismic::BackendName::Metal];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
         let limits = ResourceLimits { conversations: std::num::NonZeroUsize::new(2).unwrap(), ..limits(CHUNK_ROWS, false, 1, CHUNK_ROWS) };
-        let (mut domain, mut bindings, _) = load(&catalog, &definition, &package, backend, limits, Banked::Half);
+        let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits, Banked::Half);
         let (unstarved, starved) = (RequestId(1), RequestId(2));
         for request in [unstarved, starved] {
             domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
@@ -1565,7 +1608,7 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
     let backends = [seismic::BackendName::Cuda, seismic::BackendName::Metal];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
         let open = || load(&catalog, &definition, &package, backend, limits(rows, false, capacity, rows), Banked::Half);
-        let (mut domain, mut bindings, _) = open();
+        let (mut domain, mut bindings, _, _) = open();
         // The unstarved sequence: its prompt one chunk at a time, then two
         // decode steps.
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
@@ -1574,7 +1617,7 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
         drop(returned);
         drop(domain);
 
-        let (mut domain, mut bindings, _) = open();
+        let (mut domain, mut bindings, _, _) = open();
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
         domain.open_state(&mut bindings, request, None).unwrap();
         // The chain opens with its first chunk, which launches the rest,
@@ -1616,7 +1659,7 @@ fn a_streamed_load_dropped_with_a_running_successor_tears_down() {
         fixture_with("queued-teardown", qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
     let request = RequestId(1);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
-        let (mut domain, mut bindings, _) =
+        let (mut domain, mut bindings, _, _) =
             load(&catalog, &definition, &package, backend, limits(CHUNK_ROWS, true, 1, CHUNK_ROWS), Banked::Half);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
         domain.open_state(&mut bindings, request, None).unwrap();
@@ -1662,7 +1705,7 @@ fn a_lone_prompt_chunk_at_a_half_bank_is_finite() {
     let (chunks, rows) = ((SPLIT_CONTEXT as usize - 2) / SPLIT_CHUNK_ROWS, SPLIT_CHUNK_ROWS);
     let request = RequestId(1);
     for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
-        let (mut domain, mut bindings, _) = load(&catalog, &definition, &package, backend, limits(rows, false, chunks, rows), Banked::Half);
+        let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits(rows, false, chunks, rows), Banked::Half);
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
         domain.open_state(&mut bindings, request, None).unwrap();
         let (steps, _) = prompt_then_decode(&mut domain, bindings, request, chunks, rows, backend);

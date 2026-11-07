@@ -10,13 +10,19 @@
 //! One cache belongs to one loaded model, so artifact, tokenizer and state
 //! codec are fixed for every path it holds.
 //!
-//! The cache prices no entry itself: it bounds the entry count, holds entries
-//! only while the state every holder occupies stays within the state the
-//! memory plan charges its workload (measured by the owner, see
-//! [`PrefixCache::release_beyond_workload`]), and supplies victim identity
-//! (least recently used, never an entry in submitted use). What an eviction
-//! releases is Seismic's charge, observed by the memory heap after the
-//! entry's state drops.
+//! The cache bounds the entry count, holds entries only while the state
+//! every holder occupies stays within the state the memory plan charges its
+//! workload (measured by the owner, see
+//! [`PrefixCache::release_beyond_workload`]), and supplies victim identity:
+//! the entry worth least, never one in submitted use. An entry is worth the
+//! prefill its hits save ([`PrefixCache::held_steps`]): the tokens it holds
+//! beyond the next shorter entry a hit would fall back to, times the chance a
+//! request hits it, estimated from this cache's own lookups. Every entry's
+//! marginal state is the same (`ResourcePlan::retained_entry_bytes`), so
+//! the least valuable entry is also the least valuable per byte. What an
+//! eviction releases is Seismic's charge, observed by the memory heap after
+//! the entry's state drops.
+use crate::workload::WorkloadRates;
 use magnitude_executor::ResourcePlan;
 use magnitude_family_contracts::{InputLayout, TokenId};
 use magnitude_generation::{Generation, MethodCheckpoint, MethodChoice};
@@ -209,6 +215,10 @@ pub struct CachedPrefix<S> {
     conditioning: Vec<String>,
     last_use: u64,
     submitted: usize,
+    /// The cache's lookups when the entry was retained, and the lookups
+    /// since that hit it: what its hit chance is estimated from.
+    lookups_at_retain: u64,
+    hits: u64,
 }
 
 impl<S> CachedPrefix<S> {
@@ -232,7 +242,18 @@ pub struct PrefixCache<S> {
     capacity: PrefixCacheCapacity,
     clock: u64,
     next_id: u64,
+    /// Every lookup the cache answered, hit or miss.
+    lookups: u64,
     entries: Vec<CachedPrefix<S>>,
+}
+
+/// A cached entry as the memory heap prices it: its marginal state and the
+/// serving seconds a second its hits save.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrefixStep {
+    pub id: u64,
+    pub bytes: u64,
+    pub seconds_per_second: f64,
 }
 
 impl<S> PrefixCache<S> {
@@ -241,6 +262,7 @@ impl<S> PrefixCache<S> {
             capacity,
             clock: 0,
             next_id: 1,
+            lookups: 0,
             entries: Vec::new(),
         }
     }
@@ -277,12 +299,17 @@ impl<S> PrefixCache<S> {
     /// entries below position `bound` qualify: a resumed request must still
     /// compute the row it samples from.
     pub fn lookup(&mut self, path: PrefixPath, bound: usize) -> Result<Option<PrefixHit>, String> {
+        self.lookups = self
+            .lookups
+            .checked_add(1)
+            .ok_or("prefix cache lookup count exhausted")?;
         let Some(index) = self.best(path, bound) else {
             return Ok(None);
         };
         let last_use = self.tick()?;
         let entry = &mut self.entries[index];
         entry.last_use = last_use;
+        entry.hits += 1;
         Ok(Some(PrefixHit {
             id: entry.id,
             position: entry.position(),
@@ -396,6 +423,8 @@ impl<S> PrefixCache<S> {
             conditioning,
             last_use,
             submitted: 0,
+            lookups_at_retain: self.lookups,
+            hits: 0,
         });
         while self.entries.len() > self.capacity.max_entries {
             if !self.evict_one_except(id) {
@@ -440,7 +469,7 @@ impl<S> PrefixCache<S> {
         Ok(())
     }
 
-    /// Capacity-ladder rung zero: drop the least-recently-used entry without
+    /// Capacity-ladder rung zero: drop the entry worth least without
     /// submitted uses, preferring one no live request holds (`held`, see
     /// [`Self::held`]): such an entry's rows are the holders' own, so
     /// dropping it releases only its bank and loses the prefix they resume
@@ -457,9 +486,22 @@ impl<S> PrefixCache<S> {
         }
     }
 
+    /// Drop the entry `id` a settle of the memory heap released
+    /// ([`Self::held_steps`]): whether it was still cached without
+    /// submitted uses.
+    pub fn evict(&mut self, id: u64) -> bool {
+        match self.entries.iter().position(|entry| entry.id == id && entry.submitted == 0) {
+            Some(index) => {
+                self.entries.remove(index);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Hold cached prefixes within the state the memory plan charges: while
     /// `occupied` (the state every holder occupies, these entries included)
-    /// exceeds it, drop the least-recently-used entry without submitted uses,
+    /// exceeds it, drop the entry worth least without submitted uses,
     /// sparing the
     /// [`CONVERSATION_CHECKPOINTS`](magnitude_executor::CONVERSATION_CHECKPOINTS)
     /// the plan charges the latest
@@ -483,7 +525,7 @@ impl<S> PrefixCache<S> {
         self.unspared(held).is_some()
     }
 
-    /// Drop the least-recently-used entry beyond the latest conversation's
+    /// Drop the entry worth least beyond the latest conversation's
     /// checkpoints and in no submitted use: what retained state gives back
     /// before it would make the stores grow past the workload the plan
     /// charges. An entry a live request holds (`held`, see [`Self::held`])
@@ -504,15 +546,87 @@ impl<S> PrefixCache<S> {
         self.victim(|entry| !spared.contains(&entry.id) && !held.contains(&entry.id))
     }
 
-    /// The least-recently-used entry without submitted uses that `eligible`
-    /// admits.
+    /// The entry worth least ([`Self::worth`]) without submitted uses that
+    /// `eligible` admits; of equal worth, the least recently used.
     fn victim(&self, eligible: impl Fn(&CachedPrefix<S>) -> bool) -> Option<usize> {
         self.entries
             .iter()
             .enumerate()
             .filter(|(_, entry)| entry.submitted == 0 && eligible(entry))
-            .min_by_key(|(_, entry)| entry.last_use)
-            .map(|(index, _)| index)
+            .map(|(index, entry)| (index, self.worth(index), entry.last_use))
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.2.cmp(&b.2)))
+            .map(|(index, _, _)| index)
+    }
+
+    /// The prefill tokens entry `index` saves a request, in expectation:
+    /// the tokens it holds beyond the deepest shorter entry on its path that
+    /// a hit would fall back to ([`Self::saved_tokens`]), times its chance of
+    /// a hit per lookup. The chance is Laplace's estimate from the lookups
+    /// since it was retained, `(hits + 1) / (lookups + 2)`: an entry no
+    /// lookup has seen yet is as likely hit as not, and each lookup that
+    /// misses it lowers it.
+    fn worth(&self, index: usize) -> f64 {
+        let entry = &self.entries[index];
+        let lookups = self.lookups - entry.lookups_at_retain;
+        let chance = (entry.hits + 1) as f64 / (lookups + 2) as f64;
+        self.saved_tokens(index) as f64 * chance
+    }
+
+    /// The tokens entry `index` holds beyond the deepest other entry a hit
+    /// on its path would resume from instead: one retained under the same
+    /// method, at least [`MIN_PREFIX_HIT`] deep, whose path is a prefix of
+    /// its own.
+    fn saved_tokens(&self, index: usize) -> usize {
+        let entry = &self.entries[index];
+        let fallback = self
+            .entries
+            .iter()
+            .filter(|other| {
+                other.id != entry.id
+                    && other.position() >= MIN_PREFIX_HIT
+                    && other.position() < entry.position()
+                    && std::mem::discriminant(&other.method) == std::mem::discriminant(&entry.method)
+                    && entry.tokens.starts_with(&other.tokens)
+                    && entry.conditioning.starts_with(&other.conditioning)
+            })
+            .map(CachedPrefix::position)
+            .max()
+            .unwrap_or(0);
+        entry.position() - fallback
+    }
+
+    /// Every entry without submitted uses that no live request holds
+    /// (`held`: dropping one of those releases only its bank, its rows
+    /// being the holders') as the memory heap prices it, the least
+    /// valuable first: each holds `entry_bytes` of marginal state
+    /// (`ResourcePlan::retained_entry_bytes`), and saves its expected
+    /// tokens ([`Self::worth`]) at the load's prefill rate on each of its
+    /// requests.
+    pub fn held_steps(&self, entry_bytes: u64, rates: &WorkloadRates, held: &BTreeSet<u64>) -> Vec<PrefixStep> {
+        // Prefill seconds a token, times requests a second: what one token
+        // saved per request is worth a second. A load that has timed no
+        // prefill yet (one without an expert bank meters from nothing)
+        // knows no prefill speed, and a token saves nothing known.
+        let token = match rates.prefill_tokens_per_s {
+            speed if speed > 0.0 => rates.requests_per_s / speed,
+            _ => 0.0,
+        };
+        let mut steps: Vec<(PrefixStep, u64)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.submitted == 0 && !held.contains(&entry.id))
+            .map(|(index, entry)| {
+                let step = PrefixStep {
+                    id: entry.id,
+                    bytes: entry_bytes,
+                    seconds_per_second: self.worth(index) * token,
+                };
+                (step, entry.last_use)
+            })
+            .collect();
+        steps.sort_by(|a, b| a.0.seconds_per_second.total_cmp(&b.0.seconds_per_second).then(a.1.cmp(&b.1)));
+        steps.into_iter().map(|(step, _)| step).collect()
     }
 
     /// The checkpoints the plan charges the most recently cached
@@ -996,8 +1110,11 @@ mod tests {
         assert!(lookup_any(&mut cache, &first).is_some());
     }
 
+    /// Nested entries on one path: the shallowest saves its whole prefix,
+    /// each deeper one only its tokens beyond the one below, so the deeper
+    /// one saving least goes first, not the oldest.
     #[test]
-    fn eviction_drops_least_recent_states_and_keeps_submitted_ones() {
+    fn eviction_drops_the_least_valuable_states_and_keeps_submitted_ones() {
         let mut cache = PrefixCache::new(capacity(8));
         let owned = text(100, "artifact");
         for position in [64, 80, 100] {
@@ -1011,15 +1128,62 @@ mod tests {
         assert_eq!(cache.len(), 3);
         assert!(cache.evict_one(&BTreeSet::new()));
         assert_eq!(cache.len(), 2);
-        assert!(!referenced(1064));
-        assert!(referenced(1080) && referenced(1100));
+        assert!(!referenced(1080), "80 saves 16 tokens beyond 64; 100 saves 20, 64 saves 64");
+        assert!(referenced(1064) && referenced(1100));
         let hit = lookup_any(&mut cache, &owned).unwrap();
         assert_eq!(hit.position(), 100);
         cache.begin_submitted(hit.id()).unwrap();
         cache.evict_all();
         assert_eq!(cache.len(), 1);
-        assert!(!referenced(1080) && referenced(1100));
+        assert!(!referenced(1064) && referenced(1100));
         assert!(!cache.evict_one(&BTreeSet::new()));
+    }
+
+    /// An entry requests keep hitting outlasts a newer one lookups keep
+    /// missing: the cache keeps what saves prefill, not what was used last.
+    #[test]
+    fn eviction_follows_what_hits_save_not_recency() {
+        let mut cache = PrefixCache::new(capacity(2));
+        let hit = text(64, "hit");
+        let missed = text(64, "missed");
+        assert!(retain(&mut cache, &hit, 64, rows(0..64)));
+        for _ in 0..3 {
+            assert!(lookup_any(&mut cache, &hit).is_some());
+        }
+        assert!(retain(&mut cache, &missed, 64, rows(100..164)));
+        for _ in 0..4 {
+            assert!(lookup_any(&mut cache, &text(64, "other")).is_none());
+        }
+        assert!(retain(&mut cache, &text(64, "new"), 64, rows(200..264)));
+        assert!(!referenced(100), "the newer entry no lookup hit went");
+        assert!(referenced(0) && referenced(200));
+    }
+
+    /// The heap's view: entries least valuable first, each worth its
+    /// expected tokens at the load's prefill rate on each of its requests.
+    #[test]
+    fn held_steps_price_entries_least_valuable_first() {
+        let mut cache = PrefixCache::new(capacity(8));
+        let owned = text(100, "path");
+        assert!(retain(&mut cache, &owned, 64, rows(0..64)));
+        assert!(retain(&mut cache, &owned, 100, rows(0..100)));
+        let rates = WorkloadRates {
+            decode_steps_per_s: 10.0,
+            prefill_tokens_per_s: 1000.0,
+            requests_per_s: 0.5,
+            vision_uses_per_s: 0.0,
+        };
+        let steps = cache.held_steps(7, &rates, &BTreeSet::new());
+        assert_eq!(steps.len(), 2);
+        assert!(steps.iter().all(|step| step.bytes == 7));
+        // 100 saves 36 tokens beyond 64, 64 saves 64; each as likely hit as not.
+        let expected = |tokens: f64| tokens * 0.5 * 0.5 / 1000.0;
+        assert!((steps[0].seconds_per_second - expected(36.0)).abs() < 1e-12);
+        assert!((steps[1].seconds_per_second - expected(64.0)).abs() < 1e-12);
+        // An entry a live request holds is not the heap's to release.
+        let held = BTreeSet::from([steps[0].id]);
+        assert_eq!(cache.held_steps(7, &rates, &held).iter().map(|step| step.id).collect::<Vec<_>>(), [steps[1].id]);
+        assert!(cache.evict(steps[1].id) && !cache.evict(steps[1].id));
     }
 
     #[test]

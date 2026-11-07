@@ -7,7 +7,7 @@
 //! measured kernel costs).
 
 use super::demand::DecodeDemand;
-use super::estimate::{estimate_decode, performance_depths, PerformanceEstimate, Pricing};
+use super::estimate::{estimate_decode, form_seconds, launch_seconds, performance_depths, PerformanceEstimate, Pricing};
 use super::executor_costs::ExecutorCosts;
 use super::launches::Declarations;
 use super::misses::HeldSlots;
@@ -215,6 +215,10 @@ pub struct ExecutionShortfall {
 /// memory charge.
 pub struct PreparedExecutionAssessment {
     demand: DecodeDemand,
+    /// Of a plan that banks its experts, its demand holding them whole: the
+    /// resident form its decode runs while its bank holds every expert. None
+    /// of a plan that holds them whole, whose own demand is that form.
+    whole: Option<DecodeDemand>,
     fit_context_tokens: u32,
     charge: AssessmentMemoryCharge,
     /// The charges planning's search made, which a fit's search of the
@@ -228,6 +232,15 @@ impl PreparedExecutionAssessment {
         &self.demand
     }
 
+    /// The plan's decode step at `depth` over `sequences` sequences in each
+    /// form ([`form_seconds`]): its experts held whole, and as the plan holds
+    /// them. A plan prepared whole has no streamed form of its own: a fit
+    /// that streams it plans its bank anew (`assess_execution_fit`), and its
+    /// streamed form is priced as its resident one.
+    pub fn form_seconds(&self, pricing: &Pricing<'_>, sequences: u64, depth: u32) -> Result<super::FormSeconds, AssessmentError> {
+        form_seconds(self.whole.as_ref().unwrap_or(&self.demand), &self.demand, pricing, sequences, depth)
+    }
+
     /// The checked header and graph charge, shared with physical finalization.
     pub fn memory_charge(&self) -> &AssessmentMemoryCharge {
         &self.charge
@@ -235,7 +248,8 @@ impl PreparedExecutionAssessment {
 }
 
 /// Perform model-specific arithmetic while the fixed generic basis is
-/// measured: the plain decode step's demand ([`decode_demand`]) beside the
+/// measured: the plain decode step's demand ([`decode_demand`]), and of a
+/// plan that banks its experts its demand holding them whole, beside the
 /// memory charge planning confirmed of the draft ([`ChargedDraft`]).
 pub fn prepare_execution_assessment<C: HeldCharge>(
     definition: &ModelDefinition,
@@ -250,8 +264,14 @@ pub fn prepare_execution_assessment<C: HeldCharge>(
     }
     let fit_context_tokens = u32::try_from(crate::planning::fit_depth(definition))
         .map_err(|_| AssessmentError::Memory("fit depth exceeds u32".into()))?;
+    let draft = planned.draft();
+    let whole = match draft.load().expert_bank() {
+        Some(_) => Some(decode_demand(definition, &draft.held_whole(definition)?)?),
+        None => None,
+    };
     Ok(PreparedExecutionAssessment {
-        demand: decode_demand(definition, planned.draft())?,
+        demand: decode_demand(definition, draft)?,
+        whole,
         fit_context_tokens,
         charge: *planned.charge(),
         held: planned.held().charges(),
@@ -525,14 +545,13 @@ pub fn assess_execution_fit(
     topology: &DeviceTopology,
     status: &Status,
     request: &AssessmentRequest,
+    prices: &crate::assessment::Priced<crate::PlanPrices>,
 ) -> Result<ExecutionAssessment, AssessmentError> {
     let device = planned_executor(draft, topology)?;
-    let fit_of = |charge: &AssessmentMemoryCharge| {
-        charge
-            .assess_fit(topology, device, status, &request.reserves)
-            .map_err(AssessmentError::Memory)
-    };
-    let fit = fit_of(&prepared.charge)?;
+    // The plan is confirmed as a load's plan of it is (`StableRoom::fit`),
+    // and settles into the same room.
+    let room = crate::planning::StableRoom { topology, executor: device, status, reserves: &request.reserves };
+    let fit = room.fit(draft, &prepared.charge)?;
     let (limiting, deficit_bytes) = match fit.verdict {
         AssessmentFitVerdict::Fits => {
             return Ok(ExecutionAssessment::Fits(ExecutionFit {
@@ -546,26 +565,19 @@ pub fn assess_execution_fit(
             deficit_bytes,
         } => (limiting, deficit_bytes),
     };
-    let allocation = fit
-        .domains
-        .iter()
-        .find(|domain| domain.role == DomainRole::Allocation)
-        .ok_or_else(|| AssessmentError::Memory("the fit reaches no allocation domain".into()))?;
-    let bound = allocation.capacity_bytes - allocation.reserve_bytes;
+    // The settle grants into the allocation domain's stable fit, as the
+    // load's plan does (`ExecutionPlanDraft::with_bank`); every other store
+    // `Fit` places the plan in is its confirm's.
+    let bound = fit.settle_bound().map_err(AssessmentError::Memory)?;
     let confirm = |candidate: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge| {
-        // A bank beyond its floor leaves its prompt groups' class room, as
-        // a load's plan does (`ExecutionPlanDraft::with_bank`).
-        let fit = match candidate.beyond_floor() {
-            true => fit_of(&charge.clone().with_group_class().map_err(AssessmentError::Memory)?)?,
-            false => fit_of(charge)?,
-        };
+        let fit = room.fit(candidate, charge)?;
         Ok::<_, AssessmentError>(match fit.verdict {
             AssessmentFitVerdict::Fits => Ok((prepared.fit_context_tokens, fit.domains)),
             AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
         })
     };
     let mut held = prepared.held.clone();
-    Ok(match draft.with_held_experts(definition, bound, &mut held, confirm)? {
+    Ok(match draft.with_held_experts(definition, bound, prices, &mut held, room, confirm)? {
         Ok((held, (fit_context_tokens, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains,
@@ -578,6 +590,28 @@ pub fn assess_execution_fit(
             deficit_bytes,
         }),
     })
+}
+
+/// A banked plan's launch of some rows at some depth in each form
+/// ([`crate::DecodeStep`]): `resident`'s demand, the plan holding its
+/// experts whole, and `banked`'s, the plan as it banks them, whose streamed
+/// layers decode in their streamed form ([`decode_demand`]), each on
+/// `costs` under `resident`'s lookahead, which the two share; a decode step
+/// within the decode row classes, a prefill launch beyond
+/// ([`launch_seconds`]).
+pub fn decode_step(
+    definition: &ModelDefinition,
+    resident: &ExecutionPlanDraft,
+    banked: &ExecutionPlanDraft,
+    costs: ExecutorCosts,
+) -> Result<Box<crate::DecodeStep>, AssessmentError> {
+    let (whole, streamed) = (decode_demand(definition, resident)?, decode_demand(definition, banked)?);
+    let lookahead = decode_pricing(resident, &costs).lookahead;
+    Ok(Box::new(move |rows, depth| {
+        let pricing = Pricing { costs: &costs, lookahead };
+        let launch = |demand| launch_seconds(demand, &pricing, u64::from(rows), depth).map(|launch| launch.total());
+        Ok(super::FormSeconds { resident: launch(&whole)?, streamed: launch(&streamed)? })
+    }))
 }
 
 /// What the draft's decode is priced with on `costs`: its resolved
@@ -695,6 +729,7 @@ pub(crate) mod tests {
             &environment.topology,
             &environment.status,
             request,
+            &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()),
         )
         .unwrap()
     }
@@ -793,6 +828,7 @@ pub(crate) mod tests {
             &environment.topology,
             &environment.status,
             &request,
+            &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()),
         )
         .is_ok());
     }
