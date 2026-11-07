@@ -235,7 +235,7 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
             volume: taken.volume.id,
             offset: piece.start,
             bytes: piece.end - piece.start,
-            window: if taken.due { taken.volume.shape.due } else { taken.volume.shape.knee },
+            window: if taken.standing.due() { taken.volume.shape.due } else { taken.volume.shape.knee },
             since: Instant::now(),
         });
         // A panic is the request's, whose observer resumes it: the worker serves

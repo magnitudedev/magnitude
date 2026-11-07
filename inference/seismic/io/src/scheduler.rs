@@ -30,22 +30,72 @@ use engine::engine;
 /// while `λ · D` (≈ 790 KB) exceeds the gap read.
 const COALESCE_GAP: u64 = 128 * 1024;
 
-/// When a request's consumer would wait from: an instant, or none (a load
-/// or a fill, which no consumer waits on at any instant), after every
-/// dated one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// When a request's consumer would wait from, and how: an instant a step
+/// waits on it parked, an instant from which a stream consumes it at the
+/// link's rate (a prompt group's conveyor, which keeps the link at its due
+/// depth and parks on no single read), or none (a load or a fill, which no
+/// consumer waits on at any instant), after every dated one. Of one
+/// instant, a parked wait orders first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Deadline {
-    At(Instant),
+    Parked(Instant),
+    Streamed(Instant),
     None,
+}
+
+impl Deadline {
+    /// Its instant, and whether a stream rather than a parked step waits:
+    /// what it orders by, `None` after every instant.
+    fn key(&self) -> Option<(Instant, bool)> {
+        match *self {
+            Self::Parked(at) => Some((at, false)),
+            Self::Streamed(at) => Some((at, true)),
+            Self::None => None,
+        }
+    }
+}
+
+impl Ord for Deadline {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.key(), other.key()) {
+            (Some(left), Some(right)) => left.cmp(&right),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
+    }
+}
+
+impl PartialOrd for Deadline {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// How a request stands with its consumer at an instant ("Order and
+/// depth"): a step waits on it parked, a stream consumes it at the link's
+/// rate, or none waits yet (read ahead).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Standing {
+    Parked,
+    Streamed,
+    Ahead,
+}
+
+impl Standing {
+    /// Whether a consumer waits on it: due.
+    pub(crate) fn due(self) -> bool {
+        self != Self::Ahead
+    }
 }
 
 /// What a request is for, as its link orders it ("Order and depth"): its
 /// deadline, and its value, the step time it is expected to save, in
 /// seconds (a read ahead right with probability `p` saves its bytes' time
 /// at the volume's rate, `p · b/R`), which only orders requests of one
-/// deadline. A request is **due** once
-/// its deadline has come: a consumer waits on it now. More urgent orders
-/// first: the earlier deadline, then the greater value.
+/// deadline. A request is **due** once its deadline has come: a consumer
+/// waits on it now, a step parked or a stream at the link's rate. More
+/// urgent orders first: the earlier deadline, then the greater value.
 #[derive(Clone, Copy, Debug)]
 pub struct Want {
     deadline: Deadline,
@@ -53,14 +103,20 @@ pub struct Want {
 }
 
 impl Want {
-    /// Due now: a consumer waits on it.
+    /// Due now, a step parked on it.
     pub fn now() -> Self {
         Self::at(Instant::now(), 0.)
     }
 
-    /// Wanted from `deadline`, worth `value`.
+    /// A step parks on it from `deadline`; worth `value`.
     pub fn at(deadline: Instant, value: f64) -> Self {
-        Self::new(Deadline::At(deadline), value)
+        Self::new(Deadline::Parked(deadline), value)
+    }
+
+    /// Due now, consumed by a stream at the link's rate: a prompt group's
+    /// read, which holds back nothing read ahead ("Order and depth").
+    pub fn streamed() -> Self {
+        Self::new(Deadline::Streamed(Instant::now()), 0.)
     }
 
     /// Wanted at no instant (a load, a fill), worth `value`.
@@ -83,7 +139,16 @@ impl Want {
 
     /// Whether a consumer waits on it at `now`: its deadline has come.
     pub fn due(&self, now: Instant) -> bool {
-        matches!(self.deadline, Deadline::At(at) if at <= now)
+        self.standing(now).due()
+    }
+
+    /// How it stands at `now`.
+    pub(crate) fn standing(&self, now: Instant) -> Standing {
+        match self.deadline {
+            Deadline::Parked(at) if at <= now => Standing::Parked,
+            Deadline::Streamed(at) if at <= now => Standing::Streamed,
+            _ => Standing::Ahead,
+        }
     }
 }
 

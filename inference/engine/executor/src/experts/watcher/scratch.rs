@@ -755,7 +755,10 @@ impl Scratch {
                     }
                 };
                 let reads = core.reads_to(layer, expert, &self.conveyor, record);
-                match core.table.source().request(reads, Want::now()) {
+                // A stream's read: the group's rounds consume its conveyor
+                // at the link's rate, so it holds back no read ahead (the
+                // bank's fill) beside it.
+                match core.table.source().request(reads, Want::streamed()) {
                     Ok(ticket) => {
                         // Its end is an event: a round may await it.
                         let events = shared.events().clone();

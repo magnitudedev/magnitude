@@ -1,5 +1,5 @@
 use super::handle::{first_failures, RequestState};
-use super::{Ended, Want, COALESCE_GAP};
+use super::{Deadline, Ended, Standing, Want, COALESCE_GAP};
 use crate::accounting::{Book, Wait};
 use crate::disk::{Shape, SourceFile, VolumeReads};
 use crate::{Volume, ALIGNMENT};
@@ -129,20 +129,20 @@ pub(crate) struct Queued {
 }
 
 /// A piece a worker took, with its request (by its submission, and its
-/// state), file and volume, and whether it was due when taken.
+/// state), file and volume, and how its request stood when it was taken.
 pub(crate) struct Taken {
     pub(crate) id: u64,
     pub(crate) state: Arc<RequestState>,
     pub(crate) file: Arc<SourceFile>,
     pub(crate) volume: VolumeReads,
     pub(crate) piece: Piece,
-    pub(crate) due: bool,
+    pub(crate) standing: Standing,
 }
 
 impl Taken {
     /// This piece, its read returned at `at`, to end ([`Queue::ended`]).
     pub(crate) fn returned(&self, at: Instant) -> Returned {
-        Returned { id: self.id, volume: self.volume.id, due: self.due, bytes: self.piece.end - self.piece.start, at }
+        Returned { id: self.id, volume: self.volume.id, standing: self.standing, bytes: self.piece.end - self.piece.start, at }
     }
 }
 
@@ -151,7 +151,7 @@ impl Taken {
 pub(crate) struct Returned {
     id: u64,
     volume: Volume,
-    due: bool,
+    standing: Standing,
     bytes: u64,
     at: Instant,
 }
@@ -173,67 +173,128 @@ pub(crate) struct Queue {
 
 /// A volume's link, the one authority on what of it is in flight ("Order
 /// and depth"): its requests with pieces not yet taken, most urgent first
-/// (by [`Want`], then by submission), so its due ones lead; the bytes in
-/// flight of pieces due when taken and of those read ahead; and its book
-/// ([`crate::accounting`]).
+/// (by [`Want`], then by submission), those a stream consumes apart from
+/// the rest, so the due ones of each lead; the bytes in flight of pieces by
+/// how they stood when taken; and its book ([`crate::accounting`]).
 pub(crate) struct Link {
     requests: BTreeMap<(Want, u64), Queued>,
-    pub(crate) due: u64,
-    pub(crate) ahead: u64,
+    streamed: BTreeMap<(Want, u64), Queued>,
+    pub(crate) flight: InFlight,
     pub(crate) book: Book,
+}
+
+/// A link's bytes in flight, by how their pieces stood when taken.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct InFlight {
+    pub(crate) parked: u64,
+    pub(crate) streamed: u64,
+    pub(crate) ahead: u64,
+}
+
+impl InFlight {
+    fn of(&mut self, standing: Standing) -> &mut u64 {
+        match standing {
+            Standing::Parked => &mut self.parked,
+            Standing::Streamed => &mut self.streamed,
+            Standing::Ahead => &mut self.ahead,
+        }
+    }
+
+    /// Every byte in flight.
+    pub(crate) fn total(&self) -> u64 {
+        self.parked + self.streamed + self.ahead
+    }
 }
 
 impl Link {
     /// A link holding nothing, counted from `now`.
     fn new(now: Instant) -> Self {
-        Self { requests: BTreeMap::new(), due: 0, ahead: 0, book: Book::new(now) }
+        Self { requests: BTreeMap::new(), streamed: BTreeMap::new(), flight: InFlight::default(), book: Book::new(now) }
     }
 
-    /// Its most urgent request and whether it is due at `now`.
-    fn head(&self, now: Instant) -> Option<(&(Want, u64), &Queued, bool)> {
-        self.requests.first_key_value().map(|(key, request)| (key, request, key.0.due(now)))
+    fn map(&mut self, want: &Want) -> &mut BTreeMap<(Want, u64), Queued> {
+        match want.deadline() {
+            Deadline::Streamed(_) => &mut self.streamed,
+            Deadline::Parked(_) | Deadline::None => &mut self.requests,
+        }
     }
 
-    /// Whether its most urgent request's next piece may start at `now`.
+    /// The request whose next piece may start at `now`, and how it stands:
+    /// the more urgent of the two maps' due heads, where the due bytes in
+    /// flight leave it room; else, where no parked piece is queued, the
+    /// head read ahead, where the bytes in flight it is counted against
+    /// leave it room ([`admits`]). A due head held back at the due depth
+    /// holds back the due pieces behind it, a parked one everything read
+    /// ahead too; a streamed one holds back nothing read ahead.
+    fn next(&self, now: Instant) -> Option<((Want, u64), Standing)> {
+        let head = self.requests.first_key_value().map(|(key, request)| (*key, request, key.0.standing(now)));
+        let streamed = self.streamed.first_key_value().map(|(key, request)| (*key, request, key.0.standing(now)));
+        let due = [head, streamed].into_iter().flatten().filter(|(_, _, standing)| standing.due()).min_by_key(|(key, ..)| *key);
+        if let Some((key, request, standing)) = due {
+            if self.admits(request, standing) {
+                return Some((key, standing));
+            }
+        }
+        match head {
+            Some((key, request, Standing::Ahead)) => self.admits(request, Standing::Ahead).then_some((key, Standing::Ahead)),
+            _ => None,
+        }
+    }
+
+    fn admits(&self, request: &Queued, standing: Standing) -> bool {
+        let piece = request.pieces.front().expect("a queued request has a piece");
+        admits(self.flight, &request.volume.shape, piece.end - piece.start, standing)
+    }
+
+    /// Whether a piece of it may start at `now`.
     fn ready(&self, now: Instant) -> bool {
-        self.head(now).is_some_and(|(_, request, due)| {
-            let piece = request.pieces.front().expect("a queued request has a piece");
-            admits((self.due, self.ahead), &request.volume.shape, piece.end - piece.start, due)
-        })
+        self.next(now).is_some()
     }
 
-    /// How many of its most urgent request's pieces, in order, may start at
-    /// `now` beside what is in flight: the workers to wake for it.
+    /// How many pieces, in order, of the request [`Self::next`] names, then
+    /// of the head read ahead where nothing parked is queued, may start at
+    /// `now` beside what is in flight: the workers to wake for them.
     fn room(&self, now: Instant) -> usize {
-        let Some((_, request, due)) = self.head(now) else {
+        let Some((key, standing)) = self.next(now) else {
             return 0;
         };
-        let (mut flight, mut fits) = ((self.due, self.ahead), 0);
-        for piece in &request.pieces {
-            let bytes = piece.end - piece.start;
-            if !admits(flight, &request.volume.shape, bytes, due) {
-                break;
+        let mut flight = self.flight;
+        let mut fits = 0;
+        let mut count = |request: &Queued, standing: Standing| {
+            for piece in &request.pieces {
+                let bytes = piece.end - piece.start;
+                if !admits(flight, &request.volume.shape, bytes, standing) {
+                    break;
+                }
+                *flight.of(standing) += bytes;
+                fits += 1;
             }
-            *(if due { &mut flight.0 } else { &mut flight.1 }) += bytes;
-            fits += 1;
+        };
+        let request = self.requests.get(&key).or_else(|| self.streamed.get(&key)).expect("the request named");
+        count(request, standing);
+        if standing == Standing::Streamed {
+            if let Some((_, ahead)) = self.requests.first_key_value().filter(|(key, _)| key.0.standing(now) == Standing::Ahead) {
+                count(ahead, Standing::Ahead);
+            }
         }
         fits
     }
 }
 
-/// Whether a piece of `bytes`, due or not, may start beside `flight` (the
-/// bytes in flight of due pieces, then of those read ahead), by `shape`'s
-/// depths ("Order and depth"): a due piece while the due bytes leave it
-/// room under the due depth; a piece not due (the caller's to know that
-/// none due waits) while everything in flight leaves it room under the
-/// knee. A piece past its depth starts where nothing it is counted against
-/// is in flight.
-fn admits((due_bytes, ahead_bytes): (u64, u64), shape: &Shape, bytes: u64, due: bool) -> bool {
-    if due {
-        return due_bytes == 0 || due_bytes + bytes <= shape.due;
-    }
-    let flight = due_bytes + ahead_bytes;
-    flight == 0 || flight + bytes <= shape.knee
+/// Whether a piece of `bytes`, standing `standing`, may start beside
+/// `flight` by `shape`'s depths ("Order and depth"): a due piece while the
+/// due bytes in flight, parked and streamed, leave it room under the due
+/// depth; a piece read ahead (the caller's to know that nothing parked
+/// waits) while the parked bytes and those read ahead leave it room under
+/// the knee: a stream's bytes are its own, at the rate the stream takes.
+/// A piece past its depth starts where nothing it is counted against is in
+/// flight.
+fn admits(flight: InFlight, shape: &Shape, bytes: u64, standing: Standing) -> bool {
+    let (counted, depth) = match standing {
+        Standing::Parked | Standing::Streamed => (flight.parked + flight.streamed, shape.due),
+        Standing::Ahead => (flight.parked + flight.ahead, shape.knee),
+    };
+    counted == 0 || counted + bytes <= depth
 }
 
 /// Change request `id`'s wait by `change`, removed once `change` says it
@@ -270,7 +331,7 @@ impl Queue {
             crate::timeline::note(crate::timeline::Kind::Submit, id, (i64::from(!want.due(now)), request.pieces.len() as i64, bytes as i64));
         }
         self.wants.insert(id, (volume, want));
-        link.requests.insert((want, id), request);
+        link.map(&want).insert((want, id), request);
         (id, link.room(now))
     }
 
@@ -282,29 +343,27 @@ impl Queue {
     /// due waits.
     pub(crate) fn take(&mut self) -> Option<Taken> {
         let now = Instant::now();
-        let (volume, key, due) = self
+        let (volume, key, standing) = self
             .links
             .iter()
-            .filter(|(_, link)| link.ready(now))
-            .map(|(volume, link)| {
-                let (key, _, due) = link.head(now).expect("a ready link has a request");
-                (*volume, *key, due)
-            })
+            .filter_map(|(volume, link)| link.next(now).map(|(key, standing)| (*volume, key, standing)))
             .min_by_key(|(_, key, _)| *key)?;
         let link = self.links.get_mut(&volume).expect("a ready link");
-        let request = link.requests.get_mut(&key).expect("the chosen request");
+        let flight = link.flight.total();
+        let map = link.map(&key.0);
+        let request = map.get_mut(&key).expect("the chosen request");
         let piece = request.pieces.pop_front().expect("a queued request has a piece");
         let bytes = piece.end - piece.start;
-        crate::timeline::note_at(now, crate::timeline::Kind::Take, key.1, (piece.start as i64, bytes as i64, (link.due + link.ahead) as i64));
-        *(if due { &mut link.due } else { &mut link.ahead }) += bytes;
-        link.book.began(due, now);
-        self.waits.get_mut(&key.1).expect("a queued request is waited").taken(due, &mut link.book, now);
+        crate::timeline::note_at(now, crate::timeline::Kind::Take, key.1, (piece.start as i64, bytes as i64, flight as i64));
         request.state.started.get_or_init(|| now);
-        let taken = Taken { id: key.1, state: request.state.clone(), file: request.file.clone(), volume: request.volume.clone(), piece, due };
+        let taken = Taken { id: key.1, state: request.state.clone(), file: request.file.clone(), volume: request.volume.clone(), piece, standing };
         if request.pieces.is_empty() {
-            link.requests.remove(&key);
+            map.remove(&key);
             self.wants.remove(&key.1);
         }
+        *link.flight.of(standing) += bytes;
+        link.book.began(standing.due(), now);
+        self.waits.get_mut(&key.1).expect("a queued request is waited").taken(standing.due(), &mut link.book, now);
         Some(taken)
     }
 
@@ -320,12 +379,12 @@ impl Queue {
     /// book and its request's wait: whether the link holds a request
     /// queued, whose next piece the room it freed may admit.
     pub(crate) fn ended(&mut self, returned: Returned) -> bool {
-        let Returned { id, volume, due, bytes, at } = returned;
+        let Returned { id, volume, standing, bytes, at } = returned;
         let link = self.links.get_mut(&volume).expect("an ended piece was in flight");
-        *(if due { &mut link.due } else { &mut link.ahead }) -= bytes;
-        link.book.ended(due, bytes, at);
+        *link.flight.of(standing) -= bytes;
+        link.book.ended(standing.due(), bytes, at);
         settle(&mut self.waits, id, |wait| wait.ended(&mut link.book, at));
-        !link.requests.is_empty()
+        !(link.requests.is_empty() && link.streamed.is_empty())
     }
 
     /// Order request `id`'s pieces not yet taken by `want`: the workers to
@@ -335,10 +394,10 @@ impl Queue {
             return 0;
         };
         let link = self.links.get_mut(volume).expect("a queued request's link");
-        let request = link.requests.remove(&(*current, id)).expect("a queued request");
+        let request = link.map(current).remove(&(*current, id)).expect("a queued request");
         *current = want;
         crate::timeline::note(crate::timeline::Kind::Reprice, id, (i64::from(!want.due(Instant::now())), request.pieces.len() as i64, 0));
-        link.requests.insert((want, id), request);
+        link.map(&want).insert((want, id), request);
         link.room(Instant::now())
     }
 
@@ -347,7 +406,7 @@ impl Queue {
     pub(crate) fn cancel(&mut self, id: u64) -> Option<Queued> {
         let (volume, want) = self.wants.remove(&id)?;
         let link = self.links.get_mut(&volume).expect("a queued request's link");
-        let request = link.requests.remove(&(want, id)).expect("a queued request");
+        let request = link.map(&want).remove(&(want, id)).expect("a queued request");
         crate::timeline::note(crate::timeline::Kind::Cancel, id, (request.pieces.len() as i64, 0, 0));
         settle(&mut self.waits, id, |wait| wait.cancelled(&mut link.book, Instant::now()));
         Some(request)

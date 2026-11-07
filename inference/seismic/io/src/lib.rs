@@ -58,26 +58,36 @@
 //!
 //! A link orders its requests by want: the earlier deadline, then the
 //! greater value, then submission. A request is due once its deadline has
-//! come, so the due ones lead. Its depths come from the volume's curve ("A
-//! volume's curve"), in bytes in flight:
+//! come, so the due ones lead. A due request is waited on in one of two
+//! ways: a step **parks** on it (a decode step's miss, a hint it comes to
+//! wait on), or a **stream** consumes it at the link's rate (a prompt
+//! group's conveyor, which keeps the link at its due depth and parks on no
+//! single read). Its depths come from the volume's curve ("A volume's
+//! curve"), in bytes in flight:
 //!
-//! 1. A due piece starts whenever the due bytes in flight leave it room
-//!    under the due depth. Nothing not due starts while a due piece is
-//!    queued.
-//! 2. A piece not due starts only while none due is queued, and only while
-//!    everything in flight, due and ahead, leaves it room under the knee:
-//!    below the knee depth still adds rate, so the read ahead runs on
-//!    throughput the due reads leave unused; past it every byte more in
-//!    flight would delay a due byte, so the read ahead waits.
+//! 1. A due piece, parked or streamed, starts whenever the due bytes in
+//!    flight leave it room under the due depth.
+//! 2. A piece not due starts only while no parked piece is queued, and only
+//!    while the parked bytes in flight and those read ahead leave it room
+//!    under the knee: below the knee depth still adds rate, so the read
+//!    ahead runs on throughput the parked reads leave unused; past it every
+//!    byte more in flight would delay a parked byte, so the read ahead
+//!    waits. A stream's bytes are not counted against the knee: it takes
+//!    the rate it takes, and a read ahead beside it (a bank's fill during a
+//!    prompt) shares the device as the stream's own reads do.
+//! 3. A request held back at one depth holds back only the requests counted
+//!    against it: a due one the due pieces behind it, a parked one
+//!    everything read ahead too, a streamed one nothing read ahead.
 //!
 //! A piece past its depth starts where nothing it is counted against is in
-//! flight. So what a wrong read ahead costs a due read is bounded. One not
-//! started when its handle drops costs nothing. One that started and ended
-//! while no due read was outstanding used link time nothing was due on.
-//! One in flight when a due read arrives shares the device with it: the due
-//! read's pieces start at once (rule 1), and its extra time is at most the
-//! bytes read ahead in flight over the rate, at most the knee's, which
-//! nothing later adds to (rules 1 and 2).
+//! flight. So what a wrong read ahead costs a parked read is bounded. One
+//! not started when its handle drops costs nothing. One that started and
+//! ended while no parked read was outstanding used link time no step was
+//! parked on. One in flight when a parked read arrives shares the device
+//! with it: the parked read's pieces start at once (rule 1), and its extra
+//! time is at most the bytes read ahead in flight over the rate, at most
+//! the knee's, which nothing later adds to (rules 1 and 2). Where no stream
+//! runs (decode), these are the rules of a link with one kind of due read.
 //!
 //! # How reads share the engine
 //!

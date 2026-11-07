@@ -3,7 +3,7 @@ use crate::accounting::{Book, Wait};
 #[cfg(unix)]
 use crate::disk::drop_pages;
 use crate::disk::{full_rate, grid, Request, Shape, VolumeLines, VolumeReads, LEAST_READ, WIDEST_WINDOW};
-use crate::scheduler::{pieces, Engine, Part, Piece, Queue, Queued, RequestState, Span};
+use crate::scheduler::{pieces, Engine, Part, Piece, Queue, Queued, RequestState, Span, Standing};
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::File;
@@ -634,11 +634,11 @@ fn a_read_returning_under_a_held_lock_is_ended_by_its_next_holder() {
     let returned = taken.returned(Instant::now());
     let held = engine.queue();
     engine.read_returned(returned);
-    assert_eq!(held.links[&taken.volume.id].ahead, LEAST_READ, "ended while another held the lock");
+    assert_eq!(held.links[&taken.volume.id].flight.ahead, LEAST_READ, "ended while another held the lock");
     drop(held);
     let queue = engine.queue();
     let link = &queue.links[&taken.volume.id];
-    assert_eq!((link.ahead, link.book.requests()), (0, 1), "the next holder ended it");
+    assert_eq!((link.flight.ahead, link.book.requests()), (0, 1), "the next holder ended it");
 }
 
 /// A request whose handle drops before it is waited for is cancelled or
@@ -907,13 +907,52 @@ fn a_piece_read_ahead_never_starts_while_a_due_one_is_queued() {
     queue.push(queued_on(&link, &[(0, 4), (4, 8)]), Want::now());
     queue.push(queued_on(&link, &[(8, 10)]), ahead());
     let first = queue.take().expect("a due piece");
-    assert!(first.due);
+    assert!(first.standing.due());
     assert!(queue.take().is_none(), "a read ahead started while a due piece was queued");
     queue.ended(first.returned(Instant::now()));
     let second = queue.take().expect("the second due piece");
-    assert_eq!((second.piece.start, second.due), (4, true));
+    assert_eq!((second.piece.start, second.standing.due()), (4, true));
     let ahead = queue.take().expect("the read ahead, beside due work within the knee");
-    assert_eq!((ahead.piece.start, ahead.due), (8, false));
+    assert_eq!((ahead.piece.start, ahead.standing.due()), (8, false));
+}
+
+/// A stream's due reads hold back nothing read ahead: a prompt group's
+/// conveyor keeps its link at the due depth (4 of 4 streamed) with more
+/// queued, and a fill of 2 starts beside it under the knee (8), as its
+/// bytes are not counted against it; a second fill piece waits at the knee
+/// only once the read ahead fills it.
+#[test]
+fn a_streams_due_reads_leave_the_fill_its_knee() {
+    let link = volume(14, (4, 8), 4);
+    let mut queue = Queue::default();
+    queue.push(queued_on(&link, &[(0, 4), (4, 8)]), Want::streamed());
+    queue.push(queued_on(&link, &[(8, 12), (12, 16), (16, 18)]), Want::undated(0.));
+    let streamed = queue.take().expect("a streamed piece");
+    assert_eq!(streamed.standing, Standing::Streamed);
+    let fill = queue.take().expect("the fill beside a stream at its due depth");
+    assert_eq!((fill.piece.start, fill.standing), (8, Standing::Ahead));
+    let more = queue.take().expect("4 + 4 is the knee");
+    assert_eq!(more.piece.start, 12);
+    assert!(queue.take().is_none(), "the due depth and the knee are full");
+    queue.ended(streamed.returned(Instant::now()));
+    assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing)), Some((4, Standing::Streamed)), "due first");
+}
+
+/// A parked step's due read still holds back everything read ahead beside
+/// a stream: once a parked piece is queued behind the stream's at the due
+/// depth, no fill piece starts, though the knee holds it.
+#[test]
+fn a_parked_read_holds_the_fill_back_beside_a_stream() {
+    let link = volume(15, (4, 8), 4);
+    let mut queue = Queue::default();
+    queue.push(queued_on(&link, &[(0, 4)]), Want::streamed());
+    let streamed = queue.take().expect("a streamed piece");
+    queue.push(queued_on(&link, &[(4, 8)]), Want::now());
+    queue.push(queued_on(&link, &[(8, 10)]), Want::undated(0.));
+    assert!(queue.take().is_none(), "a fill started while a parked piece was queued");
+    queue.ended(streamed.returned(Instant::now()));
+    assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing)), Some((4, Standing::Parked)));
+    assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing)), Some((8, Standing::Ahead)), "within the knee once nothing parked is queued");
 }
 
 /// A piece read ahead starts only while everything in flight, due and
@@ -950,7 +989,7 @@ fn a_due_piece_starts_beside_a_full_knee() {
     assert!(queue.take().is_some() && queue.take().is_some());
     assert!(queue.take().is_none(), "8 of 8 read ahead");
     queue.push(queued_on(&link, &[(12, 16), (16, 20)]), Want::now());
-    assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.due)), Some((12, true)));
+    assert_eq!(queue.take().map(|taken| (taken.piece.start, taken.standing.due())), Some((12, true)));
     assert!(queue.take().is_none(), "4 of 4 due, and a due piece queued");
 }
 
@@ -967,7 +1006,7 @@ fn a_repriced_request_starts_at_its_new_depth() {
     assert_eq!(woken, 0);
     assert!(queue.take().is_none(), "past the knee");
     assert_eq!(queue.reprice(id, Want::now()), 1);
-    assert!(queue.take().is_some_and(|taken| taken.due), "within the due depth");
+    assert!(queue.take().is_some_and(|taken| taken.standing.due()), "within the due depth");
 }
 
 /// A request wakes a worker for each of its pieces its link may start:
