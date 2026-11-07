@@ -683,7 +683,7 @@ fn a_reader_reads_by_the_earlier_choice_until_the_curve_holds_its_request() {
     let curve = Curve { points: vec![point(LEAST_READ, 0.4), point(4 * LEAST_READ, 1.5), point(16 * LEAST_READ, 3.)], lone: vec![Lone { read: LEAST_READ, seconds: 1e-3, error: 1e-5 }] };
     adopt_volume(&source, Some(&urgent), &curve).unwrap();
     let probed = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap().volume.shape;
-    assert_eq!(probed, Shape::of(&curve.points, Some(&curve.lone)), "the curve, once it holds the request");
+    assert_eq!(probed, Shape::of(&curve.points, Some((&urgent, &curve.lone))), "the curve, once it holds the request");
     assert_eq!(read_cores([&source], &urgent).unwrap(), 2.);
     std::fs::remove_file(path).unwrap();
 }
@@ -771,8 +771,25 @@ fn a_links_depths_come_from_its_curve() {
     assert_eq!((shape.ahead_read, shape.knee), (2 * LEAST_READ, 2 * mib));
     let gb10 = recorded(&[(LEAST_READ, &[(1, 0.438), (16, 6.02), (32, 9.66), (64, 10.09), (128, 10.12), (256, 10.10)])]);
     let lone = [Lone { read: LEAST_READ, seconds: 0.634e-3, error: 0.02e-3 }];
-    let shape = Shape::of(&gb10, Some(&lone));
+    let expert = Urgent { parts: vec![589_824, 589_824, 720_896], records: 1 };
+    let shape = Shape::of(&gb10, Some((&expert, &lone)));
     assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (LEAST_READ, 8 * mib, LEAST_READ, 32 * mib));
+}
+
+/// A due depth holds a step's whole request: where the due size's line
+/// peaks shallower (an M4 Pro's internal drive, 1 MiB reads at 4 MiB), the
+/// request's pieces are in flight at once, never waiting on the host for
+/// another to end; one smaller than the line's full-rate window keeps that.
+#[test]
+fn a_due_depth_holds_a_steps_whole_request() {
+    let mib = 1024 * 1024;
+    let read = 8 * LEAST_READ;
+    let internal = recorded(&[(read, &[(1, 2.1), (2, 3.6), (4, 5.05), (8, 4.6), (16, 4.5), (32, 4.5)])]);
+    let lone = [Lone { read, seconds: 3.1e-3, error: 0.05e-3 }];
+    let step = Urgent { parts: vec![589_824, 589_824, 720_896], records: 8 };
+    assert_eq!(Shape::of(&internal, Some((&step, &lone))).due, 16 * mib, "eight experts' 15.2 MB whole");
+    let one = Urgent { records: 1, ..step };
+    assert_eq!(Shape::of(&internal, Some((&one, &lone))).due, 4 * mib, "the line's full-rate window holds one");
 }
 
 /// A request's due pieces are cut at the size its lone record is served
@@ -785,12 +802,12 @@ fn due_pieces_are_cut_at_the_size_a_lone_request_is_soonest() {
         (8 * LEAST_READ, &[(1, 2.), (8, 6.)]),
     ]);
     let lone = [Lone { read: LEAST_READ, seconds: 0.7e-3, error: 1e-5 }, Lone { read: 8 * LEAST_READ, seconds: 0.6e-3, error: 1e-5 }];
-    let shape = Shape::of(&points, Some(&lone));
+    let request = Urgent { parts: vec![589_824, 589_824, 720_896], records: 8 };
+    let shape = Shape::of(&points, Some((&request, &lone)));
     assert_eq!((shape.ahead_read, shape.due_read), (8 * LEAST_READ, 8 * LEAST_READ));
     let lone = [Lone { read: LEAST_READ, seconds: 0.5e-3, error: 1e-5 }, Lone { read: 8 * LEAST_READ, seconds: 0.6e-3, error: 1e-5 }];
-    assert_eq!(Shape::of(&points, Some(&lone)).due_read, LEAST_READ);
-    let urgent = Urgent { parts: vec![589_824, 589_824, 720_896], records: 8 };
-    assert_eq!(urgent.reads(), vec![LEAST_READ, 2 * LEAST_READ, 4 * LEAST_READ, 8 * LEAST_READ]);
+    assert_eq!(Shape::of(&points, Some((&request, &lone))).due_read, LEAST_READ);
+    assert_eq!(request.reads(), vec![LEAST_READ, 2 * LEAST_READ, 4 * LEAST_READ, 8 * LEAST_READ]);
     assert_eq!(Urgent { parts: vec![4096], records: 1 }.reads(), vec![LEAST_READ]);
 }
 

@@ -59,14 +59,21 @@
 //!   depth still adds rate, so a read ahead runs on throughput a due read
 //!   would leave unused; past it every byte more in flight delays a due
 //!   byte.
-//! - **The size read due:** the one a lone request is served soonest at
-//!   through the engine, its least median. Sizes within each other's noise
+//! - **The size read due:** the one a lone request, the step's whole
+//!   request ([`Urgent`]), is served soonest at through the engine, its
+//!   least median: a park waits for every piece of its request, not for its
+//!   first. Sizes within each other's noise
 //!   cost it the same, so no tie rule picks among them: one that took the
 //!   least such size by threads' timing chose 128 KiB demand reads on Mac
 //!   Metal, slower than 256 KiB through the engine (capped decode +3.4%). A
 //!   reader with no request reads due pieces at the size read ahead.
-//! - **The due depth:** the due size's widest window within the noise of
-//!   its line's best rate, at least the knee depth. Due reads only
+//! - **The due depth:** the least window holding a step's whole request,
+//!   the depth its lone time was measured at, so none of its pieces waits
+//!   on the host for another to end (Qwen3.6 on an M4 Pro's internal
+//!   drive: its 1 MiB line peaks by 4 MiB, and a 4 MiB due depth decoded
+//!   1.1% slower than 32 MiB; the read model gives +0.46 ms of the measured
+//!   +0.47); at least the due size's widest window within the noise of its
+//!   line's best rate, and the knee depth. Due reads only
 //!   share the link with due reads, so a wider window costs nothing they
 //!   would not wait for anyway, while serving lengthens each read's time in
 //!   flight, so the knee measured alone falls short of the window a served
@@ -132,6 +139,18 @@ pub struct Urgent {
 }
 
 impl Urgent {
+    /// The bytes it reads: every record's ranges.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.records * self.parts.iter().sum::<u64>()
+    }
+
+    /// The least window of a probe's grid that holds it whole, at most
+    /// [`WIDEST_WINDOW`]: the due depth at which every piece it is cut
+    /// into is in flight at once.
+    fn whole(&self) -> u64 {
+        self.bytes().max(LEAST_READ).next_power_of_two().min(WIDEST_WINDOW)
+    }
+
     /// The read sizes it is probed at: from [`LEAST_READ`] doubling to the
     /// least that holds its widest range, past which a read reads nothing
     /// more of a record, or to [`WIDEST_WINDOW`], past which no window of
@@ -187,8 +206,9 @@ impl Point {
 
 }
 
-/// A lone record's time through the engine in pieces of `read` bytes: the
-/// median seconds of its rounds and that median's standard error.
+/// A lone request's time through the engine in pieces of `read` bytes, the
+/// whole of what a step's request reads ([`Urgent`]): the median seconds of
+/// its rounds and that median's standard error.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Lone {
     pub read: u64,
@@ -220,7 +240,7 @@ impl VolumeLines {
         let points = self.lines.values().flat_map(|(_, points)| points.iter().copied()).collect::<Vec<_>>();
         match self.requests.get(&urgent.cloned()) {
             Some(Adopted::Earlier(earlier)) => earlier.shape(),
-            Some(Adopted::Curve(lone)) => Shape::of(&points, urgent.map(|_| lone.as_slice())),
+            Some(Adopted::Curve(lone)) => Shape::of(&points, urgent.map(|urgent| (urgent, lone.as_slice()))),
             None if points.is_empty() => Shape::PENDING,
             None => Shape::of(&points, None),
         }
@@ -263,7 +283,7 @@ impl VolumeLines {
         let lone = match urgent {
             Some(urgent) => {
                 let reads = urgent.reads();
-                let seconds = lone(key, file, &urgent.parts, &reads)?;
+                let seconds = lone(key, file, urgent, &reads)?;
                 reads.iter().zip(&seconds).map(|(&read, seconds)| Lone { read, seconds: median(seconds), error: median_error(seconds) }).collect()
             }
             None => Vec::new(),
@@ -299,10 +319,11 @@ impl VolumeLines {
 }
 
 impl Shape {
-    /// How a volume of `points` is read ("A volume's curve"), its due pieces
-    /// at the size `lone` serves a request soonest at (none: no request, at
-    /// the size read ahead).
-    pub(crate) fn of(points: &[Point], lone: Option<&[Lone]>) -> Self {
+    /// How a volume of `points` is read ("A volume's curve"): for a request
+    /// (`urgent`, its lone times `lone`), its due pieces at the size it is
+    /// read whole soonest at, at a depth holding it whole; with none, at the
+    /// size read ahead.
+    pub(crate) fn of(points: &[Point], request: Option<(&Urgent, &[Lone])>) -> Self {
         let top = *points.iter().max_by(|a, b| a.rate.total_cmp(&b.rate)).expect("a probed point");
         let at_best = |point: &Point| point.rate + point.spread + top.spread >= top.rate;
         let line = |read: u64| {
@@ -319,13 +340,13 @@ impl Shape {
             .filter_map(|&read| line(read).iter().find(|point| at_best(point)).map(|knee| (read, knee.window)))
             .min_by_key(|&(read, knee)| (knee, std::cmp::Reverse(read)))
             .expect("the best point reaches its own rate");
-        let due_read = lone.and_then(|lone| lone.iter().min_by(|a, b| a.seconds.total_cmp(&b.seconds))).map_or(ahead_read, |soonest| soonest.read);
+        let due_read = request.and_then(|(_, lone)| lone.iter().min_by(|a, b| a.seconds.total_cmp(&b.seconds))).map_or(ahead_read, |soonest| soonest.read);
         let due_line = line(due_read);
         let full = full_rate(&due_line);
         let ahead_line = line(ahead_read);
         let cores_at = |line: &[Point], window: u64| line.iter().filter(|point| point.window <= window).map(|point| point.cores).fold(0., f64::max);
         Self {
-            due: full.window.max(knee),
+            due: full.window.max(knee).max(request.map_or(0, |(urgent, _)| urgent.whole())),
             knee,
             ahead_read,
             due_read,
@@ -432,21 +453,24 @@ fn rate(file: &SourceFile, read: u64, depth: usize) -> Result<(f64, f64), Error>
     })
 }
 
-/// Lone requests of `file`, each one record (its `parts`, each at a random
-/// offset of its own, unaligned at the 32-byte grain a model file stores
-/// tensors at, landing back to back in one record's sink as a bank's
-/// records do), each submitted alone to the read engine as a due request of
+/// Lone requests of `file`, each `urgent`'s whole request (its `records`
+/// records, each its `parts`, each part at a random offset of its own,
+/// unaligned at the 32-byte grain a model file stores tensors at, landing
+/// back to back in one sink as a bank's records do): a park waits for every
+/// piece of its request, so the size it is read whole soonest at is its
+/// due size. Each is submitted alone to the read engine as a due request of
 /// volume `key` read in pieces of each size of `reads`, as a step's own
 /// reads are; in rounds of one request at each size, for [`LONE_SECONDS`]:
 /// their seconds, by size and round. What a request pays is the engine's
 /// (its cut into pieces, the workers it wakes, the copy of a piece that
 /// does not land straight), not a read's alone.
-fn lone(key: Volume, file: &Arc<SourceFile>, parts: &[u64], reads: &[u64]) -> Result<Vec<Vec<f64>>, Error> {
+fn lone(key: Volume, file: &Arc<SourceFile>, urgent: &Urgent, reads: &[u64]) -> Result<Vec<Vec<f64>>, Error> {
     const GRAIN: u64 = 32;
+    let parts = &urgent.parts;
     let record = parts.iter().sum::<u64>();
     assert!(record + ALIGNMENT * parts.len() as u64 <= file.size, "a record of {record} bytes beyond a file of {}", file.size);
-    let sink: Arc<dyn crate::Destination> = Arc::new(Buffer::new(record as usize));
-    // Every piece of a request at once: its due depth holds a record whole.
+    let sink: Arc<dyn crate::Destination> = Arc::new(Buffer::new(urgent.bytes() as usize));
+    // Every piece of a request at once: its due depth holds it whole.
     let volumes = reads
         .iter()
         .map(|&read| VolumeReads { id: key, shape: Shape { ahead_read: read, due_read: read, ..Shape::PENDING } })
@@ -459,8 +483,8 @@ fn lone(key: Volume, file: &Arc<SourceFile>, parts: &[u64], reads: &[u64]) -> Re
     while began.elapsed().as_secs_f64() < LONE_SECONDS || seconds[0].is_empty() {
         for (volume, times) in volumes.iter().zip(&mut seconds) {
             let mut at = 0;
-            let ranges = parts
-                .iter()
+            let ranges = (0..urgent.records)
+                .flat_map(|_| parts.iter())
                 .map(|&part| {
                     let offset = random_offset(file, &mut state, part + ALIGNMENT) + state % (ALIGNMENT / GRAIN) * GRAIN;
                     let range = Range { offset, length: part as usize, into: sink.clone(), at };
