@@ -612,7 +612,7 @@ native readout_planes_rows for metal from "metal/readout_planes_rows.metal":
     launch readout_planes_rows_stage when O > 16:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch readout_planes_rows_gemv when O < BATCH_FROM:
+    launch readout_planes_rows_gemv when O < BATCH_FROM and O <= 8:
         params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
         threadgroups (ceil_div(V, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)

@@ -42,7 +42,6 @@ kernel void readout_planes_rows_gemv(PLANES_ROWS_ARGUMENTS,
     uint rows = uint(SEISMIC_DIM_O);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     const auto x = projection::shared_norm(in, squares);
     // The certified survivor pass and its full small-row fallback must use
     // the same dot recipe, so a near tie cannot change selection merely
@@ -52,30 +51,65 @@ kernel void readout_planes_rows_gemv(PLANES_ROWS_ARGUMENTS,
         SEISMIC_BIT3_STRIDE_0, rest, SEISMIC_REST_STRIDE_0,
         SEISMIC_REST_STRIDE_1, SEISMIC_REST_STRIDE_2,
         scales, SEISMIC_SCALES_STRIDE_0};
+    // The rows are normalized once per threadgroup into `shared`, in A
+    // storage (the values `x.load8` returns), quarter-major per row
+    // ([row][quarter][group]) so a simdgroup's reads are contiguous, in
+    // chunks of whole lane strides that fit the declared GEMV staging
+    // (`gemv_stage_packet_rows` packet rows of four words).
+    // At most PROGRESSIVE_ROWS rows (the launch's `O <= 8`), so a chunk is
+    // at least one lane stride.
+    static_assert(projection::gemv_stage_packet_rows / PROGRESSIVE_ROWS >= 32u,
+        "the staging holds a lane stride of every row");
+    const uint groups = k / 32u;
+    const uint capacity = projection::gemv_stage_packet_rows;
+    const uint chunk = rows * groups <= capacity ? groups : capacity / rows / 32u * 32u;
+    threadgroup uint4 *stage = reinterpret_cast<threadgroup uint4 *>(shared);
+    const uint tid = sg * 32u + lane, threads = simdgroups * 32u;
     constexpr uint outputs = ROWS * 32u / LANES;
     const uint first = (tile * simdgroups + sg) * outputs;
+    float acc[outputs][PROGRESSIVE_ROWS] = {};
+    for (uint start = 0; start < groups; start += chunk) {
+        const uint count = min(chunk, groups - start);
+        // The squares (first chunk) or the previous chunk's reads finish
+        // before this chunk is staged.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint item = tid; item < rows * count * 4u; item += threads) {
+            const uint m = item / (count * 4u), w = item % (count * 4u);
+            const uint g = w / 4u, q = w % 4u;
+            float4 even, odd;
+            x.load8(m, (start + g) * 32u + q * 8u, 0.0f, even, odd);
+            stage[(m * 4u + q) * count + g] = activation::pack8(even, odd);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        PROJECTION_UNROLL
+        for (uint r = 0; r < outputs; ++r) {
+            const uint n = first + r;
+            if (n >= uint(SEISMIC_DIM_V))
+                break;
+            for (uint g = lane; g < count; g += 32u) {
+                const auto codes = progressive::exact_codes(planes.group(n, start + g));
+                const float scale = planes.scale(n, start + g);
+                PROJECTION_UNROLL
+                for (uint m = 0; m < PROGRESSIVE_ROWS; ++m) {
+                    if (m >= rows) break;
+                    float4 xe[4], xo[4];
+                    PROJECTION_UNROLL
+                    for (uint q = 0; q < 4u; ++q)
+                        activation::split8(stage[(m * 4u + q) * count + g], xe[q], xo[q]);
+                    acc[r][m] += progressive::exact(scale, codes, xe, xo);
+                }
+            }
+        }
+    }
+    PROJECTION_UNROLL
     for (uint r = 0; r < outputs; ++r) {
         const uint n = first + r;
         if (n >= uint(SEISMIC_DIM_V))
             break;
-        float acc[PROGRESSIVE_ROWS] = {};
-        for (uint g = lane; g < k / 32u; g += 32u) {
-            const auto codes = progressive::exact_codes(planes.group(n, g));
-            const float scale = planes.scale(n, g);
-            PROJECTION_UNROLL
-            for (uint m = 0; m < PROGRESSIVE_ROWS; ++m) {
-                if (m >= rows) break;
-                float4 xe[4], xo[4];
-                PROJECTION_UNROLL
-                for (uint q = 0; q < 4u; ++q)
-                    x.load8(m, g * 32u + q * 8u, 0.0f, xe[q], xo[q]);
-                acc[m] += progressive::exact(scale, codes, xe, xo);
-            }
-        }
         PROJECTION_UNROLL
         for (uint m = 0; m < PROGRESSIVE_ROWS; ++m) {
             if (m >= rows) break;
-            const float logit = simd_sum(acc[m]);
+            const float logit = simd_sum(acc[r][m]);
             if (lane == 0u)
                 out.store(m, n, logit);
         }
