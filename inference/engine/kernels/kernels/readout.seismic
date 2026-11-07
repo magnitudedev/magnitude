@@ -606,10 +606,12 @@ native readout_exact_rows for metal from "metal/readout_exact_rows.metal":
         shared_bytes (min(O * D * 2, 16384))
 
 # Metal: `readout_head_rows`' row classes (GEMV, batched GEMV, staged GEMM)
-# over the projection library's packets of the exact view.
+# over the projection library's packets of the exact view, batched from three
+# rows by default: its scalar GEMV decodes five planes a packet, so past two
+# rows its per-row FMAs no longer hide under the read.
 native readout_planes_rows for metal from "metal/readout_planes_rows.metal":
     static (V, D, PT, NM, P)
-    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5)
+    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default 3)
     scratch normalized bytes (O * D * 2) when O > 16
     launch readout_planes_rows_stage when O > 16:
         threadgroups (O, 1, 1)
