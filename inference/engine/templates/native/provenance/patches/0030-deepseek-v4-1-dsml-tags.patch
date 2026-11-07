@@ -1,0 +1,62 @@
+DeepSeek V4.1's DSML tool calls: the parsing part of upstream 74bca3950 ("model: DSV4.1 flash (#31086)"),
+as llama.cpp v0.9.0 (cd959bae) has it:
+- common/chat.cpp:1373-1383 recognizes a template that writes "｜DSML｜ calls>";
+- common/parsers/deepseek.cpp:79-80 sets is_v41, and :136-143 spells its tag names with a leading space
+  and its call block "calls" (the checkpoint's encoding/encoding.py:428-430).
+The commit's other V4.1 parts are not ported: tools declared on system messages, the reasoning-effort
+mapping, the bare </think> of a continuation, and render_message_to_json_deepseek_v4_1. The extraction's
+requests carry none of those.
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1054,11 +1054,13 @@
+     // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
+     // The template source contains the token as a variable assignment, not as a literal in markup.
+     // V3.2 names the tool call block "function_calls", V4 names it "tool_calls".
+-    if (src.find("dsml_token") != std::string::npos &&
+-        src.find("DSML") != std::string::npos &&
+-        (src.find("function_calls") != std::string::npos ||
+-         src.find("tool_calls") != std::string::npos)) {
+-        LOG_DBG("Using specialized template: DeepSeek V3.2/V4\n");
++    // V4.1 tag names have a leading space and its template does not name the dsml_token variable.
++    if ((src.find("dsml_token") != std::string::npos &&
++         src.find("DSML") != std::string::npos &&
++         (src.find("function_calls") != std::string::npos ||
++          src.find("tool_calls") != std::string::npos)) ||
++        src.find("｜DSML｜ calls>") != std::string::npos) {
++        LOG_DBG("Using specialized template: DeepSeek V3.2/V4/V4.1\n");
+         return common_chat_params_init_deepseek_v3_2(tmpl, params);
+     }
+ 
+--- a/common/parsers/deepseek.cpp
++++ b/common/parsers/deepseek.cpp
+@@ -75,6 +75,8 @@
+     // non-thinking generation prompt ends with a bare </think> instead of an empty
+     // <think></think> pair.
+     const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
++    // V4.1: DSML tag names carry a leading space, e.g. <｜DSML｜ calls>
++    const bool is_v41 = is_v4 && tmpl.source().find("｜DSML｜ calls>") != std::string::npos;
+ 
+     std::optional<json> adjusted_messages;
+     if (is_v4) {
+@@ -94,13 +96,14 @@
+     const std::string DSML         = "｜DSML｜";
+     const std::string THINK_START  = "<think>";
+     const std::string THINK_END    = "</think>";
+-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
+-    const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
+-    const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
+-    const std::string INVOKE_START = "<" + DSML + "invoke";
+-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
+-    const std::string PARAM_START  = "<" + DSML + "parameter";
+-    const std::string PARAM_END    = "</" + DSML + "parameter>";
++    const std::string TAG_SP       = is_v41 ? " " : "";
++    const std::string TC_BLOCK     = is_v41 ? "calls" : is_v4 ? "tool_calls" : "function_calls";
++    const std::string FC_START     = "<" + DSML + TAG_SP + TC_BLOCK + ">";
++    const std::string FC_END       = "</" + DSML + TAG_SP + TC_BLOCK + ">";
++    const std::string INVOKE_START = "<" + DSML + TAG_SP + "invoke";
++    const std::string INVOKE_END   = "</" + DSML + TAG_SP + "invoke>";
++    const std::string PARAM_START  = "<" + DSML + TAG_SP + "parameter";
++    const std::string PARAM_END    = "</" + DSML + TAG_SP + "parameter>";
+     const std::string GEN_PROMPT   = "<｜Assistant｜>";
+     const std::string TC_SEPARATOR = "\n\n";
+ 

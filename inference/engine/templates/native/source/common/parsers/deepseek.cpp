@@ -75,6 +75,8 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     // non-thinking generation prompt ends with a bare </think> instead of an empty
     // <think></think> pair.
     const bool is_v4 = tmpl.source().find("function_calls") == std::string::npos;
+    // V4.1: DSML tag names carry a leading space, e.g. <｜DSML｜ calls>
+    const bool is_v41 = is_v4 && tmpl.source().find("｜DSML｜ calls>") != std::string::npos;
 
     std::optional<json> adjusted_messages;
     if (is_v4) {
@@ -94,13 +96,14 @@ common_chat_params common_chat_params_init_deepseek_v3_2(const common_chat_templ
     const std::string DSML         = "｜DSML｜";
     const std::string THINK_START  = "<think>";
     const std::string THINK_END    = "</think>";
-    const std::string TC_BLOCK     = is_v4 ? "tool_calls" : "function_calls";
-    const std::string FC_START     = "<" + DSML + TC_BLOCK + ">";
-    const std::string FC_END       = "</" + DSML + TC_BLOCK + ">";
-    const std::string INVOKE_START = "<" + DSML + "invoke";
-    const std::string INVOKE_END   = "</" + DSML + "invoke>";
-    const std::string PARAM_START  = "<" + DSML + "parameter";
-    const std::string PARAM_END    = "</" + DSML + "parameter>";
+    const std::string TAG_SP       = is_v41 ? " " : "";
+    const std::string TC_BLOCK     = is_v41 ? "calls" : is_v4 ? "tool_calls" : "function_calls";
+    const std::string FC_START     = "<" + DSML + TAG_SP + TC_BLOCK + ">";
+    const std::string FC_END       = "</" + DSML + TAG_SP + TC_BLOCK + ">";
+    const std::string INVOKE_START = "<" + DSML + TAG_SP + "invoke";
+    const std::string INVOKE_END   = "</" + DSML + TAG_SP + "invoke>";
+    const std::string PARAM_START  = "<" + DSML + TAG_SP + "parameter";
+    const std::string PARAM_END    = "</" + DSML + TAG_SP + "parameter>";
     const std::string GEN_PROMPT   = "<｜Assistant｜>";
     const std::string TC_SEPARATOR = "\n\n";
 

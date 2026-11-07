@@ -2,6 +2,8 @@
 //!
 //! A reference holds a corpus encoded by the model's original `tokenizer.json`
 //! and chat requests rendered by the model's own chat format, with their ids.
+//! DeepSeek V4.1's also holds assistant replies with tool calls, as its
+//! encoding writes them, which the engine must read back.
 //!
 //! - DeepSeek V4.1's reference is committed and always runs:
 //!   `tests/assets/deepseek41.json` beside the published GGUF's vocabulary,
@@ -22,12 +24,13 @@ use magnitude_artifacts::{
 };
 use magnitude_chat::{
     artifacts::{gguf_byte_bpe, gguf_templates},
-    ByteBpeTokenizer, ChatRequest, PreparedChat, SpecialTokens, TemplateBundle, TemplateSelection,
-    TokenId,
+    ByteBpeTokenizer, ChatRequest, Event, FinishReason, OutputToken, PreparedChat, SpecialTokens,
+    TemplateBundle, TemplateSelection, TerminalCause, TokenChatStream, TokenId,
 };
+use magnitude_grammar::{CacheLimits, Vocabulary};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use std::io::Read;
+use std::{io::Read, sync::Arc};
 
 #[derive(Deserialize)]
 struct Case {
@@ -49,11 +52,34 @@ struct Render {
     ids: Vec<u32>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct Call {
+    name: String,
+    arguments: Map<String, Value>,
+}
+
+/// An assistant reply, as the text the model writes after its request's
+/// prompt (without the EOS generation drops), and what it was written from.
+#[derive(Deserialize)]
+struct Reply {
+    name: String,
+    messages: Vec<Value>,
+    tools: Vec<Value>,
+    template_arguments: Map<String, Value>,
+    text: String,
+    content: String,
+    reasoning: String,
+    calls: Vec<Call>,
+}
+
 #[derive(Deserialize)]
 struct Reference {
     now: i64,
     corpus: Vec<Case>,
     renders: Vec<Render>,
+    /// Only DeepSeek V4.1's reference has replies.
+    #[serde(default)]
+    replies: Vec<Reply>,
 }
 
 fn load() -> (ByteBpeTokenizer, TemplateBundle, Reference) {
@@ -236,4 +262,226 @@ fn deepseek41_reasoning_is_the_encodings() {
         .collect::<Vec<_>>();
     assert_eq!(efforts, ["none", "low", "high", "max"]);
     assert_eq!(reasoning.default_effort.as_deref(), Some("high"));
+}
+
+/// What the output parser reads from a reply.
+#[derive(Debug, PartialEq)]
+struct Parsed {
+    content: String,
+    reasoning: String,
+    calls: Vec<Call>,
+}
+
+impl Reply {
+    fn request(&self, now: i64) -> ChatRequest {
+        let mut request = ChatRequest::new(self.messages.clone(), now);
+        request.tools = self.tools.clone();
+        request.template_arguments = self.template_arguments.clone();
+        request
+    }
+}
+
+/// `text` generated after `request`'s prompt: its tokens, then EOS.
+struct Generated {
+    tokenizer: Arc<ByteBpeTokenizer>,
+    prepared: PreparedChat,
+    tokens: Vec<TokenId>,
+}
+
+impl Generated {
+    fn new(
+        tokenizer: &Arc<ByteBpeTokenizer>,
+        templates: &TemplateBundle,
+        request: &ChatRequest,
+        text: &str,
+    ) -> Self {
+        let prepared =
+            PreparedChat::prepare(templates, tokenizer, request, &TemplateSelection::default())
+                .unwrap();
+        let mut tokens = tokenizer.encode(text, SpecialTokens::Recognize).unwrap();
+        let eos = tokenizer
+            .encode("<｜end▁of▁sentence｜>", SpecialTokens::Recognize)
+            .unwrap();
+        assert!(eos.len() == 1 && tokenizer.stop_tokens().contains(&eos[0]));
+        tokens.extend(eos);
+        Self {
+            tokenizer: tokenizer.clone(),
+            prepared,
+            tokens,
+        }
+    }
+
+    /// Whether the request's grammar admits the tokens and ends with them.
+    fn admitted(&self) -> Result<(), String> {
+        let plan = self
+            .prepared
+            .input()
+            .constraint
+            .clone()
+            .expect("a request with tools or JSON output is constrained");
+        let mut vocabulary = Vocabulary::new(
+            self.tokenizer.clone(),
+            self.tokenizer.vocabulary(),
+            CacheLimits {
+                entries: 0,
+                bytes: 0,
+            },
+        )
+        .unwrap();
+        vocabulary
+            .bind(&plan.grammar, &plan.prefix)
+            .unwrap()
+            .advance(&self.tokens)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// The output parser's reading, each token published in turn as
+    /// generation publishes it, the stop token ending the output.
+    fn parsed(&self) -> Result<Parsed, String> {
+        let mut stream = TokenChatStream::new(&self.prepared, &self.tokenizer, Vec::new(), 1 << 20)?;
+        let mut events = Vec::new();
+        for (index, token) in self.tokens[..self.tokens.len() - 1].iter().enumerate() {
+            events.extend(stream.feed(&OutputToken {
+                index,
+                token: *token,
+            })?);
+        }
+        events.extend(stream.finish(FinishReason::Stop)?);
+        let mut parsed = Parsed {
+            content: String::new(),
+            reasoning: String::new(),
+            calls: Vec::new(),
+        };
+        // A call is read once it completes: its name and its argument text.
+        let mut started = Vec::<(String, String)>::new();
+        for event in events {
+            match event {
+                Event::Content { text } => parsed.content.push_str(&text),
+                Event::Reasoning { text } => parsed.reasoning.push_str(&text),
+                Event::ToolStart { index, name, .. } => {
+                    assert_eq!(index as usize, started.len());
+                    started.push((name, String::new()));
+                }
+                Event::ToolArguments { index, text } => started[index as usize].1.push_str(&text),
+                Event::ToolComplete { index } => {
+                    assert_eq!(index as usize, parsed.calls.len());
+                    let (name, text) = &started[index as usize];
+                    parsed.calls.push(Call {
+                        name: name.clone(),
+                        arguments: serde_json::from_str(text)
+                            .map_err(|error| format!("call {index} arguments {text:?}: {error}"))?,
+                    });
+                }
+                Event::Finish { cause } => assert_eq!(cause, TerminalCause::Natural),
+            }
+        }
+        if parsed.calls.len() != started.len() {
+            return Err(format!("{} of {} calls completed", parsed.calls.len(), started.len()));
+        }
+        Ok(parsed)
+    }
+}
+
+/// Every reply the encoding writes is admitted by its request's grammar and
+/// reads back as the reasoning, content and calls (names, and arguments as
+/// JSON) it was written from.
+#[test]
+fn deepseek41_replies_read_back_as_their_calls() {
+    let (tokenizer, templates, reference) = deepseek41();
+    let tokenizer = Arc::new(tokenizer);
+    assert!(!reference.replies.is_empty());
+    let mut failures = Vec::new();
+    for reply in &reference.replies {
+        let generated = Generated::new(
+            &tokenizer,
+            &templates,
+            &reply.request(reference.now),
+            &reply.text,
+        );
+        if let Err(error) = generated.admitted() {
+            failures.push(format!("{}: {error}", reply.name));
+        }
+        let expected = Parsed {
+            content: reply.content.clone(),
+            reasoning: reply.reasoning.clone(),
+            calls: reply.calls.clone(),
+        };
+        match generated.parsed() {
+            Ok(parsed) if parsed == expected => {}
+            Ok(parsed) => failures.push(format!(
+                "{}: parsed\n  engine    {parsed:?}\n  reference {expected:?}",
+                reply.name
+            )),
+            Err(error) => failures.push(format!("{}: {error}", reply.name)),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    eprintln!("{} replies read back", reference.replies.len());
+}
+
+/// A parameter without its `string` attribute is not V4.1's format (the
+/// encoding's own reader refuses it, encoding.py:927-929): the grammar never
+/// writes it, and the parser refuses it.
+#[test]
+fn deepseek41_refuses_a_parameter_without_its_string_attribute() {
+    let (tokenizer, templates, reference) = deepseek41();
+    let tokenizer = Arc::new(tokenizer);
+    let reply = reference
+        .replies
+        .iter()
+        .find(|reply| reply.name == "single_call")
+        .unwrap();
+    let malformed = reply.text.replacen(" string=\"true\"", "", 1);
+    assert_ne!(malformed, reply.text);
+    let generated = Generated::new(
+        &tokenizer,
+        &templates,
+        &reply.request(reference.now),
+        &malformed,
+    );
+    assert_eq!(
+        generated.admitted(),
+        Err("grammar violation: the tokens violate the grammar".into())
+    );
+    assert_eq!(
+        generated.parsed(),
+        Err("Output does not match its prepared parser".into())
+    );
+}
+
+/// JSON output follows the convention of llama.cpp's DeepSeek handler, which
+/// V4.1 shares from v0.9.0: the value in a ```json fence. The encoding has no
+/// reply form for a response format (encoding.py:604-629 only states the
+/// schema), so the fence is the engine's, and the parser reads the value
+/// inside it as the content.
+#[test]
+fn deepseek41_reads_fenced_json_output() {
+    let (tokenizer, templates, reference) = deepseek41();
+    let tokenizer = Arc::new(tokenizer);
+    let user = reference
+        .renders
+        .iter()
+        .find(|render| render.name == "user")
+        .unwrap();
+    let mut request = ChatRequest::new(user.messages.clone(), reference.now);
+    request.json_schema = Some(serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "integer"}},
+        "required": ["answer"]
+    }));
+    let generated = Generated::new(
+        &tokenizer,
+        &templates,
+        &request,
+        "Two plus two.</think>```json\n{\"answer\": 4}\n```",
+    );
+    generated.admitted().unwrap();
+    let parsed = generated.parsed().unwrap();
+    assert_eq!(parsed.reasoning, "Two plus two.");
+    assert!(parsed.calls.is_empty());
+    assert_eq!(
+        serde_json::from_str::<Value>(&parsed.content).unwrap(),
+        serde_json::json!({"answer": 4})
+    );
 }

@@ -79,6 +79,12 @@ itself. Every family takes both from `common_chat_template_render_prompt`, which
 side alone. Prompts and generation prompts are unchanged. A preparation describes how many renders
 it made.
 
+Patch 0030 reads DeepSeek V4.1's tool calls, as upstream's `74bca3950` (llama.cpp v0.9.0) does: a
+template that writes `｜DSML｜ calls>` selects the DeepSeek handler, whose call block, invoke and
+parameter tags are then V4.1's, each name after a space (`<｜DSML｜ calls>`). Only its parsing is
+ported; its other V4.1 parts serve request fields the extraction never receives. For V4.1, as for V4, a
+JSON-schema reply is the value in a ```` ```json ```` fence.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

@@ -17,7 +17,8 @@ empty one.
 
 `python -m magnitude_references.deepseek41_chat --tokenizer tokenizer.json --encoding-tests encoding/tests
 --output DIR` checks the renderer on the goldens, then writes the engine's fixture: the reference tokenizer's ids
-for a corpus and the renders of a set of requests (`deepseek41.json`), and the published GGUF's vocabulary
+for a corpus, the renders of a set of requests, and assistant replies with tool calls as the text the model writes
+after a prompt (`deepseek41.json`), and the published GGUF's vocabulary
 (`DeepSeek-V4.1-Flash-1017-vocabulary.gguf.gz`, read with range requests).
 """
 
@@ -238,6 +239,17 @@ def request(messages: list[dict], tools: list[dict], *, enable_thinking: bool = 
     return encode(messages, thinking=enable_thinking, drop_thinking=drop_thinking, reasoning_effort=reasoning_effort)
 
 
+def reply(messages: list[dict], tools: list[dict], assistant: dict, **arguments: Any) -> str:
+    """The text the model writes after a request's prompt to give `assistant`: the conversation's encoding with
+    that reply, past the request's prompt, without its closing EOS (generation stops on EOS and drops it). This is
+    the completion `parse_message_from_completion_text` reads (encoding.py:946-989)."""
+    prompt = request(messages, tools, **arguments)
+    answered = request(messages + [assistant], tools, **arguments)
+    if not answered.startswith(prompt) or not answered.endswith(EOS):
+        raise AssertionError(f"the reply does not extend the prompt:\n{prompt!r}\n{answered!r}")
+    return answered[len(prompt):-len(EOS)]
+
+
 def check_golden(tests: Path) -> list[int]:
     """The checkpoint's expected outputs this renderer covers, each rendered equal (as `test_encoding.py` loads
     them: top-level tools on the first message, "chat" mode unless the case names one)."""
@@ -377,6 +389,51 @@ CONVERSATIONS = [
     ("tool_calls_next_turn", LOOKUP + [{"role": "user", "content": "q3"}], [], {}),
 ]
 
+LOOKUP_TOOL = {
+    "type": "function",
+    "function": {"name": "lookup", "description": "Look a value up", "parameters": {"type": "object", "properties": {}}},
+}
+PLAN = {
+    "type": "function",
+    "function": {
+        "name": "plan_trip",
+        "description": "Plan a trip",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "cities": {"type": "array", "items": {"type": "string"}},
+                "options": {"type": "object", "properties": {"metric": {"type": "boolean"}, "budget": {"type": "number"}}},
+                "note": {"type": "string"},
+            },
+            "required": ["cities"],
+        },
+    },
+}
+
+# (name, messages, tools, the request's template arguments, the assistant reply). The engine reads each reply's
+# text back to the reply's content, reasoning and calls. The calls cover one call, several, none of a call's
+# arguments, string values with quotes and newlines, and JSON values of every kind, in both modes.
+REPLIES = [
+    ("single_call", [{"role": "user", "content": "What is the weather in Paris?"}], [WEATHER, SEARCH], {},
+     {"role": "assistant", "content": "", "reasoning_content": "Paris only: one call.",
+      "tool_calls": [_call("call_1", "get_weather", {"city": "Paris", "days": 2})]}),
+    ("single_call_without_arguments", LOOKUP[:3], [LOOKUP_TOOL], {}, LOOKUP[3]),
+    ("several_calls", WEATHER_TRIP[:1], [WEATHER], {}, WEATHER_TRIP[1]),
+    ("several_calls_chat", WEATHER_TRIP[:1], [WEATHER], {"enable_thinking": False}, WEATHER_TRIP[1]),
+    ("content_and_call_chat", [{"role": "system", "content": "Use tools when they help."},
+                               {"role": "user", "content": "Search for llama.cpp."}], [SEARCH],
+     {"enable_thinking": False},
+     {"role": "assistant", "content": "Searching.",
+      "tool_calls": [_call("call_1", "search", {"query": "llama.cpp \"chat\" parser\nsecond line"})]}),
+    ("json_arguments", [{"role": "user", "content": "Plan Paris then Tokyo, metric, under 2000."}],
+     [PLAN, WEATHER], {},
+     {"role": "assistant", "content": "Planning both.", "reasoning_content": "One plan, then the weather.",
+      "tool_calls": [_call("call_1", "plan_trip", {"cities": ["Paris", "東京"],
+                                                   "options": {"metric": True, "budget": 1999.5},
+                                                   "note": "<b>no</b> rush"}),
+                     _call("call_2", "get_weather", {"city": "Tokyo", "days": 0})]}),
+]
+
 # The published GGUF whose vocabulary the fixture carries: our converter's output, its tokenizer keys exactly those
 # a converted slice carries.
 GGUF = ("magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF", "3769ebe41a97ba3619216ebc1fefb53f2c432495",
@@ -415,6 +472,15 @@ def main(argv: list[str] | None = None) -> int:
         text = request(messages, tools, **template_arguments)
         renders.append({"name": name, "messages": messages, "tools": tools,
                         "template_arguments": template_arguments, "text": text, "ids": ids(text)})
+    replies = []
+    for name, messages, tools, template_arguments, assistant in REPLIES:
+        thinking = template_arguments.get("enable_thinking", True)
+        replies.append({"name": name, "messages": messages, "tools": tools, "template_arguments": template_arguments,
+                        "text": reply(messages, tools, assistant, **template_arguments),
+                        "content": assistant["content"],
+                        "reasoning": assistant.get("reasoning_content", "") if thinking else "",
+                        "calls": [{"name": call["function"]["name"], "arguments": call["function"]["arguments"]}
+                                  for call in assistant["tool_calls"]]})
     record = {
         "gguf": dict(zip(("repository", "revision", "path"), GGUF)),
         "reference": dict(zip(("repository", "revision"), REFERENCE)),
@@ -422,12 +488,13 @@ def main(argv: list[str] | None = None) -> int:
         "now": NOW,
         "corpus": corpus,
         "renders": renders,
+        "replies": replies,
     }
     arguments.output.mkdir(parents=True, exist_ok=True)
     (arguments.output / "deepseek41.json").write_text(json.dumps(record, ensure_ascii=False, indent=1) + "\n")
     (arguments.output / "DeepSeek-V4.1-Flash-1017-vocabulary.gguf.gz").write_bytes(
         gzip.compress(vocabulary(*GGUF), 9, mtime=0))
-    print(f"goldens {covered}; {len(corpus)} texts, {len(renders)} renders")
+    print(f"goldens {covered}; {len(corpus)} texts, {len(renders)} renders, {len(replies)} replies")
     return 0
 
 

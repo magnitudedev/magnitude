@@ -3410,5 +3410,360 @@
     128821
    ]
   }
+ ],
+ "replies": [
+  {
+   "name": "single_call",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "Paris only: one call.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "content": "",
+   "reasoning": "Paris only: one call.",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris",
+      "days": 2
+     }
+    }
+   ]
+  },
+  {
+   "name": "single_call_without_arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q1"
+    },
+    {
+     "role": "assistant",
+     "content": "a1",
+     "reasoning_content": "r1"
+    },
+    {
+     "role": "user",
+     "content": "q2"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "lookup",
+      "description": "Look a value up",
+      "parameters": {
+       "type": "object",
+       "properties": {}
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "r2</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "content": "",
+   "reasoning": "r2",
+   "calls": [
+    {
+     "name": "lookup",
+     "arguments": {}
+    }
+   ]
+  },
+  {
+   "name": "several_calls",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris and Tokyo?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "Two cities: two calls.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "content": "",
+   "reasoning": "Two cities: two calls.",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris",
+      "days": 2
+     }
+    },
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Tokyo"
+     }
+    }
+   ]
+  },
+  {
+   "name": "several_calls_chat",
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Paris and Tokyo?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {
+    "enable_thinking": false
+   },
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "content": "",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Paris",
+      "days": 2
+     }
+    },
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Tokyo"
+     }
+    }
+   ]
+  },
+  {
+   "name": "content_and_call_chat",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Use tools when they help."
+    },
+    {
+     "role": "user",
+     "content": "Search for llama.cpp."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the web",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "query": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "query"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {
+    "enable_thinking": false
+   },
+   "text": "Searching.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">llama.cpp \"chat\" parser\nsecond line</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "content": "Searching.",
+   "reasoning": "",
+   "calls": [
+    {
+     "name": "search",
+     "arguments": {
+      "query": "llama.cpp \"chat\" parser\nsecond line"
+     }
+    }
+   ]
+  },
+  {
+   "name": "json_arguments",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Plan Paris then Tokyo, metric, under 2000."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "plan_trip",
+      "description": "Plan a trip",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "cities": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        },
+        "options": {
+         "type": "object",
+         "properties": {
+          "metric": {
+           "type": "boolean"
+          },
+          "budget": {
+           "type": "number"
+          }
+         }
+        },
+        "note": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "cities"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Get the current weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string",
+         "description": "City name"
+        },
+        "days": {
+         "type": "integer"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "template_arguments": {},
+   "text": "One plan, then the weather.</think>Planning both.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"plan_trip\">\n<｜DSML｜ parameter name=\"cities\" string=\"false\">[\"Paris\", \"東京\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"options\" string=\"false\">{\"metric\": true, \"budget\": 1999.5}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"note\" string=\"true\"><b>no</b> rush</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">0</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "content": "Planning both.",
+   "reasoning": "One plan, then the weather.",
+   "calls": [
+    {
+     "name": "plan_trip",
+     "arguments": {
+      "cities": [
+       "Paris",
+       "東京"
+      ],
+      "options": {
+       "metric": true,
+       "budget": 1999.5
+      },
+      "note": "<b>no</b> rush"
+     }
+    },
+    {
+     "name": "get_weather",
+     "arguments": {
+      "city": "Tokyo",
+      "days": 0
+     }
+    }
+   ]
+  }
  ]
 }
