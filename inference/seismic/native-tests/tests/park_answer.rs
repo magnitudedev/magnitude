@@ -10,7 +10,7 @@
 //! submissions block. The call must end within a bound of its answer, with
 //! the bytes the host wrote.
 
-use seismic::{BackendName, Element, NativeGraphFamily, NativeSpecialization, Tensor, Timeline, TimelineNode};
+use seismic::{BackendName, Element, NativeGraphFamily, NativeSpecialization, Tensor, Timeline};
 use seismic_native_tests::{parked_scale, scale_rows};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -81,7 +81,7 @@ fn busy<'scope>(
 /// than leave the busy threads' join waiting on a call that never ends.
 struct Answer<'a> {
     word: &'a Tensor,
-    parks: &'a Timeline,
+    parks: &'a Timeline<seismic::timeline::Parks>,
     parked: Option<u64>,
     answered: bool,
 }
@@ -115,7 +115,7 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
         let answer = graph.port(Element::i32(), &[1]).unwrap();
         let skip = graph.port(Element::i32(), &[1]).unwrap();
         let input = graph.port(Element::f32(), &[n]).unwrap();
-        let park = graph.timeline(TimelineNode::Park);
+        let park = graph.timeline(seismic::timeline::Park);
         // The waiting call reads `input` in place once answered, and the
         // call after it reads what it wrote.
         let waited = graph
@@ -129,7 +129,7 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
             .enqueue(&after_kernel, scale_rows::WorkflowArgs { x: (&waited.reshape(&[1, n])).into(), factor: 2.0 })
             .unwrap()
             .value;
-        let after = graph.timeline(TimelineNode::Signal);
+        let after = graph.timeline(seismic::timeline::Signal);
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
@@ -146,7 +146,10 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
             word.write_shared(0, &[0; 4]).unwrap();
             skipped.write_shared(0, &[0; 4]).unwrap();
         }
-        let (parks, done) = (Timeline::new(&device).unwrap(), Timeline::new(&device).unwrap());
+        let (parks, done) = (
+            Timeline::<seismic::timeline::Parks>::new(&device).unwrap(),
+            Timeline::<seismic::timeline::Reached>::new(&device).unwrap(),
+        );
         let start = Instant::now();
         let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
         let mut bindings = plan.bindings();
@@ -164,7 +167,7 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
         match parked {
             Some(value) => {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while !parks.parked(value).unwrap() {
+                while !parks.reached(value).unwrap() {
                     assert!(Instant::now() < deadline, "{backend:?}: the run never reached its park");
                     std::thread::yield_now();
                 }
@@ -211,7 +214,7 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
                 eprintln!(
                     "{backend:?}: the call did not end within 10 s of its answer (parked {parked:?}, park reached {:?}), \
                      {} runs queued behind it",
-                    parked.map(|value| parks.parked(value)),
+                    parked.map(|value| parks.reached(value)),
                     queued.load(Ordering::Acquire)
                 );
                 std::process::abort();
@@ -249,12 +252,12 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
         let answer = graph.port(Element::i32(), &[1]).unwrap();
         let skip = graph.port(Element::i32(), &[1]).unwrap();
         let input = graph.port(Element::f32(), &[n]).unwrap();
-        let park = graph.timeline(TimelineNode::Park);
+        let park = graph.timeline(seismic::timeline::Park);
         let waited = graph
             .enqueue(&kernel, parked_scale::WorkflowArgs { answer: answer.tensor().into(), skip: skip.tensor().into(), x: input.tensor().into() })
             .unwrap()
             .value;
-        let after = graph.timeline(TimelineNode::Signal);
+        let after = graph.timeline(seismic::timeline::Signal);
         graph.export(&waited).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
@@ -286,7 +289,10 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
             })
             .collect::<Vec<_>>();
 
-        let (parks, done) = (Timeline::new(&device).unwrap(), Timeline::new(&device).unwrap());
+        let (parks, done) = (
+            Timeline::<seismic::timeline::Parks>::new(&device).unwrap(),
+            Timeline::<seismic::timeline::Reached>::new(&device).unwrap(),
+        );
         let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();
         let mut bindings = plan.bindings();
         bindings.set(&answer, &word).unwrap();
@@ -300,7 +306,7 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
         match parked {
             Some(value) => {
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while !parks.parked(value).unwrap() {
+                while !parks.reached(value).unwrap() {
                     assert!(Instant::now() < deadline, "{backend:?}: the run never reached its park");
                     std::thread::yield_now();
                 }

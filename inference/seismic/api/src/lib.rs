@@ -926,87 +926,187 @@ impl BF16 {
 }
 
 pub use seismic_runtime::native::graph::NativeTimelinePort;
-pub use seismic_runtime::native::timeline::{AnsweredBy, ParkAnswer, TimelineNode};
+pub use seismic_runtime::native::timeline::{AnsweredBy, ParkAnswer};
 
-/// A monotonic value one device's native work and the host both advance
-/// and wait on (`seismic_runtime::native::timeline`). A sealed graph's
-/// timeline node binds it per run: at a wait node (the host gate) the device
-/// runs nothing after it until the host has raised the timeline to the run's
-/// value; at a signal node the device raises it to the run's value once the
-/// work before has completed, its writes visible to the host.
+/// Timeline roles and node kinds (`seismic_runtime::native::timeline`).
+pub mod timeline {
+    pub use seismic_runtime::native::timeline::{
+        Gate, Park, Parks, Publish, Reached, Signal, TimelineNodeKind, TimelineRole, ValuedRole, Wait,
+    };
+}
+
+/// A monotonic value between the host and one device's native work, of role
+/// `R` (`timeline::Gate`, `Reached` or `Parks`), which says who raises it and
+/// who waits on it; the handle has only the operations of its role, and a
+/// graph's timeline node binds only a timeline of its own role
+/// (`NativeGraphBindings::set_timeline`). A sealed graph's node binds it per
+/// run: at a wait node (a `Gate`) the device runs nothing after it until the
+/// host has raised the timeline to the run's value; at a signal node (a
+/// `Reached`) the device raises it to the run's value once the work before
+/// has completed, its writes visible to the host.
+///
+/// So the host never waits on what only it raises, nor the device on what
+/// only it raises: on Metal, CUDA and Vulkan each side is its own event,
+/// word or semaphore, and such a wait would never return.
+///
+/// Each side has its own operations and nodes:
+///
+/// ```
+/// use seismic::timeline::{Gate, Reached, Signal, Wait};
+/// fn each_side_its_own(
+///     graph: &mut seismic::NativeGraph,
+///     bindings: &mut seismic::NativeGraphBindings,
+///     gate: &seismic::Timeline<Gate>,
+///     read: &seismic::Timeline<Reached>,
+/// ) {
+///     let (opened, done) = (graph.timeline(Wait), graph.timeline(Signal));
+///     bindings.set_timeline(opened, gate, 1).unwrap();
+///     bindings.set_timeline(done, read, 1).unwrap();
+///     gate.signal(1).unwrap();
+///     read.wait(1, std::time::Duration::from_secs(1)).unwrap();
+/// }
+/// ```
+///
+/// and neither the other's:
+///
+/// ```compile_fail
+/// fn host_waits_on_its_own_gate(gate: &seismic::Timeline<seismic::timeline::Gate>) {
+///     gate.wait(1, std::time::Duration::from_secs(1));
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn host_signals_the_devices_side(read: &seismic::Timeline<seismic::timeline::Reached>) {
+///     read.signal(1);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn gate_bound_to_a_signal_node(
+///     graph: &mut seismic::NativeGraph,
+///     bindings: &mut seismic::NativeGraphBindings,
+///     gate: &seismic::Timeline<seismic::timeline::Gate>,
+/// ) {
+///     let signal = graph.timeline(seismic::timeline::Signal);
+///     bindings.set_timeline(signal, gate, 1);
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn park_bound_at_a_value(
+///     graph: &mut seismic::NativeGraph,
+///     bindings: &mut seismic::NativeGraphBindings,
+///     parks: &seismic::Timeline<seismic::timeline::Parks>,
+/// ) {
+///     let park = graph.timeline(seismic::timeline::Park);
+///     bindings.set_timeline(park, parks, 1);
+/// }
+/// ```
 ///
 /// Clones are handles of one timeline. Dropping the last opens every wait a
 /// run binds on it, and each such run whose wait was never reached fails its
 /// completion: a teardown leaves no device work waiting. So a handle lives
 /// as long as runs wait on the timeline, whoever is to raise it.
-#[derive(Clone)]
-pub struct Timeline {
-    host: Arc<seismic_runtime::native::timeline::TimelineHost>,
+pub struct Timeline<R: timeline::TimelineRole> {
+    host: Arc<seismic_runtime::native::timeline::TimelineHost<R>>,
 }
 
-impl Timeline {
+impl<R: timeline::TimelineRole> Clone for Timeline<R> {
+    fn clone(&self) -> Self {
+        Self { host: self.host.clone() }
+    }
+}
+
+impl<R: timeline::TimelineRole> Timeline<R> {
     /// A timeline at 0 on `device`.
     pub fn new(device: &Device) -> Result<Self, TensorError> {
-        seismic_runtime::native::timeline::TimelineInner::new(device.inner()).map(Self::of)
+        seismic_runtime::native::timeline::TimelineHost::new(device.inner()).map(|host| Self { host: Arc::new(host) })
     }
+}
 
-    fn of(inner: seismic_runtime::native::timeline::TimelineInner) -> Self {
-        Self {
-            host: Arc::new(seismic_runtime::native::timeline::TimelineHost::new(inner)),
-        }
-    }
-
-    fn inner(&self) -> &Arc<seismic_runtime::native::timeline::TimelineInner> {
-        self.host.inner()
-    }
-
-    /// Raise the timeline's gates to `value` from the host, after every
-    /// host write before it; a value it has reached already changes
-    /// nothing. Where the device's side is its own (every device), this raises
-    /// only what device work waits on, never what the host waits on
-    /// ([`Self::reached`], [`Self::wait`]).
+impl Timeline<timeline::Gate> {
+    /// Raise the gate to `value` from the host, after every host write
+    /// before it; a value it has reached already changes nothing.
     pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
-        self.inner().signal(value)
+        self.host.signal(value)
+    }
+
+    /// Whether the host has raised the gate to `value`; the device's loss
+    /// where it cannot say.
+    pub fn signalled(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.host.signalled(value)
+    }
+
+    /// Wait at most `timeout` for the host (another thread) to raise the
+    /// gate to `value`, after which this thread sees every host write before
+    /// that signal; whether it did, or the device's loss where it cannot
+    /// say.
+    pub fn wait_signalled(&self, value: u64, timeout: std::time::Duration) -> Result<bool, ExecutionError> {
+        self.host.wait_signalled(value, timeout)
+    }
+}
+
+impl Timeline<timeline::Reached> {
+    /// Whether the device has raised the timeline to `value`; the device's
+    /// loss where it cannot say.
+    pub fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.host.reached(value)
+    }
+
+    /// The value the device has raised the timeline to; the device's loss
+    /// where it cannot say.
+    pub fn current(&self) -> Result<u64, ExecutionError> {
+        self.host.current()
+    }
+
+    /// Wait at most `timeout` for the device to raise the timeline to
+    /// `value`, after which the host sees every device write before the
+    /// signal; whether it did, or the device's loss where it cannot say.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> Result<bool, ExecutionError> {
+        self.host.wait(value, timeout)
+    }
+
+    /// Raise the timeline to `value` in the device's place: the host
+    /// completes a signal no device work will raise (a step queued but
+    /// never run), or plays the device (a test). Precondition: no device
+    /// signal of the timeline is pending.
+    pub fn reach(&self, value: u64) -> Result<(), ExecutionError> {
+        self.host.reach(value)
+    }
+}
+
+impl Timeline<timeline::Parks> {
+    /// Whether the device reached the park or publication that took `value`
+    /// (`NativeGraphOutputs::park`), every device write before it visible
+    /// to the host; a park's call waits there unless the host answered it.
+    /// The device's loss where it cannot say.
+    pub fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.host.reached(value)
+    }
+
+    /// The value the device has raised the timeline to; the device's loss
+    /// where it cannot say.
+    pub fn current(&self) -> Result<u64, ExecutionError> {
+        self.host.current()
     }
 
     /// Raise what the device raises to `value`, as the device would: a host
-    /// that plays the device (a test). On the CPU, whose one value both
-    /// raise, [`Self::signal`].
+    /// that plays the device (a test).
     pub fn reach(&self, value: u64) -> Result<(), ExecutionError> {
-        self.inner().reach(value)
-    }
-
-    /// Whether the timeline has reached `value`; the device's loss where it
-    /// cannot say.
-    pub fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
-        self.inner().reached(value)
-    }
-
-    /// The value the timeline holds now; the device's loss where it cannot
-    /// say.
-    pub fn current(&self) -> Result<u64, ExecutionError> {
-        self.inner().current()
-    }
-
-    /// Whether the device reached the park that took `value`
-    /// (`NativeGraphOutputs::park`), every device write before it visible
-    /// to the host; its call waits there unless the host answered it. The
-    /// device's loss where it cannot say.
-    pub fn parked(&self, value: u64) -> Result<bool, ExecutionError> {
-        self.inner().parked(value)
+        self.host.reach(value)
     }
 
     /// Whether the host answered the park that took `value`, whether or not
     /// the device reached it; never where the dropping of the last handle
     /// opened its gate unanswered. The device's loss where it cannot say.
     pub fn answered(&self, value: u64) -> Result<bool, ExecutionError> {
-        self.inner().answered(value)
+        self.host.answered(value)
     }
 
     /// Whether the device's kernels wait for a park's answer themselves, so
     /// a park binds no operation of this timeline.
     pub fn parks_in_kernels(&self) -> bool {
-        self.inner().parks_in_kernels()
+        self.host.parks_in_kernels()
     }
 
     /// Answer the park that took `value`, after every host write the call
@@ -1016,14 +1116,7 @@ impl Timeline {
     /// `answer` is why the host answers now, which a trace keeps
     /// (`TracedQueueSubmission::opened`).
     pub fn answer(&self, value: u64, answer: ParkAnswer) -> Result<(), ExecutionError> {
-        self.inner().answer(value, answer)
-    }
-
-    /// Wait at most `timeout` for the timeline to reach `value`, after which
-    /// the host sees every device write before the signal; whether it did,
-    /// or the device's loss where it cannot say.
-    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> Result<bool, ExecutionError> {
-        self.inner().wait(value, timeout)
+        self.host.answer(value, answer)
     }
 }
 
@@ -3098,7 +3191,7 @@ impl NativeGraphMetadata {
 
     /// A timeline node after every node enqueued so far
     /// (`NativeGraph::timeline`).
-    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+    pub fn timeline<N: timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role> {
         self.inner.timeline(node)
     }
 
@@ -3491,7 +3584,7 @@ impl NativeGraph {
     /// device waits at, or a signal the host waits for (`Timeline`). Each
     /// run binds it (`NativeGraphBindings::set_timeline`; a park,
     /// `set_park` or `set_answered`).
-    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+    pub fn timeline<N: timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role> {
         self.inner.timeline(node)
     }
 
@@ -3983,14 +4076,13 @@ impl NativeGraphBindings {
     /// Bind timeline node `port` to `timeline` at `value` for this run: a
     /// gate waits until the timeline reaches the value, a signal raises it
     /// to the value.
-    pub fn set_timeline(
+    pub fn set_timeline<R: timeline::ValuedRole>(
         &mut self,
-        port: NativeTimelinePort,
-        timeline: &Timeline,
+        port: NativeTimelinePort<R>,
+        timeline: &Timeline<R>,
         value: u64,
     ) -> Result<(), WorkflowError> {
-        self.inner
-            .set_timeline(port, timeline.inner().clone(), value)
+        self.inner.set_timeline(port, &timeline.host, value)
     }
 
     /// Bind park node `port` to `timeline`: where the device's kernels do
@@ -3999,19 +4091,19 @@ impl NativeGraphBindings {
     /// its outputs (`NativeGraphOutputs::park`): the device signals `v`
     /// once the call waits, every write before visible to the host, and
     /// goes on once the host answers (`Timeline::answer`). The timeline's
-    /// values are the runtime's: bind no wait or signal on it.
+    /// values are the runtime's: no node binds it at a value.
     pub fn set_park(
         &mut self,
-        port: NativeTimelinePort,
-        timeline: &Timeline,
+        port: NativeTimelinePort<timeline::Parks>,
+        timeline: &Timeline<timeline::Parks>,
     ) -> Result<(), WorkflowError> {
-        self.inner.set_park(port, timeline.inner().clone())
+        self.inner.set_park(port, &timeline.host)
     }
 
     /// Bind park node `port` as answered before the run is submitted (the
     /// words its call awaits already hold the answer): it binds no
     /// operation, and a run of only such parks is the same work each time.
-    pub fn set_answered(&mut self, port: NativeTimelinePort) -> Result<(), WorkflowError> {
+    pub fn set_answered(&mut self, port: NativeTimelinePort<timeline::Parks>) -> Result<(), WorkflowError> {
         self.inner.set_answered(port)
     }
 
@@ -4067,7 +4159,7 @@ impl NativeGraphOutputs {
     /// (`NativeGraphBindings::set_park`); `None` where it binds nothing:
     /// the device's kernels park themselves, it was bound answered, or the
     /// run encodes none of its call's launches.
-    pub fn park(&self, port: NativeTimelinePort) -> Option<u64> {
+    pub fn park(&self, port: NativeTimelinePort<timeline::Parks>) -> Option<u64> {
         self.inner.park(port)
     }
 }

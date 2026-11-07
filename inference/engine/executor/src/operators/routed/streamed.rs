@@ -86,7 +86,7 @@ use magnitude_kernels::{
     routed_seed_commit, routed_select_streamed, routed_site_request, routed_step, routed_tier_wait,
 };
 use seismic::{
-    Element, NativeGraph, NativeGraphMetadata, NativePort, NativeTimelinePort, TimelineNode, WorkflowTensor,
+    Element, NativeGraph, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
     WorkflowTensorRef, WorkflowTensorView,
 };
 
@@ -351,7 +351,7 @@ pub(crate) struct BankGraph<'p, 'a, G: GraphDraft + 'a> {
     /// The park node before each call that waits for the host, and the
     /// publication after each site request, each with its layer's scope and
     /// kind (`crate::experts::Parks`).
-    pub parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort)>,
+    pub parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
 }
 
 /// How a routed layer's graph reads its experts: from the stacks a load
@@ -420,7 +420,7 @@ pub(crate) struct StreamedLayer<'p, 'a, G: GraphDraft + 'a> {
     binding: BankBinding,
     entries: BankGraphEntries<'a, G>,
     ports: &'p mut Vec<(BankPort, NativePort)>,
-    parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort)>,
+    parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
 }
 
 /// The extents a streamed layer's decode entries take beside its bank's.
@@ -577,16 +577,16 @@ impl<'p, 'a, G: GraphDraft + 'a> StreamedLayer<'p, 'a, G> {
     /// The park node before this layer's call that waits for the host, of
     /// `kind`, which each run binds (`crate::experts::Parks`).
     fn park(&mut self, graph: &mut G, kind: ParkKind) {
-        let port = graph.timeline(TimelineNode::Park);
+        let port = graph.timeline(seismic::timeline::Park);
         self.parks.push((GraphTimeline::Park(GraphPark { scope: self.scope, kind }), port));
     }
 
     /// The publication of this layer's site request, the call enqueued last,
     /// whose writes the CPU pool reads while the device goes on
-    /// (`TimelineNode::Publish`): a submission boundary where parks are,
+    /// (`seismic::timeline::Publish`): a submission boundary where parks are,
     /// nothing where kernels wait in place.
     fn publish(&mut self, graph: &mut G) {
-        let port = graph.timeline(TimelineNode::Publish);
+        let port = graph.timeline(seismic::timeline::Publish);
         self.parks.push((GraphTimeline::Publish(self.scope), port));
     }
 

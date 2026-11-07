@@ -14,7 +14,7 @@ use magnitude_kernels::{embedding_rows, selection_notice};
 use seismic::{BackendName, NativeGraphMetadata, NativeGraphStorageBytes};
 use seismic::{
     Device, Element, NativeGraphLayout, NativeGraphPlan, NativePort, NativeTimelinePort,
-    TimelineNode, WorkflowTensor,
+    WorkflowTensor,
 };
 
 /// The per-layer entry graph of one row class.
@@ -127,7 +127,7 @@ pub(crate) struct KeptTokens {
 #[derive(Clone)]
 pub(crate) struct EntryNotice {
     pub tokens: NativePort,
-    pub signal: NativeTimelinePort,
+    pub signal: NativeTimelinePort<seismic::timeline::Reached>,
 }
 
 impl PreparedTargetEntryGraph {
@@ -296,7 +296,7 @@ pub(super) fn entry_graph_topology<'a, G: GraphDraft + 'a>(
             )?;
             Some(EntryNotice {
                 tokens: copied,
-                signal: graph.timeline(TimelineNode::Signal),
+                signal: graph.timeline(seismic::timeline::Signal),
             })
         }
         _ => None,

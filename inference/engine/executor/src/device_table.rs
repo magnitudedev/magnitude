@@ -9,6 +9,7 @@
 //!
 //! Nothing here knows which table it holds or what its readers compute.
 
+use seismic::timeline::{Gate, Reached};
 use crate::planning::{DirectoryForm, TableFlights};
 use crate::slot_directory::SlotDirectory;
 use crate::stored_table::StoredTable;
@@ -251,11 +252,11 @@ struct Shared {
     /// into host-shared storage.
     notice: seismic::Tensor,
     /// Raised by the device to a read's value once its notice is written.
-    noticed: seismic::Timeline,
+    noticed: seismic::Timeline<Reached>,
     /// Raised by the filler to a read's value once its tiles are landed.
-    gate: seismic::Timeline,
+    gate: seismic::Timeline<Gate>,
     /// Raised by the device to a read's value once it has read.
-    read: seismic::Timeline,
+    read: seismic::Timeline<Reached>,
     rows: Arc<dyn StoredRows>,
     /// Bytes of one stored row.
     row_bytes: usize,
@@ -376,9 +377,9 @@ pub struct SelectedRead {
     pub value: u64,
     /// Where the step copies its `[rows, 2]` selection for the host.
     pub notice: seismic::Tensor,
-    pub noticed: seismic::Timeline,
-    pub gate: seismic::Timeline,
-    pub read: seismic::Timeline,
+    pub noticed: seismic::Timeline<Reached>,
+    pub gate: seismic::Timeline<Gate>,
+    pub read: seismic::Timeline<Reached>,
     /// The landing staging of the read's tiles (`[rows, ..]` as stored),
     /// and the landing slots its step converts it into (`[rows, ..]`).
     pub staging: seismic::Tensor,
@@ -960,7 +961,7 @@ impl Shared {
     /// Land the tiles read `value` selects (at most `rows`) that the
     /// regular slots do not hold for it: the first rows of the tiles landed,
     /// or why they could not be; `None` of an abandoned read, whose read the
-    /// filler signals itself.
+    /// filler raises itself.
     fn fill(&self, value: u64, rows: u64) -> Option<Result<Vec<u64>, String>> {
         // The read before is done with the landing slots and staging, and
         // the device has passed it.
@@ -988,8 +989,9 @@ impl Shared {
                 .abandoned
                 .remove(&value)
             {
-                // Nobody reads it: its read is done.
-                return match self.read.signal(value) {
+                // Nobody reads it: its read is done, raised in the device's
+                // place once the read before it was.
+                return match self.read.reach(value) {
                     Ok(()) => None,
                     Err(error) => Some(Err(error.to_string())),
                 };
@@ -1145,12 +1147,16 @@ mod tests {
         }
     }
 
-    /// An 8-row, 3-column F32 table on the CPU backend, stored as it is
-    /// held, in four slots and two landing slots with stagings for a step
-    /// that brings up to every slot's row, seeded with the rows `kept` keeps.
+    /// An 8-row, 3-column F32 table on the requested test backend, else the
+    /// CPU (off the CPU a timeline's host and device sides are apart), stored
+    /// as it is held, in four slots and two landing slots with stagings for a
+    /// step that brings up to every slot's row, seeded with the rows `kept`
+    /// keeps.
     fn device_table(kept: Option<&Path>) -> Rc<DeviceTable> {
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let device = catalog.open_backend(BackendName::Cpu).unwrap();
+        let device = catalog
+            .open_backend(seismic::testing::requested_backend().unwrap_or(BackendName::Cpu))
+            .unwrap();
         let table = DeviceTable::new(
             &device,
             Element::f32(),
@@ -1204,8 +1210,8 @@ mod tests {
         // SAFETY: the read's gate has not opened, so the filler does not
         // read the notice yet.
         unsafe { read.notice.write_shared(0, &selection) }.unwrap();
-        read.noticed.signal(read.value).unwrap();
-        assert!(read.gate.wait(read.value, Duration::from_secs(10)).unwrap());
+        read.noticed.reach(read.value).unwrap();
+        assert!(read.gate.wait_signalled(read.value, Duration::from_secs(10)).unwrap());
         let mut staged = vec![0u8; read.staging.byte_len() as usize];
         // SAFETY: the filler wrote the staging before it opened the gate.
         unsafe { read.staging.read_shared(0, &mut staged) }.unwrap();
@@ -1218,7 +1224,7 @@ mod tests {
                 slot(table, entry as u64)
             })
             .collect();
-        read.read.signal(read.value).unwrap();
+        read.read.reach(read.value).unwrap();
         (read.submitted(), found)
     }
 

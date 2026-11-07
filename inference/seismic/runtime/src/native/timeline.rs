@@ -6,11 +6,19 @@
 //! every node to a timeline and a value:
 //!
 //! - **wait** (the host gate): the device runs nothing after the node until
-//!   the timeline reaches the value, which the host sets (`Timeline::signal`)
-//!   once what the work after the gate reads is in place;
+//!   the timeline reaches the value, which the host sets
+//!   (`TimelineHost::<Gate>::signal`) once what the work after the gate
+//!   reads is in place;
 //! - **signal**: the timeline reaches the value once the device has completed
 //!   the work before the node, its writes visible to the host
-//!   (`Timeline::wait`).
+//!   (`TimelineHost::<Reached>::wait`).
+//!
+//! Where the device's side is its own (every backend but the CPU), a host
+//! wait on what the host raised would watch a side nothing raises, and a
+//! device wait on what the device raises would never open. So a timeline's
+//! role ([`TimelineRole`]: [`Gate`], [`Reached`], [`Parks`]) is its type:
+//! the host handle has only that role's operations, and a node's port binds
+//! only a timeline of its role ([`TimelineNodeKind`]).
 //!
 //! Per backend:
 //!
@@ -43,11 +51,12 @@ use crate::api::TensorError;
 use crate::backends::OpenedKind;
 use seismic_compiler::errors::ExecutionError;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 /// One device's host timeline.
-pub struct TimelineInner {
+pub(crate) struct TimelineInner {
     device: Arc<DeviceInner>,
     kind: TimelineKind,
     /// Whether a host handle lives, and what the gates bound on the timeline
@@ -84,25 +93,210 @@ enum Gates {
     Released { from: Option<u64> },
 }
 
-/// The host's means to signal a timeline. Dropping the last releases it:
-/// every wait bound on it opens (the module documentation).
-pub struct TimelineHost {
-    inner: Arc<TimelineInner>,
+mod sealed {
+    pub trait Sealed {}
 }
 
-impl TimelineHost {
-    pub fn new(inner: TimelineInner) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
+/// Who raises a timeline and who waits on it: the operations a host handle
+/// ([`TimelineHost`]) has and the nodes it binds to follow from its role,
+/// so a host wait on what only the host raises (on Metal, CUDA and Vulkan a
+/// wait on the device's side, which never moves), or a device wait on what
+/// only the device raises, cannot be written.
+pub trait TimelineRole: sealed::Sealed + Send + Sync + 'static {}
+
+/// The host raises the timeline ([`TimelineHost::signal`]) and device work
+/// waits on it at wait nodes ([`Wait`]): a host gate. The host can see what
+/// it raised ([`TimelineHost::signalled`]), never anything of the device's.
+pub enum Gate {}
+
+/// Device work raises the timeline at signal nodes ([`Signal`]) and the host
+/// waits on it ([`TimelineHost::wait`]); the host raises it only in the
+/// device's place, for work that will never run ([`TimelineHost::reach`]).
+pub enum Reached {}
+
+/// The timeline of a load's parks and publications ([`Park`], [`Publish`]):
+/// the runtime takes its values as runs are queued; the device reaches each
+/// park ([`TimelineHost::reached`]) and the host answers it
+/// ([`TimelineHost::answer`]).
+pub enum Parks {}
+
+impl sealed::Sealed for Gate {}
+impl sealed::Sealed for Reached {}
+impl sealed::Sealed for Parks {}
+impl TimelineRole for Gate {}
+impl TimelineRole for Reached {}
+impl TimelineRole for Parks {}
+
+/// A role whose nodes each run binds at a value of the host's
+/// (`NativeGraphBindings::set_timeline`).
+pub trait ValuedRole: TimelineRole {}
+impl ValuedRole for Gate {}
+impl ValuedRole for Reached {}
+
+/// A kind of timeline node a graph places (`NativeGraphDraft::timeline`),
+/// and the role of the timeline each run binds it to.
+pub trait TimelineNodeKind: sealed::Sealed + Copy {
+    const NODE: TimelineNode;
+    type Role: TimelineRole;
+}
+
+/// A wait node ([`TimelineNode::Wait`]), bound to a [`Gate`].
+#[derive(Clone, Copy, Debug)]
+pub struct Wait;
+/// A signal node ([`TimelineNode::Signal`]), bound to a [`Reached`].
+#[derive(Clone, Copy, Debug)]
+pub struct Signal;
+/// A park node ([`TimelineNode::Park`]), bound to a [`Parks`] timeline or
+/// answered.
+#[derive(Clone, Copy, Debug)]
+pub struct Park;
+/// A publication node ([`TimelineNode::Publish`]), bound to a [`Parks`]
+/// timeline.
+#[derive(Clone, Copy, Debug)]
+pub struct Publish;
+
+impl sealed::Sealed for Wait {}
+impl sealed::Sealed for Signal {}
+impl sealed::Sealed for Park {}
+impl sealed::Sealed for Publish {}
+impl TimelineNodeKind for Wait {
+    const NODE: TimelineNode = TimelineNode::Wait;
+    type Role = Gate;
+}
+impl TimelineNodeKind for Signal {
+    const NODE: TimelineNode = TimelineNode::Signal;
+    type Role = Reached;
+}
+impl TimelineNodeKind for Park {
+    const NODE: TimelineNode = TimelineNode::Park;
+    type Role = Parks;
+}
+impl TimelineNodeKind for Publish {
+    const NODE: TimelineNode = TimelineNode::Publish;
+    type Role = Parks;
+}
+
+/// The host's handle of a timeline of role `R`, which has only the
+/// operations of its role. Dropping the last releases it: every wait bound
+/// on it opens (the module documentation).
+pub struct TimelineHost<R: TimelineRole> {
+    inner: Arc<TimelineInner>,
+    role: PhantomData<fn() -> R>,
+}
+
+impl<R: TimelineRole> TimelineHost<R> {
+    /// A timeline at 0 on `device`.
+    pub fn new(device: &Arc<DeviceInner>) -> Result<Self, TensorError> {
+        Ok(Self {
+            inner: Arc::new(TimelineInner::new(device)?),
+            role: PhantomData,
+        })
     }
 
-    pub fn inner(&self) -> &Arc<TimelineInner> {
+    pub(crate) fn inner(&self) -> &Arc<TimelineInner> {
         &self.inner
     }
 }
 
-impl Drop for TimelineHost {
+impl TimelineHost<Gate> {
+    /// Raise the gate to `value`, after every host write before it; a value
+    /// it has reached already changes nothing. Any thread may signal at any
+    /// time.
+    pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
+        self.inner.signal(value)
+    }
+
+    /// Whether the host has raised the gate to `value`; the device's loss
+    /// where it cannot say.
+    pub fn signalled(&self, value: u64) -> Result<bool, ExecutionError> {
+        Ok(self.inner.covers(self.inner.gated()?, value))
+    }
+
+    /// Wait at most `timeout` for the host to raise the gate to `value`,
+    /// after which this thread sees every host write before that signal;
+    /// whether it did, or the device's loss where it cannot say.
+    pub fn wait_signalled(&self, value: u64, timeout: Duration) -> Result<bool, ExecutionError> {
+        self.inner.wait_gated(value, timeout)
+    }
+}
+
+impl TimelineHost<Reached> {
+    /// Whether the device has raised the timeline to `value`; the device's
+    /// loss where it cannot say.
+    pub fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.inner.reached(value)
+    }
+
+    /// The value the device has raised the timeline to (a word timeline's,
+    /// its word); the device's loss where it cannot say.
+    pub fn current(&self) -> Result<u64, ExecutionError> {
+        self.inner.current()
+    }
+
+    /// Wait at most `timeout` for the device to raise the timeline to
+    /// `value`, after which the host sees every device write before the
+    /// signal; whether it did, or the device's loss where it cannot say.
+    pub fn wait(&self, value: u64, timeout: Duration) -> Result<bool, ExecutionError> {
+        self.inner.wait(value, timeout)
+    }
+
+    /// Raise the timeline to `value` in the device's place: the host
+    /// completes a signal no device work will raise (a step queued but
+    /// never run), or plays the device (a test). Precondition: no device
+    /// signal of the timeline is pending, so none raises it at once.
+    pub fn reach(&self, value: u64) -> Result<(), ExecutionError> {
+        self.inner.reach(value)
+    }
+}
+
+impl TimelineHost<Parks> {
+    /// Whether the device reached the park or publication that took `value`
+    /// (`NativeGraphOutputs::park`), every write before it visible to the
+    /// host. A park's call waits there unless the host answered it
+    /// ([`Self::answered`]), which may come first. The device's loss where
+    /// it cannot say.
+    pub fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.inner.reached(value)
+    }
+
+    /// The value the device has raised the timeline to; the device's loss
+    /// where it cannot say.
+    pub fn current(&self) -> Result<u64, ExecutionError> {
+        self.inner.current()
+    }
+
+    /// Raise what the device raises to `value`, as the device would: a host
+    /// that plays the device (a test).
+    pub fn reach(&self, value: u64) -> Result<(), ExecutionError> {
+        self.inner.reach(value)
+    }
+
+    /// Whether the timeline's device's kernels wait for a park's answer
+    /// themselves (`BackendName::parks_in_kernels`), so a park binds no
+    /// operation of it.
+    pub fn parks_in_kernels(&self) -> bool {
+        self.inner.parks_in_kernels()
+    }
+
+    /// Answer the park that took `value`, every host write before this
+    /// call visible to the call: the timeline's gates raised to
+    /// `value + 1`, the call's gate, before or after the device reaches it.
+    /// `answer` is why the host answers now, which a trace keeps.
+    pub fn answer(&self, value: u64, answer: ParkAnswer) -> Result<(), ExecutionError> {
+        self.inner.answer(value, answer)
+    }
+
+    /// Whether the host answered the park that took `value`: its gate
+    /// raised to `value + 1` by the host's signal, not opened by the
+    /// timeline's release ([`TimelineInner::released_unsignalled`]). The
+    /// device's loss where it cannot say, or where the release could not
+    /// say what the host reached.
+    pub fn answered(&self, value: u64) -> Result<bool, ExecutionError> {
+        self.inner.answered(value)
+    }
+}
+
+impl<R: TimelineRole> Drop for TimelineHost<R> {
     fn drop(&mut self) {
         self.inner.release();
     }
@@ -182,7 +376,7 @@ fn word_reached(word: u32, value: u64) -> bool {
 
 impl TimelineInner {
     /// A timeline at 0 on `device`.
-    pub fn new(device: &Arc<DeviceInner>) -> Result<Self, TensorError> {
+    pub(crate) fn new(device: &Arc<DeviceInner>) -> Result<Self, TensorError> {
         let kind = match &device.kind {
             OpenedKind::Cpu(_) => TimelineKind::Cpu(CpuTimeline {
                 value: Mutex::new(0),
@@ -228,7 +422,7 @@ impl TimelineInner {
     /// Raise the timeline to `value` from the host, after every host write
     /// before it; a value it has reached already changes nothing. Any
     /// thread may signal at any time.
-    pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
+    pub(crate) fn signal(&self, value: u64) -> Result<(), ExecutionError> {
         let _raising = self.raising.lock().expect("timeline raising lock is never poisoned");
         match &self.kind {
             TimelineKind::Cpu(timeline) => timeline.signal(value),
@@ -253,10 +447,10 @@ impl TimelineInner {
         Ok(())
     }
 
-    /// Raise what the device raises to `value`, as the device would: a host
-    /// that plays the device (a test). On the CPU, whose one value both
-    /// raise, [`Self::signal`].
-    pub fn reach(&self, value: u64) -> Result<(), ExecutionError> {
+    /// Raise what the device raises to `value` in the device's place (no
+    /// device signal of it pending, [`TimelineHost::reach`]). On the CPU,
+    /// whose one value both raise, [`Self::signal`].
+    pub(crate) fn reach(&self, value: u64) -> Result<(), ExecutionError> {
         match &self.kind {
             #[cfg(target_os = "macos")]
             TimelineKind::Metal(timeline) => {
@@ -290,26 +484,17 @@ impl TimelineInner {
         self.parks.fetch_add(2, Ordering::Relaxed)
     }
 
-    /// Whether the device reached the park that took `value`
-    /// (`NativeGraphOutputs::park`), every write before it visible to the
-    /// host: once the timeline reaches `value`. Its call waits there unless
-    /// the host answered it ([`Self::answered`]), which may come first.
-    /// The device's loss where it cannot say.
-    pub fn parked(&self, value: u64) -> Result<bool, ExecutionError> {
-        self.reached(value)
-    }
-
     /// Whether the timeline's device's kernels wait for a park's answer
     /// themselves (`BackendName::parks_in_kernels`), so a park binds no
     /// operation of it.
-    pub fn parks_in_kernels(&self) -> bool {
+    pub(crate) fn parks_in_kernels(&self) -> bool {
         crate::native::backend_name(&self.device.kind).parks_in_kernels()
     }
 
     /// Answer the park that took `value`, every host write before this
     /// call visible to the call: the timeline's gates raised to
     /// `value + 1`, the call's gate, before or after the device reaches it.
-    pub fn answer(&self, value: u64, answer: ParkAnswer) -> Result<(), ExecutionError> {
+    pub(crate) fn answer(&self, value: u64, answer: ParkAnswer) -> Result<(), ExecutionError> {
         match &self.kind {
             #[cfg(not(target_os = "macos"))]
             TimelineKind::Vulkan(timeline) => {
@@ -329,7 +514,7 @@ impl TimelineInner {
     /// timeline's release ([`Self::released_unsignalled`]). The device's
     /// loss where it cannot say, or where the release could not say what
     /// the host reached.
-    pub fn answered(&self, value: u64) -> Result<bool, ExecutionError> {
+    pub(crate) fn answered(&self, value: u64) -> Result<bool, ExecutionError> {
         Ok(self.covers(self.signalled()?, value + 1))
     }
 
@@ -352,13 +537,13 @@ impl TimelineInner {
 
     /// Whether the timeline has reached `value`; the device's loss where it
     /// cannot say.
-    pub fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
+    pub(crate) fn reached(&self, value: u64) -> Result<bool, ExecutionError> {
         Ok(self.covers(self.current()?, value))
     }
 
     /// The value the timeline holds now (a word timeline's, its word); the
     /// device's loss where it cannot say.
-    pub fn current(&self) -> Result<u64, ExecutionError> {
+    pub(crate) fn current(&self) -> Result<u64, ExecutionError> {
         Ok(match &self.kind {
             TimelineKind::Cpu(timeline) => timeline.value(),
             #[cfg(target_os = "macos")]
@@ -381,6 +566,23 @@ impl TimelineInner {
             TimelineKind::Vulkan(timeline) => timeline.gate.value()?,
             _ => return self.current(),
         })
+    }
+
+    /// Wait at most `timeout` for the host to raise the gates to `value`,
+    /// after which this thread sees every host write before that signal;
+    /// whether it did, or the device's loss where it cannot say.
+    fn wait_gated(&self, value: u64, timeout: Duration) -> Result<bool, ExecutionError> {
+        let gated = match &self.kind {
+            TimelineKind::Cpu(timeline) => timeline.wait(value, timeout),
+            #[cfg(target_os = "macos")]
+            TimelineKind::Metal(timeline) => timeline.gate.wait(value, timeout),
+            // `HostWord::store` wakes its waiters.
+            TimelineKind::Cuda(timeline) => timeline.gate.wait(|current| word_reached(current, value), timeout),
+            #[cfg(not(target_os = "macos"))]
+            TimelineKind::Vulkan(timeline) => timeline.gate.wait(value, timeout)?,
+        };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        Ok(gated)
     }
 
     /// Whether a timeline holding `current` has reached `value`.
@@ -454,7 +656,7 @@ impl TimelineInner {
     /// Wait at most `timeout` for the timeline to reach `value`, after which
     /// the host sees every device write before the signal; whether it did,
     /// or the device's loss where it cannot say.
-    pub fn wait(&self, value: u64, timeout: Duration) -> Result<bool, ExecutionError> {
+    pub(crate) fn wait(&self, value: u64, timeout: Duration) -> Result<bool, ExecutionError> {
         let reached = match &self.kind {
             TimelineKind::Cpu(timeline) => timeline.wait(value, timeout),
             #[cfg(target_os = "macos")]
@@ -549,21 +751,21 @@ mod tests {
         assert_eq!(timeline.value(), 3);
     }
 
-    /// A timeline of a CPU device, whose runs block at a gate as
+    /// A gate of a CPU device, whose runs block at a gate as
     /// `CpuTimeline::wait_unbounded` does.
-    fn cpu_timeline() -> TimelineInner {
+    fn cpu_gate() -> TimelineHost<Gate> {
         let devices = crate::devices::Devices::discover(&[]).unwrap();
         let device = devices
             .open_backend(seismic_lang::registry::BackendName::Cpu)
             .unwrap();
-        TimelineInner::new(&device).unwrap()
+        TimelineHost::new(&device).unwrap()
     }
 
     #[test]
     fn dropping_the_last_host_handle_opens_a_pending_gate_and_fails_its_wait() {
-        let host = Arc::new(TimelineHost::new(cpu_timeline()));
-        let inner = host.inner().clone();
-        inner.signal(1).unwrap();
+        let host = Arc::new(cpu_gate());
+        let inner = TimelineHost::inner(&host).clone();
+        host.signal(1).unwrap();
         // A run's gate awaits 3, and blocks as a CPU run blocks at its gate:
         // the host signals it no further.
         inner.await_at(3);
@@ -579,7 +781,7 @@ mod tests {
         // A second handle keeps it; the last one's drop releases it.
         let other = host.clone();
         drop(host);
-        assert!(!inner.reached(3).unwrap());
+        assert!(!other.signalled(3).unwrap());
         drop(other);
         let started = std::time::Instant::now();
         waiter.join().unwrap();
@@ -601,31 +803,31 @@ mod tests {
             eprintln!("no Vulkan device: no timeline has gates of its own");
             return;
         };
-        let host = TimelineHost::new(TimelineInner::new(&device).unwrap());
+        let host = TimelineHost::<Parks>::new(&device).unwrap();
         let inner = host.inner().clone();
         // Park 1 is answered before the device reached it; park 3's run is
         // bound, and its host dies before answering it.
         inner.await_at(2);
         inner.answer(1, ParkAnswer { by: AnsweredBy::Ready, park: "test", layer: 0 }).unwrap();
         inner.await_at(4);
-        assert!(inner.answered(1).unwrap() && !inner.parked(1).unwrap(), "an answer comes before the device");
+        assert!(inner.answered(1).unwrap() && !inner.reached(1).unwrap(), "an answer comes before the device");
         drop(host);
         assert!(inner.covers(inner.gated().unwrap(), 4), "the release opens the gate bound after the answer");
         assert!(inner.answered(1).unwrap() && !inner.answered(3).unwrap(), "a gate the release opened is no answer");
-        assert!(!inner.parked(1).unwrap() && !inner.parked(3).unwrap(), "the release raises nothing the device reaches");
+        assert!(!inner.reached(1).unwrap() && !inner.reached(3).unwrap(), "the release raises nothing the device reaches");
         assert_eq!(inner.released_unsignalled(2), None, "the host's answer is an answer");
         assert!(inner.released_unsignalled(4).is_some(), "the gate the release opened fails its run");
     }
 
     #[test]
     fn a_wait_bound_after_the_release_opens_as_it_is_bound() {
-        let host = TimelineHost::new(cpu_timeline());
+        let host = cpu_gate();
         let inner = host.inner().clone();
         // The last handle is dropped between a run's binding of the wait
         // node and its registration of the awaited value.
         drop(host);
         inner.await_at(4);
-        assert!(inner.reached(4).unwrap());
+        assert!(inner.covers(inner.gated().unwrap(), 4));
         assert!(inner.released_unsignalled(4).is_some());
     }
 }

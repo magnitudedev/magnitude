@@ -2737,9 +2737,9 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
     let step = table
         .queue(StepRows::Known(vec![vec![1], vec![3500]]))
         .unwrap();
-    assert!(step.gate.wait(step.value, std::time::Duration::from_secs(10)).unwrap());
+    assert!(step.gate.wait_signalled(step.value, std::time::Duration::from_secs(10)).unwrap());
     // The device read the step's rows.
-    step.read.signal(step.value).unwrap();
+    step.read.reach(step.value).unwrap();
     (path, crate::programs::StoredRead::new(table, step.value))
 }
 

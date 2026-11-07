@@ -8,7 +8,7 @@ use crate::{
 use magnitude_family_contracts::{Decoder, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{import_dense, repack_weight, selection_notice, stored_rows};
 use seismic::{
-    Element, NativeGraphMetadata, NativePort, NativeTimelinePort, TimelineNode, WorkflowTensor,
+    Element, NativeGraphMetadata, NativePort, NativeTimelinePort, WorkflowTensor,
 };
 
 /// What a graph's weight port binds of the resident weight of `role`.
@@ -50,7 +50,7 @@ pub(crate) struct GraphPark {
 /// A timeline node of a graph that each run binds to the bank's park
 /// timeline (`BankRun::bind`): a park, or the publication
 /// of the site request of the streamed layer of a scope
-/// (`seismic::TimelineNode::Publish`), each registered with the value it
+/// (`seismic::timeline::Publish`), each registered with the value it
 /// takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GraphTimeline {
@@ -359,8 +359,8 @@ pub(crate) fn landed_read<'a, G: GraphDraft + 'a, T>(
             notice: notice.tensor_mut().into(),
         },
     )?;
-    let noticed = graph.timeline(TimelineNode::Signal);
-    let gate = graph.timeline(TimelineNode::Wait);
+    let noticed = graph.timeline(seismic::timeline::Signal);
+    let gate = graph.timeline(seismic::timeline::Wait);
     // The import's `[B, N, K]` view of the landing rows.
     let width = plan.shape[1];
     let staging = port(graph, plan.upload, &[1, rows, width], 1)?;
@@ -392,7 +392,7 @@ pub(crate) fn landed_read<'a, G: GraphDraft + 'a, T>(
     };
     graph.store(&converted, &landed)?;
     let value = reader(graph)?;
-    let read = graph.timeline(TimelineNode::Signal);
+    let read = graph.timeline(seismic::timeline::Signal);
     Ok((
         value,
         LandedReadPorts {
@@ -493,11 +493,11 @@ pub(crate) struct LandedReadPorts {
     /// The rows the read names (`DeviceTable::read_selected`).
     pub rows: u64,
     pub notice: NativePort,
-    pub noticed: NativeTimelinePort,
-    pub gate: NativeTimelinePort,
+    pub noticed: NativeTimelinePort<seismic::timeline::Reached>,
+    pub gate: NativeTimelinePort<seismic::timeline::Gate>,
     pub staging: NativePort,
     pub landing: NativePort,
-    pub read: NativeTimelinePort,
+    pub read: NativeTimelinePort<seismic::timeline::Reached>,
 }
 
 impl LandedReadPorts {
@@ -535,16 +535,11 @@ impl LandedReadPorts {
         bindings
             .set(&self.landing, &view(&read.landing)?)
             .map_err(|error| text(&error))?;
-        for (port, timeline) in [
-            (self.noticed, &read.noticed),
-            (self.gate, &read.gate),
-            (self.read, &read.read),
-        ] {
-            bindings
-                .set_timeline(port, timeline, read.value)
-                .map_err(|error| text(&error))?;
-        }
-        Ok(())
+        bindings
+            .set_timeline(self.noticed, &read.noticed, read.value)
+            .and_then(|()| bindings.set_timeline(self.gate, &read.gate, read.value))
+            .and_then(|()| bindings.set_timeline(self.read, &read.read, read.value))
+            .map_err(|error| text(&error))
     }
 }
 
@@ -553,8 +548,8 @@ impl LandedReadPorts {
 /// the signal after it, which says the read is done with the rows.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StoredReadPorts {
-    pub gate: NativeTimelinePort,
-    pub read: NativeTimelinePort,
+    pub gate: NativeTimelinePort<seismic::timeline::Gate>,
+    pub read: NativeTimelinePort<seismic::timeline::Reached>,
 }
 
 /// The rows `rows` (`[count, 2]`, (row, status) pairs) of the stored table
@@ -582,7 +577,7 @@ pub(crate) fn stored_table_rows<'a, G: GraphDraft + 'a>(
         return Err(format!("stored table {:?} is not records of rows", table.role).into());
     };
     let directory = table.directory(graph, load, ports)?;
-    let gate = graph.timeline(TimelineNode::Wait);
+    let gate = graph.timeline(seismic::timeline::Wait);
     let decoded = graph
         .enqueue(
             entry,
@@ -601,7 +596,7 @@ pub(crate) fn stored_table_rows<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    let read = graph.timeline(TimelineNode::Signal);
+    let read = graph.timeline(seismic::timeline::Signal);
     Ok((decoded, StoredReadPorts { gate, read }))
 }
 

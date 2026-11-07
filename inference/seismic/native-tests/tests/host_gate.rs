@@ -6,7 +6,7 @@
 
 use seismic::{
     BackendName, Devices, Element, NativeGraphFamily, NativeGraphMetadata,
-    NativeSpecialization, Tensor, Timeline, TimelineNode,
+    NativeSpecialization, Tensor, Timeline,
 };
 use seismic_native_tests::scale_rows;
 use std::time::Duration;
@@ -48,8 +48,8 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
             )
             .unwrap()
             .value;
-        let arrival = graph.timeline(TimelineNode::Signal);
-        let gate = graph.timeline(TimelineNode::Wait);
+        let arrival = graph.timeline(seismic::timeline::Signal);
+        let gate = graph.timeline(seismic::timeline::Wait);
         let after = graph
             .enqueue(
                 &kernel,
@@ -60,7 +60,7 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
             )
             .unwrap()
             .value;
-        let signal = graph.timeline(TimelineNode::Signal);
+        let signal = graph.timeline(seismic::timeline::Signal);
         graph.export(&before).unwrap();
         graph.export(&after).unwrap();
         let plan = graph.seal().unwrap();
@@ -74,9 +74,9 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
         // SAFETY: no device work uses the tensor yet.
         unsafe { shared.write_shared(0, &f32_bytes(&first)).unwrap() };
         let (arrived, opened, done) = (
-            Timeline::new(&device).unwrap(),
-            Timeline::new(&device).unwrap(),
-            Timeline::new(&device).unwrap(),
+            Timeline::<seismic::timeline::Reached>::new(&device).unwrap(),
+            Timeline::<seismic::timeline::Gate>::new(&device).unwrap(),
+            Timeline::<seismic::timeline::Reached>::new(&device).unwrap(),
         );
         // Two runs: the second's values are past the first's.
         for step in 1..=2u64 {
@@ -141,7 +141,7 @@ fn an_open_gate_lets_the_run_through() {
                 .unwrap();
         let mut graph = device.native_graph();
         let input = graph.port(Element::f32(), &[m, n]).unwrap();
-        let gate = graph.timeline(TimelineNode::Wait);
+        let gate = graph.timeline(seismic::timeline::Wait);
         let value = graph
             .enqueue(
                 &kernel,
@@ -189,7 +189,7 @@ fn a_run_binds_every_timeline_node() {
             .unwrap();
     let mut graph = device.native_graph();
     let input = graph.port(Element::f32(), &[1, 4]).unwrap();
-    let gate = graph.timeline(TimelineNode::Wait);
+    let gate = graph.timeline(seismic::timeline::Wait);
     let value = graph
         .enqueue(
             &kernel,
@@ -230,8 +230,8 @@ fn timeline_nodes_are_in_the_planned_host_heap() {
     let mut metadata = NativeGraphMetadata::new(device.backend());
     let input = graph.port(Element::f32(), &[1, 4]).unwrap();
     let planned_input = metadata.port(Element::f32(), &[1, 4]).unwrap();
-    graph.timeline(TimelineNode::Wait);
-    metadata.timeline(TimelineNode::Wait);
+    graph.timeline(seismic::timeline::Wait);
+    metadata.timeline(seismic::timeline::Wait);
     let value = graph
         .enqueue(
             &kernel,
@@ -253,8 +253,8 @@ fn timeline_nodes_are_in_the_planned_host_heap() {
         )
         .unwrap()
         .value;
-    graph.timeline(TimelineNode::Signal);
-    metadata.timeline(TimelineNode::Signal);
+    graph.timeline(seismic::timeline::Signal);
+    metadata.timeline(seismic::timeline::Signal);
     graph.export(&value).unwrap();
     metadata.export(&planned).unwrap();
     assert_eq!(graph.seal().unwrap().host_heap(), metadata.plan_heap());

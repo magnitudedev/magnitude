@@ -53,6 +53,7 @@ use crate::slot_directory::SlotDirectory;
 use magnitude_family_contracts::WeightDescriptor;
 use seismic_io::{Reader, Ended, Range, Want};
 use seismic::cpu::repack::RowConversion;
+use seismic::timeline::{Gate, Reached};
 use seismic::Element;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
@@ -111,7 +112,7 @@ enum Named {
 
 impl Named {
     /// Whether the slot is free by `read`: its step's read is done.
-    fn free(self, read: &seismic::Timeline) -> Result<bool, seismic::ExecutionError> {
+    fn free(self, read: &seismic::Timeline<Reached>) -> Result<bool, seismic::ExecutionError> {
         match self {
             Self::Step(step) => read.reached(step),
             Self::Held => Ok(false),
@@ -184,8 +185,8 @@ impl StepFailure {
 /// A queued step's timeline bindings: its gate and read nodes bind the
 /// table's timelines at `value`.
 pub struct StoredStep {
-    pub gate: seismic::Timeline,
-    pub read: seismic::Timeline,
+    pub gate: seismic::Timeline<Gate>,
+    pub read: seismic::Timeline<Reached>,
     pub value: u64,
 }
 
@@ -197,7 +198,7 @@ pub struct StoredStep {
 /// filler read the copy.
 pub struct SelectionNotice {
     copies: seismic::Tensor,
-    timeline: seismic::Timeline,
+    timeline: seismic::Timeline<Reached>,
     /// The last step's value.
     next: Mutex<u64>,
 }
@@ -205,7 +206,7 @@ pub struct SelectionNotice {
 /// One step's selection notice: the copy it writes and its value.
 pub struct NoticeStep {
     pub tokens: seismic::Tensor,
-    pub timeline: seismic::Timeline,
+    pub timeline: seismic::Timeline<Reached>,
     pub value: u64,
 }
 
@@ -453,8 +454,8 @@ struct Shared {
     /// its row tensors.
     ranges: Vec<RowRange>,
     rows: u64,
-    gate: seismic::Timeline,
-    read: seismic::Timeline,
+    gate: seismic::Timeline<Gate>,
+    read: seismic::Timeline<Reached>,
     jobs: Mutex<Jobs>,
     /// Wakes the filler when jobs arrive.
     arrived: Condvar,
@@ -801,17 +802,19 @@ impl StoredTable {
     /// every step before it has read. Precondition: no step queued after it
     /// has been submitted.
     pub fn abandon(&self, value: u64) -> Result<(), String> {
-        // The filler opens the gate of every step it takes; the read
-        // timeline says every step up to a value has read.
+        // The filler opens the gate of every step it takes; the device
+        // raises the read timeline as every step up to a value has read, and
+        // with none of them pending the host raises it in the device's place
+        // for the step that never runs.
         let lost = |error: seismic::ExecutionError| format!("an abandoned stored-table step's predecessors: {error}");
-        let taken = self.shared.gate.wait(value, SLOT_WAIT).map_err(lost)?
+        let taken = self.shared.gate.wait_signalled(value, SLOT_WAIT).map_err(lost)?
             && self.shared.read.wait(value.saturating_sub(1), SLOT_WAIT).map_err(lost)?;
         if !taken {
             return Err("an abandoned stored-table step's predecessors did not read".into());
         }
         self.shared
             .read
-            .signal(value)
+            .reach(value)
             .map_err(|error| error.to_string())
     }
 
@@ -1379,10 +1382,12 @@ mod tests {
         vec![RowRange { source: Reader::open(path, CachePolicy::Uncached).unwrap(), first: 100, bytes: ROW_BYTES }]
     }
 
+    /// The requested test backend's device, else the CPU's: off the CPU a
+    /// timeline's host and device sides are apart.
     fn device() -> seismic::Device {
         seismic::Devices::discover(&[])
             .unwrap()
-            .open_backend(BackendName::Cpu)
+            .open_backend(seismic::testing::requested_backend().unwrap_or(BackendName::Cpu))
             .unwrap()
     }
 
@@ -1454,7 +1459,7 @@ mod tests {
         let rows = |count: u64, from: u64| (from..from + count).map(|row| row * 3 % ROWS).collect::<Vec<_>>();
         let run = |rows: Vec<u64>| {
             let step = table.queue(StepRows::Known(vec![rows])).unwrap();
-            assert!(step.gate.wait(step.value, Duration::from_secs(10)).unwrap());
+            assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
             step
         };
         // Every slot holds a row.
@@ -1512,7 +1517,7 @@ mod tests {
 
     /// Mark step `value`'s read done, as the device does after its read.
     fn read_done(step: &StoredStep) {
-        step.read.signal(step.value).unwrap();
+        step.read.reach(step.value).unwrap();
     }
 
     /// Rows prefetched ahead of the steps that name them are read before
@@ -1525,7 +1530,7 @@ mod tests {
         let (path, table) = table("prefetch", 64, DirectoryForm::Hashed);
         let run = |rows: std::ops::Range<u64>| {
             let step = table.queue(StepRows::Known(vec![rows.collect()])).unwrap();
-            assert!(step.gate.wait(step.value, Duration::from_secs(10)).unwrap());
+            assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
             assert_eq!(table.failure(step.value), None);
             read_done(&step);
         };
@@ -1543,7 +1548,7 @@ mod tests {
         assert_eq!(held(&prompt[..48]), 48);
         for chunk in prompt[..48].chunks(16) {
             let step = table.queue(StepRows::Known(vec![chunk.to_vec()])).unwrap();
-            assert!(step.gate.wait(step.value, Duration::from_secs(10)).unwrap());
+            assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
             for row in chunk {
                 assert_eq!(found(&table, *row), Some(slot_row(*row)));
             }
@@ -1627,15 +1632,9 @@ mod tests {
             )
             .unwrap();
             let step = table.queue(StepRows::Known(vec![(0..ROWS).collect()])).unwrap();
-            // The device waits at the gate the filler opens; the host waits
-            // for the filler's count of the step instead (Metal's host sees
-            // only what the device raises, `Timeline::wait`). The filler
-            // counts a step once its rows are written and published.
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while table.waits().known_steps == 0 {
-                assert!(std::time::Instant::now() < deadline, "{backend:?}: the filler never filled the step");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            // The filler opens the gate once the step's rows are written and
+            // published.
+            assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap(), "{backend:?}: the filler never filled the step");
             assert_eq!(table.failure(step.value), None);
             let kernel = stored_rows::native_for_device_with(
                 &device,
@@ -1687,7 +1686,7 @@ mod tests {
                     .queue(StepRows::Known(vec![rows[..8].to_vec(), rows[8..].to_vec()]))
                     .unwrap();
                 assert_eq!(queued.value, step + 1);
-                assert!(queued.gate.wait(queued.value, Duration::from_secs(10)).unwrap());
+                assert!(queued.gate.wait_signalled(queued.value, Duration::from_secs(10)).unwrap());
                 assert_eq!(table.failure(queued.value), None);
                 for row in &rows {
                     assert_eq!(found(&table, *row), Some(slot_row(*row)), "{form:?} row {row}");
@@ -1703,16 +1702,16 @@ mod tests {
     fn a_slot_a_queued_step_reads_is_not_taken_until_that_step_has_read_it() {
         let (path, table) = table("eviction", 4, DirectoryForm::Hashed);
         let first = table.queue(StepRows::Known(vec![vec![1, 2, 3, 4]])).unwrap();
-        assert!(first.gate.wait(1, Duration::from_secs(10)).unwrap());
+        assert!(first.gate.wait_signalled(1, Duration::from_secs(10)).unwrap());
         // The next step needs a slot while every slot holds a row the first
         // step has not read: its gate waits for that read.
         let second = table.queue(StepRows::Known(vec![vec![5]])).unwrap();
-        assert!(!second.gate.wait(2, Duration::from_millis(100)).unwrap());
+        assert!(!second.gate.wait_signalled(2, Duration::from_millis(100)).unwrap());
         for row in [1, 2, 3, 4] {
             assert_eq!(found(&table, row), Some(slot_row(row)));
         }
         read_done(&first);
-        assert!(second.gate.wait(2, Duration::from_secs(10)).unwrap());
+        assert!(second.gate.wait_signalled(2, Duration::from_secs(10)).unwrap());
         assert_eq!(found(&table, 5), Some(slot_row(5)));
         // One of the first step's rows left; the others are still found.
         let held = [1, 2, 3, 4]
@@ -1721,6 +1720,33 @@ mod tests {
             .count();
         assert_eq!(held, 3);
         read_done(&second);
+        drop(table);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// An abandoned step's read is done once the steps before it have read:
+    /// abandoning it waits for the filler to take it (the gate the host
+    /// raised) and for the device's read of the step before, then raises
+    /// the read in the device's place, so the slots it named come free to
+    /// the steps after it.
+    #[test]
+    fn an_abandoned_step_frees_its_slots_for_the_steps_after_it() {
+        let (path, table) = table("abandoned", 4, DirectoryForm::Hashed);
+        let first = table.queue(StepRows::Known(vec![vec![1, 2]])).unwrap();
+        let abandoned = table.queue(StepRows::Known(vec![vec![3, 4]])).unwrap();
+        assert!(abandoned.gate.wait_signalled(abandoned.value, Duration::from_secs(10)).unwrap());
+        read_done(&first);
+        table.abandon(abandoned.value).unwrap();
+        assert!(abandoned.read.reached(abandoned.value).unwrap());
+        // Every slot holds a row of the two steps: the next takes those of
+        // both, the abandoned step's among them.
+        let next = table.queue(StepRows::Known(vec![vec![5, 6, 7, 8]])).unwrap();
+        assert!(next.gate.wait_signalled(next.value, Duration::from_secs(10)).unwrap());
+        assert_eq!(table.failure(next.value), None);
+        for row in [5, 6, 7, 8] {
+            assert_eq!(found(&table, row), Some(slot_row(row)));
+        }
+        read_done(&next);
         drop(table);
         std::fs::remove_file(path).unwrap();
     }
@@ -1734,15 +1760,15 @@ mod tests {
                 receiver.recv().map_err(|error| error.to_string())
             })))
             .unwrap();
-        assert!(!step.gate.reached(1).unwrap());
+        assert!(!step.gate.signalled(1).unwrap());
         sender.send(vec![vec![7], vec![9]]).unwrap();
-        assert!(step.gate.wait(1, Duration::from_secs(10)).unwrap());
+        assert!(step.gate.wait_signalled(1, Duration::from_secs(10)).unwrap());
         assert_eq!(found(&table, 9), Some(slot_row(9)));
         read_done(&step);
         // A row outside the table fails the slot that named it, and the
         // step's gate opens.
         let failed = table.queue(StepRows::Known(vec![vec![2], vec![ROWS]])).unwrap();
-        assert!(failed.gate.wait(2, Duration::from_secs(10)).unwrap());
+        assert!(failed.gate.wait_signalled(2, Duration::from_secs(10)).unwrap());
         let failure = table.failure(2).unwrap();
         assert_eq!(failure.slots, FailedSlots::Only(BTreeSet::from([1])));
         read_done(&failed);
@@ -1750,12 +1776,12 @@ mod tests {
         let lost = table
             .queue(StepRows::Selected(Box::new(|| Err("never selected".into()))))
             .unwrap();
-        assert!(lost.gate.wait(3, Duration::from_secs(10)).unwrap());
+        assert!(lost.gate.wait_signalled(3, Duration::from_secs(10)).unwrap());
         assert_eq!(table.failure(3).unwrap().slots, FailedSlots::Every);
         read_done(&lost);
         // A failure stays until its step is retired.
         let later = table.queue(StepRows::Known(vec![vec![1]])).unwrap();
-        assert!(later.gate.wait(4, Duration::from_secs(10)).unwrap());
+        assert!(later.gate.wait_signalled(4, Duration::from_secs(10)).unwrap());
         assert_eq!(table.failure(4), None);
         assert!(table.failure(2).is_some());
         table.retire(3);
@@ -1782,7 +1808,7 @@ mod tests {
         let second = table.queue(StepRows::Known(vec![vec![1]])).unwrap();
         go.send(()).unwrap();
         for step in [&first, &second] {
-            assert!(step.gate.wait(step.value, Duration::from_secs(10)).unwrap());
+            assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
             let failure = table.failure(step.value).unwrap();
             assert_eq!(failure.slots, FailedSlots::Every);
             assert!(failure.error.contains("an injected panic"), "{}", failure.error);
@@ -1808,7 +1834,7 @@ mod tests {
         let step = table
             .queue(StepRows::Known(vec![vec![1, 2, 3], vec![3, 3500]]))
             .unwrap();
-        assert!(step.gate.wait(1, Duration::from_secs(10)).unwrap());
+        assert!(step.gate.wait_signalled(1, Duration::from_secs(10)).unwrap());
         let failure = table.failure(1).unwrap();
         assert_eq!(failure.slots, FailedSlots::Only(BTreeSet::from([1])));
         assert!(failure.fails(1) && !failure.fails(0));
@@ -1819,7 +1845,7 @@ mod tests {
         read_done(&step);
         // The next step reads as usual.
         let next = table.queue(StepRows::Known(vec![vec![4], vec![5]])).unwrap();
-        assert!(next.gate.wait(2, Duration::from_secs(10)).unwrap());
+        assert!(next.gate.wait_signalled(2, Duration::from_secs(10)).unwrap());
         assert_eq!(table.failure(2), None);
         assert_eq!(found(&table, 5), Some(slot_row(5)));
         read_done(&next);
@@ -1878,7 +1904,7 @@ mod tests {
                         let step = table
                             .queue(StepRows::Known(vec![vec![first], vec![second]]))
                             .unwrap();
-                        assert!(step.gate.wait(step.value, Duration::from_secs(10)).unwrap());
+                        assert!(step.gate.wait_signalled(step.value, Duration::from_secs(10)).unwrap());
                         let selections = [first as i32, 0, -1, 0, second as i32, 0, -1, 1];
                         let tokens = seismic::Tensor::from_host(
                             &device,

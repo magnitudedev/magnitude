@@ -100,7 +100,7 @@ pub(super) fn owned_vectors_heap(weights: usize, banks: usize, parks: usize, con
     let mut heap = HostHeap::default();
     heap.hold(weights, size_of::<(WeightPort, NativePort)>());
     heap.hold(banks, size_of::<(BankPort, NativePort)>());
-    heap.hold(parks, size_of::<(GraphTimeline, NativeTimelinePort)>());
+    heap.hold(parks, size_of::<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>());
     heap.hold(constants, size_of::<GraphConstant>());
     heap.hold(state, size_of::<NativePort>());
     heap

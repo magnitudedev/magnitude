@@ -1,4 +1,4 @@
-//! A call that parks (`&await`, `TimelineNode::Park`): the host answers it
+//! A call that parks (`&await`, `seismic::timeline::Park`): the host answers it
 //! while it waits, on every backend, and a park node pairs with exactly such
 //! a call. Where the backend's devices see host writes while work runs, the
 //! call's kernel waits for the answer itself and the park node binds no
@@ -9,7 +9,7 @@
 
 use seismic::{
     BackendName, Element, NativeGraphFamily, NativeSpecialization, Tensor,
-    Timeline, TimelineNode,
+    Timeline,
 };
 use seismic_native_tests::{parked_scale, scale_rows};
 use std::time::Duration;
@@ -28,7 +28,7 @@ fn the_host_answers_a_parked_call() {
         let answer = graph.port(Element::i32(), &[1]).unwrap();
         let skip = graph.port(Element::i32(), &[1]).unwrap();
         let input = graph.port(Element::f32(), &[n]).unwrap();
-        let park = graph.timeline(TimelineNode::Park);
+        let park = graph.timeline(seismic::timeline::Park);
         let value = graph
             .enqueue(
                 &kernel,
@@ -40,7 +40,7 @@ fn the_host_answers_a_parked_call() {
             )
             .unwrap()
             .value;
-        let after = graph.timeline(TimelineNode::Signal);
+        let after = graph.timeline(seismic::timeline::Signal);
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
@@ -52,7 +52,10 @@ fn the_host_answers_a_parked_call() {
         let skipped = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
         // Three runs, the second leaving the call out: it takes no park
         // value, and the third's lies past the first's.
-        let (parks, done) = (Timeline::new(&device).unwrap(), Timeline::new(&device).unwrap());
+        let (parks, done) = (
+            Timeline::<seismic::timeline::Parks>::new(&device).unwrap(),
+            Timeline::<seismic::timeline::Reached>::new(&device).unwrap(),
+        );
         let mut last = 0;
         for step in 1..=3u64 {
             let skip_step = step == 2;
@@ -84,7 +87,7 @@ fn the_host_answers_a_parked_call() {
                 assert!(value > last, "{backend:?} step {step}: park values rise");
                 last = value;
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                while !parks.parked(value).unwrap() {
+                while !parks.reached(value).unwrap() {
                     assert!(std::time::Instant::now() < deadline, "{backend:?} step {step}: the device parks");
                     std::thread::yield_now();
                 }
@@ -115,7 +118,7 @@ fn the_host_answers_a_parked_call() {
     }
 }
 
-/// A publication (`TimelineNode::Publish`) follows a call, which it
+/// A publication (`seismic::timeline::Publish`) follows a call, which it
 /// publishes. Where parks are submission boundaries it takes the park
 /// timeline's next value as its run is queued, the run's output as a park's
 /// is, and the device reaches it once the call completed, waiting for
@@ -129,7 +132,7 @@ fn a_publication_ends_a_submission_after_its_call_and_waits_for_nothing() {
         let rows = scale_rows::native_for_device(&device, &NativeSpecialization::new().with_param("ROWS", 1)).unwrap();
         let mut graph = device.native_graph();
         let input = graph.port(Element::f32(), &[1, 4]).unwrap();
-        graph.timeline(TimelineNode::Publish);
+        graph.timeline(seismic::timeline::Publish);
         let call = scale_rows::WorkflowArgs { x: input.tensor().into(), factor: 1.0 };
         assert!(graph.enqueue(&rows, call).is_err(), "{backend:?}: a publication before any call");
 
@@ -143,8 +146,8 @@ fn a_publication_ends_a_submission_after_its_call_and_waits_for_nothing() {
             .enqueue(&rows, scale_rows::WorkflowArgs { x: published.tensor().into(), factor: 3.0 })
             .unwrap()
             .value;
-        let publication = graph.timeline(TimelineNode::Publish);
-        let park = graph.timeline(TimelineNode::Park);
+        let publication = graph.timeline(seismic::timeline::Publish);
+        let park = graph.timeline(seismic::timeline::Park);
         let value = graph
             .enqueue(
                 &kernel,
@@ -185,7 +188,7 @@ fn a_publication_ends_a_submission_after_its_call_and_waits_for_nothing() {
             // the device passes it on its own, reaching the park.
             assert!(published < parked, "{backend:?}: the publication's value precedes the park's");
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !parks.parked(parked).unwrap() {
+            while !parks.reached(parked).unwrap() {
                 assert!(std::time::Instant::now() < deadline, "{backend:?}: the device passes the publication");
                 std::thread::yield_now();
             }
@@ -222,7 +225,7 @@ fn a_park_pairs_with_a_call_that_parks() {
         // A park before a call that does not park.
         let mut graph = device.native_graph();
         let input = graph.port(Element::f32(), &[1, 4]).unwrap();
-        graph.timeline(TimelineNode::Park);
+        graph.timeline(seismic::timeline::Park);
         let call = scale_rows::WorkflowArgs {
             x: input.tensor().into(),
             factor: 1.0,
@@ -237,14 +240,15 @@ fn a_park_pairs_with_a_call_that_parks() {
         };
         let value = graph.enqueue(&kernel, call).unwrap().value;
         graph.export(&value).unwrap();
-        graph.timeline(TimelineNode::Park);
+        graph.timeline(seismic::timeline::Park);
         assert!(graph.seal().is_err());
     }
 }
 
 /// A park answered before its run is submitted (`set_answered`) binds no
 /// operation on any backend: the call reads the answer already in place.
-/// Only a park may be bound so.
+/// Only a park's port may be bound so, which its type says
+/// (`seismic::Timeline`).
 #[test]
 fn a_park_answered_before_the_run_waits_for_nothing() {
     let n = 4u64;
@@ -255,7 +259,7 @@ fn a_park_answered_before_the_run_waits_for_nothing() {
         let answer = graph.port(Element::i32(), &[1]).unwrap();
         let skip = graph.port(Element::i32(), &[1]).unwrap();
         let input = graph.port(Element::f32(), &[n]).unwrap();
-        let park = graph.timeline(TimelineNode::Park);
+        let park = graph.timeline(seismic::timeline::Park);
         let value = graph
             .enqueue(
                 &kernel,
@@ -267,7 +271,7 @@ fn a_park_answered_before_the_run_waits_for_nothing() {
             )
             .unwrap()
             .value;
-        let after = graph.timeline(TimelineNode::Signal);
+        let after = graph.timeline(seismic::timeline::Signal);
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
         let mut slot = plan.new_slot().unwrap();
@@ -277,7 +281,7 @@ fn a_park_answered_before_the_run_waits_for_nothing() {
         word.store_release(0, 3).unwrap();
         let run = Tensor::shared(&device, Element::i32(), &[1]).unwrap();
         run.store_release(0, 0).unwrap();
-        let done = Timeline::new(&device).unwrap();
+        let done = Timeline::<seismic::timeline::Reached>::new(&device).unwrap();
         let mut bindings = plan.bindings();
         bindings.set(&answer, &word).unwrap();
         bindings.set(&skip, &run).unwrap();
@@ -297,36 +301,6 @@ fn a_park_answered_before_the_run_waits_for_nothing() {
                 .collect::<Vec<_>>(),
             values.iter().map(|value| 3.0 * value).collect::<Vec<_>>(),
             "{backend:?}: the call read the answer in place"
-        );
-        // A signal is no park, and a park takes no value of the host's.
-        let mut refused = |bind: &dyn Fn(&mut seismic::NativeGraphBindings)| {
-            let mut bindings = plan.bindings();
-            bindings.set(&answer, &word).unwrap();
-            bindings.set(&skip, &run).unwrap();
-            bindings.set(&input, &x).unwrap();
-            bind(&mut bindings);
-            slot.attach(bindings, plan.new_outputs().unwrap()).is_err()
-        };
-        assert!(
-            refused(&|bindings| {
-                bindings.set_answered(park).unwrap();
-                bindings.set_answered(after).unwrap();
-            }),
-            "{backend:?}: a signal bound answered"
-        );
-        assert!(
-            refused(&|bindings| {
-                bindings.set_answered(park).unwrap();
-                bindings.set_park(after, &done).unwrap();
-            }),
-            "{backend:?}: a signal bound as a park"
-        );
-        assert!(
-            refused(&|bindings| {
-                bindings.set_timeline(park, &done, 2).unwrap();
-                bindings.set_timeline(after, &done, 3).unwrap();
-            }),
-            "{backend:?}: a park bound at a value"
         );
     }
 }

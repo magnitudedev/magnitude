@@ -5,7 +5,7 @@
 use super::GraphError;
 use seismic::{
     Element, Entry, LaunchEncoding, NativeGraph, NativeGraphMetadata, NativeGraphPlan, NativeGraphStorageBytes,
-    NativeKernel, NativePort, NativeTimelinePort, TimelineNode, WorkflowTensor,
+    NativeKernel, NativePort, NativeTimelinePort, WorkflowTensor,
 };
 
 /// How a block's graph takes its launch's per-step controls (coordinates,
@@ -102,7 +102,7 @@ pub(crate) trait GraphDraft: Sized {
     fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError>;
     /// A timeline node after every node enqueued so far: a host gate or a
     /// signal to the host (`seismic::Timeline`).
-    fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort;
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role>;
     /// A span mark after every node enqueued so far, its ordinal returned:
     /// where a sampled run stamps the device's time (`seismic::NativeSpans`),
     /// dividing no graph. Marked alike on a graph and its metadata, so every
@@ -179,7 +179,7 @@ impl GraphDraft for NativeGraph {
     fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
         self.store(result, port).map_err(invalid)
     }
-    fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role> {
         self.timeline(node)
     }
     fn span_mark(&mut self) -> usize {
@@ -264,7 +264,7 @@ impl GraphDraft for NativeGraphMetadata {
     fn store(&mut self, result: &WorkflowTensor, port: &NativePort) -> Result<(), GraphError> {
         Ok(self.store(result, port)?)
     }
-    fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+    fn timeline<N: seismic::timeline::TimelineNodeKind>(&mut self, node: N) -> NativeTimelinePort<N::Role> {
         self.timeline(node)
     }
     fn span_mark(&mut self) -> usize {

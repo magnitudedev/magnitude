@@ -150,14 +150,9 @@ pub enum WorkflowError {
     /// Standalone calls have no host-service boundary; this backend requires
     /// an explicit graph park for an awaited entry.
     ParkRequiresGraph,
-    /// A timeline node bound as a park (`set_park`, `set_answered`) that is
-    /// not one.
+    /// A publication bound answered (`set_answered`): only a park waits
+    /// for an answer.
     NotPark {
-        node: usize,
-    },
-    /// A park node bound at a value (`set_timeline`): a park takes its
-    /// value when its run is queued (`set_park`).
-    ParkAtValue {
         node: usize,
     },
     /// A run's timeline node was not bound to a timeline.
@@ -286,10 +281,7 @@ impl fmt::Display for CallError {
                 f.write_str("an awaited native call requires a graph park on this backend")
             }
             Self::Workflow(WorkflowError::NotPark { node }) => {
-                write!(f, "native graph timeline node {node} is bound as a park but is not one")
-            }
-            Self::Workflow(WorkflowError::ParkAtValue { node }) => {
-                write!(f, "native graph park node {node} is bound at a value; a park takes its value when queued")
+                write!(f, "native graph timeline node {node} is bound answered but is no park")
             }
             Self::Workflow(WorkflowError::NativeTimelineUnbound { node }) => {
                 write!(f, "native graph timeline node {node} is unbound")

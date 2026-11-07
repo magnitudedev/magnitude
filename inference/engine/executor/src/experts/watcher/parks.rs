@@ -4,12 +4,12 @@
 //! no host write visible to running work, nor the device's writes to the
 //! host before its submission ends.
 //!
-//! A graph places a park node (`seismic::TimelineNode::Park`) before each
+//! A graph places a park node (`seismic::timeline::Park`) before each
 //! call that waits on a slot of the exchange (`experts::exchange`): a
 //! decode layer's tier wait (`routed_tier_wait`, its file slot), a scratch
 //! round's wait (`routed_scratch_wait`, its round's lane) and a sited
 //! combine's sum (`routed_down_sited`, `routed_output_sited`, its site
-//! slot); and a publication (`TimelineNode::Publish`) right after a site
+//! slot); and a publication (`seismic::timeline::Publish`) right after a site
 //! request (`routed_site_request`), so the CPU pool reads the request while
 //! the device's hits run, before the sum's park. Every node binds the
 //! load's one park timeline (`NativeGraphBindings::set_park`). Where
@@ -182,7 +182,7 @@ pub(crate) struct Parks {
     /// Whether a park binds operations on the load's device: none where
     /// kernels wait in place, so nothing registers and no keeper runs.
     pub(super) kept: bool,
-    timeline: seismic::Timeline,
+    timeline: seismic::Timeline<seismic::timeline::Parks>,
     layers: Vec<ParkLayer>,
     state: Mutex<State>,
     /// What the keeper waits on while the head is parked or none is
@@ -211,7 +211,7 @@ impl Parks {
         self.layers.iter().any(|layer| layer.expired(step))
     }
 
-    pub(in crate::experts) fn new(timeline: seismic::Timeline, layers: Vec<ParkLayer>, events: Arc<Events>) -> Self {
+    pub(in crate::experts) fn new(timeline: seismic::Timeline<seismic::timeline::Parks>, layers: Vec<ParkLayer>, events: Arc<Events>) -> Self {
         Self {
             events,
             kept: !timeline.parks_in_kernels(),
@@ -263,18 +263,12 @@ impl Parks {
         self.device_says(held, self.timeline.reached(value))
     }
 
-    /// Whether the device reached the park that took `value`, as
-    /// [`Self::device_says`].
-    fn device_parked(&self, held: &State, value: u64) -> bool {
-        self.device_says(held, self.timeline.parked(value))
-    }
-
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().expect("parks")
     }
 
     /// The timeline every park of the load binds.
-    pub(crate) fn timeline(&self) -> &seismic::Timeline {
+    pub(crate) fn timeline(&self) -> &seismic::Timeline<seismic::timeline::Parks> {
         &self.timeline
     }
 
@@ -335,7 +329,7 @@ impl Parks {
     /// reached are in place then, as when it runs past its last park.
     pub(super) fn settled(&self) -> bool {
         let state = self.state();
-        state.pending.front().is_none_or(|head| self.device_parked(&state, head.value))
+        state.pending.front().is_none_or(|head| self.device_reached(&state, head.value))
     }
 
     /// Whether the device's requests are the host's to read: it is parked
@@ -350,7 +344,7 @@ impl Parks {
     pub(super) fn parked(&self) -> bool {
         let state = self.state();
         match state.pending.front() {
-            Some(head) => self.device_parked(&state, head.value),
+            Some(head) => self.device_reached(&state, head.value),
             None => !self.kept,
         }
     }
@@ -433,7 +427,7 @@ impl Parks {
                     arrived = true;
                 }
                 if !slots.answered(head.sequence, lane) {
-                    break match self.device_parked(state, head.value) {
+                    break match self.device_reached(state, head.value) {
                         true => Stop::Unanswered(head.value),
                         false => Stop::Unreached,
                     };
@@ -494,7 +488,7 @@ impl Parks {
     /// or while another thread holds the parks (the keeper, briefly).
     pub(in crate::experts) fn reached(&self) -> Option<crate::experts::exchange::Parked> {
         let state = self.state.try_lock().ok()?;
-        let head = state.pending.front().filter(|head| self.device_parked(&state, head.value))?;
+        let head = state.pending.front().filter(|head| self.device_reached(&state, head.value))?;
         Some(crate::experts::exchange::Parked {
             value: head.value,
             step: head.sequence,
@@ -513,7 +507,7 @@ impl Parks {
         let state = self.state.try_lock().ok()?;
         let head = state.pending.front().map(|head| {
             let answered = self.layers[head.site.layer].lane(head.site.kind).is_none_or(|(slots, lane, _)| slots.answered(head.sequence, lane));
-            format!("parked {:?}, its slot answered {answered}", self.timeline.parked(head.value))
+            format!("parked {:?}, its slot answered {answered}", self.timeline.reached(head.value))
         });
         let pending = state
             .pending
@@ -571,6 +565,20 @@ mod tests {
     /// Far past a rest and a look on a loaded test host: the bound a
     /// keeper's notice is held to here.
     const NOTICE: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Whether the host answered the park that took `value` within
+    /// `timeout`: the keeper answers on its own thread, and an answer is the
+    /// host's, never anything the device raises.
+    fn answered_within(timeline: &seismic::Timeline<seismic::timeline::Parks>, value: u64, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while !timeline.answered(value).unwrap() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::yield_now();
+        }
+        true
+    }
 
     /// A device whose parks are submission boundaries (Vulkan). The tests
     /// taking one are a Vulkan host's checks, run on one by name with
@@ -701,7 +709,7 @@ mod tests {
         assert!(!parks.settle(), "the pool has not answered");
         site.answer(7, 0, false);
         assert!(parks.settle());
-        assert!(parks.timeline.answered(3).unwrap() && !parks.timeline.parked(3).unwrap(), "the pool's answer opens the park first");
+        assert!(parks.timeline.answered(3).unwrap() && !parks.timeline.reached(3).unwrap(), "the pool's answer opens the park first");
         // Step 8's tier wait reads a request the device has not made
         // visible: it waits for the device to park.
         parks.register(5, 8, ParkSite { layer: 0, kind: ParkKind::TierWait });
@@ -719,7 +727,7 @@ mod tests {
             assert!(began.elapsed() < NOTICE, "the keeper left a published park unanswered");
             std::hint::spin_loop();
         }
-        assert!(!parks.timeline.parked(9).unwrap(), "an answer reads as no arrival");
+        assert!(!parks.timeline.reached(9).unwrap(), "an answer reads as no arrival");
         parks.stop();
         keeper.join().unwrap();
     }
@@ -785,7 +793,7 @@ mod tests {
                 std::hint::spin_loop();
             }
             parks.timeline.reach(value).unwrap();
-            assert!(parks.timeline.wait(value + 1, std::time::Duration::from_secs(1)).unwrap(), "park {value} reached and never answered");
+            assert!(answered_within(&parks.timeline, value, std::time::Duration::from_secs(1)), "park {value} reached and never answered");
         }
         parks.stop();
         keeper.join().unwrap();
@@ -820,7 +828,7 @@ mod tests {
             }
             scratch.answer(step, round_lane(0), false);
             parks.settle();
-            assert!(parks.timeline.wait(value + 1, std::time::Duration::from_secs(1)).unwrap(), "park {value} answered and never opened");
+            assert!(answered_within(&parks.timeline, value, std::time::Duration::from_secs(1)), "park {value} answered and never opened");
         }
         parks.stop();
         keeper.join().unwrap();
@@ -842,7 +850,7 @@ mod tests {
         for value in (1..400u64).step_by(2) {
             parks.register(value, 7, wait);
             parks.timeline.reach(value).unwrap();
-            assert!(parks.timeline.wait(value + 1, std::time::Duration::from_secs(1)).unwrap(), "park {value} never opened");
+            assert!(answered_within(&parks.timeline, value, std::time::Duration::from_secs(1)), "park {value} never opened");
         }
         assert_eq!(parks.events.seen(), quiet, "parks answered as reached woke the load");
         // Waiting on nothing, then on a head the device has not reached.
@@ -864,7 +872,7 @@ mod tests {
         assert_eq!(parks.events.seen(), quiet + 1, "one parked head announced more than once");
         file.answer(8, 0, false);
         assert!(parks.settle());
-        assert!(parks.timeline.reached(402).unwrap());
+        assert!(parks.timeline.answered(401).unwrap());
         parks.stop();
         keeper.join().unwrap();
     }

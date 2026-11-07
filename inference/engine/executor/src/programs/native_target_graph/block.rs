@@ -89,7 +89,7 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     /// publications after its site requests, each with the scope of its
     /// streamed layer in the block the graph was prepared for, which each
     /// run binds (`crate::experts::Parks`).
-    pub parks: Vec<(GraphTimeline, NativeTimelinePort)>,
+    pub parks: Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
     /// Host constants bound statically with the weights.
     pub constants: Vec<GraphConstant>,
     /// The span marks at its ends where it is a whole block whose routed
@@ -311,7 +311,7 @@ fn layer_bank<'p, 'a, G: GraphDraft + 'a>(
     stage: Stage,
     entries: Option<BankGraphEntries<'a, G>>,
     ports: &'p mut Vec<(BankPort, NativePort)>,
-    parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort)>,
+    parks: &'p mut Vec<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>,
 ) -> LayerBank<'p, 'a, G> {
     match (stage, entries) {
         (Stage::Run(RunStage::Resident), Some(_)) => LayerBank::Home,

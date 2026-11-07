@@ -14,7 +14,10 @@
 use super::hazard::{Reach, Through};
 use super::point::{GraphPoint, GraphTiming};
 use super::spans::{NativeSpans, Stamp};
-use super::timeline::{TimelineAction, TimelineInner, TimelineNode, TimelineOperation};
+use super::timeline::{
+    Parks, TimelineAction, TimelineHost, TimelineInner, TimelineNode, TimelineNodeKind, TimelineOperation,
+    TimelineRole, ValuedRole,
+};
 use super::{
     merge_access, submit, CallLaunches, Dispatch, DispatchList, LaunchGeometry, NativeQueue,
     NativePrepared, NativeRoute, NativeSubmission, NativeTensorSpec, ScratchNeed, BUFFER_ALIGNMENT,
@@ -37,6 +40,7 @@ use seismic_lang::checked::NativeImplementation;
 use seismic_lang::entry::{AliasRule, CallSchema, ParameterKind, TensorAccess};
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry::BackendName;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -280,18 +284,18 @@ fn add_port(identity: u64, ports: &mut Vec<PortSpec>, spec: PortSpec) -> NativeP
     }
 }
 
-/// Add timeline node `node` after the `nodes` enqueued so far.
-fn add_timeline(
+/// Add a timeline node of kind `N` after the `nodes` enqueued so far.
+fn add_timeline<N: TimelineNodeKind>(
     identity: u64,
     timelines: &mut Vec<(usize, TimelineNode)>,
     nodes: usize,
-    node: TimelineNode,
-) -> NativeTimelinePort {
+) -> NativeTimelinePort<N::Role> {
     let ordinal = u32::try_from(timelines.len()).expect("timeline ordinal exhausted");
-    timelines.push((nodes, node));
+    timelines.push((nodes, N::NODE));
     NativeTimelinePort {
         workflow: identity,
         ordinal,
+        role: PhantomData,
     }
 }
 
@@ -405,13 +409,38 @@ pub struct NativeGraphDraft {
     marks: Vec<usize>,
 }
 
-/// A timeline node of a graph (`timeline`): each run binds it to a
-/// timeline and a value (`NativeGraphBindings::set_timeline`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NativeTimelinePort {
+/// A timeline node of a graph (`timeline`), which each run binds to a
+/// timeline of role `R` (`NativeGraphBindings::set_timeline`, `set_park`).
+pub struct NativeTimelinePort<R: TimelineRole> {
     workflow: u64,
     ordinal: u32,
+    role: PhantomData<fn() -> R>,
 }
+
+impl<R: TimelineRole> Clone for NativeTimelinePort<R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R: TimelineRole> Copy for NativeTimelinePort<R> {}
+
+impl<R: TimelineRole> std::fmt::Debug for NativeTimelinePort<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeTimelinePort")
+            .field("workflow", &self.workflow)
+            .field("ordinal", &self.ordinal)
+            .finish()
+    }
+}
+
+impl<R: TimelineRole> PartialEq for NativeTimelinePort<R> {
+    fn eq(&self, other: &Self) -> bool {
+        (self.workflow, self.ordinal) == (other.workflow, other.ordinal)
+    }
+}
+
+impl<R: TimelineRole> Eq for NativeTimelinePort<R> {}
 
 impl NativeGraphDraft {
     pub fn new(device: &Arc<DeviceInner>) -> Self {
@@ -439,11 +468,12 @@ impl NativeGraphDraft {
         self.marks.len() - 1
     }
 
-    /// A timeline node after every node enqueued so far: a host gate the
-    /// device waits at (`TimelineNode::Wait`), or a signal the host waits
-    /// for (`TimelineNode::Signal`).
-    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
-        add_timeline(self.identity, &mut self.timelines, self.nodes.len(), node)
+    /// A timeline node of kind `N` after every node enqueued so far: a host
+    /// gate the device waits at (`Wait`), a signal the host waits for
+    /// (`Signal`), a park or a publication. Its port binds only a timeline
+    /// of the node's role.
+    pub fn timeline<N: TimelineNodeKind>(&mut self, _node: N) -> NativeTimelinePort<N::Role> {
+        add_timeline::<N>(self.identity, &mut self.timelines, self.nodes.len())
     }
 
     pub fn with_layout(device: &Arc<DeviceInner>, layout: Arc<NativeGraphLayout>) -> Self {
@@ -1025,8 +1055,8 @@ impl NativeGraphMetadataDraft {
 
     /// A timeline node after every node enqueued so far
     /// (`NativeGraphDraft::timeline`).
-    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
-        add_timeline(self.identity, &mut self.timelines, self.nodes.len(), node)
+    pub fn timeline<N: TimelineNodeKind>(&mut self, _node: N) -> NativeTimelinePort<N::Role> {
+        add_timeline::<N>(self.identity, &mut self.timelines, self.nodes.len())
     }
 
     /// The host heap of the plan this topology seals to
@@ -3687,21 +3717,16 @@ impl NativeGraphSlot {
             .zip(&self.plan.executable.timelines)
             .enumerate()
         {
-            // A publication binds as a park; only a park waits for an answer.
-            let parked = matches!(kind, TimelineNode::Park | TimelineNode::Publish);
-            let (timeline, value) = match bound {
-                None => return Err(CallError::Workflow(WorkflowError::NativeTimelineUnbound { node })),
-                Some(TimelineBinding::Parked(_)) if !parked => {
+            // A port binds only a timeline of its node's role
+            // (`NativeTimelinePort`): a publication binds as a park, and
+            // only a park waits for an answer.
+            let (timeline, value, action) = match (kind, bound) {
+                (_, None) => return Err(CallError::Workflow(WorkflowError::NativeTimelineUnbound { node })),
+                (TimelineNode::Publish, Some(TimelineBinding::Answered)) => {
                     return Err(CallError::Workflow(WorkflowError::NotPark { node }));
                 }
-                Some(TimelineBinding::Answered) if kind != TimelineNode::Park => {
-                    return Err(CallError::Workflow(WorkflowError::NotPark { node }));
-                }
-                Some(TimelineBinding::Bound(..)) if parked => {
-                    return Err(CallError::Workflow(WorkflowError::ParkAtValue { node }));
-                }
-                Some(TimelineBinding::Answered) => continue,
-                Some(TimelineBinding::Parked(timeline)) => {
+                (TimelineNode::Park, Some(TimelineBinding::Answered)) => continue,
+                (TimelineNode::Park | TimelineNode::Publish, Some(TimelineBinding::Parked(timeline))) => {
                     if !Arc::ptr_eq(timeline.device(), &self.plan.device) {
                         return Err(CallError::Workflow(WorkflowError::NativeTimelineMismatch { node }));
                     }
@@ -3715,21 +3740,22 @@ impl NativeGraphSlot {
                     }
                     continue;
                 }
-                Some(TimelineBinding::Bound(timeline, value)) => (timeline, value),
+                (TimelineNode::Wait, Some(TimelineBinding::Bound(timeline, value))) => {
+                    (timeline, value, TimelineAction::Wait)
+                }
+                (TimelineNode::Signal, Some(TimelineBinding::Bound(timeline, value))) => {
+                    (timeline, value, TimelineAction::Signal)
+                }
+                (_, Some(_)) => unreachable!("a timeline port binds only its node's role"),
             };
             if !Arc::ptr_eq(timeline.device(), &self.plan.device) {
                 return Err(CallError::Workflow(WorkflowError::NativeTimelineMismatch {
                     node,
                 }));
             }
-            let action = match kind {
-                TimelineNode::Wait => {
-                    timeline.await_at(value);
-                    TimelineAction::Wait
-                }
-                TimelineNode::Signal => TimelineAction::Signal,
-                TimelineNode::Park | TimelineNode::Publish => unreachable!("a park or publication binds no value"),
-            };
+            if action == TimelineAction::Wait {
+                timeline.await_at(value);
+            }
             timelines.push((
                 position,
                 TimelineOperation {
@@ -3771,7 +3797,7 @@ impl NativeGraphOutputs {
     /// device's kernels park themselves, it was bound answered, or the run
     /// encodes none of its call's launches (their conditions leave them
     /// out), so nothing waits.
-    pub fn park(&self, port: NativeTimelinePort) -> Option<u64> {
+    pub fn park(&self, port: NativeTimelinePort<Parks>) -> Option<u64> {
         if port.workflow != self.plan.identity {
             return None;
         }
@@ -3869,13 +3895,15 @@ enum TimelineBinding {
 }
 
 impl NativeGraphBindings {
-    /// Bind timeline node `port` to `timeline` at `value` for this run.
-    pub fn set_timeline(
+    /// Bind timeline node `port` to `timeline`, of the node's role, at
+    /// `value` for this run.
+    pub fn set_timeline<R: ValuedRole>(
         &mut self,
-        port: NativeTimelinePort,
-        timeline: Arc<TimelineInner>,
+        port: NativeTimelinePort<R>,
+        timeline: &TimelineHost<R>,
         value: u64,
     ) -> Result<(), WorkflowError> {
+        let timeline = timeline.inner().clone();
         if port.workflow != self.identity {
             return Err(WorkflowError::CrossWorkflowResult);
         }
@@ -3903,7 +3931,8 @@ impl NativeGraphBindings {
     /// the call before it launches, which the work before it signals and
     /// nothing waits for; no output reports it. The timeline's values are
     /// the runtime's: no run binds it at a value of its own.
-    pub fn set_park(&mut self, port: NativeTimelinePort, timeline: Arc<TimelineInner>) -> Result<(), WorkflowError> {
+    pub fn set_park(&mut self, port: NativeTimelinePort<Parks>, timeline: &TimelineHost<Parks>) -> Result<(), WorkflowError> {
+        let timeline = timeline.inner().clone();
         if port.workflow != self.identity {
             return Err(WorkflowError::CrossWorkflowResult);
         }
@@ -3925,7 +3954,7 @@ impl NativeGraphBindings {
     /// for nothing and the park binds no operation on any backend. A run of
     /// only such parks is the same work each time, so a measurement point
     /// may run it.
-    pub fn set_answered(&mut self, port: NativeTimelinePort) -> Result<(), WorkflowError> {
+    pub fn set_answered(&mut self, port: NativeTimelinePort<Parks>) -> Result<(), WorkflowError> {
         if port.workflow != self.identity {
             return Err(WorkflowError::CrossWorkflowResult);
         }
