@@ -365,7 +365,7 @@ struct RowStack {
 }
 
 impl RowStack {
-    fn new(records: u64, record_rows: u64, row_bytes: u64) -> Self {
+    fn new(records: u64, record_rows: u64, ranges: Vec<crate::assessment::TableRange>) -> Self {
         Self {
             records: records as usize,
             record_rows,
@@ -377,7 +377,7 @@ impl RowStack {
                 rows: 0,
                 sampled: vec![0; records as usize + 1],
                 record_rows,
-                row_bytes,
+                ranges,
             },
         }
     }
@@ -564,11 +564,15 @@ impl StoredTable {
         let placement = slots_tensor
             .record_placement()
             .ok_or_else(|| failed(&"the slots hold no records"))?;
+        let curve_ranges = ranges
+            .iter()
+            .map(|range| crate::assessment::TableRange { first: range.first, bytes: range.bytes as u64 })
+            .collect();
         let shared = Arc::new(Shared {
             slots: slots_tensor,
             placement,
             record_rows,
-            stack: Mutex::new(RowStack::new(records, record_rows, row_bytes)),
+            stack: Mutex::new(RowStack::new(records, record_rows, curve_ranges)),
             directory: directory_tensor,
             fields,
             descriptor: descriptor.clone(),
@@ -1491,7 +1495,7 @@ mod tests {
     /// falls as records hold more of its rows.
     #[test]
     fn the_row_stack_counts_decode_rows_by_their_depth_in_records() {
-        let mut stack = RowStack::new(4, SAMPLED_PER_RECORD, 90);
+        let mut stack = RowStack::new(4, SAMPLED_PER_RECORD, vec![crate::assessment::TableRange { first: 0, bytes: 90 }]);
         for row in 0..600 {
             stack.read(&[row], false);
         }

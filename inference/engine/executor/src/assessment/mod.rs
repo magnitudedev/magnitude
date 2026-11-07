@@ -55,7 +55,7 @@ pub use requests::{PointRequest, PointRequests, SiteRequest, Waiter};
 pub use step::{LayerLoad, Lead, ReadAhead, StepInputs, StepTime};
 pub use misses::{
     Anticipated, HeldSlots, HintCounts, LaunchResiduals, LaunchSample, LayerStep, MissMergeError, MissRecord, MissRecordError, RecordFeed,
-    Residuals, StoredMisses, MeasuredLayer, StreamedStep, TableCurve, MISS_RATE_ERROR,
+    Residuals, StoredMisses, MeasuredLayer, StreamedStep, TableCurve, TableRange, MISS_RATE_ERROR,
 };
 pub use streaming::{
     BankSlots, DecodeWaiting, GroupLayerTerms, GroupReads, GroupUnion, Notice, PlaceGrant, Places, Stages,

@@ -851,15 +851,52 @@ impl HeldSlots {
 /// What a stored table's decode steps read (`stored_table::RowStack`): its
 /// sampled rows by their depth in its LRU stack, in records of
 /// `record_rows` rows (the last bucket deeper than every record), over
-/// `steps` steps naming `rows` distinct rows in all, each `row_bytes` as
-/// stored. A table of `r` records misses exactly the rows `r` or more deep.
+/// `steps` steps naming `rows` distinct rows in all, each read as stored
+/// from `ranges`, one range of each of its tensors. A table of `r` records
+/// misses exactly the rows `r` or more deep.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableCurve {
     pub steps: u64,
     pub rows: u64,
     pub sampled: Vec<u64>,
     pub record_rows: u64,
-    pub row_bytes: u64,
+    pub ranges: Vec<TableRange>,
+}
+
+/// One stored tensor's range of every row of a stored table: row `r`'s
+/// `bytes` from `first + r·bytes` of its file (`stored_table::RowRange`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableRange {
+    pub first: u64,
+    pub bytes: u64,
+}
+
+impl TableRange {
+    /// The bytes a missed row's read of the range reads, over the table's
+    /// rows: the whole pages the read engine reads it in
+    /// (`seismic_io::ALIGNMENT`, `P`), each range a read of its own (a row's
+    /// tensors lie whole tensors apart). Row `r` starts `s = (first + r·b)
+    /// mod P` into its page; over the rows `s` takes each of the `n = P/g`
+    /// values `c + j·g` (`g = gcd(b, P)`, `c = first mod g`) equally often,
+    /// and with `b − 1 = q·P + m` the read spans `1 + q` pages, one more where
+    /// `s ≥ P − m`.
+    pub fn read_bytes(&self) -> f64 {
+        let page = seismic_io::ALIGNMENT;
+        let bytes = self.bytes.max(1);
+        let g = gcd(bytes, page);
+        let (n, c) = (page / g, self.first % g);
+        let (q, m) = ((bytes - 1) / page, (bytes - 1) % page);
+        // The starts below `P − m`, of the `n`: `ceil((P − m − c) / g)`.
+        let short = (page - m).saturating_sub(c).div_ceil(g).min(n);
+        page as f64 * ((1 + q) as f64 + (n - short) as f64 / n as f64)
+    }
+}
+
+fn gcd(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 impl TableCurve {
@@ -873,11 +910,12 @@ impl TableCurve {
     }
 
     /// What a decode step's table read costs at `records` records, in
-    /// seconds: its misses' one read along `line` (`ReadLine::seconds`), its
-    /// latency taken when any of its rows misses and its transfer that of
-    /// the rows expected to, a row's miss share the sampled rows' at that
-    /// depth, independent of the step's other rows (they are hashed rows of
-    /// the table). None before a step counted a sampled row.
+    /// seconds: its misses' one request along `line` (`ReadLine::seconds`),
+    /// its latency taken when any of its rows misses and its transfer that of
+    /// each read of each row expected to ([`TableRange::read_bytes`]), a
+    /// row's miss share the sampled rows' at that depth, independent of the
+    /// step's other rows (they are hashed rows of the table). None before a
+    /// step counted a sampled row.
     pub fn step_seconds(&self, records: u64, line: &ReadLine) -> Option<f64> {
         let total = self.sampled.iter().sum::<u64>();
         if total == 0 || self.steps == 0 {
@@ -888,7 +926,8 @@ impl TableCurve {
         let rows = self.rows as f64 / self.steps as f64;
         let misses = share * rows;
         let missing = 1. - (1. - share).powf(rows);
-        Some(missing * line.latency_seconds() + line.transfer_seconds(misses * self.row_bytes as f64))
+        let row = self.ranges.iter().map(TableRange::read_bytes).sum::<f64>();
+        Some(missing * line.latency_seconds() + line.transfer_seconds(misses * row))
     }
 }
 
@@ -1276,5 +1315,34 @@ mod tests {
         let mut changed = widest.clone();
         changed["layers"][0]["returns"] = serde_json::json!({ "returned": [0] });
         assert_ne!(shape(&widest), shape(&changed));
+    }
+
+    /// A missed row costs a read of each of its ranges, each the whole pages
+    /// it spans: a gridded E4M3 row (256 bytes of codes and 8 of scales, in
+    /// two tensors) costs two pages, where the same 264 bytes as one range
+    /// cost one, or two for the rows that cross a page.
+    #[test]
+    fn a_gridded_row_costs_a_read_of_each_of_its_ranges() {
+        let page = seismic_io::ALIGNMENT;
+        let range = |first, bytes| TableRange { first, bytes };
+        // Rows of a page's divisors from a page boundary never cross one.
+        assert_eq!(range(0, 256).read_bytes(), page as f64);
+        assert_eq!(range(4096 * 7, 8).read_bytes(), page as f64);
+        // 264-byte rows from a page boundary start at the 512 multiples of 8
+        // in a page; the 32 from 3840 on cross into the next.
+        assert_eq!(range(0, 264).read_bytes(), page as f64 * (1. + 32. / 512.));
+        // A range wider than a page spans its pages and one more where it
+        // crosses: odd starts of rows two bytes past a page, one in 2048
+        // (from 4095).
+        assert_eq!(range(0, 2 * page).read_bytes(), 2. * page as f64);
+        assert_eq!(range(0, page + 2).read_bytes(), 2. * page as f64);
+        assert_eq!(range(1, page + 2).read_bytes(), page as f64 * (2. + 1. / 2048.));
+        let curve = |ranges| TableCurve { steps: 1, rows: 1, sampled: vec![0, 1], record_rows: 1, ranges };
+        let gridded = curve(vec![range(0, 256), range(1 << 36, 8)]);
+        let whole = curve(vec![range(0, 264)]);
+        // Every row misses at no record: one request's latency, and the pages.
+        let seconds = |curve: &TableCurve| curve.step_seconds(0, &READ).unwrap();
+        assert_eq!(seconds(&gridded), READ.latency_seconds() + READ.transfer_seconds(2. * page as f64));
+        assert!(seconds(&whole) < seconds(&gridded));
     }
 }
