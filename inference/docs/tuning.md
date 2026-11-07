@@ -261,6 +261,10 @@ mix or cached incomplete search acquires another tuning allowance.
 If a composed alternative depends on other tuned choices, those prerequisites must conclude
 first. Its comparison and retained identity use the finalized prerequisites, not provisional
 census defaults that may subsequently change. Dependency ordering shares the same allowance.
+A unit that follows another's arithmetic (a streamed layer's route keeps its resident route's
+bits) is the same: a round that searches the prerequisite registers no part of it, and the next
+round registers it once, at the prerequisite's final choice. The first round's work ends early
+enough for that round's walks and canonical compiles to finish inside the allowance.
 
 The canonical default is a distinguished legal outcome when optional search or coverage cannot
 finish. It is recorded as a default, with any unmeasured scope still explicit. A nondefault

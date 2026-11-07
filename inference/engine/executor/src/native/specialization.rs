@@ -171,24 +171,25 @@ impl<'a> Tuning<'a> {
 
     /// `fixed`, the static values of the entry `entry` at `bindings`, with
     /// `implementation`'s arithmetic parameters at the choice of the unit
-    /// of `prerequisite`'s case ([`Tuner::following`]). A walk without
-    /// choices leaves them free: a demand walk, which collects a unit's
-    /// launches by its static values alone, and a listing.
+    /// of `prerequisite`'s case ([`Tuner::following`]); none while the
+    /// tuner's round searches that unit, which defers the dependant to the
+    /// next. A walk without choices leaves them free: a demand walk, which
+    /// collects a unit's launches by its static values alone, and a listing.
     fn following<P: EntryTuning>(
         &mut self,
         prerequisite: &P,
         (entry, bindings): (&'static str, &str),
         implementation: &NativeImplementation,
         fixed: NativeSpecialization,
-    ) -> Result<NativeSpecialization, CatalogFailure> {
+    ) -> Result<Option<NativeSpecialization>, CatalogFailure> {
         match self {
             Self::Tuner(tuner) => {
                 let key = unit_of(tuner.device(), &tuner.model(), prerequisite)?;
                 tuner
-                    .following(&key, implementation, fixed)
+                    .following(&key, (entry, bindings), implementation, fixed)
                     .map_err(|outcome| failure(entry, bindings, outcome))
             }
-            Self::Demand { .. } | Self::Listing(_) => Ok(fixed),
+            Self::Demand { .. } | Self::Listing(_) => Ok(Some(fixed)),
         }
     }
 
@@ -522,6 +523,8 @@ impl<'a> Specializer<'a> {
     /// dependant of the unit of `prerequisite`'s case: its arithmetic
     /// parameters are at that unit's choice ([`Tuner::following`]), so its
     /// results carry the prerequisite's bits, and it is tuned in the others.
+    /// `None`, preparing nothing, while the tuner's round searches the
+    /// prerequisite: the next round prepares it.
     pub fn tuned_following<T: EntryTuning, P: EntryTuning>(
         &mut self,
         tuning: &mut Tuning<'_>,
@@ -531,12 +534,15 @@ impl<'a> Specializer<'a> {
         let bindings = case.bindings();
         let implementation = self.implementation(&case.entry(), &bindings)?;
         let fixed = case_statics(&tuning.model(), case, implementation)?;
-        let fixed = tuning.following(
+        let Some(fixed) = tuning.following(
             prerequisite,
             (<T::Entry as Entry>::NAME, &bindings),
             implementation,
             fixed,
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         self.specialized(tuning, case, implementation, fixed)
     }
 

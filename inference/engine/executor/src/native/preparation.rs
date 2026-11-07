@@ -366,10 +366,10 @@ impl NativePreparationCache {
         .held_to(room);
         let mut formed = HashSet::new();
         // The search runs in rounds on one tuning clock and budget. A round
-        // whose search replaced a choice a dependant was counted at
-        // (`Tuner::stale`) is followed by one that counts it at the
-        // replacement and forms and searches it there; nothing else is
-        // counted again.
+        // that searches a dependant's prerequisite defers the dependant
+        // (`Tuner::deferred`): the next counts it once, at the
+        // prerequisite's final choice, and forms and searches it there;
+        // nothing else is counted again.
         let searched = loop {
             // The count also collects every entry without tuning
             // parameters: the mandatory phase forms them with the units'
@@ -408,7 +408,7 @@ impl NativePreparationCache {
                 census.tuning.into_tuner()
             };
             let searched = censused.search()?;
-            if !searched.stale() {
+            if !searched.deferred() {
                 break searched;
             }
             tuner = searched.recount();

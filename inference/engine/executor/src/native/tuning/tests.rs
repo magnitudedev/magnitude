@@ -704,14 +704,14 @@ fn metal() -> Option<Device> {
         .then(|| crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens"))
 }
 
-/// A dependant (a streamed layer's route of its resident route) is a unit
-/// of the search's own count, fixed at its prerequisite's arithmetic as the
-/// choice stands and free in the rest, so the mandatory phase forms it and
-/// no load forms it alone. A search that promotes other arithmetic leaves
-/// it stale; the next round counts it at the promoted values and forms it
-/// there, and forms nothing an earlier round decided.
+/// A dependant (a streamed layer's route of its resident route) is fixed at
+/// its prerequisite's arithmetic and free in the rest. A round that
+/// searches the prerequisite defers it, counting, forming and searching
+/// none of it; the next round registers it once, at the prerequisite's
+/// final arithmetic, forms it there, and forms nothing an earlier round
+/// decided.
 #[test]
-fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
+fn a_search_registers_each_dependant_once_at_its_prerequisites_final_arithmetic() {
     let Some(device) = metal() else {
         return;
     };
@@ -759,14 +759,28 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
     let walk = |tuner: &mut Tuner<'_>| {
         tuner.tune(&prerequisite, &implementation, &statics).unwrap();
         let fixed = tuner
-            .following(&key, &implementation, statics.clone())
+            .following(&key, ("dense_output", "dependant"), &implementation, statics.clone())
             .unwrap();
-        tuner.tune(&dependant, &implementation, &fixed).unwrap();
+        if let Some(fixed) = &fixed {
+            tuner.tune(&dependant, &implementation, fixed).unwrap();
+        }
         fixed
     };
-    let counted = walk(&mut tuner);
-    assert_eq!(counted.param("BATCH_FROM"), Some(5));
-    assert_eq!(counted.param("TALL"), None);
+    // The round that searches the prerequisite registers no dependant.
+    assert_eq!(walk(&mut tuner), None);
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+    assert_eq!(
+        (prerequisite.formations.get(), dependant.formations.get()),
+        (1, 0)
+    );
+    assert_eq!(walk(&mut tuner), None);
+    let tuner = tuner.search().unwrap();
+    assert!(tuner.deferred());
+    // The next registers it once, at the promoted arithmetic.
+    let mut tuner = tuner.recount();
+    let recounted = walk(&mut tuner).expect("the prerequisite is decided");
+    assert_eq!(recounted.param("BATCH_FROM"), Some(3));
+    assert_eq!(recounted.param("TALL"), None);
     let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     assert_eq!(
         (prerequisite.formations.get(), dependant.formations.get()),
@@ -774,18 +788,7 @@ fn a_search_forms_each_dependant_at_its_prerequisites_final_arithmetic() {
     );
     walk(&mut tuner);
     let tuner = tuner.search().unwrap();
-    assert!(tuner.stale());
-    let mut tuner = tuner.recount();
-    let recounted = walk(&mut tuner);
-    assert_eq!(recounted.param("BATCH_FROM"), Some(3));
-    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
-    assert_eq!(
-        (prerequisite.formations.get(), dependant.formations.get()),
-        (1, 2)
-    );
-    walk(&mut tuner);
-    let tuner = tuner.search().unwrap();
-    assert!(!tuner.stale());
+    assert!(!tuner.deferred());
 }
 
 fn fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {
@@ -3727,18 +3730,19 @@ fn cpu_projection_default_form_follows_the_tier_integer_dots() {
 /// A case whose operands alias where the kernel forbids it fails here, and
 /// so does one whose launch condition's word a timed pass's cold copies
 /// (CUDA's) do not keep where the host reads it. It runs on the device the
-/// host has.
+/// host has. The load registers each unit once: a lead's unit, which follows
+/// its resident route, is registered in the round after that route's.
 #[test]
 fn a_streamed_load_searches_every_streamed_case_on_the_device() {
     use crate::planning::fixtures::{relaid_manifest, streamed_experts_manifest};
     use magnitude_family_contracts::{Operator, ScoreFunction};
     use std::collections::BTreeSet;
-    /// Each finished unit's entry and lead (`AHEAD`).
-    struct Finished(RefCell<Vec<(&'static str, Option<u64>)>>);
+    /// Each finished unit's entry, bindings and static values.
+    struct Finished(RefCell<Vec<(&'static str, String, std::collections::BTreeMap<String, u64>)>>);
     impl TuningObserver for Finished {
         fn event(&self, event: &TuningEvent) {
             if let TuningEvent::Finished(tuned) = event {
-                self.0.borrow_mut().push((tuned.entry, tuned.statics.get("AHEAD").copied()));
+                self.0.borrow_mut().push((tuned.entry, tuned.bindings.clone(), tuned.statics.clone()));
             }
         }
     }
@@ -3862,13 +3866,14 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
             None,
         )
         .unwrap_or_else(|error| panic!("{streamed}: {error}"));
-        // Every lead's unit is searched; a round that recounts a follower
-        // at its resident unit's replaced choice searches it again.
+        // Every lead's unit is searched, and every unit finishes once.
         let finished = observer.0.borrow();
+        let units = finished.iter().collect::<BTreeSet<_>>();
+        assert_eq!(units.len(), finished.len(), "{streamed}: a unit was registered twice: {finished:?}");
         let leads = finished
             .iter()
-            .filter(|(entry, _)| *entry == streamed)
-            .map(|&(_, ahead)| ahead)
+            .filter(|(entry, ..)| *entry == streamed)
+            .map(|(_, _, statics)| statics.get("AHEAD").copied())
             .collect::<BTreeSet<_>>();
         let every = (0..crate::native::LEADS as u64).map(Some).collect::<BTreeSet<_>>();
         assert_eq!(leads, every, "{streamed}: every lead's unit is searched: {finished:?}");
