@@ -991,6 +991,13 @@ pub struct Spent {
     /// Planning the next piece: the search's requests of its declared
     /// domain.
     pub planning: f64,
+    /// Forming the piece's programs where it runs, past the compiles it
+    /// ran (`compiling`): assembling its configurations from them.
+    pub forming: f64,
+    /// Ranking what the piece measured and planning the piece after it.
+    pub replanning: f64,
+    /// Releasing the kernels the piece formed and no longer needs.
+    pub releasing: f64,
 }
 
 impl Spent {
@@ -1004,6 +1011,9 @@ impl Spent {
             sampling: self.sampling - earlier.sampling,
             checking: self.checking - earlier.checking,
             planning: self.planning - earlier.planning,
+            forming: self.forming - earlier.forming,
+            replanning: self.replanning - earlier.replanning,
+            releasing: self.releasing - earlier.releasing,
         }
     }
 }
@@ -3414,6 +3424,12 @@ pub struct UnitSearch<'m, 'a> {
     /// What compiles of this unit took: the price of every compile of it.
     formation_price: Mutex<FormationPrice>,
     time: TuningTime,
+    /// What forming inside pieces past their compiles, replanning after
+    /// them and releasing their kernels took ([`Spent::forming`],
+    /// [`Spent::replanning`], [`Spent::releasing`]).
+    forming: f64,
+    replanning: f64,
+    releasing: f64,
     /// The next piece of work as last derived ([`UnitSearch::next`]); none
     /// since the unit's state last changed. With it, what each formation
     /// its price read does as it was read then.
@@ -3505,6 +3521,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             largest_bytes: 0,
             formation_price: Mutex::new(FormationPrice::default()),
             time: TuningTime::default(),
+            forming: 0.,
+            replanning: 0.,
+            releasing: 0.,
             offered: std::cell::Cell::new(None),
             offered_forming: std::cell::RefCell::default(),
         })
@@ -3714,6 +3733,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 .total(),
             building: self.builds.iter().map(Observed::total).sum(),
             checking: self.checks.iter().map(Observed::total).sum(),
+            forming: self.forming,
+            replanning: self.replanning,
+            releasing: self.releasing,
             ..Spent::default()
         };
         for point in self.points() {
@@ -4463,9 +4485,13 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 // against: its leader's standing, measurement and rounds,
                 // or the served choice.
                 if matches!(work.stage, Stage::Promote | Stage::Confirm) {
+                    let replanning = Instant::now();
                     searching.ledger.rerank();
+                    self.replanning += replanning.elapsed().as_secs_f64();
                 }
+                let releasing = Instant::now();
                 searching.ledger.release();
+                self.releasing += releasing.elapsed().as_secs_f64();
             }
         }
         // One reading ends the piece: it is the last the peak is taken
@@ -4777,10 +4803,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             unreachable!("challengers are measured by a search");
         };
         let performed = self.measure_piece(&mut searching, deadline);
+        let replanning = Instant::now();
         let replanned = performed.and_then(|()| {
             deadline.check(Duration::ZERO)?;
             Ok(self.replan(&mut searching)?)
         });
+        self.replanning += replanning.elapsed().as_secs_f64();
         self.progress = Progress::Searching(searching);
         replanned
     }
@@ -4796,6 +4824,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .expect("a measurement performs a planned piece");
         let plan = self.planned();
         let formation = self.formation();
+        let compiled = formation.price.lock().expect("formation price lock").total();
         let weighing = Weighing::of(&searching.points);
         let mut forming = 0.;
         let mut measuring = 0.;
@@ -4821,8 +4850,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             &mut measuring,
             deadline,
         );
+        let compiled = formation.price.lock().expect("formation price lock").total() - compiled;
         drop(formation);
         self.time.forming_seconds += forming;
+        self.forming += (forming - compiled).max(0.);
         self.time.measuring_seconds += measuring;
         performed
     }
@@ -4878,20 +4909,21 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 price: &self.formation_price,
             };
             let specialization = ledger.contenders[&leader].specialization.clone();
+            let compiled = formation.price.lock().expect("formation price lock").total();
             let began = Instant::now();
             let formed = run
                 .programs
                 .form(&formation, &[specialization], &[])?
                 .pop()
                 .expect("one configuration was formed");
+            let forming = began.elapsed().as_secs_f64();
+            let mut price = formation.price.lock().expect("formation price lock");
+            let compiled = price.total() - compiled;
             // Its record states how it was first formed, not this.
-            formation
-                .price
-                .lock()
-                .expect("formation price lock")
-                .calls
-                .clear();
-            self.time.forming_seconds += began.elapsed().as_secs_f64();
+            price.calls.clear();
+            drop(price);
+            self.time.forming_seconds += forming;
+            self.forming += (forming - compiled).max(0.);
             match formed {
                 Ok(kernel) => ledger.hold(&leader, kernel),
                 Err(exclusion) => {

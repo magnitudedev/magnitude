@@ -265,6 +265,7 @@ impl TuningTrace {
                 "forecast_seconds": stage.forecast_seconds,
                 "began_seconds": stage.began_seconds,
                 "actual_seconds": stage.actual_seconds,
+                "searching_seconds": stage.searching_seconds,
                 "formed_ahead": stage.formed,
                 "spent": stage.spent,
                 "raises": stage.raises,

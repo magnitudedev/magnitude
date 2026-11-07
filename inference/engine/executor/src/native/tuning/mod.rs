@@ -1268,6 +1268,9 @@ pub struct StageRecord {
     pub forecast_seconds: Option<f64>,
     pub began_seconds: f64,
     pub actual_seconds: f64,
+    /// The part of `actual_seconds` the unit's search performed; the rest
+    /// is the tuner's own work around it.
+    pub searching_seconds: f64,
     pub interrupted: bool,
     /// The piece's compile, when it ran ahead on a worker while the device
     /// did other work: its price when the piece was started, and what it
@@ -2818,6 +2821,7 @@ impl<'a> SearchedUnit<'a> for ComposedUnit<'a> {
                 forecast_seconds: work.quote.forecast().map(|forecast| forecast.as_secs_f64()),
                 began_seconds,
                 actual_seconds: began.elapsed().as_secs_f64(),
+                searching_seconds: qualified.as_secs_f64(),
                 interrupted: Instant::now() >= cutoff,
                 formed: None,
                 spent: seismic::Spent::default(),
@@ -3323,6 +3327,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
             start: self.case.search_starts(tuner.device, &self.implementation, &self.statics, tuner.limits),
         });
         let cutoff = tuner.started + before;
+        let searching = Instant::now();
         let performed = self
             .search
             .perform(
@@ -3335,6 +3340,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
                 Some(cutoff),
             )
             .map_err(|error| unit_failure(&self.key, error))?;
+        let searched = searching.elapsed();
         // A weight no built input binds leaves; one that a point of any
         // unit still binds stays shared.
         tuner.inputs().release_unheld();
@@ -3374,6 +3380,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
                 forecast_seconds: work.quote.forecast().map(|forecast| forecast.as_secs_f64()),
                 began_seconds,
                 actual_seconds: began.elapsed().as_secs_f64(),
+                searching_seconds: searched.as_secs_f64(),
                 interrupted: performed.interrupted,
                 formed: self.formed.take(),
                 spent: performed.spent,
