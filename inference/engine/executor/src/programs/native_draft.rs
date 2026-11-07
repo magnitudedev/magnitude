@@ -18,9 +18,11 @@
 //!   Markov projection of the token before it, its selection feeds slot
 //!   `k + 1`. The service uses a zero confidence threshold, so no confidence
 //!   evaluation or additional normalized-feature extraction is needed.
-//! - **Confidence.** Each proposal's probability under the readout logits
-//!   row it was selected from (`token_confidence`), published beside the
-//!   selections: the host verifies a block by it.
+//! - **Confidence.** A method that samples its proposals (DFlash, DSpark)
+//!   publishes each one's probability under the logits it sampled it from
+//!   (`readout::select`), beside the selections: the host verifies a block
+//!   by it. DFlash2 and LiLiCorr choose by path scores, which give no
+//!   probability, and publish none.
 //!
 //! Selections are step-major: proposal `k` of slot `s` is result row
 //! `k · slots + s`.
@@ -1006,8 +1008,9 @@ struct BlockPorts {
     leading: Vec<(WeightRole, NativePort)>,
     readout_vocabulary: u64,
     /// `[proposals · slots]`, step-major: each proposal's probability under
-    /// the readout logits row it was selected from.
-    confidence: WorkflowTensor,
+    /// the logits it was sampled from; absent for a method choosing by path
+    /// scores.
+    confidence: Option<WorkflowTensor>,
 }
 
 /// A port over the leading `rows` rows of `role`'s planned weight, whose
@@ -1516,16 +1519,30 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         "result",
         &[("M", selected), ("V", readout_vocabulary)],
     )?;
-    // Each proposal's probability under the logits it was selected from,
-    // step-major beside the selections.
-    let mut confidence = graph
-        .local_for(
-            entries.confidence,
-            "confidence",
-            &[("M", selected), ("N", outputs), ("V", readout_vocabulary)],
-        )?
-        .tensor()
-        .clone();
+    // Each proposal's probability under the logits it was sampled from,
+    // step-major beside the selections, of a method that samples them.
+    let confidence = draft
+        .method
+        .variant()
+        .samples_proposals()
+        .then(|| {
+            Ok::<_, GraphError>(
+                graph
+                    .local_for(
+                        entries.confidence,
+                        "confidence",
+                        &[("M", selected), ("N", outputs), ("V", readout_vocabulary)],
+                    )?
+                    .tensor()
+                    .clone(),
+            )
+        })
+        .transpose()?;
+    let sampled = || {
+        confidence
+            .as_ref()
+            .ok_or_else(|| GraphError::from("a sampling draft has no confidences".to_owned()))
+    };
     let selection = (entries.shape, entries.sample, entries.confidence);
     let selection_entries = move || readout::SelectionEntries {
         shape: selection.0,
@@ -1538,7 +1555,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let anchors = match (&draft.method, &entries.markov) {
         (DraftMethod::DFlash, None) => {
             let mut all = result.tensor().slice_leading(0, outputs);
-            let mut all_confidence = confidence.slice_leading(0, outputs);
+            let mut all_confidence = sampled()?.slice_leading(0, outputs);
             let identity = GraphConstant::identity(&mut graph, outputs)?;
             let inputs =
                 readout::selection_inputs(&mut graph, entries.sample, outputs, readout_vocabulary)?;
@@ -1670,7 +1687,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     readout_vocabulary,
                 )?;
                 let mut step_confidence =
-                    confidence.slice_leading(step * slots, (step + 1) * slots);
+                    sampled()?.slice_leading(step * slots, (step + 1) * slots);
                 // Its proposals' confidence is their probability under the
                 // biased logits they are drawn from. DSpark's own confidence
                 // head (sigmoid(score) < 0 at the service's fixed threshold)
@@ -1762,34 +1779,11 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         }
         _ => return Err("draft method and entries disagree".into()),
     };
-    // A selector's or corrector's proposals are chosen over the readout
-    // logits rows: a corrector's are its slot's mask rows, a selector's its
-    // own proposing row.
-    if matches!(
-        draft.method,
-        DraftMethod::DFlash2 { .. } | DraftMethod::LiLiCorr { .. }
-    ) {
-        let logit_rows = (0..proposals)
-            .flat_map(|proposal| (0..slots).map(move |slot| (proposal, slot)))
-            .map(|(proposal, slot)| match corrector {
-                Some(_) => slot * mask_rows + proposal,
-                None => proposal * slots + slot,
-            })
-            .map(|row| i32::try_from(row).map_err(|_| "draft row exceeds i32"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let logit_rows = GraphConstant::i32(&mut graph, &logit_rows)?;
-        readout::confidence(
-            &mut graph,
-            entries.confidence,
-            &logits,
-            logit_rows.port().tensor(),
-            result.tensor().into(),
-            (&mut confidence).into(),
-            (selected, outputs, readout_vocabulary),
-        )?;
-        constants.push(logit_rows);
+    // A selector's or corrector's proposals are chosen by path scores over
+    // a few candidates, which give no probability: they carry none.
+    if let Some(confidence) = &confidence {
+        graph.export(confidence)?;
     }
-    graph.export(&confidence)?;
     let output = result.tensor().clone();
     graph.export(&output)?;
     Ok(DraftGraphParts {
@@ -3693,9 +3687,15 @@ impl NativeDraftProgram {
                     tokens: owner
                         .tensor(&graph.output)
                         .ok_or_else(|| invalid("draft graph omitted its selections"))?,
-                    confidence: owner
-                        .tensor(&block.confidence)
-                        .ok_or_else(|| invalid("draft graph omitted its confidence"))?,
+                    confidence: block
+                        .confidence
+                        .as_ref()
+                        .map(|confidence| {
+                            owner
+                                .tensor(confidence)
+                                .ok_or_else(|| invalid("draft graph omitted its confidence"))
+                        })
+                        .transpose()?,
                 })
             })
             .transpose()?;

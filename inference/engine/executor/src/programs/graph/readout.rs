@@ -2079,10 +2079,10 @@ where
 /// are a projection's exact logits as its sampler read them (shaped in
 /// place when shaped), or a certified projection's first view
 /// ([`CertifiedReadout::view`]), whose exact logits are only its
-/// survivors'. Every drafter's confidence in its proposals is this one;
-/// one that samples its own logits rows takes it through [`select`].
+/// survivors'. Every drafter that samples its proposals takes it through
+/// [`select`], from the logits it sampled.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn confidence<'a, G: GraphDraft + 'a>(
+fn confidence<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entry: G::Binding<'a, token_confidence::Entry>,
     logits: &WorkflowTensor,

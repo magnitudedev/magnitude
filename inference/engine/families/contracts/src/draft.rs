@@ -531,6 +531,20 @@ impl fmt::Display for DraftVariant {
     }
 }
 
+impl DraftVariant {
+    /// Whether each proposal is sampled from logits over the readout
+    /// vocabulary, so it has a probability there: DFlash's and DSpark's are
+    /// (DSpark's under its Markov-biased logits). DFlash2's selector and
+    /// LiLiCorr's corrector choose by path scores over a few candidates,
+    /// which are no distribution, so their proposals have none.
+    pub fn samples_proposals(self) -> bool {
+        match self {
+            Self::DFlash | Self::DSpark => true,
+            Self::DFlash2 | Self::LiLiCorr => false,
+        }
+    }
+}
+
 impl DraftMethod {
     pub fn variant(&self) -> DraftVariant {
         match self {
@@ -775,5 +789,21 @@ impl DraftDefinition {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use super::DraftVariant;
+
+    /// Only a method that samples its proposals from logits over the
+    /// vocabulary rates them by a probability; one choosing by path scores
+    /// has none, so its rounds verify by acceptance alone.
+    #[test]
+    fn only_sampled_proposals_have_a_probability() {
+        assert!(DraftVariant::DFlash.samples_proposals());
+        assert!(DraftVariant::DSpark.samples_proposals());
+        assert!(!DraftVariant::DFlash2.samples_proposals());
+        assert!(!DraftVariant::LiLiCorr.samples_proposals());
     }
 }

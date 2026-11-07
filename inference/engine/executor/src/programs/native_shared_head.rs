@@ -13,7 +13,7 @@
 //! selection and conditions on the pass's normalized output projected back to
 //! the target's width, so no proposal returns to the host before the chain
 //! ends. Each pass publishes its selections' probabilities under the logits
-//! it selected them from (`readout::confidence`). No pass writes history:
+//! it selected them from (`readout::select`). No pass writes history:
 //! the head keeps none.
 
 use super::native_draft::widen;
@@ -1326,9 +1326,11 @@ impl NativeSharedHeadProgram {
             tokens: owner
                 .tensor(&graph.output)
                 .ok_or_else(|| invalid("head graph omitted its selections"))?,
-            confidence: owner
-                .tensor(&graph.confidence)
-                .ok_or_else(|| invalid("head graph omitted its confidence"))?,
+            confidence: Some(
+                owner
+                    .tensor(&graph.confidence)
+                    .ok_or_else(|| invalid("head graph omitted its confidence"))?,
+            ),
         };
         Ok((
             completion,

@@ -65,10 +65,11 @@ pub struct HeadOutput {
 pub struct HeadSelections {
     /// `[steps, slot class, 2]` (token, status) rows in step-major order.
     pub tokens: GraphOutputTensor,
-    /// Each selection's probability under the readout logits it was
-    /// selected from (`readout::confidence`), `[steps · slot class]` f32 in
-    /// the tokens' order.
-    pub confidence: GraphOutputTensor,
+    /// Each selection's probability under the logits it was sampled from
+    /// (`readout::select`), `[steps · slot class]` f32 in the tokens' order;
+    /// absent for a drafter that chooses by path scores, which give no
+    /// probability (`DraftVariant::samples_proposals`).
+    pub confidence: Option<GraphOutputTensor>,
 }
 
 impl HeadOutput {

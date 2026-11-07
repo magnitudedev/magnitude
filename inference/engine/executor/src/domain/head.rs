@@ -767,19 +767,26 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Some(selections) => {
                 let selected =
                     decode_selected(&read(&selections.tokens)?).map_err(DomainError::invariant)?;
-                let bytes = read(&selections.confidence)?;
-                let confidence = bytes
-                    .chunks_exact(4)
-                    .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
-                    .collect::<Vec<_>>();
-                if !bytes.len().is_multiple_of(4) || confidence.len() != selected.len() {
-                    return Err(DomainError::invariant(
-                        "head confidences differ from its selections",
-                    ));
-                }
+                let confidence = selections
+                    .confidence
+                    .as_ref()
+                    .map(|confidence| {
+                        let bytes = read(confidence)?;
+                        let confidence = bytes
+                            .chunks_exact(4)
+                            .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
+                            .collect::<Vec<_>>();
+                        if !bytes.len().is_multiple_of(4) || confidence.len() != selected.len() {
+                            return Err(DomainError::invariant(
+                                "head confidences differ from its selections",
+                            ));
+                        }
+                        Ok(confidence)
+                    })
+                    .transpose()?;
                 (selected, confidence)
             }
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), None),
         };
         let slot_class = selected.len().checked_div(steps).unwrap_or(0);
         if steps != 0 && (slot_class < slots || selected.len() != steps * slot_class) {
@@ -844,9 +851,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         proposals: (0..proposals)
                             .map(|step| selected[step * slot_class + slot])
                             .collect(),
-                        confidence: (0..proposals)
-                            .map(|step| confidence[step * slot_class + slot])
-                            .collect(),
+                        confidence: confidence.as_ref().map(|confidence| {
+                            (0..proposals)
+                                .map(|step| confidence[step * slot_class + slot])
+                                .collect()
+                        }),
                     },
                     advance: advance.map(Advance::Step),
                     primed: None,

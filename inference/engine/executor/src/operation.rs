@@ -662,11 +662,12 @@ pub enum Outcome {
         rows: Vec<RowResult>,
     },
     /// One selection per requested proposal, in chain order, with the
-    /// drafter's confidence in each: its probability under the readout
-    /// logits it was selected from.
+    /// drafter's confidence in each, its probability under the logits it was
+    /// sampled from, when the drafter samples them: a drafter choosing by
+    /// path scores has none to give.
     Head {
         proposals: Vec<Selected>,
-        confidence: Vec<f32>,
+        confidence: Option<Vec<f32>>,
     },
     Encode {
         features: FeatureRef,

@@ -8,7 +8,7 @@
 //! conditions on its output feature, so no proposal returns to the host
 //! before the chain ends. Each drafting pass publishes, beside its
 //! selections, their probabilities under the logits it selected them from
-//! (`readout::confidence`), so the host verifies the chain by the head's
+//! (`readout::select`), so the host verifies the chain by the head's
 //! confidence in each proposal. A causal-only transaction (priming,
 //! catch-up) drafts nothing: its entry pass ends once the attention has
 //! appended the rows' K/V history, the only thing a later draft reads of
@@ -1914,9 +1914,11 @@ impl NativeHeadProgram {
                     tokens: owner
                         .tensor(&graph.output)
                         .ok_or_else(|| invalid("head graph omitted its selections"))?,
-                    confidence: owner
-                        .tensor(confidence)
-                        .ok_or_else(|| invalid("head graph omitted its confidence"))?,
+                    confidence: Some(
+                        owner
+                            .tensor(confidence)
+                            .ok_or_else(|| invalid("head graph omitted its confidence"))?,
+                    ),
                 })
             })
             .transpose()?;
