@@ -340,6 +340,8 @@ impl NativePreparationCache {
             selection_limits,
             graph_demand,
         } = inputs;
+        // The search's clock: everything from here is its work.
+        let began = std::time::Instant::now();
         let recipe_states = ReadoutRecipeStates::default();
         // The search imports the weights its units measure through the
         // import kernels.
@@ -363,7 +365,8 @@ impl NativePreparationCache {
             TuningWeights::new(device, load, tuning.weights, &import),
             invocations,
         )
-        .held_to(room);
+        .held_to(room)
+        .since(began);
         let mut formed = HashSet::new();
         // The search runs in rounds on one tuning clock and budget. A round
         // that searches a dependant's prerequisite defers the dependant

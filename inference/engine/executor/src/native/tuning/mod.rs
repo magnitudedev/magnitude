@@ -4167,6 +4167,16 @@ impl<'a> Tuner<'a> {
         self
     }
 
+    /// Run the search's clock from `began`, where the first-load search
+    /// began: what it did before this count (the import kernels it formed,
+    /// the demand it derived) spends the same budget. The first round's own
+    /// walks are timed from here.
+    pub fn since(mut self, began: Instant) -> Self {
+        self.started = began;
+        self.round_began = began.elapsed();
+        self
+    }
+
     /// Publish a unit's record as it stands: derive it (`record`), store it
     /// where a later load reads it, and serve its choice. The whole is one
     /// observation of the publication class. Returns the record. A record
