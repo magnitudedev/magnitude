@@ -291,7 +291,7 @@ fn draft_at(
         }))
     };
     let draft_start = host_seconds();
-    let Outcome::Head { proposals } = head(engine, operation, 1)? else {
+    let Outcome::Head { proposals, .. } = head(engine, operation, 1)? else {
         return Err("a draft returns proposals".into());
     };
     let proposals = proposals

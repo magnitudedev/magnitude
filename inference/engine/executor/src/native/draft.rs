@@ -7,7 +7,7 @@ use magnitude_kernels::{
     corrector_attention, corrector_factors, corrector_features, corrector_nodes, corrector_path,
     corrector_rows, dense_output, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
     draft_path_step, draft_top_k, embedding_rows, project_rows, readout_features_rows, sample_rows,
-    shape_rows, widen_rows,
+    shape_rows, token_confidence, widen_rows,
 };
 use seismic::{Element, NativeKernel};
 use std::collections::HashMap;
@@ -29,6 +29,9 @@ pub struct DraftKernels {
     /// Token selection over the readout vocabulary.
     pub(super) shape: Option<NativeKernel<shape_rows::Entry>>,
     pub(super) sample: Option<NativeKernel<sample_rows::Entry>>,
+    /// Each proposal's probability under the readout logits it was selected
+    /// from.
+    pub(super) confidence: Option<NativeKernel<token_confidence::Entry>>,
     /// Widens a device-conditioned entry's target features to F32.
     pub(super) widen: Option<NativeKernel<widen_rows::Entry>>,
     pub(super) markov: Option<MarkovKernels>,

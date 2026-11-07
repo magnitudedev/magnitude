@@ -56,6 +56,10 @@ pub struct HeadOutput {
     /// The step's selections, `[steps, slot class, 2]` (token, status) rows
     /// in step-major order; absent for a causal-only head.
     pub selections: Option<GraphOutputTensor>,
+    /// Each selection's probability under the readout logits it was
+    /// selected from, `[steps · slot class]` f32 in the selections' order;
+    /// absent for a head that publishes none.
+    pub confidence: Option<GraphOutputTensor>,
     /// The step's landed reads of table rows its device work selected
     /// (`DeviceTable::read_selected`), completed once the step completed.
     pub landed_reads: Vec<crate::device_table::SubmittedRead>,

@@ -1857,6 +1857,7 @@ impl NativeHeadProgram {
             completion,
             HeadOutput {
                 selections,
+                confidence: None,
                 landed_reads,
             },
         ))

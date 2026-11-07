@@ -225,7 +225,7 @@ fn transact(
     let (pending, bindings) = domain.finish_head(flight).unwrap();
     let mut selected = Vec::new();
     for pending in pending {
-        let Outcome::Head { proposals } = pending.outcome().clone() else {
+        let Outcome::Head { proposals, .. } = pending.outcome().clone() else {
             panic!("a draft transaction returns proposals")
         };
         selected = proposals

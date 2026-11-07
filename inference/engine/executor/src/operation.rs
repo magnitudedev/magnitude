@@ -656,14 +656,17 @@ pub struct RowResult {
     pub logits: Option<LogitsRef>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
     Forward {
         rows: Vec<RowResult>,
     },
-    /// One selection per requested proposal, in chain order.
+    /// One selection per requested proposal, in chain order, with each
+    /// one's probability under the readout logits it was selected from when
+    /// the head publishes it.
     Head {
         proposals: Vec<Selected>,
+        confidence: Option<Vec<f32>>,
     },
     Encode {
         features: FeatureRef,

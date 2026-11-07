@@ -71,11 +71,16 @@ const EVEN: Costs = Costs {
     },
 };
 
+/// The drafter's confidence in a proposal, from a uniform draw and whether
+/// the proposal is right.
+type Confidence = fn(f64, bool) -> f32;
+
 #[derive(Clone)]
 struct Stream {
     /// Segment lengths in tokens with their curves.
     segments: Vec<(usize, [f64; WIDEST])>,
     seed: u64,
+    confidence: Option<Confidence>,
 }
 
 impl Stream {
@@ -83,7 +88,26 @@ impl Stream {
         Self {
             segments: segments.to_vec(),
             seed: 0x9e37_79b9_7f4a_7c15,
+            confidence: None,
         }
+    }
+
+    /// This stream with a drafter that gives its confidence in each
+    /// proposal.
+    fn confident(self, confidence: Confidence) -> Self {
+        Self {
+            confidence: Some(confidence),
+            ..self
+        }
+    }
+
+    /// A uniform draw in [0, 1) for `position` and `salt`.
+    fn draw(&self, position: usize, salt: u64) -> f64 {
+        let mut state = self.seed ^ salt ^ (position as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        state ^= state >> 30;
+        state = state.wrapping_mul(0x94d0_49bb_1331_11eb);
+        state ^= state >> 31;
+        (state >> 11) as f64 / (1u64 << 53) as f64
     }
 
     fn len(&self) -> usize {
@@ -105,11 +129,7 @@ impl Stream {
                 (position < start).then_some(curve)
             })
             .unwrap_or(&self.segments.last().unwrap().1);
-        let mut state = self.seed ^ (position as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        state ^= state >> 30;
-        state = state.wrapping_mul(0x94d0_49bb_1331_11eb);
-        state ^= state >> 31;
-        let draw = (state >> 11) as f64 / (1u64 << 53) as f64;
+        let draw = self.draw(position, 0);
         curve.iter().take_while(|right| draw < **right).count()
     }
 
@@ -124,6 +144,18 @@ impl Stream {
                 }
             })
             .collect()
+    }
+
+    /// The drafter's confidence in each proposal of the block anchored at
+    /// `position`, when it gives one.
+    fn confidence(&self, position: usize, generated: usize) -> Option<Vec<f32>> {
+        let confidence = self.confidence?;
+        let right = self.right(position);
+        Some(
+            (1..=generated)
+                .map(|depth| confidence(self.draw(position, depth as u64), depth <= right))
+                .collect(),
+        )
     }
 }
 
@@ -217,8 +249,9 @@ fn adaptive_on(
                 generated + 1,
             );
             let block = stream.block(position, generated);
-            controller.drafted(generated, &block);
-            verified = controller.verify(block.len(), limit);
+            let confidence = stream.confidence(position, generated);
+            controller.drafted(generated, &block, confidence.as_deref());
+            verified = controller.verify(limit);
         }
         let seconds = (costs.verify)(verified + 1) / 1000.0;
         run.milliseconds += seconds * 1000.0;
@@ -387,6 +420,81 @@ fn text_that_becomes_perfect_is_verified_wider() {
     assert!(run.share(15, 1_500..2_980) >= 0.9, "{}", run.rounds());
 }
 
+/// At 4k context on a mixture-of-experts target whose every verified row
+/// reads its own experts (Qwen3.6 35B-A3B with DFlash, measured to 4 rows).
+const ROWS: Costs = Costs {
+    draft: |generated| match generated {
+        0 => 0.0,
+        1..=3 => 4.9,
+        4..=7 => 6.0,
+        _ => 9.0,
+    },
+    verify: |rows| match rows {
+        1 => 14.5,
+        2 => 17.3,
+        3..=4 => 23.1,
+        5..=8 => 34.4,
+        _ => 57.0,
+    },
+};
+
+/// Mostly rejected proposals (the drafter's right proposals and wrong ones
+/// told apart by confidence, with some overlap).
+const REJECTED: [f64; WIDEST] = [
+    0.55, 0.30, 0.15, 0.07, 0.03, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+];
+
+fn telling(draw: f64, right: bool) -> f32 {
+    if right {
+        (0.5 + 0.5 * draw) as f32
+    } else {
+        (0.6 * draw) as f32
+    }
+}
+
+#[test]
+fn a_round_verifies_only_the_proposals_its_drafters_confidence_makes_worth_their_rows() {
+    let blind = Stream::of(&[(3_000, REJECTED)]);
+    let confident = blind.clone().confident(telling);
+    let without = adaptive(&blind, ROWS, &warmed(&blind, ROWS));
+    let with = adaptive(&confident, ROWS, &warmed(&confident, ROWS));
+    // The same tokens commit (each round commits the target's own), in
+    // less time than without the confidences or at any fixed width.
+    let (width, fixed) = fastest_fixed(&blind, ROWS);
+    assert!(
+        with.milliseconds < without.milliseconds * 0.97 && with.milliseconds < fixed * 0.97,
+        "with confidence {:.0} ms, without {:.0} ms, fixed {width} {fixed:.0} ms: {}",
+        with.milliseconds,
+        without.milliseconds,
+        with.rounds()
+    );
+    // Drafting rounds verify fewer of their proposals: the rest are in no
+    // verification.
+    let declining = with
+        .rounds
+        .iter()
+        .filter(|(choice, _)| choice.generated > 0 && choice.verified < choice.generated)
+        .count();
+    assert!(declining * 4 >= with.rounds.len(), "{}", with.rounds());
+}
+
+#[test]
+fn confidence_leaves_text_whose_proposals_are_all_right_verified_at_full_width() {
+    let blind = Stream::of(&[(3_000, PERFECT)]);
+    // Every proposal is right, whatever the drafter's confidence in it.
+    let confident = blind.clone().confident(|draw, _| draw as f32);
+    let without = adaptive(&blind, EVEN, &warmed(&blind, EVEN));
+    let with = adaptive(&confident, EVEN, &warmed(&confident, EVEN));
+    assert!(with.share(15, 0..2_980) >= 0.9, "{}", with.rounds());
+    assert!(
+        with.milliseconds <= without.milliseconds * 1.005,
+        "with confidence {:.0} ms, without {:.0} ms: {}",
+        with.milliseconds,
+        without.milliseconds,
+        with.rounds()
+    );
+}
+
 #[test]
 fn the_last_tokens_of_a_request_are_still_drafted() {
     let stream = Stream::of(&[(256, PERFECT)]);
@@ -472,7 +580,7 @@ fn requests_sharing_a_launch_give_its_rows_to_the_proposals_most_often_right() {
         let mut controller = DraftController::new(7, Arc::new(DraftLoad::default()));
         for round in 0..4 {
             let anchor = position + 8 * round;
-            controller.drafted(7, &stream.block(anchor, 7));
+            controller.drafted(7, &stream.block(anchor, 7), None);
             let committed = (anchor + 1..=anchor + 8)
                 .map(Stream::token)
                 .collect::<Vec<_>>();
@@ -483,7 +591,7 @@ fn requests_sharing_a_launch_give_its_rows_to_the_proposals_most_often_right() {
             ..controller
         };
         controller.generate(0, CONTEXT);
-        controller.drafted(7, &stream.block(position + 32, 7));
+        controller.drafted(7, &stream.block(position + 32, 7), None);
         controller.outlook().unwrap()
     };
     let (right, wrong) = (outlook(0), outlook(64));
@@ -511,7 +619,7 @@ fn scoring_counts_what_a_full_verification_would_accept() {
     let stream = Stream::of(&[(400, PREDICTABLE), (400, UNPREDICTABLE)]);
     for position in (0..780).step_by(7) {
         let mut controller = DraftController::new(WIDEST, Arc::new(DraftLoad::default()));
-        controller.drafted(WIDEST, &stream.block(position, WIDEST));
+        controller.drafted(WIDEST, &stream.block(position, WIDEST), None);
         let committed = (position + 1..=position + WIDEST + 1)
             .map(Stream::token)
             .collect::<Vec<_>>();
@@ -725,6 +833,7 @@ fn a_width_held_up_on_its_first_launch_is_taken_again() {
             costs: std::sync::Mutex::new(warm.costs.lock().unwrap().clone()),
             rounds: std::sync::Mutex::new(*warm.rounds.lock().unwrap()),
             depths: std::sync::Mutex::new(warm.depths.lock().unwrap().clone()),
+            calibration: std::sync::Mutex::new(warm.calibration.lock().unwrap().clone()),
             look_run: std::sync::Mutex::new(*warm.look_run.lock().unwrap()),
             look_seconds: std::sync::Mutex::new(*warm.look_seconds.lock().unwrap()),
         });
@@ -809,8 +918,8 @@ fn pipelined(
             }
             held = 0;
             let block = stream.block(position, generated);
-            controller.drafted(generated, &block);
-            verified = controller.verify(block.len(), limit);
+            controller.drafted(generated, &block, None);
+            verified = controller.verify(limit);
         } else {
             held = (held + 1).min(64);
         }
@@ -898,6 +1007,7 @@ fn texts(segments: &[(usize, [f64; WIDEST])]) -> Vec<Stream> {
         .map(|seed| Stream {
             segments: segments.to_vec(),
             seed: seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x51,
+            confidence: None,
         })
         .collect()
 }

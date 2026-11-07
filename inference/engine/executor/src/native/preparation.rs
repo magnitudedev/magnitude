@@ -57,7 +57,7 @@ use magnitude_kernels::{
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
     feature_rows, import_dense, moe_tail, ngram_gate, ngram_inject, ngram_rows, packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
-    selection_notice, stored_rows, tap_rows, widen_rows,
+    selection_notice, stored_rows, tap_rows, token_confidence, widen_rows,
 };
 use seismic::KernelRequest;
 use std::collections::HashSet;
@@ -3497,6 +3497,7 @@ impl<'a> Preparation<'a> {
                 vocabulary: self.vocabulary,
             },
         )?;
+        let confidence = fixed!(self.spec, token_confidence, String::new());
         let widen = fixed!(
             self.spec,
             widen_rows,
@@ -3543,6 +3544,7 @@ impl<'a> Preparation<'a> {
         draft.head = head;
         draft.shape = shape;
         draft.sample = sample;
+        draft.confidence = confidence;
         draft.widen = widen;
         draft.markov = markov;
         Ok(())

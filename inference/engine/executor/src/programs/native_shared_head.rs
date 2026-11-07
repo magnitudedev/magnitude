@@ -1295,6 +1295,7 @@ impl NativeSharedHeadProgram {
             completion,
             HeadOutput {
                 selections: Some(selections),
+                confidence: None,
                 landed_reads,
             },
         ))

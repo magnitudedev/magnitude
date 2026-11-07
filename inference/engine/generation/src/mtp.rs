@@ -519,7 +519,7 @@ impl MethodState for DrafterState {
             // The verified prefix is all a round offers the target.
             let count = match (&mut self.control, self.verified) {
                 (_, Some(verified)) => verified,
-                (Some(control), None) => control.verify(proposal.len(), selects.len()),
+                (Some(control), None) => control.verify(selects.len()),
                 (None, None) => self.budget.verified,
             }
             .min(proposal.len())
@@ -671,12 +671,18 @@ impl MethodState for DrafterState {
             },
             Outcome::Head {
                 proposals: selected,
+                confidence,
             },
         ) = (&head, outcome)
         else {
             return Err(format!("{name} drafter outcome has the wrong kind"));
         };
-        if head != *operation || selected.len() != proposals.len() {
+        if head != *operation
+            || selected.len() != proposals.len()
+            || confidence
+                .as_ref()
+                .is_some_and(|confidence| confidence.len() != selected.len())
+        {
             return Err(format!(
                 "{name} drafter outcome differs from its transaction"
             ));
@@ -694,7 +700,13 @@ impl MethodState for DrafterState {
                 .map(|selected| selected.token)
                 .collect::<Vec<_>>();
             if let Some(control) = &mut self.control {
-                control.drafted(proposals.len(), &proposal);
+                control.drafted(
+                    proposals.len(),
+                    &proposal,
+                    confidence
+                        .as_ref()
+                        .map(|confidence| &confidence[..proposal.len()]),
+                );
             }
             self.proposal = Some(proposal);
         }

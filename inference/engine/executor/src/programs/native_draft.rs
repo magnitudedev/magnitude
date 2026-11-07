@@ -18,6 +18,9 @@
 //!   Markov projection of the token before it, its selection feeds slot
 //!   `k + 1`. The service uses a zero confidence threshold, so no confidence
 //!   evaluation or additional normalized-feature extraction is needed.
+//! - **Confidence.** Each proposal's probability under the readout logits
+//!   row it was selected from (`token_confidence`), published beside the
+//!   selections: the host verifies a block by it.
 //!
 //! Selections are step-major: proposal `k` of slot `s` is result row
 //! `k · slots + s`.
@@ -60,7 +63,7 @@ use magnitude_kernels::{
     corrector_attention, corrector_factors, corrector_features, corrector_nodes, corrector_path,
     corrector_rows, dense_output, draft_convolve_input, draft_convolve_residual, draft_gated_rows, draft_path_step,
     draft_top_k, embedding_rows, project_rows, readout_features_rows, sample_rows, shape_rows,
-    widen_rows,
+    token_confidence, widen_rows,
 };
 use magnitude_state::LayerRef;
 use seismic::{
@@ -295,6 +298,9 @@ pub(crate) struct DraftGraphEntries<'a, G: GraphDraft + 'a> {
     pub head: readout::ProjectionEntries<'a, G>,
     pub shape: G::Binding<'a, shape_rows::Entry>,
     pub sample: G::Binding<'a, sample_rows::Entry>,
+    /// Each proposal's probability under the readout logits it was selected
+    /// from.
+    pub confidence: G::Binding<'a, token_confidence::Entry>,
     /// Widens a device-conditioned entry's target features to F32.
     pub widen: G::Binding<'a, widen_rows::Entry>,
     pub markov: Option<MarkovEntries<'a, G>>,
@@ -401,6 +407,7 @@ impl<'a> DraftGraphEntries<'a, NativeGraph> {
             head: readout::ProjectionEntries::prepared(&draft.head),
             shape: &draft.shape,
             sample: &draft.sample,
+            confidence: &draft.confidence,
             widen: &draft.widen,
             markov: draft.markov.as_ref().map(|markov| MarkovEntries {
                 embedding: &markov.embedding,
@@ -795,6 +802,7 @@ impl CheckedDraftEntries {
             head: self.head.entries(),
             shape: &self.selection[..],
             sample: &self.selection[..],
+            confidence: &self.selection[..],
             widen: &self.widen[..],
             markov: self.markov.as_ref().map(|markov| MarkovEntries {
                 embedding: &markov.embedding[..],
@@ -997,6 +1005,9 @@ struct BlockPorts {
     /// `readout_vocabulary` rows.
     leading: Vec<(WeightRole, NativePort)>,
     readout_vocabulary: u64,
+    /// `[proposals · slots]`, step-major: each proposal's probability under
+    /// the readout logits row it was selected from.
+    confidence: WorkflowTensor,
 }
 
 /// A port over the leading `rows` rows of `role`'s planned weight, whose
@@ -1721,6 +1732,31 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         }
         _ => return Err("draft method and entries disagree".into()),
     };
+    // Each proposal's probability under the readout logits row it was
+    // selected from: a corrector's are its slot's mask rows, the rest its
+    // own proposing row.
+    let logit_rows = (0..proposals)
+        .flat_map(|proposal| (0..slots).map(move |slot| (proposal, slot)))
+        .map(|(proposal, slot)| match corrector {
+            Some(_) => slot * mask_rows + proposal,
+            None => proposal * slots + slot,
+        })
+        .map(|row| i32::try_from(row).map_err(|_| "draft row exceeds i32"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let logit_rows = GraphConstant::i32(&mut graph, &logit_rows)?;
+    let confidence = graph
+        .enqueue(
+            entries.confidence,
+            &[("M", selected), ("N", outputs), ("V", readout_vocabulary)],
+            token_confidence::WorkflowArgs {
+                logits: (&logits).into(),
+                rows: logit_rows.port().tensor().into(),
+                selection: result.tensor().into(),
+            },
+        )?
+        .value;
+    constants.push(logit_rows);
+    graph.export(&confidence)?;
     let output = result.tensor().clone();
     graph.export(&output)?;
     Ok(DraftGraphParts {
@@ -1737,6 +1773,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             landed,
             leading,
             readout_vocabulary,
+            confidence,
         }),
         constants,
         weights,
@@ -3620,10 +3657,21 @@ impl NativeDraftProgram {
                     .ok_or_else(|| invalid("draft graph omitted its selections"))
             })
             .transpose()?;
+        let confidence = graph
+            .block
+            .as_ref()
+            .filter(|_| steps > 0)
+            .map(|block| {
+                owner
+                    .tensor(&block.confidence)
+                    .ok_or_else(|| invalid("draft graph omitted its confidence"))
+            })
+            .transpose()?;
         Ok((
             completion,
             HeadOutput {
                 selections,
+                confidence,
                 landed_reads: landed.into_iter().map(SelectedRead::submitted).collect(),
             },
         ))

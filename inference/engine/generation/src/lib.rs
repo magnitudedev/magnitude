@@ -901,7 +901,7 @@ impl Generation {
         else {
             return Err("only a head transaction reconciles into method state".into());
         };
-        if let magnitude_executor::Outcome::Head { proposals } = outcome {
+        if let magnitude_executor::Outcome::Head { proposals, .. } = outcome {
             if proposals.iter().any(|selected| {
                 selected.status > 2
                     || (selected.status == 0

@@ -750,6 +750,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         output.complete_landed_reads().map_err(DomainError::Submit)?;
         let HeadOutput {
             selections,
+            confidence,
             landed_reads: _,
         } = output;
         let slots = core.batch().actual_slots();
@@ -773,6 +774,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 "head selections differ from the batch's steps and slots",
             ));
         }
+        let confidence = confidence
+            .map(|confidence| {
+                let bytes = confidence.tensor().read_to_host().map_err(|error| {
+                    DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
+                })?;
+                let confidence = bytes
+                    .chunks_exact(4)
+                    .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
+                    .collect::<Vec<_>>();
+                if !bytes.len().is_multiple_of(4) || confidence.len() != selected.len() {
+                    return Err(DomainError::invariant(
+                        "head confidences differ from its selections",
+                    ));
+                }
+                Ok(confidence)
+            })
+            .transpose()?;
         let passes = core.batch().passes();
         if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {
             for (slot, (request, _, proposals)) in requests.iter().enumerate() {
@@ -830,6 +848,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         proposals: (0..proposals)
                             .map(|step| selected[step * slot_class + slot])
                             .collect(),
+                        confidence: confidence.as_ref().map(|confidence| {
+                            (0..proposals)
+                                .map(|step| confidence[step * slot_class + slot])
+                                .collect()
+                        }),
                     },
                     advance: advance.map(Advance::Step),
                     primed: None,

@@ -156,6 +156,64 @@ native draft_confidence for cpu from "cpu/draft_confidence.rs":
         shared_bytes ((D + R) * 4)
 
 
+# A draft's confidence in each of its M selected proposals: the proposal's
+# probability under the softmax of its readout logits, row `rows[m]` of the
+# draft's N projected rows, and 0 for a selection that failed (nonzero
+# status).
+fn token_confidence[M, N, V](logits: &tensor[N, V] f32, rows: &tensor[M] i32,
+    selection: &tensor[M, 2] i32) -> tensor[M] f32:
+    let mut confidence = tensor[M] f32
+    parallel for row in 0..M:
+        let line = rows[row]
+        let maximum = reduce(logits[line], 0, max)
+        let total = reduce(exp(logits[line] - maximum), 0, sum)
+        confidence[row] = 0.0
+        if selection[row, 1] == 0:
+            confidence[row] = exp(logits[line, selection[row, 0]] - maximum) / total
+    return confidence
+
+# Every backend: two launches. The partition reduces each of 64 contiguous
+# vocabulary slices of a selection's row to its maximum and its sum of
+# exp(logit - maximum), so a draft's few selections still spread over the
+# device; the merge, one thread per selection, combines them.
+native token_confidence for metal from "metal/token_confidence.metal":
+    scratch partials bytes (M * 64 * 8)
+    launch token_confidence_partition:
+        threadgroups (64, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch token_confidence_merge:
+        threadgroups (ceil_div(M, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+native token_confidence for cuda from "cuda/token_confidence.cu":
+    scratch partials bytes (M * 64 * 8)
+    launch token_confidence_partition:
+        threadgroups (64, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch token_confidence_merge:
+        threadgroups (ceil_div(M, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+native token_confidence for vulkan from "vulkan/token_confidence.comp":
+    scratch partials bytes (M * 64 * 8)
+    launch token_confidence_partition:
+        threadgroups (64, M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+    launch token_confidence_merge:
+        threadgroups (ceil_div(M, 32), 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+native token_confidence for cpu from "cpu/token_confidence.rs":
+    scratch partials bytes (M * 64 * 8)
+    launch token_confidence_partition:
+        threadgroups (64, M, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch token_confidence_merge:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+
 # DFlash2's grouped dynamic causal convolution over the rows of each draft
 # block (`block` rows; a row's block position is `row % block`). The hidden
 # width is G coefficient groups of C channels; a row's coefficient

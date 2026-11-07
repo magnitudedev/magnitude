@@ -16,6 +16,11 @@
 //! load's blocks usually are once what it last scored is old
 //! ([`DepthMeans`]).
 //!
+//! A round verifies its drafted block by the drafter's confidence in each
+//! proposal where the drafter gives one: how often a proposal at a depth is
+//! right after the ones before it divides by that confidence
+//! ([`Calibration`]), so the round's rows go to the proposals worth them.
+//!
 //! Requests verified in one launch share its rows ([`share_rows`]).
 
 use magnitude_executor::{draft_ladder, TokenId};
@@ -45,6 +50,12 @@ const COST_SAMPLES: usize = 3;
 const STALE_ROUNDS: u64 = 100;
 /// The share of decode time spent on looks.
 const LOOK_SHARE: f64 = 0.01;
+/// The equal shares of [0, 1] a depth's calibration divides the drafter's
+/// confidence into.
+const BINS: usize = 8;
+/// The weight of a new proposal in its depth's calibration: each bin holds
+/// about as many proposals as a depth's usual mean holds blocks.
+const CALIBRATION: f64 = USUAL / BINS as f64;
 
 /// Which launch of a round a duration belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +194,52 @@ impl DepthMeans {
     fn weight(&self) -> f64 {
         let text = self.text();
         text * MEMORY + (1.0 - text) * USUAL
+    }
+}
+
+/// How often a proposal that reached one depth (every proposal before it
+/// right) is right, by the drafter's confidence in it, over the load's text.
+/// It divides the depth's acceptance, which its [`DepthMeans`] give for the
+/// current text, among confidences: a proposal of a confidence is right that
+/// many times as often as the depth's proposals are.
+#[derive(Clone, Debug, PartialEq)]
+struct Calibration {
+    /// Per bin, the weight of its proposals that were right and of all of
+    /// them.
+    bins: [(f64, f64); BINS],
+}
+
+impl Calibration {
+    const EMPTY: Self = Self {
+        bins: [(0.0, 0.0); BINS],
+    };
+
+    fn bin(confidence: f32) -> usize {
+        // A NaN confidence falls in the lowest bin.
+        ((confidence.clamp(0.0, 1.0) * BINS as f32) as usize).min(BINS - 1)
+    }
+
+    fn score(&mut self, confidence: f32, right: bool) {
+        for (right, reached) in &mut self.bins {
+            *right *= 1.0 - CALIBRATION;
+            *reached *= 1.0 - CALIBRATION;
+        }
+        let (rights, reached) = &mut self.bins[Self::bin(confidence)];
+        *rights += f64::from(u8::from(right));
+        *reached += 1.0;
+    }
+
+    /// How many times as often as the depth's proposals one of `confidence`
+    /// is right. Each mean counts one proposal more at the mean around it
+    /// (an even chance for the depth's), so a bin that has seen nothing is
+    /// right as often as the depth's proposals are.
+    fn lift(&self, confidence: f32) -> f64 {
+        let (right, reached) = self.bins.iter().fold((0.0, 0.0), |(right, reached), bin| {
+            (right + bin.0, reached + bin.1)
+        });
+        let depth = (right + 0.5) / (reached + 1.0);
+        let (right, reached) = self.bins[Self::bin(confidence)];
+        (right + depth) / (reached + 1.0) / depth
     }
 }
 
@@ -494,6 +551,7 @@ pub struct DraftLoad {
     costs: Mutex<BTreeMap<(usize, usize), LaunchCosts>>,
     rounds: Mutex<u64>,
     depths: Mutex<Option<Vec<DepthMeans>>>,
+    calibration: Mutex<Option<Vec<Calibration>>>,
     /// The run of accepted rounds that earned its latest request a look.
     look_run: Mutex<Option<u32>>,
     look_seconds: Mutex<f64>,
@@ -503,6 +561,8 @@ pub struct DraftLoad {
 #[derive(Clone, Debug, PartialEq)]
 struct Block {
     tokens: Vec<TokenId>,
+    /// The drafter's confidence in each token, when it gives one.
+    confidence: Option<Vec<f32>>,
     matched: usize,
     /// Drafted by a look taken on a run of accepted rounds.
     run_look: bool,
@@ -525,6 +585,7 @@ pub struct DraftController {
     ladder: Vec<usize>,
     load: Arc<DraftLoad>,
     depths: Vec<DepthMeans>,
+    calibration: Vec<Calibration>,
     scored: Vec<bool>,
     blocks: Vec<Block>,
     /// Seconds of decode time set aside for the next look (see
@@ -551,8 +612,9 @@ pub struct DraftController {
     drafter: Option<Option<f64>>,
     after_drafting: Option<bool>,
     chosen: Option<bool>,
-    /// The length of this round's drafted block, until it is verified.
-    drafted: Option<usize>,
+    /// How often this round's drafted block is expected to be right through
+    /// each of its depths, until it is verified.
+    drafted: Option<Vec<f64>>,
     context_class: usize,
     sequences: usize,
     choice: RoundChoice,
@@ -569,10 +631,18 @@ impl DraftController {
         let depths = seed
             .filter(|depths| depths.len() == widest)
             .unwrap_or_else(|| vec![DepthMeans::UNSCORED; widest]);
+        let calibration = load
+            .calibration
+            .lock()
+            .expect("draft load calibration")
+            .clone()
+            .filter(|calibration| calibration.len() == widest)
+            .unwrap_or_else(|| vec![Calibration::EMPTY; widest]);
         Self {
             ladder: draft_ladder(widest),
             load,
             depths,
+            calibration,
             scored: vec![false; widest],
             blocks: Vec::new(),
             look_seconds,
@@ -629,11 +699,10 @@ impl DraftController {
 
     /// This round's drafted block, while it awaits verification.
     pub fn outlook(&self) -> Option<DraftOutlook> {
-        let drafted = self.drafted?;
         Some(DraftOutlook {
             load: self.load.clone(),
             context_class: self.context_class,
-            right: self.right()[..drafted].to_vec(),
+            right: self.drafted.clone()?,
             draft_seconds: self.costs().draft(self.choice.generated),
         })
     }
@@ -805,33 +874,66 @@ impl DraftController {
     }
 
     /// The block the drafter returned for a round that generated
-    /// `generated`; a block cut short is wrong from where it ends.
-    pub fn drafted(&mut self, generated: usize, block: &[TokenId]) {
+    /// `generated`, with its confidence in each token when it gives one; a
+    /// block cut short is wrong from where it ends.
+    pub fn drafted(&mut self, generated: usize, block: &[TokenId], confidence: Option<&[f32]>) {
+        assert!(
+            confidence.is_none_or(|confidence| confidence.len() == block.len()),
+            "a drafter's confidences are its block's"
+        );
         for depth in block.len() + 1..=generated {
             self.score(depth, false);
         }
         if !block.is_empty() {
             self.blocks.push(Block {
                 tokens: block.to_vec(),
+                confidence: confidence.map(<[f32]>::to_vec),
                 matched: 0,
                 run_look: self.run_look,
             });
         }
-        self.drafted = Some(block.len());
+        self.drafted = Some(self.survival(block.len(), confidence));
     }
 
-    /// The proposals of a drafted block of `drafted` this round verifies, of
-    /// at most `limit`. The drafter's launch is paid whatever is verified.
-    pub fn verify(&mut self, drafted: usize, limit: usize) -> usize {
+    /// How often a drafted block of `drafted` is expected to be right
+    /// through each of its depths: each depth's acceptance after the one
+    /// before it, as its estimate gives it ([`Self::right`]), times how much
+    /// more or less often proposals of the drafter's confidence in this one
+    /// are right there ([`Calibration`]).
+    fn survival(&self, drafted: usize, confidence: Option<&[f32]>) -> Vec<f64> {
+        let right = self.right();
+        let Some(confidence) = confidence else {
+            return right[..drafted].to_vec();
+        };
+        let (mut before, mut survival) = (1.0, 1.0);
+        right[..drafted]
+            .iter()
+            .zip(confidence)
+            .zip(&self.calibration)
+            .map(|((right, confidence), calibration)| {
+                let after = if before > 0.0 { right / before } else { 0.0 };
+                before = *right;
+                survival *= (after * calibration.lift(*confidence)).min(1.0);
+                survival
+            })
+            .collect()
+    }
+
+    /// The proposals of this round's drafted block it verifies, of at most
+    /// `limit`. The drafter's launch is paid whatever is verified.
+    pub fn verify(&mut self, limit: usize) -> usize {
+        let right = self
+            .drafted
+            .take()
+            .expect("a round verifies the block it drafted");
         let (verified, _) = self.verified(
-            &self.right(),
+            &right,
             &self.costs(),
             self.choice.generated,
-            limit.min(drafted),
+            limit.min(right.len()),
         );
         self.choice.verified = verified;
         self.timing_target = true;
-        self.drafted = None;
         verified
     }
 
@@ -853,7 +955,11 @@ impl DraftController {
         let mut blocks = std::mem::take(&mut self.blocks);
         for token in tokens {
             blocks.retain_mut(|block| {
-                if block.tokens[block.matched] == *token {
+                let right = block.tokens[block.matched] == *token;
+                if let Some(confidence) = &block.confidence {
+                    self.calibration[block.matched].score(confidence[block.matched], right);
+                }
+                if right {
                     block.matched += 1;
                     self.score(block.matched, true);
                     if block.matched == block.tokens.len() && block.run_look {
@@ -878,6 +984,8 @@ impl DraftController {
             }
         }
         *self.load.depths.lock().expect("draft load acceptance") = Some(self.depths.clone());
+        *self.load.calibration.lock().expect("draft load calibration") =
+            Some(self.calibration.clone());
         *self.load.look_run.lock().expect("draft load looks") = Some(self.look_run);
     }
 

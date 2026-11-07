@@ -13,7 +13,8 @@ use crate::{
 use magnitude_family_contracts::{ProgressivePlane, SublayerIndex, WeightScope};
 use magnitude_kernels::{
     cluster_token_rows, draft_top_k, feature_rows, import_dense, packing_bound, place_logits_rows,
-    project_rows, readout_project_rows, repack_weight, selection_notice, tap_rows, widen_rows,
+    project_rows, readout_project_rows, repack_weight, selection_notice, tap_rows, token_confidence,
+    widen_rows,
 };
 use std::rc::Rc;
 
@@ -274,6 +275,9 @@ pub(crate) struct AttestedDraft {
     /// Token selection over the readout vocabulary.
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
+    /// Each proposal's probability under the readout logits it was selected
+    /// from.
+    pub confidence: NativeKernel<token_confidence::Entry>,
     /// Widens a device-conditioned entry's target features to F32.
     pub widen: NativeKernel<widen_rows::Entry>,
     pub markov: Option<MarkovKernels>,
@@ -1253,6 +1257,10 @@ impl AttestedPrograms {
                         .sample
                         .clone()
                         .ok_or_else(|| missing("sample_rows", "draft"))?,
+                    confidence: handles
+                        .confidence
+                        .clone()
+                        .ok_or_else(|| missing("token_confidence", "draft"))?,
                     widen: handles
                         .widen
                         .clone()

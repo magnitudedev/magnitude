@@ -525,6 +525,16 @@ fn head_parts(operation: &Operation) -> (Vec<TokenId>, Vec<(u8, u8)>, usize, Vec
 
 /// Reconcile a head transaction as the service does.
 fn reconcile_head(generation: &mut Generation, operation: &Operation, proposals: &[(u32, u8)]) {
+    reconcile_confident_head(generation, operation, proposals, None);
+}
+
+/// Reconcile a head transaction that gives its confidence in each proposal.
+fn reconcile_confident_head(
+    generation: &mut Generation,
+    operation: &Operation,
+    proposals: &[(u32, u8)],
+    confidence: Option<Vec<f32>>,
+) {
     let outcome = Outcome::Head {
         proposals: proposals
             .iter()
@@ -533,6 +543,7 @@ fn reconcile_head(generation: &mut Generation, operation: &Operation, proposals:
                 status,
             })
             .collect(),
+        confidence,
     };
     let transition = generation
         .prepare_method_transition(operation, &outcome)
@@ -1999,27 +2010,32 @@ fn adaptive_drafting_fits_the_tokens_a_request_has_left() {
 
 /// Whatever a draft policy generates and verifies, a request commits exactly
 /// the tokens its target selects: a draft only decides how many of them one
-/// round commits. Fixed budgets and the adaptive policy produce one answer.
+/// round commits. Fixed budgets and the adaptive policy, with the drafter's
+/// confidences or without, produce one answer.
 #[test]
 fn every_draft_policy_commits_the_targets_own_tokens() {
     use magnitude_generation::{DraftBudget, TimedLaunch};
     use std::time::Duration;
-    const TOKENS: usize = 48;
+    const TOKENS: usize = 240;
     // What the target selects at each generated position, and a drafter that
     // is wrong at every fifth.
     let target = |position: usize| 10 + (position * 7 % 80) as u32;
     let drafted = |position: usize| if position % 5 == 0 { 97 } else { target(position) };
     let answer = (0..TOKENS).map(|position| TokenId(target(position))).collect::<Vec<_>>();
-    let methods: [Arc<dyn Method>; 4] = [
-        Arc::new(DFlash::new("fixture", 3).unwrap()),
-        Arc::new(DFlash::new("fixture", 3).unwrap().with_budget(DraftBudget::new(3, 1).unwrap()).unwrap()),
-        Arc::new(DFlash::new("fixture", 3).unwrap().with_budget(DraftBudget::new(1, 1).unwrap()).unwrap()),
-        Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()),
+    // A drafter confident in its right proposals and not in its wrong ones.
+    let confidence = |position: usize| if drafted(position) == target(position) { 0.9 } else { 0.1 };
+    let methods: [(Arc<dyn Method>, bool); 5] = [
+        (Arc::new(DFlash::new("fixture", 3).unwrap()), false),
+        (Arc::new(DFlash::new("fixture", 3).unwrap().with_budget(DraftBudget::new(3, 1).unwrap()).unwrap()), false),
+        (Arc::new(DFlash::new("fixture", 3).unwrap().with_budget(DraftBudget::new(1, 1).unwrap()).unwrap()), false),
+        (Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()), false),
+        (Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()), true),
     ];
-    for method in methods {
+    let mut launched_rows = Vec::new();
+    for (method, confident) in methods {
         let mut configured = options();
         configured.max_tokens = TOKENS;
-        configured.context_limit = 64;
+        configured.context_limit = 256;
         configured.method = MethodChoice::DFlash { proposals: 3 };
         let mut generation = resident(
             Generation::new_with_method(
@@ -2034,14 +2050,19 @@ fn every_draft_policy_commits_the_targets_own_tokens() {
         let reconcile = |generation: &mut Generation, operations: &[Operation]| {
             for operation in operations {
                 let from = generation.generated().len();
-                let proposals = (0..head_parts(operation).3.len())
+                let slots = 0..head_parts(operation).3.len();
+                let proposals = slots
+                    .clone()
                     .map(|slot| (drafted(from + slot), 0))
                     .collect::<Vec<_>>();
-                generation.timed(TimedLaunch::Draft, Some(Duration::from_millis(20)), 1, 4);
-                reconcile_head(generation, operation, &proposals);
+                let confidence =
+                    confident.then(|| slots.map(|slot| confidence(from + slot)).collect());
+                generation.timed(TimedLaunch::Draft, Some(Duration::from_millis(2)), 1, 4);
+                reconcile_confident_head(generation, operation, &proposals, confidence);
             }
         };
         let mut rounds = 0;
+        let mut launched = 0;
         while generation.finish_reason().is_none() {
             rounds += 1;
             assert!(rounds < 4 * TOKENS, "{} did not finish", method.identity());
@@ -2055,10 +2076,13 @@ fn every_draft_policy_commits_the_targets_own_tokens() {
                     // selects after each of its rows.
                     let from = round.generation().generated().len();
                     let rows = round.round_forward().selects.len();
+                    launched += rows;
                     let samples = (0..rows).map(|row| target(from + row)).collect::<Vec<_>>();
+                    // Each row adds less than a plain step costs, so
+                    // drafting pays.
                     round.timed(
                         TimedLaunch::Target,
-                        Some(Duration::from_millis(10 * rows as u64)),
+                        Some(Duration::from_millis(7 + 3 * rows as u64)),
                         1,
                         rows,
                     );
@@ -2072,5 +2096,9 @@ fn every_draft_policy_commits_the_targets_own_tokens() {
             };
         }
         assert_eq!(generation.generated(), answer, "{}", method.identity());
+        launched_rows.push(launched);
     }
+    // The drafter's confidences keep its wrong proposals out of the target's
+    // launches.
+    assert!(launched_rows[4] < launched_rows[3], "{launched_rows:?}");
 }
