@@ -105,6 +105,15 @@ pub(super) fn lock(residency: &Yielding<Residency>) -> Held<'_> {
     Held::new(residency.hold(POISONED))
 }
 
+/// [`lock`], `counted` run once the holder is counted waiting
+/// ([`Yielding::hold_counted`]): from then the keeper gives way to it at
+/// its next job's end, so what `counted` does (the request service's look,
+/// `decode::Look`) runs beside a job the keeper holds, never before one it
+/// starts.
+pub(super) fn lock_counted(residency: &Yielding<Residency>, counted: impl FnOnce()) -> Held<'_> {
+    Held::new(residency.hold_counted(POISONED, counted))
+}
+
 /// Why residency's lock is never poisoned ([`lock`]).
 const POISONED: &str = "residency is never left by a panic";
 

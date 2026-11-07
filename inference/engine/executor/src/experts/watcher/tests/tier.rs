@@ -228,8 +228,13 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
         assert_ne!(alone(held), *claimed.borrow(), "the refill took no victim the tier kept alone");
         let (requested, shared) = (state.clone(), shared.clone());
         let records = harness.layers.iter().map(|layer| layer.4.clone()).collect::<Vec<_>>();
+        // Its own count, not any holder's: the load's request service is
+        // counted too while it looks, and a turn that gave way to it alone
+        // would run the fill before this request begins its step.
+        let counted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waits = counted.clone();
         let thread = std::thread::spawn(move || {
-            let held = residency::lock(&requested);
+            let held = residency::lock_counted(&requested, || waits.store(true, std::sync::atomic::Ordering::Release));
             let directory = &held.core.directory;
             let layers = 0..held.core.layers.len();
             let found = (layers.clone().map(|layer| directory.held_count(layer)).collect::<Vec<_>>(), layers.map(|layer| directory.alone(layer)).collect::<Vec<_>>());
@@ -243,7 +248,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
             }
             (shared.telemetry.holdings(), found, step)
         });
-        eventually("the request never waited for residency", || state.waiting() > 0);
+        eventually("the request never waited for residency", || counted.load(std::sync::atomic::Ordering::Acquire));
         *request.borrow_mut() = Some(thread);
         true
     };

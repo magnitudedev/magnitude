@@ -31,7 +31,16 @@ impl<T> Yielding<T> {
     /// The value, for a holder the background gives way to. `poisoned`
     /// says why a panic can never have left it.
     pub(crate) fn hold(&self, poisoned: &str) -> MutexGuard<'_, T> {
+        self.hold_counted(poisoned, || ())
+    }
+
+    /// [`Self::hold`], `counted` run once this holder is counted waiting
+    /// and before it waits: the background gives way to it from its next
+    /// job's end, so `counted` runs beside a job the background holds,
+    /// never before one it starts.
+    pub(crate) fn hold_counted(&self, poisoned: &str, counted: impl FnOnce()) -> MutexGuard<'_, T> {
         self.waiting.fetch_add(1, Ordering::AcqRel);
+        counted();
         let held = self.value.lock().expect(poisoned);
         self.waiting.fetch_sub(1, Ordering::AcqRel);
         held

@@ -23,7 +23,7 @@
 
 use super::decode::{Began, Decode, Look, Posted};
 use super::liveness;
-use super::residency::{Residency, lock};
+use super::residency::{Residency, lock, lock_counted};
 use super::scratch::{self, Pending};
 use super::{Shared, panic_message};
 use crate::experts::yielding::Yielding;
@@ -107,10 +107,12 @@ impl Requests {
             if self.shared.life.stopping() {
                 return;
             }
+            // The look runs once the service is counted waiting for
+            // residency, so the keeper starts no job before its pass.
             let began = Began { ended, looked: Instant::now() };
-            let posted = self.look(began);
+            let mut posted = Vec::new();
             let (progressed, polls) = {
-                let mut held = lock(&residency);
+                let mut held = lock_counted(&residency, || posted = self.look(began));
                 let mut service = self.service.lock().expect("the request service is never left by a panic");
                 let progressed = match self.shared.life.ended() {
                     Some(_) => liveness::refuse(&held.core, &self.shared),
