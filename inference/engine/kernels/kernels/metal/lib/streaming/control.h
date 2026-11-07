@@ -15,10 +15,6 @@
 // <seismic/slab.h> enables `coherent(system)` pointers.
 #include <seismic/slab.h>
 
-#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
-#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
-#endif
-
 #define SYSTEM volatile coherent(system) device
 
 // The shim's qualifiers and word handles (streaming/contract.hpp).
@@ -42,7 +38,10 @@ typedef ulong u64;
 
 namespace streaming {
 
-constant metal::thread_scope system_scope = static_cast<metal::thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+// Metal's system memory scope (AIR scope 3), stated as its value: a kernel's
+// conditions read no toolchain-predefined macro, so coverage's skeleton
+// preprocessing decides every group as the toolchain does.
+constant metal::thread_scope system_scope = static_cast<metal::thread_scope>(3);
 
 } // namespace streaming
 
