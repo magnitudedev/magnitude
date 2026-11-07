@@ -3029,7 +3029,9 @@ fn gemma_fresh_only_with_scale(scale: f64) {
     bound.query = bf16_tensor(&device, &[1, geometry.kv * geometry.g, w], &query);
     bound.value_norm = f32_tensor(&device, &[1, w], &vec![1.; w]);
     bound.components = i32_tensor(&device, &[geometry.p], &vec![0; geometry.p]);
-    let spec = specialization_on(&device, geometry, &[])
+    // The partition is pinned; the slicing forms are surveyed over all their
+    // declared values, among them the historical Gemma form (SIMDS 8, SLICES 4).
+    let spec = specialization_on(&device, geometry, &[("PARTS", 16), ("SPAN", 32)])
         .with_static("I", 0)
         .with_static("NV", 1);
     let mut pristine = [
@@ -3064,15 +3066,7 @@ fn gemma_fresh_only_with_scale(scale: f64) {
         seismic::Strategy::Survey(seismic::SurveyPlan {
             samples: 2,
             min_sample_seconds: 0.0002,
-            domains: [
-                ("PARTS", vec![16]),
-                ("SPAN", vec![32]),
-                ("SIMDS", vec![4, 8]),
-                ("SLICES", vec![2, 4]),
-            ]
-            .into_iter()
-            .map(|(k, v)| (k.into(), v))
-            .collect(),
+            domains: Default::default(),
         }),
     )
     .unwrap();
