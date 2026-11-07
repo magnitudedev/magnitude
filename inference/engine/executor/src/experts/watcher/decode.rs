@@ -3,20 +3,37 @@
 //! into a ready tier record of its layer's group (`experts::landing`):
 //! landed by its hint's read, or read now into staging. Each choice's
 //! record is written as its expert lands, so no landing waits for
-//! another's read, and the request's slot is answered as its last lands; a landing is no promotion into the bank, which the
-//! ranking alone decides (`promotions`).
+//! another's read, and the request's slot is answered as its last lands; a
+//! landing is no promotion into the bank, which the ranking alone decides
+//! (`promotions`).
+//!
+//! A request is served in two parts. The request service's look ([`Look`])
+//! takes the device's request with no lock of residency's and decides
+//! nothing: each absent expert lacked by the read path's mirror
+//! (`host_records::InboundTable`), whose word it claims, is read at once
+//! into a staging record taken from the pool (`staging::StagingPool`), its
+//! ranges from the load's read table (`core::ReadTable`). Residency's pass
+//! then serves the request ([`Decode::serve`]): it claims each read's tier
+//! record, builds its landing and does the request's accounting, and
+//! serves every other absent expert (kept, landing already, or one the look
+//! could not read) as before. A read's landing runs once both its read has
+//! ended and its records are claimed (`prefetch::Join`), so neither waits
+//! for the other.
 
 use super::{Shared, Step};
-use super::core::{At, Core, RoutingRecord};
-use super::prefetch::{Named, Naming, Prefetch, Reading};
+use super::core::{At, Core, ReadTable, RoutingRecord};
+use super::prefetch::{self, Join, Named, Naming, Posting, Prefetch, Reading};
 use super::telemetry::{Anticipation, RequestCost};
 use crate::experts::directory::HostRecord;
-use crate::experts::host_records::{Claim, Grant, Located};
+use crate::experts::host_records::{Claim, Demand, Grant, InboundTable, Located};
 use crate::experts::landing::{Answer, Source};
-use crate::experts::staging::Staged;
-use seismic_io::Priority;
+use crate::experts::source::Ticket;
+use crate::experts::staging::{Staged, StagingPool};
+use crate::experts::{ExchangeTable, Words};
+use crate::planning::RegionWords;
 use magnitude_kernels::{SlotTable, constants};
 use std::collections::BTreeSet;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,225 +54,92 @@ pub(super) fn fail(core: &Core, shared: &Shared, layer: usize, sequence: Step, r
     shared.parks.settle();
 }
 
-/// How a request's absent expert lands: already landed in a tier record;
-/// read now into a staging record and landed as it ends; or once its read
-/// ahead (a hint's or the tier's fill's, hastened to demand) has landed,
-/// or, the tier holding no record past its grace or staging no free record
-/// (one a failed step's read still holds), once one is (`Waiting`): a
-/// shortage of records is backpressure, never a failure, and never a wait
-/// of the request service. Only a read is on the request's critical
-/// section.
-enum Plan {
-    Read { grant: Grant },
-    Unread(Unread),
+/// What the look reads of a streamed layer: its file table, its policy
+/// words and its experts.
+struct Watched {
+    file: ExchangeTable,
+    policy: Words,
+    experts: usize,
 }
 
-/// How an absent expert read by nothing now lands ([`Plan`]): kept already
-/// in tier record `tier`; waiting for the landing in flight that reads it
-/// (`Reading`); or waiting for a staging or tier record before it is read
-/// (`Waits`).
-enum Unread {
-    Kept(u32),
-    Reading,
-    Waits,
-}
-
-/// An absent expert of a served request waiting for its read ahead's
-/// landing, or for a record (`record`): its choices' answer, its rows, and
-/// the request's point.
-struct Waiting {
-    at: At,
-    expert: usize,
-    answer: Answer,
-    rows: BTreeSet<usize>,
-    named: Instant,
-    record: bool,
-}
-
-/// The decode requests served, and the landings waiting for a record.
-pub(super) struct Decode {
-    /// Per layer, the last request served.
+/// The request service's look at the device's decode requests, taken
+/// before residency's lock: what it reads, fixed at load, and per layer the
+/// last request it took.
+pub(super) struct Look {
+    layers: Vec<Watched>,
+    words: RegionWords,
+    table: Arc<ReadTable>,
+    staging: Arc<StagingPool>,
+    inbound: Arc<InboundTable>,
+    /// Per layer, the last request taken.
     served: Vec<Step>,
-    waiting: Vec<Waiting>,
 }
 
-impl Decode {
-    /// The misses waiting, for the exchange's watchdog: each one's step,
-    /// layer and expert, and since when its request named it.
-    pub(super) fn describe(&self) -> String {
-        let waiting = self
-            .waiting
-            .iter()
-            .map(|waiting| format!("step {} layer {} expert {} for {:?}", waiting.at.point.sequence, waiting.at.point.layer, waiting.expert, waiting.named.elapsed()))
-            .collect::<Vec<_>>();
-        format!("served through {:?}, misses waiting [{}]", self.served, waiting.join("; "))
+/// A request the look took ([`Look::look`]): its step and layer, when it
+/// was noticed, each choice's expert (none for a held one), its absent
+/// experts, and the read it posted of those it claimed, if any.
+pub(super) struct Posted {
+    pub(super) sequence: Step,
+    pub(super) layer: usize,
+    noticed: Instant,
+    choices: Vec<Option<usize>>,
+    absent: Vec<usize>,
+    read: Option<PostedRead>,
+}
+
+/// The read a look posted of a request's experts: each one's staging
+/// record and its reads of the posting, when it was submitted, and the
+/// posting, or why the read engine took none.
+struct PostedRead {
+    landings: Vec<(usize, u32, Range<usize>)>,
+    submitted: Instant,
+    posting: Result<Posting, String>,
+}
+
+impl PostedRead {
+    /// Whether it reads `expert`.
+    fn reads(&self, expert: usize) -> bool {
+        self.landings.iter().any(|&(read, ..)| read == expert)
     }
 }
 
-/// The records the device may still read at or after its park at `layer`
-/// of step `sequence` (its tier wait) that its route resolved there (its
-/// routing record's sources), each as (group, record) of the records the
-/// host lands into (`landing::Source`, under every placer); those
-/// answered for its request are outstanding answers, which nothing takes
-/// (`HostRecords::answer`). Every other resolution a record is freed past
-/// lies before the park
-/// ([`super::super::directory::Directory::release`]). Its routing record
-/// is the parked step's: the route publishes it before its request
-/// (`streaming/resolve.hpp`), so a record of another step is the device's
-/// broken invariant, never a set of reads to free past.
-pub(super) fn parked_reads(core: &Core, layer: usize, sequence: Step) -> Vec<(usize, u32)> {
-    let placer = core.extents.placer;
-    let group = core.layers[layer].group;
-    let record = |word: i32| match Source::of(placer, word) {
-        Source::Host(record) => Some((group, record as u32)),
-        Source::Absent | Source::Device => None,
-    };
-    let routing = RoutingRecord::read(&core.layers[layer].routing, core.extents.words, sequence, layer);
-    routing.choices().filter_map(|(_, source)| record(source)).collect()
+/// When the look began, for the read timeline: the previous pass's end and
+/// the look's start.
+#[derive(Clone, Copy)]
+pub(super) struct Began {
+    pub(super) ended: Instant,
+    pub(super) looked: Instant,
 }
 
-/// Claim a demand landing of `staged`, the device parked at `parked` in a
-/// group of `steps` steps (`Directory::claim_demand`): kept or landing
-/// already, that; else a ready tier record of its group, one the reserve
-/// holds ready (its graces released at the park, `Directory::release`), or
-/// one a kept record's unmapping frees at once, the unmapping stored (by the
-/// host records, its one writer) before any landing writes the record;
-/// never one a resolution at or after the park may name ([`parked_reads`]),
-/// nor a request's outstanding answer (`HostRecords::answer`). The record
-/// taken answers the parked request once it lands.
-fn demand_claim(core: &mut Core, staged: Staged, (parked, steps): (crate::experts::directory::Point, u64)) -> Claim {
-    let read = parked_reads(core, staged.0, parked.sequence);
-    core.directory.release((parked, steps), &read);
-    core.directory.claim_demand(staged, &read, (parked, steps))
-}
-
-/// The landing `grant` allows of a parked step's absent expert from staging
-/// record `record`, the device parked at `parked` in a group of `steps`
-/// steps: mapped from the first step that has not resolved its layer
-/// (`Point::first_unresolved`), which the device cannot pass before the
-/// landing answers, so a step begun behind the parked one that has yet to
-/// resolve the layer hits it, as the host serving it decides.
-fn parked_landing(
-    core: &Core,
-    grant: crate::experts::host_records::Grant,
-    record: u32,
-    parked: crate::experts::directory::Point,
-    steps: u64,
-) -> crate::experts::landing::Landing {
-    let from = Some(parked.first_unresolved(grant.staged().0, steps));
-    crate::experts::landing::Landing { from, ..core.landing(grant, record) }
-}
-
-impl Decode {
-    pub(super) fn new(layers: usize) -> Self {
-        Self { served: vec![0; layers], waiting: Vec::new() }
+impl Look {
+    /// The look at `core`'s layers, its reads into `staging`.
+    pub(super) fn new(core: &Core, staging: Arc<StagingPool>) -> Self {
+        Self {
+            layers: core
+                .layers
+                .iter()
+                .map(|layer| Watched { file: layer.file.clone(), policy: layer.policy.clone(), experts: layer.experts })
+                .collect(),
+            words: core.extents.words,
+            table: core.table.clone(),
+            staging,
+            inbound: core.directory.inbound(),
+            served: vec![0; core.layers.len()],
+        }
     }
 
-    /// Each layer's last request noticed (`Self::request`).
+    /// Each layer's last request taken.
     pub(super) fn served(&self) -> &[Step] {
         &self.served
     }
 
-    /// Answer each waiting expert its tier keeps now (its read ahead
-    /// landed), pass over each whose read ahead still runs, and land the
-    /// rest a tier record is now past its grace for, in the order they
-    /// waited: each read now and answered as it lands; one of a step that
-    /// ended (retired, or failed) is dropped, as its launches returned. The landings that ended are learned first
-    /// (`Prefetch::settle`), so a miss waits for its read ahead's landing
-    /// alone, never for residency's next turn to learn it. True when any
-    /// landing was learned, or any miss answered, landed or dropped.
-    pub(super) fn resume(&mut self, serving: Serving<'_>) -> bool {
-        let Serving { core, prefetch, shared } = serving;
-        let mut progressed = !self.waiting.is_empty() && prefetch.settle(&mut core.directory);
-        let mut waiting = std::mem::take(&mut self.waiting);
-        waiting.retain(|waits| {
-            let (layer, sequence) = (waits.at.point.layer, waits.at.point.sequence);
-            let failed = core.layers[layer].file.answer_of(sequence, 0) == Some(crate::experts::exchange::Answer::Failed);
-            if shared.steps.ended(sequence) || failed {
-                progressed = true;
-                return false;
-            }
-            true
-        });
-        let mut index = 0;
-        while let Some(waits) = waiting.get(index) {
-            let (layer, expert) = (waits.at.point.layer, waits.expert);
-            let staged = (layer, expert);
-            match core.directory.located(layer, expert) {
-                // Kept already (landed meanwhile by its read ahead):
-                // answered with its record.
-                Located::Kept(tier) => {
-                    core.directory.answer(layer, HostRecord(tier), waits.at.point);
-                    waiting.remove(index).answer.publish(Some(tier));
-                    progressed = true;
-                    continue;
-                }
-                // A landing of it is in flight, hastened to demand: it
-                // lands it, or fails and lacks it again.
-                Located::Landing => {
-                    prefetch.hasten(staged);
-                    index += 1;
-                    continue;
-                }
-                Located::Lacked => {}
-            }
-            // A record to read it into: none free (a failed step's read
-            // still holds one) waits for one, its landing's end an event.
-            if prefetch.staging.free() == 0 {
-                break;
-            }
-            let steps = shared.steps.group_of(waits.at.point.sequence).1;
-            // Lacked, as located above: a claim takes a record, or finds
-            // none ready.
-            let Claim::Taken(grant) = demand_claim(core, staged, (waits.at.point, steps)) else {
-                break;
-            };
-            let tier = grant.record();
-            let waits = waiting.remove(index);
-            progressed = true;
-            if waits.record {
-                crate::experts::landing::LandingAccount::add(&shared.landings.waited, waits.named.elapsed());
-            }
-            let record = prefetch.staging.take().expect("a free staging record, looked at above");
-            let reads = core.reads(layer, expert, record);
-            let count = reads.len();
-            let landing = Named {
-                landing: parked_landing(core, grant, record, waits.at.point, steps),
-                staged: record,
-                reads: 0..count,
-                rows: waits.rows,
-                answer: waits.answer,
-            };
-            let naming = Naming { layer, sequence: waits.at.point.sequence, named: waits.named };
-            match core.source.submit(reads, Priority::Demand) {
-                Ok(ticket) => {
-                    for job in ticket.jobs() {
-                        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, naming.sequence as i64, -1));
-                    }
-                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), naming.sequence as u64, (layer as i64, expert as i64, 5));
-                    prefetch.demand(ticket, vec![landing], vec![(record, staged, tier, naming.sequence)], naming, None, None, shared)
-                }
-                // The read was never made: as a failed read, only the rows that named the
-                // expert fail, and its wait is answered with none, so the rest of the step serves.
-                Err(reason) => {
-                    core.directory.unlanded(layer, HostRecord(tier));
-                    prefetch.staging.release(record);
-                    shared.steps.fail_request_rows(naming.sequence, layer, &landing.rows, reason);
-                    landing.answer.publish(None);
-                }
-            }
-        }
-        self.waiting = waiting;
-        progressed
-    }
-
-    /// Layer `layer`'s earliest file request not yet served, taken as
-    /// served, by its step: none while every slot's request is served, or
-    /// of a step ended (read now: steps end beside the request service; one
-    /// a device error ended, which no launch waits for). A layer's requests
-    /// come in step order, the device's.
-    pub(super) fn request(&mut self, core: &Core, shared: &Shared, layer: usize) -> Option<Step> {
-        let file = &core.layers[layer].file;
+    /// Layer `layer`'s earliest file request not yet taken, taken now, by
+    /// its step: none while every slot's request is taken, or of a step
+    /// ended (read now: steps end beside the request service; one a device
+    /// error ended, which no launch waits for). A layer's requests come in
+    /// step order, the device's.
+    fn request(&mut self, shared: &Shared, layer: usize) -> Option<Step> {
+        let file = &self.layers[layer].file;
         let live = shared.steps.live();
         let unserved = live.start.max(self.served[layer] + 1)..live.end;
         let sequence = file.earliest_requested(unserved, 0, |step| !shared.steps.ended(step))?;
@@ -263,29 +147,41 @@ impl Decode {
         Some(sequence)
     }
 
-    /// Serve the request `at` its point, noticed at `started`, the device
-    /// past every point before it. Its critical section is what its read
-    /// needs: which absent experts read now, a staging record and a ready
-    /// tier record each, and the read's submission. What the read does not
-    /// need follows it: the request's accounting, the tier map's
-    /// publication, its landings' registration and the answers of the
-    /// experts landed or landing already.
-    pub(super) fn serve(&mut self, at: At, started: Instant, serving: Serving<'_>) {
-        let Serving { core, prefetch, shared } = serving;
-        let point = at.point;
-        let (layer, sequence) = (point.layer, point.sequence);
+    /// Take each layer's next request where the device's requests are the
+    /// host's to read (`Parks::parked`), each read posted at once
+    /// ([`Self::post`]): a request's reads are the step's critical path,
+    /// and nothing of residency's stands before them.
+    pub(super) fn look(&mut self, shared: &Shared, began: Began) -> Vec<Posted> {
+        if !shared.parks.parked() {
+            return Vec::new();
+        }
+        (0..self.layers.len())
+            .filter_map(|layer| {
+                let sequence = self.request(shared, layer)?;
+                Some(self.post(sequence, layer, began))
+            })
+            .collect()
+    }
+
+    /// Take step `sequence`'s request at `layer` and post the read of each
+    /// absent expert whose word it claims while a staging record is free;
+    /// every other absent expert is left to residency's pass.
+    fn post(&mut self, sequence: Step, layer: usize, began: Began) -> Posted {
+        let noticed = Instant::now();
+        if let (Some(ended), Some(looked)) = (seismic_io::timeline::stamp(began.ended), seismic_io::timeline::stamp(began.looked)) {
+            seismic_io::timeline::note_at(noticed, seismic_io::timeline::Kind::Noted("pass"), sequence, (layer as i64, looked as i64, looked as i64));
+            seismic_io::timeline::note_at(noticed, seismic_io::timeline::Kind::Noted("pass_ended"), sequence, (layer as i64, ended as i64, 0));
+        }
+        let watched = &self.layers[layer];
         // No wait is encoded where the word is set, so a request there would
         // leave its choices unsourced: an invariant violation, which ends
         // serving (`Requests::serve`).
         assert_eq!(
-            core.layers[layer].policy.load(constants::POLICY_RESOLVED as usize),
+            watched.policy.load(constants::POLICY_RESOLVED as usize),
             0,
             "step {sequence} requested the file at layer {layer}, whose experts cannot be absent"
         );
-        let steps = shared.steps.group_of(sequence).1;
-        let experts = core.layers[layer].experts;
-        let width = core.extents.words.choices;
-        let file = core.layers[layer].file.clone();
+        let (file, experts, width) = (&watched.file, watched.experts, self.words.choices);
         let count = file.load(sequence, 0, constants::FILE_COUNT);
         // The route requests at most the decode form's choices, each an
         // absent expert or -1 - a held one (routed.seismic).
@@ -316,6 +212,367 @@ impl Decode {
                 }
             }
         }
+        seismic_io::timeline::note_at(noticed, seismic_io::timeline::Kind::Noted("notice"), sequence, (layer as i64, absent.len() as i64, count as i64));
+        // Each absent expert lacked, its word claimed, into a staging
+        // record: those taken beyond the claims go back.
+        let mut free = self.staging.take_up_to(absent.len());
+        let mut landings = Vec::new();
+        let mut reads = Vec::new();
+        for &expert in &absent {
+            if free.is_empty() {
+                break;
+            }
+            if !self.inbound.claim((layer, expert)) {
+                continue;
+            }
+            let record = free.pop().expect("a free record, looked at above");
+            let begun = reads.len();
+            reads.extend(self.table.reads(layer, expert, record));
+            landings.push((expert, record, begun..reads.len()));
+        }
+        for record in free {
+            self.staging.release(record);
+        }
+        let read = (!landings.is_empty()).then(|| {
+            let reading = landings.len() as i64;
+            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("decided"), sequence, (layer as i64, reading, 0));
+            let submitted = Instant::now();
+            let posting = prefetch::post(&self.table, reads, seismic_io::Priority::Demand);
+            if let Ok(posting) = &posting {
+                for job in posting.ticket.jobs() {
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, sequence as i64, reading));
+                }
+            }
+            PostedRead { landings, submitted, posting }
+        });
+        Posted { sequence, layer, noticed, choices, absent, read }
+    }
+}
+
+/// How a request's absent expert lands: read now, the look's posted read
+/// of it, its tier record
+/// claimed as residency serves it; already landed in a tier record; or once
+/// its read ahead (a hint's or the tier's fill's, hastened to demand) has
+/// landed, or, the look having read nothing of it (no staging record free,
+/// or it was not lacked then and is now), once a staging and a tier record
+/// are (`Waiting`): a shortage of records is backpressure, never a failure,
+/// and never a wait of the request service.
+enum Plan {
+    Posted,
+    Unread(Unread),
+}
+
+/// How an absent expert read by nothing now lands ([`Plan`]): kept already
+/// in tier record `tier`; waiting for the landing in flight that reads it
+/// (`Reading`); or waiting for a staging or tier record before it is read
+/// (`Waits`).
+enum Unread {
+    Kept(u32),
+    Reading,
+    Waits,
+}
+
+/// An absent expert of a served request waiting for its read ahead's
+/// landing, or to be read (`record`: once it found no staging or tier
+/// record free): its choices' answer, its rows, and the request's point.
+struct Waiting {
+    at: At,
+    expert: usize,
+    answer: Answer,
+    rows: BTreeSet<usize>,
+    named: Instant,
+    record: bool,
+}
+
+/// A served request's posted read (`ticket`, joined by `join`), some of
+/// whose tier records were short as it was served: its `landings` wait for
+/// them, in order, its read running or ended ([`prefetch::Join`]); the
+/// others land as they would.
+struct Unclaimed {
+    at: At,
+    naming: Naming,
+    ticket: Arc<Ticket>,
+    join: Arc<Join>,
+    landings: Vec<Landing>,
+}
+
+/// A posted read's landing of one expert: its staging record and its reads
+/// of the posting, and its request's rows and answer.
+struct Landing {
+    expert: usize,
+    record: u32,
+    reads: Range<usize>,
+    rows: BTreeSet<usize>,
+    answer: Answer,
+}
+
+/// The decode requests served: the landings waiting for a record, and the
+/// posted reads waiting for theirs.
+pub(super) struct Decode {
+    waiting: Vec<Waiting>,
+    unclaimed: Vec<Unclaimed>,
+}
+
+impl Decode {
+    /// The misses waiting, for the exchange's watchdog: each one's step,
+    /// layer and expert, and since when its request named it.
+    pub(super) fn describe(&self) -> String {
+        let waiting = self
+            .waiting
+            .iter()
+            .map(|waiting| format!("step {} layer {} expert {} for {:?}", waiting.at.point.sequence, waiting.at.point.layer, waiting.expert, waiting.named.elapsed()))
+            .chain(self.unclaimed.iter().map(|unclaimed| {
+                format!("step {} layer {} read awaiting tier records for {:?}", unclaimed.at.point.sequence, unclaimed.at.point.layer, unclaimed.naming.named.elapsed())
+            }))
+            .collect::<Vec<_>>();
+        format!("misses waiting [{}]", waiting.join("; "))
+    }
+}
+
+/// The records the device may still read at or after its park at `layer`
+/// of step `sequence` (its tier wait) that its route resolved there (its
+/// routing record's sources), each as (group, record) of the records the
+/// host lands into (`landing::Source`, under every placer); those
+/// answered for its request are outstanding answers, which nothing takes
+/// (`HostRecords::answer`). Every other resolution a record is freed past
+/// lies before the park
+/// ([`super::super::directory::Directory::release`]). Its routing record
+/// is the parked step's: the route publishes it before its request
+/// (`streaming/resolve.hpp`), so a record of another step is the device's
+/// broken invariant, never a set of reads to free past.
+pub(super) fn parked_reads(core: &Core, layer: usize, sequence: Step) -> Vec<(usize, u32)> {
+    let placer = core.extents.placer;
+    let group = core.layers[layer].group;
+    let record = |word: i32| match Source::of(placer, word) {
+        Source::Host(record) => Some((group, record as u32)),
+        Source::Absent | Source::Device => None,
+    };
+    let routing = RoutingRecord::read(&core.layers[layer].routing, core.extents.words, sequence, layer);
+    routing.choices().filter_map(|(_, source)| record(source)).collect()
+}
+
+/// Claim a demand landing of `staged` for `demand`, the device parked at
+/// `parked` in a group of `steps` steps (`Directory::claim_demand`): kept
+/// or landing already, that (a lacked expert's alone); else a ready tier
+/// record of its group, one the reserve holds ready (its graces released at
+/// the park, `Directory::release`), or one a kept record's unmapping frees
+/// at once, the unmapping stored (by the host records, its one writer)
+/// before any landing writes the record; never one a resolution at or after
+/// the park may name ([`parked_reads`]), nor a request's outstanding answer
+/// (`HostRecords::answer`). The record taken answers the parked request
+/// once it lands.
+fn demand_claim(core: &mut Core, staged: Staged, demand: Demand, (parked, steps): (crate::experts::directory::Point, u64)) -> Claim {
+    let read = parked_reads(core, staged.0, parked.sequence);
+    core.directory.release((parked, steps), &read);
+    core.directory.claim_demand(staged, demand, &read, (parked, steps))
+}
+
+/// A posted read's tier record for `staged`: taken, or none while the tier
+/// has none to take.
+fn posted_claim(core: &mut Core, staged: Staged, parked: (crate::experts::directory::Point, u64)) -> Option<Grant> {
+    match demand_claim(core, staged, Demand::Posted, parked) {
+        Claim::Taken(grant) => Some(grant),
+        Claim::Short => None,
+        Claim::Kept(_) | Claim::Landing => unreachable!("a posted read's claim finds its expert lacked"),
+    }
+}
+
+/// The landing `grant` allows of a parked step's absent expert from staging
+/// record `record`, the device parked at `parked` in a group of `steps`
+/// steps: mapped from the first step that has not resolved its layer
+/// (`Point::first_unresolved`), which the device cannot pass before the
+/// landing answers, so a step begun behind the parked one that has yet to
+/// resolve the layer hits it, as the host serving it decides.
+fn parked_landing(
+    core: &Core,
+    grant: crate::experts::host_records::Grant,
+    record: u32,
+    parked: crate::experts::directory::Point,
+    steps: u64,
+) -> crate::experts::landing::Landing {
+    let from = Some(parked.first_unresolved(grant.staged().0, steps));
+    crate::experts::landing::Landing { from, ..core.landing(grant, record) }
+}
+
+/// Give up the landings of a posted read whose step ended before their
+/// tier records were claimed: their experts are lacked again, the read's
+/// pieces not yet taken are withdrawn where it lands nothing else, and
+/// their staging frees as the read ends (`Join::claimed`).
+fn discard(core: &mut Core, prefetch: &Prefetch, shared: &Arc<Shared>, layer: usize, unclaimed: Unclaimed) {
+    let Unclaimed { mut ticket, join, landings, .. } = unclaimed;
+    let mut records = Vec::with_capacity(landings.len());
+    for landing in landings {
+        core.directory.unposted(layer, landing.expert);
+        records.push(landing.record);
+    }
+    if Arc::get_mut(&mut ticket).is_some() {
+        ticket.withdraw();
+    }
+    let (staging, events) = (prefetch.staging.clone(), shared.events().clone());
+    join.claimed(move |_, _, _| {
+        // Every request of the ticket has ended: dropping it waits for none.
+        drop(ticket);
+        for record in records {
+            staging.release(record);
+        }
+        events.notify();
+    });
+}
+
+impl Decode {
+    pub(super) fn new() -> Self {
+        Self { waiting: Vec::new(), unclaimed: Vec::new() }
+    }
+
+    /// Carry what waits: the posted reads still short of tier records
+    /// claim them, and each waiting expert its tier keeps now (its read
+    /// ahead landed) is answered, each whose read ahead still runs passed
+    /// over, and the rest a staging and a tier record are free for read
+    /// now and answered as it lands, in the order they waited; one of a step
+    /// that ended (retired, or failed) is dropped, as its launches returned.
+    /// The landings that ended are learned first (`Prefetch::settle`), so a
+    /// miss waits for its read ahead's landing alone, never for residency's
+    /// next turn to learn it. True when any landing was learned, or any
+    /// miss claimed, answered, landed or dropped.
+    pub(super) fn resume(&mut self, serving: Serving<'_>) -> bool {
+        let Serving { core, prefetch, shared } = serving;
+        let mut progressed = !(self.waiting.is_empty() && self.unclaimed.is_empty()) && prefetch.settle(&mut core.directory);
+        let ended = |core: &Core, at: At| {
+            let (layer, sequence) = (at.point.layer, at.point.sequence);
+            shared.steps.ended(sequence) || core.layers[layer].file.answer_of(sequence, 0) == Some(crate::experts::exchange::Answer::Failed)
+        };
+        for mut unclaimed in std::mem::take(&mut self.unclaimed) {
+            let (at, layer) = (unclaimed.at, unclaimed.at.point.layer);
+            if ended(core, at) {
+                discard(core, prefetch, shared, layer, unclaimed);
+                progressed = true;
+                continue;
+            }
+            let steps = shared.steps.group_of(at.point.sequence).1;
+            let mut claimed = Vec::new();
+            let mut landings = std::mem::take(&mut unclaimed.landings).into_iter();
+            for landing in landings.by_ref() {
+                match posted_claim(core, (layer, landing.expert), (at.point, steps)) {
+                    Some(grant) => claimed.push((landing, grant)),
+                    None => {
+                        unclaimed.landings.push(landing);
+                        break;
+                    }
+                }
+            }
+            unclaimed.landings.extend(landings);
+            if !claimed.is_empty() {
+                land(core, prefetch, shared, &unclaimed, claimed, None);
+                progressed = true;
+            }
+            if !unclaimed.landings.is_empty() {
+                self.unclaimed.push(unclaimed);
+            }
+        }
+        let mut waiting = std::mem::take(&mut self.waiting);
+        waiting.retain(|waits| {
+            if ended(core, waits.at) {
+                progressed = true;
+                return false;
+            }
+            true
+        });
+        let mut index = 0;
+        while let Some(waits) = waiting.get(index) {
+            let (layer, expert) = (waits.at.point.layer, waits.expert);
+            let staged = (layer, expert);
+            match core.directory.located(layer, expert) {
+                // Kept already (landed meanwhile by its read ahead):
+                // answered with its record.
+                Located::Kept(tier) => {
+                    core.directory.answer(layer, HostRecord(tier), waits.at.point);
+                    waiting.remove(index).answer.publish(Some(tier));
+                    progressed = true;
+                    continue;
+                }
+                // A landing of it is in flight, hastened to demand: it
+                // lands it, or fails and lacks it again.
+                Located::Landing => {
+                    prefetch.hasten(staged);
+                    index += 1;
+                    continue;
+                }
+                Located::Lacked => {}
+            }
+            // A record to read it into: none free (a failed step's read
+            // still holds one) waits for one, its landing's end an event.
+            // Short of a record: waits for one, counted once.
+            let short = |waiting: &mut Vec<Waiting>| {
+                let waits = &mut waiting[index];
+                if !std::mem::replace(&mut waits.record, true) {
+                    shared.landings.waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            };
+            let Some(record) = prefetch.staging.take_beyond(0) else {
+                short(&mut waiting);
+                break;
+            };
+            let steps = shared.steps.group_of(waits.at.point.sequence).1;
+            // Lacked, as located above: a claim takes a record, or finds
+            // none ready (or a posted read claimed it since).
+            let Claim::Taken(grant) = demand_claim(core, staged, Demand::Lacked, (waits.at.point, steps)) else {
+                prefetch.staging.release(record);
+                short(&mut waiting);
+                break;
+            };
+            let tier = grant.record();
+            let waits = waiting.remove(index);
+            progressed = true;
+            if waits.record {
+                crate::experts::landing::LandingAccount::add(&shared.landings.waited, waits.named.elapsed());
+            }
+            let reads = core.reads(layer, expert, record);
+            let count = reads.len();
+            let landing = Named {
+                landing: parked_landing(core, grant, record, waits.at.point, steps),
+                staged: record,
+                reads: 0..count,
+                rows: waits.rows,
+                answer: waits.answer,
+            };
+            let naming = Naming { layer, sequence: waits.at.point.sequence, named: waits.named };
+            match prefetch::post(&core.table, reads, seismic_io::Priority::Demand) {
+                Ok(Posting { ticket, join }) => {
+                    for job in ticket.jobs() {
+                        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, naming.sequence as i64, -1));
+                    }
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), naming.sequence, (layer as i64, expert as i64, 5));
+                    prefetch::account(&ticket, &join, naming, None, shared);
+                    prefetch.demand((&Arc::new(ticket), &join), vec![landing], vec![(record, staged, tier, naming.sequence)], naming, None, shared)
+                }
+                // The read was never made: as a failed read, only the rows that named the
+                // expert fail, and its wait is answered with none, so the rest of the step serves.
+                Err(reason) => {
+                    core.directory.unlanded(layer, HostRecord(tier));
+                    prefetch.staging.release(record);
+                    shared.steps.fail_request_rows(naming.sequence, layer, &landing.rows, reason);
+                    landing.answer.publish(None);
+                }
+            }
+        }
+        self.waiting = waiting;
+        progressed
+    }
+
+    /// Serve the request the look posted, `at` its point, the device past
+    /// every point before it: its posted read's tier records claimed and
+    /// its landings joined to the read (each runs once both have come); its
+    /// other absent experts each answered (kept), waiting for its landing in
+    /// flight (hastened to demand), or waiting for records; and the
+    /// request's accounting.
+    pub(super) fn serve(&mut self, posted: Posted, at: At, serving: Serving<'_>) {
+        let Serving { core, prefetch, shared } = serving;
+        let Posted { noticed: started, choices, absent, read, .. } = posted;
+        let point = at.point;
+        let (layer, sequence) = (point.layer, point.sequence);
+        let steps = shared.steps.group_of(sequence).1;
+        let width = core.extents.words.choices;
+        let file = core.layers[layer].file.clone();
         // Choice c = m K + k is row m's (routed.seismic): the rows that
         // named an expert, which its read's failure fails alone, and the
         // choices its landing answers.
@@ -336,136 +593,84 @@ impl Decode {
             parks: shared.parks.clone(),
         };
         let naming = Naming { layer, sequence, named: started };
-        seismic_io::timeline::note_at(started, seismic_io::timeline::Kind::Noted("notice"), sequence as u64, (layer as i64, absent.len() as i64, count as i64));
-        // Each absent expert's landing: a read ahead's, hastened to demand
-        // (reading), or one read now. The request's lead is the layers since
-        // its last read a route issued was submitted: none where every miss had landed already, a read it
-        // never saw. A fill's read no route issued is a demand's to it: no
-        // prediction made it.
+        // Each absent expert's landing: the look's read, a read ahead's,
+        // hastened to demand (reading), or one read once records are free.
+        // The request's lead is the layers since its last read a route
+        // issued was submitted: none where every miss had landed already, a
+        // read it never saw. A fill's read no route issued is a demand's to
+        // it: no prediction made it.
         let mut served = RequestCost { missed: absent.clone(), ..RequestCost::default() };
-        // Each absent expert's plan, none yet for one read now.
         let mut plans = Vec::with_capacity(absent.len());
-        let mut fresh = 0;
         let mut lead: Option<u64> = None;
         let record_bytes = core.layers[layer].expert_bytes();
         for &expert in &absent {
             let staged = (layer, expert);
-            // The request's lead is its latest read's.
             let mut taken_from = |from: At| {
                 let layers = from.runs_until(at);
                 lead = Some(lead.map_or(layers, |lead| lead.min(layers)));
             };
-            let (plan, anticipation) = match core.directory.located(layer, expert) {
-                // Kept already: landed after the route resolved it (a read
-                // ahead's that ended and settled since), answered with its
-                // record, an outstanding answer from now, which no claim of
-                // the request's other misses takes.
-                Located::Kept(tier) => {
-                    core.directory.answer(layer, HostRecord(tier), point);
-                    (Some(Plan::Unread(Unread::Kept(tier))), None)
-                }
-                // A landing of it is in flight, whoever's (a read ahead's,
-                // another request's, the fill's): it waits for it, hastened
-                // to demand.
-                Located::Landing => {
-                    match prefetch.hasten(staged) {
+            let (plan, anticipation) = match read.as_ref().is_some_and(|read| read.reads(expert)) {
+                true => (Plan::Posted, Some(Anticipation::Demand)),
+                false => match core.directory.located(layer, expert) {
+                    // Kept already: landed after the route resolved it (a
+                    // read ahead's that ended and settled since), answered
+                    // with its record, an outstanding answer from now,
+                    // which no claim of the request's other misses takes.
+                    Located::Kept(tier) => {
+                        core.directory.answer(layer, HostRecord(tier), point);
+                        (Plan::Unread(Unread::Kept(tier)), None)
+                    }
+                    // A landing of it is in flight, whoever's (a read
+                    // ahead's, another request's, the fill's): it waits for
+                    // it, hastened to demand.
+                    Located::Landing => match prefetch.hasten(staged) {
                         Some(Reading::Hint(issued)) => {
                             taken_from(issued);
-                            (Some(Plan::Unread(Unread::Reading)), Some(Anticipation::Reading))
+                            (Plan::Unread(Unread::Reading), Some(Anticipation::Reading))
                         }
-                        Some(Reading::Unpredicted) | None => (Some(Plan::Unread(Unread::Reading)), Some(Anticipation::Demand)),
-                    }
-                }
-                Located::Lacked => {
-                    fresh += 1;
-                    (None, Some(Anticipation::Demand))
-                }
+                        Some(Reading::Unpredicted) | None => (Plan::Unread(Unread::Reading), Some(Anticipation::Demand)),
+                    },
+                    // The look read nothing of it: it waits for records.
+                    Located::Lacked => (Plan::Unread(Unread::Waits), Some(Anticipation::Demand)),
+                },
             };
             let code = match (&plan, anticipation) {
-                (Some(Plan::Unread(Unread::Kept(_))), _) => 0,
+                (Plan::Unread(Unread::Kept(_)), _) => 0,
                 (_, Some(Anticipation::Reading)) => 1,
-                (Some(Plan::Unread(Unread::Reading)), _) => 2,
+                (Plan::Unread(Unread::Reading), _) => 2,
+                (Plan::Unread(Unread::Waits), _) => 3,
                 _ => 4,
             };
-            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), sequence as u64, (layer as i64, expert as i64, code));
+            seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("plan"), sequence, (layer as i64, expert as i64, code));
             // A miss kept already reads nothing: no read miss, nor its bytes.
             match anticipation {
                 Some(anticipation) => served.anticipated[anticipation as usize] += 1,
                 None => served.missed.retain(|&missed| missed != expert),
             }
-            plans.push(plan);
+            plans.push((expert, plan));
         }
-        // Those read now, each into a free staging record: an earlier
-        // request's are free once its landings end,
-        // which the device past its answers proves (`Residency::advance`
-        // learned them), but one a failed step left reading frees only as
-        // its read and landing end. An expert beyond them waits for one
-        // (`Self::resume`), as one the tier has no ready record for.
-        let mut free = prefetch.staging.free();
-        let plans = absent
-            .iter()
-            .zip(plans)
-            .map(|(&expert, plan)| {
-                // Lacked, as located above: a claim takes a record, or
-                // finds none ready.
-                plan.unwrap_or_else(|| match (free > 0).then(|| demand_claim(core, (layer, expert), (point, steps))) {
-                    Some(Claim::Taken(grant)) => {
-                        free -= 1;
-                        Plan::Read { grant }
-                    }
-                    _ => Plan::Unread(Unread::Waits),
-                })
-            })
-            .collect::<Vec<_>>();
-        // The device's convert holds its staging until the device is past
-        // this barrier, which opens only once every miss is answered, so a
-        // miss waiting for a record rules it out: the host's landings free
-        // their records without the device.
-        let convertible = !plans.iter().any(|plan| matches!(plan, Plan::Unread(Unread::Waits)));
-        // The request's one demand job, its reads landing in staging
-        // records taken now: a point of the served file's read line where
-        // it reads all the request's misses. It is submitted before
-        // anything it does not need.
-        let reading = plans.iter().filter(|plan| matches!(plan, Plan::Read { .. })).count();
-        let mut taken = prefetch.staging.take_many(reading).expect("a free staging record for each read, counted above").into_iter();
-        let (mut reads, mut landings, mut tracked, mut others) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for (&expert, plan) in absent.iter().zip(plans) {
-            match plan {
-                Plan::Read { grant } => {
-                    let tier = grant.record();
-                    let record = taken.next().expect("a staging record a read");
-                    let begun = reads.len();
-                    reads.extend(core.reads(layer, expert, record));
-                    landings.push(Named {
-                        landing: parked_landing(core, grant, record, point, steps),
-                        staged: record,
-                        reads: begun..reads.len(),
-                        rows: rows_of(expert),
-                        answer: answer_of(expert),
-                    });
-                    tracked.push((record, (layer, expert), tier, sequence));
-                }
-                Plan::Unread(unread) => others.push((expert, unread)),
-            }
-        }
-        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("decided"), sequence as u64, (layer as i64, reading as i64, 0));
-        let submitted = (!reads.is_empty()).then(|| (Instant::now(), core.source.submit(reads, Priority::Demand)));
-        if let Some((_, Ok(ticket))) = &submitted {
-            for job in ticket.jobs() {
-                seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, sequence as i64, reading as i64));
-            }
-        }
+        // The posted read's tier records, each claimed now: a short tier
+        // leaves its landing waiting for one, its read in flight
+        // (`Self::resume`).
+        let read = read.map(|read| {
+            let grants = match read.posting {
+                Ok(_) => read.landings.iter().map(|&(expert, ..)| posted_claim(core, (layer, expert), (point, steps))).collect(),
+                Err(_) => Vec::new(),
+            };
+            (read, grants)
+        });
+        let short = read.as_ref().map_or(0, |(_, grants): &(PostedRead, Vec<Option<Grant>>)| grants.iter().filter(|grant| grant.is_none()).count());
+        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("claimed"), sequence, (layer as i64, read.as_ref().map_or(0, |(read, _)| read.landings.len()) as i64, short as i64));
         // Its own hints hastened, the device is at this layer: the hints of
         // layers it has begun or passed read nothing more. Withdrawing them
-        // frees no record now (a withdrawn read frees its own as it ends),
-        // so it follows the reads.
+        // frees no record now (a withdrawn read frees its own as it ends).
         prefetch.withdraw_passed(core, &shared.steps, Some((sequence, layer)));
         // The next request's victims, prepared now its reads are in flight
         // where this one took any or they are of an earlier step: a claim
         // then takes the first still free, scanning nothing while its step
         // waits. Twice a request's choices, as some are read by the step a
         // claim parks or gone by then.
-        if fresh > 0 {
+        if read.is_some() {
             lead = Some(0);
             core.directory.prepare_demand(layer, 2 * width as usize, sequence);
         }
@@ -476,52 +681,101 @@ impl Decode {
         // Counted before any answer, which releases the device to complete
         // the step: no landing is registered yet, nor answer published.
         shared.telemetry.serve(layer, sequence, served);
-        // The tier map's unmappings, a ready record's reclaim among them,
-        // were stored as each claim took its record, before any landing
-        // starts: no step after the parked one resolves an unmapped expert
-        // to a record a landing writes, however soon the landing answers.
-        match submitted {
-            Some((at, Ok(ticket))) => {
-                let timed = (reading == absent.len()).then_some((reading as u64 * record_bytes, at));
-                // Where a request's misses land is priced per request: the
-                // device's convert past its barrier, or the host's landing.
-                let device = core.layers[layer]
-                    .landing
-                    .clone()
-                    .filter(|_| convertible && shared.telemetry.device_lands(layer, reading as u64))
-                    .map(|words| (words, core.layers[layer].file.clone(), point));
-                prefetch.demand(ticket, landings, tracked, naming, timed, device, shared);
-            }
-            // The reads were never made: as failed reads, only the rows that named their
-            // experts fail, and their waits are answered with none, so the rest of the step
-            // serves.
-            Some((_, Err(reason))) => {
-                for (record, (layer, _), tier, _) in tracked {
-                    core.directory.unlanded(layer, HostRecord(tier));
-                    prefetch.staging.release(record);
+        // The device's convert holds its staging until the device is past
+        // this barrier, which opens only once every miss is answered, so a
+        // miss waiting for a record rules it out: the host's landings free
+        // their records without the device.
+        let convertible = short == 0 && !plans.iter().any(|(_, plan)| matches!(plan, Plan::Unread(Unread::Waits)));
+        if let Some((PostedRead { landings, submitted, posting }, grants)) = read {
+            let reading = landings.len();
+            match posting {
+                // The tier map's unmappings, a ready record's reclaim among
+                // them, were stored as each claim took its record, before
+                // any landing starts: no step after the parked one resolves
+                // an unmapped expert to a record a landing writes, however
+                // soon the landing answers.
+                Ok(Posting { ticket, join }) => {
+                    let timed = (reading == absent.len()).then_some((reading as u64 * record_bytes, submitted));
+                    prefetch::account(&ticket, &join, naming, timed, shared);
+                    let mut unclaimed = Unclaimed { at, naming, ticket: Arc::new(ticket), join, landings: Vec::new() };
+                    let mut claimed = Vec::new();
+                    for ((expert, record, reads), grant) in landings.into_iter().zip(grants) {
+                        let landing = Landing { expert, record, reads, rows: rows_of(expert), answer: answer_of(expert) };
+                        match grant {
+                            Some(grant) => claimed.push((landing, grant)),
+                            None => unclaimed.landings.push(landing),
+                        }
+                    }
+                    // Where a request's misses land is priced per request:
+                    // the device's convert past its barrier, or the host's
+                    // landing.
+                    let device = core.layers[layer]
+                        .landing
+                        .clone()
+                        .filter(|_| convertible && shared.telemetry.device_lands(layer, reading as u64))
+                        .map(|words| (words, core.layers[layer].file.clone(), point));
+                    if !claimed.is_empty() {
+                        land(core, prefetch, shared, &unclaimed, claimed, device);
+                    }
+                    if !unclaimed.landings.is_empty() {
+                        self.unclaimed.push(unclaimed);
+                    }
                 }
-                for landing in landings {
-                    shared.steps.fail_request_rows(sequence, layer, &landing.rows, reason.clone());
-                    landing.answer.publish(None);
+                // The reads were never made: as failed reads, only the rows
+                // that named their experts fail, and their waits are
+                // answered with none, so the rest of the step serves.
+                Err(reason) => {
+                    for (expert, record, _) in landings {
+                        core.directory.unposted(layer, expert);
+                        prefetch.staging.release(record);
+                        shared.steps.fail_request_rows(sequence, layer, &rows_of(expert), reason.clone());
+                        answer_of(expert).publish(None);
+                    }
                 }
             }
-            None => {}
         }
-        for (expert, unread) in others {
-            let record = match unread {
-                Unread::Kept(tier) => {
+        let mut waits = false;
+        for (expert, plan) in plans {
+            match plan {
+                Plan::Posted => continue,
+                Plan::Unread(Unread::Kept(tier)) => {
                     answer_of(expert).publish(Some(tier));
                     continue;
                 }
-                // Its landing in flight, or a record, answers it as the
+                // Its landing in flight, or its read, answers it as the
                 // watcher resumes it (`Self::resume`).
-                Unread::Reading => false,
-                Unread::Waits => true,
-            };
-            if record {
-                shared.landings.waits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Plan::Unread(Unread::Reading) => {}
+                Plan::Unread(Unread::Waits) => waits = true,
             }
-            self.waiting.push(Waiting { at, expert, answer: answer_of(expert), rows: rows_of(expert), named: started, record });
+            self.waiting.push(Waiting { at, expert, answer: answer_of(expert), rows: rows_of(expert), named: started, record: false });
+        }
+        // What the look could not read (staging an earlier request's
+        // landings held until residency's advance learned their end) is
+        // read now, its records free since.
+        if waits {
+            self.resume(Serving { core, prefetch, shared });
         }
     }
+}
+
+/// Join landings `claimed` of `unclaimed`'s read, each with its tier
+/// record, to the read (`Prefetch::demand`): landed on the device where
+/// `device` names the words of the request's barrier, else on the host.
+fn land(
+    core: &Core,
+    prefetch: &mut Prefetch,
+    shared: &Arc<Shared>,
+    unclaimed: &Unclaimed,
+    claimed: Vec<(Landing, Grant)>,
+    device: Option<(Arc<crate::experts::landing::DeviceWords>, ExchangeTable, crate::experts::directory::Point)>,
+) {
+    let Unclaimed { at, naming, ticket, join, .. } = unclaimed;
+    let (layer, sequence) = (at.point.layer, at.point.sequence);
+    let steps = shared.steps.group_of(sequence).1;
+    let (mut named, mut tracked) = (Vec::with_capacity(claimed.len()), Vec::with_capacity(claimed.len()));
+    for (Landing { expert, record, reads, rows, answer }, grant) in claimed {
+        tracked.push((record, (layer, expert), grant.record(), sequence));
+        named.push(Named { landing: parked_landing(core, grant, record, at.point, steps), staged: record, reads, rows, answer });
+    }
+    prefetch.demand((ticket, join), named, tracked, *naming, device, shared);
 }

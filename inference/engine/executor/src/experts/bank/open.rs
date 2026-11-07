@@ -361,7 +361,7 @@ fn watch(
             routing: words(&layer.routing, 0)?,
             policy: words(&layer.policy, 0)?,
             site: site_layers.iter().find(|site| site.layer() == index).map(|site| site.slots().clone()),
-            stored,
+            stored: stored.into(),
             slots,
             scratch_form,
             landing: layer

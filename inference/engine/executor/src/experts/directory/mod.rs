@@ -27,13 +27,14 @@
 mod replay;
 mod stack;
 
-use super::host_records::{Claim, HostRecords, Kept, Located, Resolution};
+use super::host_records::{Claim, Demand, HostRecords, InboundTable, Kept, Located, Resolution};
 use super::map::{LandingMap, StampedMap};
 use super::records::{BankRecords, Lent, Record};
 use super::reuse::{Rank, Ranking, Reuse, Score};
 use super::staging::Staged;
 use super::watcher::{Lending, LentRecords, Step, Steps, Unbegun};
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 pub use stack::{LayerCurve, MissCurve, RoutedRead, Stack};
 pub(crate) use stack::Ranks;
 #[cfg(any(test, feature = "expert-routing"))]
@@ -155,6 +156,8 @@ pub(super) struct Directory {
     homes: Vec<Vec<(usize, usize)>>,
     /// Each group's host tier records, where the bank has a tier.
     host: Vec<HostRecords>,
+    /// Their read path's mirror of where every expert is.
+    inbound: Arc<InboundTable>,
     /// Whether a growth of the records the host lands into runs, from its
     /// decision until its last slot joined ([`Self::host_growth`]): the
     /// tier's planned records exceed those it holds and fills.
@@ -371,6 +374,7 @@ impl Directory {
         for (layer, (&group, &experts)) in layers.iter().zip(experts).enumerate() {
             members[group].push((layer, experts, maps.as_mut().map(|maps| maps.next().expect("each layer has its map"))));
         }
+        let inbound = Arc::new(InboundTable::new(experts));
         Self {
             bank: BankRecords::new(records, &layers.iter().copied().zip(experts.iter().copied()).collect::<Vec<_>>(), bank_maps),
             homes,
@@ -385,9 +389,10 @@ impl Directory {
                     .iter()
                     .zip(members)
                     .zip(lent)
-                    .map(|((&count, members), lent)| HostRecords::new(count, layers.len(), members, resolution, lent))
+                    .map(|((&count, members), lent)| HostRecords::new(count, layers.len(), members, resolution, lent, inbound.clone()))
                     .collect()
             },
+            inbound,
             host_growing: false,
             prompt_reads: HashMap::new(),
             ranking: Reuse::ranking(experts, layers, layers.iter().map(|&group| share(kept[group], layers, group)).collect()),
@@ -494,6 +499,12 @@ impl Directory {
     pub fn shares(&self) -> Vec<usize> {
         let groups = self.layer_groups();
         groups.iter().map(|&group| share(self.bank.records(group).len() - self.reserve[group], &groups, group)).collect()
+    }
+
+    /// The read path's mirror of where every expert is
+    /// ([`InboundTable`]), which a posted read claims beside residency.
+    pub fn inbound(&self) -> Arc<InboundTable> {
+        self.inbound.clone()
     }
 
     /// Group `group`'s host records.
@@ -620,15 +631,21 @@ impl Directory {
     /// there (`read`, [`HostRecords::claim_demand`]), its unmapping
     /// stored before the claim returns, so before the landing writes the
     /// record. Short without a tier.
-    pub fn claim_demand(&mut self, (layer, expert): Staged, read: &[(usize, u32)], parked: (Point, u64)) -> Claim {
+    pub fn claim_demand(&mut self, (layer, expert): Staged, demand: Demand, read: &[(usize, u32)], parked: (Point, u64)) -> Claim {
         let group = self.bank.group(layer);
         let read = |record| read.contains(&(group, record));
-        if let Some(claim) = self.host[group].claim_prepared((layer, expert), read, parked) {
+        if let Some(claim) = self.host[group].claim_prepared((layer, expert), demand, read, parked) {
             return claim;
         }
         let reuse = Reuse::of(&self.ranking);
         let rank = store_rank(&reuse, &self.prompt_reads);
-        self.host[group].claim_demand((layer, expert), rank, read, parked)
+        self.host[group].claim_demand((layer, expert), demand, rank, read, parked)
+    }
+
+    /// The posted read of `layer`'s `expert`, which no record took, ended
+    /// unlanded or was never made ([`HostRecords::unposted`]).
+    pub fn unposted(&mut self, layer: usize, expert: usize) {
+        self.tier(layer).unposted((layer, expert));
     }
 
     /// Prepare `layer`'s group's demand victims, `depth` of them

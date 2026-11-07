@@ -676,7 +676,7 @@ impl Scratch {
         self.land_conveyed(core, shared, settled.landed);
         let mut failed = settled.failed;
         self.claim_lent(core);
-        let window = core.source.window();
+        let window = core.table.source().window();
         for index in 0..self.tiers.len() {
             let layer = self.tiers[index].layer;
             // What the earlier tiers of the layer's form still lack: their
@@ -738,7 +738,7 @@ impl Scratch {
                     }
                 };
                 let reads = core.reads_to(layer, expert, &self.conveyor, record);
-                match core.source.submit(reads, Priority::Demand) {
+                match core.table.source().submit(reads, Priority::Demand) {
                     Ok(ticket) => {
                         // Its end is an event: a round may await it.
                         let events = shared.events().clone();

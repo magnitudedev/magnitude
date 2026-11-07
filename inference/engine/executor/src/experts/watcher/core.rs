@@ -56,8 +56,9 @@ pub(in crate::experts) struct Layer {
     pub policy: Words,
     /// Its CPU site's table of the exchange, where it has a site.
     pub site: Option<ExchangeTable>,
-    /// Each routed tensor of its record, in record order.
-    pub stored: Vec<StoredTensor>,
+    /// Each routed tensor of its record, in record order, shared with the
+    /// load's read table ([`ReadTable`]).
+    pub stored: Arc<[StoredTensor]>,
     /// Its scratch view of each routed tensor, in record order, as the host
     /// addresses it, where it does (on unified memory): a slot no pass
     /// reads may carry a stored expert, read into its base
@@ -243,6 +244,57 @@ pub(in crate::experts) struct Pool {
     pub staging: Records,
 }
 
+/// Where every stored expert's reads come from and land, fixed at load: the
+/// source, each layer's routed tensors' file ranges (`(layer, expert)` to
+/// its ranges, [`StoredTensor`]) and each staging pool's records. Residency
+/// reads through it, and so does the request service's look, which submits
+/// a request's reads before residency's lock (`decode::Look`).
+pub(super) struct ReadTable {
+    source: ExpertSource,
+    staging: Vec<Records>,
+    stored: Vec<Arc<[StoredTensor]>>,
+}
+
+impl ReadTable {
+    /// `source`'s reads of `layers`' experts into `pools`.
+    pub(super) fn new(source: ExpertSource, pools: Vec<Pool>, layers: &[Layer]) -> Self {
+        Self {
+            source,
+            staging: pools.into_iter().map(|pool| pool.staging).collect(),
+            stored: layers.iter().map(|layer| layer.stored.clone()).collect(),
+        }
+    }
+
+    /// The model's files, read through.
+    pub(super) fn source(&self) -> &ExpertSource {
+        &self.source
+    }
+
+    /// Staging pool `pool`'s records.
+    pub(super) fn staging(&self, pool: usize) -> &Records {
+        &self.staging[pool]
+    }
+
+    /// The reads that bring expert `expert` of `layer` into staging record
+    /// `record` of each of its pools.
+    pub(super) fn reads(&self, layer: usize, expert: usize, record: u32) -> Vec<Read> {
+        self.reads_into(layer, expert, |pool| (&self.staging[pool], u64::from(record)))
+    }
+
+    /// The reads that bring expert `expert` of `layer` into record `into`
+    /// names (its records and index) of each of its pools, by pool.
+    pub(super) fn reads_into<'a>(&self, layer: usize, expert: usize, into: impl Fn(usize) -> (&'a Records, u64)) -> Vec<Read> {
+        self.stored[layer]
+            .iter()
+            .map(|stored| {
+                let (records, record) = into(stored.pool);
+                let offset = stored.base + expert as u64 * stored.pitch;
+                Read::new(stored.file, offset, stored.bytes, records, record)
+            })
+            .collect()
+    }
+}
+
 /// A point in the device's order, with its position there: the layer runs
 /// the device makes before it. Groups run in sequence order, each
 /// layer-major over its steps, so point `(g, l, q)` of a group of `k` steps
@@ -276,11 +328,10 @@ impl At {
 /// the directory, the layers and groups, and the records taken until the
 /// device is past them.
 pub(super) struct Core {
-    pub(super) source: ExpertSource,
+    pub(super) table: Arc<ReadTable>,
     pub(super) directory: Directory,
     pub(super) layers: Vec<Layer>,
     pub(super) groups: Vec<Group>,
-    pub(super) pools: Vec<Pool>,
     pub(super) extents: Extents,
     /// The steps begun, under whose lock every map entry is written
     /// (`Steps::unbegun`).
@@ -345,7 +396,7 @@ impl Core {
     /// The reads that bring expert `expert` of `layer` into staging record
     /// `record` of each of its pools.
     pub(super) fn reads(&self, layer: usize, expert: usize, record: u32) -> Vec<Read> {
-        self.reads_into(layer, expert, |pool| (&self.pools[pool].staging, u64::from(record)))
+        self.table.reads(layer, expert, record)
     }
 
     /// The landing of expert `expert` of `layer` from staging record
@@ -381,7 +432,7 @@ impl Core {
     /// staging record `record` of each of its pools, mapped by the grant
     /// (`experts::landing`).
     pub(super) fn landing(&self, grant: Grant, record: u32) -> Landing {
-        self.landing_from(grant, |pool| (&self.pools[pool].staging, u64::from(record)))
+        self.landing_from(grant, |pool| (self.table.staging(pool), u64::from(record)))
     }
 
     /// The landing `grant` allows (its expert into its tier record) from
@@ -430,20 +481,7 @@ impl Core {
 
     /// The reads that bring expert `expert` of `layer` into record `into`
     /// names (its records and index) of each of its pools, by pool.
-    pub(super) fn reads_into<'a>(
-        &'a self,
-        layer: usize,
-        expert: usize,
-        into: impl Fn(usize) -> (&'a Records, u64),
-    ) -> Vec<Read> {
-        self.layers[layer]
-            .stored
-            .iter()
-            .map(|stored| {
-                let (records, record) = into(stored.pool);
-                let offset = stored.base + expert as u64 * stored.pitch;
-                Read::new(stored.file, offset, stored.bytes, records, record)
-            })
-            .collect()
+    pub(super) fn reads_into<'a>(&self, layer: usize, expert: usize, into: impl Fn(usize) -> (&'a Records, u64)) -> Vec<Read> {
+        self.table.reads_into(layer, expert, into)
     }
 }

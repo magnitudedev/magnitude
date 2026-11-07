@@ -118,7 +118,7 @@ pub(crate) use resize::{Candidates, Join, MoveBudget};
 pub(crate) use steps::{ExpertStep, Recording, Step, StepFailure, StepRoute, low_word};
 pub use telemetry::{ExpertCosts, GroupCost, GroupLayer, LayerTimeline, Span, StepTimeline, LayerCost, LayerExperts, StepCost, STEP_TRACE};
 
-use self::core::Core;
+use self::core::{Core, ReadTable};
 use super::conveyor::{Carrier, Conveyor};
 use super::directory::{Directory, HostTier};
 use super::source::ExpertSource;
@@ -541,7 +541,7 @@ impl Watcher {
                 ));
             }
         }
-        for stored in layers.iter().flat_map(|layer| &layer.stored) {
+        for stored in layers.iter().flat_map(|layer| layer.stored.iter()) {
             let pool = pools
                 .get(stored.pool)
                 .ok_or_else(|| format!("a routed tensor reads staging pool {} of {}", stored.pool, pools.len()))?;
@@ -595,11 +595,10 @@ impl Watcher {
         } = load;
         let count = layers.len();
         let core = Core {
-            source,
+            table: Arc::new(ReadTable::new(source, pools, &layers)),
             directory,
             layers,
             groups,
-            pools,
             extents,
             retired: steps.frontier(),
             steps: steps.clone(),
@@ -626,7 +625,7 @@ impl Watcher {
             core.bank_records(),
             resident,
             core.directory.ranking(),
-            core.source.volumes(),
+            core.table.source().volumes(),
             spans,
         );
         // The load's parks, on one timeline of its device, which each answer
@@ -718,7 +717,7 @@ impl Watcher {
             #[cfg(test)]
             state: residency.clone(),
         };
-        let requests = Requests::new(residency.clone(), shared.clone(), count);
+        let requests = Requests::new(residency.clone(), shared.clone());
         watcher.watchdog = Some({
             let held = residency::lock(&residency);
             liveness::watch(&held.core, &shared, residency.clone(), requests.service(), copies.clone(), answers, crate::experts::exchange::abort())?

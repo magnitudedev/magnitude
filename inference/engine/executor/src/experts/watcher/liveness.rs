@@ -108,7 +108,7 @@ pub(super) fn watch(
             }
         })
     };
-    let reads = Box::new(core.source.reads());
+    let reads = Box::new(core.table.source().reads());
     let witnesses = vec![
         Witness { name: "steps", report: Arc::new({ let shared = shared.clone(); move || shared.steps.describe() }) },
         Witness { name: "request service", report: Arc::new(move || held(|| service.try_lock(), Service::report)) },

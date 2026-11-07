@@ -9,9 +9,11 @@
 //! made.
 //!
 //! A read's end submits its landing to the host compute executor on the
-//! read engine's worker that ends it, once the read's end is set
-//! (`Ticket::on_end`; each landing is tracked by its own `Ended` from
-//! before its read is submitted): the executor converts the stored record into
+//! read engine's worker that ends it, once the read's end is set and its
+//! tier records are claimed ([`Join`]: a request's read is submitted before
+//! residency claims them, and where the claim comes last the request
+//! service submits the landing; each landing is tracked by its own `Ended`
+//! from its claim): the executor converts the stored record into
 //! the tier record taken for it, maps it, and answers the choices of the
 //! request that named it; a read that failed fails exactly the rows of that
 //! request whose choices named its expert (`Steps::fail_request_rows`),
@@ -25,19 +27,119 @@
 
 use super::Shared;
 use super::telemetry::Admitted;
-use super::core::{At, Core};
+use super::core::{At, Core, ReadTable};
 use crate::experts::directory::{Directory, HostRecord, Point};
 use crate::experts::host_records::Claim;
 use crate::experts::compute::Urgency;
 use super::Step;
 use crate::experts::landing::{Answer, Converting, DeviceLanding, DeviceWords, Ended, Landing};
-use crate::experts::source::{Outcome, Ticket};
-use crate::experts::staging::{Staged, Staging};
+use crate::experts::source::{Outcome, Read, Ticket};
+use crate::experts::staging::{Staged, StagingPool};
 use seismic_io::Priority;
 use magnitude_kernels::constants;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// Which party of a read's join ran its landing ([`Join`]): the read's
+/// end, on the read worker that ended it (which works its landing's pieces
+/// beside the executor's), or the claim of its records, on the request
+/// service (which leaves them to the executor).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Party {
+    Read,
+    Claim,
+}
+
+/// What lands a read once it ended and its records are claimed.
+type Lands = Box<dyn FnOnce(Outcome, &[usize], Party) + Send>;
+
+/// A read's join ([`Join`]): what the claims registered while it ran, or
+/// how it ended.
+enum Parties {
+    Reading(Vec<Lands>),
+    Ended(Outcome, Vec<usize>),
+}
+
+/// The join of a read that lands experts into the host tier: its end, and
+/// each claim of the records some of its experts land into
+/// (`Prefetch::demand`, `Prefetch::read_ahead`, and a request's accounting,
+/// [`account`]). A request's read is submitted by the request service's
+/// look before residency decides its tier records (`decode::Look`), so
+/// either may come first: whichever is second runs each landing, so
+/// neither waits for the other, and an expert whose record is short never
+/// holds back its request's others.
+pub(super) struct Join(Mutex<Parties>);
+
+impl Join {
+    fn parties(&self) -> std::sync::MutexGuard<'_, Parties> {
+        self.0.lock().expect("a read's join is never left by a panic")
+    }
+
+    /// Its read ended as `outcome`, the reads `failed` failing: every
+    /// claim made lands.
+    fn read_ended(&self, outcome: Outcome, failed: &[usize]) {
+        let ended = Parties::Ended(outcome.clone(), failed.to_vec());
+        let Parties::Reading(claims) = std::mem::replace(&mut *self.parties(), ended) else {
+            unreachable!("a read ends once");
+        };
+        for land in claims {
+            land(outcome.clone(), failed, Party::Read);
+        }
+    }
+
+    /// Records are claimed for some of its experts: `land` lands them once
+    /// its read ended, now where it has. It must not wait for a read.
+    pub(super) fn claimed(&self, land: impl FnOnce(Outcome, &[usize], Party) + Send + 'static) {
+        let mut parties = self.parties();
+        match &mut *parties {
+            Parties::Reading(claims) => claims.push(Box::new(land)),
+            Parties::Ended(outcome, failed) => {
+                let (outcome, failed) = (outcome.clone(), failed.clone());
+                drop(parties);
+                land(outcome, &failed, Party::Claim);
+            }
+        }
+    }
+}
+
+/// A read submitted, and its join.
+pub(super) struct Posting {
+    pub(super) ticket: Ticket,
+    pub(super) join: Arc<Join>,
+}
+
+/// Submit `reads` at `priority` from `table`, joined to the claim of what they
+/// land into ([`Join`]): the one way the watcher reads experts into
+/// staging. Fails only where the read engine takes no request.
+pub(super) fn post(table: &ReadTable, reads: Vec<Read>, priority: Priority) -> Result<Posting, String> {
+    let ticket = table.source().submit(reads, priority)?;
+    let join = Arc::new(Join(Mutex::new(Parties::Reading(Vec::new()))));
+    let ended = join.clone();
+    ticket.on_end(move |outcome, failed| ended.read_ended(outcome, failed));
+    Ok(Posting { ticket, join })
+}
+
+/// Account request `naming`'s demand read `ticket` (joined by `join`) as
+/// it ends, once: a point of the read line over `timed` bytes where it
+/// reads all the request's misses; and a read worker's panic, which ends
+/// serving.
+pub(super) fn account(ticket: &Ticket, join: &Join, naming: Naming, timed: Option<(u64, Instant)>, shared: &Arc<Shared>) {
+    // When the volume began reading the job: from its submission, which
+    // the request times where it reads all its misses, else now, just
+    // after.
+    let (started, submitted) = (ticket.started(), timed.map_or_else(Instant::now, |(_, submitted)| submitted));
+    let shared = shared.clone();
+    join.claimed(move |outcome, _, _| {
+        panicked(&shared, &outcome);
+        if let Outcome::Read = outcome {
+            let timed = timed.map(|(bytes, submitted)| (bytes, submitted.elapsed()));
+            let first = started.iter().filter_map(|started| started.get().copied()).min();
+            let queued = first.map_or(std::time::Duration::ZERO, |first| first.saturating_duration_since(submitted));
+            shared.landed(naming.layer, naming.sequence, naming.named.elapsed(), timed, queued);
+        }
+    });
+}
 
 /// A request that names reads: its step's layer and sequence, and when it
 /// named them.
@@ -97,11 +199,11 @@ fn read_named(shared: &Shared, naming: Naming, named: &Named, outcome: &Outcome,
     false
 }
 
-/// End named read `named` of request `naming` on the thread that ends it,
-/// its landing on the host: submitted to the executor, which converts and
-/// maps its record, records its end in `ended`, then answers it. The read
-/// worker works its pieces beside the executor's, so no wake stands between
-/// the read and its landing.
+/// End named read `named` of request `naming`, its landing on the host:
+/// submitted to the executor, which converts and maps its record, records
+/// its end in `ended`, then answers it. Where the read's end ran it
+/// (`party`), its read worker works its pieces beside the executor's, so no
+/// wake stands between the read and its landing.
 fn end_named(
     shared: &Arc<Shared>,
     naming: Naming,
@@ -110,6 +212,7 @@ fn end_named(
     outcome: &Outcome,
     failed: &[usize],
     (ended, urgency): (Ended, Arc<Urgency>),
+    party: Party,
 ) {
     if !read_named(shared, naming, &named, outcome, failed, &ended) {
         return;
@@ -125,7 +228,10 @@ fn end_named(
             landings.ended(&serving);
         })
     };
-    shared.compute.run(Arc::new(converting));
+    match party {
+        Party::Read => shared.compute.run(Arc::new(converting)),
+        Party::Claim => shared.compute.submit(Arc::new(converting)),
+    }
 }
 
 /// End a request's named reads on the thread that ends them, their landings
@@ -227,8 +333,9 @@ pub(super) enum Reading {
 
 /// The staging records and the reads into them.
 pub(super) struct Prefetch {
-    /// Staging record indices, valid in every pool.
-    pub(super) staging: Staging,
+    /// Staging record indices, valid in every pool, under their own lock:
+    /// the request service's look takes a request's beside residency.
+    pub(super) staging: Arc<StagingPool>,
     /// What is inbound, by expert, until the watcher learns its landing's
     /// end ([`Self::settle`]).
     inbound: HashMap<Staged, Inbound>,
@@ -247,7 +354,7 @@ impl Prefetch {
     /// `records` staging records, every one free, for `layers` layers.
     pub(super) fn new(records: u32, layers: usize) -> Self {
         Self {
-            staging: Staging::new(records),
+            staging: Arc::new(StagingPool::new(records)),
             inbound: HashMap::new(),
             past: Point { group: 0, layer: 0, sequence: 0 },
             rings: vec![[0; crate::planning::HINT_LEADS as usize]; layers],
@@ -255,20 +362,19 @@ impl Prefetch {
         }
     }
 
-    /// Track the demand job `ticket`, landing `named` for the request
-    /// `naming` names, a point of the read line over `timed` bytes where it
-    /// reads all the request's: its end lands or fails each, on the host
-    /// ([`end_named`]) or, where `device` names the words of the request's
-    /// barrier at its point, on the device ([`end_converted`]).
-    /// `landings` are each named landing's staging record, expert, tier
-    /// record and read step, in order.
+    /// Track the demand job `ticket` (joined by `join`), landing `named`
+    /// for the request `naming` names, its tier records claimed: its end
+    /// lands or fails each, on the host ([`end_named`]) or, where `device`
+    /// names the words of the request's barrier at its point, on the device
+    /// ([`end_converted`]). `landings` are each named landing's staging
+    /// record, expert, tier record and read step, in order. A request's
+    /// read is accounted apart, once ([`account`]).
     pub(super) fn demand(
         &mut self,
-        ticket: Ticket,
+        (ticket, join): (&Arc<Ticket>, &Join),
         named: Vec<Named>,
         landings: Vec<(u32, Staged, u32, Step)>,
         naming: Naming,
-        timed: Option<(u64, Instant)>,
         device: Option<(Arc<DeviceWords>, crate::experts::ExchangeTable, Point)>,
         shared: &Arc<Shared>,
     ) {
@@ -279,18 +385,7 @@ impl Prefetch {
             .collect::<Vec<_>>();
         let (shared, ended, held) = (shared.clone(), ends.clone(), converted.clone());
         let words = device.map(|(words, ..)| words);
-        // When the volume began reading the job: from its submission, which
-        // the request times where it reads all its misses, else now, just
-        // after.
-        let (started, submitted) = (ticket.started(), timed.map_or_else(Instant::now, |(_, submitted)| submitted));
-        ticket.on_end(move |outcome, failed| {
-            panicked(&shared, &outcome);
-            if let Outcome::Read = outcome {
-                let timed = timed.map(|(bytes, submitted)| (bytes, submitted.elapsed()));
-                let first = started.iter().filter_map(|started| started.get().copied()).min();
-                let queued = first.map_or(std::time::Duration::ZERO, |first| first.saturating_duration_since(submitted));
-                shared.landed(naming.layer, naming.sequence, naming.named.elapsed(), timed, queued);
-            }
+        join.claimed(move |outcome, failed, party| {
             match &words {
                 Some(words) => {
                     let named = named.into_iter().zip(held).zip(ended).map(|((named, held), (ended, _))| (named, held.expect("a device landing's"), ended)).collect();
@@ -299,13 +394,12 @@ impl Prefetch {
                 None => {
                     let landings = Landings::new(naming.layer, named.len());
                     for (named, ended) in named.into_iter().zip(ended) {
-                        end_named(&shared, naming, named, &landings, &outcome, failed, ended);
+                        end_named(&shared, naming, named, &landings, &outcome, failed, ended, party);
                     }
                 }
             }
         });
         assert!(!landings.is_empty(), "a demand read lands an expert");
-        let ticket = Arc::new(ticket);
         for (((record, staged, tier, read), (ended, urgency)), device) in landings.into_iter().zip(ends).zip(converted) {
             let need = Need::Due { ticket: ticket.clone(), read, device };
             self.arrive(staged, Inbound { record, tier, need, ended, urgency });
@@ -668,19 +762,19 @@ impl Prefetch {
         (staging, tier): (usize, usize),
     ) -> Result<u64, Short> {
         let (target, expert) = staged;
-        if self.staging.free() <= staging {
+        let Some(record) = self.staging.take_beyond(staging) else {
             return Err(Short::Staging);
-        }
+        };
         let Claim::Taken(grant) = core.directory.claim_landing(target, expert, tier) else {
+            self.staging.release(record);
             return Err(Short::Tier);
         };
         let tier = grant.record();
-        let record = self.staging.take().expect("a record beyond the reserve");
         let reads = core.reads(target, expert, record);
         let bytes = reads.iter().map(crate::experts::source::Read::bytes).sum::<u64>();
         let landing = core.landing(grant, record);
-        match core.source.submit(reads, priority) {
-            Ok(ticket) => {
+        match post(&core.table, reads, priority) {
+            Ok(Posting { ticket, join }) => {
                 for job in ticket.jobs() {
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead"), job, (target as i64, expert as i64, priority as i64));
                 }
@@ -690,7 +784,7 @@ impl Prefetch {
                 // A read ahead's end: read, its landing is submitted, whose
                 // end maps its tier record; failed, it fails nothing (a step
                 // waiting for it reads its expert anew).
-                ticket.on_end(move |outcome, failed| {
+                join.claimed(move |outcome, failed, _| {
                     panicked(&serving, &outcome);
                     let read = failed.is_empty() && matches!(outcome, Outcome::Read);
                     seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("ahead_read"), 0, (target as i64, expert as i64, read as i64));

@@ -11,14 +11,17 @@
 //! reading it: where kernels wait in place (CUDA, Metal, the CPU) nothing
 //! announces it, so while a step that may ask anything runs, the service
 //! looks again within [`IDLE`] of its last look: the one poll of serving,
-//! which the hardware forces. Everything else it waits for is an event of
-//! the load (a landing's or a read's end, a copy's completion, a step's
-//! begin or end), which ends the rest at once. Where parks are submission
+//! which the hardware forces. Each turn looks at the decode requests first,
+//! before residency's lock: the look posts each request's reads with no
+//! decision of residency's before them (`decode::Look`), and the pass under
+//! the lock then serves what it took. Everything else it waits for is an
+//! event of the load (a landing's or a read's end, a copy's completion, a
+//! step's begin or end), which ends the rest at once. Where parks are submission
 //! boundaries (Vulkan) the device's words are the host's only at a park,
 //! and the parks' keeper announces each change it sees: there the service
 //! never polls.
 
-use super::decode::Decode;
+use super::decode::{Began, Decode, Look, Posted};
 use super::liveness;
 use super::residency::{Residency, lock};
 use super::scratch::{self, Pending};
@@ -46,9 +49,10 @@ pub(super) struct Requests {
     service: Arc<Mutex<Service>>,
 }
 
-/// The request service's own state: the decode requests noticed and the
+/// The request service's own state: its look at the decode requests, the
 /// misses waiting, and per layer the scratch request being served.
 pub(super) struct Service {
+    look: Look,
     decode: Decode,
     /// Per layer, the scratch request taken and not yet served whole: a
     /// layer's requests are served in step order, one at a time, as the
@@ -71,8 +75,12 @@ impl Service {
 }
 
 impl Requests {
-    pub(super) fn new(residency: Arc<Yielding<Residency>>, shared: Arc<Shared>, layers: usize) -> Self {
-        let service = Service { decode: Decode::new(layers), pending: (0..layers).map(|_| None).collect() };
+    pub(super) fn new(residency: Arc<Yielding<Residency>>, shared: Arc<Shared>) -> Self {
+        let service = {
+            let held = lock(&residency);
+            let layers = held.core.layers.len();
+            Service { look: Look::new(&held.core, held.prefetch.staging.clone()), decode: Decode::new(), pending: (0..layers).map(|_| None).collect() }
+        };
         Self { residency, shared, service: Arc::new(Mutex::new(service)) }
     }
 
@@ -81,14 +89,15 @@ impl Requests {
         self.service.clone()
     }
 
-    /// The service's thread: a pass on every event, and while a step that
-    /// may ask anything runs where kernels wait in place, within [`IDLE`]
-    /// of the last; a pass that progressed is an event itself (residency
-    /// reads what it changed). Once serving ended, each pass refuses what
-    /// the device waits on instead. Every device and every completing step
-    /// waits on this thread, so a panic while serving must not end it: it
-    /// is recorded before residency's lock is released, and the state it
-    /// left is never served from again.
+    /// The service's thread: a look then a pass on every event, and while
+    /// a step that may ask anything runs where kernels wait in place, within
+    /// [`IDLE`] of the last; a pass that progressed is an event itself
+    /// (residency reads what it changed). Once serving ended, each pass
+    /// refuses what the device waits on instead, and nothing is looked at.
+    /// Every device and every completing step waits on this thread, so a
+    /// panic while serving must not end it: it is recorded before
+    /// residency's lock is released, and the state it left is never served
+    /// from again.
     pub(super) fn serve(self) {
         let events = self.shared.events().clone();
         let residency = self.residency.clone();
@@ -98,14 +107,14 @@ impl Requests {
             if self.shared.life.stopping() {
                 return;
             }
-            let asked = Instant::now();
+            let began = Began { ended, looked: Instant::now() };
+            let posted = self.look(began);
             let (progressed, polls) = {
                 let mut held = lock(&residency);
                 let mut service = self.service.lock().expect("the request service is never left by a panic");
-                let pass = Pass { ended, asked, held: Instant::now() };
                 let progressed = match self.shared.life.ended() {
                     Some(_) => liveness::refuse(&held.core, &self.shared),
-                    None => match std::panic::catch_unwind(AssertUnwindSafe(|| self.pass(&mut service, &mut held, pass))) {
+                    None => match std::panic::catch_unwind(AssertUnwindSafe(|| self.pass(&mut service, &mut held, posted))) {
                         Ok(progressed) => progressed,
                         Err(payload) => {
                             self.shared.end_serving(format!("it panicked: {}", panic_message(payload.as_ref())));
@@ -127,6 +136,23 @@ impl Requests {
         }
     }
 
+    /// The decode requests the device posted since the last look, each
+    /// absent expert's read submitted (`Look::look`): none once serving
+    /// ended. A panic ends serving, as the pass's does.
+    fn look(&self, began: Began) -> Vec<Posted> {
+        if self.shared.life.ended().is_some() {
+            return Vec::new();
+        }
+        let mut service = self.service.lock().expect("the request service is never left by a panic");
+        match std::panic::catch_unwind(AssertUnwindSafe(|| service.look.look(&self.shared, began))) {
+            Ok(posted) => posted,
+            Err(payload) => {
+                self.shared.end_serving(format!("its look panicked: {}", panic_message(payload.as_ref())));
+                Vec::new()
+            }
+        }
+    }
+
     /// Whether the device's words are looked at by time: where kernels wait
     /// in place, while a step runs that may ask anything (with every layer
     /// whole a decode step asks nothing, no miss and no hint, but a prompt
@@ -137,12 +163,13 @@ impl Requests {
     }
 
     /// One pass: the misses waiting resumed, the conveyor carried, then
-    /// each layer's requests served in step order and the hints read. A
-    /// route publishes its request and the next layer's hints at once, so
-    /// the request's reads reach the readers before any read of those
+    /// each layer's requests served in step order (`posted`, the look's)
+    /// and the hints read. A route publishes its request and the next
+    /// layer's hints at once, and the look submitted the request's reads
+    /// before this pass, so they reach the readers before any read of those
     /// hints, and a ring whose hinted layer's request is noticed is
     /// decided, not read (`Prefetch::hint`). True when it changed anything.
-    fn pass(&self, service: &mut Service, residency: &mut Residency, pass: Pass) -> bool {
+    fn pass(&self, service: &mut Service, residency: &mut Residency, posted: Vec<Posted>) -> bool {
         // A panic of the executor's work, or the device lost under the
         // parks, ends serving, as the service's own panic does.
         if let Some(reason) = self.shared.fault() {
@@ -156,48 +183,41 @@ impl Requests {
         let resumed = service.decode.resume(residency.serving());
         // A served group's reads that landed move on, ahead of its rounds.
         let conveyed = residency.scratch.convey(&mut residency.core, &self.shared);
-        let served = self.serve_requests(service, residency, pass);
+        let served = self.serve_requests(service, residency, posted);
         resumed | conveyed | served
     }
 
     /// Each layer's decode and scratch requests, served in step order, then
     /// the hints. The device's words (its requests and hints) are read only
     /// once they are in place: where a park is a submission boundary, while
-    /// the device is parked (`Parks::parked`), its hints, which only ever
-    /// advise, once they may be (`Parks::settled`). What the host alone
-    /// holds (a scratch request taken, its rounds) is carried every pass.
-    /// Whether it served any.
-    fn serve_requests(&self, service: &mut Service, residency: &mut Residency, pass: Pass) -> bool {
+    /// the device is parked (`Parks::parked`, the look's alike), its hints,
+    /// which only ever advise, once they may be (`Parks::settled`). What the
+    /// host alone holds (a scratch request taken, its rounds, the decode
+    /// requests the look took, `posted`) is carried every pass. Whether it
+    /// served any.
+    fn serve_requests(&self, service: &mut Service, residency: &mut Residency, posted: Vec<Posted>) -> bool {
         let parked = self.shared.parks.parked();
         let layers = residency.core.layers.len();
         let mut progressed = false;
+        let mut posted = posted.into_iter().peekable();
         for layer in 0..layers {
+            // The look's requests, by layer: their reads already run, and
+            // what decides their landings follows (the device's progress to
+            // the request, `Residency::advance`, and a tier record each).
+            while let Some(request) = posted.next_if(|request| request.layer == layer) {
+                let at = self.shared.steps.at(request.sequence, layer, layers);
+                residency.advance(at.point);
+                service.decode.serve(request, at, residency.serving());
+                progressed = true;
+            }
             if parked {
-                // A request's reads are the step's critical path: they are
-                // submitted with nothing before them but what decides them
-                // (a hint an earlier pass read, which a read may already
-                // serve, a ready record each, which the parked step's own
-                // reads bound: `decode::parked_reads`, and what the device's
-                // progress to the request decides: the landings ended before
-                // it, and a group past staged, `Residency::advance`).
-                if let Some(sequence) = service.decode.request(&residency.core, &self.shared, layer) {
-                    let started = Instant::now();
-                    if let (Some(ended), Some(asked), Some(held)) = (seismic_io::timeline::stamp(pass.ended), seismic_io::timeline::stamp(pass.asked), seismic_io::timeline::stamp(pass.held)) {
-                        seismic_io::timeline::note_at(started, seismic_io::timeline::Kind::Noted("pass"), sequence, (layer as i64, asked as i64, held as i64));
-                        seismic_io::timeline::note_at(started, seismic_io::timeline::Kind::Noted("pass_ended"), sequence, (layer as i64, ended as i64, 0));
-                    }
-                    let at = self.shared.steps.at(sequence, layer, layers);
-                    residency.advance(at.point);
-                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("advanced"), sequence, (layer as i64, 0, 0));
-                    service.decode.serve(at, started, residency.serving());
-                    progressed = true;
-                }
                 progressed |= residency.publish(layer);
             }
             progressed |= self.scratch(service, residency, layer);
         }
+        assert!(posted.next().is_none(), "the look takes requests of the load's layers, in order");
         if self.shared.parks.settled() {
-            progressed |= residency.prefetch.hint(&mut residency.core, &self.shared, service.decode.served());
+            progressed |= residency.prefetch.hint(&mut residency.core, &self.shared, service.look.served());
         }
         progressed
     }
@@ -257,14 +277,4 @@ impl Requests {
             }
         }
     }
-}
-
-/// When a pass of the request service began, for the read timeline: the
-/// previous pass's end, when it asked for residency's lock, and when it
-/// held it.
-#[derive(Clone, Copy)]
-struct Pass {
-    ended: Instant,
-    asked: Instant,
-    held: Instant,
 }
