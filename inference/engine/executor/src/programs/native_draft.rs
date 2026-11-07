@@ -1441,9 +1441,10 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     };
     let readout_vocabulary = vocabulary;
     let mut leading = Vec::new();
-    // Full draft logits retain the canonical packed vocabulary prefix.
-    // A scope a separate draft projects through is never stored as planes
-    // (`ModelLoadPlan::with_readout_candidates`).
+    // Full draft logits read the projection's vocabulary prefix as it is
+    // stored: the packed projection, or the planes of a scope another reader
+    // selected a class of (`ModelLoadPlan::finalize_readout`), through their
+    // full pass.
     let plans = readout::HeadPlans::of(load, projection_scope)?.selected();
     let mut prefix = |plan: &crate::WeightPlan| -> Result<NativePort, GraphError> {
         let mut shape = plan.shape.clone();
@@ -1452,7 +1453,15 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         leading.push((plan.role, port.clone()));
         Ok(port)
     };
-    let (projection, head_rows) = match plans {
+    let mut dimensions = vec![
+        ("M", rows),
+        ("O", outputs),
+        ("V", readout_vocabulary),
+        ("D", hidden),
+        ("PT", 1),
+        ("NM", hidden),
+    ];
+    let projection = match plans {
         readout::HeadPlans::Packed(plan) => {
             let weight = prefix(plan)?;
             let (scale, extent) = weight_scale_port(
@@ -1465,31 +1474,28 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 &mut weights,
                 &mut constants,
             )?;
-            let head_rows = entries.head.raw_packed_out_rows(
-                &mut graph,
-                &[
-                    ("M", rows),
-                    ("O", outputs),
-                    ("V", readout_vocabulary),
-                    ("D", hidden),
-                    ("WS", extent),
-                    ("PT", 1),
-                    ("NM", hidden),
-                ],
-            )?;
-            (
-                readout::ProjectionPorts::Packed {
-                    weight,
-                    scale,
-                    scale_extent: extent,
-                },
-                head_rows,
-            )
+            dimensions.push(("WS", extent));
+            readout::ProjectionPorts::Packed {
+                weight,
+                scale,
+                scale_extent: extent,
+            }
         }
-        readout::HeadPlans::Progressive(_) | readout::HeadPlans::Qualified { .. } => {
-            return Err("draft full logits require the canonical packed projection".into());
+        readout::HeadPlans::Progressive(planes) => {
+            let depth = planes[0]
+                .progressive_depth()
+                .ok_or("progressive projection has no code depth")?;
+            dimensions.push(("P", u64::from(depth.rest_planes())));
+            readout::ProjectionPorts::Progressive {
+                depth,
+                planes: readout::HeadPlans::read_planes(planes, false)
+                    .map(|(plane, weight)| Ok((plane, prefix(weight)?)))
+                    .collect::<Result<_, GraphError>>()?,
+            }
         }
+        readout::HeadPlans::Qualified { .. } => unreachable!("a stored form was selected above"),
     };
+    let head_rows = entries.head.raw_out_rows(&mut graph, &projection, &dimensions)?;
     let mut logits = readout::project_readout(
         &mut graph,
         entries.head.borrowed(),
@@ -3235,7 +3241,8 @@ impl BoundDraftGraphs {
 }
 
 /// A draft graph's weight: the block's embedding table (the target's or the
-/// draft's own), the target's projection, or a drafter weight.
+/// draft's own), the target's projection as it is stored (packed, or its
+/// planes), or a drafter weight.
 fn resident_draft_weight(
     resident: &ResidentHead,
     role: WeightRole,
@@ -3246,10 +3253,14 @@ fn resident_draft_weight(
         }
         (WeightScope::Target | WeightScope::Draft, WeightKind::Output) => match &resident.output {
             ResidentOutput::Packed(weight) => Ok(weight),
-            // `ModelLoadPlan::with_readout_candidates` offers no planes of a
-            // projection a separate draft reads.
             ResidentOutput::Progressive(_) => Err(invalid(
-                "the draft reads an output projection the load stores as planes",
+                "the draft reads the packed projection of a load that stores its planes",
+            )),
+        },
+        (WeightScope::Target, WeightKind::OutputPlane(plane)) => match &resident.output {
+            ResidentOutput::Progressive(planes) => Ok(planes.plane(plane)),
+            ResidentOutput::Packed(_) => Err(invalid(
+                "the draft reads the planes of a load that stores its packed projection",
             )),
         },
         _ => resident.weights.get(role).map_err(invalid),

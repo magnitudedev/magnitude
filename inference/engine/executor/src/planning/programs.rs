@@ -864,7 +864,14 @@ pub(super) fn derive_program_plan(
     let draft_program = separate
         .zip(head)
         .map(|(draft, weights)| {
-            draft_program_plan(draft, decoder.hidden, target, weights, active_element)
+            draft_program_plan(
+                draft,
+                decoder.hidden,
+                target,
+                weights,
+                active_element,
+                readout_choices,
+            )
         })
         .transpose()?;
     // A selected head is embedded in the target or reads its history.
@@ -1089,6 +1096,7 @@ fn draft_program_plan(
     target: &[WeightPlan],
     weights: &[WeightPlan],
     activation: Element,
+    readout_choices: &[super::ReadoutClassChoice],
 ) -> Result<DraftProgramPlan, PlanError> {
     let lookup = |weights: &[WeightPlan], scope, kind| planned_element(weights, scope, kind);
     let fusion_norm = lookup(target, WeightScope::Draft, WeightKind::DraftFusionNorm)?;
@@ -1140,11 +1148,12 @@ fn draft_program_plan(
         },
         output_norm: lookup(weights, WeightScope::Draft, WeightKind::OutputNorm)?,
         // The draft's head entry binds the projection's scale port as the
-        // target readout does.
+        // target readout does; the target's projection is read as it is
+        // stored, its planes when a reader of it selected a class.
         projection: if draft.output.is_some() {
             planned_readout(weights, WeightScope::Draft)?
         } else {
-            planned_readout(target, WeightScope::Target)?
+            planned_readout_recipe(target, WeightScope::Target, readout_choices)?
         },
         projection_scope: if draft.output.is_some() {
             WeightScope::Draft

@@ -988,10 +988,11 @@ fn target_reading_head_plans_its_program_weights_and_charge() {
     );
 }
 
-/// A separate draft keeps its full packed logits: the projection it
-/// reads, the target's or its own, is stored packed and never as views.
+/// A separate draft reads the projection as it is stored: its own is
+/// stored packed, and the target's keeps its views, which the draft reads
+/// once a reader of them selects a class.
 #[test]
-fn a_projection_a_separate_draft_reads_is_stored_packed() {
+fn a_separate_draft_reads_the_projection_as_it_is_stored() {
     use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
     use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest};
     use magnitude_family_contracts::{
@@ -1081,32 +1082,34 @@ fn a_projection_a_separate_draft_reads_is_stored_packed() {
             candidate_plan.draft().unwrap().projection(),
             crate::ReadoutHead::Packed { .. }
         ));
-        // A weight has one stored form, and the draft has no kernel for
-        // the views: a projection it reads is not offered as them,
-        // whether it is the target's or the draft's own, so no reader
-        // of it can select a class.
-        let read_by_draft = if owns_output {
-            magnitude_family_contracts::WeightScope::Draft
-        } else {
-            magnitude_family_contracts::WeightScope::Target
-        };
+        // Only the target's projection is offered as views: a draft's own
+        // is stored packed, and the target's is offered whether or not
+        // the draft reads it.
         assert!(
-            !load
-                .readout_candidates()
+            load.readout_candidates()
                 .iter()
-                .any(|candidate| candidate.role.scope == read_by_draft),
-            "a projection the draft reads is not offered as views"
+                .all(|candidate| candidate.role.scope
+                    == magnitude_family_contracts::WeightScope::Target),
+            "only the target's projection is offered as views"
         );
-        assert!(
-            load.clone()
-                .finalize_readout(&[crate::ReadoutClassChoice {
-                    scope: magnitude_family_contracts::WeightScope::Target,
-                    norm_scope: magnitude_family_contracts::WeightScope::Target,
-                    prepared: false,
-                    rows: vec![1],
-                }])
-                .is_err()
-        );
+        let target_choice = crate::ReadoutClassChoice {
+            scope: magnitude_family_contracts::WeightScope::Target,
+            norm_scope: magnitude_family_contracts::WeightScope::Target,
+            prepared: false,
+            rows: vec![1],
+        };
+        let selected = load.clone().finalize_readout(std::slice::from_ref(&target_choice));
+        if owns_output {
+            // The target's projection is not Q8_0 here: nothing to select.
+            assert!(selected.is_err());
+        } else {
+            let selected = selected.unwrap();
+            let plan = selected.program_plan(&definition, KvCodec::Dense).unwrap();
+            assert!(matches!(
+                plan.draft().unwrap().projection(),
+                crate::ReadoutHead::Qualified { .. }
+            ));
+        }
         let load = load.finalize_readout(&[]).unwrap();
         let limits = fixture_limits(false);
         let state = crate::ResourcePlanner::state_plan(

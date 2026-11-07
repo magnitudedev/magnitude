@@ -228,17 +228,24 @@ impl<'p> HeadPlans<'p> {
                 depth: planes[0]
                     .progressive_depth()
                     .ok_or("progressive projection has no code depth")?,
-                planes: ProgressivePlane::ALL
-                    .into_iter()
-                    .filter(|plane| certified || *plane != ProgressivePlane::Radius)
-                    .map(|plane| {
-                        let weight = Self::plane(&planes, plane);
-                        Ok((plane, graph.port(weight.resident, &weight.shape)?))
-                    })
+                planes: Self::read_planes(planes, certified)
+                    .map(|(plane, weight)| Ok((plane, graph.port(weight.resident, &weight.shape)?)))
                     .collect::<Result<_, GraphError>>()?,
             },
             Self::Qualified { .. } => unreachable!("a recipe was selected above"),
         })
+    }
+
+    /// The planes a progressive projection reads: every plane through the
+    /// certified levels, all but the radii through the full pass.
+    pub(crate) fn read_planes(
+        planes: [&'p crate::WeightPlan; 5],
+        certified: bool,
+    ) -> impl Iterator<Item = (ProgressivePlane, &'p crate::WeightPlan)> {
+        ProgressivePlane::ALL
+            .into_iter()
+            .filter(move |plane| certified || *plane != ProgressivePlane::Radius)
+            .map(move |plane| (plane, Self::plane(&planes, plane)))
     }
 
     /// The most selected rows its certified classes serve on `backend`:
@@ -1115,21 +1122,28 @@ pub(crate) enum ProjectionEntries<'a, G: GraphDraft + 'a> {
 }
 
 impl<'a, G: GraphDraft + 'a> ProjectionEntries<'a, G> {
-    /// Host-selected row indices are owned upload inputs of the raw packed
-    /// recipe, even when this projection also offers a qualified contender.
-    pub(crate) fn raw_packed_out_rows(
+    /// Host-selected row indices are owned upload inputs of the raw recipe
+    /// `ports` select: the packed projection's, or the planes' full pass,
+    /// even when this projection also offers a qualified contender.
+    pub(crate) fn raw_out_rows(
         &self,
         graph: &mut G,
+        ports: &ProjectionPorts,
         dimensions: &[(&str, u64)],
     ) -> Result<NativePort, GraphError> {
-        match self {
-            Self::RawPacked(entry) => {
+        match (self, ports) {
+            (Self::RawPacked(entry), ProjectionPorts::Packed { .. }) => {
                 graph.input_for::<readout_head_rows::Entry>(*entry, "out_rows", dimensions)
             }
-            Self::Qualified { packed, .. } => packed.raw_packed_out_rows(graph, dimensions),
-            Self::PreparedPacked(_) | Self::Progressive(_) => {
-                Err("raw packed row indices require a raw packed projection".into())
+            (Self::Qualified { packed, .. }, ProjectionPorts::Packed { .. }) => {
+                packed.raw_out_rows(graph, ports, dimensions)
             }
+            (
+                Self::Qualified { progressive, .. } | Self::Progressive(progressive),
+                ProjectionPorts::Progressive { .. },
+            ) => graph
+                .input_for::<readout_planes_rows::Entry>(progressive.planes, "out_rows", dimensions),
+            _ => Err("raw row indices require a raw projection of their representation".into()),
         }
     }
 

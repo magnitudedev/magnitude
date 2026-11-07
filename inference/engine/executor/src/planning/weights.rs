@@ -1474,11 +1474,12 @@ impl ModelLoadPlan {
     /// Offer lossless bounded-selection views of the target's output
     /// projection where every reader of it can read them at no loss: a Q8_0
     /// projection without a soft cap. Indexed policies require the
-    /// canonical table, and a separate drafter that projects through the
-    /// target's projection has no kernel for the views, so there the
-    /// projection keeps its packed form, as does a head's own projection. A
-    /// view becomes resident, in place of the packed projection, only after
-    /// whole-recipe class-cost qualification.
+    /// canonical table, so there the projection keeps its packed form, as
+    /// does a head's own projection. A separate drafter that projects
+    /// through the target's projection reads its full logits through the
+    /// views' full pass, as every reader of a class the levels do not serve
+    /// does. A view becomes resident, in place of the packed projection, only
+    /// after whole-recipe class-cost qualification.
     pub fn with_readout_candidates(mut self, definition: &ModelDefinition) -> Result<Self, String> {
         let mut indexed = HashSet::new();
         if let Some(head) = &definition.head {
@@ -1559,19 +1560,7 @@ impl ModelLoadPlan {
             }
             Ok(views)
         };
-        let drafter_reads_target = definition
-            .draft
-            .as_ref()
-            .is_some_and(|draft| draft.output.is_none())
-            && self
-                .target
-                .iter()
-                .any(|weight| weight.role.scope == WeightScope::Draft);
-        self.readout_candidates = if drafter_reads_target {
-            Vec::new()
-        } else {
-            select(&self.target)?
-        };
+        self.readout_candidates = select(&self.target)?;
         Ok(self)
     }
 

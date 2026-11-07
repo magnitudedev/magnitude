@@ -401,6 +401,11 @@ impl AttestedPrograms {
                 head.projection = packed.as_ref().clone();
             }
         }
+        if let Some(draft) = &mut self.draft {
+            if let ProjectionKernels::Qualified { packed, .. } = &draft.head {
+                draft.head = packed.as_ref().clone();
+            }
+        }
         self.readout_choices.clear();
         Ok(())
     }

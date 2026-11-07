@@ -606,6 +606,18 @@ enum ReadoutReader {
     HeadBlock(crate::HeadBinding),
     /// A head's own projection, which nothing else reads.
     SharedHead,
+    /// A separate draft's projection of its proposing rows through the
+    /// target's.
+    Draft,
+}
+
+/// The selected-row counts of a reader whose selections are row classes up
+/// to `bound`.
+fn selected_row_classes(bound: usize) -> Vec<u64> {
+    magnitude_batching::row_classes(bound)
+        .into_iter()
+        .map(|rows| rows as u64)
+        .collect()
 }
 
 /// A reader of a candidate scope that selected no class of its own. A scope
@@ -691,10 +703,12 @@ impl<'a> Preparation<'a> {
         }
     }
 
-    /// Register one complete physical recipe per served selected-row class.
-    /// A cache hit forms retained configurations but never measures or searches.
+    /// Register one complete physical recipe per served selected-row count
+    /// (`selected_rows`). A cache hit forms retained configurations but never
+    /// measures or searches.
     /// A reader that selects no class still gets the views' kernels when its
-    /// scope is stored as them for another reader.
+    /// scope is stored as them for another reader. `declared_rows` is the
+    /// output rows a raw reader's canonical head declares (`HeadRowsTuning`).
     fn qualified_readout(
         &mut self,
         reader: ReadoutReader,
@@ -705,7 +719,8 @@ impl<'a> Preparation<'a> {
         activation: Element,
         softcap: f32,
         prepared: bool,
-        row_bound: usize,
+        declared_rows: Option<u64>,
+        selected_rows: Vec<u64>,
         canonical: Option<ProjectionKernels>,
     ) -> Result<Option<ProjectionKernels>, CatalogFailure> {
         if self
@@ -735,7 +750,7 @@ impl<'a> Preparation<'a> {
                 weight,
                 activation,
                 epsilon: self.epsilon,
-                rows: None,
+                rows: declared_rows,
             })?
         };
         let Some(dependency) = dependency else {
@@ -825,14 +840,14 @@ impl<'a> Preparation<'a> {
             || "no-norm".to_owned(),
             |plan| format!("{:?}", plan.storage_identity()),
         );
-        let mut selected_rows = Vec::new();
+        let mut chosen_rows = Vec::new();
         let mut selected_state = None;
-        for rows in magnitude_batching::row_classes(row_bound) {
+        for rows in selected_rows {
             let point = super::tuning::PointShape {
                 label: format!("m{rows}"),
                 weight: 1.0,
                 terms: Vec::new(),
-                rows: rows as u64,
+                rows,
                 sequences: 1,
                 context: None,
                 class: None,
@@ -900,7 +915,7 @@ impl<'a> Preparation<'a> {
                     state.selected = true;
                     state.canonical_specification = Some(specification);
                 }
-                selected_rows.push(point.rows);
+                chosen_rows.push(point.rows);
                 selected_state = Some(state);
             }
         }
@@ -932,12 +947,12 @@ impl<'a> Preparation<'a> {
                     .expect("a formed recipe retains bounded kernels"),
             }));
         };
-        selected_rows.sort_unstable();
-        selected_rows.dedup();
+        chosen_rows.sort_unstable();
+        chosen_rows.dedup();
         if let Some(choice) = self.readout_choices.iter_mut().find(|choice| {
             choice.scope == scope && choice.norm_scope == norm_scope && choice.prepared == prepared
         }) {
-            choice.rows.extend(&selected_rows);
+            choice.rows.extend(&chosen_rows);
             choice.rows.sort_unstable();
             choice.rows.dedup();
         } else {
@@ -945,7 +960,7 @@ impl<'a> Preparation<'a> {
                 scope,
                 norm_scope,
                 prepared,
-                rows: selected_rows,
+                rows: chosen_rows,
             });
         }
         // A count or a listing forms no kernels, the canonical projection
@@ -1010,6 +1025,14 @@ impl<'a> Preparation<'a> {
                 ReadoutReader::SharedHead => {
                     unreachable!("a head's own projection has one reader")
                 }
+                ReadoutReader::Draft => {
+                    if let Some(head) = self.draft.as_mut().and_then(|draft| draft.head.as_mut()) {
+                        *head = ProjectionKernels::Qualified {
+                            packed: Box::new(head.clone()),
+                            progressive,
+                        };
+                    }
+                }
             }
         }
         Ok(())
@@ -1030,9 +1053,9 @@ impl<'a> Preparation<'a> {
         }
         self.target(plan)?;
         self.head(plan)?;
-        self.follow_readout_scopes()?;
         self.shared_head(plan)?;
         self.draft(plan)?;
+        self.follow_readout_scopes()?;
         self.vision(plan)?;
         Ok(glue)
     }
@@ -1439,8 +1462,11 @@ impl<'a> Preparation<'a> {
             b.activation,
             self.softcap,
             false,
-            self.selection_limits
-                .map_or(0, |limits| limits.max_selected_rows),
+            None,
+            selected_row_classes(
+                self.selection_limits
+                    .map_or(0, |limits| limits.max_selected_rows),
+            ),
             head.as_ref().map(|head| match head {
                 ReadoutHeadKernels::Packed { head, .. } => {
                     ProjectionKernels::RawPacked(head.clone())
@@ -3207,9 +3233,10 @@ impl<'a> Preparation<'a> {
                 b.activation,
                 0.0,
                 true,
-                self.selection_limits.map_or(0, |limits| {
+                None,
+                selected_row_classes(self.selection_limits.map_or(0, |limits| {
                     limits.max_launch_slots.min(limits.max_launch_rows)
-                }),
+                })),
                 logits.clone(),
             )?;
             let logits = qualified.or(logits);
@@ -3354,12 +3381,13 @@ impl<'a> Preparation<'a> {
                 activation,
                 0.0,
                 true,
-                self.selection_limits.map_or(0, |limits| {
+                None,
+                selected_row_classes(self.selection_limits.map_or(0, |limits| {
                     limits
                         .max_launch_slots
                         .min(limits.max_launch_rows)
                         .min(limits.max_drafting_slots)
-                }),
+                })),
                 projection.clone(),
             )?
         } else {
@@ -3491,6 +3519,37 @@ impl<'a> Preparation<'a> {
                     },
                 )?
                 .map(ProjectionKernels::RawPacked),
+        };
+        // A draft through the target's projection reads it as it is stored:
+        // its planes, through their full pass, when another reader of the
+        // scope selected a class. The draft selects no class of its own: its
+        // proposals' confidences read every logit.
+        let head = match draft_plan.projection_scope() {
+            WeightScope::Target => {
+                let draft = self
+                    .tuning
+                    .model()
+                    .definition
+                    .draft
+                    .as_ref()
+                    .expect("a draft program has a draft");
+                let weight = draft_plan.projection().packed();
+                self.qualified_readout(
+                    ReadoutReader::Draft,
+                    WeightScope::Target,
+                    WeightScope::Draft,
+                    draft_plan.output_norm(),
+                    weight.element,
+                    draft_plan.activation(),
+                    draft.logit_softcap.unwrap_or(0.0) as f32,
+                    false,
+                    Some(self.vocabulary),
+                    Vec::new(),
+                    head.clone(),
+                )?
+                .or(head)
+            }
+            _ => head,
         };
         let shape = self.spec.tuned(
             &mut self.tuning,
