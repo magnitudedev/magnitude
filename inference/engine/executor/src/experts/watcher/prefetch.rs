@@ -331,6 +331,49 @@ pub(super) enum Reading {
     Unpredicted,
 }
 
+/// What became of one entry of a hint ring, as the read timeline records it
+/// (`candidate`: the step as its job; the target layer, the expert, and
+/// `short << 24 | fate << 16 | lead << 8 | rank`, with the staging records
+/// free as it was admitted from bit 32): read; not a candidate (held,
+/// kept, or landing already, a longer lead's read among them); named twice
+/// in the ring; refused by its rank's precision (`HintPrice::pays`); paid
+/// for and not read, short of what [`ShortOf`] says; or its ring read
+/// after its target's request was noticed. Each fate keeps its number in
+/// every recording.
+#[derive(Clone, Copy)]
+enum Fate {
+    Read = 0,
+    Held = 1,
+    Repeated = 2,
+    Refused = 3,
+    Short = 5,
+    Passed = 6,
+}
+
+impl Fate {
+    /// Note the entry `(expert, rank)` of step `sequence`'s ring of lead
+    /// `lead` hinting `target`, short of `short` with `free` staging
+    /// records free.
+    fn note(self, sequence: Step, target: usize, lead: usize, (expert, rank): (usize, usize), (short, free): (ShortOf, usize)) {
+        let packed = (free as i64) << 32 | (short as i64) << 24 | (self as i64) << 16 | (lead as i64) << 8 | rank as i64;
+        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("candidate"), sequence, (target as i64, expert as i64, packed));
+    }
+}
+
+/// What a hint ring entry paid for fell short of ([`Fate::Short`]).
+#[derive(Clone, Copy)]
+enum ShortOf {
+    Nothing = 0,
+    /// Staging beyond the demand reserve.
+    Staging = 1,
+    /// A ready tier record beyond the reserve.
+    Tier = 2,
+    /// The read engine took no job (`Short::Refused`).
+    Claim = 3,
+    /// An entry before it in the ring fell short.
+    Earlier = 4,
+}
+
 /// The staging records and the reads into them.
 pub(super) struct Prefetch {
     /// Staging record indices, valid in every pool, under their own lock:
@@ -602,6 +645,11 @@ impl Prefetch {
                 // Those of a step whose request there was noticed name a
                 // layer the device has passed.
                 if served[target] >= sequence {
+                    if seismic_io::timeline::recording() {
+                        for &(expert, rank) in &entries {
+                            Fate::Passed.note(sequence, target, lead, (expert as usize, rank as usize), (ShortOf::Nothing, 0));
+                        }
+                    }
                     continue;
                 }
                 let hinted = entries
@@ -650,11 +698,23 @@ impl Prefetch {
     /// left are the least likely. Its candidates, each with whether it was
     /// read and its rank, are counted with their step (`Telemetry::hinted`).
     fn admit(&mut self, core: &mut Core, shared: &Arc<Shared>, target: usize, lead: usize, hinted: &[(usize, usize)], issued: At) {
+        let sequence = issued.point.sequence;
+        let recording = seismic_io::timeline::recording();
         let mut seen = BTreeSet::new();
         let ranked = hinted
             .iter()
             .copied()
-            .filter(|&(expert, _)| seen.insert(expert) && Self::candidate(core, (target, expert)))
+            .filter(|&(expert, rank)| {
+                let fate = match (seen.insert(expert), Self::candidate(core, (target, expert))) {
+                    (false, _) => Fate::Repeated,
+                    (true, false) => Fate::Held,
+                    (true, true) => return true,
+                };
+                if recording {
+                    fate.note(sequence, target, lead, (expert, rank), (ShortOf::Nothing, 0));
+                }
+                false
+            })
             .collect::<Vec<_>>();
         // A hint takes staging beyond the demand reserve, so a request
         // finds its own, and the ready tier records beyond what the
@@ -665,14 +725,32 @@ impl Prefetch {
         let request = core.extents.demand;
         let demand = core.extents.reserve.saturating_sub(self.staging.records().saturating_sub(request));
         let price = shared.telemetry.price(lead);
+        let mut short = false;
         for &(expert, rank) in &ranked {
+            let free = if recording { self.staging.free() } else { 0 };
+            let noted = |fate: Fate, of: ShortOf| {
+                if recording {
+                    fate.note(sequence, target, lead, (expert, rank), (of, free));
+                }
+            };
+            if short {
+                noted(Fate::Short, ShortOf::Earlier);
+                continue;
+            }
             if !price.pays(rank) {
+                noted(Fate::Refused, ShortOf::Nothing);
                 continue;
             }
             match self.read_ahead(core, shared, (target, expert), Priority::Prefetch, Some(issued), (request, demand)) {
-                Ok(bytes) => shared.telemetry.hint(bytes),
-                Err(Short::Refused) => {}
-                Err(Short::Staging | Short::Tier) => break,
+                Ok(bytes) => {
+                    shared.telemetry.hint(bytes);
+                    noted(Fate::Read, ShortOf::Nothing);
+                }
+                Err(Short::Refused) => noted(Fate::Short, ShortOf::Claim),
+                Err(fell @ (Short::Staging | Short::Tier)) => {
+                    short = true;
+                    noted(Fate::Short, if matches!(fell, Short::Staging) { ShortOf::Staging } else { ShortOf::Tier });
+                }
             }
         }
         // No candidate was a hint's before: those that are now were read.
@@ -680,7 +758,7 @@ impl Prefetch {
             .into_iter()
             .map(|(expert, rank)| Admitted { expert, rank, read: self.inbound.contains_key(&(target, expert)) })
             .collect();
-        shared.telemetry.hinted(issued.point.sequence, target, lead, candidates);
+        shared.telemetry.hinted(sequence, target, lead, candidates);
     }
 
     /// Fill the host tier: each expert its tier lacks that nothing carries,
