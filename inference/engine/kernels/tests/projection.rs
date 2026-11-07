@@ -5032,9 +5032,14 @@ fn head_logits_match_the_host(
         };
         for &mapping in mappings {
             let specialization = if is_cpu(device) {
-                let implementation = readout_project_rows::native_implementation(device)
-                    .unwrap()
-                    .unwrap();
+                // The declaration at the weight's binding, whose `where`
+                // reads its forms.
+                let implementation = seismic::generated::native_offered::<readout_project_rows::Entry>(
+                    device,
+                    &[("A", act.element()), ("OW", repr.resident(device))],
+                )
+                .unwrap()
+                .unwrap();
                 let statics = implementation
                     .statics
                     .iter()

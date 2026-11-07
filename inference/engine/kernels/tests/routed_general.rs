@@ -1328,6 +1328,8 @@ fn portable_expert_entries_match_host_reference() {
                     floats(DType::F32, &[m, k], scores),
                     weights(&bank(&block.down), h, f),
                     bf16(&[tiered, h, f], &tier(&block.down)),
+                    // A resident layer's policy words: zero, read by none.
+                    ints(&[constants::POLICY_WORDS as usize], &[0; constants::POLICY_WORDS as usize]),
                 ],
             );
             result(&outcome, 0).into_iter().map(|v| v as f32).collect::<Vec<_>>()
