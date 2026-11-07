@@ -4,6 +4,9 @@
 // (static WS = 1) and softcapped from the accumulator when `softcap` > 0.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
+#if defined(SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV) || defined(SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV_ROWS) || defined(SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMV_PAIR)
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;

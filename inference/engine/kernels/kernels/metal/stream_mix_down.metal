@@ -5,6 +5,9 @@
 #define KERNEL_W1 SEISMIC_INJECT_WEIGHT
 #include "lib/core/arrive.h"
 #include "lib/projection/projection.h"
+#ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;

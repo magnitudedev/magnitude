@@ -8,6 +8,9 @@
 // maximum, then the sync-scratch keys); the last threadgroup to arrive
 // publishes the thresholds.
 #include "lib/readout/progressive.h"
+#ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV
+#include "lib/projection/gemv.h"
+#endif
 
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 

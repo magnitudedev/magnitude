@@ -3,6 +3,9 @@
 // one weight stream.
 #define KERNEL_W0 SEISMIC_UP_WEIGHT
 #include "lib/projection/projection.h"
+#ifdef SEISMIC_FORMING_DENSE_UP_GEMV
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;

@@ -16,7 +16,7 @@
 // The includer defines ROUTED_SOURCE_ROWS, the sources' rows: the entry's
 // XS (0 for a resident layer), or SOURCE_ROWS where the entry's layers
 // stream.
-#include "routed.h"
+#include "channels.h"
 
 namespace routed {
 

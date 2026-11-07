@@ -5,6 +5,9 @@
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
+#if defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV) || defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV_ROWS) || defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV_PAIR)
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;

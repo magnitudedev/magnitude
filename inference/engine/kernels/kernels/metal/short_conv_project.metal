@@ -6,6 +6,9 @@
 #define KERNEL_W1 SEISMIC_X_WEIGHT
 #define KERNEL_W2 SEISMIC_C_WEIGHT
 #include "lib/projection/projection.h"
+#ifdef SEISMIC_FORMING_SHORT_CONV_PROJECT_GEMV
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;

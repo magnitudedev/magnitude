@@ -4,6 +4,9 @@
 // A(A(act(A(gate))) * inputs[m, layer, p]).
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #include "lib/projection/projection.h"
+#ifdef SEISMIC_FORMING_PER_LAYER_GATE_GEMV
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 

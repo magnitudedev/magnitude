@@ -3,6 +3,9 @@
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
+#if defined(SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV) || defined(SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_ROWS) || defined(SEISMIC_FORMING_ATTENTION_OUTPUT_GEMV_PAIR)
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 // The output weight's operand rows (the gated rows, or NVFP4 operands): the

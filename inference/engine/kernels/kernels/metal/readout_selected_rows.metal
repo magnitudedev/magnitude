@@ -2,6 +2,9 @@
 // projection onto the `selected` vocabulary rows, into F32 logits.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
+#ifdef SEISMIC_FORMING_READOUT_SELECTED_ROWS_GEMV
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;

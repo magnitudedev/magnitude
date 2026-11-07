@@ -11,6 +11,7 @@
 #define KERNEL_W2 SEISMIC_SHARED_GATE
 #define KERNEL_W3 SEISMIC_SHARED_UP
 #include "lib/routed/routed.h"
+#include "lib/projection/gemv.h"
 
 // The rows the experts' and the shared expert's weights take (the
 // normalized rows, or NVFP4 operands), each pair's own, formed while its

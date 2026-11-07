@@ -2,6 +2,7 @@
 // rows (the draft head's readout) into F32 logits.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
+#include "lib/projection/gemv.h"
 
 typedef element::Act activation;
 // The weight's operand row (the feature row, or NVFP4 operands), formed

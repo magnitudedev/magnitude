@@ -7,6 +7,9 @@
 #define KERNEL_W3 SEISMIC_VALUE_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
+#if defined(SEISMIC_FORMING_ATTENTION_PROJECT_GEMV) || defined(SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_ROWS) || defined(SEISMIC_FORMING_ATTENTION_PROJECT_GEMV_PAIR)
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;

@@ -10,6 +10,7 @@
 // This file is independent of any entry ABI.
 
 #include "../projection/projection.h"
+#include "../projection/gemv.h"
 #include "../core/arrive.h"
 
 namespace routing {

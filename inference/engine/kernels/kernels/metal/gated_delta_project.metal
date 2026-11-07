@@ -7,6 +7,9 @@
 #define KERNEL_W3 SEISMIC_BETA_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
+#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;

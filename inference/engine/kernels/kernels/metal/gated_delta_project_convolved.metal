@@ -14,6 +14,9 @@
 #define KERNEL_W3 SEISMIC_BETA_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/recurrent/versions.h"
+#if defined(SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV) || defined(SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_ROWS) || defined(SEISMIC_FORMING_GATED_DELTA_PROJECT_CONVOLVED_GEMV_PAIR)
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;

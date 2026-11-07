@@ -9,6 +9,7 @@
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
 #include "lib/routed/routed.h"
+#include "lib/projection/gemv.h"
 
 // The row both weights take (the normalized row, or NVFP4 operands), formed
 // while the GEMV stages it.

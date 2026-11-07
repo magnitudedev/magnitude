@@ -3,6 +3,9 @@
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
+#ifdef SEISMIC_FORMING_PROJECT_ROWS_GEMV
+#include "lib/projection/gemv.h"
+#endif
 
 typedef element::Act activation;
 typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) published;

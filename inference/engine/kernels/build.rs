@@ -165,6 +165,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the token-packing GEMM of the projection entries' PACK form, on simdgroup matrices",
     ),
     (
+        "lib/projection/gemv",
+        &[BackendName::Metal],
+        "the projection family's GEMV row classes, apart from `projection.h` so a library that runs no GEMV (a GEMM's, a batched GEMV's) compiles none of them: Metal compiles a launch's library whole",
+    ),
+    (
         "lib/core/rotary",
         &[BackendName::Vulkan],
         "rotary sin/cos shared by attention and vision; inside `attention.h` / `attention.cuh` elsewhere",
@@ -178,6 +183,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/routed/router",
         &[BackendName::Metal],
         "decode router logits shared by the Metal route and select GEMVs over the projection GEMV body (any activation element, unlike `routed.h`); CUDA and Vulkan keep their router GEMVs inline",
+    ),
+    (
+        "lib/routed/channels",
+        &[BackendName::Metal],
+        "the decode down projections over the projection GEMV body, shared by `down.h` and `output.h`, apart from `routed.h` so the expert GEMMs' libraries compile no GEMV; CUDA and Vulkan keep them in their down and output files",
     ),
     (
         "lib/routed/shared",
