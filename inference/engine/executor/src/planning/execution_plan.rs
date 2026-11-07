@@ -731,8 +731,8 @@ impl ExecutionPlanDraft {
             super::pass_rows_curve(&ladder, 0, &pass_bytes, &|pass| prices.prompt_seconds(pass, most), rates.requests_per_s, 0.0),
         ];
         let mut settled = None;
-        let granted = settle_confirmed(curves, load_supply(room), |granted| -> Result<Result<(), NonZeroU64>, E> {
-            let (slots, pass) = (points[granted[0]], ladder[granted[1]]);
+        // The charge a draft of `slots` and `pass` needs beyond the room.
+        let mut over = |slots: u64, pass: PassLaunches| -> Result<_, E> {
             let draft = resized(slots, pass)?;
             let charge = held.charge(definition, &draft)?;
             let needed = match draft.holds_group_class() {
@@ -740,9 +740,32 @@ impl ExecutionPlanDraft {
                 false => Self::allocated(charge.charge())?,
             };
             let over = needed.saturating_sub(mandatory_bytes).saturating_sub(room.free.min(room.ceiling));
-            if let Some(over) = NonZeroU64::new(over) {
-                return Ok(Err(over));
+            Ok((draft, charge, over))
+        };
+        let granted = settle_confirmed(curves, load_supply(room), |granted| -> Result<Result<(), NonZeroU64>, E> {
+            let slots = points[granted[0]];
+            // A larger pass the prices cannot tell from the granted one
+            // prices no slower: the largest of them that fits is held, as
+            // fewer submissions of the same work, the granted bank beside it.
+            let granted_seconds = prices.prompt_seconds(ladder[granted[1]], most);
+            let mut tied = None;
+            for &pass in ladder[granted[1] + 1..].iter().rev() {
+                if prices.prompt_seconds(pass, most) > granted_seconds {
+                    continue;
+                }
+                let (draft, charge, excess) = over(slots, pass)?;
+                if excess == 0 {
+                    tied = Some((draft, charge));
+                    break;
+                }
             }
+            let (draft, charge) = match tied {
+                Some(tied) => tied,
+                None => match over(slots, ladder[granted[1]])? {
+                    (draft, charge, 0) => (draft, charge),
+                    (_, _, excess) => return Ok(Err(NonZeroU64::new(excess).expect("a nonzero excess"))),
+                },
+            };
             Ok(confirm(&draft, charge.charge())?.map(|found| settled = Some((draft, charge, found))))
         })?;
         Ok(match granted {
@@ -1652,7 +1675,11 @@ mod tests {
     /// slots are worth far more per byte than the larger merged passes of
     /// its whole-context prompt group, so the settle keeps the bank
     /// resident (every slot) and a pass of at least 512 rows beside it,
-    /// whose prefill is no slower than 512-row passes'.
+    /// whose prefill is no slower than 512-row passes'. Every pass ties
+    /// beside the whole bank, so the plan holds the largest one whose prompt
+    /// group's class fits beside it: none above 512 rows in the device's
+    /// own room (the whole bank and the class, 1.40 GB, overrun it by
+    /// 361 MB), the largest with a GiB more.
     #[test]
     fn gemma_q4_on_a_3090_keeps_its_bank_resident_beside_a_merged_pass() {
         use crate::planning::fixtures::{LIMITS, gemma_moe_fixture_definition, gemma_moe_fixture_manifest};
@@ -1717,6 +1744,33 @@ mod tests {
         );
         let region = *magnitude_batching::row_classes(limits.max_launch_rows).last().unwrap() as u64;
         assert!(bank.pass.get() as u64 * region >= 512, "{:?} of {region} rows", bank.pass);
+        // Every pass size prices alike beside a whole bank, compute-bound
+        // from 512 rows on: the largest whose class fits is held, the
+        // fewest submissions. A pass above 512 rows charges its group's
+        // class, which the device's room cannot hold beside every slot.
+        let charge = crate::assessment::execution_memory_charge(&definition, planned.draft()).unwrap();
+        let with_class = ExecutionPlanDraft::allocated(&charge.with_group_class().unwrap()).unwrap();
+        assert!(with_class > bound, "the whole bank and its class ({with_class} bytes) fit the room ({bound})");
+        assert_eq!(bank.pass, PassLaunches::FLOOR, "no pass above the floor fits beside the whole bank");
+        // With a GiB more, the class fits beside the whole bank: the largest
+        // pass is held.
+        let wider = bound + (1 << 30);
+        let (wide, ()) = draft
+            .with_held_experts(&definition, HeldBound::Room(wider), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), |mandatory: u64| {
+                let left = wider.saturating_sub(mandatory);
+                PlanRoom { free: left, ceiling: left }
+            }, |_, _| Ok::<_, PlanError>(Ok(())))
+            .unwrap()
+            .unwrap();
+        let widened = wide.draft().load().expert_bank().unwrap();
+        assert_eq!((widened.slots, widened.ceiling), (128, 128), "the wider room keeps the whole bank");
+        assert_eq!(
+            widened.pass,
+            *super::super::pass_ladder(PassLaunches::new(NonZeroUsize::new(widened.places as usize).unwrap())).last().unwrap(),
+            "{:?} of {} places",
+            widened.pass,
+            widened.places
+        );
         let Priced::Measured(prices) = &prices else { unreachable!("the prices are measured") };
         let prices = prices.of_bank(planned.draft(), &definition).unwrap();
         assert!(
