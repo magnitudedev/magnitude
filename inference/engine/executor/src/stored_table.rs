@@ -98,22 +98,35 @@ impl Prefetched {
     }
 }
 
-/// What keeps a slot's row: the latest step that named it (0 for none),
-/// free once the read timeline reaches that step; or a prefetch's hold for
-/// steps not yet queued, which no read frees: only a step that names the
-/// row, or the holders' release, ends it. The hold is never a timeline
-/// value, so no timeline's comparison (CUDA's wraps a 32-bit word) can
-/// read it as reached.
+/// What keeps a slot's row: nothing; the latest step that named it, free
+/// once the read timeline reaches that step; or a prefetch's hold for steps
+/// not yet queued, which no read frees: only a step that names the row, or
+/// the holders' release, ends it. Only a step is a timeline value: neither
+/// the absence of one nor a hold is ever compared against the timeline,
+/// whose comparison (CUDA's wraps a 32-bit word) reads only values near its
+/// own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Named {
+    Free,
     Step(u64),
     Held,
 }
 
 impl Named {
-    /// Whether the slot is free by `read`: its step's read is done.
+    /// What a step names: nothing before the first step (0), which no read
+    /// awaits.
+    fn by(step: u64) -> Self {
+        match step {
+            0 => Self::Free,
+            step => Self::Step(step),
+        }
+    }
+
+    /// Whether the slot is free by `read`: no step named its row, or that
+    /// step's read is done.
     fn free(self, read: &seismic::Timeline<Reached>) -> Result<bool, seismic::ExecutionError> {
         match self {
+            Self::Free => Ok(true),
             Self::Step(step) => read.reached(step),
             Self::Held => Ok(false),
         }
@@ -590,7 +603,7 @@ impl StoredTable {
             state: Mutex::new(State {
                 records,
                 directory,
-                named: vec![Named::Step(0); slots as usize],
+                named: vec![Named::Free; slots as usize],
                 served: vec![false; slots as usize],
                 holds: HashMap::new(),
             }),
@@ -754,7 +767,7 @@ impl StoredTable {
         if records < state.records {
             let held = records as usize * record_rows;
             state.directory.limit(held);
-            state.named[held..].fill(Named::Step(0));
+            state.named[held..].fill(Named::Free);
             state.served[held..].fill(false);
             // The rows the released records held are no longer held.
             let State { holds, directory, .. } = &mut *state;
@@ -1028,7 +1041,7 @@ impl Shared {
             match state.directory.try_free(kept) {
                 Ok(Some((slot, _))) => {
                     // Free until its row is read in.
-                    state.named[slot] = Named::Step(0);
+                    state.named[slot] = Named::Free;
                     claimed.insert(slot);
                     taken.push(slot);
                 }
@@ -1069,7 +1082,7 @@ impl Shared {
             let kept = !holders.is_empty();
             if let (false, Some(slot)) = (kept, directory.slot(*row)) {
                 if named[slot as usize] == Named::Held {
-                    named[slot as usize] = Named::Step(0);
+                    named[slot as usize] = Named::Free;
                 }
             }
             kept
@@ -1118,7 +1131,7 @@ impl Shared {
                     if state.named[slot as usize] == Named::Held {
                         state.holds.remove(&row);
                     }
-                    state.named[slot as usize] = Named::Step(step);
+                    state.named[slot as usize] = Named::by(step);
                     state.served[slot as usize] |= served;
                 }
                 None => absent.push(row),
@@ -1134,7 +1147,7 @@ impl Shared {
                 // read it: this step, or one whose read is not done, or not
                 // known to be (the device cannot say, which fails the step).
                 let kept = |slot: usize| {
-                    Ok(claimed.contains(&slot) || (step != 0 && named[slot] == Named::Step(step)) || !named[slot].free(read)?)
+                    Ok(claimed.contains(&slot) || named[slot] == Named::Step(step) || !named[slot].free(read)?)
                 };
                 let free = state.directory.try_free(kept).map_err(|error: seismic::ExecutionError| format!("the stored table's reads: {error}"))?;
                 if let Some((slot, _)) = free {
@@ -1146,7 +1159,7 @@ impl Shared {
                     .iter()
                     .filter_map(|named| match *named {
                         Named::Step(named) if named != step => Some(named),
-                        Named::Step(_) | Named::Held => None,
+                        Named::Free | Named::Step(_) | Named::Held => None,
                     })
                     .min()
                     .ok_or("a step names more rows than the table has slots")?;
@@ -1154,7 +1167,7 @@ impl Shared {
                     return Err("no slot of the stored table came free".into());
                 }
             };
-            state.named[slot] = Named::Step(step);
+            state.named[slot] = Named::by(step);
             claimed.insert(slot);
             taken.push(slot);
         }
