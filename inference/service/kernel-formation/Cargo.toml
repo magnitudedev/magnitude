@@ -19,4 +19,4 @@ sha2.workspace = true
 libc.workspace = true
 
 [build-dependencies]
-sha2.workspace = true
+magnitude-source-identity = { path = "../../engine/source-identity" }

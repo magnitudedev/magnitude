@@ -470,7 +470,7 @@ pub struct AssessmentGraphResourceBounds {
 impl AssessmentGraphResourceBounds {
     /// [`Self::derive`], kept in `cache`. Deriving builds and certifies
     /// every graph in metadata alone, opening no device: its result is a
-    /// function of its inputs and the engine build, stored under them and
+    /// function of its inputs and the executor build, stored under them and
     /// read by every later plan of the same load. A refusal is not kept.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn kept(
@@ -488,7 +488,7 @@ impl AssessmentGraphResourceBounds {
         let key = crate::kernel_cache::TuningCacheKey::of(&format!(
             "graph bounds\nbuild {}\nbackend {backend:?}\nmethod {method:?}\ncodec {codec:?}\nlimits {limits:?}\n\
              definition {definition:?}\nload {load:?}\nstate {}",
-            crate::ENGINE_BUILD,
+            crate::EXECUTOR_BUILD,
             state.graph_material(),
         ));
         if let Some(bounds) = cache.graph_bounds(&key)? {

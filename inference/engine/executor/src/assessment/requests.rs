@@ -153,13 +153,13 @@ impl SiteRequest {
     }
 
     /// The precision system's verdict is a function of the request, the
-    /// CPU's architecture and native tier, and the engine build that holds
+    /// CPU's architecture and native tier, and the executor build that holds
     /// the site's arithmetic and the reference; the executor's identity
     /// names the machine's job.
     fn key(&self, identity: &Identity) -> PointKey {
         let digest = crate::kernel_cache::TuningCacheKey::of(&format!(
             "site admission\nbuild {}\ncpu {} {:?}\nrows {DECODE_ROWS}\n{self:?}",
-            crate::ENGINE_BUILD,
+            crate::EXECUTOR_BUILD,
             std::env::consts::ARCH,
             seismic::cpu::Tier::detected(),
         ));
@@ -265,7 +265,7 @@ impl PartialOrd for Waiter {
 
 /// A request as it is stored: its executor, what it asks for and who waits
 /// on it. Its form is its build's own: a load asks its own build's job, so
-/// the schema is the engine build, and a request another build stored in a
+/// the schema is the executor build, and a request another build stored in a
 /// shared kernel cache lies apart, never read here.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct Stored {
@@ -275,7 +275,7 @@ struct Stored {
 }
 
 impl seismic::measure::Stored for Stored {
-    const SCHEMA: &'static str = concat!("point-request.", env!("MAGNITUDE_ENGINE_BUILD"));
+    const SCHEMA: &'static str = concat!("point-request.", env!("MAGNITUDE_EXECUTOR_BUILD"));
 }
 
 /// The most bytes a stored request is written as: an executor's identity

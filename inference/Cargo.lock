@@ -2296,6 +2296,7 @@ dependencies = [
  "magnitude-grammar",
  "magnitude-scheduler",
  "magnitude-service-utils",
+ "magnitude-source-identity",
  "magnitude-state",
  "magnitude-templates",
  "opentelemetry 0.33.0",
@@ -2346,6 +2347,7 @@ dependencies = [
  "magnitude-family-qwen35",
  "magnitude-family-qwen4exp",
  "magnitude-kernels",
+ "magnitude-source-identity",
  "magnitude-state",
  "seismic",
  "seismic-io",
@@ -2536,6 +2538,7 @@ dependencies = [
  "libc",
  "magnitude-kernels",
  "magnitude-service-server",
+ "magnitude-source-identity",
  "seismic",
  "sha2 0.10.9",
 ]
@@ -2738,6 +2741,14 @@ dependencies = [
  "magnitude-solver",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "magnitude-source-identity"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sha2 0.11.0",
 ]
 
 [[package]]

@@ -26,15 +26,16 @@ use seismic::{PointKey, StoreIdentity};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// The engine build identity: the package version and a digest of the engine
-/// sources. Two processes speak the protocol only with equal builds.
+/// The engine build identity: the package version and a digest of the
+/// engine's dependency closure (`build.rs`). Two processes speak the protocol
+/// only with equal builds.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EngineBuild(pub String);
 
 impl EngineBuild {
     pub fn current() -> Self {
-        Self(magnitude_executor::ENGINE_BUILD.to_owned())
+        Self(env!("MAGNITUDE_ENGINE_BUILD").to_owned())
     }
 }
 

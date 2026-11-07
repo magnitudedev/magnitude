@@ -1,10 +1,9 @@
 //! Family-neutral model execution contracts and implementations.
 
-/// The engine build identity: the package version and a digest of the
-/// engine's sources (`build.rs`). Two processes speak the worker protocol
-/// only with equal builds, and what a build alone decides is stored under
-/// it.
-pub const ENGINE_BUILD: &str = env!("MAGNITUDE_ENGINE_BUILD");
+/// The executor build identity: the package version and a digest of the
+/// executor's dependency closure (`build.rs`). What the executor alone decides
+/// is stored under it.
+pub const EXECUTOR_BUILD: &str = env!("MAGNITUDE_EXECUTOR_BUILD");
 
 pub mod assessment;
 mod completion;

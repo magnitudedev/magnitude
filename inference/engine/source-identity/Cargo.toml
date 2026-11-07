@@ -1,0 +1,9 @@
+[package]
+name = "magnitude-source-identity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = "=1.0.151"
+sha2 = "=0.11.0"

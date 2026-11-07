@@ -61,4 +61,4 @@ seismic-lang.workspace = true
 seismic-std.workspace = true
 
 [build-dependencies]
-sha2 = "=0.11.0"
+magnitude-source-identity = { path = "../source-identity" }
