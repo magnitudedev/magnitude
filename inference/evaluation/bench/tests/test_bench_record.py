@@ -73,3 +73,34 @@ def test_drafting_reports_acceptance_over_valid_drafting_requests():
     assert value == {"proposed": 30, "accepted": 12, "acceptance": 0.4,
                      "tokens_per_verify": None, "requests": 2}
     assert record.drafting([record.serving_row(row(draft=None))], "magnitude") is None
+
+
+def test_draft_rounds_count_each_requests_widths_from_the_engine_log():
+    def round(request, generated, verified, look):
+        return (f"draft width request=RequestId({request}) generated={generated} "
+                f"verified={verified} look={look} committed=1 right=[] measured=x")
+
+    log = "\n".join([
+        "INFO magnitude_engine: chat completion started",
+        round(4, 0, 0, "false"), round(4, 3, 1, "true"), round(4, 0, 0, "false"),
+        round(5, 1, 1, "false"),
+    ])
+    assert record.draft_rounds(log) == [
+        {"request": "RequestId(4)",
+         "widths": [{"generated": 0, "verified": 0, "rounds": 2},
+                    {"generated": 3, "verified": 1, "rounds": 1}],
+         "looks": 1},
+        {"request": "RequestId(5)", "widths": [{"generated": 1, "verified": 1, "rounds": 1}],
+         "looks": 0},
+    ]  # fmt: skip
+    assert record.draft_rounds("INFO a load without the controller") == []
+
+
+def test_block_draft_rounds_read_each_blocks_engine_log(tmp_path):
+    line = "draft width request=RequestId({}) generated=1 verified=1 look=false committed=2 x\n"
+    (tmp_path / "magnitude-block-0.log").write_text(line.format(3))
+    (tmp_path / "magnitude-block-1.log").write_text(line.format(7) + line.format(7))
+    assert [
+        (block["block"], [(r["request"], r["widths"][0]["rounds"]) for r in block["requests"]])
+        for block in record.block_draft_rounds(tmp_path, {1, 0})
+    ] == [(0, [("RequestId(3)", 1)]), (1, [("RequestId(7)", 2)])]

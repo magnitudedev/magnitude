@@ -17,7 +17,7 @@ import os
 import httpx
 
 from ..models import file_hash
-from ..record import TUNING_TRACE
+from ..record import DRAFT_WIDTH_TRACE, TUNING_TRACE
 from .base import Adapter
 
 OUTPUT_CAPACITY = 256
@@ -38,6 +38,13 @@ class Native(Adapter):
             return None
         drafter = self.acquisition.drafter
         return self.magnitude.method or (drafter.method if drafter is not None else None)
+
+    def environment(self) -> dict:
+        """A drafting engine traces the widths its controller chooses each round into its log."""
+        env = super().environment()
+        if self.drafting is not None:
+            env[DRAFT_WIDTH_TRACE] = "1"
+        return env
 
     async def prepare(self):
         binary = self.magnitude.binary

@@ -424,6 +424,8 @@ def write_result(
     if magnitude:
         drafting = record.drafting(rows, "magnitude")
         if drafting is not None:
+            blocks = {row["block"] for row in records if row["target"] == "magnitude"}
+            drafting["rounds"] = record.block_draft_rounds(store.path / "logs", blocks)
             measurements["drafting"] = drafting
         trace = store.path / record.TUNING_TRACE
         if trace.is_file():

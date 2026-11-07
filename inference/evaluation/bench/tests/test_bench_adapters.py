@@ -5,6 +5,7 @@ from magnitude_bench.adapters import ADAPTERS
 from magnitude_bench.adapters.omlx_native import instrumentation
 from magnitude_bench.models import Acquisition, Drafter, Target, prepare
 from magnitude_bench.options import EngineOptions, LlamaOptions, MagnitudeOptions, SourceBuild
+from magnitude_bench.record import DRAFT_WIDTH_TRACE
 from magnitude_bench.store import RunStore
 
 
@@ -102,9 +103,12 @@ def test_magnitude_serves_the_catalog_drafter_and_the_run_tuning(
     assert flag(argv, "--method") == "mtp" and "--draft" not in argv
     assert "--tuning-budget" not in argv and "--fresh-tuning" not in argv
 
+    # A drafting engine traces its controller's widths into its log; a plain one doesn't.
+    assert adapter.environment()[DRAFT_WIDTH_TRACE] == "1"
     plain = make("magnitude", artifact_path, tmp_path, acquisition, EngineOptions(drafting=False))
     argv = plain.argv(1234, 8192, 1, tmp_path)
     assert flag(argv, "--method") == "plain" and "--draft" not in argv
+    assert DRAFT_WIDTH_TRACE not in plain.environment()
     without = acquisition.model_copy(update={"drafter": None})
     argv = make("magnitude", artifact_path, tmp_path, without).argv(1234, 8192, 1, tmp_path)
     assert flag(argv, "--method") == "plain"
