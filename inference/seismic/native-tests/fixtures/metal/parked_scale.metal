@@ -3,12 +3,10 @@
 // fences, then scales `x` by it.
 
 #pragma METAL internals : enable
-#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
-#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
-#endif
 
+// Metal's system memory scope (AIR scope 3).
 constant metal::thread_scope system_scope =
-    static_cast<metal::thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+    static_cast<metal::thread_scope>(3);
 
 // Spins before the kernel stops waiting: a bound, so an unanswered park ends
 // the launch (and the test fails on its result) rather than holding the

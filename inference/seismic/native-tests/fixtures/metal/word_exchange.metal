@@ -4,12 +4,10 @@
 // shared storage alone does not order a host write before a device read.
 
 #pragma METAL internals : enable
-#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
-#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
-#endif
 
+// Metal's system memory scope (AIR scope 3).
 constant metal::thread_scope system_scope =
-    static_cast<metal::thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+    static_cast<metal::thread_scope>(3);
 
 inline void system_fence() {
     metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst,
