@@ -546,7 +546,10 @@ mod tests {
                         let bits = |values: &[f32]| values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
                         assert_eq!(bits(&values), bits(&expected), "{name} {tier:?} k {k} row {row}");
                     }
-                    for block in ROW_BLOCKS.into_iter().filter(|_| int8(name)) {
+                    if !int8(name) {
+                        continue;
+                    }
+                    for block in ROW_BLOCKS {
                         for first in (0..rows - block + 1).step_by(block) {
                             let (mut out, mut expected) = (vec![0.0f32; block], vec![0.0f32; block]);
                             unsafe {

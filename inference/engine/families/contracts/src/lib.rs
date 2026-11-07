@@ -114,7 +114,7 @@ impl WeightDescriptor {
     /// shape.
     pub fn transformed_shape(&self, stored: &[u64]) -> Result<Vec<u64>, DefinitionError> {
         let mut shape = stored.to_vec();
-        for (index, transform) in self.transforms.iter().enumerate() {
+        for transform in &self.transforms {
             let axis = row_axis(&shape).ok_or_else(|| {
                 DefinitionError::new(format!("{:?} has no row axis to transform", self.name))
             })?;
@@ -180,28 +180,10 @@ impl WeightDescriptor {
                             self.name
                         )));
                     }
-                    if index != 0 {
+                    if !ImportTransform::tiles(&shape, *tile) {
                         return Err(DefinitionError::new(format!(
-                            "the scale grid of {:?} scales it as stored: its first transform",
+                            "{:?} {shape:?} is no matrix of whole power-of-two {tile:?} tiles",
                             self.name
-                        )));
-                    }
-                    let tiled = match shape[..] {
-                        [rows, columns] => {
-                            tile[0] != 0
-                                && tile[1].is_multiple_of(ImportTransform::GRID_BLOCK)
-                                && tile[1] != 0
-                                && rows.is_multiple_of(tile[0])
-                                && columns.is_multiple_of(tile[1])
-                        }
-                        _ => false,
-                    };
-                    if !tiled {
-                        return Err(DefinitionError::new(format!(
-                            "{:?} {shape:?} is no matrix of whole {tile:?} tiles of whole \
-                             {}-value row blocks",
-                            self.name,
-                            ImportTransform::GRID_BLOCK
                         )));
                     }
                 }
@@ -265,11 +247,10 @@ pub enum ImportTransform {
     },
     /// Read the stored matrix (of single-value blocks) under the stored
     /// grid `tensor` of block scales: one scale of `codes` per `tile`
-    /// (`[rows, columns]`, columns a multiple of [`Self::GRID_BLOCK`]) of
-    /// the matrix, the grid shaped `[rows / tile[0], columns / tile[1]]`.
-    /// The importer places each tile's scale beside each
-    /// [`Self::GRID_BLOCK`] values of its rows, which replicates it exactly,
-    /// so the transform scales the tensor as stored: its descriptor's first.
+    /// (`[rows, columns]`, [`Self::tiles`]) of the matrix, the grid shaped
+    /// `[rows / tile[0], columns / tile[1]]`. The importer places each
+    /// tile's scale beside each block of its rows' values, which replicates
+    /// it exactly.
     ScaleBlocks {
         tensor: String,
         tile: [u64; 2],
@@ -284,8 +265,46 @@ pub enum ImportTransform {
 }
 
 impl ImportTransform {
-    /// The values of a row one placed block scale scales (OCP MX's block).
-    pub const GRID_BLOCK: u64 = 32;
+    /// The tile a stored grid `grid` of block scales gives a `shape` matrix,
+    /// when the grid tiles it ([`Self::tiles`]): `[rows / g, columns / h]`
+    /// for a `[g, h]` grid dividing it exactly.
+    pub fn grid_tile(shape: &[u64], grid: &[u64]) -> Option<[u64; 2]> {
+        let (&[rows, columns], &[grid_rows, grid_columns]) = (shape, grid) else {
+            return None;
+        };
+        if grid_rows == 0
+            || grid_columns == 0
+            || !rows.is_multiple_of(grid_rows)
+            || !columns.is_multiple_of(grid_columns)
+        {
+            return None;
+        }
+        let tile = [rows / grid_rows, columns / grid_columns];
+        Self::tiles(shape, tile).then_some(tile)
+    }
+
+    /// Whether `tile` tiles a `shape` matrix exactly, each extent a power of
+    /// two dividing the matrix's.
+    ///
+    /// A file stores no tile, only its grid, so the tile is inferred from
+    /// the shapes, and this rule is what makes the inferred tile the true
+    /// one. Producers tile by powers of two, `T`, with `g = ceil(n / T)`
+    /// tiles over an extent `n`; the inferred `t = n / g` is admitted only
+    /// when `g` divides `n` and `t` is a power of two. If `t < T`, then
+    /// `t <= T / 2`, so `n = g t <= g T / 2`, while `n > (g - 1) T`: that
+    /// holds only for `g = 1`, where every row (column) is in the one tile
+    /// under either. If `t > T`, then `t >= 2 T` and `n = g t >= 2 g T > n`.
+    /// So `t = T` whenever the extent has more than one tile, and a grid
+    /// over a partial last tile (`300 = 10 x 30`) is refused, not misread.
+    pub fn tiles(shape: &[u64], tile: [u64; 2]) -> bool {
+        let &[rows, columns] = shape else {
+            return false;
+        };
+        tile[0].is_power_of_two()
+            && tile[1].is_power_of_two()
+            && rows.is_multiple_of(tile[0])
+            && columns.is_multiple_of(tile[1])
+    }
 }
 
 /// The codes of a stored block-scale grid (`ImportTransform::ScaleBlocks`),
@@ -1476,5 +1495,37 @@ mod tests {
             }],
         };
         assert_eq!(scaled.transformed_shape(&[2, 4, 8]).unwrap(), [2, 4, 8]);
+    }
+
+    /// A grid gives a tile only when it divides the matrix into power-of-two
+    /// tiles: a partial last tile (300 rows in tiles of 32, 10 grid rows)
+    /// or a non-power-of-two inferred tile (192 rows in tiles of 128, 2 grid
+    /// rows, inferred 96) is refused rather than misread.
+    #[test]
+    fn a_scale_grid_tiles_only_by_exact_powers_of_two() {
+        assert_eq!(ImportTransform::grid_tile(&[64, 256], &[2, 8]), Some([32, 32]));
+        assert_eq!(ImportTransform::grid_tile(&[64, 256], &[64, 8]), Some([1, 32]));
+        assert_eq!(ImportTransform::grid_tile(&[64, 256], &[1, 2]), Some([64, 128]));
+        for (shape, grid) in [
+            ([300, 4096], [10, 128]),
+            ([192, 256], [2, 8]),
+            ([8, 64], [3, 2]),
+            ([64, 256], [0, 8]),
+        ] {
+            assert_eq!(ImportTransform::grid_tile(&shape, &grid), None, "{shape:?} {grid:?}");
+        }
+        assert_eq!(ImportTransform::grid_tile(&[64, 256, 1], &[2, 8]), None);
+        let tiled = |tile| WeightDescriptor {
+            name: "w".into(),
+            shape: vec![64, 256],
+            transforms: vec![ImportTransform::ScaleBlocks {
+                tensor: "w.scale".into(),
+                tile,
+                codes: ScaleCodes::Ue8m0,
+            }],
+        };
+        assert_eq!(tiled([32, 32]).transformed_shape(&[64, 256]).unwrap(), [64, 256]);
+        assert!(tiled([16, 48]).transformed_shape(&[64, 256]).is_err());
+        assert!(tiled([0, 32]).transformed_shape(&[64, 256]).is_err());
     }
 }

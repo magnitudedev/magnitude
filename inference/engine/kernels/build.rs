@@ -329,12 +329,18 @@ fn gguf_format_tests(out: &Path) {
             .into_iter()
             .flat_map(|encoding| [GgufScales::Own, GgufScales::E8m0Grid].map(|scales| (encoding, scales)))
         {
-            let (block, suffix) = match scales {
-                GgufScales::Own => (encoding.block_elements(), ""),
-                GgufScales::E8m0Grid => (GgufScales::GRID_BLOCK, "_e8m0"),
-            };
-            let Some(source) = registry::gguf_source(encoding, scales, block) else {
+            let Some(source) = registry::gguf_packet_source(encoding, scales) else {
                 continue;
+            };
+            let registry::RepresentationKind::External(packet) =
+                &registry::representation_info(source).kind
+            else {
+                unreachable!("a GGUF source is external storage")
+            };
+            let block = u64::from(packet.logical_group);
+            let suffix = match scales {
+                GgufScales::Own => "",
+                GgufScales::E8m0Grid => "_e8m0",
             };
             for operands in OperandRecipe::ALL {
                 let Some(element) = registry::conversion_destination(source, layout, operands)

@@ -701,12 +701,17 @@ mod tests {
         }
     }
 
+    /// Whether packed-rows storage `id`'s value codes are all integers of
+    /// `i8`, which an int8 form multiplies (mxfp8g32's E4M3 codes are not).
+    fn codes_fit_i8(id: crate::ids::RepresentationId) -> bool {
+        registry::decode_axes(id).is_some_and(|axes| axes.profile().codes.fits_i8())
+    }
+
     /// CUDA's int8 GEMM admission of every representation it imports: main's
     /// library took the INT8 path for every packed weight whose products do
     /// not take NVFP4 operand rows (`projection::quantizable`), and so does
     /// the admission, of every packed-rows representation of the registry
-    /// but mxfp8g32, which main did not have and whose E4M3 codes are no
-    /// integers of `i8`.
+    /// whose codes fit `i8` (every one main had).
     #[test]
     fn cuda_int8_is_mains() {
         let admitted = [
@@ -724,7 +729,7 @@ mod tests {
         for info in registry::representations() {
             let main = match info.kind {
                 registry::RepresentationKind::PackedRows(_) => {
-                    u32::from(info.operands != OperandRecipe::Nvfp4Rows && info.representation != "mxfp8g32")
+                    u32::from(info.operands != OperandRecipe::Nvfp4Rows && codes_fit_i8(info.id))
                 }
                 _ => 0,
             };
@@ -751,9 +756,9 @@ mod tests {
     /// projections quantized their activations for every weight with a CPU
     /// component, the floating dense elements and every packed-rows decode,
     /// except one whose products take NVFP4 operand rows, whose quantized
-    /// rows they dropped for the F32 dot (`projection::project_arithmetic`);
-    /// and mxfp8g32, which main did not have and whose E4M3 codes are no
-    /// integers of `i8`, takes the F32 dot.
+    /// rows they dropped for the F32 dot (`projection::project_arithmetic`),
+    /// and one whose codes do not fit `i8` (none main had), which takes the
+    /// F32 dot too.
     #[test]
     fn cpu_int8_is_mains() {
         let admitted = [
@@ -796,7 +801,7 @@ mod tests {
             let main = match info.kind {
                 registry::RepresentationKind::Dense(dtype) => matches!(dtype, DType::F32 | DType::BF16 | DType::F16),
                 registry::RepresentationKind::PackedRows(_) => {
-                    info.operands != OperandRecipe::Nvfp4Rows && info.representation != "mxfp8g32"
+                    info.operands != OperandRecipe::Nvfp4Rows && codes_fit_i8(info.id)
                 }
                 _ => false,
             };

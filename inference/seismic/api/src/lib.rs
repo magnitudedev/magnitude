@@ -585,6 +585,14 @@ impl Element {
     ) -> Option<Element> {
         seismic_lang::registry::gguf_source(encoding, scales, width).map(Element)
     }
+    /// The registered source of `encoding` scaled as `scales` says,
+    /// whatever its rows' width.
+    pub fn gguf_packet_source(
+        encoding: magnitude_ggml::Encoding,
+        scales: GgufScales,
+    ) -> Option<Element> {
+        seismic_lang::registry::gguf_packet_source(encoding, scales).map(Element)
+    }
     /// Every external (artifact-format) storage the registry converts from.
     pub fn external_sources() -> impl Iterator<Item = Element> {
         seismic_lang::registry::representations()

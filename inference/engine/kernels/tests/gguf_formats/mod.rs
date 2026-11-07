@@ -73,16 +73,13 @@ impl Format {
     /// The registry's source of this format's GGUF blocks (assembled
     /// blocks, under a scale grid).
     pub fn source(self) -> Element {
-        Element::gguf_source(self.encoding, self.scales, self.packet_values())
+        Element::gguf_packet_source(self.encoding, self.scales)
             .unwrap_or_else(|| panic!("{:?} {:?}: no registered GGUF source", self.encoding, self.scales))
     }
     /// The values of one source packet: a block of the type, or an
     /// assembled grid block.
     fn packet_values(self) -> u64 {
-        match self.scales {
-            GgufScales::Own => self.encoding.block_elements(),
-            GgufScales::E8m0Grid => GgufScales::GRID_BLOCK,
-        }
+        self.source().logical_group().expect("a source has packets")
     }
     /// This format's element in `layout`.
     pub fn element(self, layout: Layout) -> Element {
@@ -225,8 +222,7 @@ impl Format {
         })
     }
     fn converted(self, layout: Layout) -> Option<Element> {
-        Element::gguf_source(self.encoding, self.scales, self.packet_values())?
-            .converted(layout, self.operands)
+        Element::gguf_packet_source(self.encoding, self.scales)?.converted(layout, self.operands)
     }
     /// This format's element in a layout the registry converts it into.
     fn stored(self) -> Option<Element> {

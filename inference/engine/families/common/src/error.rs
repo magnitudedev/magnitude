@@ -140,9 +140,9 @@ pub enum CompanionForm {
     /// One F32 value per matrix (of `matrices`).
     PerMatrix { matrices: u64 },
     /// An F8_E4M3 `[rows, columns]` matrix's grid of UE8M0 block scales:
-    /// I8 `[rows / r, columns / c]` for whole tiles `[r, c]` of whole
-    /// `ImportTransform::GRID_BLOCK`-value row blocks, the file declaring
-    /// `magnitude.scale_encoding = "ue8m0"`.
+    /// I8 `[rows / r, columns / c]` for the power-of-two tiles `[r, c]` it
+    /// divides the matrix into (`ImportTransform::grid_tile`), the file
+    /// declaring `magnitude.scale_encoding = "ue8m0"`.
     Ue8m0Grid { rows: u64, columns: u64 },
 }
 
@@ -152,9 +152,8 @@ impl fmt::Display for CompanionForm {
             Self::PerMatrix { matrices } => write!(formatter, "F32 [{matrices}]"),
             Self::Ue8m0Grid { rows, columns } => write!(
                 formatter,
-                "an I8 grid of whole tiles of whole {}-value row blocks of [{rows}, {columns}], \
+                "an I8 grid dividing [{rows}, {columns}] into power-of-two tiles, \
                  declared `{}` = {:?}",
-                magnitude_family_contracts::ImportTransform::GRID_BLOCK,
                 crate::tensors::SCALE_ENCODING,
                 crate::tensors::UE8M0,
             ),

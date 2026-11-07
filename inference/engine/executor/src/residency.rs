@@ -24,7 +24,7 @@ use magnitude_artifacts::{
 };
 use magnitude_family_contracts::{ScaleCodes, WeightDescriptor, WeightRole};
 use seismic::{
-    DType, Device, Element, GgufScales, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission,
+    DType, Device, Element, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission,
 };
 use std::{
     cell::RefCell,
@@ -118,13 +118,14 @@ impl StoredTensor {
     }
 }
 
-/// A validated byte range of a stored grid of block scales
-/// (`ImportTransform::ScaleBlocks`), one byte a tile.
+/// The byte range of a stored grid of block scales
+/// (`ImportTransform::ScaleBlocks`), one code of `codes` a tile.
 #[derive(Clone, Debug)]
 pub struct StoredGrid {
     pub source: Arc<FileSource>,
     pub offset: u64,
     pub nbytes: u64,
+    pub codes: ScaleCodes,
 }
 
 impl StoredGrid {
@@ -213,55 +214,45 @@ impl Stored {
         }
     }
 
-    /// Where the stored values' scales are.
-    pub fn scales(&self) -> GgufScales {
-        match self.grid() {
-            Some(_) => GgufScales::E8m0Grid,
-            None => GgufScales::Own,
-        }
-    }
-
     pub fn source_element(&self) -> Option<Element> {
         match self {
             Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
             Self::GgmlBlocks {
-                encoding, shape, ..
+                encoding,
+                shape,
+                grid,
+                ..
             } => crate::planning::scaled_source_element(
                 *encoding,
-                self.scales(),
+                crate::import_transforms::scales_of(grid.as_ref().map(|grid| grid.codes)),
                 shape.last().copied().unwrap_or(1),
             ),
         }
     }
 
     /// The stored tensor `descriptor` names, with its grid of block scales
-    /// where it names one: UE8M0 bytes, stored as I8.
+    /// where it names one (bound and admitted with the weight,
+    /// `Tensors::companion_scale`).
     pub fn from_gguf(
         artifact: &GgufArtifact,
         descriptor: &WeightDescriptor,
     ) -> Result<Self, WeightImportError> {
         let grid = crate::import_transforms::grid(descriptor)
-            .map(|(name, _, ScaleCodes::Ue8m0)| {
+            .map(|(name, _, codes)| {
                 let grid = artifact.tensor(name)?;
-                if grid.encoding != Encoding::I8 {
-                    return Err(invalid(format!(
-                        "scale grid {name:?} of {:?} is {:?}, not UE8M0 bytes",
-                        descriptor.name, grid.encoding
-                    )));
-                }
-                Ok(StoredGrid {
+                Ok::<_, WeightImportError>(StoredGrid {
                     source: grid.source,
                     offset: grid.offset,
                     nbytes: grid.nbytes,
+                    codes,
                 })
             })
             .transpose()?;
         let tensor = artifact.tensor(&descriptor.name)?;
         match tensor.encoding {
-            Encoding::F32 | Encoding::F16 | Encoding::BF16 if grid.is_some() => Err(invalid(
-                format!("dense weight {:?} has no scale grid", descriptor.name),
-            )),
-            Encoding::F32 | Encoding::F16 | Encoding::BF16 => Ok(Self::Dense(StoredTensor {
+            Encoding::F32 | Encoding::F16 | Encoding::BF16 => {
+                assert!(grid.is_none(), "an admitted dense weight {:?} has no scale grid", descriptor.name);
+                Ok(Self::Dense(StoredTensor {
                 source: tensor.source,
                 offset: tensor.offset,
                 nbytes: tensor.nbytes,
@@ -272,7 +263,8 @@ impl Stored {
                     _ => unreachable!("dense encoding was matched above"),
                 },
                 shape: tensor.shape,
-            })),
+                }))
+            }
             encoding => Ok(Self::GgmlBlocks {
                 source: tensor.source,
                 offset: tensor.offset,

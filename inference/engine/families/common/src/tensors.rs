@@ -168,9 +168,9 @@ impl<'a> Tensors<'a> {
 
     /// Binds `scale` as the grid of UE8M0 block scales of the F8_E4M3
     /// matrix `weight` (`ImportTransform::ScaleBlocks`): I8 `[rows / r,
-    /// columns / c]` for whole tiles `[r, c]` of whole
-    /// `ImportTransform::GRID_BLOCK`-value row blocks (DeepSeek's 32×32,
-    /// a table's 1×32), in a file declaring [`SCALE_ENCODING`] =
+    /// columns / c]` for the tiles `[r, c]` it tiles the matrix by
+    /// (`ImportTransform::grid_tile`; DeepSeek's 128×128, a table's 1×32),
+    /// in a file declaring [`SCALE_ENCODING`] =
     /// [`UE8M0`], since an I8 tensor's bytes are codes only by that
     /// declaration. Any other scale is refused, naming it.
     fn scale_grid(
@@ -186,27 +186,14 @@ impl<'a> Tensors<'a> {
         };
         let declared =
             self.directory.value(SCALE_ENCODING).and_then(|value| value.string()) == Some(UE8M0);
-        let tile = match scale.shape[..] {
-            [grid_rows, grid_columns]
-                if declared
-                    && scale.encoding == Encoding::I8
-                    && grid_rows != 0
-                    && grid_columns != 0
-                    && rows.is_multiple_of(grid_rows)
-                    && columns.is_multiple_of(grid_columns)
-                    && (columns / grid_columns).is_multiple_of(ImportTransform::GRID_BLOCK) =>
-            {
-                [rows / grid_rows, columns / grid_columns]
-            }
-            _ => {
-                return Err(HeaderError::CompanionScale {
-                    name: scale.name.clone(),
-                    expected: CompanionForm::Ue8m0Grid { rows, columns },
-                    encoding: scale.encoding,
-                    shape: scale.shape.clone(),
-                });
-            }
-        };
+        let tile = ImportTransform::grid_tile(&weight.shape, &scale.shape)
+            .filter(|_| declared && scale.encoding == Encoding::I8)
+            .ok_or_else(|| HeaderError::CompanionScale {
+                name: scale.name.clone(),
+                expected: CompanionForm::Ue8m0Grid { rows, columns },
+                encoding: scale.encoding,
+                shape: scale.shape.clone(),
+            })?;
         self.bound.insert(scale.name.as_str());
         Ok(ImportTransform::ScaleBlocks {
             tensor: scale.name.clone(),
@@ -243,9 +230,15 @@ mod tests {
     const WEIGHT: &str = "blk.0.attn_q_b.weight";
     const SCALE: &str = "blk.0.attn_q_b.scale";
 
-    /// A file of an F8_E4M3 `[64, 256]` weight and, when `scale` gives it,
+    const SHAPE: [u64; 2] = [64, 256];
+
+    /// A file of an F8_E4M3 [`SHAPE`] weight and, when `scale` gives it,
     /// its `.scale`, declaring `declared` as its scale encoding.
     fn directory(declared: Option<&str>, scale: Option<(Encoding, Vec<u64>)>) -> Directory {
+        shaped(SHAPE, declared, scale)
+    }
+
+    fn shaped(weight: [u64; 2], declared: Option<&str>, scale: Option<(Encoding, Vec<u64>)>) -> Directory {
         let tensor = |name: &str, shape: Vec<u64>, encoding| TensorDescriptor {
             name: name.into(),
             shape,
@@ -265,7 +258,7 @@ mod tests {
                 })
                 .into_iter()
                 .collect(),
-            tensors: std::iter::once(tensor(WEIGHT, vec![64, 256], Encoding::F8E4M3))
+            tensors: std::iter::once(tensor(WEIGHT, weight.to_vec(), Encoding::F8E4M3))
                 .chain(scale.map(|(encoding, shape)| tensor(SCALE, shape, encoding)))
                 .collect(),
         }
@@ -276,7 +269,7 @@ mod tests {
         for (shape, tile) in [(vec![2, 8], [32, 32]), (vec![64, 8], [1, 32]), (vec![1, 2], [64, 128])] {
             let directory = directory(Some(UE8M0), Some((Encoding::I8, shape)));
             let mut tensors = Tensors::new(&directory);
-            let weight = tensors.bind_scaled(WEIGHT, &[64, 256]).unwrap();
+            let weight = tensors.bind_scaled(WEIGHT, &SHAPE).unwrap();
             assert_eq!(
                 weight.transforms,
                 [ImportTransform::ScaleBlocks { tensor: SCALE.into(), tile, codes: ScaleCodes::Ue8m0 }]
@@ -285,9 +278,9 @@ mod tests {
         }
     }
 
-    /// An undeclared or otherwise declared I8 grid, a grid that is not whole
-    /// tiles of whole 32-value blocks, an F32 scale, and no scale at all are
-    /// each refused, naming the tensor.
+    /// An undeclared or otherwise declared I8 grid, a grid that does not
+    /// divide the matrix into power-of-two tiles, an F32 scale, and no scale
+    /// at all are each refused, naming the tensor.
     #[test]
     fn any_other_scale_of_an_f8_e4m3_weight_is_refused_naming_it() {
         for (declared, scale) in [
@@ -296,13 +289,24 @@ mod tests {
             (Some(UE8M0), Some((Encoding::F32, vec![2, 8]))),
             (Some(UE8M0), Some((Encoding::F32, vec![1]))),
             (Some(UE8M0), Some((Encoding::I8, vec![3, 8]))),
-            (Some(UE8M0), Some((Encoding::I8, vec![2, 16]))),
             (Some(UE8M0), Some((Encoding::I8, vec![2, 8, 1]))),
             (Some(UE8M0), Some((Encoding::I8, vec![0, 8]))),
             (Some(UE8M0), None),
         ] {
             let directory = directory(declared, scale);
-            let error = Tensors::new(&directory).bind_scaled(WEIGHT, &[64, 256]).unwrap_err();
+            let error = Tensors::new(&directory).bind_scaled(WEIGHT, &SHAPE).unwrap_err();
+            assert!(error.to_string().contains(SCALE), "{error}");
+        }
+    }
+
+    /// A grid whose inferred tile could be wrong is refused, naming it:
+    /// `[300, 4096]` under `[10, 128]` (a partial last 32-row tile, inferred
+    /// 30) and `[192, 256]` under `[2, 8]` (128-row tiles, inferred 96).
+    #[test]
+    fn a_grid_inferring_no_power_of_two_tile_is_refused_naming_it() {
+        for (weight, grid) in [([300, 4096], vec![10, 128]), ([192, 256], vec![2, 8])] {
+            let directory = shaped(weight, Some(UE8M0), Some((Encoding::I8, grid)));
+            let error = Tensors::new(&directory).bind_scaled(WEIGHT, &weight).unwrap_err();
             assert!(error.to_string().contains(SCALE), "{error}");
         }
     }

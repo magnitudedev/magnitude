@@ -18,10 +18,6 @@ use magnitude_family_contracts::{
 };
 use seismic::{Element, GgufScales};
 
-// The block a definition's grid tiles are whole multiples of is the block
-// the registry's assembled source packet holds.
-const _: () = assert!(ImportTransform::GRID_BLOCK == GgufScales::GRID_BLOCK);
-
 /// Whether the importer can apply `descriptor`'s transforms to a tensor
 /// stored as `source` with `stored` shape, making the shape `descriptor`
 /// declares: [`admit_transforms`], checked against it.
@@ -59,6 +55,18 @@ pub(crate) fn admit_transforms(
                     "{:?}: scale grid {tensor:?} scales the tensor as stored, so it is its \
                      first transform",
                     descriptor.name
+                ));
+            }
+            // Each assembled block is one packet of the source: a tile's
+            // columns are whole packets of its values.
+            ImportTransform::ScaleBlocks { tensor, tile, .. }
+                if source.logical_group().is_none_or(|block| !tile[1].is_multiple_of(block)) =>
+            {
+                return Err(format!(
+                    "{:?}: scale grid {tensor:?} tiles it by {tile:?}, whose columns are no \
+                     whole packets of {}",
+                    descriptor.name,
+                    source.name()
                 ));
             }
             ImportTransform::Rows(_) | ImportTransform::PermuteRows { .. }
@@ -171,12 +179,9 @@ pub(crate) fn apply(
     let mut shape = stored.to_vec();
     for transform in &descriptor.transforms {
         match transform {
-            ImportTransform::ScaleBlocks { tensor, tile, .. } => {
-                let grid = grid.ok_or_else(|| {
-                    format!("{:?}: scale grid {tensor:?} was not read", descriptor.name)
-                })?;
-                bytes = assemble_grid(&bytes, grid, &shape, *tile)
-                    .map_err(|error| format!("{:?}: {error}", descriptor.name))?;
+            ImportTransform::ScaleBlocks { tile, .. } => {
+                let grid = grid.expect("a weight under a scale grid is stored with it");
+                bytes = assemble_grid(source, &bytes, grid, &shape, *tile)?;
             }
             ImportTransform::Rows(range) => {
                 let rows = RowLayout::of(&shape, source)?;
@@ -260,8 +265,14 @@ pub(crate) fn upload_bytes(
 /// (`seismic::GgufScales`): in its stored tensor's own blocks, or in its
 /// grid of UE8M0 block scales.
 pub(crate) fn stored_scales(descriptor: &WeightDescriptor) -> GgufScales {
-    match grid(descriptor) {
-        Some((_, _, ScaleCodes::Ue8m0)) => GgufScales::E8m0Grid,
+    scales_of(grid(descriptor).map(|(_, _, codes)| codes))
+}
+
+/// Where the scales of stored blocks are, under a grid of `grid` codes when
+/// they have one.
+pub(crate) fn scales_of(grid: Option<ScaleCodes>) -> GgufScales {
+    match grid {
+        Some(ScaleCodes::Ue8m0) => GgufScales::E8m0Grid,
         None => GgufScales::Own,
     }
 }
@@ -283,28 +294,29 @@ pub(crate) fn grid(descriptor: &WeightDescriptor) -> Option<(&str, [u64; 2], Sca
         })
 }
 
-/// The blocks of a `[rows, columns]` matrix of one-byte codes `codes` under
-/// its `[rows / tile[0], columns / tile[1]]` grid of one-byte block scales
-/// `grid` (`GgufScales::E8m0Grid`): per row, per
-/// `ImportTransform::GRID_BLOCK` values, their tile's scale, then their
-/// codes. Every byte is the stored one, so the source holds the stored
-/// values exactly, NaN codes and scales included.
-fn assemble_grid(codes: &[u8], grid: &[u8], shape: &[u64], tile: [u64; 2]) -> Result<Vec<u8>, String> {
+/// The blocks of `source` (`GgufScales::E8m0Grid`) of a `[rows, columns]`
+/// matrix of one-byte codes `codes` under its `[rows / tile[0], columns /
+/// tile[1]]` grid of one-byte block scales `grid`: per row, per packet of
+/// the source's values, their tile's scale, then their codes. Every byte is
+/// the stored one, so the source holds the stored values exactly, NaN codes
+/// and scales included. The plan admitted the tiling (`admit_transforms`)
+/// and the stored bytes, so any other geometry is an invariant violation.
+fn assemble_grid(
+    source: Element,
+    codes: &[u8],
+    grid: &[u8],
+    shape: &[u64],
+    tile: [u64; 2],
+) -> Result<Vec<u8>, String> {
     let &[rows, columns] = shape else {
-        return Err(format!("a scale grid scales a matrix, not {shape:?}"));
+        unreachable!("an admitted scale grid scales a matrix, not {shape:?}");
     };
     let (rows, columns) = (to_usize(rows)?, to_usize(columns)?);
     let (tile_rows, tile_columns) = (to_usize(tile[0])?, to_usize(tile[1])?);
-    let block = to_usize(ImportTransform::GRID_BLOCK)?;
+    let block = to_usize(source.logical_group().expect("a grid source has packets"))?;
     let grid_columns = columns / tile_columns;
-    if codes.len() != rows * columns || grid.len() != rows / tile_rows * grid_columns {
-        return Err(format!(
-            "{} code and {} scale bytes are not a [{rows}, {columns}] matrix under its \
-             {tile:?} tiles",
-            codes.len(),
-            grid.len()
-        ));
-    }
+    assert_eq!(codes.len(), rows * columns, "the admitted codes of a {shape:?} matrix");
+    assert_eq!(grid.len(), rows / tile_rows * grid_columns, "the admitted grid of {tile:?} tiles");
     let mut blocks = Vec::with_capacity(rows * columns / block * (block + 1));
     for (row, codes) in codes.chunks_exact(columns).enumerate() {
         let scales = &grid[row / tile_rows * grid_columns..][..grid_columns];
