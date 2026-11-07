@@ -3,6 +3,9 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    // Every input is a variable Cargo sets for the unit (`TARGET`, `PROFILE`,
+    // `RUSTC`), whose change already rebuilds it; the script reads no file.
+    println!("cargo:rerun-if-changed=build.rs");
     emit(
         "SERVICE_BUILD_TARGET",
         &env::var("TARGET").expect("TARGET must be set"),

@@ -325,6 +325,9 @@ fn body(text: &mut String, words: &[String]) {
 }
 
 fn main() {
+    // The tables come from the build dependency `magnitude_ggml`, whose
+    // changes Cargo tracks itself; the script reads no file.
+    println!("cargo:rerun-if-changed=build.rs");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     for dialect in DIALECTS {
         let mut text = format!(

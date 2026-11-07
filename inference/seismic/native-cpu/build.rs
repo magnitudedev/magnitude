@@ -138,6 +138,9 @@ fn packed(id: seismic_lang::ids::RepresentationId, storage: u32) -> String {
 }
 
 fn main() {
+    // The registry comes from the build dependency `seismic_lang`, whose
+    // changes Cargo tracks itself; the script reads no file.
+    println!("cargo:rerun-if-changed=build.rs");
     let mut components: Vec<String> = Vec::new();
     let mut component_of: Vec<Option<usize>> = Vec::new();
     for info in registry::representations() {
