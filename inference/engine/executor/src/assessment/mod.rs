@@ -21,7 +21,7 @@ pub mod launches;
 pub use assess::{
     assess_execution_fit, decode_pricing, estimate_execution, prepare_execution_assessment,
     AssessmentRequest, DomainFit, ExecutionAssessment, ExecutionFit, ExecutionShortfall,
-    PreparedExecutionAssessment,
+    MemoryBreakdown, PreparedExecutionAssessment,
 };
 pub use demand::{Bytes, Call, DecodeDemand, Experts, Flops, HistoryRead, Work};
 pub use estimate::{

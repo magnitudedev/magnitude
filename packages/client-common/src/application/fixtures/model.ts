@@ -64,6 +64,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
           domains: [],
           totalRequiredBytes: 0,
           requiredSystemMemoryBytes: 0,
+          breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
         },
         performance: {
           _tag: "Estimated",
@@ -131,7 +132,7 @@ export const makeFoundModel = (
       served: { contextLength: 32_768 },
       assessmentId: ModelAssessmentIdSchema.make("found-assessment"),
       environmentId: AssessmentEnvironmentIdSchema.make("setup-environment"),
-      memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
+      memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 } },
       performance: {
         _tag: "Estimated",
         samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 40 }],

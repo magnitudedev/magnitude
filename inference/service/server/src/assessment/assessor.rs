@@ -25,7 +25,7 @@ use magnitude_executor::assessment::{
 };
 use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, DrafterVerdict, InstalledModelPackages as _, KernelStatic,
-    KnownUnsupportedReason, MemoryAssessment, ModelAssessment, ModelAssessmentId,
+    KnownUnsupportedReason, MemoryAssessment, MemoryBreakdown, ModelAssessment, ModelAssessmentId,
     ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
     ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelServingConfiguration,
     PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle,
@@ -507,6 +507,7 @@ pub(crate) fn model_assessment(
                 ExecutionFit {
                     fit_context_tokens,
                     domains,
+                    breakdown,
                 },
             performance,
         } => ModelAssessment::Fits {
@@ -516,6 +517,11 @@ pub(crate) fn model_assessment(
             },
             assessment_id,
             memory: memory_assessments(&domains, environment),
+            memory_breakdown: MemoryBreakdown {
+                weights_bytes: breakdown.weights_bytes,
+                context_bytes: breakdown.context_bytes,
+                overhead_bytes: breakdown.overhead_bytes,
+            },
             performance: model_performance(performance, &performance_depths(fit_context_tokens))?,
             projector,
             drafter,

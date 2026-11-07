@@ -51,6 +51,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         domains: [],
         totalRequiredBytes: 0,
         requiredSystemMemoryBytes: 0,
+        breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
       },
       performance: {
         _tag: "Estimated",

@@ -308,7 +308,7 @@ mod tests {
     use super::*;
     use magnitude_service_contracts::MemoryDomainId;
     use magnitude_service_contracts::models::{
-        MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelPerformance,
+        MemoryAssessment, MemoryBreakdown, ModelAssessmentId, ModelCapabilities, ModelPerformance,
         ModelReasoningCapabilities, PerformanceEvidence, ServingProfile,
     };
 
@@ -400,6 +400,11 @@ mod tests {
                 compatibility_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
+            memory_breakdown: MemoryBreakdown {
+                weights_bytes: 30,
+                context_bytes: 10,
+                overhead_bytes: 10,
+            },
             performance: ModelPerformance::Estimated {
                 samples: vec![PerformanceEvidence {
                     context_tokens: 50_000,

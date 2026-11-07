@@ -7527,6 +7527,33 @@
         },
         "additionalProperties": false
       },
+      "MemoryBreakdown": {
+        "type": "object",
+        "description": "What a fitting model's required memory holds across every domain: its weights, the\nconversation's state at the served context, and everything else the load holds.",
+        "required": [
+          "weightsBytes",
+          "contextBytes",
+          "overheadBytes"
+        ],
+        "properties": {
+          "weightsBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "contextBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "overheadBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "MemoryDomainId": {
         "type": "string",
         "description": "Stable identity of one store, a place bytes live: `system` for host RAM, otherwise the\nstore's own identity (a device's memory by its physical device)."
@@ -7758,6 +7785,7 @@
               "served",
               "assessmentId",
               "memory",
+              "memoryBreakdown",
               "performance",
               "projector",
               "drafter",
@@ -7778,6 +7806,9 @@
                 "items": {
                   "$ref": "#/components/schemas/MemoryAssessment"
                 }
+              },
+              "memoryBreakdown": {
+                "$ref": "#/components/schemas/MemoryBreakdown"
               },
               "performance": {
                 "$ref": "#/components/schemas/ModelPerformance"

@@ -3111,6 +3111,11 @@ mod tests {
                 "assessment".to_owned(),
             ),
             memory: Vec::new(),
+            memory_breakdown: magnitude_service_contracts::models::MemoryBreakdown {
+                weights_bytes: 0,
+                context_bytes: 0,
+                overhead_bytes: 0,
+            },
             performance: magnitude_service_contracts::models::ModelPerformance::Pending,
             projector: magnitude_service_contracts::models::ProjectorVerdict::None,
             drafter: DrafterVerdict::Bound {
@@ -3911,7 +3916,8 @@ mod tests {
     #[tokio::test]
     async fn standard_models_list_the_served_context() {
         let ModelAssessment::Fits {
-            profile, served: _, assessment_id, memory, performance, projector, drafter,
+            profile, served: _, assessment_id, memory, memory_breakdown, performance, projector,
+            drafter,
         } = fits_assessment()
         else {
             unreachable!()
@@ -3923,6 +3929,7 @@ mod tests {
             },
             assessment_id,
             memory,
+            memory_breakdown,
             performance,
             projector,
             drafter,

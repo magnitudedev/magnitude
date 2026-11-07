@@ -267,6 +267,7 @@ describe("LocalModelSchema invariants", () => {
         served: { contextLength: 4096 },
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
+          breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
         },
         performance: {
           _tag: "Estimated",
@@ -299,6 +300,7 @@ describe("LocalModelSchema invariants", () => {
         served: { contextLength: 4096 },
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
+          breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
         },
         performance: {
           _tag: "Estimated",

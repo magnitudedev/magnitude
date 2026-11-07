@@ -54,6 +54,17 @@ pub struct DomainFit {
     pub remaining_bytes: i64,
 }
 
+/// What the standard workload's required bytes hold, summed across every
+/// domain the load touches: the weights, the conversation's state at the
+/// served context, and everything else the load holds (prepared programs and
+/// graphs, workspace, process bytes and the loading peak).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryBreakdown {
+    pub weights_bytes: u64,
+    pub context_bytes: u64,
+    pub overhead_bytes: u64,
+}
+
 /// Whether the standard workload fits, each verdict with its own evidence.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExecutionAssessment {
@@ -67,6 +78,7 @@ pub enum ExecutionAssessment {
 pub struct ExecutionFit {
     pub fit_context_tokens: u32,
     pub domains: Vec<DomainFit>,
+    pub breakdown: MemoryBreakdown,
 }
 
 /// The standard workload exceeds some domain at every served context;
@@ -265,14 +277,19 @@ pub fn assess_execution_fit(
     let device = planned_executor(draft, topology)?;
     let mut shortfall = None;
     for &fit_context_tokens in &request.served_contexts {
-        let fit = prepared
+        let charge = prepared
             .memory_charge_at(fit_context_tokens)
-            .and_then(|charge| charge.assess_fit(topology, device, status, &request.reserves))
+            .map_err(AssessmentError::Memory)?;
+        let fit = charge
+            .assess_fit(topology, device, status, &request.reserves)
             .map_err(AssessmentError::Memory)?;
         match fit.verdict {
             AssessmentFitVerdict::Fits => {
                 return Ok(ExecutionAssessment::Fits(ExecutionFit {
                     fit_context_tokens,
+                    breakdown: charge
+                        .breakdown(&fit.domains)
+                        .map_err(AssessmentError::Memory)?,
                     domains: fit.domains,
                 }));
             }
@@ -427,6 +444,7 @@ pub(crate) mod tests {
         let ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains,
+            breakdown,
         }) = assess(
             &environment,
             &request(150_000, &[25_000, 50_000, 50_000, 200_000]),
@@ -435,6 +453,11 @@ pub(crate) mod tests {
             panic!("the fixture fits every supported host");
         };
         assert_eq!(fit_context_tokens, 150_000);
+        assert!(breakdown.weights_bytes > 0 && breakdown.context_bytes > 0);
+        assert_eq!(
+            breakdown.weights_bytes + breakdown.context_bytes + breakdown.overhead_bytes,
+            domains.iter().map(|domain| domain.required_bytes).sum::<u64>()
+        );
         assert!(domains
             .iter()
             .any(|domain| domain.role == DomainRole::Allocation));

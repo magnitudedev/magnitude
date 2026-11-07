@@ -4086,6 +4086,11 @@ mod tests {
                 },
                 assessment_id: magnitude_service_contracts::models::ModelAssessmentId(String::new()),
                 memory: Vec::new(),
+                memory_breakdown: magnitude_service_contracts::models::MemoryBreakdown {
+                    weights_bytes: 0,
+                    context_bytes: 0,
+                    overhead_bytes: 0,
+                },
                 performance: magnitude_service_contracts::models::ModelPerformance::Pending,
                 projector: magnitude_service_contracts::models::ProjectorVerdict::None,
                 drafter: magnitude_service_contracts::models::DrafterVerdict::None,

@@ -16,7 +16,7 @@ use super::{
     ComponentSelection, ModelLoadPlan, PlannedMethod, ResourceLimits,
     weight_bytes_by_component,
 };
-use crate::assessment::DomainFit;
+use crate::assessment::{DomainFit, MemoryBreakdown};
 use crate::platform::{DomainRole, Fit, FitMode, StorageDemand};
 use crate::{AttestedPrograms, GraphError};
 use magnitude_family_contracts::ModelDefinition;
@@ -902,6 +902,30 @@ impl AssessmentMemoryCharge {
             .and_then(|bytes| bytes.checked_add(self.bounds.drafter_graph_host_bytes))
             .and_then(|bytes| bytes.checked_add(self.bounds.host_process.bytes().ok()?))
             .ok_or_else(|| "host charge overflows".to_owned())
+    }
+
+    /// What `domains`, this charge's fit, require in all: the weights (the
+    /// resident components and the host tables), the workload's state, and
+    /// the rest as overhead.
+    pub fn breakdown(&self, domains: &[DomainFit]) -> Result<MemoryBreakdown, String> {
+        let weights_bytes = self
+            .exact_resident_bytes
+            .checked_sub(self.state_bytes)
+            .and_then(|bytes| bytes.checked_add(self.host_table_bytes))
+            .ok_or("weight bytes overflow")?;
+        let required_bytes = domains
+            .iter()
+            .try_fold(0u64, |total, domain| total.checked_add(domain.required_bytes))
+            .ok_or("required bytes overflow")?;
+        let overhead_bytes = required_bytes
+            .checked_sub(weights_bytes)
+            .and_then(|bytes| bytes.checked_sub(self.state_bytes))
+            .ok_or("the fit requires less than the weights and state it holds")?;
+        Ok(MemoryBreakdown {
+            weights_bytes,
+            context_bytes: self.state_bytes,
+            overhead_bytes,
+        })
     }
 
     /// Whether the charge fits `executor` at stable capacity: its device

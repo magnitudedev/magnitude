@@ -1249,6 +1249,11 @@ mod tests {
                     "assessment".to_owned(),
                 ),
                 memory: Vec::new(),
+                memory_breakdown: magnitude_service_contracts::models::MemoryBreakdown {
+                    weights_bytes: 0,
+                    context_bytes: 0,
+                    overhead_bytes: 0,
+                },
                 performance,
                 projector: magnitude_service_contracts::models::ProjectorVerdict::None,
                 drafter: magnitude_service_contracts::models::DrafterVerdict::None,

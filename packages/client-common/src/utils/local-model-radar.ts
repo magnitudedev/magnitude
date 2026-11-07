@@ -8,7 +8,7 @@ import {
   type LocalModelServingState,
   type MachineMeasurement,
 } from "@magnitudedev/sdk"
-import { formatMemorySize } from "./format-bytes"
+import { formatContext, formatMemorySize } from "./format-bytes"
 import { localModelSpeculativeMethodLabel } from "./model-presentation"
 
 const clamp01 = (value: number): number => Math.min(1, Math.max(0, value))
@@ -238,3 +238,21 @@ export const localModelFacts = (model: LocalModel): LocalModelFacts => {
     speed: fits === undefined ? Option.none() : Option.some(performanceRangeSpeedLabel(fits.performance, fits.profile.contextLength)),
   }
 }
+
+export interface LocalModelMemoryPart {
+  readonly label: string
+  readonly bytes: number
+}
+
+/** What a fitting model's memory holds, in order: weights, context at the length it is served at, and overhead. */
+export const localModelMemoryParts = (assessment: Extract<ModelAssessment, { readonly _tag: "Fits" }>): readonly [LocalModelMemoryPart, LocalModelMemoryPart, LocalModelMemoryPart] => [
+  { label: "Weights", bytes: assessment.memory.breakdown.weightsBytes },
+  { label: `${formatContext(assessment.served.contextLength)} context`, bytes: assessment.memory.breakdown.contextBytes },
+  { label: "Overhead", bytes: assessment.memory.breakdown.overheadBytes },
+]
+
+/** The full context a fitting model is served below, which this computer has no memory for. */
+export const localModelUnservedContext = (assessment: Extract<ModelAssessment, { readonly _tag: "Fits" }>): Option.Option<string> =>
+  assessment.served.contextLength < assessment.profile.contextLength
+    ? Option.some(`full ${formatContext(assessment.profile.contextLength)} doesn’t fit`)
+    : Option.none()

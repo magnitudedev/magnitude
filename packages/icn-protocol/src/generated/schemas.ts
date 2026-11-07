@@ -2074,6 +2074,14 @@ export const MemoryAssessment = S.Struct({
 export type MemoryAssessment = S.Schema.Type<typeof MemoryAssessment>
 export type MemoryAssessmentEncoded = S.Schema.Encoded<typeof MemoryAssessment>
 
+export const MemoryBreakdown = S.Struct({
+  contextBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  overheadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  weightsBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+})
+export type MemoryBreakdown = S.Schema.Type<typeof MemoryBreakdown>
+export type MemoryBreakdownEncoded = S.Schema.Encoded<typeof MemoryBreakdown>
+
 export const MemoryDomainId = S.String
 export type MemoryDomainId = S.Schema.Type<typeof MemoryDomainId>
 export type MemoryDomainIdEncoded = S.Schema.Encoded<typeof MemoryDomainId>
@@ -2171,6 +2179,7 @@ export const ModelAssessment = S.Union(
       assessmentId: S.suspend((): S.Schema<ModelAssessmentId, ModelAssessmentIdEncoded> => ModelAssessmentId),
       drafter: S.suspend((): S.Schema<DrafterVerdict, DrafterVerdictEncoded> => DrafterVerdict),
       memory: S.Array(S.suspend((): S.Schema<MemoryAssessment, MemoryAssessmentEncoded> => MemoryAssessment)),
+      memoryBreakdown: S.suspend((): S.Schema<MemoryBreakdown, MemoryBreakdownEncoded> => MemoryBreakdown),
       performance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
       profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),
       projector: S.suspend((): S.Schema<ProjectorVerdict, ProjectorVerdictEncoded> => ProjectorVerdict),

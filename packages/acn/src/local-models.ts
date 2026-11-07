@@ -180,6 +180,7 @@ export const projectAssessment = (
       served: assessment.served,
       memory: {
         domains: assessment.memory, totalRequiredBytes, requiredSystemMemoryBytes,
+        breakdown: assessment.memoryBreakdown,
       },
       performance: projectPerformance(assessment.performance, snapshot.measurement),
     })

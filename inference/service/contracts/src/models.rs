@@ -2343,6 +2343,17 @@ pub struct MemoryAssessment {
     pub remaining_bytes: i64,
 }
 
+/// What a fitting model's required memory holds across every domain: its weights, the
+/// conversation's state at the served context, and everything else the load holds.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryBreakdown {
+    pub weights_bytes: u64,
+    pub context_bytes: u64,
+    pub overhead_bytes: u64,
+}
+
 /// An estimated decode speed at one context depth, in tokens per second per conversation, from
 /// the costs measured of this machine's selected executor: what the engine's own kernels achieve
 /// on it.
@@ -2401,6 +2412,7 @@ pub enum ModelAssessment {
         served: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
+        memory_breakdown: MemoryBreakdown,
         performance: ModelPerformance,
         projector: ProjectorVerdict,
         drafter: DrafterVerdict,

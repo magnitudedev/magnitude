@@ -1094,6 +1094,7 @@ mod tests {
             "served": { "contextLength": served },
             "assessmentId": "assessment",
             "memory": [],
+            "memoryBreakdown": { "weightsBytes": 0, "contextBytes": 0, "overheadBytes": 0 },
             "performance": { "_tag": "Pending" },
             "projector": { "_tag": "None" },
             "drafter": { "_tag": "None" },

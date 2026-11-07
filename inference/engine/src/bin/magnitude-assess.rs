@@ -561,12 +561,18 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
                 ExecutionFit {
                     fit_context_tokens,
                     domains,
+                    breakdown,
                 },
             performance,
         } => json!({
             "_tag": "Fits",
             "servedContextTokens": fit_context_tokens,
             "memory": memory(domains),
+            "memoryBreakdown": {
+                "weightsBytes": breakdown.weights_bytes,
+                "contextBytes": breakdown.context_bytes,
+                "overheadBytes": breakdown.overhead_bytes,
+            },
             "performance": match performance {
                 Performance::Pending => json!({ "_tag": "Pending" }),
                 Performance::Unavailable { reason } => {
