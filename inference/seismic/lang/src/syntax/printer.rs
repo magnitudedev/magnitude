@@ -149,6 +149,9 @@ impl Printer {
                     }
                     self.indent();
                     let _ = write!(self.out, "launch {}", launch.kernel.name);
+                    if let Some(barrier) = &launch.resident {
+                        let _ = write!(self.out, " resident ({})", barrier.name);
+                    }
                     if let Some(when) = &launch.when {
                         self.out.push_str(" when ");
                         self.expr(when, 0);

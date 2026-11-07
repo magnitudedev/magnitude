@@ -264,16 +264,19 @@ pub(crate) fn grid_buffer(
         LaunchGrid::Parameter(name) => {
             tensor_buffer(schema, name).expect("a checked launch grid is a tensor parameter")
         }
-        LaunchGrid::Scratch(name) => {
-            let scratch = implementation.scratch.len();
-            buffer_writes(schema, implementation).len() - scratch
-                + implementation
-                    .scratch
-                    .iter()
-                    .position(|buffer| &buffer.name == name)
-                    .expect("a checked launch grid is a scratch buffer")
-        }
+        LaunchGrid::Scratch(name) => scratch_buffer(schema, implementation, name),
     }
+}
+
+/// The ABI buffer of scratch buffer `name`, which follows every tensor
+/// parameter and result.
+pub(crate) fn scratch_buffer(schema: &CallSchema, implementation: &NativeImplementation, name: &str) -> usize {
+    buffer_writes(schema, implementation).len() - implementation.scratch.len()
+        + implementation
+            .scratch
+            .iter()
+            .position(|buffer| buffer.name == name)
+            .expect("a checked scratch name is a scratch buffer")
 }
 
 /// Whether the entry writes each of its buffers, in ABI order: a tensor
@@ -503,6 +506,28 @@ fn render_source_with(
                 );
             }
         }
+    }
+    // Each resident kernel's name (`launch K resident (BARRIER)`), which a
+    // grid barrier needs to form, so no other kernel forms one; then the
+    // barrier itself (`metal_resident.h`), over the registry's layout. Only
+    // Metal runs resident launches (`BackendName::resident_launches`).
+    let mut resident = Vec::new();
+    for launch in implementation.launches.iter().filter(|launch| launch.resident.is_some()) {
+        if !resident.contains(&&launch.kernel) {
+            resident.push(&launch.kernel);
+            prefix.push_str(&format!("#define SEISMIC_RESIDENT_{} 1u\n", native_macro(&launch.kernel)));
+        }
+    }
+    if !resident.is_empty() {
+        assert!(
+            matches!(dialect, Dialect::Metal(_)),
+            "only Metal runs resident launches, as the checker admits them"
+        );
+        prefix.push_str(&format!(
+            "#define SEISMIC_RESIDENT_GIVE_UP_WORD {}u\n",
+            registry::RESIDENT_GIVE_UP_BYTE / 4
+        ));
+        prefix.push_str(include_str!("metal_resident.h"));
     }
     if let Some(kernel) = forming {
         prefix.push_str(&format!(

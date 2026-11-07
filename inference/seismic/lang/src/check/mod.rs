@@ -1967,6 +1967,43 @@ fn check_native(
         if let Some(own) = &launch.records {
             launch_records.push((launches.len(), native_records(own, contract, backend, &mut errors)));
         }
+        // A resident launch's grid is the backend's: as many threadgroups as
+        // it holds co-resident for the formed pipeline, at most the first
+        // axis of `threadgroups`, so its other axes are 1 and no written
+        // grid sizes it. Its barrier is a `sync` buffer, zero whenever a
+        // launch starts, of at least the barrier's words.
+        let resident = launch.resident.as_ref().and_then(|barrier| {
+            let refusal = if !backend.resident_launches() {
+                Some(format!(
+                    "`resident` needs a backend that runs a launch's threadgroups co-resident; {} does not",
+                    native.target.name
+                ))
+            } else if launch.grid.is_some() {
+                Some("a resident launch's grid is the backend's `RESIDENT`; it reads no written grid".to_owned())
+            } else if !matches!((&y, &z), (NativeNatExpr::Constant(1), NativeNatExpr::Constant(1))) {
+                Some("a resident launch's grid has one axis: `threadgroups (WORK, 1, 1)`".to_owned())
+            } else {
+                match scratch.iter().find(|buffer| buffer.name == barrier.name) {
+                    Some(NativeScratch { bytes: NativeNatExpr::Constant(bytes), sync: true, when: None, .. })
+                        if *bytes >= crate::registry::RESIDENT_BARRIER_BYTES =>
+                    {
+                        None
+                    }
+                    _ => Some(format!(
+                        "resident barrier `{}` must be a `sync` scratch buffer of at least `bytes ({})`, without `when`",
+                        barrier.name,
+                        crate::registry::RESIDENT_BARRIER_BYTES
+                    )),
+                }
+            };
+            match refusal {
+                Some(message) => {
+                    errors.push((barrier.span, message));
+                    None
+                }
+                None => Some(crate::checked::ResidentLaunch { barrier: barrier.name.clone() }),
+            }
+        });
         launches.push(NativeLaunch {
             kernel: launch.kernel.name.clone(),
             params: launch_params,
@@ -1977,6 +2014,7 @@ fn check_native(
             conditions,
             group_extent: [ex, ey, ez],
             shared_bytes,
+            resident,
         });
     }
 
@@ -1991,6 +2029,14 @@ fn check_native(
             errors.push((
                 native.launches[ordinal].span,
                 format!("launches of kernel `{}` list different record ports", launch.kernel),
+            ));
+        }
+        // A kernel's source forms once for its launches, resident or not
+        // (`SEISMIC_RESIDENT`, under which its grid barriers form).
+        if first.is_some_and(|first| launches[first].resident.is_some() != launch.resident.is_some()) {
+            errors.push((
+                native.launches[ordinal].span,
+                format!("launches of kernel `{}` are not all resident or all dispatched", launch.kernel),
             ));
         }
     }

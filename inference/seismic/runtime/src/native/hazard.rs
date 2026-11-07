@@ -80,7 +80,8 @@ pub(crate) fn schedule(list: &impl DispatchList, repetitions: usize) -> Vec<Sche
                     continue;
                 }
                 let after = order.after(&accesses);
-                segment.push((order.place(&accesses, &after), index, ordinal));
+                let alone = dispatch.launches[ordinal].is_some_and(|launch| launch.barrier.is_some());
+                segment.push((order.place(&accesses, &after, alone), index, ordinal));
             }
         }
     }
@@ -321,6 +322,11 @@ pub(crate) struct Order {
     reached: HashMap<u64, Allocated>,
     /// Each placed launch's level.
     levels: Vec<usize>,
+    /// One past the highest level placed.
+    top: usize,
+    /// The lowest level a later launch may take: one past the last resident
+    /// launch's.
+    floor: usize,
 }
 
 impl Order {
@@ -349,9 +355,16 @@ impl Order {
 
     /// Place the next launch, which reaches `accesses` and depends on
     /// `after` (its [`Self::after`]): its level, one past the highest of
-    /// those launches' (0 with none).
-    pub(crate) fn place(&mut self, accesses: &[Access], after: &[usize]) -> usize {
-        let level = after.iter().map(|&launch| self.levels[launch] + 1).max().unwrap_or(0);
+    /// those launches' (0 with none), and past the last resident launch's.
+    /// An `alone` (resident) launch takes a level above every placed one,
+    /// and no later launch shares it.
+    pub(crate) fn place(&mut self, accesses: &[Access], after: &[usize], alone: bool) -> usize {
+        let needed = after.iter().map(|&launch| self.levels[launch] + 1).max().unwrap_or(0);
+        let level = if alone { needed.max(self.top) } else { needed.max(self.floor) };
+        if alone {
+            self.floor = level + 1;
+        }
+        self.top = self.top.max(level + 1);
         let launch = self.levels.len();
         self.levels.push(level);
         for access in accesses {
@@ -399,7 +412,7 @@ mod tests {
             .iter()
             .map(|launch| {
                 let after = order.after(launch);
-                order.place(launch, &after)
+                order.place(launch, &after, false)
             })
             .collect()
     }
@@ -412,10 +425,24 @@ mod tests {
             .iter()
             .map(|launch| {
                 let after = order.after(launch);
-                order.place(launch, &after);
+                order.place(launch, &after, false);
                 after
             })
             .collect()
+    }
+
+    /// A resident launch shares its level with no launch, earlier or
+    /// later, though none of them depends on another.
+    #[test]
+    fn a_resident_launch_is_alone_in_its_level() {
+        let mut order = Order::default();
+        let placed = [(1, false), (2, true), (3, false), (4, false)]
+            .map(|(allocation, alone)| {
+                let launch = [write(allocation, 0..64)];
+                let after = order.after(&launch);
+                order.place(&launch, &after, alone)
+            });
+        assert_eq!(placed, [0, 1, 2, 2]);
     }
 
     #[test]
@@ -652,6 +679,7 @@ mod tests {
     const ACTIVE: [Option<super::super::LaunchGeometry>; 1] = [Some(super::super::LaunchGeometry {
         groups: [1, 1, 1],
         grid: None,
+        barrier: None,
         threads: [1, 1, 1],
         shared_bytes: 0,
     })];

@@ -215,3 +215,23 @@ native parked_scale for vulkan from "vulkan/parked_scale.comp":
         threadgroups (1, 1, 1)
         unless (skip)
         threads_per_threadgroup (1, 1, 1)
+
+# A resident launch (`launch K resident (BARRIER)`) of three phases between
+# grid barriers, each reading what other threadgroups wrote in the phase
+# before: x[i] = i + 1, then y[i] = 2 x[N - 1 - i], then x[i] = y[N - 1 - i]
+# + 1. Where `skip[0]` is set, threadgroup 0 leaves without arriving at the
+# first barrier (it still departs), so every other threadgroup's wait gives
+# up. The reference has no barrier.
+fn resident_reverse[N](skip: &tensor[1] i32, x: &mut tensor[N] f32, y: &mut tensor[N] f32) where N >= 1:
+    for i in 0..N:
+        x[i] = f32(i) + 1.0
+    for i in 0..N:
+        y[i] = x[N - 1 - i] * 2.0
+    for i in 0..N:
+        x[i] = y[N - 1 - i] + 1.0
+
+native resident_reverse for metal from "metal/resident_reverse.metal":
+    scratch barrier bytes (16) sync
+    launch resident_reverse resident (barrier):
+        threadgroups (N, 1, 1)
+        threads_per_threadgroup (64, 1, 1)

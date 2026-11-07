@@ -29,6 +29,7 @@ pub mod topology;
 
 mod command;
 mod compile;
+mod registry_entry;
 mod render;
 mod services;
 mod timing;

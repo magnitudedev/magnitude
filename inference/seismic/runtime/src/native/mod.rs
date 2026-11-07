@@ -140,6 +140,10 @@ pub(crate) struct LaunchGeometry {
     /// The ABI buffer holding the grid the launch dispatches, written by an
     /// earlier launch (`NativeLaunch::grid`).
     pub(crate) grid: Option<usize>,
+    /// The ABI buffer holding a resident launch's barrier
+    /// (`NativeLaunch::resident`), whose give-up word the host reads once
+    /// the work completes ([`NativeSubmission::wait`]).
+    pub(crate) barrier: Option<usize>,
     pub(crate) threads: [u64; 3],
     pub(crate) shared_bytes: u64,
 }
@@ -2279,12 +2283,28 @@ impl NativePrepared {
                         )));
                     }
                     let available = opened.device_description().limits().max_workgroup_bytes;
-                    if shared_bytes + pipeline.static_threadgroup_bytes() > available {
+                    let group_bytes = shared_bytes + pipeline.static_threadgroup_bytes();
+                    if group_bytes > available {
                         return Err(limit(format!(
-                            "launch `{}` needs {} threadgroup bytes; the device allows {available}",
+                            "launch `{}` needs {group_bytes} threadgroup bytes; the device allows {available}",
                             launch.kernel,
-                            shared_bytes + pipeline.static_threadgroup_bytes()
                         )));
+                    }
+                    // `RESIDENT`: half of the threadgroups the cores hold at
+                    // once, each core as many as the pipeline's threads and
+                    // the threadgroup memory allow. The memory term takes
+                    // the per-threadgroup limit as a core's capacity, which
+                    // holds at least because a core fits one maximal
+                    // threadgroup; the half covers the rest. On an M4 Pro a
+                    // grid of the full count was seen co-resident and one
+                    // more was not; the half leaves the margin no query
+                    // states, and the barrier's bounded wait reports a grid
+                    // that still was not.
+                    if launch.resident.is_some() {
+                        let per_core = (pipeline.max_threads_per_threadgroup() / participants.max(1))
+                            .min(available / group_bytes.max(1));
+                        let cores = opened.device_description().facts().properties().units.get();
+                        groups = [groups[0].min((cores * per_core / 2).max(1)), 1, 1];
                     }
                 }
                 NativeRoute::Cuda { opened, launches } => {
@@ -2339,9 +2359,14 @@ impl NativePrepared {
                 .grid
                 .as_ref()
                 .map(|grid| abi::grid_buffer(self.schema(), &self.implementation, grid));
+            let barrier = launch
+                .resident
+                .as_ref()
+                .map(|resident| abi::scratch_buffer(self.schema(), &self.implementation, &resident.barrier));
             geometry.push(Some(LaunchGeometry {
                 groups,
                 grid,
+                barrier,
                 threads,
                 shared_bytes,
             }));
@@ -3058,6 +3083,8 @@ pub struct NativeSubmission {
     route: Arc<RouteSubmission>,
     /// Each host gate the work waits at: its timeline and value.
     gates: Vec<(Arc<timeline::TimelineInner>, u64)>,
+    /// Each resident launch's barrier, whose give-up fails the work.
+    barriers: Vec<ResidentBarrier>,
     _retained: Arc<dyn std::any::Any + Send + Sync>,
 }
 
@@ -3085,14 +3112,22 @@ impl NativeSubmission {
         self.route.finish()?;
         // Work behind a gate its timeline's release opened read what the
         // host never put in place (`timeline`).
-        match self
+        if let Some(error) = self
             .gates
             .iter()
             .find_map(|(timeline, value)| timeline.released_unsignalled(*value))
         {
-            Some(error) => Err(CallError::Execution(error)),
-            None => Ok(()),
+            return Err(CallError::Execution(error));
         }
+        // A give-up is terminal: its word stays set, so every later launch
+        // over the barrier gives up at once, and the device is lost to the
+        // load, not a call to retry.
+        if self.barriers.iter().any(ResidentBarrier::gave_up) {
+            return Err(CallError::Execution(ExecutionError::DeviceLost(
+                "a resident launch's threadgroups were not all on the device at once: its grid barrier gave up".into(),
+            )));
+        }
+        Ok(())
     }
 
     /// Device execution time of the completed submission.
@@ -3225,8 +3260,64 @@ pub(crate) fn submit(
     Ok(NativeSubmission {
         route: issued.take(),
         gates,
+        barriers: resident_barriers(list, access),
         _retained: retained,
     })
+}
+
+/// Each resident launch's barrier of `list` (`NativeLaunch::resident`), once:
+/// the host address of its give-up word, with the allocation of `access`
+/// that keeps it alive.
+fn resident_barriers(list: &impl DispatchList, access: &[(Arc<Allocation>, bool)]) -> Vec<ResidentBarrier> {
+    let mut barriers: Vec<ResidentBarrier> = Vec::new();
+    let mut bound = Vec::new();
+    for index in 0..list.count() {
+        bound.clear();
+        let dispatch = list.dispatch(index, &mut bound);
+        for barrier in dispatch.launches.iter().flatten().filter_map(|launch| launch.barrier) {
+            let (allocation, offset) = bound[dispatch.kernel.argument(barrier)];
+            let base = allocation
+                .storage()
+                .host_address()
+                .expect("a resident launch's barrier is host-addressed scratch: only Metal runs resident launches");
+            // SAFETY: the barrier's checked bytes lie inside the bound view.
+            let give_up = unsafe { base.as_ptr().add((offset + seismic_lang::registry::RESIDENT_GIVE_UP_BYTE) as usize) } as usize;
+            if barriers.iter().any(|known| known.give_up == give_up) {
+                continue;
+            }
+            let (held, _) = access
+                .iter()
+                .find(|(held, _)| allocation.shares_access_with(held))
+                .expect("a submission's access names every allocation its launches bind");
+            barriers.push(ResidentBarrier { give_up, _held: held.clone() });
+        }
+    }
+    barriers
+}
+
+/// A resident launch's barrier, read once its submission completes.
+struct ResidentBarrier {
+    /// The host address of its give-up word.
+    give_up: usize,
+    /// Keeps the word's storage alive.
+    _held: Arc<Allocation>,
+}
+
+impl ResidentBarrier {
+    /// Whether a threadgroup of a launch over this barrier stopped waiting
+    /// for the others: the device did not hold its grid at once, so the
+    /// launch's results are not its kernel's. The word stays set, the one
+    /// word of `sync` scratch no launch restores: a host reset races the
+    /// work queued after it, and a grid sized at half of what the cores hold
+    /// that still was not co-resident is a broken premise, so it is
+    /// terminal (`ExecutionError::DeviceLost`).
+    fn gave_up(&self) -> bool {
+        // SAFETY: the address is a word of storage `_held` keeps alive; the
+        // device's writes are visible once the work completed.
+        unsafe { std::sync::atomic::AtomicU32::from_ptr(self.give_up as *mut u32) }
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+    }
 }
 
 /// Issued work's retirement, until its [`NativeSubmission`] takes it: on
@@ -3706,6 +3797,53 @@ mod tests {
             }
             Err(other) => panic!("unexpected preparation error: {other:?}"),
             Ok(_) => panic!("32 Metal buffer slots were prepared"),
+        }
+    }
+
+    /// A resident launch's grid is `RESIDENT`: half of what the cores hold
+    /// of its pipeline at once, never more than its work bound, and the
+    /// launch names its barrier's ABI buffer.
+    #[test]
+    #[ignore = "requires Metal device"]
+    fn a_resident_launch_dispatches_at_most_half_of_what_the_cores_hold() {
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "spread.seismic".into(),
+                text: "fn spread[N](x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative spread for metal from \"spread.metal\":\n    scratch barrier bytes (16) sync\n    launch spread resident (barrier):\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n".into(),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("kernel void spread() {}\n".into()))
+            },
+        )
+        .expect("spread source checks");
+        let entry = module.entry_named("spread").expect("spread entry");
+        let device = crate::devices::Devices::discover(&[])
+            .expect("device discovery")
+            .open_backend(BackendName::Metal)
+            .expect("Metal device");
+        let prepared = NativePrepared::prepare(
+            &device,
+            &module,
+            entry,
+            ElementBindings::default(),
+            NativeSpecialization::new(),
+            None,
+        )
+        .expect("spread prepares");
+        let NativeRoute::Metal { opened, launches } = &prepared.route else {
+            unreachable!("a Metal device's route");
+        };
+        let cores = opened.device_description().facts().properties().units.get();
+        let per_core = launches.pipeline(0).max_threads_per_threadgroup() / 256;
+        let resident = (cores * per_core / 2).max(1);
+        for (work, expected) in [(1, 1), (resident, resident), (resident + 1, resident), (1 << 20, resident)] {
+            let geometry = prepared
+                .launches_at(&|name| (name == "N").then_some(work))
+                .expect("spread's launches")
+                .geometry[0]
+                .expect("the launch is active");
+            assert_eq!(geometry.groups, [expected, 1, 1], "work {work}, {cores} cores");
+            assert_eq!(geometry.barrier, Some(1), "the barrier follows x");
         }
     }
 

@@ -606,10 +606,20 @@ impl Parser {
         Ok(Some(self.expr()?))
     }
 
-    /// `launch KERNEL [when CONDITION]:` followed by its indented geometry.
+    /// `launch KERNEL [resident (BARRIER)] [when CONDITION]:` followed by its
+    /// indented geometry.
     fn native_launch(&mut self) -> PResult<NativeLaunchDecl> {
         let begin = self.bump().span;
         let kernel = self.expect_name()?;
+        let resident = if self.at_word("resident") {
+            self.bump();
+            self.expect_op(Op::LParen)?;
+            let barrier = self.expect_name()?;
+            self.expect_op(Op::RParen)?;
+            Some(barrier)
+        } else {
+            None
+        };
         let when = self.native_when()?;
         self.expect_op(Op::Colon)?;
         self.native_block_start("launch")?;
@@ -696,6 +706,7 @@ impl Parser {
         self.native_block_end("launch")?;
         Ok(NativeLaunchDecl {
             kernel,
+            resident,
             when,
             params,
             constraint,

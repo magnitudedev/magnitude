@@ -187,6 +187,19 @@ impl BackendName {
         }
     }
 
+    /// Whether the backend runs a resident launch (`launch K resident
+    /// (BARRIER)`): every threadgroup of its grid on the device at once, so
+    /// they may wait for one another at grid barriers. Metal sizes the grid
+    /// from the formed pipeline and the device's cores (`RESIDENT`), and
+    /// every barrier wait is bounded: nothing guarantees co-residency, so a
+    /// give-up fails the submission instead of hanging it. CUDA would take a
+    /// cooperative launch, which no runtime path issues yet; Vulkan has
+    /// neither an occupancy query nor a cooperative launch; the CPU runs
+    /// groups as tasks a worker finishes one at a time.
+    pub const fn resident_launches(self) -> bool {
+        matches!(self, BackendName::Metal)
+    }
+
     /// Whether a native implementation dispatches a block of its launches
     /// more than once (`repeat`): its runtime's encoder replays the block.
     pub const fn repeats_launches(self) -> bool {
@@ -218,6 +231,15 @@ impl BackendName {
         }
     }
 }
+
+/// The bytes of a resident launch's barrier, at the start of its `sync`
+/// scratch buffer: four words, arrivals, departures, the give-up word and
+/// a pad (`seismic_grid` in the runtime's `native/metal_resident.h`).
+pub const RESIDENT_BARRIER_BYTES: u64 = 16;
+
+/// The byte of a resident barrier's give-up word, which the runtime reads
+/// once the work completes (`NativeSubmission::wait`).
+pub const RESIDENT_GIVE_UP_BYTE: u64 = 8;
 
 /// The bytes of one entry of a record table: the 8-byte device address of
 /// its record.

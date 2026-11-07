@@ -1634,7 +1634,10 @@ pub struct NativeScratch {
     pub bytes: NativeNatExpr,
     /// Arrival counters, placed apart from every other buffer: zero when a
     /// launch starts, restored to zero by the call's kernels before it ends
-    /// (so one zeroed region serves every call and graph that uses it).
+    /// (so one zeroed region serves every call and graph that uses it). One
+    /// word is the exception: a resident launch's barrier's give-up word
+    /// (`registry::RESIDENT_GIVE_UP_BYTE`) stays set once a wait gave up,
+    /// and the device is lost to its load.
     pub sync: bool,
     /// The buffer is sized by `bytes` only when this holds; otherwise it
     /// keeps its ABI slot at the minimum charge and `bytes` is not
@@ -1677,6 +1680,19 @@ pub struct NativeLaunch {
     pub group_extent: [NativeNatExpr; 3],
     /// Dynamic group-shared memory in bytes.
     pub shared_bytes: NativeNatExpr,
+    /// A resident launch's barrier: its grid is `RESIDENT` (the backend's
+    /// co-resident threadgroups for the formed pipeline, at most `groups`'
+    /// first axis), never an expression; `None` dispatches `groups`.
+    pub resident: Option<ResidentLaunch>,
+}
+
+/// A resident launch (`launch K resident (BARRIER)`): every threadgroup of
+/// its one-axis grid is co-resident (`BackendName::resident_launches`), so they meet
+/// at grid barriers, held at the start of the `sync` scratch buffer
+/// `barrier` (`registry::RESIDENT_BARRIER_BYTES`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidentLaunch {
+    pub barrier: String,
 }
 
 /// Where a launch's written grid lives.
@@ -4902,6 +4918,65 @@ mod native_tests {
             assert!(
                 error.to_string().contains(expected),
                 "{parameter} {scratch:?} {grid}: expected {expected:?}, got {error}"
+            );
+        }
+    }
+
+    /// A resident launch (`launch K resident (BARRIER)`) is declared on a
+    /// backend that runs resident launches, with a one-axis work bound, no
+    /// written grid and a barrier of `sync` scratch of at least
+    /// `RESIDENT_BARRIER_BYTES`; every launch of its kernel is resident.
+    #[test]
+    fn a_resident_launch_names_a_sync_barrier_on_a_backend_that_runs_it() {
+        let declaration = |scratch: &str, launch: &str, backend: &str| {
+            format!(
+                "fn fill[N](grid: &tensor[3] i32, x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\nnative fill for {backend} from \"fill.src\":\n{scratch}{launch}"
+            )
+        };
+        let resident = |head: &str, groups: &str, grid: &str| {
+            format!("    launch {head}:\n        threadgroups ({groups})\n{grid}        threads_per_threadgroup (32, 1, 1)\n")
+        };
+        let check = |text: String| {
+            crate::native_source::check_fixture(
+                SourceSet::new(vec![SourceFile {
+                    path: "fill.seismic".to_owned(),
+                    text,
+                }]),
+                &[],
+            )
+        };
+        let barrier = "    scratch barrier bytes (16) sync\n";
+        let module = check(declaration(barrier, &resident("fill resident (barrier)", "N, 1, 1", ""), "metal"))
+            .expect("a resident launch checks on Metal");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Metal)
+            .expect("native implementation");
+        assert_eq!(
+            native.launches[0].resident,
+            Some(ResidentLaunch { barrier: "barrier".to_owned() })
+        );
+        let two = format!(
+            "{}{}",
+            resident("fill resident (barrier)", "N, 1, 1", ""),
+            resident("fill", "N, 1, 1", "")
+        );
+        for (scratch, launch, backend, expected) in [
+            (barrier, resident("fill resident (barrier)", "N, 1, 1", ""), "cuda", "cuda does not"),
+            (barrier, resident("fill resident (barrier)", "N, 1, 1", ""), "vulkan", "vulkan does not"),
+            (barrier, resident("fill resident (barrier)", "N, 1, 1", ""), "cpu", "cpu does not"),
+            (barrier, resident("fill resident (barrier)", "N, 1, 1", "        grid (grid)\n"), "metal", "reads no written grid"),
+            (barrier, resident("fill resident (barrier)", "N, 2, 1", ""), "metal", "has one axis"),
+            ("    scratch barrier bytes (8) sync\n", resident("fill resident (barrier)", "N, 1, 1", ""), "metal", "at least `bytes (16)`"),
+            ("    scratch barrier bytes (16)\n", resident("fill resident (barrier)", "N, 1, 1", ""), "metal", "at least `bytes (16)`"),
+            ("    scratch barrier bytes (16) sync when N > 1\n", resident("fill resident (barrier)", "N, 1, 1", ""), "metal", "without `when`"),
+            ("", resident("fill resident (barrier)", "N, 1, 1", ""), "metal", "must be a `sync` scratch buffer"),
+            (barrier, two, "metal", "not all resident or all dispatched"),
+        ] {
+            let error = check(declaration(scratch, &launch, backend))
+                .expect_err("an inadmissible resident launch must fail checking");
+            assert!(
+                error.to_string().contains(expected),
+                "{backend} {scratch:?} {launch:?}: expected {expected:?}, got {error}"
             );
         }
     }

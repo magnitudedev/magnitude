@@ -324,6 +324,11 @@ pub struct NativeConditionDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NativeLaunchDecl {
     pub kernel: Ident,
+    /// `resident (BARRIER)`: every threadgroup of the launch is co-resident,
+    /// its grid the backend's (`RESIDENT`, at most `threadgroups`' first
+    /// axis), and its threadgroups meet at grid barriers held in the `sync`
+    /// scratch buffer BARRIER.
+    pub resident: Option<Ident>,
     /// The launch runs only when this condition holds.
     pub when: Option<Expr>,
     /// Parameters local to this launch; names may be reused by other launches.

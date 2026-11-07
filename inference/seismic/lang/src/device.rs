@@ -592,6 +592,9 @@ properties! {
     metal;
     queries {
         max_threadgroup_memory_length: Count,
+        // The GPU's cores, as the device's IORegistry entry states them
+        // (`gpu-core-count`).
+        gpu_cores: Count,
         apple10_family: Support,
         // The compiler forms a `matmul2d` pipeline: asked of the API at
         // open, running nothing.
@@ -600,6 +603,7 @@ properties! {
     probes {}
     properties {
         shared_bytes_per_group: Count = query(max_threadgroup_memory_length);
+        units: Count = query(gpu_cores);
         tensor_ops: Support = query(apple10_family) & query(tensor_matmul_forms);
     }
 }
@@ -686,7 +690,7 @@ mod tests {
         assert!(!answers.later_asked.get(), "no source is asked once one does not hold");
         assert_eq!(DeviceValues::value(&properties, "shared_bytes_per_group"), 49152);
         assert_eq!(provided(BackendName::Vulkan, "matrix"), Some(PropertyKind::Support));
-        assert_eq!(provided(BackendName::Metal, "units"), None);
+        assert_eq!(provided(BackendName::Metal, "matrix"), None);
         let unanswered = Answers { matrix: None, later_asked: Default::default() };
         assert_eq!(vulkan::describe(&unanswered, &vulkan::Probed::default()).unwrap_err(), Unanswered("matrix"));
     }

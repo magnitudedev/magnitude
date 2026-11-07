@@ -678,6 +678,9 @@ impl seismic_lang::device::metal::Queries for Queries<'_> {
     fn max_threadgroup_memory_length(&self) -> Option<u64> {
         Some(self.device.maxThreadgroupMemoryLength() as u64)
     }
+    fn gpu_cores(&self) -> Option<u64> {
+        crate::registry_entry::gpu_cores(self.device.registryID())
+    }
     fn apple10_family(&self) -> Option<bool> {
         Some(crate::pooled(|| self.device.supportsFamily(MTLGPUFamily::Apple10)))
     }

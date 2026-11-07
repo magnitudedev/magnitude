@@ -688,6 +688,23 @@ mod internals {
                 )?;
             }
         }
+        // A resident kernel's name, under which its grid barrier forms, and
+        // the barrier itself (the runtime's `metal_resident.h`), in the
+        // prefix of a source with a resident launch.
+        let mut resident = false;
+        for launch in definition.launches.iter().filter(|launch| launch.resident.is_some()) {
+            resident = true;
+            abi.define(
+                AbiMeaning::Resident(launch.kernel.clone()),
+                [format!("SEISMIC_RESIDENT_{}", native_macro(&launch.kernel))],
+            )?;
+        }
+        if resident {
+            abi.define(
+                AbiMeaning::Abi,
+                ["SEISMIC_GRID_BARRIER".to_owned(), "SEISMIC_RESIDENT_GIVE_UP_WORD".to_owned()],
+            )?;
+        }
         for scratch in &definition.scratch {
             abi.define(
                 AbiMeaning::Scratch(scratch.name.clone()),
@@ -901,6 +918,7 @@ mod internals {
         Tune(String),
         Runtime(String),
         Forming(String),
+        Resident(String),
         Scratch(String),
         Dimension(String),
         Element(String),
@@ -917,6 +935,7 @@ mod internals {
                 Self::Tune(name) => write!(f, "tuning parameter `{name}`"),
                 Self::Runtime(name) => write!(f, "runtime parameter `{name}`"),
                 Self::Forming(kernel) => write!(f, "launch `{kernel}`"),
+                Self::Resident(kernel) => write!(f, "resident launch `{kernel}`"),
                 Self::Scratch(name) => write!(f, "scratch buffer `{name}`"),
                 Self::Dimension(name) => write!(f, "dimension `{name}`"),
                 Self::Element(name) => write!(f, "element `{name}`"),
