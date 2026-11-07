@@ -257,6 +257,16 @@ impl<'a> Tuning<'a> {
         }
     }
 
+    /// A choice derived from completed composed choices, as a tuning pin
+    /// decides it ([`Tuner::derived_composed`]); a walk without a tuner
+    /// serves nothing, so its own derivation stands.
+    pub fn derived_composed(&mut self, label: &'static str, identity: &str, derived: bool) -> bool {
+        match self {
+            Self::Tuner(tuner) => tuner.derived_composed(label, identity, derived),
+            Self::Listing(_) | Self::Demand { .. } => derived,
+        }
+    }
+
     pub fn model(&self) -> ModelInputs<'a> {
         match self {
             Self::Tuner(tuner) => tuner.model(),

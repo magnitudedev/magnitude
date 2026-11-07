@@ -1149,7 +1149,7 @@ fn draft_program_plan(
         output_norm: lookup(weights, WeightScope::Draft, WeightKind::OutputNorm)?,
         // The draft's head entry binds the projection's scale port as the
         // target readout does; the target's projection is read as it is
-        // stored, its planes when a reader of it selected a class.
+        // stored, its planes when a choice names its scope.
         projection: if draft.output.is_some() {
             planned_readout(weights, WeightScope::Draft)?
         } else {

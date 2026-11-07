@@ -49,6 +49,7 @@ pub(crate) use target::{
 pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
+pub(crate) use tuning::readout_choice::RecipeCosts;
 pub(crate) use tuning::workload as tuning_workload;
 pub use tuning::{
     MIN_SAMPLE_SECONDS, NumericalProfile, PinnedChoice, PointShape, ROTATION_LAYERS, Receipt,

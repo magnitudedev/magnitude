@@ -990,7 +990,7 @@ fn target_reading_head_plans_its_program_weights_and_charge() {
 
 /// A separate draft reads the projection as it is stored: its own is
 /// stored packed, and the target's keeps its views, which the draft reads
-/// once a reader of them selects a class.
+/// once the scope is stored as them.
 #[test]
 fn a_separate_draft_reads_the_projection_as_it_is_stored() {
     use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
