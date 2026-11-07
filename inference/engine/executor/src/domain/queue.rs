@@ -404,6 +404,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.queue.holder()
     }
 
+    /// The steps queued behind the last flight.
+    #[cfg(test)]
+    pub(crate) fn queued_steps(&self) -> usize {
+        self.queue.len()
+    }
+
     /// Whether `request`'s work may be claimed now: while a chain is under
     /// way, its holder's alone (`chain_holder`), which continues it.
     pub fn claims(&self, request: RequestId) -> bool {

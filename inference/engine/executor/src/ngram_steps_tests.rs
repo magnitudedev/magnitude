@@ -1595,6 +1595,49 @@ fn a_starved_chunk_of_a_chain_releases_it_and_the_rerun_scores_as_unstarved() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
+/// A streamed load dropped with a pipelined successor still running tears
+/// down: the successor, a prompt chunk of a grouped class on a partial bank,
+/// whose first round every streamed layer waits on the host for, is waited
+/// for and dropped while the watcher still answers it. (Regression: the
+/// bank's watcher stopped serving first, beside a pulse the load's live
+/// tables kept beating, so the successor's waits never ended and every
+/// release behind it, residency's records and a growth's recommit, waited
+/// for it forever.) A teardown past [`TEARDOWN_BOUND`] ends the process.
+#[test]
+fn a_streamed_load_dropped_with_a_running_successor_tears_down() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) =
+        fixture_with("queued-teardown", qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+    let request = RequestId(1);
+    for backend in STREAMING_BACKENDS.into_iter().filter(|&backend| available(&catalog, backend)) {
+        let (mut domain, mut bindings, _) =
+            load(&catalog, &definition, &package, backend, limits(CHUNK_ROWS, true, 1, CHUNK_ROWS), Banked::Half);
+        domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+        domain.open_state(&mut bindings, request, None).unwrap();
+        domain.plan_successors(vec![prompt_chunk(request, 1, 2, CHUNK_ROWS)]);
+        let (_, returned) = run(&mut domain, bindings, prompt_chunk(request, 0, 2, CHUNK_ROWS), false, backend);
+        assert_eq!(domain.queued_steps(), 1, "{backend:?}: the next chunk runs queued behind the first");
+        let (dropped, watched) = std::sync::mpsc::channel::<()>();
+        let watchdog = std::thread::spawn(move || {
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watched.recv_timeout(TEARDOWN_BOUND) {
+                eprintln!("{backend:?}: the load's teardown hung past {TEARDOWN_BOUND:?} behind its queued successor");
+                std::process::abort();
+            }
+        });
+        drop(domain);
+        drop(returned);
+        dropped.send(()).unwrap();
+        watchdog.join().unwrap();
+    }
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+/// The longest a load's teardown may take behind one queued fixture step
+/// that its host answers: a few of the step's reads and launches, which take
+/// milliseconds.
+const TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// A fresh load's prompt run one chunk at a time with no chain planned, each
 /// chunk a prompt group of one step, at a bank half the experts: every step's
 /// features and logits are finite on every backend this host runs. Each

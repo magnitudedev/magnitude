@@ -625,6 +625,24 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     refreshes: std::cell::Cell<usize>,
 }
 
+impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
+    /// The queued steps are the one device work the domain owns: each is
+    /// waited for and dropped before any field, so its waits on a streamed
+    /// load's host are answered by a watcher that still serves (the
+    /// family's bank, whose watcher answers nothing once it stops, drops
+    /// with the fields). A queued step that faulted is nobody's outcome:
+    /// the device is past it either way.
+    fn drop(&mut self) {
+        match self.drain_queue() {
+            Ok(()) => {}
+            Err(DomainError::Device(error)) => {
+                tracing::warn!("a queued step the dropped load never claimed faulted: {error}");
+            }
+            Err(error) => panic!("a queued step the dropped load never claimed: {error}"),
+        }
+    }
+}
+
 /// The resident decode launch of a number of rows at a depth,
 /// `(rows, depth)`, as the load's assessment estimates it on this executor
 /// (`assessment::step_seconds`, a row a sequence).

@@ -780,7 +780,17 @@ impl crate::settle::Owed for Shared {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        // Nothing is answered once serving stops: the watchdog stops first.
+        // Nothing is answered once serving stops, and while the load's
+        // tables live its pulse beats, so a running step's wait on the
+        // device never ends: every step's owner drains it before the bank
+        // drops (the domain its queued ones, as it drops).
+        let running = self.shared.steps.in_flight();
+        assert!(
+            running == 0,
+            "the expert watcher stops with {running} steps running, whose waits it would never answer: {}",
+            self.shared.steps.describe()
+        );
+        // The watchdog stops first.
         drop(self.watchdog.take());
         self.shared.life.stop();
         self.shared.lent.wake();
