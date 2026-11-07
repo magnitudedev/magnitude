@@ -1519,13 +1519,19 @@ impl Programs {
             .map_err(|error| Unformed::Never(error.clone()))
     }
 
+    /// Whether a point timed here touches the host: it does itself
+    /// (`host`), or the executor's device is the host's CPU.
+    fn touches_host(&self, host: bool) -> bool {
+        host || self.host
+    }
+
     /// Hold the formation between its programs for a point that touches
     /// the host (`host`), or any on the host's own device: once no compile
     /// runs, none starts until the hold is dropped, so the point is timed
     /// with none beside it; the job's deadline passing first expires it.
     /// No hold for any other point.
     fn quiet(&self, host: bool) -> Result<Option<Quiet>, Unformed<ExecutorCostsError>> {
-        if !(host || self.host) {
+        if !self.touches_host(host) {
             return Ok(None);
         }
         self.formation.hold(self.deadline).map(Some).ok_or(Unformed::Expired)
@@ -1582,6 +1588,9 @@ trait Times {
         build: &mut Build<'_>,
         share: Share,
     ) -> Result<Timing, Stop<Self::Missing>>;
+
+    /// The walk is done with `route`: no later point lays out along it.
+    fn done_with(&mut self, route: NativeKind);
 }
 
 /// How a point's reading is forecast, where records forecast it (a deeper
@@ -1729,6 +1738,9 @@ impl Times for Retraced<'_> {
     ) -> Result<Timing, Stop<PointKey>> {
         self.time(spec, programs, build, share)
     }
+
+    /// Records alone hold nothing along a route.
+    fn done_with(&mut self, _: NativeKind) {}
 }
 
 /// The job's timings: each point's record, or measured through the
@@ -1820,13 +1832,18 @@ impl Times for Measured<'_, '_> {
         let backings = &mut self.backings;
         let host = &mut *self.attempting;
         // A point that touches the host, or any on the host's own device, is
-        // timed while no program forms beside it: held once its own kernels
-        // are formed, as it is made, until it is timed.
+        // timed while no program forms beside it and no backing is being
+        // released: once it is made, the releases begun end, and the
+        // formation is held once its own kernels are formed, until it is
+        // timed.
         let mut quiet = None;
         let mut outcomes = self.measurer.measure_all(
             vec![(key, || {
                 let formed = &formed.get_or_init(|| programs.form(device, deadline)).programs;
                 let point = build(device, formed, backings)?;
+                if formed.touches_host(share.host) {
+                    backings.settle();
+                }
                 quiet = formed.quiet(share.host)?;
                 Ok(point)
             })],
@@ -1858,6 +1875,10 @@ impl Times for Measured<'_, '_> {
         let timed = self.time(spec, programs, build, share);
         self.backings.release_to(&held);
         timed
+    }
+
+    fn done_with(&mut self, route: NativeKind) {
+        self.backings.release_route(route);
     }
 }
 
@@ -2138,6 +2159,9 @@ impl Operand {
 #[derive(Default)]
 struct Backings {
     routes: Vec<(NativeKind, Vec<Tensor>)>,
+    /// The routes the walk is done with, dropped on a thread of their own
+    /// while it goes on ([`Self::release_route`]).
+    released: Releaser,
     /// The views of the backings the points made since the last restore
     /// write.
     written: Vec<Tensor>,
@@ -2147,7 +2171,57 @@ struct Backings {
     filled: (u64, f64),
 }
 
+/// The releases of the backings of routes a walk is done with, each
+/// dropped on a thread of its own, so it (unpinning host memory takes a
+/// GB10 about 0.3 s a GiB, 2026-11-07) runs beside the walk's later device
+/// points instead of after its last. Host memory and the host's clock are
+/// timed with no release beside them, as with no compile: a point that
+/// touches the host waits for every release begun before it is timed
+/// ([`Self::settle`]), and so does the walk's end, so no point after the
+/// walk is timed beside one. Dropping it settles too: no release outlives
+/// the job that made it, and none is driving the device as an in-process
+/// caller tears down.
+#[derive(Default)]
+struct Releaser(Vec<std::thread::JoinHandle<()>>);
+
+impl Releaser {
+    fn release(&mut self, allocations: Vec<Tensor>) {
+        let thread = std::thread::Builder::new()
+            .name("measurement-release".into())
+            .spawn(move || drop(allocations))
+            .expect("the host starts a release thread");
+        self.0.push(thread);
+    }
+
+    /// Wait for every release begun.
+    fn settle(&mut self) {
+        for thread in self.0.drain(..) {
+            thread.join().expect("a release thread ends by returning");
+        }
+    }
+}
+
+impl Drop for Releaser {
+    fn drop(&mut self) {
+        self.settle();
+    }
+}
+
 impl Backings {
+    /// Release `route`'s backing, which no later point of the walk lays out
+    /// along, on the release thread ([`Releaser`]).
+    fn release_route(&mut self, route: NativeKind) {
+        if let Some(index) = self.routes.iter().position(|(known, _)| *known == route) {
+            let (_, allocations) = self.routes.remove(index);
+            self.released.release(allocations);
+        }
+    }
+
+    /// Wait for every route's release begun ([`Releaser::settle`]).
+    fn settle(&mut self) {
+        self.released.settle();
+    }
+
     /// The wall seconds allocating and zero-filling `bytes` more is
     /// forecast to take, at the rate the job's backings filled so far; none
     /// before any was, when the job has made no point to spend its time on.
@@ -3500,12 +3574,14 @@ impl fmt::Display for Step {
 /// CPU's attention reads its history at a hundredth of memory's rate, which
 /// prices history unread: 110 to 310 MB/s against 30 GB/s on a 4-vCPU EPYC
 /// 7763); the activation dtype's matrix throughput, during which the affine
-/// attention's compile (the job's longest) ends; and what touches the host
-/// (host storage's routes, which hold only rows, and the launch graph's
-/// host times), once no compile shares it; then every other format's pilot
-/// along each device storage route, without which it is priced at the
-/// activation dtype's figures (a 12-core M6's CPU formats stream at 0.05 to
-/// 0.58 of bf16 and multiply at 0.13 to 0.83 of it, 2026-10-22). Then the
+/// attention's compile (the job's longest) ends; and what touches the host,
+/// once no compile shares it: the launch graph's host times, then host
+/// storage's routes, which hold only rows, last of what touches the host so
+/// their backings are released beside the device points after them
+/// ([`Releaser`]); then every other format's pilot along each device
+/// storage route, without which it is priced at the activation dtype's
+/// figures (a 12-core M6's CPU formats stream at 0.05 to 0.58 of bf16 and
+/// multiply at 0.13 to 0.83 of it, 2026-10-22). Then the
 /// rest, the figures priced furthest off until read first: the formats'
 /// streaming rates, which a pilot may price up to twice as fast and which
 /// the walk reads in the order their pilots price them furthest off
@@ -3544,11 +3620,11 @@ fn plan(routes: &[&Route], formats: &[Element], moves: bool) -> Vec<Step> {
     // them, what the shrink's release costs device work running with it.
     steps.extend(moves.then_some([Step::Moves, Step::Releases]).into_iter().flatten());
     steps.extend(first_rungs(KvCodec::AffineK8V4));
+    steps.extend([GraphTiming::Waited, GraphTiming::Queued].map(Step::Launch));
     steps.extend(
         host.iter()
             .map(|&route| Step::WeightRate(route, activation, Pass::Rate)),
     );
-    steps.extend([GraphTiming::Waited, GraphTiming::Queued].map(Step::Launch));
     for pass in [Pass::Pilot, Pass::Rate] {
         for &route in &device {
             steps.extend(
@@ -3638,7 +3714,16 @@ fn walk<T: Times>(
                 .sort_by(|near, far| read.overlap(*far).total_cmp(&read.overlap(*near)));
         }
         let step = steps[index];
-        match walk.step(step, Share::UNFORECAST, &mut read, times) {
+        let outcome = walk.step(step, Share::UNFORECAST, &mut read, times);
+        // A route other than device storage's first, which every step but
+        // its own weight rates reads, is done with after its last of them.
+        if let Step::WeightRate(route, _, _) = step {
+            let later = |later: &Step| matches!(later, Step::WeightRate(other, _, _) if *other == route);
+            if route != 0 && !steps[index + 1..].iter().any(later) {
+                times.done_with(walk.routes[route].route);
+            }
+        }
+        match outcome {
             Ok(()) => {}
             Err(stop) => {
                 if let Step::Rung(layout, _) = step {
@@ -4470,7 +4555,10 @@ impl<'a, 'd> Walks<'a, 'd> {
     /// the probe could not be read outside its points' timings (its figure
     /// stays priced).
     pub(super) fn walk(&mut self, scope: Scope) -> (Option<ExecutorCostsError>, Vec<ExecutorCostsError>) {
-        match walk(&self.topology, &self.executor, &mut self.measured, scope) {
+        let walked = walk(&self.topology, &self.executor, &mut self.measured, scope);
+        // No point after the walk is timed beside a release it began.
+        self.measured.backings.settle();
+        match walked {
             Ok(walked) => (None, walked.failures),
             Err(Stop::Point(_) | Stop::Expired) => (None, Vec::new()),
             Err(Stop::Failed(error)) => (Some(error), Vec::new()),
@@ -4887,9 +4975,9 @@ mod tests {
         expected.extend([Step::Chain, Step::Matrix(bf16), Step::Moves, Step::Releases]);
         expected.extend(first(KvCodec::AffineK8V4));
         expected.extend([
-            Step::WeightRate(1, bf16, Pass::Rate),
             Step::Launch(GraphTiming::Waited),
             Step::Launch(GraphTiming::Queued),
+            Step::WeightRate(1, bf16, Pass::Rate),
             Step::WeightRate(0, f32, Pass::Pilot),
             Step::WeightRate(0, f32, Pass::Rate),
         ]);
