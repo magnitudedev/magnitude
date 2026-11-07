@@ -230,7 +230,10 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
     let topology = catalog.topology();
     let records = magnitude_executor::KernelCache::measurement_records(root);
     let requests = PointRequests::new(root);
-    let outstanding = || requests.outstanding(&topology, &selected.info, &records);
+    let outstanding = || {
+        let costs = magnitude_executor::assessment::ExecutorCosts::stored(&topology, &selected.info, &records).is_ok_and(|walked| walked.outstanding());
+        requests.outstanding(&topology, &selected.info, &records, costs)
+    };
     let mut left = outstanding()?;
     let mut job = 0;
     while !left.is_empty() {

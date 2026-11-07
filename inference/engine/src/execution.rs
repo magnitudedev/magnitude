@@ -1074,7 +1074,7 @@ impl ExpertPricing {
 /// pricing after the measurement job stored more is priced on it.
 pub(crate) fn expert_measures(pricing: &ExpertPricing) -> magnitude_executor::ExpertMeasures {
     use magnitude_executor::assessment::{
-        BankLines, CeilingError, ConvertCosts, ExpertLines, ExpertPass, HostLines, MemoryCosts, MemoryError, MoveCosts, MoveError, PointRequest, PricingError,
+        BankLines, CeilingError, ConvertCosts, ExpertLines, ExpertPass, HostLines, MemoryCosts, MemoryError, MoveCosts, MoveError, PricingError,
         Priced, StoredMisses, TierCopyCosts, TierCopyError,
     };
     use magnitude_executor::MissStoreError;
@@ -1186,10 +1186,7 @@ pub(crate) fn expert_measures(pricing: &ExpertPricing) -> magnitude_executor::Ex
     let waiting = pricing
         .requests
         .iter()
-        .filter(|request| match request {
-            PointRequest::Costs => costs_outstanding,
-            request => request.outstanding(topology, info, &records),
-        })
+        .filter(|request| request.outstanding(topology, info, &records, costs_outstanding))
         .cloned()
         .collect::<Vec<_>>();
     touch(root, &pricing.executor, &waiting);
@@ -1888,6 +1885,7 @@ mod tests {
         let requests = [PointRequest::HostRoutes, PointRequest::Costs];
         touch(root.path(), &identity, &requests);
         let records = seismic::measure::HeldStore::default();
-        assert_eq!(PointRequests::new(root.path()).outstanding(&topology, &executor, &records).unwrap(), requests);
+        let costs = magnitude_executor::assessment::ExecutorCosts::stored(&topology, &executor, &records).is_ok_and(|walked| walked.outstanding());
+        assert_eq!(PointRequests::new(root.path()).outstanding(&topology, &executor, &records, costs).unwrap(), requests);
     }
 }

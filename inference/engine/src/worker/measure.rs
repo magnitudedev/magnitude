@@ -22,7 +22,7 @@ use super::client::{handshake, receive};
 use super::protocol::{EngineBuild, HostMessage, WorkerMessage};
 use super::transport::{HostTransport, MessageSender};
 use super::{Held, Served, WorkerExit};
-use magnitude_executor::assessment::{requests, PointRequests};
+use magnitude_executor::assessment::{requests, ExecutorCosts, PointRequests};
 use magnitude_executor::{KernelCache, DEFAULT_KERNEL_CACHE_BYTES};
 use seismic::measure::{Attempt, JsonFileStore, Outcome, Reason, Record, StoreError};
 use seismic::{Devices, KernelIdentity, Measurer, PointKey};
@@ -371,7 +371,9 @@ pub fn measure_machine(
         Err(reason) => return machine(reason),
     };
     let records = KernelCache::measurement_records(&request.kernels);
-    let outstanding = PointRequests::new(&request.kernels).outstanding(device.topology(), device.info(), &records);
+    let (topology, executor) = (device.topology(), device.info());
+    let costs = ExecutorCosts::stored(topology, executor, &records).is_ok_and(|walked| walked.outstanding());
+    let outstanding = PointRequests::new(&request.kernels).outstanding(topology, executor, &records, costs);
     let outstanding = match outstanding {
         Ok(outstanding) => outstanding,
         Err(reason) => return machine(format!("the point requests: {reason}")),

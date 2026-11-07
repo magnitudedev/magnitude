@@ -128,7 +128,7 @@ impl AssessmentStructure {
             }) => {
                 // A request a load left outstanding is as pending as a point of the costs.
                 let pending = pending
-                    || match PointRequests::new(kernels).outstanding(&self.topology, &self.selected.info, &records) {
+                    || match PointRequests::new(kernels).outstanding(&self.topology, &self.selected.info, &records, pending) {
                         Ok(outstanding) => !outstanding.is_empty(),
                         Err(error) => {
                             return Measurements::Unavailable {

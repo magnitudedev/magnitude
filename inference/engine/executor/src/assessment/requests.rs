@@ -71,10 +71,13 @@ impl PointRequest {
     /// A request whose records cannot be derived from otherwise (a walk's
     /// probe recorded unobtainable, a point recorded so, a store that cannot
     /// be read) has none: the job's measuring ends there as the derivation
-    /// does.
-    pub fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>) -> bool {
+    /// does. The costs' is `costs_outstanding`, whether the walk of the
+    /// executor's costs ([`super::ExecutorCosts::stored`]), which its caller
+    /// walks once for whatever else it reads of them, has a point no record
+    /// holds.
+    pub fn outstanding(&self, topology: &DeviceTopology, executor: &Executor, store: &dyn RecordStore<PointKey>, costs_outstanding: bool) -> bool {
         match self {
-            Self::Costs => walk_outstanding(topology, executor, store, Scope::Whole),
+            Self::Costs => costs_outstanding,
             Self::HostRoutes => walk_outstanding(topology, executor, store, Scope::HostRoutes),
             Self::Moves(form) => {
                 matches!(MoveCosts::stored(topology, executor, *form, store), Err(MoveError::Unrecorded { .. }))
@@ -315,13 +318,15 @@ impl PointRequests {
 
     /// The requests on `executor` whose points `store`'s records do not all
     /// hold, the load that waited latest first, then assessment's standing
-    /// request for the costs where its walk is not whole; each request
-    /// satisfied is forgotten.
+    /// request for the costs where its walk is not whole
+    /// (`costs_outstanding`, as [`PointRequest::outstanding`] takes it); each
+    /// request satisfied is forgotten.
     pub fn outstanding(
         &self,
         topology: &DeviceTopology,
         executor: &Executor,
         store: &dyn RecordStore<PointKey>,
+        costs_outstanding: bool,
     ) -> Result<Vec<PointRequest>, String> {
         let identity = executor_identity(topology, executor).map_err(|error| error.to_string())?;
         let mut waiting = Vec::new();
@@ -329,14 +334,14 @@ impl PointRequests {
             if stored.executor != identity {
                 continue;
             }
-            match stored.request.outstanding(topology, executor, store) {
+            match stored.request.outstanding(topology, executor, store, costs_outstanding) {
                 true => waiting.push(stored),
                 false => self.files.remove::<Stored>(&(&stored.executor, &stored.request)).map_err(|error| error.to_string())?,
             }
         }
         waiting.sort_by(|first, second| second.waiter.cmp(&first.waiter));
         let mut requests = waiting.into_iter().map(|stored| stored.request).collect::<Vec<_>>();
-        if !requests.contains(&PointRequest::Costs) && PointRequest::Costs.outstanding(topology, executor, store) {
+        if !requests.contains(&PointRequest::Costs) && costs_outstanding {
             requests.push(PointRequest::Costs);
         }
         Ok(requests)
@@ -407,7 +412,8 @@ mod tests {
         requests.request(&identity, PointRequest::Costs, Waiter { touched: 7, rank: 0 }).unwrap();
         requests.request(&other_identity, PointRequest::HostRoutes, Waiter { touched: 9, rank: 0 }).unwrap();
         let records = seismic::measure::HeldStore::default();
-        let order = |requests: &PointRequests| requests.outstanding(&topology, &executor, &records).unwrap();
+        let costs = walk_outstanding(&topology, &executor, &records, Scope::Whole);
+        let order = |requests: &PointRequests| requests.outstanding(&topology, &executor, &records, costs).unwrap();
         assert_eq!(order(&requests), [PointRequest::Costs, PointRequest::HostRoutes]);
         // A later touch moves the host routes ahead; an earlier does not
         // move them back. Another reader sees the same.
@@ -460,6 +466,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("point-requests-standing-{}", std::process::id()));
         let (topology, executor, _) = host();
         let records = seismic::measure::HeldStore::default();
-        assert_eq!(PointRequests::new(&root).outstanding(&topology, &executor, &records).unwrap(), [PointRequest::Costs]);
+        let costs = walk_outstanding(&topology, &executor, &records, Scope::Whole);
+        assert_eq!(PointRequests::new(&root).outstanding(&topology, &executor, &records, costs).unwrap(), [PointRequest::Costs]);
     }
 }
