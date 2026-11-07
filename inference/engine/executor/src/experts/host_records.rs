@@ -67,7 +67,7 @@ use super::map::LandingMap;
 use super::reuse::Score;
 use super::staging::Staged;
 use super::watcher::{Step, Unbegun};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 
 /// What a kept record holds, which orders it for taking: an expert the
 /// tier holds alone, or a copy of one the bank holds too.
@@ -267,6 +267,14 @@ pub(super) struct HostRecords {
     /// Bumped as any layer's count of experts kept alone changes
     /// ([`Self::holdings`]).
     holdings: u64,
+    /// A demand's victims, first in taking order as last prepared
+    /// ([`Self::prepare_demand`]), each with the expert it kept then: a
+    /// claim takes the first that still keeps it, unheld and not read
+    /// ([`Self::claim_prepared`]), so no claim scans the records while a
+    /// step waits.
+    victims: VecDeque<(u32, Staged)>,
+    /// The step the victims were prepared at, and how many.
+    prepared: Option<(Step, usize)>,
 }
 
 impl HostRecords {
@@ -295,6 +303,8 @@ impl HostRecords {
             lent,
             maps,
             holdings: 0,
+            victims: VecDeque::new(),
+            prepared: None,
         };
         assert!(lent <= records, "a tier lends {lent} of its {records} records");
         host.grow(records);
@@ -709,6 +719,61 @@ impl HostRecords {
         }
     }
 
+    /// Prepare a demand's victims ([`Self::victims`]): the first `depth`
+    /// kept records no copy holds, in taking order at `rank`. Run after a
+    /// request's reads are submitted, so the scan is off every park's path;
+    /// the order it leaves is a few passes old at most when a claim reads
+    /// it, and each entry is checked again as it is taken.
+    pub fn prepare_demand(&mut self, rank: impl Rank, depth: usize, sequence: Step) {
+        let mut order = (0..self.records())
+            .filter(|&record| self.unheld(record))
+            .filter_map(|record| Some((self.place(record, &rank)?, record)))
+            .collect::<Vec<_>>();
+        if order.len() > depth {
+            order.select_nth_unstable(depth);
+            order.truncate(depth);
+        }
+        order.sort_unstable();
+        self.victims = order.into_iter().map(|((.., staged), record)| (record, staged)).collect();
+        self.prepared = Some((sequence, self.victims.len()));
+    }
+
+    /// Whether the victims want preparing again at step `sequence`: never
+    /// prepared, some taken or passed over since, or prepared at an
+    /// earlier step.
+    pub fn unprepared(&self, sequence: Step) -> bool {
+        self.prepared.is_none_or(|(at, count)| at < sequence || self.victims.len() < count)
+    }
+
+    /// [`Self::claim_demand`] from the prepared victims alone: none where it
+    /// needs a scan, every prepared victim gone (since unmapped, landed
+    /// into, held or read by the parked step).
+    pub fn claim_prepared(&mut self, staged: Staged, read: impl Fn(u32) -> bool, (parked, steps): (Point, u64)) -> Option<Claim> {
+        match self.located(staged) {
+            Located::Kept(record) => return Some(Claim::Kept(record)),
+            Located::Landing => return Some(Claim::Landing),
+            Located::Lacked if self.takes(0) => return Some(Claim::Taken(self.take_lacked(staged, Some(parked)))),
+            Located::Lacked => {}
+        }
+        let record = loop {
+            let (record, kept) = self.victims.pop_front()?;
+            let keeps = matches!(self.records[record as usize], Host::Kept(Whole { staged, holds: 0, .. }) if staged == kept);
+            if keeps && !read(record) {
+                break record;
+            }
+        };
+        Some(self.take_victim(staged, record, (parked, steps)))
+    }
+
+    /// Unmap kept record `record` from the first step whose resolution of
+    /// its expert's layer is not before `parked`, and take it for `staged`.
+    fn take_victim(&mut self, staged: Staged, record: u32, (parked, steps): (Point, u64)) -> Claim {
+        let unmapped = self.unkeep(record);
+        self.unmap_from(unmapped, record, parked.first_unresolved(unmapped.0, steps));
+        self.set(record, Host::Ready);
+        Claim::Taken(self.take_lacked(staged, Some(parked)))
+    }
+
     /// Claim a demand landing of `staged` ([`Self::claim`] leaving no
     /// reserve), the device parked at `parked` (a group of `steps` steps):
     /// where it is lacked and no record is ready, unmap the first kept
@@ -735,10 +800,7 @@ impl HostRecords {
         let Some((_, record)) = first else {
             return Claim::Short;
         };
-        let unmapped = self.unkeep(record);
-        self.unmap_from(unmapped, record, parked.first_unresolved(unmapped.0, steps));
-        self.set(record, Host::Ready);
-        Claim::Taken(self.take_lacked(staged, Some(parked)))
+        self.take_victim(staged, record, (parked, steps))
     }
 
     /// The device parked at `parked` (a group of `steps` steps), steps
@@ -942,6 +1004,10 @@ impl HostRecords {
         assert!(self.records[records as usize..].iter().all(|&content| content == Host::Ready), "a shrink keeps nothing past it");
         self.records.truncate(records as usize);
         self.ready.retain(|&record| record < records);
+        // A demand's prepared victims name records the shrink moved or
+        // dropped: none stands, and the next claim prepares again.
+        self.victims.clear();
+        self.prepared = None;
         moves
     }
 }
@@ -1103,6 +1169,52 @@ mod tests {
         let other = tier.take((0, 2), 0).unwrap();
         tier.unlanded(other);
         assert_eq!(tier.located((0, 2)), Located::Lacked, "a failed landing lacks it again");
+    }
+
+    /// A demand's prepared victims are taken in taking order, each only
+    /// while it still keeps the expert it was prepared with, unread by the
+    /// parked step: one landed into since is passed over, and once none is
+    /// left the claim falls back to the scan.
+    #[test]
+    fn a_demand_takes_its_prepared_victims_in_order_while_they_hold() {
+        let mut records = tier(3, 1, ONE, Resolution::BeforeStamp);
+        let [one, two, three] = [1, 2, 3].map(|expert| records.land((0, expert)));
+        let ranked = [((0, 1), 5), ((0, 2), 1), ((0, 3), 3)];
+        records.prepare_demand(reads(&ranked), 3, 5);
+        let taken = |claim: Option<Claim>| match claim {
+            Some(Claim::Taken(grant)) => Some(grant.record()),
+            Some(_) => panic!("a lacked expert's claim takes a record or none"),
+            None => None,
+        };
+        assert_eq!(taken(records.claim_prepared((0, 4), |_| false, (at(6), 1))), Some(two), "the least recently read first");
+        assert_eq!(taken(records.claim_prepared((0, 5), |record| record == three, (at(6), 1))), Some(one), "the parked step's read passed over");
+        assert_eq!(taken(records.claim_prepared((0, 6), |_| false, (at(6), 1))), None, "none left: the claim scans");
+        let mut stale = tier(3, 1, ONE, Resolution::BeforeStamp);
+        for expert in 1..=3 {
+            stale.land((0, expert));
+        }
+        stale.prepare_demand(reads(&ranked), 1, 5);
+        let Claim::Taken(grant) = stale.claim_demand((0, 4), reads(&ranked), |_| false, (at(6), 1)) else { panic!("a kept record frees") };
+        assert_eq!(grant.record(), two, "the scan takes the prepared victim first");
+        assert_eq!(taken(stale.claim_prepared((0, 5), |_| false, (at(6), 1))), None, "a victim taken since is passed over");
+    }
+
+    /// A shrink leaves no prepared victim behind: a claim in the same step
+    /// prepares again and takes a record the tier still has, never one the
+    /// shrink moved or dropped.
+    #[test]
+    fn a_claim_after_a_shrink_takes_no_victim_prepared_before_it() {
+        let mut records = tier(3, 1, ONE, Resolution::BeforeStamp);
+        for expert in 1..=3 {
+            records.land((0, expert));
+        }
+        let ranked = [((0, 1), 5), ((0, 2), 1), ((0, 3), 3)];
+        records.prepare_demand(reads(&ranked), 3, 5);
+        records.shrink(1, reads(&ranked));
+        assert!(records.unprepared(5), "the shrink's records want preparing again");
+        assert_eq!(records.claim_prepared((0, 4), |_| false, (at(5), 1)).map(|_| ()), None, "no victim prepared before the shrink is taken");
+        let Claim::Taken(grant) = records.claim_demand((0, 4), reads(&ranked), |_| false, (at(5), 1)) else { panic!("the kept record frees") };
+        assert_eq!(grant.record(), 0, "the tier's one record");
     }
 
     /// The ranking of experts last read at `reads`, each (expert, step);

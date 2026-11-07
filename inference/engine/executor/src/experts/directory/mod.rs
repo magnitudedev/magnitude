@@ -622,9 +622,27 @@ impl Directory {
     /// record. Short without a tier.
     pub fn claim_demand(&mut self, (layer, expert): Staged, read: &[(usize, u32)], parked: (Point, u64)) -> Claim {
         let group = self.bank.group(layer);
+        let read = |record| read.contains(&(group, record));
+        if let Some(claim) = self.host[group].claim_prepared((layer, expert), read, parked) {
+            return claim;
+        }
         let reuse = Reuse::of(&self.ranking);
         let rank = store_rank(&reuse, &self.prompt_reads);
-        self.host[group].claim_demand((layer, expert), rank, |record| read.contains(&(group, record)), parked)
+        self.host[group].claim_demand((layer, expert), rank, read, parked)
+    }
+
+    /// Prepare `layer`'s group's demand victims, `depth` of them
+    /// ([`HostRecords::prepare_demand`]), at the ranking as it is now, at
+    /// step `sequence`: where a claim took any, or they were prepared at an
+    /// earlier step (the ranking moves by steps).
+    pub fn prepare_demand(&mut self, layer: usize, depth: usize, sequence: Step) {
+        let group = self.bank.group(layer);
+        if !self.host[group].unprepared(sequence) {
+            return;
+        }
+        let reuse = Reuse::of(&self.ranking);
+        let rank = store_rank(&reuse, &self.prompt_reads);
+        self.host[group].prepare_demand(rank, depth, sequence);
     }
 
     /// `layer`'s `expert` landed whole into tier record `record`, read at

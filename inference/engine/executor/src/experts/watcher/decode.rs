@@ -460,8 +460,14 @@ impl Decode {
         // frees no record now (a withdrawn read frees its own as it ends),
         // so it follows the reads.
         prefetch.withdraw_passed(core, &shared.steps, Some((sequence, layer)));
+        // The next request's victims, prepared now its reads are in flight
+        // where this one took any or they are of an earlier step: a claim
+        // then takes the first still free, scanning nothing while its step
+        // waits. Twice a request's choices, as some are read by the step a
+        // claim parks or gone by then.
         if fresh > 0 {
             lead = Some(0);
+            core.directory.prepare_demand(layer, 2 * width as usize, sequence);
         }
         served.lead = lead;
         served.misses = served.missed.len() as u64;
