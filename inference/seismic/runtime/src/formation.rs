@@ -77,13 +77,17 @@ impl<P> Formed<P> {
 
     /// The compile that holds `entry` and the entry's position in it.
     pub fn entry(&self, entry: &ProgramEntry) -> (&Arc<Compile<P>>, usize) {
-        self.compiles
-            .iter()
-            .find_map(|compile| {
-                let position = compile.entries.iter().position(|held| held == entry)?;
-                Some((compile, position))
-            })
+        self.holding(entry)
             .expect("a formed source holds every entry it was requested for")
+    }
+
+    /// The compile that holds `entry`, if one does, and the entry's
+    /// position in it.
+    pub fn holding(&self, entry: &ProgramEntry) -> Option<(&Arc<Compile<P>>, usize)> {
+        self.compiles.iter().find_map(|compile| {
+            let position = compile.entries.iter().position(|held| held == entry)?;
+            Some((compile, position))
+        })
     }
 }
 

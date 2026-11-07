@@ -68,7 +68,7 @@ use crate::completion::{Committed, DeviceCompletion, IssuedFailure};
 pub(crate) use crate::completion::RouteSubmission;
 use crate::driver::{collect_native_access, typed_buffer, write_zeros, Allocation};
 pub(crate) use crate::formation::FormationClass;
-use crate::formation::{Compile, Keyed, ProgramFormer};
+use crate::formation::{Compile, Formed, Keyed, ProgramFormer};
 pub use budget::{Footprint, Linear, Observed, Quote};
 pub use graph_replays::GraphReplays;
 pub use point::{GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending};
@@ -713,8 +713,55 @@ impl Launches<Vec<seismic_metal::DirectPipeline>> {
 }
 
 /// Programs held so that implementations formed while they live share them:
-/// a tuning run holds every launch variant it may assemble.
-pub(crate) struct HeldPrograms(#[allow(dead_code)] Box<dyn Send + Sync>);
+/// a tuning run holds every launch variant it may assemble, and assembles
+/// each from them ([`NativePrepared::assemble_held`]).
+pub(crate) enum HeldPrograms {
+    /// A backend without launch-scoped programs holds none.
+    Nothing,
+    /// A formed kernel's programs, held apart from the kernel.
+    Route(#[allow(dead_code)] Box<dyn Send + Sync>),
+    /// Each launch source formed with all its variants, by launch ordinal.
+    #[cfg(target_os = "macos")]
+    Metal(Vec<(usize, Formed<Vec<seismic_metal::DirectPipeline>>)>),
+    Cuda(Vec<(usize, Formed<seismic_cuda::direct::DirectModule>)>),
+}
+
+/// The launches of `specialization` placed at the entries `held` formed:
+/// each launch it reaches runs its variant's entry, which a held source of
+/// that launch has. Nothing renders or forms.
+fn held_launches<P>(
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    dialect: abi::Dialect,
+    held: &[&[(usize, Formed<P>)]],
+) -> Launches<P> {
+    let launches = (0..implementation.launches.len())
+        .map(|ordinal| {
+            if !implementation.reachable(specialization, ordinal) {
+                return None;
+            }
+            let entry = bounded(
+                dialect,
+                template_instance(
+                    &implementation.launches[ordinal].kernel,
+                    &plan::code_values(implementation, specialization, ordinal),
+                ),
+                implementation.static_group_size(specialization, ordinal),
+            );
+            let placed = held
+                .iter()
+                .flat_map(|sources| sources.iter())
+                .filter(|(launch, _)| *launch == ordinal)
+                .find_map(|(_, formed)| {
+                    let (compile, position) = formed.holding(&entry)?;
+                    Some((compile.clone(), position, formed.key().clone()))
+                })
+                .expect("a tuning run assembles only the launch variants it holds");
+            Some(placed)
+        })
+        .collect();
+    Launches { launches }
+}
 
 /// What was formed, for tuning records and measurement attribution: the
 /// backend, entry, element bindings, specialization, rendered-source digest
@@ -1581,7 +1628,7 @@ impl NativePrepared {
     /// none of the kernel's call state (its scalar slots and scratch) is
     /// kept with them.
     pub(crate) fn programs(&self) -> HeldPrograms {
-        HeldPrograms(Box::new(self.route.clone()))
+        HeldPrograms::Route(Box::new(self.route.clone()))
     }
 
     /// Form each launch in `sources` with all its code variants, one
@@ -1607,18 +1654,23 @@ impl NativePrepared {
             sources,
         )?
         else {
-            return Ok(HeldPrograms(Box::new(())));
+            return Ok(HeldPrograms::Nothing);
         };
-        Ok(HeldPrograms(match &device.programs {
+        let ordinals = || sources.iter().map(|source| source.ordinal);
+        Ok(match &device.programs {
             #[cfg(target_os = "macos")]
-            crate::backends::DevicePrograms::Metal(former) => {
-                Box::new(former.form(&programs).map_err(compilation)?)
-            }
-            crate::backends::DevicePrograms::Cuda(former) => {
-                Box::new(former.form(&programs).map_err(compilation)?)
-            }
+            crate::backends::DevicePrograms::Metal(former) => HeldPrograms::Metal(
+                ordinals()
+                    .zip(former.form(&programs).map_err(compilation)?)
+                    .collect(),
+            ),
+            crate::backends::DevicePrograms::Cuda(former) => HeldPrograms::Cuda(
+                ordinals()
+                    .zip(former.form(&programs).map_err(compilation)?)
+                    .collect(),
+            ),
             _ => unreachable!("only Metal and CUDA form launch-scoped programs"),
-        }))
+        })
     }
 
     /// The programs [`NativePrepared::hold_launch_variants`] of `sources`
@@ -1738,6 +1790,61 @@ impl NativePrepared {
         specialization: NativeSpecialization,
         cpu: Option<&'static CpuNativeKernels>,
         implementation: NativeImplementation,
+    ) -> Result<Arc<Self>, PrepareError> {
+        Self::prepare_formed(
+            device,
+            module,
+            entry,
+            logical,
+            bindings,
+            specialization,
+            cpu,
+            implementation,
+            None,
+        )
+    }
+
+    /// [`NativePrepared::prepare_implementation`] of a launch-scoped
+    /// specialization a tuning run assembles from the launch variants it
+    /// holds (`held`, [`NativePrepared::hold_launch_variants`]): its
+    /// launches are placed at the held entries, and no source is rendered
+    /// or formed.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn assemble_held(
+        device: &Arc<DeviceInner>,
+        module: &CheckedModule,
+        entry: EntryId,
+        logical: &Arc<LogicalEntry>,
+        bindings: ElementBindings,
+        specialization: NativeSpecialization,
+        cpu: Option<&'static CpuNativeKernels>,
+        implementation: NativeImplementation,
+        held: &[&HeldPrograms],
+    ) -> Result<Arc<Self>, PrepareError> {
+        Self::prepare_formed(
+            device,
+            module,
+            entry,
+            logical,
+            bindings,
+            specialization,
+            cpu,
+            implementation,
+            Some(held),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_formed(
+        device: &Arc<DeviceInner>,
+        module: &CheckedModule,
+        entry: EntryId,
+        logical: &Arc<LogicalEntry>,
+        bindings: ElementBindings,
+        specialization: NativeSpecialization,
+        cpu: Option<&'static CpuNativeKernels>,
+        implementation: NativeImplementation,
+        held: Option<&[&HeldPrograms]>,
     ) -> Result<Arc<Self>, PrepareError> {
         let backend = backend_name(&device.kind);
         let name = entry_name(module, entry);
@@ -1874,9 +1981,25 @@ impl NativePrepared {
                             words * 8
                         )));
                     }
-                    let (sources, requests) = rendered()?;
                     let former = device.programs.metal();
-                    let launches = form_launches(former, &sources, &requests)?;
+                    let launches = match held {
+                        Some(held) => held_launches(
+                            &implementation,
+                            &specialization,
+                            metal_dialect(opened),
+                            &held
+                                .iter()
+                                .filter_map(|held| match held {
+                                    HeldPrograms::Metal(sources) => Some(sources.as_slice()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        None => {
+                            let (sources, requests) = rendered()?;
+                            form_launches(former, &sources, &requests)?
+                        }
+                    };
                     launches.identify(&mut digest);
                     (
                         NativeRoute::Metal {
@@ -1887,9 +2010,25 @@ impl NativePrepared {
                     )
                 }
                 OpenedKind::Cuda(opened) => {
-                    let (sources, requests) = rendered()?;
                     let former = device.programs.cuda();
-                    let launches = form_launches(former, &sources, &requests)?;
+                    let launches = match held {
+                        Some(held) => held_launches(
+                            &implementation,
+                            &specialization,
+                            cuda_dialect(opened),
+                            &held
+                                .iter()
+                                .filter_map(|held| match held {
+                                    HeldPrograms::Cuda(sources) => Some(sources.as_slice()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        None => {
+                            let (sources, requests) = rendered()?;
+                            form_launches(former, &sources, &requests)?
+                        }
+                    };
                     launches.identify(&mut digest);
                     // Measurements depend on the driver the CUBIN runs under.
                     let toolchain = format!(
