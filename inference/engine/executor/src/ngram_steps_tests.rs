@@ -571,8 +571,9 @@ fn scores(
         domain.open_state(&mut bindings, request, None).unwrap();
         let (outcome, mut returned) =
             run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, backend);
+        // The prompt step's misses reach the site as a decode step's do.
+        let mut sited = site_answers(&domain, &stored, function, backend, 0);
         let mut steps = vec![step_bits(&outcome)];
-        let mut sited = Vec::new();
         for position in 2..2 + DECODE_STEPS {
             let token = (position * 37 % 256) as u32;
             let (outcome, next) =
