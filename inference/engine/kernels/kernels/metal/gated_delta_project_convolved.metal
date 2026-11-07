@@ -1,11 +1,13 @@
 // gated_delta_project_convolved: `gated_delta_project`'s GEMV and batched
 // GEMV launches (RMS prologue over the F32 residual, one segmented projection
-// qkv | z | alpha | beta), whose qkv segment also convolves. Its column
-// epilogue (`ConvolvedChannel`) receives every row's sum of a channel and,
-// for each row it publishes, forms `gated_delta_step`'s convolved channel
-// (`recurrent::convolve`'s F32 tap chain over the rows rounded to A, then
-// SiLU) and the row's share of the successor window. Channels of the window
-// rows must be contiguous (unit stride), as the step requires.
+// qkv | z | alpha | beta), whose qkv segment also convolves. For each row
+// of a channel, `ConvolvedChannel` forms `gated_delta_step`'s convolved
+// channel (`recurrent::convolve`'s F32 tap chain over the rows rounded to A,
+// then SiLU) and the row's share of the successor window: the batched class
+// as its column epilogue, from every row's sum of the channel; the GEMV
+// classes in a pass after their qkv projection, from the values the
+// threadgroup published. Channels of the window rows must be contiguous
+// (unit stride), as the step requires.
 #define KERNEL_W0 SEISMIC_QKV_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_ALPHA_WEIGHT
@@ -86,16 +88,15 @@ struct ConvolvedChannel {
     threadgroup const ConvolvedRow *rows;
     constant ulong *seismic_words;
 
-    template <uint N>
-    void store_column(uint m, uint n, thread const float (&sums)[N]) const {
+    // Channel n of row m, given `value(j)`, row j's projection value of
+    // channel n rounded to A.
+    template <typename Value>
+    void convolve(uint m, uint n, Value value) const {
         typedef activation::storage Storage;
-        const float raw = row_sum(sums, m);
-        reinterpret_cast<device Storage *>(projection)[ulong(m) * projection0 + ulong(n) * projection1] =
-            activation::store(raw);
-        device float *value = convolved + ulong(m) * convolved0 + ulong(n) * convolved1;
+        device float *out = convolved + ulong(m) * convolved0 + ulong(n) * convolved1;
         const ConvolvedRow row = rows[m];
         if (row.lo < 0) {
-            *value = 0.0f;
+            *out = 0.0f;
             return;
         }
         const long taps = long(SEISMIC_DIM_C) - 1;
@@ -107,19 +108,41 @@ struct ConvolvedChannel {
             const long position = local + long(tap) - taps;
             const float input = position < 0
                 ? activation::load(source[ulong(row.taped + taps + position) * SEISMIC_WINDOW_STRIDE_1 + channel])
-                : activation::round(row_sum(sums, ulong(row.lo + position)));
+                : value(ulong(row.lo + position));
             sum = metal::fma(convolution[channel * SEISMIC_CONVOLUTION_STRIDE_0 + tap * SEISMIC_CONVOLUTION_STRIDE_1],
                 input, sum);
         }
-        *value = sum / (1.0f + metal::exp(-sum));
+        *out = sum / (1.0f + metal::exp(-sum));
         device Storage *target = reinterpret_cast<device Storage *>(row.target);
         const long kept = local - row.stop + taps;
         if (kept >= 0 && kept < row.kept)
-            target[ulong(kept) * SEISMIC_WINDOW_STRIDE_1 + channel] = activation::store(raw);
+            target[ulong(kept) * SEISMIC_WINDOW_STRIDE_1 + channel] = activation::store(value(ulong(m)));
         if (local == 0) {
             for (long tap = 0; row.stop + tap < taps; ++tap)
                 target[ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel] =
                     source[ulong(row.taped + row.stop + tap) * SEISMIC_WINDOW_STRIDE_1 + channel];
+        }
+    }
+
+    // The batched class's column epilogue: the projection value, then the
+    // channel from every row's sum of it.
+    template <uint N>
+    void store_column(uint m, uint n, thread const float (&sums)[N]) const {
+        reinterpret_cast<device activation::storage *>(projection)[ulong(m) * projection0 + ulong(n) * projection1] =
+            activation::store(row_sum(sums, m));
+        convolve(m, n, [&](ulong j) { return activation::round(row_sum(sums, j)); });
+    }
+
+    // The GEMV classes' pass after their projection of channels first ..
+    // first + count, which this threadgroup published: every thread takes
+    // (row, channel) items in turn, reading the published values, so the
+    // items run at once. A lane group's column epilogue would run its rows'
+    // items one after another.
+    void convolve_channels(uint first, uint count, uint m_rows, uint thread_index, uint threads) const {
+        device const activation::storage *published = reinterpret_cast<device const activation::storage *>(projection);
+        for (uint item = thread_index; item < count * m_rows; item += threads) {
+            const uint n = first + item / m_rows, m = item % m_rows;
+            convolve(m, n, [&](ulong j) { return activation::load(published[j * projection0 + ulong(n) * projection1]); });
         }
     }
 };
@@ -168,10 +191,12 @@ struct ConvolvedChannel {
 
 // The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows. The last
 // simdgroup resolves the rows' slots after its share of the norm; the body's
-// opening barrier publishes them to the epilogue.
+// opening barrier publishes them to the convolution pass.
 #define RECURRENT_PROJECT_CONVOLVED_GEMV(ROWS, LANES, COUNT)                            \
     threadgroup ConvolvedRow slot_rows[16];                                             \
     RECURRENT_PROJECT_OPERANDS;                                                         \
+    projection::Store<activation> qkv_values{result, SEISMIC_RESULT_0_STRIDE_0,         \
+        SEISMIC_RESULT_0_STRIDE_1, 0};                                                  \
     uint per = simdgroups * ROWS * (32u / LANES);                                       \
     uint rows = uint(SEISMIC_DIM_M);                                                    \
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);                            \
@@ -184,8 +209,11 @@ struct ConvolvedChannel {
         convolved_rows({segments, stop, previous_bank, previous_tape, following_bank}, window, slot_rows, lane, \
             seismic_words);                                                             \
     if (tile < t0) {                                                                    \
-        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_columns_runtime<packets::W0, ROWS, MAXM, LANES>( \
-            x, qkv_out, qkv, rows, qkv_rows, k, tile, shared, simdgroups, sg, lane));   \
+        PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>( \
+            x, qkv_values, qkv, rows, qkv_rows, k, tile, shared, simdgroups, sg, lane)); \
+        threadgroup_barrier(mem_flags::mem_device);                                     \
+        qkv_out.convolve_channels(tile * per, metal::min(per, qkv_rows - tile * per), rows, \
+            sg * 32u + lane, simdgroups * 32u);                                         \
     } else if (tile < t0 + t1) {                                                        \
         PROJECTION_FOR_##COUNT##_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>( \
             x, gate_out, gate, rows, gate_rows, k, tile - t0, shared, simdgroups, sg, lane)); \
