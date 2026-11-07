@@ -1054,6 +1054,8 @@ impl<'m> Subject<'m> {
         })
     }
 
+    /// Whether the entry forms at `bindings` and so does its native
+    /// implementation on the subject's backend.
     fn admits(&self, bindings: &ElementBindings) -> bool {
         let key = format!("{bindings:?}");
         if let Some(admitted) = self
@@ -1064,7 +1066,11 @@ impl<'m> Subject<'m> {
         {
             return *admitted;
         }
-        let admitted = self.module.entry(self.info.id, bindings).is_ok();
+        let admitted = self.module.entry(self.info.id, bindings).is_ok()
+            && self
+                .module
+                .native_implementation_at(self.info.id, self.backend, bindings)
+                .is_some();
         self.admitted
             .lock()
             .expect("no thread panics holding the cache")

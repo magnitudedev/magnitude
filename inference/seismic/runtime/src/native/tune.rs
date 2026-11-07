@@ -8504,7 +8504,8 @@ mod tests {
         let implementation = module
             .native_implementation(entry, BackendName::Metal)
             .unwrap()
-            .at_elements(&bindings);
+            .at_elements(&bindings)
+            .unwrap();
         let statics = NativeSpecialization::new()
             .with_static("H", 1024)
             .with_static("F", 4096)

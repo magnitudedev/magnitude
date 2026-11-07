@@ -1741,7 +1741,14 @@ impl NativePrepared {
     ) -> Result<Arc<Self>, PrepareError> {
         let backend = backend_name(&device.kind);
         let name = entry_name(module, entry);
-        let implementation = on_device(device, implementation).at_elements(&bindings);
+        let implementation = on_device(device, implementation)
+            .at_elements(&bindings)
+            .ok_or_else(|| {
+                preparation(format!(
+                    "`{name}` has no `{}` implementation at these element bindings",
+                    backend.as_str()
+                ))
+            })?;
         let scoped = implementation.launch_scoped();
         if scoped && !matches!(backend, BackendName::Metal | BackendName::Cuda) {
             return Err(preparation(format!(
