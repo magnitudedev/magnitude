@@ -8,6 +8,7 @@ import {
   LocalInferenceDeviceIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelVersionNotRunnable,
+  type CatalogLocalModel,
   type CustomLocalModel,
   type ModelCatalogState,
 } from "@magnitudedev/sdk"
@@ -16,6 +17,7 @@ import {
   ADDED_MODEL_ID,
   catalogState,
   doesNotFitAssessment,
+  fitsAssessment,
   FOUND_MODEL_ID,
   makeAcquiringModel,
   makeAddedModel,
@@ -308,6 +310,22 @@ describe("catalog renderers", () => {
       { name: "Test GPU", details: "25.8 GB VRAM · CUDA acceleration · in use" },
       { name: "Integrated graphics", details: "shares system memory · available" },
     ])
+  })
+
+  it("breaks a fitting model's memory into weights, context and overhead in catalog and model details", () => {
+    const GB = 1_000_000_000
+    const fitting = (served: number) => makeCatalogModel({ servingState: { ...makeCatalogModel().servingState, assessment: {
+      ...fitsAssessment(),
+      profile: { contextLength: 1_048_576 },
+      served: { contextLength: served },
+      memory: { domains: [], totalRequiredBytes: 45.4 * GB, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 36 * GB, contextBytes: 7.1 * GB, overheadBytes: 2.3 * GB } },
+    } } as CatalogLocalModel["servingState"] })
+    const full = fitting(1_048_576)
+    const line = /Breakdown +Weights 36 GB · 1M context 7\.1 GB · Overhead 2\.3 GB\n/
+    expect(renderCatalogDetail({ model: full, models: [full] })).toMatch(line)
+    expect(renderModelDetail({ model: full, models: [full], drafters: { _tag: "NotApplicable" }, hidden: false })).toMatch(line)
+    const reduced = fitting(262_144)
+    expect(renderCatalogDetail({ model: reduced, models: [reduced] })).toContain("256K context 7.1 GB · Overhead 2.3 GB (full 1M doesn’t fit)")
   })
 
   it("prints the search command for other versions in catalog details", () => {

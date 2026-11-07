@@ -547,7 +547,7 @@ const plan = { contextWindowTokens: 4096, requiredMemoryBytes: 10, device: { dev
 const withEvidence = <M extends CatalogLocalModel | CustomLocalModel>(model: M): M => {
   const serving = model.servingState
   if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") return model
-  return { ...model, servingState: { ...serving, assessment: { ...serving.assessment, memory: { domains: [memoryEvidence], totalRequiredBytes: 10, requiredSystemMemoryBytes: 0 } } } }
+  return { ...model, servingState: { ...serving, assessment: { ...serving.assessment, memory: { domains: [memoryEvidence], totalRequiredBytes: 10, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 7, contextBytes: 2, overheadBytes: 1 } } } } }
 }
 
 const residencies = [
@@ -637,7 +637,7 @@ describe("--json never leaks internals", () => {
     const shown = encode(catalogDetailJson, { model: catalog, models: [] })
     expect(shown.model).toMatchObject({
       catalogData: { intelligence: 75, quantizationAware: false },
-      servingState: { assessment: { _tag: "Fits", memory: { totalRequiredBytes: 10 } } },
+      servingState: { assessment: { _tag: "Fits", memory: { totalRequiredBytes: 10, breakdown: { weightsBytes: 7, contextBytes: 2, overheadBytes: 1 } } } },
     })
   })
 })

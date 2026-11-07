@@ -36,7 +36,7 @@ import { Schema, Struct } from "effect"
 
 const optional = <A, I>(schema: Schema.Schema<A, I, never>) => Schema.optionalWith(schema, { as: "Option", exact: true })
 
-const MemoryJsonSchema = Schema.Struct(Struct.pick(LocalModelMemorySchema.from.fields, "totalRequiredBytes", "requiredSystemMemoryBytes"))
+const MemoryJsonSchema = Schema.Struct(Struct.pick(LocalModelMemorySchema.from.fields, "totalRequiredBytes", "requiredSystemMemoryBytes", "breakdown"))
 
 const FitsJsonSchema = Schema.Struct({
   ...Struct.omit(LocalModelFitsAssessmentSchema.fields, "assessmentId", "environmentId"),

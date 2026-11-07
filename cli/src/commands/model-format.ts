@@ -11,8 +11,10 @@ import {
   modelStoppedForMemory,
   localModelResidency,
   localModelContextLimit,
+  localModelMemoryParts,
   localModelServingProfile,
   localModelServingState,
+  localModelUnservedContext,
 } from "@magnitudedev/client-common"
 import { findLocalModelById, type CatalogLocalModel, type LocalModel, type ModelCatalogState, type ModelId } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
@@ -70,6 +72,17 @@ export const modelMemoryBytes = (model: LocalModel): number | undefined => {
 export const modelMemory = (model: LocalModel): string => {
   const bytes = modelMemoryBytes(model)
   return bytes === undefined ? "—" : formatMemorySize(bytes)
+}
+
+/** What a fitting model's memory holds, as the desktop shows it: "Weights 36 GB · 1M context 7.1 GB · Overhead 2.3 GB". */
+export const memoryBreakdownFields = (model: LocalModel): readonly (readonly [string, string])[] => {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  if (serving?._tag !== "Assessed" || serving.assessment._tag !== "Fits") return []
+  const parts = localModelMemoryParts(serving.assessment).map(({ label, bytes }) => `${label} ${formatMemorySize(bytes)}`).join(" · ")
+  return [["Breakdown", Option.match(localModelUnservedContext(serving.assessment), {
+    onNone: () => parts,
+    onSome: (unserved) => `${parts} (${unserved})`,
+  })]]
 }
 
 export const supportFields = (

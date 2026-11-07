@@ -46,6 +46,7 @@ import {
   isCatalogModel,
   residencyState,
   modelContext,
+  memoryBreakdownFields,
   modelMemory,
   supportFields,
   accelerationLabel,
@@ -348,6 +349,7 @@ export const renderCatalogDetail = ({ model, models }: CatalogDetailView): strin
     return ["Performance on this machine", renderFields([
       ["Speed", speedLabel(model)],
       ["Fit", radarDetail(model, "FIT")],
+      ...memoryBreakdownFields(model),
       ["Intelligence", `${model.catalogData.intelligence}%`],
       ["Fidelity", radarDetail(model, "FIDELITY")],
       ["Acceleration", accelerationLabel(model)],
@@ -428,7 +430,7 @@ export const renderHardware = ({ hardware, models }: HardwareView): string => {
         `  ${formatMemorySize(domain.usedBytes)} / ${formatMemorySize(domain.totalBytes)} used`,
         ...(Option.isSome(allocation) ? [
           `  Weights       ${formatMemorySize(domain.fixedBytes ?? 0)}`,
-          `  KV cache      ${formatMemorySize(domain.kvCacheBytes ?? 0)}`,
+          `  Context       ${formatMemorySize(domain.kvCacheBytes ?? 0)}`,
           `  System & apps ${formatMemorySize(domain.systemAndAppsBytes ?? 0)}`,
         ] : []),
         `  Free          ${formatMemorySize(domain.freeBytes)}`,
