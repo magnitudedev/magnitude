@@ -895,7 +895,8 @@ impl ResidencyStore {
     /// The stored table of the streamed gathered table `plan`
     /// (`TableFill::Stored`), its slots holding the rows steps named when it
     /// was last served. Its rows are read from the artifact without the
-    /// file cache.
+    /// file cache, a range of each of its row tensors
+    /// (`import_transforms::row_tensors`), each from the file that holds it.
     fn store_table(
         &self,
         artifact: &GgufArtifact,
@@ -904,29 +905,26 @@ impl ResidencyStore {
         let streamed = plan
             .streamed()
             .ok_or_else(|| invalid("a weight held whole has no stored table"))?;
-        let stored = Stored::from_gguf(artifact, &plan.descriptor)
-            .map_err(|error| invalid(error.to_string()))?;
-        let (source, offset, length) = stored.file_range();
+        let names = crate::import_transforms::row_tensors(&plan.descriptor);
+        let tensors = names.iter().map(|name| artifact.tensor(name)).collect::<Result<Vec<_>, _>>()?;
         let row_bytes = plan
             .upload
             .canonical_byte_len(&[1, plan.table_width()])
             .map_err(|error| invalid(error.to_string()))?;
-        if streamed.table_rows.checked_mul(row_bytes) != Some(length) {
-            return Err(invalid(format!(
-                "stored table {:?}: {length} bytes are not {} rows of {row_bytes}",
-                plan.descriptor.name, streamed.table_rows
-            )));
-        }
+        let bytes = crate::planning::stored_row_ranges(
+            &names.iter().zip(&tensors).map(|(name, tensor)| (*name, tensor.nbytes)).collect::<Vec<_>>(),
+            streamed.table_rows,
+            row_bytes,
+        )
+        .map_err(|error| invalid(format!("stored table {:?}: {error}", plan.descriptor.name)))?;
+        // Every range's file, offset and bytes, which the rows kept are of.
         let kept = self.kept_table_rows.as_ref().map(|directory| {
-            KeptRows::of(
-                directory,
-                &format!(
-                    "{}\n{offset}\n{length}\n{:?}\n{:?}",
-                    source.path().display(),
-                    plan.resident,
-                    plan.shape
-                ),
-            )
+            let ranges = tensors
+                .iter()
+                .zip(&bytes)
+                .map(|(tensor, bytes)| format!("{}\n{}\n{bytes}\n", tensor.source.path().display(), tensor.offset))
+                .collect::<String>();
+            KeptRows::of(directory, &format!("{ranges}{:?}\n{:?}", plan.resident, plan.shape))
         });
         let [records, record_rows, width] = plan.shape[..] else {
             return Err(invalid(format!("stored table {:?} is not records of rows", plan.descriptor.name)));
@@ -942,22 +940,37 @@ impl ResidencyStore {
             true => crate::stored_table::StoredSlots::Reserved { records, record_rows },
             false => crate::stored_table::StoredSlots::Whole { records, record_rows },
         };
+        // A step waits on the rows its lookups name: one head's rows of a
+        // step, each its ranges in their files, are the table's urgent
+        // request (the ranges of one file are its parts).
+        let ranges = tensors
+            .iter()
+            .zip(&bytes)
+            .map(|(tensor, &range)| {
+                let parts = tensors
+                    .iter()
+                    .zip(&bytes)
+                    .filter(|(other, _)| Arc::ptr_eq(&other.source, &tensor.source))
+                    .map(|(_, bytes)| *bytes)
+                    .collect();
+                let urgent = seismic_io::Urgent { parts, records: magnitude_batching::MAX_CLASS_ROWS as u64 };
+                Ok(crate::stored_table::RowRange {
+                    source: seismic_io::Reader::of_urgent(&*tensor.source, seismic_io::CachePolicy::Uncached, &urgent)?,
+                    first: tensor.offset,
+                    bytes: usize::try_from(range).map_err(|_| invalid("a table row's range exceeds the host address range"))?,
+                })
+            })
+            .collect::<Result<Vec<_>, WeightImportError>>()?;
         let table = StoredTable::new(
             &self.device,
+            &plan.descriptor,
             plan.upload,
             plan.resident,
             streamed.table_rows,
             width,
             slots,
             streamed.directory,
-            // A step waits on the rows its lookups name: one head's rows of a
-            // step, each a row as stored, are the table's urgent request.
-            seismic_io::Reader::of_urgent(
-                &**source,
-                seismic_io::CachePolicy::Uncached,
-                &seismic_io::Urgent { parts: vec![row_bytes], records: magnitude_batching::MAX_CLASS_ROWS as u64 },
-            )?,
-            offset,
+            ranges,
             kept,
         )
         .map_err(invalid)?;
@@ -1814,22 +1827,26 @@ mod tests {
         let path = std::env::temp_dir().join(format!("magnitude-imported-table-{}.bin", std::process::id()));
         std::fs::write(&path, vec![0u8; 100 + ROWS as usize * 90]).unwrap();
         let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let descriptor = WeightDescriptor::stored("ngram", [ROWS, 160]);
         let table = Arc::new(
             StoredTable::new(
                 &device,
+                &descriptor,
                 Element::named("gguf_iq4_nl").unwrap(),
                 Element::named("iq4g32s@rows16").unwrap(),
                 ROWS,
                 160,
                 crate::stored_table::StoredSlots::Reserved { records: 4, record_rows: 256 },
                 crate::planning::DirectoryForm::Hashed,
-                seismic_io::Reader::open(&path, seismic_io::CachePolicy::Uncached).unwrap(),
-                100,
+                vec![crate::stored_table::RowRange {
+                    source: seismic_io::Reader::open(&path, seismic_io::CachePolicy::Uncached).unwrap(),
+                    first: 100,
+                    bytes: 90,
+                }],
                 None,
             )
             .unwrap(),
         );
-        let descriptor = WeightDescriptor::stored("ngram", [ROWS, 160]);
         let key = ResidencyKey {
             artifact: magnitude_artifacts::ArtifactIdentity([0; 32]),
             name: descriptor.name.clone(),

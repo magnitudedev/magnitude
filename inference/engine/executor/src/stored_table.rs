@@ -34,12 +34,19 @@
 //! usual. Rows are read without filling the file cache (`Reader`,
 //! `CachePolicy::Uncached`).
 //!
+//! A row as stored is read from one range of each of its tensors
+//! (`RowRange`, `import_transforms::row_tensors`: the table's codes, and its
+//! scale grid's row where it has one), each in any file, and assembled by
+//! the importer's own transforms (`import_transforms::assemble_row`) before
+//! it is converted.
+//!
 //! The table counts the rows its filler read for each step after the step
 //! was queued (`TableWaits`).
 
 use crate::device_table::KeptRows;
 use crate::planning::DirectoryForm;
 use crate::slot_directory::SlotDirectory;
+use magnitude_family_contracts::WeightDescriptor;
 use seismic_io::{Reader, Ended, Range, Want};
 use seismic::cpu::repack::RowConversion;
 use seismic::Element;
@@ -48,6 +55,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// One stored tensor's range of every row of a stored table: row `r`'s
+/// `bytes` from `first + r·bytes` in the file `source` reads.
+pub struct RowRange {
+    pub source: Reader,
+    pub first: u64,
+    pub bytes: usize,
+}
 
 /// What a stored table's steps read after they were queued: the rows its
 /// filler read for a step, which the step's gate waited on. A step of rows
@@ -365,16 +380,18 @@ struct Shared {
     /// `[entries, fields]` I32 (`DirectoryForm`).
     directory: seismic::Tensor,
     fields: u64,
+    /// The table's weight, whose transforms assemble a row as stored from
+    /// its ranges (`import_transforms::assemble_row`).
+    descriptor: WeightDescriptor,
+    stored: Element,
     /// How a row as stored becomes a slot's row.
     conversion: &'static RowConversion,
     width: u64,
-    /// The bytes of a row as stored and of a slot's row.
-    row_bytes: usize,
+    /// The bytes of a slot's row.
     slot_bytes: usize,
-    /// The table's rows in the artifact file: `rows` of `row_bytes` from
-    /// `offset`.
-    source: Reader,
-    offset: u64,
+    /// The table's `rows` rows in the artifact's files: a range of each of
+    /// its row tensors.
+    ranges: Vec<RowRange>,
     rows: u64,
     gate: seismic::Timeline,
     read: seismic::Timeline,
@@ -402,21 +419,23 @@ struct State {
 }
 
 impl StoredTable {
-    /// A table of `rows` rows of `width` values stored as `stored` (from
-    /// `offset` in the file `source` reads), in `layout`'s slots of the
-    /// `resident` representation, every record committed, and a directory
-    /// of `form`, on `device`. Its slots are empty (`seed`).
+    /// A table of `rows` rows of `width` values of `descriptor`'s weight,
+    /// stored as `stored` once assembled from `ranges` (one of each of its
+    /// row tensors, `import_transforms::row_tensors`, in order), in
+    /// `layout`'s slots of the `resident` representation, every record
+    /// committed, and a directory of `form`, on `device`. Its slots are
+    /// empty (`seed`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &seismic::Device,
+        descriptor: &WeightDescriptor,
         stored: seismic::Element,
         resident: seismic::Element,
         rows: u64,
         width: u64,
         layout: StoredSlots,
         form: DirectoryForm,
-        source: Reader,
-        offset: u64,
+        ranges: Vec<RowRange>,
         kept: Option<KeptRows>,
     ) -> Result<Self, String> {
         let failed = |error: &dyn std::fmt::Display| format!("stored table: {error}");
@@ -439,8 +458,25 @@ impl StoredTable {
         if piece != (row_bytes as usize, Some(slot_bytes as usize)) {
             return Err(failed(&"a stored row does not convert into one slot's row"));
         }
-        if source.size() < offset + rows * row_bytes {
+        // Each range lies in its file, and the ranges of a row assemble into
+        // one row as stored.
+        if ranges.iter().any(|range| range.source.size() < range.first + rows * range.bytes as u64) {
             return Err(failed(&"the artifact does not hold the table's rows"));
+        }
+        let zeros = ranges.iter().map(|range| vec![0u8; range.bytes]).collect::<Vec<_>>();
+        let assembled = crate::import_transforms::assemble_row(
+            descriptor,
+            stored,
+            width,
+            &zeros.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+        )
+        .map_err(|error| failed(&error))?;
+        if assembled.len() as u64 != row_bytes {
+            return Err(failed(&format!(
+                "ranges of {:?} bytes assemble into {} bytes, not a row of {row_bytes}",
+                ranges.iter().map(|range| range.bytes).collect::<Vec<_>>(),
+                assembled.len()
+            )));
         }
         let (records, record_rows, reserved) = layout.shape();
         let slots = records * record_rows;
@@ -472,12 +508,12 @@ impl StoredTable {
             stack: Mutex::new(RowStack::new(records, record_rows, row_bytes)),
             directory: directory_tensor,
             fields,
+            descriptor: descriptor.clone(),
+            stored,
             conversion,
             width,
-            row_bytes: row_bytes as usize,
             slot_bytes: slot_bytes as usize,
-            source,
-            offset,
+            ranges,
             rows,
             gate: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
             read: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
@@ -912,57 +948,19 @@ impl Shared {
             claimed.insert(slot);
             taken.push(slot);
         }
-        // Read the absent rows as stored, convert each into its slot, then
-        // publish those that were read; a row that was not leaves its slot
-        // free.
-        let stored = Arc::new(seismic_io::Buffer::new(absent.len() * self.row_bytes));
-        let ranges = absent
-            .iter()
-            .enumerate()
-            .map(|(index, row)| Range {
-                offset: self.offset + row * self.row_bytes as u64,
-                length: self.row_bytes,
-                into: stored.clone(),
-                at: index * self.row_bytes,
-            })
-            .collect();
-        // SAFETY: the ranges are distinct rows of `stored`, which nothing
-        // reads until the request has ended.
-        let ended = unsafe { self.source.request(ranges, Want::now()) }
-            .map_err(|error| format!("stored table rows: {error}"))?
-            .wait();
-        let unread = match ended {
-            Ended::Read { failed } => failed,
-            Ended::Panicked(panic) => panic.resume(),
-        };
-        let mut read = vec![true; absent.len()];
-        for (index, error) in unread {
-            read[index] = false;
-            failed.extend(naming[&absent[index]].iter().copied());
-            errors.push(format!("table row {}: {error}", absent[index]));
-        }
-        let mut converted = vec![0u8; self.slot_bytes];
-        // SAFETY: the request that read into `stored` has ended.
-        let stored = unsafe { stored.bytes() };
-        for (index, row) in stored.chunks_exact(self.row_bytes).enumerate() {
-            if !read[index] {
-                continue;
-            }
-            self.convert(row, &mut converted);
-            let offset = self.slot_offset(taken[index] as u64);
-            // SAFETY: the slot's previous row has been read by every step
-            // that named it, and no queued step names the slot's new row
-            // before its gate opens.
-            if let Err(error) = unsafe { self.slots.write_shared(offset, &converted) } {
-                read[index] = false;
-                failed.extend(naming[&absent[index]].iter().copied());
-                errors.push(format!("table row {}: {error}", absent[index]));
-            }
-        }
-        for ((row, slot), read) in absent.iter().zip(&taken).zip(read) {
-            if read {
-                state.directory.hold(*row, *slot, true);
-                state.served[*slot] = served;
+        // Read the absent rows into their slots, then publish those that
+        // were read; a row that was not leaves its slot free.
+        let unread = self.read_rows(&absent, &taken);
+        for ((row, slot), error) in absent.iter().zip(&taken).zip(unread) {
+            match error {
+                None => {
+                    state.directory.hold(*row, *slot, true);
+                    state.served[*slot] = served;
+                }
+                Some(error) => {
+                    failed.extend(naming[row].iter().copied());
+                    errors.push(format!("table row {row}: {error}"));
+                }
             }
         }
         if state.directory.crowded() {
@@ -982,6 +980,80 @@ impl Shared {
         Ok((failure, absent.len() as u64))
     }
 
+    /// Read `absent`'s rows as stored, a range of each of the table's row
+    /// tensors per row, due now (a step waits on them), then assemble and
+    /// convert each into its slot of `taken`: per row, why it was not, if it
+    /// was not.
+    fn read_rows(&self, absent: &[u64], taken: &[usize]) -> Vec<Option<String>> {
+        let mut unread = vec![None; absent.len()];
+        if absent.is_empty() {
+            return unread;
+        }
+        // Every range's bytes of every absent row, a buffer per range, read
+        // as one request per range, all in flight together.
+        let want = Want::now();
+        let buffers = self
+            .ranges
+            .iter()
+            .map(|range| Arc::new(seismic_io::Buffer::new(absent.len() * range.bytes)))
+            .collect::<Vec<_>>();
+        let mut requests = Vec::with_capacity(self.ranges.len());
+        for (range, buffer) in self.ranges.iter().zip(&buffers) {
+            let reads = absent
+                .iter()
+                .enumerate()
+                .map(|(index, row)| Range {
+                    offset: range.first + row * range.bytes as u64,
+                    length: range.bytes,
+                    into: buffer.clone(),
+                    at: index * range.bytes,
+                })
+                .collect();
+            // SAFETY: the reads are distinct rows of `buffer`, which nothing
+            // reads until the request has ended.
+            match unsafe { range.source.request(reads, want) } {
+                Ok(request) => requests.push(request),
+                Err(error) => unread.fill(Some(error.to_string())),
+            }
+        }
+        for request in requests {
+            match request.wait() {
+                Ended::Read { failed } => {
+                    for (index, error) in failed {
+                        unread[index].get_or_insert_with(|| error.to_string());
+                    }
+                }
+                Ended::Panicked(panic) => panic.resume(),
+            }
+        }
+        // SAFETY: every request that read into the buffers has ended (one
+        // not made read none).
+        let read = buffers.iter().map(|buffer| unsafe { buffer.bytes() }).collect::<Vec<_>>();
+        let mut converted = vec![0u8; self.slot_bytes];
+        for (index, slot) in taken.iter().enumerate() {
+            if unread[index].is_some() {
+                continue;
+            }
+            let pieces = self
+                .ranges
+                .iter()
+                .zip(&read)
+                .map(|(range, bytes)| &bytes[index * range.bytes..][..range.bytes])
+                .collect::<Vec<_>>();
+            // `new` assembled a row of these ranges.
+            let stored = crate::import_transforms::assemble_row(&self.descriptor, self.stored, self.width, &pieces)
+                .expect("a row's ranges assemble into one row as stored");
+            self.convert(&stored, &mut converted);
+            // SAFETY: the slot's previous row has been read by every step
+            // that named it, and no queued step names the slot's new row
+            // before its gate opens.
+            if let Err(error) = unsafe { self.slots.write_shared(self.slot_offset(*slot as u64), &converted) } {
+                unread[index] = Some(error.to_string());
+            }
+        }
+        unread
+    }
+
     /// Where slot `slot` lies in the slots' storage: its row of its record,
     /// where the storage lays the record (`Tensor::record_placement`).
     fn slot_offset(&self, slot: u64) -> u64 {
@@ -990,8 +1062,8 @@ impl Shared {
 
     /// The slot row of the row `stored` as stored (`row_conversion`).
     fn convert(&self, stored: &[u8], slot: &mut [u8]) {
-        // `stored` is a read range of `row_bytes`, one row of `width` values
-        // as stored, and `slot` a buffer of `slot_bytes`, one resident row:
+        // `stored` is an assembled row, one row of `width` values as stored,
+        // and `slot` a buffer of `slot_bytes`, one resident row:
         // one piece of the conversion (`Shared::new`).
         self.conversion
             .piece(self.width as usize, stored, slot)
@@ -1071,18 +1143,28 @@ mod tests {
         let path = file(name);
         let table = StoredTable::new(
             &device(),
+            &descriptor(),
             stored(),
             resident(),
             ROWS,
             WIDTH,
             StoredSlots::Whole { records: 1, record_rows: slots },
             form,
-            Reader::open(&path, CachePolicy::Uncached).unwrap(),
-            100,
+            ranges(&path),
             None,
         )
         .unwrap();
         (path, table)
+    }
+
+    /// The table's weight: its rows as stored, one range each.
+    fn descriptor() -> WeightDescriptor {
+        WeightDescriptor::stored("table", [ROWS, WIDTH])
+    }
+
+    /// The one range of each row of the table `file` wrote.
+    fn ranges(path: &std::path::Path) -> Vec<RowRange> {
+        vec![RowRange { source: Reader::open(path, CachePolicy::Uncached).unwrap(), first: 100, bytes: ROW_BYTES }]
     }
 
     fn device() -> seismic::Device {
@@ -1146,14 +1228,14 @@ mod tests {
         let path = file("resize");
         let table = StoredTable::new(
             &device(),
+            &descriptor(),
             stored(),
             resident(),
             ROWS,
             WIDTH,
             StoredSlots::Reserved { records: 4, record_rows: 256 },
             DirectoryForm::Hashed,
-            Reader::open(&path, CachePolicy::Uncached).unwrap(),
-            100,
+            ranges(&path),
             None,
         )
         .unwrap();
@@ -1219,6 +1301,113 @@ mod tests {
     /// Mark step `value`'s read done, as the device does after its read.
     fn read_done(step: &StoredStep) {
         step.read.signal(step.value).unwrap();
+    }
+
+    /// The E4M3 value of `code` (S.EEEE.MMM, bias 7, NaN at S.1111.111),
+    /// decoded independently of the registry.
+    fn e4m3(code: u8) -> f64 {
+        let (exponent, mantissa) = ((code >> 3) & 15, code & 7);
+        let magnitude = match (exponent, mantissa) {
+            (15, 7) => f64::NAN,
+            (0, _) => f64::from(mantissa) * 2f64.powi(-9),
+            _ => (1.0 + f64::from(mantissa) / 8.0) * 2f64.powi(i32::from(exponent) - 7),
+        };
+        if code & 0x80 != 0 { -magnitude } else { magnitude }
+    }
+
+    /// A table of E4M3 rows 256 wide under a `[1, 32]` UE8M0 grid, its codes
+    /// and its scales in two files (V4.1's n-gram table, `gguf_f8_e4m3_e8m0`):
+    /// each slot row read through `stored_rows` decodes to exactly
+    /// `code·2^(e−127)`, its codes' and its own scales', every code (NaN
+    /// codes NaN) under scales from 2^−27 to 2^12, on the CPU and Metal.
+    #[test]
+    fn a_gridded_row_from_two_files_decodes_exactly() {
+        use magnitude_family_contracts::{ImportTransform, ScaleCodes};
+        use magnitude_kernels::stored_rows;
+        const ROWS: u64 = 64;
+        const WIDTH: u64 = 256;
+        let code = |row: u64, column: u64| (row * 37 + column) as u8;
+        let scale = |row: u64, group: u64| (100 + (row * 8 + group) % 40) as u8;
+        let write = |name: &str, header: usize, bytes: Vec<u8>| {
+            let path = std::env::temp_dir().join(format!("magnitude-gridded-{name}-{}.bin", std::process::id()));
+            std::fs::write(&path, [vec![0xee; header], bytes].concat()).unwrap();
+            path
+        };
+        let codes = write("codes", 100, (0..ROWS).flat_map(|row| (0..WIDTH).map(move |column| code(row, column))).collect());
+        let scales = write("scales", 37, (0..ROWS).flat_map(|row| (0..WIDTH / 32).map(move |group| scale(row, group))).collect());
+        let descriptor = WeightDescriptor {
+            name: "codes".into(),
+            shape: vec![ROWS, WIDTH],
+            transforms: vec![ImportTransform::ScaleBlocks { tensor: "scales".into(), tile: [1, 32], codes: ScaleCodes::Ue8m0 }],
+        };
+        let resident = Element::named("mxfp8g32@rows16").unwrap();
+        let devices = seismic::Devices::discover(&[]).unwrap();
+        let mut backends = Vec::new();
+        for backend in [BackendName::Cpu, BackendName::Metal] {
+            let Ok(device) = devices.open_backend(backend) else {
+                continue;
+            };
+            backends.push(backend);
+            let ranges = vec![
+                RowRange { source: Reader::open(&codes, CachePolicy::Uncached).unwrap(), first: 100, bytes: WIDTH as usize },
+                RowRange { source: Reader::open(&scales, CachePolicy::Uncached).unwrap(), first: 37, bytes: (WIDTH / 32) as usize },
+            ];
+            let table = StoredTable::new(
+                &device,
+                &descriptor,
+                Element::named("gguf_f8_e4m3_e8m0").unwrap(),
+                resident,
+                ROWS,
+                WIDTH,
+                StoredSlots::Whole { records: 1, record_rows: ROWS },
+                DirectoryForm::Dense,
+                ranges,
+                None,
+            )
+            .unwrap();
+            let step = table.queue(StepRows::Known(vec![(0..ROWS).collect()])).unwrap();
+            // The device waits at the gate the filler opens; the host waits
+            // for the filler's count of the step instead (Metal's host sees
+            // only what the device raises, `Timeline::wait`). The filler
+            // counts a step once its rows are written and published.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while table.waits().known_steps == 0 {
+                assert!(std::time::Instant::now() < deadline, "{backend:?}: the filler never filled the step");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(table.failure(step.value), None);
+            let kernel = stored_rows::native_for_device_with(
+                &device,
+                stored_rows::Elements { E: resident, A: Element::f32() },
+                &seismic::generated::native_implementation::<stored_rows::Entry>(&device)
+                    .unwrap()
+                    .unwrap()
+                    .default_specialization(&seismic::NativeSpecialization::new().with_static("W", WIDTH))
+                    .unwrap(),
+            )
+            .unwrap();
+            let selections = (0..ROWS as i32).flat_map(|row| [row, 0]).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
+            let tokens = seismic::Tensor::from_host(&device, Element::i32(), &[ROWS, 2], &selections).unwrap();
+            let rows = kernel
+                .call(stored_rows::Args { slots: table.slots_tensor(), tokens: &tokens, directory: table.directory() })
+                .unwrap()
+                .value
+                .read_to_host()
+                .unwrap();
+            for (at, value) in rows.chunks_exact(4).enumerate() {
+                let (row, column) = (at as u64 / WIDTH, at as u64 % WIDTH);
+                let value = f32::from_le_bytes(value.try_into().unwrap());
+                let expected = (e4m3(code(row, column)) * 2f64.powi(i32::from(scale(row, column / 32)) - 127)) as f32;
+                assert!(
+                    value.to_bits() == expected.to_bits() || value.is_nan() && expected.is_nan(),
+                    "{backend:?} row {row} column {column}: {value:e}, not {expected:e}"
+                );
+            }
+        }
+        assert!(backends.contains(&BackendName::Cpu));
+        assert_eq!(backends.contains(&BackendName::Metal), cfg!(target_os = "macos"), "Metal decodes where it runs");
+        std::fs::remove_file(codes).unwrap();
+        std::fs::remove_file(scales).unwrap();
     }
 
     #[test]
@@ -1410,14 +1599,14 @@ mod tests {
             let run = || {
                 let table = StoredTable::new(
                     &device,
+                    &descriptor(),
                     stored(),
                     resident(),
                     ROWS,
                     WIDTH,
                     StoredSlots::Whole { records: 1, record_rows: 4 },
                     form,
-                    Reader::open(&path, CachePolicy::Uncached).unwrap(),
-                    100,
+                    ranges(&path),
                     Some(KeptRows::of(&kept, "table")),
                 )
                 .unwrap();

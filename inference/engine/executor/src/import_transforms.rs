@@ -298,6 +298,40 @@ pub(crate) fn grid(descriptor: &WeightDescriptor) -> Option<(&str, [u64; 2], Sca
         })
 }
 
+/// The stored tensors one row of `descriptor`'s matrix is read from, in the
+/// order [`assemble_row`] takes their ranges: its own tensor, then its grid
+/// of block scales where it has one (the importer's two inputs, `Stored`).
+pub(crate) fn row_tensors(descriptor: &WeightDescriptor) -> Vec<&str> {
+    std::iter::once(descriptor.name.as_str())
+        .chain(grid(descriptor).map(|(name, _, _)| name))
+        .collect()
+}
+
+/// One row of `width` values of `descriptor`'s matrix as `source` holds it,
+/// from `ranges`, that row's range of each of its [`row_tensors`] in order:
+/// the importer's own transforms ([`apply`]) over a `[1, width]` matrix.
+/// The plan admitted only transforms that act within a row, so a row's
+/// ranges are its whole input.
+pub(crate) fn assemble_row(
+    descriptor: &WeightDescriptor,
+    source: Element,
+    width: u64,
+    ranges: &[&[u8]],
+) -> Result<Vec<u8>, String> {
+    let [own, grid @ ..] = ranges else {
+        return Err(format!("{:?}: a row is read from no range", descriptor.name));
+    };
+    if ranges.len() != row_tensors(descriptor).len() {
+        return Err(format!(
+            "{:?}: {} ranges of a row read from {} tensors",
+            descriptor.name,
+            ranges.len(),
+            row_tensors(descriptor).len()
+        ));
+    }
+    apply(descriptor, &[1, width], source, own.to_vec(), grid.first().copied())
+}
+
 /// The blocks of `source` (`GgufScales::E8m0Grid`) of a `[rows, columns]`
 /// matrix of one-byte codes `codes` under its `[rows / tile[0], columns /
 /// tile[1]]` grid of one-byte block scales `grid`: per row, per packet of

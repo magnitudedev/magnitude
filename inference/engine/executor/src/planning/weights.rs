@@ -1992,9 +1992,12 @@ pub const NGRAM_TABLE_STORED_ROWS: u64 = 180 * 16_384;
 /// `NGRAM_TABLE_STORED_ROWS` of its rows as stored (all of them, of a table
 /// of no more), which the host converts from the artifact's rows
 /// (`stored_table::row_conversion`) and writes, and a directory of the form
-/// the plan picks (`DirectoryForm::of`). A table with import transforms,
-/// rows past I32 or without a host row conversion into its resident
-/// representation is refused. The slots, `[records, rows, width]` (one
+/// the plan picks (`DirectoryForm::of`). A row as stored is a range of each
+/// of its row tensors (`import_transforms::row_tensors`), in any of the
+/// component's files, which the importer's own transforms assemble
+/// (`stored_row_ranges`). A table with rows past I32, without a host row
+/// conversion into its resident representation, or with a transform that
+/// acts across rows is refused. The slots, `[records, rows, width]` (one
 /// record of them here), are the weight's shape and resident bytes; the load
 /// uploads nothing.
 fn push_stored_table(
@@ -2023,8 +2026,15 @@ fn push_stored_table(
     let [table_rows, width] = stored.shape[..] else {
         return Err(refused("it is not a matrix"));
     };
-    if !descriptor.transforms.is_empty() || stored.shape != descriptor.shape {
-        return Err(refused("it is not the stored matrix itself"));
+    // Its own rows, each with its own row of block scales at most: each row
+    // as stored is then its tensors' ranges of that row alone.
+    let within_rows = match &descriptor.transforms[..] {
+        [] => true,
+        [ImportTransform::ScaleBlocks { tile, .. }] => tile[0] == 1,
+        _ => false,
+    };
+    if !within_rows || stored.shape != descriptor.shape {
+        return Err(refused("it is not the stored matrix itself, under a scale grid of its rows at most"));
     }
     if table_rows > i32::MAX as u64 {
         return Err(refused("its rows exceed I32"));
@@ -2050,6 +2060,17 @@ fn push_stored_table(
             table.resident.name()
         )));
     }
+    let tensors = crate::import_transforms::row_tensors(descriptor)
+        .into_iter()
+        .map(|name| {
+            inventory
+                .iter()
+                .find(|tensor| tensor.name == name)
+                .map(|tensor| (tensor.name.as_str(), tensor.nbytes))
+                .ok_or_else(|| refused(&format!("its row tensor {name:?} is absent from its component")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    stored_row_ranges(&tensors, table_rows, representation_bytes(table.upload, &[1, width])?).map_err(|error| refused(&error))?;
     let budget = representation_bytes(table.upload, &[NGRAM_TABLE_STORED_ROWS, width])?;
     let slots = (budget / representation_bytes(table.resident, &[1, width])?).min(table_rows);
     // One record of every slot; a bank holding the table records them in
@@ -2068,6 +2089,25 @@ fn push_stored_table(
     });
     out.push(table);
     Ok(())
+}
+
+/// The bytes of each range of a stored table's row: `tensors`, its row
+/// tensors (`import_transforms::row_tensors`) with their stored bytes, each
+/// whole ranges of the table's `rows`, which together hold one row as
+/// stored, `row_bytes` (the importer's assembly moves every byte, adding
+/// none). The planner and the importer each take a table's ranges from this.
+pub(crate) fn stored_row_ranges(tensors: &[(&str, u64)], rows: u64, row_bytes: u64) -> Result<Vec<u64>, String> {
+    let ranges = tensors
+        .iter()
+        .map(|&(name, bytes)| match bytes % rows {
+            0 => Ok(bytes / rows),
+            _ => Err(format!("{name:?}'s {bytes} bytes are not {rows} rows")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if ranges.iter().sum::<u64>() != row_bytes {
+        return Err(format!("ranges of {ranges:?} bytes are not a row of {row_bytes} as stored"));
+    }
+    Ok(ranges)
 }
 
 fn push_weight(
@@ -2816,6 +2856,54 @@ mod stored_table_tests {
         )
         .unwrap_err();
         assert!(error.contains("no row conversion"), "{error}");
+    }
+
+    /// V4.1's n-gram table (384,006,168 E4M3 rows 256 wide under a `[1, 32]`
+    /// UE8M0 grid, slice B's) plans as a stored table of the assembled
+    /// 264-byte rows of mxfp8g32, each read as 256 bytes of codes and 8 of
+    /// scales, in the bytes of `NGRAM_TABLE_STORED_ROWS` assembled rows. A
+    /// grid that one row's scales do not tile alone, and a grid absent from
+    /// the component, are refused, naming it.
+    #[test]
+    fn a_gridded_ngram_table_plans_its_rows_as_their_tensors_ranges() {
+        use magnitude_family_contracts::ScaleCodes;
+        const ROWS: u64 = 384_006_168;
+        const WEIGHT: &str = "per_layer_token_embd.weight";
+        const SCALE: &str = "per_layer_token_embd.scale";
+        let tensor = |name: &str, columns, encoding| TensorDescriptor {
+            name: name.into(),
+            shape: vec![ROWS, columns],
+            encoding,
+            offset: 0,
+            nbytes: ROWS * columns,
+        };
+        let inventory = [tensor(WEIGHT, 256, Encoding::F8E4M3), tensor(SCALE, 8, Encoding::I8)];
+        let descriptor = |tile| WeightDescriptor {
+            name: WEIGHT.into(),
+            shape: vec![ROWS, 256],
+            transforms: vec![ImportTransform::ScaleBlocks { tensor: SCALE.into(), tile, codes: ScaleCodes::Ue8m0 }],
+        };
+        let component = ArtifactComponent { kind: ArtifactComponentKind::Target, identity: ArtifactIdentity([0; 32]) };
+        let plan = |inventory: &[TensorDescriptor], tile| {
+            let mut out = Vec::new();
+            let form = ResidentForm { activation: DType::BF16, layout: Layout::Rows16 };
+            push_stored_table(&mut out, inventory, component, ngram_role(), &descriptor(tile), form).map(|()| out.remove(0))
+        };
+        let table = plan(&inventory, [1, 32]).unwrap();
+        assert_eq!(table.upload, Element::gguf_source(Encoding::F8E4M3, GgufScales::E8m0Grid, 32).unwrap());
+        assert_eq!(table.resident, Element::stored("mxfp8g32", Layout::Rows16).unwrap());
+        assert_eq!(table.streamed().unwrap().fill, TableFill::Stored);
+        let row = representation_bytes(table.upload, &[1, 256]).unwrap();
+        assert_eq!(row, 264);
+        assert_eq!(stored_row_ranges(&[(WEIGHT, ROWS * 256), (SCALE, ROWS * 8)], ROWS, row), Ok(vec![256, 8]));
+        let slot = representation_bytes(table.resident, &[1, 256]).unwrap();
+        let budget = NGRAM_TABLE_STORED_ROWS * row;
+        assert_eq!(table.shape, vec![1, budget / slot, 256]);
+        assert!(table.resident_bytes <= budget && budget < table.resident_bytes + slot);
+        let error = plan(&inventory, [32, 32]).unwrap_err();
+        assert!(error.contains(WEIGHT) && error.contains("scale grid of its rows"), "{error}");
+        let error = plan(&inventory[..1], [1, 32]).unwrap_err();
+        assert!(error.contains(SCALE), "{error}");
     }
 
     /// The qwen4exp fixture with its n-gram table stored as Q5_0 blocks (as

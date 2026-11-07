@@ -2712,18 +2712,18 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
     let table = Arc::new(
         StoredTable::new(
             &device,
+            &magnitude_family_contracts::WeightDescriptor::stored("ngram", [ROWS, 160]),
             seismic::Element::named("gguf_iq4_nl").unwrap(),
             seismic::Element::named("iq4g32s@rows16").unwrap(),
             ROWS,
             160,
             crate::stored_table::StoredSlots::Whole { records: 1, record_rows: 64 },
             crate::planning::DirectoryForm::Hashed,
-            seismic_io::Reader::open(
-                &path,
-                seismic_io::CachePolicy::Uncached,
-            )
-            .unwrap(),
-            0,
+            vec![crate::stored_table::RowRange {
+                source: seismic_io::Reader::open(&path, seismic_io::CachePolicy::Uncached).unwrap(),
+                first: 0,
+                bytes: ROW_BYTES as usize,
+            }],
             None,
         )
         .unwrap(),
