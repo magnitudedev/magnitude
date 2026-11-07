@@ -428,66 +428,83 @@ kernel void indexer_select_select(
     if (thread_index == 0)
         span_first[spans] = keys;
     threadgroup_barrier(mem_flags::mem_device);
-    // Key k's read flag and stored row: a cursor on the span holding the
-    // last key asked, searched again when a key lies outside it.
-    uint span = 0;
-    auto seek = [&](uint key) {
-        if (key < span_first[span] || key >= span_first[span + 1]) {
-            // The last span starting at or before `key`: the one holding it.
-            uint lo = 0, hi = spans;
-            while (hi - lo > 1) {
-                const uint middle = (lo + hi) / 2;
-                if (span_first[middle] <= key)
-                    lo = middle;
-                else
-                    hi = middle;
-            }
-            span = lo;
-        }
-    };
-    auto stored = [&](uint key) {
-        seek(key);
-        return row_visible[span * 2] + int(key - span_first[span]);
-    };
-    auto read = [&](uint key) {
-        const uint block = key / INDEXER_SB;
-        return block >= 32 * written || ((bitmap[block / 32] >> (block % 32)) & 1u) != 0u;
-    };
-    // A read key continues the run of the key before it.
-    auto continues = [&](uint key, int at) {
-        return key > 0 && at % int(slab_rows) != 0 && read(key - 1) && stored(key - 1) + 1 == at;
-    };
+    // Thread t's keys [key_lo, key_hi). A key is read when its block is
+    // marked (or lies past the bitmap) and is stored at its span's first row
+    // plus its place in the span. A run starts at a read key unless the key
+    // before is read, stored one row before it, and the key does not begin a
+    // slab. The walk starts at the key before the share (whether a run
+    // continues into it) and ends at the key after (whether the share's last
+    // run ends in it). It reads each block's bit once and skips the rest of
+    // an unread block, and finds its first span by bisection, then advances
+    // span by span. With `emit` it writes the share's runs from index
+    // `opened` + 1 (`opened` is the run open at key_lo, begun before it);
+    // it returns the runs starting in the share.
     const uint share = (keys + THREADS - 1) / THREADS;
     const uint key_lo = metal::min(thread_index * share, keys);
     const uint key_hi = metal::min(key_lo + share, keys);
-    // The runs starting in this thread's keys, then their places.
-    uint starts = 0;
-    for (uint key = key_lo; key < key_hi;) {
-        if (!read(key)) {
-            key = metal::min((key / INDEXER_SB + 1) * INDEXER_SB, key_hi);
-            continue;
+    auto walk = [&](bool emit, int opened) {
+        uint starts = 0;
+        if (key_lo >= key_hi)
+            return starts;
+        const uint kstart = key_lo > 0 ? key_lo - 1 : 0;
+        uint span = 0;
+        for (uint high = spans - 1; span < high;) {
+            const uint middle = (span + high + 1) / 2;
+            if (span_first[middle] <= kstart)
+                span = middle;
+            else
+                high = middle - 1;
         }
-        starts += continues(key, stored(key)) ? 0u : 1u;
-        ++key;
-    }
+        uint first = span_first[span];
+        uint next = span_first[span + 1];
+        int lo = row_visible[span * 2];
+        uint block = 0xffffffffu;
+        bool block_read = false;
+        bool previous_read = false;
+        int previous_stored = 0;
+        int index = opened;
+        const uint kend = metal::min(key_hi + 1, keys);
+        for (uint key = kstart; key < kend; ++key) {
+            if (key / INDEXER_SB != block) {
+                block = key / INDEXER_SB;
+                block_read = block >= 32 * written || ((bitmap[block / 32] >> (block % 32)) & 1u) != 0u;
+            }
+            if (!block_read) {
+                // The run through the previous key ends there; the block's
+                // other keys are unread too.
+                if (emit && key > key_lo && previous_read && uint(index) < c)
+                    out[index * 2 + 1] = previous_stored + 1;
+                previous_read = false;
+                key = metal::min((block + 1) * INDEXER_SB, kend) - 1;
+                continue;
+            }
+            while (key >= next) {
+                ++span;
+                first = next;
+                next = span_first[span + 1];
+                lo = row_visible[span * 2];
+            }
+            const int at = lo + int(key - first);
+            const bool continues = previous_read && previous_stored + 1 == at && at % int(slab_rows) != 0;
+            if (emit && key > key_lo && previous_read && !continues && uint(index) < c)
+                out[index * 2 + 1] = previous_stored + 1;
+            if (key >= key_lo && key < key_hi && !continues) {
+                ++starts;
+                ++index;
+                if (emit && uint(index) < c)
+                    out[index * 2] = at;
+            }
+            previous_read = true;
+            previous_stored = at;
+        }
+        // The row's last key ends its run.
+        if (emit && key_hi == keys && previous_read && uint(index) < c)
+            out[index * 2 + 1] = previous_stored + 1;
+        return starts;
+    };
     uint runs = 0;
-    int run = int(indexer::group_exclusive(starts, totals, simd, lane, runs)) - 1;
-    for (uint key = key_lo; key < key_hi;) {
-        if (!read(key)) {
-            key = metal::min((key / INDEXER_SB + 1) * INDEXER_SB, key_hi);
-            continue;
-        }
-        const int at = stored(key);
-        if (!continues(key, at)) {
-            ++run;
-            if (uint(run) < c)
-                out[run * 2] = at;
-        }
-        const bool ends = key + 1 >= keys || !read(key + 1) || !continues(key + 1, stored(key + 1));
-        if (ends && run >= 0 && uint(run) < c)
-            out[run * 2 + 1] = at + 1;
-        ++key;
-    }
+    const int opened = int(indexer::group_exclusive(walk(false, 0), totals, simd, lane, runs)) - 1;
+    walk(true, opened);
     for (uint entry = runs + thread_index; entry < c; entry += THREADS) {
         out[entry * 2] = 0;
         out[entry * 2 + 1] = 0;
