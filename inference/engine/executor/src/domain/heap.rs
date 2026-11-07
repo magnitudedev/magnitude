@@ -239,7 +239,8 @@ impl DeviceHeap {
             room,
             bank: None,
         };
-        heap.observe(&status)?;
+        // Nothing the load plans is held yet, nor admitted.
+        heap.observe(&status, 0)?;
         Ok(heap)
     }
 
@@ -250,14 +251,14 @@ impl DeviceHeap {
     /// did while it loaded. A one store's expert bank of `bank`'s slots of
     /// its bytes each serves from here, every slot committed
     /// ([`BankRoom`]).
-    pub fn serve(&mut self, bank: Option<(u64, u64)>) -> Result<(), MemoryPolicyError> {
+    pub fn serve(&mut self, bank: Option<(u64, u64)>, planned: u64) -> Result<(), MemoryPolicyError> {
         let status = self.status();
         let host = status.sample.host_ram.as_ref().map_err(|error| MemoryPolicyError::Observation(error.clone()))?;
         let now = std::time::Instant::now();
         self.room = HostRoom::serving(host, now);
         let counted = matches!(self.room, HostRoom::Load(LoadStage::Serving(_)));
         self.bank = bank.map(|(slots, slot_bytes)| BankRoom::new(counted, slot_bytes, slots, now));
-        self.observe(&status).map(drop)
+        self.observe(&status, planned).map(drop)
     }
 
     /// The host RAM room its readings read: its field's, the hold on the
@@ -338,18 +339,24 @@ impl DeviceHeap {
     /// one, so no decision stands on a reading older than the release before
     /// it. A failed observation revokes unspent grants and leaves the heap
     /// Blind.
-    pub fn refresh(&mut self) -> Result<Vec<DomainReading>, MemoryPolicyError> {
+    pub fn refresh(&mut self, planned: u64) -> Result<Vec<DomainReading>, MemoryPolicyError> {
         let status = self.reading.status(&self.device);
-        self.observe(&status)
+        self.observe(&status, planned)
     }
 
-    /// [`Self::refresh`] from the status sample `status`.
+    /// [`Self::refresh`] from the status sample `status`, Seismic's bound
+    /// keeping `planned` bytes admissible: the load's planned holdings in
+    /// its device storage's store not yet allocated
+    /// (`ExecutorDomain::planned_unheld`, the one owner of the figure every
+    /// reading is passed), admitted with the load whatever the line does later
+    /// (`platform::refresh_device_ceiling`).
     fn observe(
         &mut self,
         status: &seismic::Status,
+        planned: u64,
     ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
         let readings =
-            crate::platform::refresh_device_ceiling(&self.device, status, &self.reserves, self.room());
+            crate::platform::refresh_device_ceiling(&self.device, status, &self.reserves, self.room(), planned);
         self.account();
         if let (Ok(readings), Some(bank)) = (&readings, self.bank.as_mut()) {
             let now = std::time::Instant::now();
@@ -387,7 +394,7 @@ impl DeviceHeap {
     /// the Normal band, within every domain's ceiling beyond outstanding
     /// claims. The readings exclude existing charges, so only the added peak
     /// is compared.
-    pub fn check(&mut self, required: u64, staged: u64) -> Result<(), ClaimRefusal> {
+    pub fn check(&mut self, required: u64, staged: u64, planned: u64) -> Result<(), ClaimRefusal> {
         self.check_storage(
             ClaimDemand {
                 device: required,
@@ -396,6 +403,7 @@ impl DeviceHeap {
             },
             0,
             FitMode::Live,
+            planned,
         )
     }
 
@@ -403,8 +411,8 @@ impl DeviceHeap {
     /// outstanding claim and the held host tables in `mode`'s room, from one
     /// fresh status sample. Fit decides where the claims' staged bytes are
     /// charged ([`Fit::host_staging`]).
-    fn check_storage(&mut self, claim: ClaimDemand, table: u64, mode: FitMode) -> Result<(), ClaimRefusal> {
-        let (status, readings) = self.sample()?;
+    fn check_storage(&mut self, claim: ClaimDemand, table: u64, mode: FitMode, planned: u64) -> Result<(), ClaimRefusal> {
+        let (status, readings) = self.sample(planned)?;
         self.refusal(&status, &readings, claim, table, mode)?.map_or(Ok(()), Err)
     }
 
@@ -414,9 +422,9 @@ impl DeviceHeap {
     /// kind, which also counts every outstanding claim and the host's
     /// direct demands), and its readings; refused while a domain is in the
     /// Reclaim band.
-    fn sample(&mut self) -> Result<(seismic::Status, Vec<DomainReading>), ClaimRefusal> {
+    fn sample(&mut self, planned: u64) -> Result<(seismic::Status, Vec<DomainReading>), ClaimRefusal> {
         let status = self.status();
-        let readings = self.observe(&status).map_err(ClaimRefusal::Blind)?;
+        let readings = self.observe(&status, planned).map_err(ClaimRefusal::Blind)?;
         match reclaiming(&readings) {
             Some(refusal) => Err(refusal),
             None => Ok((status, readings)),
@@ -473,8 +481,8 @@ impl DeviceHeap {
     /// status sample: by halving over [`Self::refusal`], the one test of a
     /// claim, which never admits more bytes where it refuses fewer. Refused
     /// while a domain is in the Reclaim band, or blind.
-    pub fn reserved_room(&mut self, kind: BankTier, beside: u64, mode: FitMode) -> Result<u64, ClaimRefusal> {
-        let (status, readings) = self.sample()?;
+    pub fn reserved_room(&mut self, kind: BankTier, beside: u64, mode: FitMode, planned: u64) -> Result<u64, ClaimRefusal> {
+        let (status, readings) = self.sample(planned)?;
         let fits = |bytes: u64| -> Result<bool, ClaimRefusal> {
             let claim = besides(reserved(kind, bytes), beside)?;
             Ok(self.refusal(&status, &readings, claim, 0, mode)?.is_none())
@@ -506,13 +514,13 @@ impl DeviceHeap {
     /// planning reserve, beside every outstanding claim and every storage
     /// placement into host RAM. Its mapped pages then count against every
     /// later decision there.
-    pub fn hold_host_table(&mut self, bytes: u64) -> Result<(), ClaimRefusal> {
-        self.check_storage(ClaimDemand::default(), bytes, FitMode::Live)?;
+    pub fn hold_host_table(&mut self, bytes: u64, planned: u64) -> Result<(), ClaimRefusal> {
+        self.check_storage(ClaimDemand::default(), bytes, FitMode::Live, planned)?;
         self.host_table_bytes = self
             .host_table_bytes
             .checked_add(bytes)
             .ok_or(ClaimRefusal::Accounting(MemoryError::Overflow))?;
-        self.refresh().map_err(ClaimRefusal::Blind)?;
+        self.refresh(planned).map_err(ClaimRefusal::Blind)?;
         Ok(())
     }
 
@@ -529,14 +537,15 @@ impl DeviceHeap {
         required: u64,
         staged: u64,
         class: HoldingClass,
+        planned: u64,
     ) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_storage(ClaimDemand { device: required, staged, ..ClaimDemand::default() }, class)
+        self.claim_storage(ClaimDemand { device: required, staged, ..ClaimDemand::default() }, class, planned)
     }
 
     /// [`Self::claim`] with `upload` bytes of upload storage beside the
     /// `required` device bytes.
-    pub fn claim_storage(&mut self, demand: ClaimDemand, class: HoldingClass) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_in(demand, 0, class, FitMode::Live)
+    pub fn claim_storage(&mut self, demand: ClaimDemand, class: HoldingClass, planned: u64) -> Result<ClaimId, ClaimRefusal> {
+        self.claim_in(demand, 0, class, FitMode::Live, planned)
     }
 
     /// Claim `bytes` a reservation of `kind` storage backs, the expert
@@ -553,8 +562,9 @@ impl DeviceHeap {
         beside: u64,
         class: HoldingClass,
         mode: FitMode,
+        planned: u64,
     ) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_in(reserved(kind, bytes), beside, class, mode)
+        self.claim_in(reserved(kind, bytes), beside, class, mode, planned)
     }
 
     /// Claim `demand` once it fits with `beside` more device bytes, planned
@@ -565,21 +575,25 @@ impl DeviceHeap {
         demand: ClaimDemand,
         beside: u64,
         class: HoldingClass,
+        planned: u64,
     ) -> Result<ClaimId, ClaimRefusal> {
-        self.claim_in(demand, beside, class, FitMode::Live)
+        self.claim_in(demand, beside, class, FitMode::Live, planned)
     }
 
     /// Claim `demand` once it fits with `beside` more device bytes in
-    /// `mode`'s room. A refusal of a claim the load must have is owed room
-    /// the owner's release settles, the lowest rate per byte first.
+    /// `mode`'s room, the reading's bound keeping `planned` bytes
+    /// admissible ([`Self::observe`]). A refusal of a claim the load must
+    /// have is owed room the owner's release settles, the lowest rate per
+    /// byte first.
     fn claim_in(
         &mut self,
         demand: ClaimDemand,
         beside: u64,
         class: HoldingClass,
         mode: FitMode,
+        planned: u64,
     ) -> Result<ClaimId, ClaimRefusal> {
-        let (status, readings) = self.sample()?;
+        let (status, readings) = self.sample(planned)?;
         if let Some(refusal) = self.refusal(&status, &readings, besides(demand, beside)?, 0, mode)? {
             return Err(refusal);
         }
@@ -743,12 +757,12 @@ mod tests {
             ceiling > 1024,
             "the test host has headroom above its reserve"
         );
-        let claim = heap.claim(ceiling / 2, 0, HoldingClass::Live).unwrap();
+        let claim = heap.claim(ceiling / 2, 0, HoldingClass::Live, 0).unwrap();
         assert_eq!(heap.heap().claims().count(), 1);
         // A fresh reading of the same host now leaves only about the
         // unclaimed half of the ceiling.
         assert!(matches!(
-            heap.check(ceiling / 4 * 3, 0),
+            heap.check(ceiling / 4 * 3, 0, 0),
             Err(ClaimRefusal::Deficit {
                 role: DomainRole::Allocation,
                 constraint: MemoryConstraint::HostRam,
@@ -757,9 +771,9 @@ mod tests {
         ));
         heap.release(claim);
         assert_eq!(heap.heap().claims().count(), 0);
-        assert_eq!(heap.check(0, 0), Ok(()));
+        assert_eq!(heap.check(0, 0, 0), Ok(()));
         assert!(matches!(
-            heap.claim(u64::MAX / 2, 0, HoldingClass::Live),
+            heap.claim(u64::MAX / 2, 0, HoldingClass::Live, 0),
             Err(ClaimRefusal::Deficit { required, .. }) if required == u64::MAX / 2
         ));
         assert_eq!(heap.heap().claims().count(), 0);
@@ -773,18 +787,18 @@ mod tests {
         let mut heap = cpu_heap();
         let ceiling = live_ceiling(&heap);
         assert!(matches!(
-            heap.hold_host_table(u64::MAX / 2),
+            heap.hold_host_table(u64::MAX / 2, 0),
             Err(ClaimRefusal::Deficit {
                 role: DomainRole::Allocation,
                 ..
             })
         ));
         assert_eq!(heap.host_table_bytes(), 0);
-        heap.hold_host_table(ceiling / 2).unwrap();
+        heap.hold_host_table(ceiling / 2, 0).unwrap();
         assert_eq!(heap.host_table_bytes(), ceiling / 2);
         assert!(live_ceiling(&heap) <= ceiling - ceiling / 2 + ceiling / 8);
         assert!(matches!(
-            heap.check(ceiling / 4 * 3, 0),
+            heap.check(ceiling / 4 * 3, 0, 0),
             Err(ClaimRefusal::Deficit {
                 role: DomainRole::Allocation,
                 ..

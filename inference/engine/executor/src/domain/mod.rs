@@ -991,6 +991,8 @@ struct MemoryProbe<'d> {
     pace: &'d RefCell<MemoryPace>,
     bank_claim: Option<&'d GrowthClaim>,
     resizing: bool,
+    /// [`ExecutorDomain::planned_unheld`], read when the probe was taken.
+    planned: u64,
 }
 
 impl<'d> MemoryProbe<'d> {
@@ -1001,8 +1003,9 @@ impl<'d> MemoryProbe<'d> {
         pace: &'d RefCell<MemoryPace>,
         bank_claim: Option<&'d GrowthClaim>,
         held: &ResizeHeld,
+        planned: u64,
     ) -> Self {
-        Self { domain, memory, pace, bank_claim, resizing: held.runs() }
+        Self { domain, memory, pace, bank_claim, resizing: held.runs(), planned }
     }
 
     /// [`ExecutorDomain::observe_memory`], beside `bank`.
@@ -1011,7 +1014,7 @@ impl<'d> MemoryProbe<'d> {
         let readings = self
             .memory
             .borrow_mut()
-            .refresh()
+            .refresh(self.planned)
             .map_err(|error| DomainError::Blind(error.to_string()))?;
         self.settle_growth_claim(bank)?;
         Ok(readings)
@@ -1862,7 +1865,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// What reads memory for the domain ([`MemoryProbe`]).
     fn memory_probe(&self) -> MemoryProbe<'_> {
-        MemoryProbe::of(&self.domain, &self.memory, &self.pace, self.bank_claim.as_ref(), &self.resize_held)
+        MemoryProbe::of(&self.domain, &self.memory, &self.pace, self.bank_claim.as_ref(), &self.resize_held, self.planned_unheld())
     }
 
     /// Submit a chain of target launches and its spare output slot
@@ -1877,8 +1880,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         chain: Chain<crate::ValidatedTargetLaunch>,
         spare: crate::TargetGraphOutputLease,
     ) -> Result<Chain<F::TargetSubmission>, crate::programs::ChainRefusal> {
-        // The family is lent to the chain, so the probe borrows the rest.
-        let probe = MemoryProbe::of(&self.domain, &self.memory, &self.pace, self.bank_claim.as_ref(), &self.resize_held);
+        // The family is lent to the chain, so the probe borrows the rest,
+        // the plan's unheld holdings read before it is.
+        let planned = self.planned_unheld();
+        let probe = MemoryProbe::of(&self.domain, &self.memory, &self.pace, self.bank_claim.as_ref(), &self.resize_held, planned);
         let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank));
         self.note_running_cut();
         submitted

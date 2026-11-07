@@ -700,7 +700,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         grow: impl FnOnce(&mut crate::VisionGraphPool) -> Result<(), crate::resources::VisionGrowth>,
     ) -> Result<(), DomainError> {
         let bytes = demand.bytes();
-        let claim = self.memory.borrow_mut().claim_storage(demand, HoldingClass::Live)?;
+        let planned = self.planned_unheld();
+        let claim = self.memory.borrow_mut().claim_storage(demand, HoldingClass::Live, planned)?;
         let grown = grow(
             self.resources
                 .vision_graph_mut()
@@ -841,7 +842,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         staged: u64,
         class: HoldingClass,
     ) -> Result<ClaimId, DomainError> {
-        Ok(self.memory.borrow_mut().claim(required, staged, class)?)
+        let planned = self.planned_unheld();
+        Ok(self.memory.borrow_mut().claim(required, staged, class, planned)?)
     }
 
     pub(super) fn release_claim(&mut self, claim: ClaimId) {
@@ -859,7 +861,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(());
         }
         let (_, unborn) = self.opportunistic_room(seismic::Contract::DeviceOnly);
-        let claim = match self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live) {
+        let planned = self.planned_unheld();
+        let claimed = self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live, planned);
+        let claim = match claimed {
             Ok(claim) => claim,
             Err(refusal) => {
                 self.family.unbind_optional(super::OptionalComponent::Drafter);
@@ -883,7 +887,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         required: u64,
         staged: u64,
     ) -> Result<(), DomainError> {
-        Ok(self.memory.borrow_mut().check(required, staged)?)
+        let planned = self.planned_unheld();
+        Ok(self.memory.borrow_mut().check(required, staged, planned)?)
     }
 
     /// Before a request's next launch reserves rows, relocate the partial
@@ -1049,7 +1054,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         for (more, (demand, bytes)) in counts.skip(1).rev() {
             let grown = floor.saturating_add(more);
             let places = grown.get();
-            let claim = match self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live) {
+            let planned = self.planned_unheld();
+            let claimed = self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live, planned);
+            let claim = match claimed {
                 Ok(claim) => claim,
                 Err(ClaimRefusal::Deficit { .. }) => continue,
                 // Nothing grows in Reclaim, nor blind.
@@ -1252,7 +1259,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Room::Committed => crate::platform::FitMode::Live,
             Room::Borrowed => crate::platform::FitMode::Borrow,
         };
-        let bytes = self.memory.borrow_mut().reserved_room(kind, unborn, mode)?;
+        let planned = self.planned_unheld();
+        let bytes = self.memory.borrow_mut().reserved_room(kind, unborn, mode, planned)?;
         let fluctuation = self.store_of(kind.storage()).map_or(0, |store| self.pace.borrow().fluctuation(store));
         let claimed = self.measurement_beside(kind.storage());
         Ok((bytes.saturating_sub(fluctuation).saturating_sub(claimed), unborn))
@@ -1298,6 +1306,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.committed_state_bytes(),
             [(self.family.head_is_bound(), bytes.head_weights), (self.family.vision_is_bound(), bytes.vision_weights)],
         )
+    }
+
+    /// The load's planned holdings in its device storage's store not yet
+    /// allocated ([`Self::bank_unborn`] there): what every reading of the
+    /// heap and every claim keeps admissible in Seismic's bound
+    /// (`DeviceHeap::observe`), passed from here alone.
+    pub(super) fn planned_unheld(&self) -> u64 {
+        self.bank_unborn(seismic::Contract::DeviceOnly)
     }
 
     /// What a growth of the expert bank in `kind` storage leaves beside it:
@@ -1354,7 +1370,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The store `kind` storage is placed in first; none where the
     /// executor places none.
     pub(super) fn store_of(&self, kind: seismic::Contract) -> Option<seismic::StoreId> {
-        self.memory_probe().store_of(kind)
+        let device = self.domain.device();
+        storage_store(device.topology(), device.info(), kind)
     }
 
     /// Whether `kind` storage lies in device storage's store, beside the
@@ -1411,9 +1428,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             _ => None,
         };
+        let planned = self.planned_unheld();
         self.memory
             .borrow_mut()
-            .serve(bank)
+            .serve(bank, planned)
             .map_err(|error| DomainError::Blind(error.to_string()))
     }
 

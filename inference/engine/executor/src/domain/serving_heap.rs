@@ -681,7 +681,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             0 => crate::platform::FitMode::Live,
             _ => crate::platform::FitMode::Borrow,
         };
-        let claim = self.memory.borrow_mut().claim_reserved(grant.kind, grant.bytes, unborn, HoldingClass::Model, mode)?;
+        let planned = self.planned_unheld();
+        let claim = self.memory.borrow_mut().claim_reserved(grant.kind, grant.bytes, unborn, HoldingClass::Model, mode, planned)?;
         match bank.grow(grant.holding, grant.to, wake) {
             Ok(BankStep::Begun(tier)) => {
                 // The one store's bank's slots on borrowed room are its

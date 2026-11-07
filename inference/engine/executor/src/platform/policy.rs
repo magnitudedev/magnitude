@@ -1452,6 +1452,27 @@ pub struct DomainReading {
     pub band: MemoryBand,
 }
 
+impl DomainReading {
+    /// The room Seismic's bound on this store gives beyond its charge: its
+    /// live room, host RAM's up to the line its expert bank borrows within
+    /// where it has one ([`FitMode::Borrow`]), and in the store the device's
+    /// storage is placed on ([`DomainRole::Allocation`]) never less than
+    /// `planned`, what the load's plan holds and has not allocated yet (its
+    /// workload's state, its unbound components, its prompt-group class).
+    /// That was admitted with the load, so a line that rises past the live
+    /// room shrinks what grows beyond the plan (the Reclaim band's
+    /// release), never a planned holding's room.
+    fn bound_room(&self, planned: u64) -> u64 {
+        let live = self
+            .borrowable_bytes
+            .map_or(self.ceiling_bytes, |bytes| self.ceiling_bytes.max(self.thresholds.ceiling(bytes)));
+        match self.role {
+            DomainRole::Allocation => live.max(planned),
+            DomainRole::Staging => live,
+        }
+    }
+}
+
 impl fmt::Display for DomainReading {
     /// The reading a band was judged on.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1553,17 +1574,20 @@ fn domain_readings(
 }
 
 /// Bound `device`'s stores and paths from the status sample `status`: what
-/// each has charged plus its live room. A failed reading holds the device's
-/// own ledger on every store it reaches to what it claims: missing
-/// observations never authorize allocation. Host RAM's room is `room`, the
-/// one the claims checked against these bounds read.
+/// each has charged plus its live room, and in the store its device storage
+/// is placed on never less than `planned`, the load's planned holdings not
+/// yet allocated. A failed reading holds the device's own ledger on every
+/// store it reaches to what it claims: missing observations never authorize
+/// allocation. Host RAM's room is `room`, the one the claims checked against
+/// these bounds read.
 pub(crate) fn refresh_device_ceiling(
     device: &seismic::Device,
     status: &Status,
     reserves: &MemoryReserves,
     room: HostRoom,
+    planned: u64,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
-    let result = set_device_ceiling(device, status, reserves, room);
+    let result = set_device_ceiling(device, status, reserves, room, planned);
     if result.is_err() {
         for (store, ledger) in device.ledgers().own {
             device
@@ -1575,8 +1599,7 @@ pub(crate) fn refresh_device_ceiling(
 }
 
 /// Bound `device`'s stores and paths from `status`: what each has charged
-/// plus its live room, host RAM's up to the line its expert bank borrows
-/// within where it has one ([`FitMode::Borrow`]): the bank's growth into
+/// plus its room ([`DomainReading::bound_room`]): the bank's growth into
 /// borrowed room recommits into it, and every other claim the heap holds
 /// to its live ceiling first. The readings it bound them from.
 fn set_device_ceiling(
@@ -1584,14 +1607,12 @@ fn set_device_ceiling(
     status: &Status,
     reserves: &MemoryReserves,
     room: HostRoom,
+    planned: u64,
 ) -> Result<Vec<DomainReading>, MemoryPolicyError> {
     let fit = Fit::new(device.topology(), status, reserves, room);
     let readings = domain_readings(device, status, reserves, room)?;
     for reading in &readings {
-        let room = reading
-            .borrowable_bytes
-            .map_or(reading.ceiling_bytes, |bytes| reading.ceiling_bytes.max(reading.thresholds.ceiling(bytes)));
-        let limit = status.charged(reading.domain).saturating_add(room);
+        let limit = status.charged(reading.domain).saturating_add(reading.bound_room(planned));
         device
             .bound(seismic::Ledger::Store(reading.domain), Some(limit))
             .map_err(MemoryPolicyError::Limit)?;
@@ -2031,6 +2052,41 @@ mod tests {
             .unwrap();
         assert_eq!(host_ram.distress, None);
         assert_eq!(host_ram.band, MemoryBand::Normal);
+    }
+
+    /// A line that rises past what the host has left never starves what the
+    /// plan holds and has not allocated yet: with another program taking
+    /// everything above the planning reserve, host RAM reads Reclaim (the
+    /// bank releases first) and has no live room, yet the bound on the store
+    /// the device's storage is placed on still admits the plan's unheld
+    /// 6 GiB; a staging store's bound keeps no plan.
+    #[test]
+    fn a_rising_line_keeps_the_plans_unheld_holdings_admissible() {
+        let reserves = reserves();
+        let m4_pro = recorded::m4_pro();
+        let pressed = Fit::new(&m4_pro, &status(host(ReportedBy::MachAllocatablePages, 0)), &reserves, HostRoom::Allocatable)
+            .store(m4_pro.host_ram().id())
+            .unwrap();
+        assert_eq!(pressed.band, MemoryBand::Reclaim);
+        assert_eq!(pressed.ceiling_bytes, 0);
+        let reading = |role| DomainReading {
+            role,
+            domain: pressed.store,
+            headroom_bytes: pressed.headroom_bytes,
+            identity: m4_pro.store_identity(pressed.store).unwrap(),
+            constraint: pressed.constraint,
+            thresholds: pressed.thresholds,
+            ceiling_bytes: pressed.ceiling_bytes,
+            distress: pressed.distress,
+            held: None,
+            displacement: None,
+            borrowable_bytes: pressed.borrowable_bytes,
+            displacing: pressed.displacing,
+            band: pressed.band,
+        };
+        assert_eq!(reading(DomainRole::Allocation).bound_room(6 * GIB), 6 * GIB);
+        assert_eq!(reading(DomainRole::Allocation).bound_room(0), 0, "with nothing planned, no live room");
+        assert_eq!(reading(DomainRole::Staging).bound_room(6 * GIB), 0);
     }
 
     /// A load's room leaves out what the OS displaced from other programs

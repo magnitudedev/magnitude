@@ -1545,6 +1545,10 @@ struct StartupClaims {
 }
 
 impl StartupClaims {
+    /// Startup has no load plan yet, so nothing planned is held unallocated
+    /// beside its claims.
+    const PLANNED: u64 = 0;
+
     /// Claim `allocation` additional bytes of the device's storage, `staged`
     /// of which the backend stages through host RAM; fit charges the staged
     /// bytes to host RAM as well only where host RAM is not a store of the
@@ -1562,7 +1566,7 @@ impl StartupClaims {
         }
         let claim = self
             .heap
-            .claim_storage(demand, HoldingClass::Model)
+            .claim_storage(demand, HoldingClass::Model, Self::PLANNED)
             .map_err(|refusal| self.refusal(purpose, refusal))?;
         self.held = Some(claim);
         Ok(())
@@ -1575,7 +1579,7 @@ impl StartupClaims {
             return Ok(());
         }
         self.heap
-            .hold_host_table(bytes)
+            .hold_host_table(bytes, Self::PLANNED)
             .map_err(|refusal| self.refusal("host tables", refusal))
     }
 

@@ -874,17 +874,17 @@ fn a_growth_step_is_sized_within_what_the_heap_admits() {
         let device = crate::planning::BankTier::Bank;
         // What a growth may take: the free headroom's room, which a growth's
         // claim reads.
-        let available = domain.memory.borrow_mut().reserved_room(device, 0, crate::platform::FitMode::Live).unwrap();
-        let held = domain.memory.borrow_mut().claim_reserved(device, available - 5 * row / 2, 0, HoldingClass::Live, crate::platform::FitMode::Live).unwrap();
-        let room = domain.memory.borrow_mut().reserved_room(device, 0, crate::platform::FitMode::Live).unwrap();
+        let available = domain.memory.borrow_mut().reserved_room(device, 0, crate::platform::FitMode::Live, 0).unwrap();
+        let held = domain.memory.borrow_mut().claim_reserved(device, available - 5 * row / 2, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0).unwrap();
+        let room = domain.memory.borrow_mut().reserved_room(device, 0, crate::platform::FitMode::Live, 0).unwrap();
         assert!(
             matches!(
-                domain.memory.borrow_mut().claim_reserved(device, room + 1, 0, HoldingClass::Live, crate::platform::FitMode::Live),
+                domain.memory.borrow_mut().claim_reserved(device, room + 1, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0),
                 Err(ClaimRefusal::Deficit { .. })
             ),
             "one byte past the room is refused"
         );
-        let claim = domain.memory.borrow_mut().claim_reserved(device, room, 0, HoldingClass::Live, crate::platform::FitMode::Live).unwrap();
+        let claim = domain.memory.borrow_mut().claim_reserved(device, room, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0).unwrap();
         domain.memory.borrow_mut().release(claim);
         assert!(device_pays(&mut domain));
         assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank), "within the room");
@@ -1343,12 +1343,12 @@ fn a_paying_growth_stops_at_the_line() {
         assert_eq!(near[0].held[..], whole[0].held[..near[0].held.len()]);
         // What the heap grants a growth now, by whichever constraint binds:
         // the free headroom's room, which a growth's claim reads.
-        let available = domain.memory.borrow_mut().reserved_room(kind, 0, crate::platform::FitMode::Live).unwrap();
+        let available = domain.memory.borrow_mut().reserved_room(kind, 0, crate::platform::FitMode::Live, 0).unwrap();
         // Claimed as a reservation's, the bytes take the store's room itself,
         // which `available` reads: the free space of the device's blocks serves
         // none of them.
         let leaving = |domain: &ExecutorDomain<TestFamily>, left: u64| {
-            domain.memory.borrow_mut().claim_reserved(kind, available - left, 0, HoldingClass::Live, crate::platform::FitMode::Live).unwrap()
+            domain.memory.borrow_mut().claim_reserved(kind, available - left, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0).unwrap()
         };
         let held = leaving(&domain, step / 2);
         assert!(matches!(
@@ -1383,7 +1383,7 @@ fn a_holding_update_beside_a_shrinks_release_classifies_within_the_charge() {
         assert!(domain.advance_expert_bank(unwatched()).unwrap().is_none());
         domain.family.bank.as_ref().unwrap().release_now();
         // A claim's observation, which no holding follows.
-        domain.memory.borrow_mut().refresh().unwrap();
+        domain.memory.borrow_mut().refresh(0).unwrap();
         domain.refresh_memory().unwrap();
         assert!(matches!(finish(&mut domain), crate::BankResized::Shrunk { from: 4, to: 3, released, .. } if released == row));
     }
