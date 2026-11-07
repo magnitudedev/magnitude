@@ -194,6 +194,29 @@ fn planned_prefill(
         .map_err(invariant("planned prefill"))
 }
 
+/// Whether `operations` are one primed prompt chunk that closes its request's
+/// prompt, so its target result publishes before its drafter entry finishes.
+/// The prompt's end says so, never the entry's shape: a drafter that enters
+/// each row with its successor enters every row of a chunk but a prompt's
+/// first.
+fn closes_prompt(round: &Round, operations: &[Operation]) -> bool {
+    let [Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        tokens,
+        position,
+        prime: Some(_),
+        ..
+    }] = operations
+    else {
+        return false;
+    };
+    round
+        .members
+        .get(request)
+        .is_some_and(|member| position + tokens.len() == member.state.generation().prompt().len())
+}
+
 /// The selection bound `operations` spend: every selected target row, and one
 /// per drafting request.
 fn selection_charge(operations: &[Operation]) -> usize {
@@ -3217,7 +3240,7 @@ impl<F: ProgramFamily> Service<F> {
                 return Err((Some(round.members), invariant("prefix cache")(error)));
             }
         }
-        let (outcomes, continuation) = match finish(&mut self.domain, flight, &operations) {
+        let (outcomes, continuation) = match finish(&mut self.domain, flight, closes_prompt(&round, &operations)) {
             Ok(finished) => finished,
             Err(error) => return Err((Some(round.members), classify_domain_error(error))),
         };

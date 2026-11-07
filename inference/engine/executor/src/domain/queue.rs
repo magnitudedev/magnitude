@@ -418,6 +418,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.queue.holder()
     }
 
+    /// Where `request`'s target state ends: its chain's while one is under
+    /// way (its holder's state is the chain's), else its accepted state's.
+    pub(super) fn target_end(&self, request: RequestId) -> Option<usize> {
+        match &self.queue {
+            Queue::Chain(chain) if chain.holder == request => Some(chain.joined.end()),
+            Queue::Empty | Queue::Opening(_) | Queue::Chain(_) | Queue::Successor(_) => {
+                self.target.get(&request).map(SequenceState::position)
+            }
+        }
+    }
+
     /// The steps queued behind the last flight.
     #[cfg(test)]
     pub(crate) fn queued_steps(&self) -> usize {

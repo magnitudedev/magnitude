@@ -2470,13 +2470,26 @@ fn target_with_pending_priming(
     // Target submission precedes its head submission, just as in production.
     // This controlled target is already ready and has returned its workspace.
     let mut flight = submit_reserved_target(&mut domain, bindings, vec![operation]);
+    let control = attach_pending_priming(&mut domain, &mut flight, request, TokenId(2));
+    (domain, flight, control)
+}
+
+/// Attach to `flight`, `request`'s target chunk, a checked head launch
+/// entering `token` after the request's drafter state, with controlled
+/// completion: the chunk's drafter entry, still running.
+fn attach_pending_priming(
+    domain: &mut ExecutorDomain<TestFamily>,
+    flight: &mut TargetFlight<TestFamily>,
+    request: RequestId,
+    token: TokenId,
+) -> PendingControl {
     let advance = TentativeAdvance::Accepted(
         OwnedStateAdvance::begin(domain.head.remove(&request).unwrap(), 1)
             .ok()
             .unwrap(),
     );
     let slot = domain
-        .head_slot(request, &[TokenId(2)], 0, &[], &advance, 0)
+        .head_slot(request, &[token], 0, &[], &advance, 0)
         .unwrap();
     let batch = crate::batching::ValidatedHeadBatch::from_slots(
         &[slot],
@@ -2520,7 +2533,7 @@ fn target_with_pending_priming(
         submission: head,
         continuation: None,
     });
-    (domain, flight, control)
+    control
 }
 
 fn publish_before_priming(
@@ -2578,6 +2591,54 @@ fn deferred_priming_commits_after_target_publication_and_releases_leases() {
         held_outputs + 1
     );
     // The returned binding right is usable only after the second flight ends.
+    domain.provision_open(&mut bindings).unwrap();
+    domain.close(request).unwrap();
+}
+
+/// A chunk opening a chain whose drafter entry finishes after the chunk
+/// publishes: the entry commits with the chunk, whose state the chain under
+/// way holds, so the drafter follows the chunks queued behind it and the
+/// holder claims each of them. An entry aborted for want of an accepted
+/// target state would leave the drafter trailing the chain, and the
+/// holder's next primed chunk, no longer the queued one, would orphan it.
+#[test]
+fn a_deferred_entry_commits_with_the_chain_its_chunk_opens() {
+    let request = RequestId(95);
+    let (mut domain, mut bindings) = fixture_of(
+        tiny_definition(),
+        limits(2, 3, false),
+        None,
+        true,
+        platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+    );
+    // A load chains once it is priced (`chain_load`).
+    with_room(&mut domain, 1 << 30);
+    measure_load(&mut domain, &mut bindings);
+    open(&mut domain, &mut bindings, request);
+    domain.plan_successors(vec![prefill(request, 1), prefill(request, 2)]);
+    let mut flight = submit_reserved_target(&mut domain, bindings, vec![prefill(request, 0)]);
+    assert_eq!(domain.queue.len(), 2, "the chain queues two chunks");
+    let control = attach_pending_priming(&mut domain, &mut flight, request, TokenId(1));
+    let (pending, priming) = publish_before_priming(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert_eq!(domain.chain_holder(), Some(request));
+    control.resolve(Ok(()));
+    let (_, _, mut bindings) = domain.finish_priming(priming).unwrap();
+    assert_eq!(domain.head[&request].position(), 1, "the entry committed with its chunk");
+    for position in 1..3 {
+        let flight = submit_claimed(&mut domain, bindings, vec![prefill(request, position)]);
+        let (pending, returned) = finish_one(&mut domain, flight);
+        bindings = returned;
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+    }
+    assert_eq!(domain.chain_holder(), None);
+    let checkpoint = domain.resume_state(request).unwrap();
+    assert_eq!(checkpoint.target.position(), 3);
+    assert_eq!(checkpoint.head.as_ref().unwrap().position(), 1);
     domain.provision_open(&mut bindings).unwrap();
     domain.close(request).unwrap();
 }

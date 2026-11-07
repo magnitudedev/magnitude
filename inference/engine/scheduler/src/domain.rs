@@ -202,21 +202,17 @@ fn submit<F: ProgramFamily>(
     })
 }
 
-/// Finish a completed flight: its outcomes, and the bindings it held.
+/// Finish a completed flight: its outcomes, and the bindings it held. A
+/// target flight that is the prompt chunk `closing` its request's prompt
+/// publishes its result before its drafter entry finishes.
 pub fn finish<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
     flight: DomainFlight<F>,
-    operations: &[Operation],
+    closing: bool,
 ) -> Result<(FlightOutcomes, TargetContinuation<F>), DomainError> {
     match flight {
         DomainFlight::Target(flight) => {
-            // A finishing prompt chunk knows one fewer successor token
-            // than it has rows. Its target result can publish independently
-            // of the already submitted history entry.
-            let finishing = matches!(operations, [Operation::Forward {
-                kind: magnitude_executor::WorkKind::Prefill, tokens, prime: Some(prime), ..
-            }] if prime.tokens.len() + 1 == tokens.len());
-            domain.finish_target_for_publication(flight, finishing)
+            domain.finish_target_for_publication(flight, closing)
                 .map(|(outcomes, continuation)| (FlightOutcomes::Target(outcomes), continuation))
         }
         DomainFlight::Head(flight) => domain

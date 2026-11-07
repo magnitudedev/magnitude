@@ -1034,10 +1034,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     "deferred entry has another head owner",
                 ));
             }
-            let accepted = self
-                .target
-                .get(&request)
-                .is_some_and(|state| state.position() == flight.target_end);
+            // The entry commits with its chunk: in the request's accepted
+            // state, or in the chain under way that holds it.
+            let accepted = self.target_end(request) == Some(flight.target_end);
             let state = if accepted {
                 let rows = advance.rows();
                 let (OwnedAdvanceResolution::Aborted(state)
