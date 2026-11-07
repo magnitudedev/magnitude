@@ -1825,7 +1825,7 @@ impl NativeTargetProgram {
         let mut bindings = bound.bindings();
         if let Some(bank) = &run.bank {
             bank.bind(graph, index, run.region.place, &mut bindings).map_err(invalid)?;
-            bank.fill_followed(graph, index, followed).map_err(invalid)?;
+            bank.fill_followed(index, followed).map_err(invalid)?;
         }
         let mut active = run.launch.graph_workspace.slot_mut().activate(&graph.plan).map_err(device)?;
         let ready = active

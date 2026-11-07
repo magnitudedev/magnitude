@@ -98,26 +98,15 @@ impl BankRun {
     pub(crate) fn block_sampled<P>(&self, graph: &PreparedTargetBlockGraph<P>, index: usize, spans: seismic::NativeSpans) -> Result<(), String> {
         // Only a graph whose ends are marked is sampled (`Self::samples`).
         let marks = graph.span.expect("a sampled run's graph is marked at its ends");
-        // Its streamed layer is its block's feed-forward: the sublayer, or a
-        // parallel sublayer's routed branch.
-        let [_, routed] = super::prepared::block_scopes(graph.block)?;
-        let scope = block_scope(routed, graph.block, index)?;
-        let (layer, _) = self
-            .bank
-            .plan()
-            .feed_forward(scope)
-            .ok_or_else(|| format!("{scope:?} has no streamed routed layer"))?;
-        self.bank.block_sampled(self.sequence, layer, spans, marks);
+        self.bank.block_sampled(self.sequence, block_layer(self.bank.plan(), index)?, spans, marks);
         Ok(())
     }
 
     /// This step's fill, `graph`'s run as block `index`, is `followed`
     /// directly by a sibling fill on its queue
     /// (`ExpertBank::fill_followed`), at block `index`'s streamed layer.
-    pub(crate) fn fill_followed<P>(&self, graph: &PreparedTargetBlockGraph<P>, index: usize, followed: bool) -> Result<(), String> {
-        let [_, routed] = super::prepared::block_scopes(graph.block)?;
-        let layer = self.bank.streamed_layer(block_scope(routed, graph.block, index)?)?;
-        self.bank.fill_followed(self.sequence, layer, followed);
+    pub(crate) fn fill_followed(&self, index: usize, followed: bool) -> Result<(), String> {
+        self.bank.fill_followed(self.sequence, block_layer(self.bank.plan(), index)?, followed);
         Ok(())
     }
 
@@ -146,6 +135,16 @@ impl BankRun {
         }
         Ok(())
     }
+}
+
+/// The bank's index of block `index`'s streamed layer: its feed-forward,
+/// the sublayer's own or a parallel sublayer's routed branch
+/// (`ExpertBankPlan::feed_forward`).
+pub(crate) fn block_layer(bank: &crate::ExpertBankPlan, index: usize) -> Result<usize, String> {
+    let [_, feed_forward] = super::prepared::block_scopes(index)?;
+    bank.feed_forward(feed_forward)
+        .map(|(layer, _)| layer)
+        .ok_or_else(|| format!("{feed_forward:?} has no streamed routed layer"))
 }
 
 /// The words of `bank` a run of block `index` at chain place `place` binds
