@@ -1443,8 +1443,9 @@ mod tests {
     #[test]
     fn a_reserved_table_resizes_by_records() {
         let path = file("resize");
+        let device = device();
         let table = StoredTable::new(
-            &device(),
+            &device,
             &descriptor(),
             stored(),
             resident(),
@@ -1471,7 +1472,14 @@ mod tests {
         let before = table.charged_bytes().unwrap();
         table.resize(2).unwrap().unwrap();
         assert_eq!(table.records(), 2);
-        assert!(table.charged_bytes().unwrap() < before);
+        // It frees the whole granules the two records' bytes leave
+        // (none where the four lie in one granule, as on Metal's).
+        let backing = granules(&device, 256);
+        let record = record_bytes(256);
+        assert_eq!(
+            before - table.charged_bytes().unwrap(),
+            backing.backing(4 * record).unwrap() - backing.backing(2 * record).unwrap()
+        );
         let kept = every.iter().filter(|row| found(&table, **row).is_some()).collect::<Vec<_>>();
         assert_eq!(kept.len(), 512);
         for row in kept {
@@ -1489,6 +1497,70 @@ mod tests {
             assert_eq!(found(&table, row), Some(slot_row(row)));
         }
         read_done(&step);
+        drop(table);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// The bytes of one record of `record_rows` slots.
+    fn record_bytes(record_rows: u64) -> u64 {
+        resident().canonical_byte_len(&[1, record_rows, WIDTH]).unwrap()
+    }
+
+    /// The reservation the test device backs a stored table's slots in, as
+    /// it reserves records of `record_rows` slots: its granule is what a
+    /// resize backs and frees whole.
+    fn granules(device: &seismic::Device, record_rows: u64) -> seismic::Reservation {
+        let contract = crate::planning::BankTier::Bank.contract_on(device);
+        let record = std::num::NonZeroU64::new(record_bytes(record_rows)).unwrap();
+        device
+            .info()
+            .reserving(contract)
+            .unwrap()
+            .expect("the test device reserves a stored table's slots")
+            .of_records(seismic::ReservedRecords::of(record))
+    }
+
+    /// A reserved table charges whole granules of its device's reservation
+    /// (read from the device): a shrink by records frees exactly the whole
+    /// granules its records' bytes leave, and none for a shrink within one
+    /// granule. Sized to three granules of 16-row records, at least two to a
+    /// granule.
+    #[test]
+    fn a_reserved_table_shrink_frees_whole_granules() {
+        let device = device();
+        let record_rows = 16;
+        let reservation = granules(&device, record_rows);
+        let (granule, record) = (reservation.granule, record_bytes(record_rows));
+        assert!(record * 2 <= granule, "{record}-byte records, {granule}-byte granules");
+        // The most records within three granules, and within one.
+        let (three, one) = (3 * granule / record, granule / record);
+        let rows = three * record_rows;
+        let path = std::env::temp_dir().join(format!("magnitude-stored-table-granules-{}.bin", std::process::id()));
+        std::fs::File::create(&path).unwrap().set_len(100 + rows * ROW_BYTES as u64).unwrap();
+        let table = StoredTable::new(
+            &device,
+            &WeightDescriptor::stored("table", [rows, WIDTH]),
+            stored(),
+            resident(),
+            rows,
+            WIDTH,
+            StoredSlots::Reserved { records: three, record_rows },
+            DirectoryForm::Hashed,
+            ranges(&path),
+            None,
+        )
+        .unwrap();
+        let charged = || table.charged_bytes().unwrap();
+        let full = charged();
+        // One record less still lies in the third granule: nothing is freed.
+        table.resize(three - 1).unwrap().unwrap();
+        assert_eq!(charged(), full, "a shrink within a granule frees nothing");
+        // Down to one granule's records: the other two are freed whole.
+        table.resize(one).unwrap().unwrap();
+        assert_eq!(full - charged(), 2 * granule, "a shrink frees whole granules");
+        // Growing back backs them again.
+        table.resize(three).unwrap().unwrap();
+        assert_eq!(charged(), full);
         drop(table);
         std::fs::remove_file(path).unwrap();
     }
