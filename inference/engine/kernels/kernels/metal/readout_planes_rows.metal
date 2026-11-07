@@ -3,6 +3,7 @@
 // `readout_head_rows`' launches over the projection library's packets of the
 // head's exact view (`lib/readout/progressive.h`).
 #include "lib/readout/progressive.h"
+#include "lib/projection/gemv.h"
 
 typedef progressive::activation activation;
 typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
