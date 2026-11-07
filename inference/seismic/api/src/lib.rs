@@ -3777,15 +3777,18 @@ impl NativeGraphFamily {
             .iter()
             .map(|plan| vec![plan.clone()])
             .collect::<Vec<_>>();
-        Self::with_launches(plans, &launches)
+        Self::with_launches(plans, &launches, &[])
     }
     /// A family of `plans` whose launches each make the runs of one of
     /// `launches`, a plan once for each of its runs, the first its decode
     /// launch: its plans of one layout share one graph, recorded as a run
     /// first needs it, within what its live slots hold ([`Self::graphs`]).
+    /// A chain of `k + 2` launches in one submission further runs
+    /// `chains[k]`, each plan its count of runs, beyond each launch's own.
     pub fn with_launches(
         plans: &[NativeGraphPlan],
         launches: &[Vec<NativeGraphPlan>],
+        chains: &[Vec<(NativeGraphPlan, u64)>],
     ) -> Result<Self, WorkflowError> {
         let inner = |plans: &[NativeGraphPlan]| {
             plans
@@ -3794,7 +3797,11 @@ impl NativeGraphFamily {
                 .collect::<Vec<_>>()
         };
         let launches = launches.iter().map(|runs| inner(runs)).collect::<Vec<_>>();
-        seismic_runtime::native::graph::NativeGraphFamily::with_launches(&inner(plans), &launches)
+        let chains = chains
+            .iter()
+            .map(|runs| runs.iter().map(|(plan, count)| (plan.inner.clone(), *count)).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        seismic_runtime::native::graph::NativeGraphFamily::with_launches(&inner(plans), &launches, &chains)
             .map(|inner| Self {
                 inner: Arc::new(inner),
             })

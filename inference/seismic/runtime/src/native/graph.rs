@@ -2765,7 +2765,7 @@ impl NativeGraphPlan {
         let census = self.run_graphs(&form);
         let layout = super::LayoutGraph { form, plans: vec![self.clone()] };
         let layouts = super::LayoutForms::new([(self.shape.layout, layout)]);
-        let graphs = LaunchGraphs { decode: census, union: census };
+        let graphs = LaunchGraphs { decode: census, union: census, chained: Vec::new() };
         super::FamilyGraphs::new(&self.device, layouts, graphs).slot().map_err(TensorError::Execution)
     }
 
@@ -2995,7 +2995,7 @@ impl NativeGraphFamily {
     /// A family of `plans` whose launch is one run of one of them.
     pub fn new(plans: &[Arc<NativeGraphPlan>]) -> Result<Self, WorkflowError> {
         let launches = plans.iter().map(|plan| vec![plan.clone()]).collect::<Vec<_>>();
-        Self::with_launches(plans, &launches)
+        Self::with_launches(plans, &launches, &[])
     }
 
     /// A family of `plans` whose launches each make the runs of one of
@@ -3005,8 +3005,16 @@ impl NativeGraphFamily {
     /// each launch any of them makes, each run enabling its own; elsewhere
     /// their own graphs. Every graph is recorded as a run first needs one,
     /// within what its live slots hold of the device's graph budget
-    /// ([`Self::graphs`]).
-    pub fn with_launches(plans: &[Arc<NativeGraphPlan>], launches: &[Vec<Arc<NativeGraphPlan>>]) -> Result<Self, WorkflowError> {
+    /// ([`Self::graphs`]). A chain of `k + 2` launches, all in one
+    /// submission, further runs `chains[k]`, each plan its count of runs,
+    /// beyond each launch's own runs: on a backend where one graph serves one run of its shape a
+    /// submission (`BackendName::graphs_update_in_flight`), each a graph of
+    /// its own; elsewhere the launches' graphs serve them.
+    pub fn with_launches(
+        plans: &[Arc<NativeGraphPlan>],
+        launches: &[Vec<Arc<NativeGraphPlan>>],
+        chains: &[Vec<(Arc<NativeGraphPlan>, u64)>],
+    ) -> Result<Self, WorkflowError> {
         let first = plans.first().ok_or(WorkflowError::Empty)?;
         assert!(
             plans.iter().all(|plan| !plan.launched),
@@ -3077,7 +3085,15 @@ impl NativeGraphFamily {
                 census.plus(graph.times(runs as u64)?)
             })
             .expect("a family's graph census fits u64");
-        let graphs = LaunchGraphs { decode, union };
+        let chained = match super::backend_name(&first.device.kind).graphs_update_in_flight() {
+            true => Vec::new(),
+            false => chains
+                .iter()
+                .map(|runs| runs.iter().try_fold(GraphCensus::default(), |census, (plan, count)| census.plus(graph_of(plan).times(*count)?)))
+                .collect::<Option<Vec<_>>>()
+                .expect("a family's graph census fits u64"),
+        };
+        let graphs = LaunchGraphs { decode, union, chained };
         let count = layouts.len();
         let mut decode_layouts = Vec::<(u64, usize)>::new();
         for plan in launches[0].iter().filter(|plan| plan.graphed()) {

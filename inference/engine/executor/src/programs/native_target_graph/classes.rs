@@ -353,6 +353,59 @@ impl Passes {
     fn lengths(self) -> impl Iterator<Item = u64> {
         (1..=self.launches).map(move |launches| self.of_chain(launches))
     }
+
+    /// The passes of a merge set of `merged` runs: as many of
+    /// [`Self::launches`] runs as it fills, then one of the rest, if any.
+    fn merge_passes(self, merged: usize) -> (usize, usize) {
+        (merged / self.launches, merged % self.launches)
+    }
+
+    /// The passes, as ranges of its runs, a group of `runs` runs makes at
+    /// a block whose merge set is `merged` runs: a pass of each single run
+    /// first, then the merge set's ([`Self::merge_passes`]). The one split
+    /// of a group into passes: the engine runs it (`run_sets`) and the
+    /// graph census counts it ([`chained_once_runs`]).
+    pub(crate) fn sets(self, runs: usize, merged: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+        let merged = merged.clamp(1, runs.max(1)).min(runs);
+        let singles = runs - merged;
+        let (full, rest) = self.merge_passes(merged);
+        let most = self.launches;
+        (0..singles)
+            .map(|start| start..start + 1)
+            .chain((0..full).map(move |pass| singles + pass * most..singles + (pass + 1) * most))
+            .chain((rest > 0).then(|| runs - rest..runs))
+    }
+}
+
+/// What a chain of `launches` launches, in one submission, runs of a
+/// split block's graphs run once a group beyond one run of each, which a
+/// launch's own graphs hold (`launch_runs`): of each pass length the most
+/// passes of it any merge set makes ([`Passes::sets`]), and a fill for
+/// every launch; each `(stage, rows)` with its further runs, each a graph
+/// of its own where one graph serves one run of its shape a submission
+/// (`BackendName::graphs_update_in_flight`). The plan's census
+/// (`certify_target_family`) and the sealed family (`PreparedTargetGraphs`)
+/// both count a chain's graphs by it.
+pub(super) fn chained_once_runs(passes: Passes, launches: usize) -> Vec<((OnceStage, u64), u64)> {
+    // Passes by length (in runs), the most any merge set makes.
+    let mut most = vec![0u64; passes.launches + 1];
+    for merged in 1..=launches {
+        // Its single runs' passes, then its merge set's (`Passes::sets`).
+        let (singles, (full, rest)) = (launches - merged, passes.merge_passes(merged));
+        let of_length = |length: usize| {
+            usize::from(length == 1) * singles + usize::from(length == passes.launches) * full + usize::from(length == rest)
+        };
+        for length in [1, passes.launches, rest].into_iter().filter(|&length| length > 0) {
+            most[length] = most[length].max(of_length(length) as u64);
+        }
+    }
+    most.into_iter()
+        .enumerate()
+        .skip(1)
+        .map(|(length, count)| ((OnceStage::Pass, passes.of_chain(length)), count.saturating_sub(1)))
+        .chain([((OnceStage::Fill, passes.rows()), launches.saturating_sub(1) as u64)])
+        .filter(|&(_, further)| further > 0)
+        .collect()
 }
 
 /// The class of block `index`'s graph of `stage` sealed once at a pass's

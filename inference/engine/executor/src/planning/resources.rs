@@ -460,7 +460,7 @@ impl NativeGraphCharge {
         storage: seismic::NativeGraphStorageBytes,
         slots: GraphSlots,
     ) -> Result<Self, String> {
-        let graphs = seismic::LaunchGraphs { decode: storage.recorded, union: storage.recorded };
+        let graphs = seismic::LaunchGraphs { decode: storage.recorded, union: storage.recorded, chained: Vec::new() };
         Self::from_checked(storage, serial_upload_regions(storage.upload), slots, graphs)
     }
 

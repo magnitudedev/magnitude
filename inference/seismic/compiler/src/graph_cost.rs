@@ -116,37 +116,53 @@ impl GraphCensus {
 }
 
 /// What a family's graphs hold with launches in flight: its decode
-/// launch's graphs, and the union of every launch's, each layout's graph
-/// for the most runs of it any one launch makes ([`Self::held`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// launch's graphs, the union of every launch's, each layout's graph for
+/// the most runs of it any one launch makes, and what a chain of launches
+/// replays beyond each launch's own ([`Self::held`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchGraphs {
     pub decode: GraphCensus,
     pub union: GraphCensus,
+    /// A chain of `k + 2` launches' graphs beyond each launch's own, at
+    /// `k`: the further runs of the graphs it runs once a group, where one
+    /// graph serves one run of its shape a submission. Empty where none.
+    pub chained: Vec<GraphCensus>,
 }
 
 impl LaunchGraphs {
     /// What the family holds with `launches` launches in flight: the
     /// union, within which any one launch's graphs are whatever its class,
-    /// so every submission fits; and beside it each other launch's, a
-    /// decode launch's, so one prompt launch in flight with decode launches
-    /// records no graph it once recorded. Each layout's graphs kept for its
-    /// decode launches, `decode`'s runs of it for every launch, are within
-    /// this, as a layout's union runs are no fewer than its decode runs, so
-    /// no release ever takes them. A second prompt launch in flight (a
-    /// chunk's pipelined successor, where prompt chunks do not chain) still
-    /// fits, releasing graphs only the first prompt launch replays, which
-    /// then record again. None without a launch, none on overflow.
-    pub fn held(self, launches: u64) -> Option<GraphCensus> {
-        match launches {
-            0 => Some(GraphCensus::default()),
-            launches => self.decode.times(launches - 1)?.plus(self.union),
-        }
+    /// so every submission fits; beside it each other launch's, a decode
+    /// launch's, so one prompt launch in flight with decode launches
+    /// records no graph it once recorded; and what a chain of them replays
+    /// beyond each launch's own (`chained`), the longest chain's past it.
+    /// Each layout's graphs kept for its decode launches, `decode`'s runs
+    /// of it for every launch, are within this, as a layout's union runs
+    /// are no fewer than its decode runs, so no release ever takes them. A
+    /// second prompt launch in flight (a chunk's pipelined successor, where
+    /// prompt chunks do not chain) still fits, releasing graphs only the
+    /// first prompt launch replays, which then record again. None without
+    /// a launch, none on overflow.
+    pub fn held(&self, launches: u64) -> Option<GraphCensus> {
+        let chained = match launches {
+            0 => return Some(GraphCensus::default()),
+            1 => GraphCensus::default(),
+            launches => usize::try_from(launches - 2)
+                .ok()
+                .and_then(|at| self.chained.get(at).or(self.chained.last()))
+                .copied()
+                .unwrap_or_default(),
+        };
+        self.decode.times(launches - 1)?.plus(self.union)?.plus(chained)
     }
 
-    /// Whether both terms are within `bound`'s: what it holds at any count
+    /// Whether every term is within `bound`'s: what it holds at any count
     /// of launches is then within what `bound` holds.
-    pub fn within(self, bound: Self) -> bool {
-        self.decode.within(bound.decode) && self.union.within(bound.union)
+    pub fn within(&self, bound: &Self) -> bool {
+        self.decode.within(bound.decode)
+            && self.union.within(bound.union)
+            && self.chained.len() == bound.chained.len()
+            && self.chained.iter().zip(&bound.chained).all(|(chained, bound)| chained.within(*bound))
     }
 }
 

@@ -8,7 +8,7 @@ use super::{
     certify::{TargetFamilyCertificate, certify_target_family},
     classes::{
         BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, LaunchControlLayout,
-        Passes, StagedClass, block_sealed_stages, block_stages, class_topology, enumerate_block_graphs, launch_runs, once_class,
+        Passes, StagedClass, block_sealed_stages, block_stages, chained_once_runs, class_topology, enumerate_block_graphs, launch_runs, once_class,
         slot_selection,
     },
     entry::{
@@ -769,10 +769,32 @@ impl PreparedTargetGraphs {
                 runs
             })
             .collect::<Vec<_>>();
+        // What a chain of each length beyond one launch further runs of
+        // the graphs every split block runs once a group
+        // (`chained_once_runs`), as the plan certified them.
+        let chains = (2..=limits.chain_capacity.get())
+            .map(|launches| {
+                let further = chained_once_runs(passes, launches);
+                let count = |key: (OnceStage, u64)| further.iter().find(|&&(at, _)| at == key).map_or(0, |&(_, count)| count);
+                let mut runs = Vec::new();
+                for graphs in &blocks_by_class {
+                    for (rows, block) in &graphs.passes {
+                        runs.push((block.plan.clone(), count((OnceStage::Pass, *rows))));
+                    }
+                    for ((class, stage), block) in &graphs.runs {
+                        if *stage == Stage::Once(OnceStage::Fill) {
+                            runs.push((block.plan.clone(), count((OnceStage::Fill, class.0))));
+                        }
+                    }
+                }
+                runs.retain(|&(_, count)| count > 0);
+                runs
+            })
+            .collect::<Vec<_>>();
         // The sealed family is what the load charges; the plan's bound
         // (`TargetFamilyCertificate::graphs`), which the assessment charged
         // before any plan was sealed, holds it.
-        let family = NativeGraphFamily::with_launches(&plans, &launches).map_err(|error| error.to_string())?;
+        let family = NativeGraphFamily::with_launches(&plans, &launches, &chains).map_err(|error| error.to_string())?;
         let (sealed, bound) = (family.graphs(), certificate.graphs);
         let bytes = |census| device.graph_cost().bytes(census).map_or(0, |bytes| bytes.device + bytes.upload);
         tracing::info!(
@@ -782,7 +804,7 @@ impl PreparedTargetGraphs {
             bytes(bound.decode),
             bytes(bound.union),
         );
-        if !sealed.within(bound) {
+        if !sealed.within(&bound) {
             return Err(format!(
                 "the sealed target graphs, {sealed:?}, exceed the plan's bound on them, {bound:?}"
             ));

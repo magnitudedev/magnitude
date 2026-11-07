@@ -516,6 +516,111 @@ mod resource_template_tests {
         }
     }
 
+    /// A chain's launches run in one submission, and at a split block a
+    /// merge set of one run makes a pass of each run: a chain of 29
+    /// launches of 512 rows runs 29 passes of 512 rows there, where a
+    /// launch alone runs one. On CUDA, where one graph serves one run of
+    /// its shape a submission, the family holds a graph for each, beyond
+    /// one each its launches hold. For every chain length and merge set,
+    /// what the group runs of its once graphs beyond one each, walked by
+    /// the engine's own split (`Passes::sets`), is within what the census
+    /// holds for the chain (`LaunchGraphs::chained`); where a graph updates
+    /// in flight it holds none.
+    #[test]
+    fn a_chain_holds_a_graph_for_every_pass_it_runs() {
+        let limits = ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 64,
+            max_selected_rows: 64,
+            max_drafting_slots: 64,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::new(29).unwrap(),
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        let mut configuration = QWEN35_CONFIGURATIONS[3];
+        configuration.blocks = configuration.attention_interval;
+        let (definition, manifest) = declared_model(&configuration);
+        for backend in [BackendName::Cuda, BackendName::Metal] {
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection { head: false, vision: false },
+                resident_layout(ExecutionPath::Native, backend),
+                PlannedMethod::Plain,
+                limits,
+            )
+            .unwrap();
+            let capacity = ResourceCapacity { domain_bytes: 64 << 30, tensor_operations: crate::TensorOperations::Absent };
+            let state =
+                ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, KvCodec::Dense, limits, capacity).unwrap();
+            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+            let certificate =
+                certify_target_family(backend, &load, &definition.decoder, &state, plan.target(), limits).unwrap();
+            let chained = &certificate.graphs.chained;
+            if backend.graphs_update_in_flight() {
+                assert!(chained.is_empty(), "{backend:?}");
+                continue;
+            }
+            assert_eq!(chained.len(), 28);
+            let passes = certificate.passes;
+            assert_eq!(passes.region, 512);
+            let once = |index: usize, stage: OnceStage, rows: u64| {
+                let first = certificate.outline.first_of_shape(index);
+                certificate.blocks[first][&class_topology(once_class(rows, stage))].layout.storage_bytes().recorded
+            };
+            let split = certificate
+                .served
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| block.split.is_some())
+                .map(|(index, block)| (index, block.streams))
+                .collect::<Vec<_>>();
+            assert!(!split.is_empty());
+            let further = |launches: usize, merged: usize| {
+                let mut lengths = std::collections::BTreeMap::<usize, u64>::new();
+                for set in passes.sets(launches, merged) {
+                    *lengths.entry(set.len()).or_default() += 1;
+                }
+                split.iter().fold(seismic::GraphCensus::default(), |census, &(index, streams)| {
+                    let census = lengths.iter().fold(census, |census, (&length, &count)| {
+                        census.plus(once(index, OnceStage::Pass, passes.of_chain(length)).times(count - 1).unwrap()).unwrap()
+                    });
+                    match streams {
+                        true => census
+                            .plus(once(index, OnceStage::Fill, passes.rows()).times(launches as u64 - 1).unwrap())
+                            .unwrap(),
+                        false => census,
+                    }
+                })
+            };
+            for launches in 2..=29 {
+                for merged in 1..=launches {
+                    assert!(
+                        further(launches, merged).within(chained[launches - 2]),
+                        "{launches} launches, merge sets of {merged}: {:?} beyond {:?}",
+                        further(launches, merged),
+                        chained[launches - 2]
+                    );
+                }
+            }
+            // Merge sets of one run: 29 passes of 512 rows at each split
+            // block, 28 of them beyond the launch's own.
+            let single = split
+                .iter()
+                .fold(seismic::GraphCensus::default(), |census, &(index, _)| {
+                    census.plus(once(index, OnceStage::Pass, 512).times(28).unwrap()).unwrap()
+                });
+            assert!(single.graphs >= 28 && single.within(chained[27]), "{single:?} beyond {:?}", chained[27]);
+            assert!(
+                certificate.graphs.held(29).unwrap().graphs
+                    >= certificate.graphs.decode.graphs * 28 + certificate.graphs.union.graphs + single.graphs
+            );
+        }
+    }
+
     /// Every exact entry and block class seals into the layout certified for
     /// its structural regime and is charged that layout, and the family
     /// charges exactly the binding constants the exact classes bind.

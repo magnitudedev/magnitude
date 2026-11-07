@@ -4,7 +4,7 @@ use super::{
     classes::{
         BlockOutputScales, BlockServed, FamilyOutline, Passes, StagedClass, Topology, UnreadScales,
         block_class_slice, block_listings, block_routed, block_served, block_split, block_stages,
-        block_upload_regions, class_topology, enumerate_block_graphs, launch_runs, once_class, once_graphs,
+        block_upload_regions, chained_once_runs, class_topology, enumerate_block_graphs, launch_runs, once_class, once_graphs,
         slot_scores,
     },
     entry::{
@@ -514,9 +514,29 @@ pub(super) fn certify_target_family(
         }
         Ok(census)
     };
+    // What a chain of each length beyond one launch further runs of the
+    // graphs its split blocks run once a group (`chained_once_runs`), each
+    // block's own once classes, at its shape's first block's layouts: none
+    // where one graph serves every run of its shape in a submission.
+    let chain = |launches: usize| {
+        let further = chained_once_runs(passes, launches);
+        let mut runs = BTreeMap::<Graphed, u64>::new();
+        for &(index, (class, stage)) in &staged {
+            let Stage::Once(once) = stage else { continue };
+            if let Some(&(_, count)) = further.iter().find(|&&(key, _)| key == (once, class.0)) {
+                *runs.entry(Graphed::Block(outline.first_of_shape(index), class_topology((class, stage)))).or_default() += count;
+            }
+        }
+        census(&runs)
+    };
+    let chained = match backend.graphs_update_in_flight() {
+        true => Vec::new(),
+        false => (2..=limits.chain_capacity.get()).map(chain).collect::<Result<Vec<_>, _>>()?,
+    };
     let graphs = LaunchGraphs {
         decode: census(&decode.ok_or("a target family has no launch class")?)?,
         union: census(&most)?,
+        chained,
     };
     Ok(TargetFamilyCertificate {
         outline,

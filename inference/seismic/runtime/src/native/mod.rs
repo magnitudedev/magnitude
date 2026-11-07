@@ -437,7 +437,7 @@ impl FamilyGraphs {
 
     /// What its decode launch and the union of its launches replay.
     pub(crate) fn launches(&self) -> LaunchGraphs {
-        self.launches
+        self.launches.clone()
     }
 
     /// Its live slots, each a launch in flight, as its hold counts them.

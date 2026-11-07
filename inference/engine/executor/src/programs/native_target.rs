@@ -1755,19 +1755,16 @@ impl NativeTargetProgram {
     ) -> Result<(), SubmitError> {
         let count = runs.len();
         let block = runs.iter_mut().find_map(|run| run.back.as_ref().map(|&(at, _)| at));
-        let merged = block.map_or(1, |at| sets[at].clamp(1, count));
-        // A pass covers at most the runs whose rows its graph holds
-        // (`group_pass_rows`): a longer merge set is several passes.
-        let most = self.graphs.passes().launches();
+        let merged = block.map_or(1, |at| sets[at]);
         let filled = |at: usize| scratch && self.graphs.prepared.streams(at);
         let early = self.device.backend().fills_beside_compute();
         // The runs of block `index`'s first merge set, whose fills follow
         // no pass of their own layer: every run where the layer merges
         // whole, else its first, a set of one.
         let first = |place: usize| index < self.geometry.blocks.len() && (sets[index].clamp(1, count) == count || place == 0);
-        let mut start = 0;
-        while start < count {
-            let set = start..if start + merged < count { start + 1 } else { count.min(start + most) };
+        // A pass covers at most the runs whose rows its graph holds
+        // (`group_pass_rows`): a longer merge set is several passes.
+        for set in self.graphs.passes().sets(count, merged) {
             if let Some(at) = block {
                 // Where fills share the compute queue, the set's fills run
                 // back to back, each but the last directly followed by a
@@ -1807,7 +1804,6 @@ impl NativeTargetProgram {
             if early && index < self.geometry.blocks.len() && filled(index) {
                 submitter.flush()?;
             }
-            start = set.end;
         }
         Ok(())
     }

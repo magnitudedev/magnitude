@@ -1803,7 +1803,7 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
         let entry_family = NativeGraphFamily::new(&[entry.clone()]).unwrap();
         // A launch on the block slot runs the block `blocks` times in one
         // submission, each run replaying a graph of the block's shape.
-        let block_family = NativeGraphFamily::with_launches(&[block.clone()], &[vec![block.clone(); blocks]]).unwrap();
+        let block_family = NativeGraphFamily::with_launches(&[block.clone()], &[vec![block.clone(); blocks]], &[]).unwrap();
         let mut entry_slot = entry_family.new_slot(&[entry_family.upload_bytes()]).unwrap();
         let mut block_slot = block_family.new_slot(&[block_family.upload_bytes()]).unwrap();
         let mut entry_output = Some(entry_family.new_output_slot().unwrap());
