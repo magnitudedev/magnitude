@@ -82,9 +82,12 @@ fn readout_head_rows[M, O, V, D, PT, NM, WS](hidden: &tensor[M, PT * D] f32,
 # normalize once into activation storage. Through 16 rows, supported compressed
 # weights use the shared matrix GEMV and other formats use batched GEMV;
 # larger classes use GEMM. (CUDA: GEMV up to 8 rows, no batched launch.)
+# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
+# 0.95x the time batched that they took on the GEMV (14 opens, at most
+# 0.97x). Fewer than 3 rows and more than 4 launch alike either way.
 native readout_head_rows for metal from "metal/readout_head_rows.metal":
     static (V, D, PT, NM, WS)
-    params (arithmetic BATCH_FROM in [5, 3, 9] default 5)
+    params (arithmetic BATCH_FROM in [3, 5, 9] default 3)
     where WS <= 1 and (MATRIX == 0 or form(OW, MATRIX) == 1)
     scratch normalized bytes (O * D * 2) when O >= BATCH_FROM
     launch readout_head_rows_stage when O >= BATCH_FROM:
