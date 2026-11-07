@@ -1,6 +1,6 @@
 //! Tuning cases of the state-space block (`operators::state_space`): the
 //! normed projection row (`attention_project`, query segment only), the
-//! in-place state advance (`state_space_step` below [`CHUNKED_ROWS`] rows,
+//! in-place state advance (`state_space_step` below `CHUNKED_ROWS` rows,
 //! `state_space_chunk` from there) and the output projection
 //! (`attention_output` over `heads` heads). `state_space_gate` declares no
 //! parameters.
@@ -12,12 +12,9 @@
 //! validation run.
 
 use super::cases::{packing_statics, projection_shape, scale_extent};
-use super::{
-    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
-    served_row_points,
-};
+use super::{CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs};
 use crate::operators::InputForm;
-use crate::operators::gated_delta::graph::CHUNKED_ROWS;
+use crate::operators::gated_delta::graph::chunked;
 use crate::{StateSpaceBinding, StateSpaceShape};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, attention_project, state_space_chunk, state_space_step};
@@ -118,10 +115,6 @@ impl EntryTuning for StateSpaceProjectTuning {
         )?);
         statics.extend(InputForm::SINGLE.dimensions(shape.hidden));
         Ok(statics)
-    }
-
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
     }
 
     fn rotation(
@@ -234,10 +227,6 @@ impl EntryTuning for StateSpaceOutputTuning {
         Ok(statics)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
-    }
-
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -296,12 +285,12 @@ pub(crate) struct StateSpaceState {
     pub scopes: Vec<WeightScope>,
 }
 
-/// `state_space_step`, for row classes below [`CHUNKED_ROWS`]. Its
+/// `state_space_step`, for row classes below `CHUNKED_ROWS`. Its
 /// parameters are mappings: every configuration is bit-exact.
 #[derive(Clone)]
 pub(crate) struct StateSpaceStepTuning(pub StateSpaceState);
 
-/// `state_space_chunk`, for row classes of [`CHUNKED_ROWS`] and more.
+/// `state_space_chunk`, for row classes of `CHUNKED_ROWS` and more.
 #[derive(Clone)]
 pub(crate) struct StateSpaceChunkTuning(pub StateSpaceState);
 
@@ -412,8 +401,8 @@ macro_rules! state_entry {
                 Ok(self.0.shape.state_statics().to_vec())
             }
 
-            fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-                served_row_points(limits, $serves)
+            fn serves(&self, rows: u64) -> bool {
+                ($serves)(rows)
             }
 
             fn rotation(
@@ -461,7 +450,7 @@ macro_rules! state_entry {
     };
 }
 
-state_entry!(StateSpaceStepTuning, state_space_step, |rows| rows
-    < CHUNKED_ROWS);
-state_entry!(StateSpaceChunkTuning, state_space_chunk, |rows| rows
-    >= CHUNKED_ROWS);
+state_entry!(StateSpaceStepTuning, state_space_step, |rows| !chunked(
+    rows
+));
+state_entry!(StateSpaceChunkTuning, state_space_chunk, chunked);

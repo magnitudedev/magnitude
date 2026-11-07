@@ -3,7 +3,7 @@
 //! shapes and model geometry, and builds every argument set from real
 //! resident weights of distinct layers plus case-owned activations.
 
-use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{dense_expand, dense_output, dense_up};
 use seismic::{Element, Tensor};
@@ -185,10 +185,6 @@ impl EntryTuning for DenseExpandTuning {
         Ok(statics)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
-    }
-
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -292,10 +288,6 @@ impl EntryTuning for DenseUpTuning {
         ])
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
-    }
-
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -396,10 +388,6 @@ impl EntryTuning for DenseOutputTuning {
             &[("DB", Some(self.down_kind))],
         )?);
         Ok(statics)
-    }
-
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
     }
 
     fn rotation(

@@ -8,14 +8,12 @@
 
 use super::cases::scale_extent;
 use super::routed::{
-    BankOperands, ExpansionScales, GroupedTables, RoutedShape, bank_sources, bank_statics,
-    decode_points, group, grouped_points, lead_ports, no_sources, no_tier, routes, streamed_hint,
+    BankOperands, ExpansionScales, GroupedTables, RoutedShape, bank_sources, bank_statics, group,
+    lead_ports, no_sources, no_tier, routes, streamed_hint,
 };
-use super::{
-    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
-};
+use super::{CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs};
 use crate::GeneralRoutedBinding;
-use crate::operators::routed::fused_graph::TILE_ROWS;
+use crate::operators::routed::fused_graph::{TILE_ROWS, decodes};
 use crate::planning::BankBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -89,10 +87,6 @@ impl EntryTuning for RoutedSelectTuning {
         let [_, statics @ ..] = shape.select_dimensions(0);
         let down = scale_extent(inputs, &self.scopes, WeightKind::ExpertDown)?;
         Ok([statics.as_slice(), &[("ES", shape.expert_scale_extent(down))]].concat())
-    }
-
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
     }
 
     fn rotation(
@@ -229,8 +223,8 @@ impl EntryTuning for RoutedSelectStreamedTuning {
         Ok(statics)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        decode_points(limits)
+    fn serves(&self, rows: u64) -> bool {
+        decodes(rows)
     }
 
     fn rotation(
@@ -413,8 +407,8 @@ impl EntryTuning for RoutedGateUpTuning {
         self.0.statics(inputs)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        decode_points(limits)
+    fn serves(&self, rows: u64) -> bool {
+        decodes(rows)
     }
 
     fn rotation(
@@ -470,8 +464,8 @@ impl EntryTuning for RoutedUpTuning {
         self.0.statics(inputs)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        decode_points(limits)
+    fn serves(&self, rows: u64) -> bool {
+        decodes(rows)
     }
 
     fn rotation(
@@ -543,8 +537,8 @@ impl EntryTuning for RoutedDownTuning {
         Ok(statics.to_vec())
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        decode_points(limits)
+    fn serves(&self, rows: u64) -> bool {
+        decodes(rows)
     }
 
     fn rotation(
@@ -638,8 +632,8 @@ impl EntryTuning for RoutedDownProjectTuning {
         self.resident.statics(inputs)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        decode_points(limits)
+    fn serves(&self, rows: u64) -> bool {
+        decodes(rows)
     }
 
     fn rotation(
@@ -780,8 +774,8 @@ impl EntryTuning for RoutedGatedTilesTuning {
         self.0.statics(inputs)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        grouped_points(limits)
+    fn serves(&self, rows: u64) -> bool {
+        !decodes(rows)
     }
 
     fn rotation(
@@ -848,8 +842,8 @@ impl EntryTuning for RoutedUpTilesTuning {
         self.0.statics(inputs)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        grouped_points(limits)
+    fn serves(&self, rows: u64) -> bool {
+        !decodes(rows)
     }
 
     fn rotation(
@@ -923,8 +917,8 @@ impl EntryTuning for RoutedScatterTuning {
         Ok(vec![("H", shape.expert_hidden), ("K", shape.selected)])
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        grouped_points(limits)
+    fn serves(&self, rows: u64) -> bool {
+        !decodes(rows)
     }
 
     /// One argument set: the rows it reads are the step's own outputs.

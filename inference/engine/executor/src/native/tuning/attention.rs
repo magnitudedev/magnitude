@@ -17,7 +17,7 @@
 use super::cases::{packing_statics, projection_shape, scale_extent, scale_statics};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, across_sequences,
-    history_placement, longest_history, row_points, served_row_points, with_contexts,
+    history_placement, longest_history, served_row_points, with_contexts,
 };
 use crate::operators;
 use crate::operators::attention::graph::{
@@ -421,10 +421,6 @@ impl EntryTuning for AttentionProjectTuning {
         Ok(statics)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
-    }
-
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -584,10 +580,6 @@ impl EntryTuning for IndexerProjectTuning {
         Ok(statics)
     }
 
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
-    }
-
     fn rotation(
         &self,
         inputs: &mut TuningInputs<'_, '_>,
@@ -698,10 +690,6 @@ impl EntryTuning for AttentionOutputTuning {
         let (streams, inject) = inputs.join(&self.scopes)?;
         statics.extend([("SN", streams), ("IN", inject)]);
         Ok(statics)
-    }
-
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
-        row_points(limits)
     }
 
     fn rotation(
@@ -1378,14 +1366,7 @@ macro_rules! mix_entry {
      $(, search_starts $starts:path)?) => {
         impl $tuning {
             fn served(&self, limits: TuningLimits) -> Vec<PointShape> {
-                let rows = served_row_points(limits, |rows| {
-                    ($serves)(rows)
-                        && self
-                            .0
-                            .decode_rows
-                            .as_ref()
-                            .is_none_or(|range| range.contains(&rows))
-                });
+                let rows = served_row_points(limits, |rows| self.serves(rows));
                 // Decode rows are one sequence's (a drafter's verification)
                 // or several sequences' (requests decoding together), each
                 // of which reads a history of its own: a point for every
@@ -1432,12 +1413,18 @@ macro_rules! mix_entry {
                 self.served(limits)
             }
 
+            fn serves(&self, rows: u64) -> bool {
+                ($serves)(rows)
+                    && self
+                        .0
+                        .decode_rows
+                        .as_ref()
+                        .is_none_or(|range| range.contains(&rows))
+            }
+
             fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
                 let rows = launch.rows;
-                if rows == 0 || !($serves)(rows)
-                    || self.0.decode_rows.as_ref().is_some_and(|range| !range.contains(&rows))
-                    || !self.0.listing.serves(launch)
-                {
+                if rows == 0 || !self.serves(rows) || !self.0.listing.serves(launch) {
                     return None;
                 }
                 if rows <= DECODE_ROWS {

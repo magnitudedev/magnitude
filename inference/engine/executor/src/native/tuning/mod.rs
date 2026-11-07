@@ -1058,15 +1058,28 @@ pub(crate) trait EntryTuning: Clone + 'static {
     fn launches(&self) -> usize;
     /// The value of every dimension the model fixes.
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String>;
-    fn points(&self, limits: TuningLimits) -> Vec<PointShape>;
+    /// Whether the graph runs a launch of `rows` rows of the case's layers
+    /// with this entry: the graph's own rule for its row classes, where
+    /// another entry serves the rest of the same layers' launches (a decode
+    /// form beside a grouped one, a step beside a chunked advance). Every
+    /// row count unless the entry shares its layers' launches.
+    fn serves(&self, _rows: u64) -> bool {
+        true
+    }
+    /// The points the entry is timed and checked at: every row class it
+    /// serves ([`Self::serves`]) up to the row bound.
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        served_row_points(limits, |rows| self.serves(rows))
+    }
 
     /// Project a logical graph launch onto this entry's performance
     /// representative: the rows of the point that times it, none where the
     /// unit's kernel does not serve it (another kernel for the same layers
-    /// does). Numerical support remains `points`/served dimensions.
+    /// does, [`Self::serves`]). Numerical support remains `points`/served
+    /// dimensions.
     fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
         let rows = launch.rows;
-        (rows > 0)
+        (rows > 0 && self.serves(rows))
             .then(|| {
                 representatives
                     .iter()
