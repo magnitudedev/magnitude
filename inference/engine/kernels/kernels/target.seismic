@@ -161,8 +161,9 @@ fn stored_rows[M, C, P, W, R, F](slots: &tensor[C, P, W] E, tokens: &tensor[M, 2
 
 # Each native decodes the slots' rows16 rows through the shared decoders.
 # Metal, CUDA and Vulkan: one threadgroup per row and 256 columns, a thread
-# per value. Metal reads a record where its storage holds it (a reserved
-# table's chunks); the others address the slots' contiguous rows.
+# per value. Metal and Vulkan, whose reserved storage is chunked, read a
+# record where its storage holds it (`records (slots)`); CUDA and the CPU
+# reserve one range and address the slots' contiguous rows.
 native stored_rows for metal from "metal/stored_rows.metal":
     static (W)
     records (slots)
@@ -178,6 +179,7 @@ native stored_rows for cuda from "cuda/stored_rows.cu":
 
 native stored_rows for vulkan from "vulkan/stored_rows.comp":
     static (W)
+    records (slots)
     launch stored_rows:
         threadgroups (min(M, 65535), ceil_div(W, 256), 1)
         threads_per_threadgroup (256, 1, 1)
