@@ -559,8 +559,10 @@ fn every_admissible_split_sum_configuration_matches_the_reference() {
         let implementation = split_sum::native_implementation(&device)
             .expect("bundle")
             .expect("split_sum has an implementation on every backend");
+        // The declared domain, with what a CPU device adds of its own (each
+        // launch's participant count and the tier) at its defaults.
         let configurations = implementation
-            .admissible(&statics(n as u64))
+            .admissible(&implementation.implementation().with_owned_defaults(statics(n as u64)))
             .expect("statics");
         // Three part counts by two widths, all admissible at N = 1000.
         assert_eq!(configurations.len(), 6, "{}", device.backend().as_str());
@@ -584,7 +586,9 @@ fn every_admissible_split_sum_configuration_matches_the_reference() {
 fn where_filters_configurations_at_small_static_values() {
     for device in seismic_native_tests::every_device() {
         let implementation = split_sum::native_implementation(&device).unwrap().unwrap();
-        let admissible = implementation.admissible(&statics(2)).unwrap();
+        let admissible = implementation
+            .admissible(&implementation.implementation().with_owned_defaults(statics(2)))
+            .unwrap();
         // PARTS <= N keeps parts 1 and 2 at N = 2.
         assert_eq!(admissible.len(), 4);
         assert!(
@@ -1961,32 +1965,23 @@ fn a_host_read_before_completion_returns_the_final_bytes() {
     }
 }
 
-/// The device storage one standalone call claims while it runs beyond its
-/// results: the least headroom above the device's charge under which it
-/// succeeds (a smaller one refuses its allocation), less its results'
-/// bytes. The call's scratch is its own, so the charge is back where it was
-/// once the call and its results are gone.
+/// The device storage one standalone call charges while it runs beyond its
+/// results: the most the device's charge rises over the call, less its
+/// results' bytes. The call's scratch is its own, so the charge is back
+/// where it was once the call and its results are gone. Read from the
+/// charge, not from the least bound the call runs under: a backend that
+/// carves allocations from blocks it already holds (CUDA) admits a call
+/// inside that slack under any bound, as it takes no device memory more.
 fn standalone_scratch_bytes(
     device: &Device,
     call: impl Fn() -> Result<Tensor, CallError>,
 ) -> u64 {
     let before = device.device_ledger().charged;
+    device.restart_high_water();
     let results = call().unwrap().storage_bytes();
-    assert_eq!(device.device_ledger().charged, before);
-    // `high` admits the call, `low` refuses it.
-    let (mut low, mut high) = (0u64, 1u64 << 20);
-    while low + 1 < high {
-        let headroom = (low + high) / 2;
-        device.bound(seismic::Ledger::Own(device.device_store()), Some(before + headroom)).unwrap();
-        match call() {
-            Ok(_) => high = headroom,
-            Err(CallError::Execution(ExecutionError::AllocationCapacity { .. })) => low = headroom,
-            Err(error) => panic!("{:?}: {error}", device.backend()),
-        }
-    }
-    device.bound(seismic::Ledger::Own(device.device_store()), None).unwrap();
-    assert_eq!(device.device_ledger().charged, before);
-    high - results
+    let charged = device.device_ledger();
+    assert_eq!(charged.charged, before);
+    charged.high_water - before - results
 }
 
 /// S8: a standalone call's scratch is its own, released when the call ends;
