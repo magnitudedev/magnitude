@@ -40,9 +40,9 @@ use crate::slot_directory::SlotDirectory;
 use seismic_io::{Reader, Ended, Range, Want};
 use seismic::cpu::repack::RowConversion;
 use seismic::Element;
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -205,7 +205,6 @@ impl NoticeStep {
 /// A table whose slots the host fills, converting its rows as stored.
 pub struct StoredTable {
     shared: Arc<Shared>,
-    jobs: Mutex<Option<mpsc::Sender<Job>>>,
     filler: Option<JoinHandle<()>>,
     /// The last step queued.
     queued: Mutex<u64>,
@@ -219,6 +218,14 @@ pub struct StoredTable {
 struct Job {
     step: u64,
     rows: StepRows,
+}
+
+/// What the filler is given: steps, taken in queue order.
+#[derive(Default)]
+struct Jobs {
+    steps: VecDeque<Job>,
+    /// The table dropped: the filler takes the steps queued, and stops.
+    closed: bool,
 }
 
 /// Where a stored table's slots lie: `[records, record_rows, width]` rows,
@@ -352,8 +359,14 @@ struct Shared {
     rows: u64,
     gate: seismic::Timeline,
     read: seismic::Timeline,
+    jobs: Mutex<Jobs>,
+    /// Wakes the filler when jobs arrive.
+    arrived: Condvar,
     state: Mutex<State>,
     failures: Mutex<BTreeMap<u64, StepFailure>>,
+    /// The last step the filler took, and the last whose gate it opened.
+    taken: AtomicU64,
+    opened: AtomicU64,
     kept: Option<KeptRows>,
 }
 
@@ -448,6 +461,8 @@ impl StoredTable {
             rows,
             gate: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
             read: seismic::Timeline::new(device).map_err(|error| failed(&error))?,
+            jobs: Mutex::new(Jobs::default()),
+            arrived: Condvar::new(),
             state: Mutex::new(State {
                 records,
                 directory,
@@ -455,6 +470,8 @@ impl StoredTable {
                 served: vec![false; slots as usize],
             }),
             failures: Mutex::new(BTreeMap::new()),
+            taken: AtomicU64::new(0),
+            opened: AtomicU64::new(0),
             kept,
         });
         // The directory starts with every entry empty.
@@ -464,17 +481,23 @@ impl StoredTable {
             // SAFETY: no device work uses the table yet.
             unsafe { shared.directory.write_shared(0, &bytes) }.map_err(|error| failed(&error))?;
         }
-        let (jobs, receiver) = mpsc::channel::<Job>();
         let filler = {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("stored-table-filler".into())
-                .spawn(move || shared.fill_steps(receiver))
+                .spawn(move || {
+                    // A filler that panics fails every step whose gate it
+                    // had not opened and opens them, so none waits on it,
+                    // then ends with the panic (`Drop` joins it).
+                    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shared.fill())) {
+                        shared.died(panic.as_ref());
+                        std::panic::resume_unwind(panic);
+                    }
+                })
                 .map_err(|error| failed(&error))?
         };
         Ok(Self {
             shared,
-            jobs: Mutex::new(Some(jobs)),
             filler: Some(filler),
             queued: Mutex::new(0),
             resizer: Mutex::new(resizer),
@@ -606,13 +629,14 @@ impl StoredTable {
     pub fn queue(&self, rows: StepRows) -> Result<StoredStep, String> {
         let mut queued = self.queued.lock().expect("stored table queue lock");
         let step = *queued + 1;
-        self.jobs
-            .lock()
-            .expect("stored table jobs lock")
-            .as_ref()
-            .ok_or("the stored table's filler has stopped")?
-            .send(Job { step, rows })
-            .map_err(|_| "the stored table's filler has stopped".to_owned())?;
+        {
+            let mut jobs = self.shared.jobs.lock().expect("stored table jobs lock");
+            if jobs.closed {
+                return Err("the stored table's filler has stopped".into());
+            }
+            jobs.steps.push_back(Job { step, rows });
+        }
+        self.shared.arrived.notify_one();
         *queued = step;
         Ok(StoredStep {
             gate: self.shared.gate.clone(),
@@ -667,7 +691,8 @@ impl Drop for StoredTable {
     /// The filler takes every step queued, so every gate a submitted step
     /// waits at opens, and stops.
     fn drop(&mut self) {
-        drop(self.jobs.lock().expect("stored table jobs lock").take());
+        self.shared.jobs.lock().expect("stored table jobs lock").closed = true;
+        self.shared.arrived.notify_one();
         if let Some(filler) = self.filler.take() {
             let _ = filler.join();
         }
@@ -687,42 +712,89 @@ impl crate::settle::Owed for StoredTable {
 }
 
 impl Shared {
-    /// The filler: each step in queue order.
-    fn fill_steps(&self, jobs: mpsc::Receiver<Job>) {
-        for Job { step, rows } in jobs {
-            let selected = matches!(rows, StepRows::Selected(_));
-            let failure = match rows {
-                StepRows::Known(rows) => Ok(rows),
-                StepRows::Selected(rows) => rows(),
-            }
-            .and_then(|rows| {
-                let distinct = rows.iter().flatten().copied().collect::<BTreeSet<_>>();
-                self.stack
-                    .lock()
-                    .expect("stored table stack lock")
-                    .read(&distinct.into_iter().collect::<Vec<_>>(), selected);
-                let mut state = self.state.lock().expect("stored table lock");
-                let failure = self.bring(&mut state, step, &rows, true)?;
-                if step == KEPT_AFTER_STEPS {
-                    self.keep(&state);
+    /// The filler: each step in queue order, until the table drops with
+    /// every step taken.
+    fn fill(&self) {
+        loop {
+            let job = {
+                let mut jobs = self.jobs.lock().expect("stored table jobs lock");
+                loop {
+                    if let Some(job) = jobs.steps.pop_front() {
+                        break job;
+                    }
+                    if jobs.closed {
+                        return;
+                    }
+                    jobs = self.arrived.wait(jobs).expect("stored table jobs lock");
                 }
-                Ok(failure)
-            })
-            .unwrap_or_else(|error| Some(StepFailure::every(error)));
-            if let Some(failure) = failure {
-                self.failures
-                    .lock()
-                    .expect("stored table failures lock")
-                    .insert(step, failure);
-            }
-            // Open the gate whatever happened: the work behind it drains.
-            if let Err(error) = self.gate.signal(step) {
-                self.failures
-                    .lock()
-                    .expect("stored table failures lock")
-                    .insert(step, StepFailure::every(error.to_string()));
-            }
+            };
+            self.fill_step(job);
         }
+    }
+
+    /// Step `step`: hold its rows, then open its gate.
+    fn fill_step(&self, Job { step, rows }: Job) {
+        self.taken.store(step, Ordering::SeqCst);
+        let selected = matches!(rows, StepRows::Selected(_));
+        let failure = match rows {
+            StepRows::Known(rows) => Ok(rows),
+            StepRows::Selected(rows) => rows(),
+        }
+        .and_then(|rows| {
+            let distinct = rows.iter().flatten().copied().collect::<BTreeSet<_>>();
+            self.stack
+                .lock()
+                .expect("stored table stack lock")
+                .read(&distinct.into_iter().collect::<Vec<_>>(), selected);
+            let mut state = self.state.lock().expect("stored table lock");
+            let failure = self.bring(&mut state, step, &rows, true)?;
+            if step == KEPT_AFTER_STEPS {
+                self.keep(&state);
+            }
+            Ok(failure)
+        })
+        .unwrap_or_else(|error| Some(StepFailure::every(error)));
+        if let Some(failure) = failure {
+            self.failures
+                .lock()
+                .expect("stored table failures lock")
+                .insert(step, failure);
+        }
+        // Open the gate whatever happened: the work behind it drains.
+        if let Err(error) = self.gate.signal(step) {
+            self.failures
+                .lock()
+                .expect("stored table failures lock")
+                .insert(step, StepFailure::every(error.to_string()));
+        }
+        self.opened.store(step, Ordering::SeqCst);
+    }
+
+    /// The filler panicked with `panic`: no step is queued from now, and
+    /// every step taken or queued whose gate it had not opened fails every
+    /// slot, its gate opened. Locks the panic poisoned are taken as they are.
+    fn died(&self, panic: &(dyn std::any::Any + Send)) {
+        let reason = panic
+            .downcast_ref::<&str>()
+            .map(|reason| reason.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "a panic".into());
+        let error = format!("the stored table's filler died: {reason}");
+        let queued = {
+            let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
+            jobs.closed = true;
+            jobs.steps.drain(..).map(|job| job.step).max()
+        };
+        let opened = self.opened.load(Ordering::SeqCst);
+        let last = queued.unwrap_or(0).max(self.taken.load(Ordering::SeqCst));
+        let mut failures = self.failures.lock().unwrap_or_else(PoisonError::into_inner);
+        for step in opened + 1..=last {
+            failures.insert(step, StepFailure::every(error.clone()));
+        }
+        drop(failures);
+        // A gate the device cannot be told of fails its steps as above all
+        // the same.
+        let _ = self.gate.signal(last);
     }
 
     /// Hold every row `rows` names per batch slot for step `step` (0 before
@@ -919,6 +991,7 @@ impl Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
     use seismic_io::CachePolicy;
     use seismic::{BackendName, Element};
 
@@ -1199,6 +1272,32 @@ mod tests {
         assert_eq!(table.failure(2), None);
         assert_eq!(table.failure(3), None);
         read_done(&later);
+        drop(table);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A filler that panics fails every step whose gate it had not opened,
+    /// the one it took and the ones queued behind it, and opens their gates:
+    /// no step waits on a dead filler, and none is queued after it.
+    #[test]
+    fn a_filler_that_panics_fails_and_opens_every_gate_behind_it() {
+        let (path, table) = table("panic", 8, DirectoryForm::Dense);
+        let (go, wait) = mpsc::channel::<()>();
+        let first = table
+            .queue(StepRows::Selected(Box::new(move || -> Result<Vec<Vec<u64>>, String> {
+                wait.recv().unwrap();
+                panic!("an injected panic")
+            })))
+            .unwrap();
+        let second = table.queue(StepRows::Known(vec![vec![1]])).unwrap();
+        go.send(()).unwrap();
+        for step in [&first, &second] {
+            assert!(step.gate.wait(step.value, Duration::from_secs(10)).unwrap());
+            let failure = table.failure(step.value).unwrap();
+            assert_eq!(failure.slots, FailedSlots::Every);
+            assert!(failure.error.contains("an injected panic"), "{}", failure.error);
+        }
+        assert!(table.queue(StepRows::Known(vec![vec![2]])).is_err());
         drop(table);
         std::fs::remove_file(path).unwrap();
     }
