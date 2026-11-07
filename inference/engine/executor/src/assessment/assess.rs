@@ -59,13 +59,21 @@ pub enum ExecutionAssessment {
     DoesNotFit(ExecutionShortfall),
 }
 
-/// The standard workload fits every domain the load touches, held as
-/// `residency` says.
+/// The standard workload fits every domain the load touches, the plan's
+/// routed experts held in `bank`, whole or streamed (none for a plan that
+/// banks no experts).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionFit {
     pub fit_context_tokens: u32,
     pub domains: Vec<DomainFit>,
-    pub residency: Residency,
+    pub bank: Option<crate::planning::ExpertBankPlan>,
+}
+
+impl ExecutionFit {
+    /// How the fit holds its routed experts ([`Residency::of_bank`]).
+    pub fn residency(&self) -> Residency {
+        Residency::of_bank(self.bank.as_ref())
+    }
 }
 
 /// How a fitting plan holds its routed experts.
@@ -83,7 +91,13 @@ impl Residency {
     /// How `draft` holds its routed experts: a bank of every expert holds
     /// them as a resident load does.
     pub fn of(draft: &ExecutionPlanDraft) -> Self {
-        match draft.load().expert_bank().filter(|bank| !bank.whole()) {
+        Self::of_bank(draft.load().expert_bank())
+    }
+
+    /// How a plan holding `bank` holds its routed experts: no bank, or one
+    /// of every expert, holds them as a resident load does.
+    pub fn of_bank(bank: Option<&crate::planning::ExpertBankPlan>) -> Self {
+        match bank.filter(|bank| !bank.whole()) {
             None => Self::Resident,
             Some(bank) => Self::Streamed(bank.clone()),
         }
@@ -557,7 +571,7 @@ pub fn assess_execution_fit(
             return Ok(ExecutionAssessment::Fits(ExecutionFit {
                 fit_context_tokens: prepared.fit_context_tokens,
                 domains: fit.domains,
-                residency: Residency::of(draft),
+                bank: draft.load().expert_bank().cloned(),
             }));
         }
         AssessmentFitVerdict::DoesNotFit {
@@ -581,7 +595,7 @@ pub fn assess_execution_fit(
         Ok((held, (fit_context_tokens, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains,
-            residency: Residency::of(held.draft()),
+            bank: held.draft().load().expert_bank().cloned(),
         }),
         Err(_) => ExecutionAssessment::DoesNotFit(ExecutionShortfall {
             fit_context_tokens: prepared.fit_context_tokens,
@@ -737,17 +751,15 @@ pub(crate) mod tests {
     #[test]
     fn fit_depth_is_independent_of_performance_depths() {
         let environment = environment(150_000);
-        let ExecutionAssessment::Fits(ExecutionFit {
-            fit_context_tokens,
-            domains,
-            residency: Residency::Resident,
-        }) = assess(
+        let ExecutionAssessment::Fits(fit) = assess(
             &environment,
             &request(150_000, &[25_000, 50_000, 50_000, 200_000]),
         )
         else {
             panic!("the fixture fits every supported host");
         };
+        assert_eq!(fit.residency(), Residency::Resident);
+        let ExecutionFit { fit_context_tokens, domains, .. } = fit;
         assert_eq!(fit_context_tokens, 100_000);
         assert!(domains
             .iter()

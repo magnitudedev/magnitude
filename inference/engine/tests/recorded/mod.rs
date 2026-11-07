@@ -88,6 +88,7 @@ fn recorded_setup(
             reserves,
             policy,
             service,
+            served_context: None,
         }),
         measurements: Measurements::Pending,
     }

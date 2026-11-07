@@ -37,7 +37,7 @@ use magnitude_executor::{
         assess_execution_fit, decode_pricing, decode_step, estimate_execution, performance_depths,
         prepare_execution_assessment, undrafted_memory_charge, AssessmentError,
         AssessmentRequest,
-        DomainFit, ExecutionAssessment, ExecutionFit, ExecutionShortfall,
+        DomainFit, ExecutionAssessment, ExecutionShortfall,
         ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
         PointRequests, Priced, Residency as FitResidency, StoredCosts, StreamedFigures, StreamedLayers,
     },
@@ -81,6 +81,10 @@ pub struct AssessmentStructure {
     pub reserves: MemoryReserves,
     pub policy: ModelPolicy,
     pub service: ServiceLimits,
+    /// The context every model is planned at, as a load serving it at that
+    /// context holds it (`host::resolve_served_context`): its declared
+    /// limit when none.
+    pub served_context: Option<usize>,
 }
 
 impl AssessmentStructure {
@@ -107,6 +111,7 @@ impl AssessmentStructure {
             reserves,
             policy,
             service,
+            served_context: None,
         })
     }
 
@@ -130,6 +135,7 @@ impl AssessmentStructure {
                 reserves: self.reserves,
                 policy: self.policy.clone(),
                 service: self.service.clone(),
+                served_context: self.served_context,
             }),
             Err(error) => {
                 return AssessmentSetup {
@@ -358,13 +364,17 @@ pub enum ModelAssessment {
 }
 
 /// How a package executes on the setup's selected device: a fitting one
-/// with how it holds its weights and its decode speed held so, or why it
-/// does not fit.
+/// with how it holds its weights and its decode speed held so, its plan's
+/// expert bank among them, or why it does not fit.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelExecution {
     Fits {
         domains: Vec<DomainFit>,
         residency: ModelResidency,
+        /// The plan's expert bank, whole or streamed: its slots, ceiling,
+        /// host slots, prompt places and pass. None for a plan that banks
+        /// no experts.
+        bank: Option<magnitude_executor::ExpertBankPlan>,
     },
     DoesNotFit(ExecutionShortfall),
 }
@@ -491,10 +501,8 @@ pub fn finish_model_assessment(
     .map_err(ModelAssessmentError::Assessment)?;
     let execution = match fit {
         ExecutionAssessment::DoesNotFit(shortfall) => ModelExecution::DoesNotFit(shortfall),
-        ExecutionAssessment::Fits(ExecutionFit {
-            domains, residency, ..
-        }) => ModelExecution::Fits {
-            residency: match residency {
+        ExecutionAssessment::Fits(fit) => ModelExecution::Fits {
+            residency: match fit.residency() {
                 FitResidency::Streamed(bank) => {
                     let shares = ExpertShares::of(&bank);
                     let at = |held| streamed_performance(&setup.measurements, preparation, draft, &bank, &request, held);
@@ -513,7 +521,8 @@ pub fn finish_model_assessment(
                     )?,
                 },
             },
-            domains,
+            domains: fit.domains,
+            bank: fit.bank,
         },
     };
     Ok(ModelAssessment::Assessed {
@@ -660,7 +669,7 @@ pub fn prepare_model_assessment_from(
                 fingerprint,
             });
         }
-        Admission::Admitted(admitted) => *admitted,
+        Admission::Admitted(admitted) => admitted.served_at(structure.served_context)?,
     };
     let environment = Environment {
         policy: &structure.policy,
@@ -1002,6 +1011,21 @@ struct AdmittedPackage {
 }
 
 impl AdmittedPackage {
+    /// The package planned at `served` tokens of context, as a load serving
+    /// it at that context holds it; at its declared limit when none.
+    fn served_at(mut self: Box<Self>, served: Option<usize>) -> Result<Self, ModelAssessmentError> {
+        let limit = crate::host::resolve_served_context(served, self.definition.decoder.context_limit)
+            .map_err(|error| ModelAssessmentError::Configuration(error.to_string()))?;
+        self.definition.decoder.context_limit = limit;
+        // A drafter candidate drafts for the target's own definition, so it
+        // serves the same context.
+        if let DrafterAdmission::Candidate { definition, .. } = &mut self.drafter {
+            definition.decoder.context_limit = limit;
+        }
+        self.context_limit = u32::try_from(limit).map_err(|_| ModelAssessmentError::ContextLimit(limit))?;
+        Ok(*self)
+    }
+
     fn facts(self, drafter: DrafterVerdict) -> ModelFacts {
         ModelFacts {
             capabilities: ModelCapabilities {

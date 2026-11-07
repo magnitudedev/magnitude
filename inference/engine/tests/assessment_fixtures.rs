@@ -991,7 +991,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     // holdings the fit's settle grants on the machine's prices.
     let reserves = host_room(capacity, resident_bytes - 4_000_000_000);
     let (setup, prepared, streamed) = assess_qwen36_35b(&package, reserves);
-    let ModelExecution::Fits { domains, residency: ModelResidency::Streamed { shares, .. } } = streamed else {
+    let ModelExecution::Fits { domains, residency: ModelResidency::Streamed { shares, .. }, .. } = streamed else {
         panic!("Qwen3.6 35B fits streamed: {streamed:?}");
     };
     assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));

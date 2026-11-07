@@ -511,7 +511,7 @@ pub(crate) fn tokenizer_refusal(
     )
 }
 
-fn resolve_served_context(
+pub(crate) fn resolve_served_context(
     requested: Option<usize>,
     artifact_limit: u64,
 ) -> Result<u64, ResolveError> {

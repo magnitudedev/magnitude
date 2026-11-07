@@ -478,7 +478,7 @@ pub(crate) fn model_assessment(
         performance_context_tokens,
     } = requested;
     let assessment = match execution {
-        ModelExecution::Fits { domains, residency } => ModelAssessment::Fits {
+        ModelExecution::Fits { domains, residency, .. } => ModelAssessment::Fits {
             profile,
             assessment_id,
             memory: memory_assessments(&domains, environment),

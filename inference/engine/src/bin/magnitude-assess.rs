@@ -60,6 +60,11 @@ struct Options {
     /// Print the topology, its discovery diagnostics, its measurements and
     /// the executor costs rather than assess models.
     topology: bool,
+    /// The ceiling on every weight byte a load holds (`ModelPolicy::weight_cap`).
+    weight_cap: Option<u64>,
+    /// The context each model is planned at, as a load serving it there
+    /// (`AssessmentStructure::served_context`): its declared limit when none.
+    context: Option<usize>,
     models: Vec<ModelPackagePaths>,
 }
 
@@ -70,7 +75,7 @@ const JOB_ONLY: &str = "--measurement-job-only";
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --kernels DIR \
      [--storage DIR] [--seconds 10] [--depths 25000,50000,75000] [--sequences 1] [--breakdown] \
-     [--method auto|plain] \
+     [--method auto|plain] [--weight-cap BYTES] [--context TOKENS] \
      (--topology | TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...)";
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
@@ -89,6 +94,8 @@ fn parse() -> Result<Options, String> {
     let mut seconds = MEASUREMENT_SECONDS;
     let mut method = ModelMethod::Auto;
     let mut topology = false;
+    let mut weight_cap = None;
+    let mut context = None;
     let mut job = None;
     let mut models = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -132,6 +139,20 @@ fn parse() -> Result<Options, String> {
                 }
             }
             "--topology" => topology = true,
+            "--weight-cap" => {
+                weight_cap = Some(
+                    value(&argument, &mut args)?
+                        .parse()
+                        .map_err(|error| format!("--weight-cap: {error}"))?,
+                )
+            }
+            "--context" => {
+                context = Some(
+                    value(&argument, &mut args)?
+                        .parse()
+                        .map_err(|error| format!("--context: {error}"))?,
+                )
+            }
             JOB_ONLY => {
                 job = Some(
                     value(&argument, &mut args)?
@@ -181,6 +202,8 @@ fn parse() -> Result<Options, String> {
             .map_err(|error| format!("--seconds: {error}"))?,
         job,
         topology,
+        weight_cap,
+        context,
         models,
     })
 }
@@ -304,15 +327,16 @@ fn run() -> Result<bool, String> {
         end_measured(held, if failures.is_empty() { 0 } else { 1 });
     }
     let catalog = Devices::discover(&served).map_err(|error| error.to_string())?;
-    let structure = AssessmentStructure::discover(
+    let mut structure = AssessmentStructure::discover(
         &catalog,
         options.device,
         Some(options.kernels.as_path()),
         MemoryReserves::of_machine(Some((options.kernels.as_path(), &*catalog.topology()))),
-        ModelPolicy::default(),
+        ModelPolicy { weight_cap: options.weight_cap, ..ModelPolicy::default() },
         standard_service_limits(),
     )
     .map_err(|error| error.to_string())?;
+    structure.served_context = options.context;
     let executor = &structure.selected.info;
     eprintln!(
         "magnitude-assess: {} ({})",
@@ -654,10 +678,23 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
             ColdSource::File(FileOnly::NoHostRoom) => json!({ "file": "host memory admits no tier slot" }),
         }
     };
+    // The plan's expert bank, whole or streamed: what the planner decided
+    // beside the fit.
+    let bank = |bank: &magnitude_executor::ExpertBankPlan| {
+        json!({
+            "slots": bank.slots,
+            "ceiling": bank.ceiling,
+            "whole": bank.whole(),
+            "hostSlots": bank.host_slots,
+            "places": bank.places,
+            "passLaunches": bank.pass.get(),
+        })
+    };
     let mut object = match execution {
-        ModelExecution::Fits { domains, residency } => json!({
+        ModelExecution::Fits { domains, residency, bank: planned } => json!({
             "_tag": "Fits",
             "memory": memory(domains),
+            "expertBank": planned.as_ref().map(bank),
             "residency": match residency {
                 ModelResidency::Resident { performance: resident } => json!({
                     "_tag": "Resident",
