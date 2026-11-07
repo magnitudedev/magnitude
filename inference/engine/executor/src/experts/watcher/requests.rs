@@ -34,25 +34,8 @@ use std::time::{Duration, Instant};
 /// noticed. Measured (an M4 Pro, 64k, 2026-10-25): this rest sleeps
 /// 33.6 µs and a miss's notice averages ~18 µs, ~1.6% of a ~1.1 ms miss,
 /// while the service spins on no memory the device uses. Its thread's
-/// rests are precise ([`rest_precisely`]): no timer slack lengthens them.
+/// rests are precise (`seismic_io::waited_on`): no timer slack lengthens them.
 pub(super) const IDLE: Duration = Duration::from_micros(20);
-
-/// Make the calling thread's timed waits last what they ask. On Linux a
-/// wait ends late by the thread's timer slack, 50 µs by default, which
-/// would stretch the 20 µs [`IDLE`] rest, and every request's notice with
-/// it, several times over; the slack is set to its least, 1 ns. Elsewhere
-/// there is no slack to set (macOS: the rest measured 33.6 µs).
-pub(super) fn rest_precisely() -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: PR_SET_TIMERSLACK takes the slack in nanoseconds and
-        // changes only the calling thread's.
-        if unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) } != 0 {
-            return Err(format!("the request service's timer slack: {}", std::io::Error::last_os_error()));
-        }
-    }
-    Ok(())
-}
 
 /// The request service: what it serves through, and its own state.
 pub(super) struct Requests {
@@ -205,6 +188,7 @@ impl Requests {
                     }
                     let at = self.shared.steps.at(sequence, layer, layers);
                     residency.advance(at.point);
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("advanced"), sequence, (layer as i64, 0, 0));
                     service.decode.serve(at, started, residency.serving());
                     progressed = true;
                 }

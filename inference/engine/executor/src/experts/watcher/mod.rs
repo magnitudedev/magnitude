@@ -718,9 +718,6 @@ impl Watcher {
             #[cfg(test)]
             state: residency.clone(),
         };
-        // The request service rests precisely before it serves anything; a
-        // thread that cannot ends at once, and the load fails with why.
-        let (ready, rested) = std::sync::mpsc::sync_channel(1);
         let requests = Requests::new(residency.clone(), shared.clone(), count);
         watcher.watchdog = Some({
             let held = residency::lock(&residency);
@@ -730,16 +727,11 @@ impl Watcher {
             std::thread::Builder::new()
                 .name("expert-requests".into())
                 .spawn(move || {
-                    let precise = requests::rest_precisely();
-                    let serves = precise.is_ok();
-                    ready.send(precise).expect("the watcher's start waits for its rests");
-                    if serves {
-                        requests.serve();
-                    }
+                    seismic_io::waited_on();
+                    requests.serve();
                 })
                 .map_err(|error| format!("expert request service: {error}"))?,
         );
-        rested.recv().map_err(|error| format!("expert request service: {error}"))??;
         let kept = shared.clone();
         watcher.residency = Some(
             std::thread::Builder::new()

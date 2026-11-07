@@ -395,9 +395,6 @@ impl Decode {
             }
             plans.push(plan);
         }
-        // Its own hints hastened, the device is at this layer: the hints of
-        // layers it has begun or passed read nothing more.
-        prefetch.withdraw_passed(core, &shared.steps, Some((sequence, layer)));
         // Those read now, each into a free staging record: an earlier
         // request's are free once its landings end,
         // which the device past its answers proves (`Residency::advance`
@@ -451,12 +448,18 @@ impl Decode {
                 Plan::Unread(unread) => others.push((expert, unread)),
             }
         }
+        seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("decided"), sequence as u64, (layer as i64, reading as i64, 0));
         let submitted = (!reads.is_empty()).then(|| (Instant::now(), core.source.submit(reads, Priority::Demand)));
         if let Some((_, Ok(ticket))) = &submitted {
             for job in ticket.jobs() {
                 seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("demand"), job, (layer as i64, sequence as i64, reading as i64));
             }
         }
+        // Its own hints hastened, the device is at this layer: the hints of
+        // layers it has begun or passed read nothing more. Withdrawing them
+        // frees no record now (a withdrawn read frees its own as it ends),
+        // so it follows the reads.
+        prefetch.withdraw_passed(core, &shared.steps, Some((sequence, layer)));
         if fresh > 0 {
             lead = Some(0);
         }

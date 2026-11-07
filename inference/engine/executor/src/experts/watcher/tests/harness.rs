@@ -671,16 +671,31 @@ impl AheadLine {
     }
 
     /// Read the file, and again as that read ends, until the line is done
-    /// with.
+    /// with. A read that ended before its hook was registered runs the hook
+    /// at once, on this thread: the next read is then submitted by this
+    /// loop, not from inside the hook, so no line of reads ending as fast as
+    /// they are submitted grows the stack.
     fn stand(self: &Arc<Self>) {
-        if self.done.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+        use std::sync::atomic::{AtomicU8, Ordering};
+        const REGISTERING: u8 = 0;
+        const REGISTERED: u8 = 1;
+        const ENDED: u8 = 2;
+        while !self.done.load(Ordering::Acquire) {
+            let read = Read::new(0, 0, Ahead::FILE, &self.records.lock().unwrap(), 0);
+            let ticket = self.source.submit(vec![read], Priority::Demand).unwrap();
+            let (line, state) = (self.clone(), Arc::new(AtomicU8::new(REGISTERING)));
+            let ending = state.clone();
+            ticket.on_end(move |_, _| {
+                // Ended while its hook was registered: the loop reads again.
+                if ending.compare_exchange(REGISTERING, ENDED, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    line.stand();
+                }
+            });
+            self.tickets().push(ticket);
+            if state.compare_exchange(REGISTERING, REGISTERED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return;
+            }
         }
-        let read = Read::new(0, 0, Ahead::FILE, &self.records.lock().unwrap(), 0);
-        let ticket = self.source.submit(vec![read], Priority::Demand).unwrap();
-        let line = self.clone();
-        ticket.on_end(move |_, _| line.stand());
-        self.tickets().push(ticket);
     }
 }
 

@@ -122,7 +122,7 @@ fn a_burst_of_file_misses_across_one_steps_layers_lands_every_one() {
 
 /// The request service's rest as its thread waits it, a wait on the load's
 /// events no event ends, at the thread's default timer slack and once its
-/// rests are precise (`rest_precisely`): the median of 2,000 rests of
+/// rests are precise (`seismic_io::waited_on`): the median of 2,000 rests of
 /// `IDLE` each, on the host's clock. The default slack (50 µs) lengthens a
 /// rest beyond it and the precise rest is shorter.
 #[cfg(target_os = "linux")]
@@ -142,7 +142,7 @@ fn the_request_services_rests_last_what_they_ask() {
     };
     let (default, precise) = std::thread::spawn(move || {
         let default = rests();
-        super::requests::rest_precisely().unwrap();
+        seismic_io::waited_on();
         (default, rests())
     })
     .join()

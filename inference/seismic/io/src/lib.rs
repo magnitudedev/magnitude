@@ -85,12 +85,14 @@ pub mod disk;
 mod error;
 pub mod scheduler;
 pub mod timeline;
+mod waited;
 
 pub use accounting::{Class, Totals, Waits};
 pub use destination::{Buffer, Destination};
 pub use disk::{adopt_volume, cached_pages, probe_volume, read_cores, CachePolicy, OpenError, OpenFile, RangeReader, Reader, Urgent, Volume, VolumeChoice, ALIGNMENT};
 pub use error::Error;
 pub use scheduler::{engine_work, Ended, EngineWork, Flight, Job, Outstanding, Panic, Priority, Range};
+pub use waited::waited_on;
 
 #[cfg(test)]
 mod tests;

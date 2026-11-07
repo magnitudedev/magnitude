@@ -188,13 +188,19 @@ impl Copies {
             let (copies, stopped) = (self.clone(), stopped.clone());
             std::thread::Builder::new()
                 .name("expert-copies-issue".into())
-                .spawn(move || copies.issue(&*stopped))
+                .spawn(move || {
+                    seismic_io::waited_on();
+                    copies.issue(&*stopped)
+                })
                 .map_err(|error| format!("the transfer queue's issuer: {error}"))?
         };
         let copies = self.clone();
         let watch = std::thread::Builder::new()
             .name("expert-copies".into())
-            .spawn(move || copies.watch(&*stopped))
+            .spawn(move || {
+                seismic_io::waited_on();
+                copies.watch(&*stopped)
+            })
             .map_err(|error| format!("the transfer queue's watch: {error}"))?;
         Ok(vec![issuer, watch])
     }

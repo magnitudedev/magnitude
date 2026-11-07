@@ -764,9 +764,7 @@ mod tests {
             let service = {
                 let (events, lock, stop) = (events.clone(), lock.clone(), stop.clone());
                 std::thread::spawn(move || {
-                    #[cfg(target_os = "linux")]
-                    // SAFETY: PR_SET_TIMERSLACK changes only the calling thread's slack.
-                    assert_eq!(unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, 1 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong, 0 as libc::c_ulong) }, 0);
+                    seismic_io::waited_on();
                     let mut settled = 0;
                     while !stop.load(Ordering::Acquire) {
                         let seen = events.seen();

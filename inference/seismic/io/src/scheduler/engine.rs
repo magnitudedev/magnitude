@@ -117,7 +117,10 @@ impl Engine {
             self.flights.lock().expect("read workers' flights").push(flight.clone());
             std::thread::Builder::new()
                 .name(format!("seismic-read-{workers}"))
-                .spawn(move || work(self, &flight))
+                .spawn(move || {
+                    crate::waited_on();
+                    work(self, &flight)
+                })
                 .map_err(Error::ThreadStart)?;
             *workers += 1;
         }

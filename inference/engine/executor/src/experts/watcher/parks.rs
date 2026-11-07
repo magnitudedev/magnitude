@@ -45,8 +45,8 @@
 //! of its own, settles what no answer does (a park whose slot was answered
 //! before the device reached it, or one that waits for nothing). While the
 //! head is unreached it looks again within the request service's rest
-//! (`requests::IDLE`, rested precisely), as the service looks at the
-//! device's words where kernels wait in place: the one poll of serving,
+//! (`requests::IDLE`, rested precisely: `seismic_io::waited_on`), as the
+//! service looks at the device's words where kernels wait in place: the one poll of serving,
 //! which the hardware forces here too. A blocking wait on the timeline
 //! (`vkWaitSemaphores`) returns 25 to 97 µs after the device reached the
 //! value on GB10 (`seismic_vulkan`'s `the_keepers_wait_is_measured`), and a
@@ -540,22 +540,13 @@ impl Parks {
     /// ([`Self::settle_held`]), so a keeper with nothing to act on wakes no
     /// host job.
     pub(super) fn keep(parks: Arc<Self>) -> Result<JoinHandle<()>, String> {
-        // It rests precisely before it looks; a thread that cannot ends at
-        // once, and the load fails with why.
-        let (ready, rested) = std::sync::mpsc::sync_channel(1);
-        let keeper = std::thread::Builder::new()
+        std::thread::Builder::new()
             .name("expert-parks".into())
             .spawn(move || {
-                let precise = super::requests::rest_precisely();
-                let keeps = precise.is_ok();
-                ready.send(precise).expect("the keeper's start waits for its rests");
-                if keeps {
-                    while parks.look() {}
-                }
+                seismic_io::waited_on();
+                while parks.look() {}
             })
-            .map_err(|error| format!("expert parks' keeper: {error}"))?;
-        rested.recv().map_err(|error| format!("expert parks' keeper: {error}"))??;
-        Ok(keeper)
+            .map_err(|error| format!("expert parks' keeper: {error}"))
     }
 }
 
