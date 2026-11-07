@@ -21,6 +21,7 @@ kernel void readout_refine_rows_gather(
     device float *threshold [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     device atomic_uint *bounds [[buffer(SEISMIC_BUFFER_SCRATCH_BOUNDS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
     uint tiles [[threadgroups_per_grid]],
     uint tid [[thread_index_in_threadgroup]],
@@ -30,7 +31,7 @@ kernel void readout_refine_rows_gather(
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup atomic_uint lowest[PROGRESSIVE_ROWS];
     threadgroup uint last;
-    threadgroup uint4 stage[PROGRESSIVE_STAGE_WORDS];
+    threadgroup uint4 *stage = reinterpret_cast<threadgroup uint4 *>(shared);
     const progressive::Planes planes{nullptr, 0, bit3, SEISMIC_BIT3_STRIDE_0, nullptr, 0, 0, 0, scales,
         SEISMIC_SCALES_STRIDE_0};
     const progressive::Selection selection{draws, SEISMIC_DRAWS_STRIDE_0, SEISMIC_DRAWS_STRIDE_1, temperature,

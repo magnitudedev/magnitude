@@ -594,6 +594,7 @@ native readout_refine_rows for metal from "metal/readout_refine_rows.metal":
         params (SIMDGROUPS in [8, 4, 16] default 8)
         threadgroups (ceil_div(V, SIMDGROUPS * 32), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(O * D * 2, 16384))
 
 # Metal, O <= 8: as `readout_refine_rows`, over every plane of the survivors.
 native readout_exact_rows for metal from "metal/readout_exact_rows.metal":
@@ -602,6 +603,7 @@ native readout_exact_rows for metal from "metal/readout_exact_rows.metal":
         params (SIMDGROUPS in [8, 4, 16] default 8)
         threadgroups (ceil_div(V, SIMDGROUPS * 32), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(O * D * 2, 16384))
 
 # Metal: `readout_head_rows`' row classes (GEMV, batched GEMV, staged GEMM)
 # over the projection library's packets of the exact view.

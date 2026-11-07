@@ -41,8 +41,10 @@ inline uint4 progressive_high(device const uint *row, uint group) {
 // The largest Gumbel noise the sampler draws: -log(-log u) at the largest
 // uniform u = 1 - 2^-24, about 16.64.
 #define PROGRESSIVE_NOISE 16.65f
-// Threadgroup words (uint4) a later level stages its features in: four rows
-// of 2,048 A values.
+// Threadgroup words (uint4) a later level stages its features in, at most:
+// four rows of 2,048 A values. Its launch declares the rows' own bytes,
+// min(O × D × 2, 16 KiB), so a level of fewer rows keeps more threadgroups
+// resident.
 #define PROGRESSIVE_STAGE_WORDS 1024u
 
 // The two views of a progressive head as projection-library packets, so the
