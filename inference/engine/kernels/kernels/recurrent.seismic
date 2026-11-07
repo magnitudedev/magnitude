@@ -603,14 +603,14 @@ native gated_delta_project_convolved for metal from "metal/gated_delta_project_c
         threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(16640, min((BATCH_SIMDGROUPS * 256 + ceil_div(H, 32) * 32) * ceil_div(M, 8), 28672)))
     launch gated_delta_project_convolved_gemv_rows when M >= 3 and M < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default 2, arithmetic LANES in [8, 16, 32] default 8)
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [8, 16, 32] default 8)
         threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
             + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
     launch gated_delta_project_convolved_gemv_pair when M == 2 and M < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default 2, arithmetic LANES in [8, 16, 32] default 8)
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [8, 16, 32] default 8)
         threadgroups (ceil_div((2 * NK + NV) * W, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(NV * W, SIMDGROUPS * ROWS * 32 / LANES)
             + 2 * ceil_div(NV, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
