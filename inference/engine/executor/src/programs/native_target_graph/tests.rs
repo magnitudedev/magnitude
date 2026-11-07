@@ -159,6 +159,8 @@ mod stateless_tail_tests {
 #[cfg(test)]
 mod shared_graph_tests {
     use super::*;
+    use super::super::bound::block_layer;
+    use magnitude_family_contracts::WeightScope;
 
     /// Streamed layers at different homes of one group share a sealed
     /// graph when their blocks are of one shape, as the attention blocks of
@@ -168,11 +170,7 @@ mod shared_graph_tests {
     /// runs on the device.
     #[test]
     fn streamed_layers_at_different_homes_share_a_graph() {
-        use crate::planning::fixtures::{qwen4exp_fixture_definition_of, streamed_experts_manifest};
-        let backend = BackendName::Metal;
-        let definition = qwen4exp_fixture_definition_of(4, 32);
-        let manifest = streamed_experts_manifest(&definition);
-        let selection = crate::ComponentSelection { head: false, vision: false };
+        let (definition, load) = streamed_fixture_load();
         let limits = ResourceLimits {
             max_launch_rows: 64,
             max_launch_slots: 64,
@@ -185,10 +183,6 @@ mod shared_graph_tests {
             chain_capacity: std::num::NonZeroUsize::MIN,
             conversations: std::num::NonZeroUsize::MIN,
         };
-        let load = ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
-            .unwrap()
-            .with_expert_bank_at_floor(&definition, seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None }, crate::planning::HostTier::Unified)
-            .unwrap();
         let codec = magnitude_state::KvCodec::Dense;
         let state = crate::ResourcePlanner::state_plan(
             &definition,
@@ -203,10 +197,64 @@ mod shared_graph_tests {
         let (_, tapped) = block_taps(plan.target(), &definition.decoder).unwrap();
         let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped).unwrap();
         let bank = load.expert_bank().unwrap();
-        let home = |index: usize| bank.feed_forward(block_scopes(index).unwrap()[1]).map(|(layer, _)| bank.home(layer));
+        let home = |index: usize| block_layer(bank, index).ok().map(|layer| bank.home(layer));
         assert_eq!(shapes[1], shapes[2], "the first two attention blocks share a graph");
         assert_ne!(home(1), home(2), "at different homes of one group");
         assert!(home(1).is_some());
+    }
+
+    /// The Qwen4Exp fixture with four attention blocks of 32 experts, its
+    /// experts streamed at the bank's floor on Metal.
+    fn streamed_fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {
+        use crate::planning::fixtures::{qwen4exp_fixture_definition_of, streamed_experts_manifest};
+        let backend = BackendName::Metal;
+        let definition = qwen4exp_fixture_definition_of(4, 32);
+        let manifest = streamed_experts_manifest(&definition);
+        let selection = crate::ComponentSelection { head: false, vision: false };
+        let load = ModelLoadPlan::derive(&manifest, &definition, selection, crate::resident_layout(crate::ExecutionPath::Native, backend), crate::PlannedMethod::Plain, crate::planning::fixtures::LIMITS)
+            .unwrap()
+            .with_expert_bank_at_floor(&definition, seismic::Reservation { granule: 2 << 20, host_addressed: true, chunks: None }, crate::planning::HostTier::Unified)
+            .unwrap();
+        (definition, load)
+    }
+
+    /// A block's streamed layer is its feed-forward's, the sublayer's own or
+    /// a parallel sublayer's routed branch (Gemma 4's experts): each block's
+    /// bank calls (`BankRun::fill_followed`, `BankRun::block_sampled`) find
+    /// it where the bank holds the branch, which the sublayer's own scope
+    /// names no layer of.
+    #[test]
+    fn a_blocks_streamed_layer_is_its_feed_forwards_own_or_branch() {
+        let (_, load) = streamed_fixture_load();
+        let bank = load.expert_bank().unwrap();
+        let own = (0..bank.layers.len()).map(|layer| (block_layer(bank, layer_block(bank, layer)).unwrap(), layer)).collect::<Vec<_>>();
+        let mut branched = bank.clone();
+        let layers = bank
+            .layers
+            .iter()
+            .cloned()
+            .map(|mut layer| {
+                let WeightScope::TargetSublayer(sublayer) = layer.scope else {
+                    panic!("the fixture's streamed layers are sublayers")
+                };
+                layer.scope = WeightScope::TargetBranch { sublayer, branch: 1 };
+                layer
+            })
+            .collect();
+        branched.layers = crate::planning::BankLayers::new(layers).unwrap();
+        for (found, layer) in own {
+            assert_eq!(found, layer);
+            let block = layer_block(&branched, layer);
+            assert!(branched.layer(block_scopes(block).unwrap()[1]).is_none(), "the sublayer names no branch layer");
+            assert_eq!(block_layer(&branched, block), Ok(layer), "block {block}");
+        }
+    }
+
+    fn layer_block(bank: &crate::ExpertBankPlan, layer: usize) -> usize {
+        match bank.layers[layer].scope {
+            WeightScope::TargetSublayer(sublayer) | WeightScope::TargetBranch { sublayer, .. } => sublayer.block as usize,
+            scope => panic!("{scope:?} is no block's"),
+        }
     }
 }
 
