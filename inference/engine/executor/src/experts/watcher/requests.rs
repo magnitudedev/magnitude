@@ -113,6 +113,11 @@ impl Requests {
             let mut posted = Vec::new();
             let (progressed, polls) = {
                 let mut held = lock_counted(&residency, || posted = self.look(began));
+                // When the pass holds residency, for the read timeline: the
+                // look's requests wait for it, their reads already running.
+                for request in &posted {
+                    seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("held"), request.sequence, (request.layer as i64, 0, 0));
+                }
                 let mut service = self.service.lock().expect("the request service is never left by a panic");
                 let progressed = match self.shared.life.ended() {
                     Some(_) => liveness::refuse(&held.core, &self.shared),
