@@ -1,5 +1,7 @@
 use magnitude_kernels::{constants, import_dense, list_extent, repack_weight, routed_convert, routed_step};
 
+mod e4m3;
+
 fn dense_bytes(name: &str, values: &[f32]) -> Vec<u8> {
     match name {
         "f32" => values
@@ -54,18 +56,8 @@ fn reference_vectors(encoding: magnitude_ggml::Encoding) -> (Vec<u8>, Vec<f32>) 
 /// Assembled blocks of every E4M3 code under E8M0 scales across their range
 /// (0, the F32 subnormal 2^-127; 254, where the largest codes overflow; 255,
 /// NaN), and each value as OCP MX defines it: the code's value
-/// (`S.EEEE.MMM`: (1 + M/8) 2^(E - 7), or M 2^-9 where E is 0, S.1111.111
-/// NaN) times 2^(scale - 127), one F32 product.
+/// (`e4m3::value`) times 2^(scale - 127), one F32 product.
 fn e8m0_grid_vectors() -> (Vec<u8>, Vec<f32>) {
-    let e4m3 = |code: u8| {
-        let (exponent, mantissa) = (i32::from(code >> 3 & 15), f32::from(code & 7));
-        let magnitude = match (exponent, code & 7) {
-            (15, 7) => f32::NAN,
-            (0, _) => mantissa * 2f32.powi(-9),
-            _ => (1.0 + mantissa / 8.0) * 2f32.powi(exponent - 7),
-        };
-        if code & 0x80 != 0 { -magnitude } else { magnitude }
-    };
     let e8m0 = |scale: u8| match scale {
         255 => f32::NAN,
         0 => f32::from_bits(0x0040_0000),
@@ -76,7 +68,7 @@ fn e8m0_grid_vectors() -> (Vec<u8>, Vec<f32>) {
         for codes in (0..=u8::MAX).collect::<Vec<_>>().chunks_exact(32) {
             bytes.push(scale);
             bytes.extend_from_slice(codes);
-            values.extend(codes.iter().map(|code| e4m3(*code) * e8m0(scale)));
+            values.extend(codes.iter().map(|code| e4m3::value(*code) * e8m0(scale)));
         }
     }
     (bytes, values)
