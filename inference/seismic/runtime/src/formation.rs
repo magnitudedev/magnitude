@@ -116,6 +116,44 @@ pub(crate) enum FormationClass {
     Compiled,
 }
 
+/// The stack of each thread a toolchain call runs on. A call hands its
+/// program to the platform's compiler (NVRTC, or a Vulkan or Metal driver's
+/// shader compiler), whose recursion depth follows the program and the
+/// driver, neither of which the caller chose, so no toolchain call runs on
+/// its caller's stack ([`on_compiler_stack`]).
+///
+/// Measured on an RTX 3090, driver 570.211.01, with its pipeline cache off
+/// (2026-11-07): forming `attention_decode_k8v4` (kv 1, g 16, s 512) drove
+/// NVIDIA's SPIR-V compiler (`libnvidia-glvkspirv`) through two functions
+/// recursing in turn, 640 B and about 390 B a frame. On a 2 MiB libtest
+/// thread it overflowed about 4,050 frames in; on a compiler thread it
+/// touched 2,260,992 B of stack at its peak, of which Seismic's frames
+/// above the driver were at most 9,136 B. The stack is 16 MiB: seven
+/// times that peak, so a program several times deeper than the deepest
+/// measured still forms. It is address space reserved for the thread's
+/// life; only the pages a compile touches are committed.
+const COMPILER_STACK_BYTES: usize = 16 << 20;
+
+/// `call` on a thread of the former's, with [`COMPILER_STACK_BYTES`] of
+/// stack, while the caller waits: what a platform compiler needs of its
+/// stack is never what the calling thread happens to have. A thread is
+/// started for each call, which costs microseconds beside a compile or a
+/// platform load, and the callers that wait bound how many run at once.
+fn on_compiler_stack<R: Send>(call: impl FnOnce() -> R + Send) -> R {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(COMPILER_THREAD.into())
+            .stack_size(COMPILER_STACK_BYTES)
+            .spawn_scoped(scope, call)
+            .expect("the host starts a compiler thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// The name of every thread a toolchain call runs on.
+const COMPILER_THREAD: &str = "seismic-compile";
+
 pub(crate) struct ProgramFormer<T: Toolchain> {
     toolchain: T,
     store: Option<Arc<dyn ArtifactStore>>,
@@ -195,7 +233,9 @@ impl<T: Toolchain> ProgramFormer<T> {
 
     /// Lend the former `workers` for what it forms off the calling thread,
     /// or take them back (none). Whoever owns a span of formation owns its
-    /// concurrency: the former starts no thread of its own.
+    /// concurrency: the former starts no thread of its own beyond the one
+    /// each toolchain call runs on while its caller waits
+    /// ([`on_compiler_stack`]).
     pub(crate) fn staff(&self, workers: Option<Arc<Workers>>) {
         *self.workers.lock().expect("worker slot lock is never poisoned") = workers;
     }
@@ -366,7 +406,8 @@ impl<T: Toolchain> ProgramFormer<T> {
     }
 
     /// Form every source, at once on the threads lent to the former
-    /// ([`ProgramFormer::staff`]) and in turn without them. Formed sources
+    /// ([`ProgramFormer::staff`]) and in turn without them, each toolchain
+    /// call on a compiler thread ([`on_compiler_stack`]). Formed sources
     /// are returned in source order.
     pub(crate) fn form(
         &self,
@@ -419,7 +460,8 @@ impl<T: Toolchain> ProgramFormer<T> {
             match self.artifact(&kept) {
                 Some(artifact) => {
                     let loading = std::time::Instant::now();
-                    let program = self.toolchain.load(&artifact, &entries)?;
+                    let program =
+                        on_compiler_stack(|| self.toolchain.load(&artifact, &entries))?;
                     if T::LOAD == Load::PlatformCached {
                         let took = u64::try_from(loading.elapsed().as_nanos())
                             .expect("a load's nanoseconds fit 64 bits");
@@ -496,7 +538,7 @@ impl<T: Toolchain> ProgramFormer<T> {
             entries: entries.to_vec(),
         };
         let began = std::time::Instant::now();
-        let (artifact, program) = self.toolchain.compile(&compiling)?;
+        let (artifact, program) = on_compiler_stack(|| self.toolchain.compile(&compiling))?;
         let took = began.elapsed();
         self.compiles
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -532,6 +574,27 @@ mod tests {
         identity: seismic_native_target::ToolchainIdentity,
         compiles: AtomicUsize,
         entries: AtomicUsize,
+        /// The thread each compile and load ran on.
+        threads: Mutex<Vec<Option<String>>>,
+    }
+
+    /// Recurse through `frames` frames of 4 KiB each, as a platform
+    /// compiler may: what a caller's stack does not hold.
+    #[inline(never)]
+    fn deep(frames: usize) -> u8 {
+        let pad = std::hint::black_box([frames as u8; 4096]);
+        if frames == 0 {
+            pad[0]
+        } else {
+            deep(frames - 1).wrapping_add(pad[frames % 4096])
+        }
+    }
+
+    impl Echo {
+        fn ran(&self) {
+            let thread = std::thread::current().name().map(str::to_owned);
+            self.threads.lock().unwrap().push(thread);
+        }
     }
 
     /// An artifact of entry names, joined.
@@ -560,6 +623,11 @@ mod tests {
             &self,
             source: &ProgramSource,
         ) -> Result<(Names, Vec<String>), NativeCompilationError> {
+            self.ran();
+            if source.text == "deep" {
+                // 8 MiB of frames: four times a libtest thread's stack.
+                std::hint::black_box(deep(2048));
+            }
             self.compiles.fetch_add(1, Ordering::SeqCst);
             self.entries.fetch_add(source.entries.len(), Ordering::SeqCst);
             let names = source.entries.iter().map(|entry| entry.symbol.clone()).collect::<Vec<_>>();
@@ -570,6 +638,7 @@ mod tests {
             artifact: &Names,
             entries: &[ProgramEntry],
         ) -> Result<Vec<String>, NativeCompilationError> {
+            self.ran();
             entries
                 .iter()
                 .map(|entry| {
@@ -598,6 +667,7 @@ mod tests {
                 },
                 compiles: AtomicUsize::new(0),
                 entries: AtomicUsize::new(0),
+                threads: Mutex::default(),
             },
             store.map(|store| store as Arc<dyn ArtifactStore>),
         )
@@ -627,6 +697,36 @@ mod tests {
 
     fn class(former: &ProgramFormer<Echo>, sources: &[ProgramSource]) -> (FormationClass, usize) {
         former.class(&keyed(former, sources))
+    }
+
+    /// A compile that needs more stack than its caller has is formed: every
+    /// compile and load runs on a compiler thread of the former's, whatever
+    /// thread asks, and whether or not workers were lent.
+    #[test]
+    fn every_toolchain_call_runs_on_a_compiler_thread_whatever_its_caller_holds() {
+        let store = Arc::new(MemoryStore::default());
+        let first = former(Some(store.clone()));
+        // A caller with 1 MiB of stack forms a compile that takes 8.
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                drop(first.form(&[source("deep", &["k"])]).unwrap());
+                first
+            })
+            .unwrap()
+            .join()
+            .map(|first| {
+                assert_eq!(compiles(&first), 1);
+                let threads = first.toolchain().threads.lock().unwrap().clone();
+                assert_eq!(threads, [Some(COMPILER_THREAD.to_owned())]);
+            })
+            .unwrap();
+        // A second former loads the stored artifact.
+        let second = former(Some(store));
+        second.form(&[source("deep", &["k"])]).unwrap();
+        assert_eq!(compiles(&second), 0);
+        let threads = second.toolchain().threads.lock().unwrap().clone();
+        assert_eq!(threads, [Some(COMPILER_THREAD.to_owned())]);
     }
 
     #[test]
