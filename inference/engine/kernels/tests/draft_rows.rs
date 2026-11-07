@@ -5,11 +5,12 @@
 //! the entry's contract. The table takes every form a target embedding table
 //! a draft head reads is stored in (Q8_0, Q4_0, Q4_K, Q6_K, BF16).
 
+mod declared;
 mod random;
 
 use magnitude_kernels::{draft_rows, repack_weight};
 use random::Rng;
-use seismic::{Device, Element, Layout, NativeSpecialization, Tensor};
+use seismic::{Device, Element, Layout, NativeKernel, Tensor};
 
 fn f16_bits(value: f32) -> u16 {
     seismic_lang::registry::f16_bits(value)
@@ -142,19 +143,13 @@ fn table_weight(
         .collect::<Vec<_>>();
     let source =
         Tensor::from_host(device, external, &[1, rows as u64, columns as u64], &bytes).unwrap();
-    let table = repack_weight::native_for_device_with(
+    let table = at_defaults(
         device,
-        repack_weight::Elements {
+        repack_weight::native_entry_with(repack_weight::Elements {
             E: external,
             U: Element::stored(resident, layout).unwrap(),
-        },
-        &repack_weight::native_implementation(device)
-            .unwrap()
-            .expect("repack_weight has a native implementation on every device")
-            .default_specialization(&NativeSpecialization::new())
-            .unwrap(),
+        }),
     )
-    .unwrap()
     .call(repack_weight::Args { source: &source })
     .unwrap()
     .value
@@ -188,27 +183,47 @@ fn q8_weight(
     let external = Element::named("gguf_q8_0").unwrap();
     let source =
         Tensor::from_host(device, external, &[1, rows as u64, columns as u64], &bytes).unwrap();
-    let weight = repack_weight::native_for_device_with(
+    // Declared parameters (the CPU's rows per work item) take their defaults.
+    let weight = at_defaults(
         device,
-        repack_weight::Elements {
+        repack_weight::native_entry_with(repack_weight::Elements {
             E: external,
             U: resident_q8(device),
-        },
-        // Declared parameters (the CPU's rows per work item) take their
-        // first values.
-        &repack_weight::native_implementation(device)
-            .unwrap()
-            .expect("repack_weight has a native implementation on every device")
-            .default_specialization(&NativeSpecialization::new())
-            .unwrap(),
+        }),
     )
-    .unwrap()
     .call(repack_weight::Args { source: &source })
     .unwrap()
     .value
     .reshape(&[rows as u64, columns as u64])
     .unwrap();
     (weight, values)
+}
+
+/// `entry` prepared at its declared default configuration as its bound
+/// elements form it; it has no statics.
+fn at_defaults<E: seismic::Entry>(device: &Device, entry: seismic::BoundEntry<E>) -> NativeKernel<E> {
+    let specialization =
+        declared::declared_default(device, &entry, |name| panic!("unexpected static {name}"));
+    entry.prepare(device, &specialization).unwrap()
+}
+
+/// `draft_rows` at `elements` and width D, at its declared defaults as those
+/// elements form it, the CPU's int8 combine pinned to `int8`.
+fn draft_rows_at(
+    device: &Device,
+    elements: draft_rows::Elements,
+    width: usize,
+    int8: bool,
+) -> NativeKernel<draft_rows::Entry> {
+    let entry = draft_rows::native_entry_with(elements);
+    let mut specialization = declared::declared_default(device, &entry, |name| {
+        assert_eq!(name, "D", "draft_rows may only fix D");
+        width as u64
+    });
+    if device.backend() == seismic::BackendName::Cpu {
+        specialization = specialization.with_param("INT8", u64::from(int8));
+    }
+    entry.prepare(device, &specialization).unwrap()
 }
 
 fn half_to_f32(bits: u16) -> f32 {
@@ -309,24 +324,9 @@ fn draft_rows_match_the_host_model_over_resident_weights() {
 fn draft_rows_match_on(device: &Device) {
     // Vulkan fixes the width D at preparation (it sizes the shared joined
     // row); the other backends declare no statics. Declared parameters (the
-    // CPU's weight rows per work item) take their first values.
-    let implementation = draft_rows::native_implementation(device)
-        .unwrap()
-        .expect("draft_rows has a native implementation on every device");
+    // CPU's weight rows per work item) take their defaults.
     let prepare = |width: usize, int8: bool| {
-        let statics =
-            implementation
-                .statics
-                .iter()
-                .fold(NativeSpecialization::new(), |statics, name| {
-                    assert_eq!(name, "D", "draft_rows may only fix D");
-                    statics.with_static(name.clone(), width as u64)
-                });
-        let mut statics = implementation.default_specialization(&statics).unwrap();
-        if device.backend() == seismic::BackendName::Cpu {
-            statics = statics.with_param("INT8", u64::from(int8));
-        }
-        draft_rows::native_for_device_with(
+        draft_rows_at(
             device,
             draft_rows::Elements {
                 C: Element::bf16(),
@@ -336,9 +336,9 @@ fn draft_rows_match_on(device: &Device) {
                 HN: Element::bf16(),
                 CW: resident_q8(device),
             },
-            &statics,
+            width,
+            int8,
         )
-        .unwrap()
     };
     let epsilon = 1.0e-6;
     // Widths of whole 64-column k-blocks, below and past one block's 32
@@ -559,18 +559,7 @@ fn draft_rows_preserve_distinct_f32_streams() {
             let embedding_norm = bf16_tensor(&device, &[width as u64], &en);
             let hidden_norm = bf16_tensor(&device, &[(streams * width) as u64], &hn);
             let direct = i32_tensor(&device, &[0, 1], &[]);
-            let implementation = draft_rows::native_implementation(&device).unwrap().unwrap();
-            let statics = implementation
-                .statics
-                .iter()
-                .fold(NativeSpecialization::new(), |s, name| {
-                    s.with_static(name.clone(), width as u64)
-                });
-            let mut statics = implementation.default_specialization(&statics).unwrap();
-            if backend == seismic::BackendName::Cpu {
-                statics = statics.with_param("INT8", 0);
-            }
-            let kernel = draft_rows::native_for_device_with(
+            let kernel = draft_rows_at(
                 &device,
                 draft_rows::Elements {
                     C: Element::f32(),
@@ -580,9 +569,9 @@ fn draft_rows_preserve_distinct_f32_streams() {
                     HN: Element::bf16(),
                     CW: resident_q8(&device),
                 },
-                &statics,
-            )
-            .unwrap();
+                width,
+                false,
+            );
             let result = kernel
                 .call(draft_rows::Args {
                     tokens: &tokens,
@@ -669,23 +658,10 @@ fn draft_rows_match_with_table(
     vocabulary: usize,
     rows: usize,
 ) {
-    let implementation = draft_rows::native_implementation(device)
-        .unwrap()
-        .expect("draft_rows has a native implementation on every device");
-    let statics = implementation
-        .statics
-        .iter()
-        .fold(NativeSpecialization::new(), |statics, name| {
-            statics.with_static(name.clone(), width as u64)
-        });
-    let mut statics = implementation.default_specialization(&statics).unwrap();
-    if device.backend() == seismic::BackendName::Cpu {
-        statics = statics.with_param("INT8", 0);
-    }
     let mut random = Rng(width as u64 * 131 + rows as u64 * 7 + form as u64);
     let (table, table_values) =
         table_weight(device, form, layout, vocabulary, width, 1.0, &mut random);
-    let kernel = draft_rows::native_for_device_with(
+    let kernel = draft_rows_at(
         device,
         draft_rows::Elements {
             C: Element::bf16(),
@@ -695,9 +671,9 @@ fn draft_rows_match_with_table(
             HN: Element::bf16(),
             CW: resident_q8(device),
         },
-        &statics,
-    )
-    .unwrap();
+        width,
+        false,
+    );
     let (combine, combine_values) = q8_weight(device, width, 2 * width, 0.0009765625, &mut random);
     let embedding_norm_values = (0..width)
         .map(|_| bf16_round(1.0 + 0.25 * random.thousandths()))

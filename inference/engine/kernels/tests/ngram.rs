@@ -10,10 +10,11 @@
 // version reproduce one run's bits on each backend.
 
 mod common;
+mod declared;
 mod versions_common;
 
 use magnitude_kernels::{ngram_gate, ngram_inject, ngram_rows};
-use seismic::{Device, Element, NativeSpecialization, Tensor};
+use seismic::{Device, Element, Tensor};
 use versions_common::*;
 
 const EPSILON: f32 = 1e-6;
@@ -52,22 +53,21 @@ impl Geometry {
     }
 }
 
-/// The declared defaults of `E` at `statics` (none on the CPU).
-fn defaults<E: seismic::Entry>(device: &Device, statics: &[(&str, u64)]) -> NativeSpecialization {
-    let statics = if is_cpu(device) {
-        NativeSpecialization::new()
-    } else {
+/// `entry` prepared at its declared defaults as its bound elements form it,
+/// each static it declares taken from `statics` (the CPU declares none).
+fn at_defaults<E: seismic::Entry>(
+    device: &Device,
+    entry: seismic::BoundEntry<E>,
+    statics: &[(&str, u64)],
+) -> Result<seismic::NativeKernel<E>, seismic::LoadError> {
+    let specialization = declared::declared_default(device, &entry, |name| {
         statics
             .iter()
-            .fold(NativeSpecialization::new(), |spec, (name, value)| {
-                spec.with_static(*name, *value)
-            })
-    };
-    seismic::generated::native_implementation::<E>(device)
-        .unwrap()
-        .unwrap()
-        .default_specialization(&statics)
-        .unwrap()
+            .find(|(given, _)| *given == name)
+            .unwrap_or_else(|| panic!("static {name} is given"))
+            .1
+    });
+    entry.prepare(device, &specialization)
 }
 
 fn values(random: &mut Random, count: usize, scale: f32) -> Vec<f32> {
@@ -203,10 +203,10 @@ impl GateCase {
 
     fn native(&self, device: &Device) -> Vec<f32> {
         let (m, s, h) = (self.rows as u64, self.streams as u64, self.hidden as u64);
-        let kernel = ngram_gate::native_for_device_with(
+        let kernel = at_defaults(
             device,
-            ngram_gate::Elements { NW: Element::f32() },
-            &defaults::<ngram_gate::Entry>(device, &[("H", h), ("S", s)]),
+            ngram_gate::native_entry_with(ngram_gate::Elements { NW: Element::f32() }),
+            &[("H", h), ("S", s)],
         )
         .unwrap();
         let result = kernel
@@ -361,10 +361,10 @@ impl Case {
 
     fn native(&self, device: &Device, reuse: bool) -> Outcome {
         let mut bound = self.bind(device, reuse);
-        let kernel = ngram_inject::native_for_device_with(
+        let kernel = at_defaults(
             device,
-            ngram_inject::Elements { NW: Element::f32() },
-            &defaults::<ngram_inject::Entry>(device, &self.geometry.statics()),
+            ngram_inject::native_entry_with(ngram_inject::Elements { NW: Element::f32() }),
+            &self.geometry.statics(),
         )
         .unwrap();
         let result = kernel.call(bound.args(self.slab_banks)).unwrap().value;
@@ -875,15 +875,13 @@ impl RowsCase {
         );
         let mut window = arenas.remove(0);
         let slots = SlotTensors::new(device, &self.slots, self.rows());
-        let kernel = ngram_rows::native_for_device(
+        let kernel = at_defaults(
             device,
-            &defaults::<ngram_rows::Entry>(
-                device,
-                &[
-                    ("C", self.rule.context as u64),
-                    ("P", self.rule.per_order as u64),
-                ],
-            ),
+            ngram_rows::native_entry(),
+            &[
+                ("C", self.rule.context as u64),
+                ("P", self.rule.per_order as u64),
+            ],
         )
         .unwrap();
         let result = kernel

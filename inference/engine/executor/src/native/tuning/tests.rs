@@ -848,10 +848,11 @@ struct FakeCase {
 /// `dense_output`'s implementation on `device` over dense BF16 rows: its
 /// CPU `where` reads the weight's form (`form(DW, INT8)`).
 fn dense_output_implementation(device: &seismic::Device) -> seismic::OnDevice {
-    seismic::generated::native_offered::<dense_output::Entry>(
-        device,
-        &[("A", Element::bf16()), ("DW", Element::bf16())],
-    )
+    dense_output::native_entry_with(dense_output::Elements {
+        DW: Element::bf16(),
+        A: Element::bf16(),
+    })
+    .offered(device)
     .unwrap()
     .unwrap()
 }

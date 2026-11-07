@@ -6376,7 +6376,13 @@ fn a_streamed_route_assigns_its_misses_only_once_priced() {
     let (h, e, k) = (64u64, 32u64, 4u64);
     let table = SlotTable::file(FLIGHT, k);
     let statics = [("H", h), ("E", e), ("K", k), ("ES", 0), ("AHEAD", 0), ("EN", e), ("TM", e)];
-    let implementation = routed_select_streamed::native_implementation(&device).unwrap().unwrap();
+    let entry = routed_select_streamed::native_entry_with(routed_select_streamed::Elements {
+        NW: seismic::Element::f32(),
+        RNW: seismic::Element::f32(),
+        RW: seismic::Element::f32(),
+        A: seismic::Element::bf16(),
+    });
+    let implementation = entry.offered(&device).unwrap().unwrap();
     let statics = implementation
         .statics
         .iter()
@@ -6384,18 +6390,7 @@ fn a_streamed_route_assigns_its_misses_only_once_priced() {
             let (_, value) = statics.iter().find(|(candidate, _)| *candidate == name.as_str()).unwrap();
             specialization.with_static(name.clone(), *value)
         });
-    let elements = routed_select_streamed::Elements {
-        NW: seismic::Element::f32(),
-        RNW: seismic::Element::f32(),
-        RW: seismic::Element::f32(),
-        A: seismic::Element::bf16(),
-    };
-    let kernel = routed_select_streamed::native_for_device_with(
-        &device,
-        elements,
-        &implementation.default_specialization(&statics).unwrap(),
-    )
-    .unwrap();
+    let kernel = entry.prepare(&device, &implementation.default_specialization(&statics).unwrap()).unwrap();
     let zeros = |element, shape: &[u64]| seismic::Tensor::zeros(&device, element, shape).unwrap();
     let words = |shape: &[u64]| shared_i32(&device, shape, &vec![0; shape.iter().product::<u64>() as usize]);
     let f32 = seismic::Element::f32();

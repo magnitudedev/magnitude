@@ -23,6 +23,7 @@ use seismic_lang::{
     types::DType,
 };
 
+mod declared;
 mod gguf_formats;
 mod operands;
 
@@ -3430,36 +3431,18 @@ fn dense_up_gguf_formats_match_their_portable_body() {
                 }
             }
             for device in devices() {
-                // The declaration at the weight's binding, whose `where`
-                // reads its forms.
-                let implementation = seismic::generated::native_offered::<dense_up::Entry>(
-                    &device,
-                    &[("NW", Element::bf16()), ("UW", repr.resident(&device)), ("A", act.element())],
-                )
-                .unwrap()
-                .unwrap();
-                let statics = implementation.statics.iter().fold(
-                    NativeSpecialization::new(),
-                    |statics, name| {
-                        let value = match name.as_str() {
-                            "H" => h,
-                            "F" => f,
-                            "US" => 0,
-                            _ => panic!("unexpected static {name}"),
-                        };
-                        statics.with_static(name.clone(), value as u64)
-                    },
-                );
-                let native = dense_up::native_for_device_with(
-                    &device,
-                    dense_up::Elements {
-                        NW: Element::bf16(),
-                        UW: repr.resident(&device),
-                        A: act.element(),
-                    },
-                    &implementation.default_specialization(&statics).unwrap(),
-                )
-                .unwrap()
+                let entry = dense_up::native_entry_with(dense_up::Elements {
+                    NW: Element::bf16(),
+                    UW: repr.resident(&device),
+                    A: act.element(),
+                });
+                let specialization = declared::declared_default(&device, &entry, |name| match name {
+                    "H" => h as u64,
+                    "F" => f as u64,
+                    "US" => 0,
+                    _ => panic!("unexpected static {name}"),
+                });
+                let native = entry.prepare(&device, &specialization).unwrap()
                 .call(dense_up::Args {
                     residual: &f32_tensor(&device, &[rows, h], &residual),
                     norm: &bf16_norm(&device, &norm),
@@ -5031,37 +5014,16 @@ fn head_logits_match_the_host(
             mappings
         };
         for &mapping in mappings {
+            let entry = readout_project_rows::native_entry_with(readout_project_rows::Elements {
+                A: act.element(),
+                OW: repr.resident(device),
+            });
             let specialization = if is_cpu(device) {
-                // The declaration at the weight's binding, whose `where`
-                // reads its forms.
-                let implementation = seismic::generated::native_offered::<readout_project_rows::Entry>(
-                    device,
-                    &[("A", act.element()), ("OW", repr.resident(device))],
-                )
-                .unwrap()
-                .unwrap();
-                let statics = implementation
-                    .statics
-                    .iter()
-                    .fold(NativeSpecialization::new(), |statics, name| {
-                        statics.with_static(name.clone(), 0)
-                    });
-                implementation
-                    .default_specialization(&statics)
-                    .unwrap()
-                    .with_param("INT8", 0)
+                declared::declared_default(device, &entry, |_| 0).with_param("INT8", 0)
             } else {
                 prepared_projection_specialization_on(device, &[("V", v), ("D", d)], mapping)
             };
-            let kernel = readout_project_rows::native_for_device_with(
-                device,
-                readout_project_rows::Elements {
-                    A: act.element(),
-                    OW: repr.resident(&device),
-                },
-                &specialization,
-            )
-            .unwrap();
+            let kernel = entry.prepare(device, &specialization).unwrap();
             let logits = kernel
                 .call(readout_project_rows::Args {
                     features: &act_tensor(device, act, &[rows, d], &features),

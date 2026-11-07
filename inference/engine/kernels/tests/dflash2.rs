@@ -167,19 +167,21 @@ fn convolutions_restart_at_every_block(device: &Device) {
         &f32_bytes(&base_values),
     );
 
-    let implementation = draft_convolve_input::native_implementation(device)
+    let entry = draft_convolve_input::native_entry_with(draft_convolve_input::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("draft_convolve_input has a native implementation on every device");
-    let kernel = draft_convolve_input::native_for_device_with(
-        device,
-        draft_convolve_input::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &extents,
-        ),
-    )
-    .unwrap();
+        .expect("draft_convolve_input has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
     let input = tensor(
         device,
         Element::bf16(),
@@ -275,19 +277,21 @@ fn convolutions_restart_at_every_block(device: &Device) {
 
 fn gated_rows_are_silu_times_up(device: &Device) {
     let (rows, width) = (3usize, 300usize);
-    let implementation = draft_gated_rows::native_implementation(device)
+    let entry = draft_gated_rows::native_entry_with(draft_gated_rows::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("draft_gated_rows has a native implementation on every device");
-    let kernel = draft_gated_rows::native_for_device_with(
-        device,
-        draft_gated_rows::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &[("M", rows as u64), ("F", width as u64)],
-        ),
-    )
-    .unwrap();
+        .expect("draft_gated_rows has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &[("M", rows as u64), ("F", width as u64)],
+            ),
+        )
+        .unwrap();
     let gate_values = values(rows * width, 6)
         .into_iter()
         .map(bf16_round)
@@ -452,19 +456,21 @@ fn path_step_selects_the_best_joint_score(device: &Device) {
         );
         expected.extend([tokens[slot * count + best], 0]);
     }
-    let implementation = draft_path_step::native_implementation(device)
+    let entry = draft_path_step::native_entry_with(draft_path_step::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("draft_path_step has a native implementation on every device");
-    let kernel = draft_path_step::native_for_device_with(
-        device,
-        draft_path_step::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &[("S", slots as u64), ("K", count as u64), ("R", rank as u64)],
-        ),
-    )
-    .unwrap();
+        .expect("draft_path_step has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &[("S", slots as u64), ("K", count as u64), ("R", rank as u64)],
+            ),
+        )
+        .unwrap();
     let mut selection = tensor(
         device,
         Element::i32(),
