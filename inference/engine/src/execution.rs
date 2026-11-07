@@ -1957,12 +1957,14 @@ mod tests {
         let topology = Devices::discover(&[]).unwrap().topology();
         let executor = topology.executors().iter().find(|executor| executor.backend() == BackendName::Cpu).unwrap().clone();
         let identity = topology.executor_identity(executor.id()).unwrap();
-        let requests = [PointRequest::TierCopy, PointRequest::HostMemory { readers: 1 }];
+        let requests = [PointRequest::HostMemory { readers: 2 }, PointRequest::HostMemory { readers: 1 }];
         touch(root.path(), &identity, &requests);
         let records = seismic::measure::HeldStore::default();
         let costs = magnitude_executor::assessment::ExecutorCosts::stored(&topology, &executor, &records).ok().and_then(|walked| walked.outstanding());
         let storage = root.path();
-        let standing = magnitude_executor::assessment::requests::standing(&topology, &executor, storage).unwrap();
+        let mut standing = magnitude_executor::assessment::requests::standing(&topology, &executor, storage).unwrap();
+        // A CPU executor's graphs hold no memory: its graph cost is never outstanding.
+        standing.retain(|request| request.outstanding(&topology, &executor, &records, costs));
         assert_eq!(
             PointRequests::new(root.path()).outstanding(&topology, &executor, storage, &records, costs).unwrap(),
             [standing, requests.to_vec()].concat()
