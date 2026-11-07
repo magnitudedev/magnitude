@@ -483,10 +483,11 @@ fn a_row_that_names_no_table_row_reads_zeros() {
     for device in devices() {
         let embedding = embedding_rows_at(&device, width);
         let table = tensor(&device, Element::bf16(), &[slots as u64, width as u64], &values);
+        // The slots as one record of every slot (`stored_rows`' [C, P, W]).
         let slots_tensor = Tensor::from_host(
             &device,
             resident,
-            &[slots as u64, width as u64],
+            &[1, slots as u64, width as u64],
             &resident_slots,
         )
         .unwrap();
