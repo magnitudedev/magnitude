@@ -451,7 +451,8 @@ impl CheckedModule {
     /// The native implementation of an entry for a backend at element
     /// bindings `bindings`, every element read substituted: formed once per
     /// combination of the values it reads, and shared by every caller
-    /// after.
+    /// after. `None` when the backend has none, or it does not form at
+    /// `bindings` ([`NativeImplementation::at_elements`]).
     pub fn native_implementation_at(
         &self,
         entry: EntryId,
@@ -482,19 +483,21 @@ impl CheckedModule {
         if bound.reads.is_empty() {
             return Some(native);
         }
-        let slot = bound.reads.iter().zip(&bound.values).fold(
-            0usize,
-            |slot, ((element, query), values)| {
-                let representation = bindings
-                    .get(element)
-                    .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
-                let digit = values
-                    .binary_search(&query.of(representation))
-                    .expect("a query's values hold its value at every representation");
-                slot * values.len() + digit
-            },
-        );
-        Some(bound.slots[slot].get_or_init(|| native.at_elements(bindings)))
+        let mut slot = 0usize;
+        for ((element, query), values) in bound.reads.iter().zip(&bound.values) {
+            let representation = bindings
+                .get(element)
+                .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
+            let digit = values
+                .binary_search(&query.of(representation)?)
+                .expect("a query's values hold each value it has");
+            slot = slot * values.len() + digit;
+        }
+        Some(bound.slots[slot].get_or_init(|| {
+            native
+                .at_elements(bindings)
+                .expect("every element read has a value at these bindings")
+        }))
     }
 
     /// Builds the monomorphized semantics of one entry under one set of
@@ -1054,9 +1057,9 @@ impl<I: std::borrow::Borrow<NativeImplementation>> DeviceBound<I> {
 
     /// The bound implementation at `bindings`
     /// ([`NativeImplementation::at_elements`]), still bound: substituting
-    /// element reads reads no device.
-    pub fn at_elements(&self, bindings: &ElementBindings) -> OnDevice {
-        DeviceBound(self.0.borrow().at_elements(bindings))
+    /// element reads reads no device. `None` where it does not form.
+    pub fn at_elements(&self, bindings: &ElementBindings) -> Option<OnDevice> {
+        self.0.borrow().at_elements(bindings).map(DeviceBound)
     }
 
     /// The default configuration at the given static values: every
@@ -1137,13 +1140,24 @@ impl NativeImplementation {
     /// (`operands(W)`, `form(W, NAME)`, `packed(W)`, `unit_columns(W)`) is its value for the representation
     /// `W` is bound to. The checker admits element reads only over the
     /// entry's element parameters, and a formation binds every one of them.
-    pub fn at_elements(&self, bindings: &ElementBindings) -> Self {
-        self.at_codes(&|element: &str, query: ElementQuery| {
+    /// `None` when a read has no value at its binding (`unit_columns(U)`
+    /// with `U` bound to no conversion's packed destination): the
+    /// implementation does not form there.
+    pub fn at_elements(&self, bindings: &ElementBindings) -> Option<Self> {
+        let value = |element: &str, query: ElementQuery| {
             let representation = bindings
                 .get(element)
                 .unwrap_or_else(|| panic!("element parameter `{element}` is bound"));
             query.of(representation)
-        })
+        };
+        let unformed = std::cell::Cell::new(false);
+        let formed = self.at_codes(&|element: &str, query: ElementQuery| {
+            value(element, query).unwrap_or_else(|| {
+                unformed.set(true);
+                0
+            })
+        });
+        (!unformed.get()).then_some(formed)
     }
 
     /// The implementation on a device: every `device.NAME` read is that
@@ -1766,8 +1780,10 @@ pub enum ElementQuery {
     /// `unit_columns(W)`: the columns of a unit of the code planes' words of
     /// a conversion into packed `W`, which a converter places together
     /// ([`crate::repack::conversion_unit_columns`]). The checker admits it
-    /// only over an entry's conversion destination (`repack[U = W]`), which
-    /// its bindings bind to a registered conversion's packed destination.
+    /// only over an entry's conversion destination (`repack[U = W]`). It has
+    /// a value only where `W` is bound to a packed destination: a dense
+    /// destination (the element cast `repack` forms between dense floats)
+    /// has none, and an implementation reading it does not form there.
     UnitColumns,
     /// `packed(W)`: 1 where `W` is a packed representation (a packet or row
     /// layout), else 0 (dense or external).
@@ -1775,21 +1791,19 @@ pub enum ElementQuery {
 }
 
 impl ElementQuery {
-    /// The query's value for `representation`.
-    pub fn of(self, representation: RepresentationId) -> u64 {
+    /// The query's value for `representation`; `unit_columns` has none for
+    /// a representation no conversion packs into.
+    pub fn of(self, representation: RepresentationId) -> Option<u64> {
+        let info = registry::representation_info(representation);
         match self {
-            Self::Operands => registry::representation_info(representation).operands.code(),
-            Self::Form(form) => u64::from(form.of(representation)),
-            Self::UnitColumns => u64::from(crate::repack::conversion_unit_columns(
-                registry::ConversionLayout::of(&registry::representation_info(representation).kind)
-                    .expect(
-                        "`unit_columns` reads a conversion destination, a packed representation",
-                    ),
-            )),
-            Self::Packed => u64::from(matches!(
-                registry::representation_info(representation).kind,
+            Self::Operands => Some(info.operands.code()),
+            Self::Form(form) => Some(u64::from(form.of(representation))),
+            Self::UnitColumns => registry::ConversionLayout::of(&info.kind)
+                .map(|layout| u64::from(crate::repack::conversion_unit_columns(layout))),
+            Self::Packed => Some(u64::from(matches!(
+                info.kind,
                 registry::RepresentationKind::Packed(_) | registry::RepresentationKind::PackedRows(_)
-            )),
+            ))),
         }
     }
 
@@ -4625,6 +4639,37 @@ mod native_tests {
         );
     }
 
+    /// `unit_columns(U)` has a value only where `U` is a conversion's packed
+    /// destination: at a dense destination, the element cast `repack` forms
+    /// between dense floats, an implementation reading it does not form,
+    /// and says so rather than panicking.
+    #[test]
+    fn an_implementation_reading_unit_columns_forms_only_at_packed_destinations() {
+        let mut sources = SourceSet::default();
+        sources.push(SourceFile {
+            path: "convert.seismic".to_owned(),
+            text: "fn convert[N, K](source: &tensor[N, K] E) -> tensor[N, K] U:\n    return repack[U = U](source)\n\nnative convert for cuda from \"convert.cu\":\n    launch convert:\n        threadgroups (ceil_div(K, 256) * (256 / unit_columns(U)), N, 1)\n        threads_per_threadgroup (32, 1, 1)\n".to_owned(),
+        });
+        let module = check_source(sources).expect("`unit_columns` reads a conversion destination");
+        let entry = module.entry_named("convert").unwrap();
+        let native = module.native_implementation(entry, BackendName::Cuda).unwrap();
+        let at = |source: RepresentationId, destination: RepresentationId| {
+            let bindings = ElementBindings::new().bind("E", source).bind("U", destination);
+            (
+                module
+                    .native_implementation_at(entry, BackendName::Cuda, &bindings)
+                    .is_some(),
+                native.at_elements(&bindings).is_some(),
+            )
+        };
+        let packed = registry::storage("q4k", registry::Layout::Mma16).unwrap();
+        assert_eq!(at(registry::representation("gguf_q4_k").unwrap(), packed), (true, true));
+        assert_eq!(
+            at(registry::dense(DType::F16), registry::dense(DType::F32)),
+            (false, false)
+        );
+    }
+
     /// `form(W, NAME)` is the backend's admission of form NAME for the
     /// representation `W` is bound to, and `where` may read it: the
     /// configurations are the implementation's at its bindings, and the
@@ -4667,7 +4712,7 @@ mod native_tests {
             let bound = module
                 .native_implementation_at(entry, BackendName::Cuda, &bindings)
                 .unwrap();
-            assert_eq!(bound, &native.at_elements(&bindings), "{storage}");
+            assert_eq!(Some(bound), native.at_elements(&bindings).as_ref(), "{storage}");
             bound
                 .admissible(&statics)
                 .unwrap()
