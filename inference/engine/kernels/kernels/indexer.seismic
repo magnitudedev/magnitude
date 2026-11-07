@@ -218,8 +218,9 @@ fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
 
 # Metal, CUDA and Vulkan: `append` (a threadgroup per row), `complete` (a
 # simdgroup per row that completes a block), then in a class that scores
-# `score` (a threadgroup per 256 blocks of a row, the row's query heads
-# prepared in threadgroup memory, a simdgroup per 32 blocks) and `select` (a
+# `score` (a threadgroup per 32 blocks of a row, so B of them, the row's
+# query heads prepared in threadgroup memory, a simdgroup per 4 blocks with
+# their key loads in flight together) and `select` (a
 # threadgroup of 256 threads per row). `select` finds the K-th best score by
 # a radix select over the scores' bits (which order as the non-negative
 # scores do): each pass's histogram takes one atomic per distinct digit of a
@@ -244,7 +245,7 @@ native indexer_select for metal from "metal/indexer_select.metal":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (32, 1, 1)
     launch indexer_select_score when B > 0:
-        threadgroups (ceil_div(32 * B, 256), M, 1)
+        threadgroups (B, M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (H * (2 * P + S) * 4)
     launch indexer_select_select when B > 0:
@@ -264,7 +265,7 @@ native indexer_select for cuda from "cuda/indexer_select.cu":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (32, 1, 1)
     launch indexer_select_score when B > 0:
-        threadgroups (ceil_div(32 * B, 256), M, 1)
+        threadgroups (B, M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (H * (2 * P + S) * 4)
     launch indexer_select_select when B > 0:
@@ -284,7 +285,7 @@ native indexer_select for vulkan from "vulkan/indexer_select.comp":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (32, 1, 1)
     launch indexer_select_score when B > 0:
-        threadgroups (ceil_div(32 * B, 256), M, 1)
+        threadgroups (B, M, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (H * (2 * P + S) * 4)
     launch indexer_select_select when B > 0:

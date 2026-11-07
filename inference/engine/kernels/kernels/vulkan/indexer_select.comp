@@ -9,9 +9,10 @@
 //           coordinates stored with the first, stored in the F32 block plane.
 //           The span of the first member is located by a subgroup scan of
 //           the span extents, and a cursor walks on from it.
-// score:    workgroup per (tile of 8 * 32 blocks, row); the query heads
-//           prepared once into group memory, each subgroup scores 32 blocks
-//           from the block span holding its first, located the same way.
+// score:    workgroup per (tile of 8 * INDEXER_BATCH blocks, row); the query
+//           heads prepared into group memory, each subgroup scores
+//           INDEXER_BATCH blocks, their key loads in flight together, from the
+//           block span holding its first, located the same way.
 // select:   workgroup of 256 invocations per row. A radix select over the
 //           scores' bits (4 passes of 8 bits) finds the K-th best score T:
 //           each pass's histogram takes one atomic per distinct digit of a
@@ -213,12 +214,15 @@ void indexer_select_complete() {
 }
 
 // Shared: the prepared query heads [H][W] F32.
+// Blocks a score subgroup takes, their key loads in flight together.
+#define INDEXER_BATCH 4u
+
 void indexer_select_score() {
     const uint64_t row = gl_WorkGroupID.y;
     const uint lane = SEISMIC_LANE;
     const uint simd = SEISMIC_SUBGROUP;
     const uint complete = indexer_complete(row);
-    const uint first = gl_WorkGroupID.x * 256u;
+    const uint first = gl_WorkGroupID.x * (8u * INDEXER_BATCH);
     if (first >= complete)
         return;
     for (uint head = simd; head < INDEXER_H; head += SEISMIC_SUBGROUPS) {
@@ -233,32 +237,35 @@ void indexer_select_score() {
     }
     barrier();
     const float root = sqrt(float(INDEXER_W));
-    const uint begin = first + simd * 32u;
-    const uint last = min(min(first + 256u, complete), begin + 32u);
-    if (begin >= last)
+    const uint begin = first + simd * INDEXER_BATCH;
+    const uint end = min(begin + INDEXER_BATCH, complete);
+    if (begin >= end)
         return;
     // The subgroup's blocks from the block span holding its first.
     const uint64_t spans = indexer_block_spans(row);
     const int own = indexer_own_block(row);
     indexer_cursor cursor = indexer_locate(spans, SEISMIC_DIM_R, begin);
-    for (uint block = begin; block < last; ++block) {
-        const int at = indexer_span_row(spans, SEISMIC_DIM_R, cursor, block, own);
+    float kx[INDEXER_BATCH][INDEXER_E];
+    [[unroll]] for (uint j = 0u; j < INDEXER_BATCH; ++j) {
+        // A block past the row's last repeats the last: its score is not stored.
+        const int at = indexer_span_row(spans, SEISMIC_DIM_R, cursor, min(begin + j, end - 1u), own);
         const uint64_t k = slab_row(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_KEYS), uint(at),
             uint(SEISMIC_PARAM_BLOCK_SLAB_ROWS), INDEXER_KEY_BYTES);
-        float kx[INDEXER_E];
         [[unroll]] for (uint i = 0u; i < INDEXER_E; ++i)
-            kx[i] = element_f32_at(k + uint64_t(lane * INDEXER_E + i) * 4ul);
+            kx[j][i] = element_f32_at(k + uint64_t(lane * INDEXER_E + i) * 4ul);
+    }
+    [[unroll]] for (uint j = 0u; j < INDEXER_BATCH; ++j) {
         float score = 0.0;
         for (uint head = 0u; head < INDEXER_H; ++head) {
             float dot = 0.0;
             [[unroll]] for (uint i = 0u; i < INDEXER_E; ++i)
-                dot = seismic_fma_rn(seismic_shared_f32[head * INDEXER_W + lane * INDEXER_E + i], kx[i], dot);
+                dot = seismic_fma_rn(seismic_shared_f32[head * INDEXER_W + lane * INDEXER_E + i], kx[j][i], dot);
             score = seismic_add_rn(score, max(seismic_subgroup_sum_f32(dot), 0.0));
         }
         const float value = seismic_div_rn(score, root);
         // Scores are >= 0; a zero is stored as +0 so its bits order first.
-        if (lane == 0u)
-            element_u32_put(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SCORES) + (row * INDEXER_BLOCKS + block) * 4ul,
+        if (lane == 0u && begin + j < end)
+            element_u32_put(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SCORES) + (row * INDEXER_BLOCKS + begin + j) * 4ul,
                 value == 0.0 ? 0u : floatBitsToUint(value));
     }
 }

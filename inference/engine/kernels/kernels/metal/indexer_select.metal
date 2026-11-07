@@ -7,9 +7,10 @@
 //           window spans, then its own), RMS-normed with the key norm and
 //           rotated at the coordinates stored with the first, stored in the
 //           F32 block plane.
-// score:    threadgroup per (row, tile of 8 * 32 blocks); the row's query
-//           heads are prepared once into threadgroup memory, then each
-//           simdgroup scores 32 blocks, one block at a time over its lanes.
+// score:    threadgroup per (row, tile of 8 * INDEXER_BATCH blocks); the
+//           row's query heads are prepared into threadgroup memory, then each
+//           simdgroup scores INDEXER_BATCH blocks over its lanes, their keys'
+//           loads issued together.
 // select:   threadgroup of 256 threads per row; a radix select over the
 //           scores' bits (scores are >= 0, so their bits order as the scores
 //           do) finds the K-th best score T: each pass's histogram takes one
@@ -33,6 +34,8 @@
 #define INDEXER_H uint(SEISMIC_DIM_H)
 #define INDEXER_SB uint(SEISMIC_DIM_SB)
 #define INDEXER_UNROLL _Pragma("clang loop unroll(full)")
+// Blocks a score simdgroup takes, their key loads in flight together.
+#define INDEXER_BATCH 4u
 
 static_assert(INDEXER_W % 32 == 0, "indexer head width must be a multiple of 32");
 static_assert(SEISMIC_DIM_P % INDEXER_E == 0, "each rotary half must cover whole lanes");
@@ -243,7 +246,7 @@ kernel void indexer_select_score(
     device const int *row_spans = block_visible + row * spans * 2;
     const int own = block_destinations[row];
     const uint complete = indexer::simd_span_rows(row_spans, spans, lane) + (own >= 0 ? 1u : 0u);
-    const uint first = group.x * 256;
+    const uint first = group.x * (8 * INDEXER_BATCH);
     if (first >= complete)
         return;
     // The row's query heads, prepared in F32.
@@ -268,26 +271,34 @@ kernel void indexer_select_score(
             q[head][i] = prepared[head * INDEXER_W + lane * INDEXER_E + i];
     const ulong slab_rows = ulong(SEISMIC_PARAM_BLOCK_SLAB_ROWS);
     const float root = metal::sqrt(float(INDEXER_W));
-    const uint last = metal::min(first + 256, complete);
+    const uint begin = first + simd * INDEXER_BATCH;
+    const uint end = metal::min(begin + INDEXER_BATCH, complete);
+    if (begin >= end)
+        return;
     indexer::span_cursor cursor;
-    for (uint block = first + simd * 32; block < metal::min(first + simd * 32 + 32, last); ++block) {
-        const int at = cursor.row(row_spans, spans, block, own);
+    float kx[INDEXER_BATCH][INDEXER_E];
+    INDEXER_UNROLL
+    for (uint j = 0; j < INDEXER_BATCH; ++j) {
+        // A block past the row's last repeats the last: its score is not stored.
+        const int at = cursor.row(row_spans, spans, metal::min(begin + j, end - 1), own);
         device const float *k = slab::row<float>(block_keys, ulong(at), slab_rows, INDEXER_W);
-        float kx[INDEXER_E];
         INDEXER_UNROLL
         for (uint i = 0; i < INDEXER_E; ++i)
-            kx[i] = k[lane * INDEXER_E + i];
+            kx[j][i] = k[lane * INDEXER_E + i];
+    }
+    INDEXER_UNROLL
+    for (uint j = 0; j < INDEXER_BATCH; ++j) {
         float score = 0.0f;
         INDEXER_UNROLL
         for (uint head = 0; head < INDEXER_H; ++head) {
             float dot = 0.0f;
             INDEXER_UNROLL
             for (uint i = 0; i < INDEXER_E; ++i)
-                dot = metal::fma(q[head][i], kx[i], dot);
+                dot = metal::fma(q[head][i], kx[j][i], dot);
             score += metal::max(simd_sum(dot), 0.0f);
         }
-        if (lane == 0)
-            scores[row * nb + block] = score / root + 0.0f;
+        if (lane == 0 && begin + j < end)
+            scores[row * nb + begin + j] = score / root + 0.0f;
     }
 }
 

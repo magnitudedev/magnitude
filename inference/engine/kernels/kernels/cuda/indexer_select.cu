@@ -7,9 +7,10 @@
 //           keys (F32, members in order: the last SB - 1 rows of its window
 //           spans, then its own), RMS-normed and rotated at the coordinates
 //           stored with the first, stored in the F32 block plane.
-// score:    block per (tile of 8 * 32 blocks, row); the query heads prepared
-//           once into shared memory, each warp scores 32 blocks, walking the
-//           block spans from its first block's.
+// score:    block per (tile of 8 * kScoreBatch blocks, row); the query heads
+//           prepared into shared memory, each warp scores kScoreBatch blocks,
+//           their key loads in flight together, walking the block spans from
+//           its first block's.
 // select:   block of 256 threads per row; a radix select over the scores'
 //           bits finds the K-th best score T (each pass's histogram takes one
 //           atomic per distinct digit of a warp, the digit is found by a scan
@@ -438,6 +439,8 @@ extern "C" __global__ void indexer_select_complete(SEISMIC_KERNEL_PARAMS) {
 
 extern "C" __global__ void indexer_select_score(SEISMIC_KERNEL_PARAMS) {
     using namespace indexer;
+    // Blocks a warp takes, their key loads in flight together.
+    constexpr u32 kScoreBatch = 4;
     extern __shared__ float prepared[];  // [H][W]
     const u64 row = blockIdx.y;
     const int warp = threadIdx.x / 32;
@@ -447,7 +450,7 @@ extern "C" __global__ void indexer_select_score(SEISMIC_KERNEL_PARAMS) {
     const int own = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_DESTINATIONS))
         [row * SEISMIC_BLOCK_DESTINATIONS_STRIDE_0];
     const u32 complete = blocks.rows(lane) + (own >= 0 ? 1u : 0u);
-    const u32 first = blockIdx.x * 256u;
+    const u32 first = blockIdx.x * (8u * kScoreBatch);
     if (first >= complete) return;
     const Storage *query = reinterpret_cast<const Storage *>(SEISMIC_PTR(SEISMIC_BUFFER_QUERY));
     const int *coordinates = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES));
@@ -475,27 +478,33 @@ extern "C" __global__ void indexer_select_score(SEISMIC_KERNEL_PARAMS) {
     const u32 *block_keys = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_KEYS));
     float *scores = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SCORES));
     const float root = sqrtf(static_cast<float>(W));
-    const u32 begin = first + static_cast<u32>(warp) * 32u;
-    const u32 last = min(min(first + 256u, complete), begin + 32u);
+    const u32 begin = first + static_cast<u32>(warp) * kScoreBatch;
+    const u32 end = min(begin + kScoreBatch, complete);
+    if (begin >= end) return;
     Cursor cursor(blocks, begin, lane);
-    for (u32 block = begin; block < last; ++block) {
-        const int at = cursor.row(block, own);
+    float kx[kScoreBatch][E];
+#pragma unroll
+    for (u32 j = 0; j < kScoreBatch; ++j) {
+        // A block past the row's last repeats the last: its score is not stored.
+        const int at = cursor.row(min(begin + j, end - 1u), own);
         const float *k = reinterpret_cast<const float *>(
             slab::row(block_keys, static_cast<u64>(at), SEISMIC_PARAM_BLOCK_SLAB_ROWS, W * sizeof(float)));
-        float kx[E];
 #pragma unroll
-        for (int i = 0; i < E; ++i) kx[i] = k[lane * E + i];
+        for (int i = 0; i < E; ++i) kx[j][i] = k[lane * E + i];
+    }
+#pragma unroll
+    for (u32 j = 0; j < kScoreBatch; ++j) {
         float score = 0.0f;
 #pragma unroll
         for (int head = 0; head < H; ++head) {
             float dot = 0.0f;
 #pragma unroll
-            for (int i = 0; i < E; ++i) dot = fmaf(q[head][i], kx[i], dot);
+            for (int i = 0; i < E; ++i) dot = fmaf(q[head][i], kx[j][i], dot);
             score += fmaxf(warp_sum(dot), 0.0f);
         }
         // Scores are >= 0; a zero is stored as +0 so its bits order first.
         const float value = score / root;
-        if (lane == 0) scores[row * 32 * SEISMIC_DIM_B + block] = value == 0.0f ? 0.0f : value;
+        if (lane == 0 && begin + j < end) scores[row * 32 * SEISMIC_DIM_B + begin + j] = value == 0.0f ? 0.0f : value;
     }
 }
 
