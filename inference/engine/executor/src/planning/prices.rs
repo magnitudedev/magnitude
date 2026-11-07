@@ -63,7 +63,11 @@ impl PlanPrices {
             compute,
             rates,
             region_rows: prior.region_rows,
-            prompt_rows: prior.prefill_tokens,
+            // A pass is sized for the prompts a load's chain takes, every
+            // chunk of a whole-context one (`ExecutionPlanDraft::prompt_places`):
+            // a pass the prior's half-context prompt fills would split
+            // longer prompts into more passes, each reading its misses again.
+            prompt_rows: definition.decoder.context_limit,
         })
     }
 }
@@ -142,7 +146,7 @@ impl BankPrices {
         self.layers.step_seconds(None, self.read, held, 1.0, self.compute).total_seconds
     }
 
-    /// The prior's prompt's routed seconds in passes of `pass` launches
+    /// A whole-context prompt's routed seconds in passes of `pass` launches
     /// holding `held`: each pass's compute and the reads of its misses
     /// ([`StreamedLayers::pass_reads`]).
     pub(crate) fn prompt_seconds(&self, pass: PassLaunches, held: HeldSlots) -> f64 {
