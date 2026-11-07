@@ -2805,12 +2805,8 @@ export const ModelResidency = S.Union(
   S.extend(
     S.TaggedStruct("Streamed", {
       bank: S.suspend((): S.Schema<StreamedBank, StreamedBankEncoded> => StreamedBank),
-      floorPerformance: S.suspend(
-        (): S.Schema<StreamedModelPerformance, StreamedModelPerformanceEncoded> => StreamedModelPerformance,
-      ),
-      performance: S.suspend(
-        (): S.Schema<StreamedModelPerformance, StreamedModelPerformanceEncoded> => StreamedModelPerformance,
-      ),
+      floorPerformance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
+      performance: S.suspend((): S.Schema<ModelPerformance, ModelPerformanceEncoded> => ModelPerformance),
     }),
     S.Record({ key: S.String, value: JsonValue }),
   ),
@@ -3686,28 +3682,9 @@ export const StreamedBank = S.Struct({
 export type StreamedBank = S.Schema.Type<typeof StreamedBank>
 export type StreamedBankEncoded = S.Schema.Encoded<typeof StreamedBank>
 
-export const StreamedModelPerformance = S.Union(
-  S.extend(S.TaggedStruct("Pending", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(
-    S.TaggedStruct("Unavailable", {
-      failure: S.suspend((): S.Schema<ModelFailure, ModelFailureEncoded> => ModelFailure),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-  S.extend(S.TaggedStruct("Unmeasured", {}), S.Record({ key: S.String, value: JsonValue })),
-  S.extend(
-    S.TaggedStruct("Estimated", {
-      samples: S.Array(S.suspend((): S.Schema<PerformanceEvidence, PerformanceEvidenceEncoded> => PerformanceEvidence)),
-    }),
-    S.Record({ key: S.String, value: JsonValue }),
-  ),
-)
-export type StreamedModelPerformance = S.Schema.Type<typeof StreamedModelPerformance>
-export type StreamedModelPerformanceEncoded = S.Schema.Encoded<typeof StreamedModelPerformance>
-
 export const StreamingHostStatus = S.Struct({
   bytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
-  ceilingSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(1)),
+  ceilingSlots: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   lastResize: S.optionalWith(
     S.suspend((): S.Schema<StreamingResize, StreamingResizeEncoded> => StreamingResize),
     { exact: true, as: "Option" },
@@ -3740,7 +3717,12 @@ export const StreamingResize = S.Union(
 export type StreamingResize = S.Schema.Type<typeof StreamingResize>
 export type StreamingResizeEncoded = S.Schema.Encoded<typeof StreamingResize>
 
-export const StreamingShrinkCause = S.Union(S.Literal("reclaim"), S.Literal("live_claim"), S.Literal("rebalance"), S.Literal("measurement"))
+export const StreamingShrinkCause = S.Union(
+  S.Literal("reclaim"),
+  S.Literal("live_claim"),
+  S.Literal("rebalance"),
+  S.Literal("measurement"),
+)
 export type StreamingShrinkCause = S.Schema.Type<typeof StreamingShrinkCause>
 export type StreamingShrinkCauseEncoded = S.Schema.Encoded<typeof StreamingShrinkCause>
 

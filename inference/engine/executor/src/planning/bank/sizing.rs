@@ -143,10 +143,12 @@ impl ExpertBankPlan {
 
     /// The most host slots a host tier holds: the widest layer's experts, a
     /// host slot a record of each layer of every group, as a bank slot is,
-    /// so the tier's records hold every expert (the bank's among them);
-    /// none without a tier.
-    pub fn host_ceiling(&self) -> Option<NonZeroU64> {
-        self.tier_reservation().map(|_| self.widest())
+    /// so the tier's records hold every expert (the bank's among them), or
+    /// fewer where a weight cap leaves it fewer ([`Self::host_cap`]); none
+    /// without a tier. A tier of no host slots holds its landing reserve
+    /// alone ([`Self::host_records`]).
+    pub fn host_ceiling(&self) -> Option<u64> {
+        self.tier_reservation().map(|_| self.host_cap.unwrap_or(self.widest().get()))
     }
 
     /// Records of group `group`'s host tier tensors (`TR`): every expert of

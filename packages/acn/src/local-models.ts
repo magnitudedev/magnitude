@@ -56,7 +56,6 @@ import type {
   ModelPerformance,
   ModelResidency as NativeModelResidency,
   ReadyModel,
-  StreamedModelPerformance,
   UnsupportedLocalModel as NativeUnsupportedLocalModel,
 } from "@magnitudedev/icn-protocol/schemas"
 import type { CustomModelsConfig } from "@magnitudedev/storage"
@@ -163,7 +162,7 @@ const projectMeasurement = (measurement: MeasurementState): MachineMeasurement =
     : { _tag: measurement._tag }
 
 /** A pending speed carries the machine's measurement progress, which is what it waits on. */
-const projectPerformance = <Performance extends ModelPerformance | StreamedModelPerformance>(
+const projectPerformance = <Performance extends ModelPerformance>(
   performance: Performance,
   measurement: MeasurementState,
 ) =>

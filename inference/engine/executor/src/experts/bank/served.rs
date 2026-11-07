@@ -416,7 +416,7 @@ impl ElasticBank for ServedBank {
         // to its planned slots already on its way.
         if let Some((host, ceiling)) = self.bank.host_tier() {
             let bound = match (price, self.bank.host_backing()) {
-                (Some(_), false) => ceiling.get().max(host),
+                (Some(_), false) => ceiling.max(host),
                 _ => host,
             };
             let tier = move |host: u64| -> Result<_, DomainError> { Ok(crate::assessment::HeldSlots { host: count(host)?, ..held }) };

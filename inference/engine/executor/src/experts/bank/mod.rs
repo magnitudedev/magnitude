@@ -239,7 +239,7 @@ impl ExpertBank {
 
     /// The host slots the bank's host tier commits now, and the most it
     /// holds; none without a tier.
-    pub fn host_tier(&self) -> Option<(u64, std::num::NonZeroU64)> {
+    pub fn host_tier(&self) -> Option<(u64, u64)> {
         self.host.as_ref().map(|host| {
             let tier = host.lock().expect("host tier");
             (tier.slots.load(Ordering::Acquire), tier.ceiling)

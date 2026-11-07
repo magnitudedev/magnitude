@@ -153,6 +153,12 @@ pub struct ExpertBankPlan {
     /// cap bounds of its weights (`ExecutionPlanDraft::with_held_experts`),
     /// the one owner of the slots' upper bound; at least `slots`.
     pub ceiling: u64,
+    /// The most host slots a weight cap leaves its host tier beside the
+    /// bank's weights at its ceiling (`ExecutionPlanDraft::bank_ceiling`),
+    /// at most the widest layer's experts: a cap bounds every weight byte
+    /// the load holds, wherever it lies; none uncapped
+    /// ([`Self::host_ceiling`]).
+    pub host_cap: Option<u64>,
     /// The host slots of the tier's load-time size: as many as the host's
     /// memory admits beside the load, up to every expert
     /// (`ExecutionPlanDraft::with_host_tier`), which the bank backs from

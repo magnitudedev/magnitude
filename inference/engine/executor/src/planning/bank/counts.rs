@@ -41,7 +41,7 @@ impl ExpertBankPlan {
             })
             .collect::<Result<_, String>>()?;
         let host = match self.host_ceiling() {
-            Some(ceiling) => (0..=ceiling.get())
+            Some(ceiling) => (0..=ceiling)
                 .map(|host| {
                     Ok(Held {
                         records: groups.clone().map(|group| self.host_records(group, host)).collect(),

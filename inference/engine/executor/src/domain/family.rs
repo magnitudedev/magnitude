@@ -251,7 +251,7 @@ pub struct TableResidency {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HostResidency {
     pub slots: u64,
-    pub ceiling: std::num::NonZeroU64,
+    pub ceiling: u64,
     pub bytes: u64,
     pub fill: TierFill,
     /// The host slots' last finished resize; none before one.

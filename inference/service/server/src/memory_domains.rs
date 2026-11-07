@@ -160,7 +160,7 @@ mod tests {
                     stores: vec![(device.clone(), 700), (seismic::StoreIdentity::HostRam, 300)],
                     host: Some(HostResidency {
                         slots: 20,
-                        ceiling: positive(256),
+                        ceiling: 256,
                         bytes: 650,
                         fill: magnitude_engine::census::TierFill::Filled,
                         last_resize: Some(BankResize::Grew { from: 19, by: positive(1), at_unix_ms: 11 }),

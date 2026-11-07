@@ -916,8 +916,9 @@ impl TryFrom<StreamingTableStatusParts> for StreamingTableStatus {
 pub struct StreamingHostStatus {
     memory_domain_id: crate::MemoryDomainId,
     slots: u64,
-    #[cfg_attr(feature = "openapi", schema(value_type = u64, minimum = 1))]
-    ceiling_slots: NonZeroU64,
+    /// At most every expert; none beside the landing reserve where a
+    /// weight cap leaves the tier no slots.
+    ceiling_slots: u64,
     bytes: u64,
     /// Absent before the tier's first resize.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -931,7 +932,7 @@ pub struct StreamingHostStatus {
 pub struct StreamingHostStatusParts {
     pub memory_domain_id: crate::MemoryDomainId,
     pub slots: u64,
-    pub ceiling_slots: NonZeroU64,
+    pub ceiling_slots: u64,
     pub bytes: u64,
     #[serde(default)]
     pub last_resize: Option<StreamingResize>,
@@ -942,7 +943,7 @@ impl TryFrom<StreamingHostStatusParts> for StreamingHostStatus {
 
     fn try_from(parts: StreamingHostStatusParts) -> Result<Self, OutOfBounds> {
         let StreamingHostStatusParts { memory_domain_id, slots, ceiling_slots, bytes, last_resize } = parts;
-        OutOfBounds::check(slots <= ceiling_slots.get(), "a host tier holds at most its ceiling")?;
+        OutOfBounds::check(slots <= ceiling_slots, "a host tier holds at most its ceiling")?;
         Ok(Self { memory_domain_id, slots, ceiling_slots, bytes, last_resize })
     }
 }

@@ -143,6 +143,7 @@ impl ModelLoadPlan {
             slots,
             ceiling: slots,
             host_slots: 0,
+            host_cap: None,
             places,
             pass: crate::PassLaunches::new(
                 usize::try_from(places)

@@ -290,13 +290,14 @@ fn banked_shared_graphs_score_as_resident(
 }
 
 /// On a discrete CUDA device, a partial bank of the fixture of 128 experts
-/// a layer beside a host tier the plan sizes at load to every expert: the
-/// tier fills from the bank's open on, so once it keeps every expert
-/// (nothing left only on disk) the steps read nothing from the file, every
-/// miss the tier's, and they score as the resident load does
-/// ([`Scores::assert_as_resident`]).
+/// a layer under a weight cap of half its experts, beside a host tier the
+/// cap bounds (`ExpertBankPlan::host_cap`, fewer host slots than every
+/// expert): the tier fills from the bank's open on to its planned size
+/// (`ExpertBankPlan::host_slots`) and never holds more than its cap, and
+/// the steps, every miss served from the tier or the file, score as the
+/// resident load does ([`Scores::assert_as_resident`]).
 #[test]
-fn a_partial_banks_tier_fills_at_load_and_serves_every_miss() {
+fn a_capped_partial_banks_tier_fills_within_its_cap_and_serves_every_miss() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let backend = seismic::BackendName::Cuda;
@@ -335,8 +336,8 @@ fn misses_the_device_lands_score_as_resident() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
-/// Whether [`scores`] steps a banked load at once, once its host tier keeps
-/// every expert, then asserting no step read the file, or with its misses
+/// Whether [`scores`] steps a banked load at once, once its host tier has
+/// filled to its planned size within its weight cap, or with its misses
 /// priced to land on the device, where the host places.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Filled {
@@ -551,11 +552,22 @@ fn scores(
         let site = plan.is_some_and(|plan| !plan.whole() && (0..plan.layers().len()).any(|layer| plan.sited(layer)));
         let waited = filled == Filled::Waited && !matches!(banked, Banked::Resident);
         if waited {
-            // The tier fills from the bank's open on: nothing stays only on
-            // disk once it keeps every expert.
+            // The cap bounds the tier below every expert; the tier fills
+            // from the bank's open on to its planned size, within that bound.
+            let (cap, planned, widest) = plan
+                .and_then(|plan| plan.host_cap.map(|cap| (cap, plan.host_slots, plan.widest().get())))
+                .unwrap_or_else(|| panic!("{backend:?}: a capped load's host tier has a cap"));
+            assert!(cap < widest, "{backend:?}: the cap leaves the host tier {cap} host slots, fewer than every expert ({widest})");
+            assert!(planned <= cap, "{backend:?}: the tier is planned at {planned} host slots, past its cap of {cap}");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while domain.expert_residency().unwrap().unwrap().disk_bytes > 0 {
-                assert!(std::time::Instant::now() < deadline, "{backend:?}: the host tier never kept every expert");
+            loop {
+                let host = domain.expert_residency().unwrap().unwrap().host.unwrap_or_else(|| panic!("{backend:?}: a linked load has a host tier"));
+                assert_eq!(host.ceiling, cap, "{backend:?}: the host tier's ceiling is its cap");
+                assert!(host.slots <= cap, "{backend:?}: the host tier holds {} host slots, past its cap of {cap}", host.slots);
+                if host.fill == crate::TierFill::Filled && host.slots == planned {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline, "{backend:?}: the host tier never filled to its planned {planned} host slots ({host:?})");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
@@ -600,11 +612,8 @@ fn scores(
         }
         if waited {
             let costs = domain.expert_costs().expect("a banked load's costs");
-            let (misses, read) = costs.layers.iter().fold((0, 0), |(misses, read), layer| {
-                (misses + layer.misses, read + layer.reading + layer.unanticipated)
-            });
+            let misses = costs.layers.iter().map(|layer| layer.misses).sum::<u64>();
             assert!(misses > 0, "{backend:?}: a partial bank misses");
-            assert_eq!(read, 0, "{backend:?}: every miss is the tier's, none read from the file ({misses} misses)");
         }
         scores.push((steps, sited, site));
     }

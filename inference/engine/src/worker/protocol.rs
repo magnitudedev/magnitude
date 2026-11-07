@@ -335,7 +335,7 @@ mod tests {
                         stores: vec![(device.clone(), 10)],
                         host: Some(magnitude_executor::HostResidency {
                             slots: 12,
-                            ceiling: positive(256),
+                            ceiling: 256,
                             bytes: 14,
                             fill: magnitude_executor::TierFill::Filled,
                             last_resize: None,

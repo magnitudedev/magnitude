@@ -147,9 +147,10 @@ pub struct ModelPolicy {
     /// The caller's numerical requirement (α and the allowed deviation
     /// classes); the engine's standard profile when absent.
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
-    /// An optional ceiling on every weight byte the load holds beside its
-    /// host tier (which the host's room bounds): its expert bank grows no
-    /// further than the cap holds (`ExecutionPlanDraft::with_bank`).
+    /// An optional ceiling on every weight byte the load holds, wherever it
+    /// lies: its expert bank grows no further than the cap holds, and a host
+    /// tier holds what it leaves beside the bank at its ceiling, its landing
+    /// reserve aside as staging (`ExecutionPlanDraft::bank_ceiling`).
     pub weight_cap: Option<u64>,
 }
 

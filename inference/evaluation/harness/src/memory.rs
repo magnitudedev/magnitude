@@ -150,7 +150,7 @@ pub fn load(load: Load) -> Result<(), String> {
             holdings.insert(name, value);
             if let Some(ceiling) = bank.host_ceiling() {
                 let (name, value) = metadata(magnitude_executor::BankHolding::Host,
-                    0, 0, ceiling.get(), &|at| bank.host_charge(at))?;
+                    0, 0, ceiling, &|at| bank.host_charge(at))?;
                 holdings.insert(name, value);
             }
             for (table, plan) in bank.tables.iter().enumerate() {

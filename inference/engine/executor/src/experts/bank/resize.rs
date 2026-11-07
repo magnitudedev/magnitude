@@ -33,7 +33,7 @@ pub(super) struct Commitment {
 /// `ExpertBankPlan::host_ceiling`), and its record tensors' resize.
 pub(super) struct HostTier {
     pub(super) slots: Arc<AtomicU64>,
-    pub(super) ceiling: std::num::NonZeroU64,
+    pub(super) ceiling: u64,
     pub(super) resize: HostResize,
     /// The thread the tier's storage work runs on: host RAM is a store of
     /// its own, so its backing and growth never queue a resize of the

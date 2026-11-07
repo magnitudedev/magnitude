@@ -191,7 +191,7 @@ export type StreamingTableStatus = typeof StreamingTableStatusSchema.Type
 export const StreamingHostStatusSchema = Schema.Struct({
   memoryDomainId: LocalInferenceMemoryDomainIdSchema,
   slots: NonNegativeSafeInteger,
-  ceilingSlots: PositiveSafeInteger,
+  ceilingSlots: NonNegativeSafeInteger,
   bytes: NonNegativeSafeInteger,
   lastResize: Schema.optionalWith(StreamingResizeSchema, { as: "Option", exact: true }),
 })

@@ -182,6 +182,7 @@ fn bank_of(groups: &[usize], slots: u64, experts: impl Fn(usize) -> u64, form: R
         slots,
         ceiling: slots,
         host_slots: 0,
+        host_cap: None,
         places: 1,
         pass: crate::PassLaunches::FLOOR,
         flights: FlightDepth::PIPELINED,
@@ -376,7 +377,7 @@ fn a_banks_counts_are_its_plans_derivations_at_every_count() {
             assert_eq!(counts.host_charge(0), 0, "no host tier is charged");
             continue;
         };
-        for host in 0..=ceiling.get() {
+        for host in 0..=ceiling {
             assert_eq!(counts.host_charge(host), plan.host_charge(host).unwrap(), "{host} host slots");
             for group in 0..plan.groups().len() {
                 assert_eq!(counts.host_records(group, host), plan.host_records(group, host), "group {group} at {host} host slots");
@@ -428,7 +429,7 @@ fn a_tiered_records_host_held_misses_are_priced_as_served() {
 fn a_host_tier_holds_each_groups_records_in_their_resident_form() {
     let without = beside(bank(&[3, 1], 26), HostTier::Unified);
     let plan = beside(without.clone(), HostTier::Linked(BYTES));
-    assert_eq!((plan.host_ceiling(), without.host_ceiling()), (NonZeroU64::new(256), None));
+    assert_eq!((plan.host_ceiling(), without.host_ceiling()), (Some(256), None));
     let lent = plan.conveyor().carrier.lender().records;
     assert_eq!((plan.host_extent(0), plan.host_extent(1), without.host_extent(0)), (3 * 256 + lent, 256, 0));
     // Never fewer than the landing reserve.

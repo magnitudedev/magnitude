@@ -17,7 +17,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentMemoryCharge, ConveyorCarrier, HeldCharges, PlanError, PlanPrices, PlanRoom,
+    AssessmentMemoryCharge, ConveyorCarrier, HeldBound, HeldCharges, PlanError, PlanPrices, PlanRoom,
     assessment::{AssessmentError, ColdSource, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
     platform::{DeviceRequest, DomainRole, MemoryReserves, StoreMotion},
 };
@@ -747,11 +747,13 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
 }
 
 /// A linked host tier is sized at load by the plan's settle into the host
-/// memory the reading admits beside the rest of the load: Qwen3.6 35B on
-/// the recorded RTX 3090 under its 6,890,894,474-byte cap keeps every expert
-/// where host RAM has room for them, and the most slots whose growth past
-/// the tier's floor the room left beside the load holds where it has room
-/// for half of them.
+/// memory the reading admits beside the rest of the load, up to the ceiling
+/// its weight cap leaves it (`ExpertBankPlan::host_cap`), which an
+/// assessment's re-plan keeps: Qwen3.6 35B on the recorded RTX 3090 under
+/// its 6,890,894,474-byte cap holds its tier's ceiling where host RAM has
+/// room for it, and where it has room for half of them, the most slots
+/// whose growth past the tier's floor that room admits, up to the ceiling:
+/// of the cap's ceiling and the host's room, the smaller bound wins.
 #[test]
 fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     let scratch = Scratch::new("qwen36-tier-size");
@@ -770,13 +772,14 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     };
     let (setup, definition, draft) = prepare(MemoryReserves::of_machine(None));
     let bank = draft.load().expert_bank().expect("a capped load streams").clone();
-    let ceiling = bank.host_ceiling().expect("a discrete bank's tier is linked").get();
-    assert_eq!(bank.host_slots, ceiling, "host RAM holds every expert");
-    // A draft re-planned as an assessment's fallback does keeps its tier,
-    // which is then what its fit reports the cold experts lie in.
+    let ceiling = bank.host_ceiling().expect("a discrete bank's tier is linked");
+    assert_eq!(bank.host_slots, ceiling, "host RAM holds the tier's ceiling");
+    // A draft re-planned as an assessment's fallback does keeps its tier
+    // under its cap, which is then what its fit reports the cold experts
+    // lie in.
     let replan = |draft: &magnitude_executor::ExecutionPlanDraft| {
         draft
-            .with_held_experts(&definition, u64::MAX, &synthetic_prices(), &mut HeldCharges::<AssessmentMemoryCharge>::default(), unbounded, |_, _| {
+            .with_held_experts(&definition, HeldBound::Unbounded, &synthetic_prices(), &mut HeldCharges::<AssessmentMemoryCharge>::default(), unbounded, |_, _| {
                 Ok::<_, AssessmentError>(Ok(()))
             })
             .unwrap()
@@ -806,8 +809,9 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     let planned = replanned.draft().load().expert_bank().unwrap();
     assert_eq!(planned.slots, bank.slots, "host room leaves the device's bank as it is");
     let slots = planned.host_slots;
-    assert!((half..ceiling).contains(&slots), "{slots} host slots of {ceiling}");
-    assert!(growth(slots) <= growth(half) && growth(slots + 1) > growth(half), "{slots} host slots");
+    assert!((half..=ceiling).contains(&slots), "{slots} host slots of {ceiling}");
+    assert!(growth(slots) <= growth(half), "{slots} host slots grow past the room");
+    assert!(slots == ceiling || growth(slots + 1) > growth(half), "{slots} host slots leave room for another");
 }
 
 /// A load assessment shrinks to fit is the load `with_bank` plans, tier and
@@ -864,7 +868,7 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     };
     let prices = plan_prices(&setup.measurements, draft);
     let (planned, ()) = draft
-        .with_held_experts(definition, bound, &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
+        .with_held_experts(definition, HeldBound::Room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
@@ -1015,7 +1019,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
             PlanRoom { free: left, ceiling: left }
         };
         let (planned, ()) = draft
-            .with_held_experts(definition, bound, &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
+            .with_held_experts(definition, HeldBound::Room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
                 Ok::<_, AssessmentError>(Ok(()))
             })
             .unwrap()

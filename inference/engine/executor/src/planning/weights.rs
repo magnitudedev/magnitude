@@ -924,29 +924,34 @@ impl ModelLoadPlan {
         self.bank.as_ref().map_or(crate::PassLaunches::whole_chain(limits), |bank| bank.pass)
     }
 
-    /// Every weight byte the load holds beside its host tier: each
-    /// component's, and the expert bank's (what a weight cap bounds). The
-    /// host tier's records are the host's room's, which bounds the tier as
-    /// it grows, so the cap charges none of them, its floor included.
+    /// Every weight byte the load holds, wherever it lies (what a weight
+    /// cap bounds): each component's, the expert bank's, and its host
+    /// tier's slots. The tier's landing reserve (the tier at no slots) is
+    /// staging, as the import's is, and counts none.
     pub fn weight_bytes(&self) -> Result<u64, String> {
-        self.weight_demands()?
+        self.weight_owners()?
             .into_iter()
-            .try_fold(0u64, |total, demand| {
-                total
-                    .checked_add(demand.device)?
-                    .checked_add(demand.reserved)?
-                    .checked_add(demand.upload)?
-                    .checked_add(demand.shared)
-            })
+            .try_fold(0u64, |total, (_, bytes)| total.checked_add(bytes))
             .ok_or_else(|| "resident weight byte count overflow".to_owned())
     }
 
+    /// The host tier's slots beyond its landing reserve; none without a
+    /// tier.
+    fn host_tier_bytes(&self) -> Result<u64, String> {
+        let Some(bank) = self.bank.as_ref().filter(|bank| bank.host_ceiling().is_some()) else {
+            return Ok(0);
+        };
+        bank.host_charge(bank.host_slots)?
+            .checked_sub(bank.host_charge(0)?)
+            .ok_or_else(|| "a host tier charges less at its slots than at none".to_owned())
+    }
+
     /// What a weight cap bounds ([`Self::weight_bytes`]), by the owner of
-    /// each byte: each component's weights beside the expert bank, then the
-    /// bank's parts ([`super::ExpertBankPlan::charges`]); their sum is the
-    /// weight bytes.
+    /// each byte: each component's weights beside the expert bank, the
+    /// bank's parts ([`super::ExpertBankPlan::charges`]), then its host
+    /// tier's slots; their sum is the weight bytes.
     pub fn weight_owners(&self) -> Result<Vec<(&'static str, u64)>, String> {
-        // A weight byte as `weight_bytes` counts it: the host's are not.
+        // A component's weight byte: the host tier's are counted apart.
         let total = |demand: ClaimDemand| {
             demand.device.checked_add(demand.reserved)?.checked_add(demand.upload)?.checked_add(demand.shared)
         };
@@ -964,6 +969,7 @@ impl ModelLoadPlan {
             ("vision weights", total(vision).ok_or_else(overflow)?),
         ];
         owners.extend(bank);
+        owners.push(("host tier slots", self.host_tier_bytes()?));
         Ok(owners)
     }
 

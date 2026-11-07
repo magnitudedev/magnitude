@@ -577,7 +577,7 @@ pub fn assess_execution_fit(
         })
     };
     let mut held = prepared.held.clone();
-    Ok(match draft.with_held_experts(definition, bound, prices, &mut held, room, confirm)? {
+    Ok(match draft.with_held_experts(definition, crate::HeldBound::Room(bound), prices, &mut held, room, confirm)? {
         Ok((held, (fit_context_tokens, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains,

@@ -9406,10 +9406,10 @@
                 "$ref": "#/components/schemas/StreamedBank"
               },
               "performance": {
-                "$ref": "#/components/schemas/StreamedModelPerformance"
+                "$ref": "#/components/schemas/ModelPerformance"
               },
               "floorPerformance": {
-                "$ref": "#/components/schemas/StreamedModelPerformance"
+                "$ref": "#/components/schemas/ModelPerformance"
               },
               "_tag": {
                 "type": "string",
@@ -11424,78 +11424,6 @@
         },
         "additionalProperties": false
       },
-      "StreamedModelPerformance": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Pending"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "failure",
-              "_tag"
-            ],
-            "properties": {
-              "failure": {
-                "$ref": "#/components/schemas/ModelFailure"
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Unavailable"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "_tag"
-            ],
-            "properties": {
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Unmeasured"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "samples",
-              "_tag"
-            ],
-            "properties": {
-              "samples": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/PerformanceEvidence"
-                }
-              },
-              "_tag": {
-                "type": "string",
-                "enum": [
-                  "Estimated"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "A streamed fit's speed estimates: a [`ModelPerformance`], or unmeasured before the model's\nfirst streamed load, while the record of which experts its routing misses on this machine,\nwhich the estimate is computed from, does not exist yet."
-      },
       "StreamingHostStatus": {
         "type": "object",
         "description": "A discrete device's host-RAM tier, in its memory domain: its host slots now (each an expert\nof every streamed layer) up to its ceiling, the host memory its records take, and its last\nresize.",
@@ -11517,7 +11445,8 @@
           "ceilingSlots": {
             "type": "integer",
             "format": "int64",
-            "minimum": 1
+            "description": "At most every expert; none beside the landing reserve where a\nweight cap leaves the tier no slots.",
+            "minimum": 0
           },
           "bytes": {
             "type": "integer",
