@@ -1944,6 +1944,7 @@ fn step_form(
         .with_param("BATCH_FROM", mapping.batch_from)
         .with_param("TALL", 0)
         .with_param("PACK", 0)
+        .with_param("RESIDUE", 1)
         .with_launch_param(9, "PACK_TOKENS", 4)
         .with_launch_param(9, "WEIGHTS_AHEAD", 0)
         .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
