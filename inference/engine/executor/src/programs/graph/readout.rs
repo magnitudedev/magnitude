@@ -32,6 +32,7 @@ use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, Entry, NativeGraphClassSlice,
     NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
     NativeGraphStorageBytes, NativePort, WorkflowTensor, WorkflowTensorMut, WorkflowTensorRef,
+    WorkflowTensorView,
 };
 use std::collections::BTreeMap;
 
@@ -2078,7 +2079,8 @@ where
 /// are a projection's exact logits as its sampler read them (shaped in
 /// place when shaped), or a certified projection's first view
 /// ([`CertifiedReadout::view`]), whose exact logits are only its
-/// survivors'. Every drafter's confidence in its proposals is this one.
+/// survivors'. Every drafter's confidence in its proposals is this one;
+/// one that samples its own logits rows takes it through [`select`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn confidence<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -2100,6 +2102,57 @@ pub(crate) fn confidence<'a, G: GraphDraft + 'a>(
         },
     )?;
     Ok(())
+}
+
+/// The entries of a drafter's selection: shaping, sampling and confidence.
+pub(crate) struct SelectionEntries<'a, G: GraphDraft + 'a> {
+    pub shape: G::Binding<'a, shape_rows::Entry>,
+    pub sample: G::Binding<'a, sample_rows::Entry>,
+    pub confidence: G::Binding<'a, token_confidence::Entry>,
+}
+
+/// A drafter's selection of `rows` logits rows: sampling into `result`
+/// ([`sample`]), then each selection's confidence under the very logits it
+/// was drawn from, as shaping left them, into `confidence` ([`confidence`]):
+/// selection `s` was drawn from logits row `s` (`identity`, `0..rows`). A
+/// certified projection's confidence reads its first view instead (`view`),
+/// the only logits of its whole vocabulary it computes. Both come from one
+/// operand, so no drafter rates a proposal by logits it did not draw it from.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn select<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entries: SelectionEntries<'a, G>,
+    vocabulary: u64,
+    logits: &mut WorkflowTensor,
+    view: Option<&WorkflowTensor>,
+    identity: &WorkflowTensor,
+    rows: u64,
+    shaped: bool,
+    inputs: SelectionInputs,
+    result: &mut WorkflowTensorView,
+    confidences: &mut WorkflowTensorView,
+) -> Result<SelectionPorts, GraphError> {
+    let ports = sample(
+        graph,
+        entries.shape,
+        entries.sample,
+        vocabulary,
+        logits,
+        rows,
+        shaped,
+        inputs,
+        (&mut *result).into(),
+    )?;
+    confidence(
+        graph,
+        entries.confidence,
+        view.unwrap_or(&*logits),
+        identity,
+        (&*result).into(),
+        confidences.into(),
+        (rows, rows, vocabulary),
+    )?;
+    Ok(ports)
 }
 
 /// Selection controls of a padded selection class from a pass's packed
@@ -2604,5 +2657,198 @@ mod resource_regime_tests {
                 }
         )));
         assert!(diagnostic.iter().all(|class| class.projected <= 64));
+    }
+}
+
+#[cfg(test)]
+mod select_tests {
+    use super::{SelectionEntries, select, selection_inputs};
+    use crate::programs::graph::draft::GraphDraft;
+    use magnitude_kernels::{sample_rows, shape_rows, token_confidence};
+    use seismic::{BackendName, Element, NativeSpecialization, Tensor};
+
+    /// The specialization of an entry whose implementation lists `statics`,
+    /// each fixed from `extents`, at its defaults for the rest.
+    fn specialization(
+        statics: &[String],
+        defaults: impl Fn(&NativeSpecialization) -> NativeSpecialization,
+        extents: &[(&str, u64)],
+    ) -> NativeSpecialization {
+        defaults(&statics.iter().fold(NativeSpecialization::new(), |fixed, name| {
+            let (_, value) = extents
+                .iter()
+                .find(|(extent, _)| extent == name)
+                .unwrap_or_else(|| panic!("static {name} has no extent"));
+            fixed.with_static(name.clone(), *value)
+        }))
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
+    }
+
+    fn words(bytes: &[u8]) -> impl Iterator<Item = [u8; 4]> + '_ {
+        bytes.chunks_exact(4).map(|word| word.try_into().unwrap())
+    }
+
+    fn softmax_at(line: &[f32], token: usize) -> f32 {
+        let maximum = line.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let total = line.iter().map(|logit| (logit - maximum).exp()).sum::<f32>();
+        (line[token] - maximum).exp() / total
+    }
+
+    /// A drafter whose selection reads logits biased past its readout (as
+    /// DSpark's Markov chain biases its readout's) is confident in each
+    /// proposal by its probability under those biased logits, the ones it
+    /// drew it from, not under the readout's.
+    #[test]
+    fn a_selection_is_confident_by_the_logits_it_was_drawn_from() {
+        let catalog = seismic::Devices::discover(&[]).unwrap();
+        let device = catalog.open_backend(BackendName::Cpu).unwrap();
+        let (rows, vocabulary) = (2u64, 300u64);
+        let extents = [
+            ("M", rows),
+            ("N", rows),
+            ("Sx", rows),
+            ("V", vocabulary),
+            ("Hn", super::HISTORY_TOKENS),
+        ];
+        let sample_implementation = sample_rows::native_implementation(&device).unwrap().unwrap();
+        let sample = sample_rows::native_for_device(
+            &device,
+            &specialization(
+                &sample_implementation.statics,
+                |fixed| sample_implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
+        let shape_implementation = shape_rows::native_implementation(&device).unwrap().unwrap();
+        let shape = shape_rows::native_for_device(
+            &device,
+            &specialization(
+                &shape_implementation.statics,
+                |fixed| shape_implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
+        let confidence_implementation =
+            token_confidence::native_implementation(&device).unwrap().unwrap();
+        let confidence = token_confidence::native_for_device(
+            &device,
+            &specialization(
+                &confidence_implementation.statics,
+                |fixed| confidence_implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
+        // The readout's logits, and a bias that makes token 7 + 100 r row
+        // r's largest, which the readout alone rates far lower.
+        let readout = (0..rows * vocabulary)
+            .map(|index| ((index * 37 % 101) as f32 - 50.0) / 16.0)
+            .collect::<Vec<_>>();
+        let chosen = |row: u64| (7 + 100 * row) as usize;
+        let biased = readout
+            .iter()
+            .enumerate()
+            .map(|(index, logit)| {
+                let (row, token) = (index as u64 / vocabulary, index % vocabulary as usize);
+                logit + if token == chosen(row) { 12.0 } else { 0.0 }
+            })
+            .collect::<Vec<_>>();
+
+        let mut graph = device.native_graph();
+        let logits_port = GraphDraft::port(&mut graph, Element::f32(), &[rows, vocabulary]).unwrap();
+        let identity_port = GraphDraft::port(&mut graph, Element::i32(), &[rows]).unwrap();
+        let inputs = selection_inputs(&mut graph, &sample, rows, vocabulary).unwrap();
+        let (mask, constrained, draws) =
+            (inputs.mask.clone(), inputs.constrained.clone(), inputs.draws.clone());
+        let result_port = GraphDraft::local_for(
+            &mut graph,
+            &sample,
+            "result",
+            &[("M", rows), ("V", vocabulary)],
+        )
+        .unwrap();
+        let confidence_port = GraphDraft::local_for(
+            &mut graph,
+            &confidence,
+            "confidence",
+            &[("M", rows), ("N", rows), ("V", vocabulary)],
+        )
+        .unwrap();
+        let mut logits = logits_port.tensor().clone();
+        let mut result = result_port.tensor().slice_leading(0, rows);
+        let mut confidences = confidence_port.tensor().slice_leading(0, rows);
+        select(
+            &mut graph,
+            SelectionEntries {
+                shape: &shape,
+                sample: &sample,
+                confidence: &confidence,
+            },
+            vocabulary,
+            &mut logits,
+            None,
+            identity_port.tensor(),
+            rows,
+            false,
+            inputs,
+            &mut result,
+            &mut confidences,
+        )
+        .unwrap();
+        GraphDraft::export(&mut graph, result_port.tensor()).unwrap();
+        GraphDraft::export(&mut graph, confidence_port.tensor()).unwrap();
+        let plan = GraphDraft::seal(graph).unwrap();
+
+        let tensor = |element: Element, extents: &[u64], bytes: Vec<u8>| {
+            Tensor::from_host(&device, element, extents, &bytes).unwrap()
+        };
+        let mask_words = vocabulary.div_ceil(32);
+        let mut bindings = plan.bindings();
+        let bound = [
+            (&logits_port, tensor(Element::f32(), &[rows, vocabulary], f32_bytes(&biased))),
+            (
+                &identity_port,
+                tensor(Element::i32(), &[rows], (0..rows as i32).flat_map(i32::to_le_bytes).collect()),
+            ),
+        ];
+        for (port, tensor) in &bound {
+            bindings.set(port, tensor).unwrap();
+        }
+        // The sampler's inputs are written into the run's slot, as a
+        // drafter's are: no row constrained, zero draws select greedily.
+        let mut slot = plan.new_slot().unwrap();
+        slot.write_input(&mask, &vec![0; (rows * mask_words * 4) as usize]).unwrap();
+        slot.write_input(&constrained, &vec![0; (rows * 4) as usize]).unwrap();
+        slot.write_input(&draws, &vec![0; (rows * 6 * 4) as usize]).unwrap();
+        let (outputs, completion) = slot
+            .attach(bindings, plan.new_outputs().unwrap())
+            .unwrap()
+            .submit()
+            .unwrap();
+        completion.wait().unwrap();
+        let selected = words(&outputs.exported(result_port.tensor()).unwrap().read_to_host().unwrap())
+            .map(i32::from_le_bytes)
+            .collect::<Vec<_>>();
+        let confident = words(&outputs.exported(confidence_port.tensor()).unwrap().read_to_host().unwrap())
+            .map(f32::from_le_bytes)
+            .collect::<Vec<_>>();
+        for row in 0..rows {
+            let token = chosen(row);
+            assert_eq!(selected[2 * row as usize..][..2], [token as i32, 0], "row {row}");
+            let line = |logits: &[f32]| logits[(row * vocabulary) as usize..][..vocabulary as usize].to_vec();
+            let expected = softmax_at(&line(&biased), token);
+            let unbiased = softmax_at(&line(&readout), token);
+            let actual = confident[row as usize];
+            assert!(
+                (actual - expected).abs() <= 1e-5 + 1e-4 * expected,
+                "row {row}: confidence {actual} against the biased logits' {expected}"
+            );
+            assert!(expected - unbiased > 0.5, "row {row}: the bias decides ({expected} against {unbiased})");
+        }
     }
 }

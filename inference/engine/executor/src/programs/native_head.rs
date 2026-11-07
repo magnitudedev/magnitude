@@ -1161,32 +1161,28 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         None,
                     ),
                 };
-                let selection = readout::sample(
-                    &mut graph,
-                    entries.shape,
-                    entries.sample,
-                    vocabulary,
-                    &mut logits,
-                    class.slots,
-                    class.shaped,
-                    inputs,
-                    (&mut result).into(),
-                )?;
                 let (confidence, rows) = confidence
                     .as_ref()
                     .ok_or_else(|| "a drafting pass without confidences".to_owned())?;
                 let mut confidence =
                     confidence.slice_leading(pass * class.slots, (pass + 1) * class.slots);
-                readout::confidence(
+                Some(readout::select(
                     &mut graph,
-                    entries.confidence,
-                    view.as_ref().unwrap_or(&logits),
+                    readout::SelectionEntries {
+                        shape: entries.shape,
+                        sample: entries.sample,
+                        confidence: entries.confidence,
+                    },
+                    vocabulary,
+                    &mut logits,
+                    view.as_ref(),
                     rows.port().tensor(),
-                    (&result).into(),
-                    (&mut confidence).into(),
-                    (class.slots, class.slots, vocabulary),
-                )?;
-                Some(selection)
+                    class.slots,
+                    class.shaped,
+                    inputs,
+                    &mut result,
+                    &mut confidence,
+                )?)
             }
             _ => None,
         };

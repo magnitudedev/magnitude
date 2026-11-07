@@ -713,26 +713,23 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 None,
             ),
         };
-        let selection = readout::sample(
+        let mut step_confidence = confidence.slice_leading(step * slots, (step + 1) * slots);
+        let selection = readout::select(
             &mut graph,
-            entries.shape,
-            entries.sample,
+            readout::SelectionEntries {
+                shape: entries.shape,
+                sample: entries.sample,
+                confidence: entries.confidence,
+            },
             vocabulary,
             &mut logits,
+            view.as_ref(),
+            out_rows.port().tensor(),
             slots,
             class.shaped,
             inputs,
-            (&mut result).into(),
-        )?;
-        let mut step_confidence = confidence.slice_leading(step * slots, (step + 1) * slots);
-        readout::confidence(
-            &mut graph,
-            entries.confidence,
-            view.as_ref().unwrap_or(&logits),
-            out_rows.port().tensor(),
-            (&result).into(),
-            (&mut step_confidence).into(),
-            (slots, slots, vocabulary),
+            &mut result,
+            &mut step_confidence,
         )?;
         passes.push(PassPorts {
             blocks,

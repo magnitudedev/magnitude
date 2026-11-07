@@ -1516,25 +1516,46 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         "result",
         &[("M", selected), ("V", readout_vocabulary)],
     )?;
+    // Each proposal's probability under the logits it was selected from,
+    // step-major beside the selections.
+    let mut confidence = graph
+        .local_for(
+            entries.confidence,
+            "confidence",
+            &[("M", selected), ("N", outputs), ("V", readout_vocabulary)],
+        )?
+        .tensor()
+        .clone();
+    let selection = (entries.shape, entries.sample, entries.confidence);
+    let selection_entries = move || readout::SelectionEntries {
+        shape: selection.0,
+        sample: selection.1,
+        confidence: selection.2,
+    };
     let mut selections = Vec::new();
     let mut anchor_rows = None;
     let mut landed = None;
     let anchors = match (&draft.method, &entries.markov) {
         (DraftMethod::DFlash, None) => {
             let mut all = result.tensor().slice_leading(0, outputs);
+            let mut all_confidence = confidence.slice_leading(0, outputs);
+            let identity = GraphConstant::identity(&mut graph, outputs)?;
             let inputs =
                 readout::selection_inputs(&mut graph, entries.sample, outputs, readout_vocabulary)?;
-            selections.push(readout::sample(
+            selections.push(readout::select(
                 &mut graph,
-                entries.shape,
-                entries.sample,
+                selection_entries(),
                 readout_vocabulary,
                 &mut logits,
+                None,
+                identity.port().tensor(),
                 outputs,
                 class.shaped,
                 inputs,
-                (&mut all).into(),
+                &mut all,
+                &mut all_confidence,
             )?);
+            constants.push(identity);
             None
         }
         (DraftMethod::DSpark { markov, .. }, Some(chain)) => {
@@ -1589,6 +1610,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 &mut weights,
                 &mut constants,
             )?;
+            // A step selects from its own biased rows, row `s` slot `s`.
+            let identity = GraphConstant::identity(&mut graph, slots)?;
             for step in 0..proposals {
                 let rows_of_step = GraphConstant::i32(
                     &mut graph,
@@ -1646,22 +1669,29 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     slots,
                     readout_vocabulary,
                 )?;
-                selections.push(readout::sample(
+                let mut step_confidence =
+                    confidence.slice_leading(step * slots, (step + 1) * slots);
+                // Its proposals' confidence is their probability under the
+                // biased logits they are drawn from. DSpark's own confidence
+                // head (sigmoid(score) < 0 at the service's fixed threshold)
+                // cannot decline a selection (including a NaN score), so
+                // neither its score nor its features are computed.
+                selections.push(readout::select(
                     &mut graph,
-                    entries.shape,
-                    entries.sample,
+                    selection_entries(),
                     readout_vocabulary,
                     &mut biased,
+                    None,
+                    identity.port().tensor(),
                     slots,
                     class.shaped,
                     inputs,
-                    (&mut step_result).into(),
+                    &mut step_result,
+                    &mut step_confidence,
                 )?);
-                // Confidence is sigmoid(score) < 0 at the service's fixed
-                // threshold. It cannot decline a selection (including a NaN
-                // score), so neither the score nor its features are computed.
                 constants.push(rows_of_step);
             }
+            constants.push(identity);
             Some(anchors)
         }
         (DraftMethod::DFlash2 { selector }, None) => {
@@ -1732,36 +1762,33 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         }
         _ => return Err("draft method and entries disagree".into()),
     };
-    // Each proposal's probability under the readout logits row it was
-    // selected from: a corrector's are its slot's mask rows, the rest its
+    // A selector's or corrector's proposals are chosen over the readout
+    // logits rows: a corrector's are its slot's mask rows, a selector's its
     // own proposing row.
-    let logit_rows = (0..proposals)
-        .flat_map(|proposal| (0..slots).map(move |slot| (proposal, slot)))
-        .map(|(proposal, slot)| match corrector {
-            Some(_) => slot * mask_rows + proposal,
-            None => proposal * slots + slot,
-        })
-        .map(|row| i32::try_from(row).map_err(|_| "draft row exceeds i32"))
-        .collect::<Result<Vec<_>, _>>()?;
-    let logit_rows = GraphConstant::i32(&mut graph, &logit_rows)?;
-    let mut confidence = graph
-        .local_for(
+    if matches!(
+        draft.method,
+        DraftMethod::DFlash2 { .. } | DraftMethod::LiLiCorr { .. }
+    ) {
+        let logit_rows = (0..proposals)
+            .flat_map(|proposal| (0..slots).map(move |slot| (proposal, slot)))
+            .map(|(proposal, slot)| match corrector {
+                Some(_) => slot * mask_rows + proposal,
+                None => proposal * slots + slot,
+            })
+            .map(|row| i32::try_from(row).map_err(|_| "draft row exceeds i32"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let logit_rows = GraphConstant::i32(&mut graph, &logit_rows)?;
+        readout::confidence(
+            &mut graph,
             entries.confidence,
-            "confidence",
-            &[("M", selected), ("N", outputs), ("V", readout_vocabulary)],
-        )?
-        .tensor()
-        .clone();
-    readout::confidence(
-        &mut graph,
-        entries.confidence,
-        &logits,
-        logit_rows.port().tensor(),
-        result.tensor().into(),
-        (&mut confidence).into(),
-        (selected, outputs, readout_vocabulary),
-    )?;
-    constants.push(logit_rows);
+            &logits,
+            logit_rows.port().tensor(),
+            result.tensor().into(),
+            (&mut confidence).into(),
+            (selected, outputs, readout_vocabulary),
+        )?;
+        constants.push(logit_rows);
+    }
     graph.export(&confidence)?;
     let output = result.tensor().clone();
     graph.export(&output)?;
