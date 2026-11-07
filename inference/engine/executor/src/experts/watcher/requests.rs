@@ -120,7 +120,13 @@ impl Requests {
                 }
                 let mut service = self.service.lock().expect("the request service is never left by a panic");
                 let progressed = match self.shared.life.ended() {
-                    Some(_) => liveness::refuse(&held.core, &self.shared),
+                    // Serving ended: each request the look posted is given
+                    // up, its reads' staging freed as they end, and refused.
+                    Some(_) => {
+                        let held = &mut *held;
+                        let gave_up = posted.into_iter().fold(false, |gave_up, request| request.give_up(&mut held.core, &held.prefetch, &self.shared) | gave_up);
+                        liveness::refuse(&held.core, &self.shared) | gave_up
+                    }
                     None => match std::panic::catch_unwind(AssertUnwindSafe(|| self.pass(&mut service, &mut held, posted))) {
                         Ok(progressed) => progressed,
                         Err(payload) => {

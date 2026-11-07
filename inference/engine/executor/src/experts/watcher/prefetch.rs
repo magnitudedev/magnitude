@@ -533,12 +533,14 @@ impl Prefetch {
         )
     }
 
-    /// Whether a read or its landing is outstanding: an expert inbound,
-    /// whose read runs or whose landing's end residency has not learned
-    /// (a read ends before its landings do). Each one's end is an event of
-    /// the load (its landing's `Ended`, every read landing or ending so).
+    /// Whether a read or its landing is outstanding: any staging record
+    /// taken. Every read into staging holds its record from before it is
+    /// submitted until its landing's end is learned, or, a read given up,
+    /// until it ends: an expert inbound, a request's posted read before
+    /// residency serves it, one waiting for tier records, or one discarded.
+    /// Each record's freeing is an event of the load.
     pub(super) fn outstanding(&self) -> bool {
-        !self.inbound.is_empty()
+        self.staging.free() < self.staging.records()
     }
 
     /// The device is at `progress`: the landings it converted before it have
@@ -901,4 +903,24 @@ enum Short {
     Refused,
     Staging,
     Tier,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Prefetch;
+
+    /// A request's read posted before residency serves it, or left waiting
+    /// for tier records, or given up while it runs, holds its staging record
+    /// and is in no landing residency tracks: it is outstanding until its
+    /// record frees, so no resize or traffic hold finds the load quiet while
+    /// it may still write into staging.
+    #[test]
+    fn a_read_holding_staging_outside_the_landings_is_outstanding() {
+        let prefetch = Prefetch::new(2, 1);
+        assert!(!prefetch.outstanding(), "nothing read");
+        let posted = prefetch.staging.take_up_to(1);
+        assert!(prefetch.outstanding(), "a posted read's staging record is taken");
+        posted.into_iter().for_each(|record| prefetch.staging.release(record));
+        assert!(!prefetch.outstanding(), "its record freed as it ended");
+    }
 }

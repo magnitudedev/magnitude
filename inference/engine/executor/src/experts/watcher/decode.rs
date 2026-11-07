@@ -394,29 +394,60 @@ fn parked_landing(
     crate::experts::landing::Landing { from, ..core.landing(grant, record) }
 }
 
-/// Give up the landings of a posted read whose step ended before their
-/// tier records were claimed: their experts are lacked again, the read's
-/// pieces not yet taken are withdrawn where it lands nothing else, and
-/// their staging frees as the read ends (`Join::claimed`).
-fn discard(core: &mut Core, prefetch: &Prefetch, shared: &Arc<Shared>, layer: usize, unclaimed: Unclaimed) {
-    let Unclaimed { mut ticket, join, landings, .. } = unclaimed;
-    let mut records = Vec::with_capacity(landings.len());
-    for landing in landings {
-        core.directory.unposted(layer, landing.expert);
-        records.push(landing.record);
-    }
-    if Arc::get_mut(&mut ticket).is_some() {
-        ticket.withdraw();
+/// Give up a posted read's `landings` at `layer`, each (expert, staging
+/// record), whose tier records were never claimed: their experts are
+/// lacked again, the read's pieces not yet taken are withdrawn where it
+/// lands nothing else, and their staging frees as the read ends
+/// (`Join::claimed`), at once where the read engine took none. Until then
+/// the records stay taken, so the load's traffic is not quiet
+/// (`Prefetch::outstanding`).
+fn give_up(core: &mut Core, prefetch: &Prefetch, shared: &Shared, layer: usize, read: Option<(Arc<Ticket>, Arc<Join>)>, landings: impl IntoIterator<Item = (usize, u32)>) {
+    let mut records = Vec::new();
+    for (expert, record) in landings {
+        core.directory.unposted(layer, expert);
+        records.push(record);
     }
     let (staging, events) = (prefetch.staging.clone(), shared.events().clone());
-    join.claimed(move |_, _, _| {
-        // Every request of the ticket has ended: dropping it waits for none.
-        drop(ticket);
+    let free = move || {
         for record in records {
             staging.release(record);
         }
         events.notify();
-    });
+    };
+    match read {
+        None => free(),
+        Some((mut ticket, join)) => {
+            if Arc::get_mut(&mut ticket).is_some() {
+                ticket.withdraw();
+            }
+            join.claimed(move |_, _, _| {
+                // Every request of the ticket has ended: dropping it waits
+                // for none.
+                drop(ticket);
+                free();
+            });
+        }
+    }
+}
+
+/// Whether step `sequence`'s request at `layer` ended: its step retired or
+/// failed, or its request failed. Nothing waits on its answers.
+fn request_ended(core: &Core, shared: &Shared, layer: usize, sequence: Step) -> bool {
+    shared.steps.ended(sequence) || core.layers[layer].file.answer_of(sequence, 0) == Some(crate::experts::exchange::Answer::Failed)
+}
+
+impl Posted {
+    /// Give up this request's posted read, serving having ended before
+    /// residency served it ([`give_up`]); its choices are refused with the
+    /// rest (`liveness::refuse`). Whether it posted any.
+    pub(super) fn give_up(self, core: &mut Core, prefetch: &Prefetch, shared: &Shared) -> bool {
+        let Some(PostedRead { landings, posting, .. }) = self.read else {
+            return false;
+        };
+        let read = posting.ok().map(|Posting { ticket, join }| (Arc::new(ticket), join));
+        give_up(core, prefetch, shared, self.layer, read, landings.into_iter().map(|(expert, record, _)| (expert, record)));
+        true
+    }
 }
 
 impl Decode {
@@ -437,14 +468,12 @@ impl Decode {
     pub(super) fn resume(&mut self, serving: Serving<'_>) -> bool {
         let Serving { core, prefetch, shared } = serving;
         let mut progressed = !(self.waiting.is_empty() && self.unclaimed.is_empty()) && prefetch.settle(&mut core.directory);
-        let ended = |core: &Core, at: At| {
-            let (layer, sequence) = (at.point.layer, at.point.sequence);
-            shared.steps.ended(sequence) || core.layers[layer].file.answer_of(sequence, 0) == Some(crate::experts::exchange::Answer::Failed)
-        };
+        let ended = |core: &Core, at: At| request_ended(core, shared, at.point.layer, at.point.sequence);
         for mut unclaimed in std::mem::take(&mut self.unclaimed) {
             let (at, layer) = (unclaimed.at, unclaimed.at.point.layer);
             if ended(core, at) {
-                discard(core, prefetch, shared, layer, unclaimed);
+                let Unclaimed { ticket, join, landings, .. } = unclaimed;
+                give_up(core, prefetch, shared, layer, Some((ticket, join)), landings.into_iter().map(|landing| (landing.expert, landing.record)));
                 progressed = true;
                 continue;
             }
@@ -567,6 +596,12 @@ impl Decode {
     /// request's accounting.
     pub(super) fn serve(&mut self, posted: Posted, at: At, serving: Serving<'_>) {
         let Serving { core, prefetch, shared } = serving;
+        // A request whose step ended before residency served it is given
+        // up: its posted read's staging frees as it ends.
+        if request_ended(core, shared, posted.layer, posted.sequence) {
+            posted.give_up(core, prefetch, shared);
+            return;
+        }
         let Posted { noticed: started, choices, absent, read, .. } = posted;
         let point = at.point;
         let (layer, sequence) = (point.layer, point.sequence);
@@ -725,9 +760,9 @@ impl Decode {
                 // that named their experts fail, and their waits are
                 // answered with none, so the rest of the step serves.
                 Err(reason) => {
-                    for (expert, record, _) in landings {
-                        core.directory.unposted(layer, expert);
-                        prefetch.staging.release(record);
+                    let experts = landings.iter().map(|&(expert, ..)| expert).collect::<Vec<_>>();
+                    give_up(core, prefetch, shared, layer, None, landings.into_iter().map(|(expert, record, _)| (expert, record)));
+                    for expert in experts {
                         shared.steps.fail_request_rows(sequence, layer, &rows_of(expert), reason.clone());
                         answer_of(expert).publish(None);
                     }
