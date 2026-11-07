@@ -1,7 +1,8 @@
 //! Replay of the search against a recorded survey (tuning spec §E2).
 //!
 //! A survey ([`super::tune::Strategy::Survey`]) records every admissible
-//! configuration of one entry instance with every sample of every point. A
+//! configuration of one entry instance that runs work of its own at its
+//! points, with every sample of every point. A
 //! replay runs the production search order ([`GroupSearch`]) over that
 //! record many times: the record is the domain the order asks
 //! ([`plan::Domain`]: what it admits is what the survey recorded), and each
@@ -186,7 +187,7 @@ impl Recording {
     }
 
     /// Configurations the survey recorded: every admissible one of the
-    /// domain it was asked for.
+    /// domain it was asked for that runs work of its own at its points.
     pub fn len(&self) -> usize {
         self.configurations.len()
     }

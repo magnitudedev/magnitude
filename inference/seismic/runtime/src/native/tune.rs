@@ -749,12 +749,13 @@ pub struct SearchPlan {
     pub start: Vec<ParameterValues>,
 }
 
-/// Every admissible configuration, measured and validated (development).
-/// What is surveyed is what the caller names: the declared domain with
-/// `domains` in place of the value lists they name. The admissible
-/// configurations are visited in the declaration's order, a batch at a
-/// time, and never held: what a survey holds is the record it returns, one
-/// entry for each configuration the caller asked for.
+/// Every admissible configuration that runs work of its own at the points,
+/// measured and validated (development; [`SurveyDomain`]). What is surveyed
+/// is what the caller names: the declared domain with `domains` in place of
+/// the value lists they name. The configurations are visited in the
+/// declaration's order, a batch at a time, and never held: what a survey
+/// holds is the record it returns, one entry for each configuration it
+/// visited.
 #[derive(Clone, Debug)]
 pub struct SurveyPlan {
     /// Samples per point of every configuration.
@@ -3185,7 +3186,8 @@ impl ScopeQualification<'_, '_> {
 /// Tune one unit within its budget: its canonical defaults formed, then the
 /// [`UnitSearch`]'s work started piece by piece while each piece's whole
 /// price fits what remains ([`Quote::fits`]), under the original cutoff;
-/// or a survey of every admissible configuration. The result is the unit's
+/// or a survey of every admissible configuration that runs work of its own
+/// at the points ([`SurveyDomain`]). The result is the unit's
 /// served choice when no further piece fits.
 pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
     let began = Instant::now();
@@ -5276,7 +5278,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             let parameters = implementation
                 .params
                 .iter()
-                .filter(|parameter| !unserved.contains(&parameter.name))
+                .filter(|parameter| {
+                    !unserved.contains(&plan::ParameterAddress::Entry(parameter.name.clone()))
+                })
                 .map(|parameter| {
                     (
                         parameter.name.clone(),
@@ -5353,8 +5357,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
     }
 
-    /// Measure and validate every admissible configuration at every point
-    /// (development): the domain the caller named ([`SurveyPlan`]).
+    /// Measure and validate every admissible configuration that runs work
+    /// of its own at the points, at every point (development): the domain
+    /// the caller named ([`SurveyPlan`], [`SurveyDomain`]).
     pub fn survey(
         mut self,
         source: &mut dyn PointSource<'a>,
@@ -5380,6 +5385,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             self.time.building_seconds += began.elapsed().as_secs_f64();
             points.push(ground.validator.point(point)?);
         }
+        let domain = SurveyDomain::of(
+            &self.implementation,
+            &self.statics,
+            &self.default,
+            point_shapes(&self.device, &self.logical, &points)?,
+        )?;
+        // The record names the domain surveyed.
+        self.unit.parameters = entry_parameters(&domain.implementation);
         let formation = Formation {
             device: &self.device,
             module: self.module,
@@ -5394,6 +5407,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         };
         let tuned = Tuned {
             formation: &formation,
+            domain: &domain,
             statics: &self.statics,
             default: &self.default,
             ground: &ground,
@@ -7404,6 +7418,7 @@ struct Records {
 /// One entry's survey.
 struct Tuned<'s> {
     formation: &'s Formation<'s, 's>,
+    domain: &'s SurveyDomain,
     statics: &'s NativeSpecialization,
     default: &'s NativeSpecialization,
     ground: &'s Ground,
@@ -7483,25 +7498,22 @@ impl Tuned<'_> {
             }
             Ok(())
         };
-        // The admissible configurations in the declaration's order, the
-        // defaults first, a batch at a time: the walk holds one batch, and
-        // the survey the records it returns.
+        // The configurations that run work of their own at the points, in
+        // the declaration's order, the defaults first, a batch at a time:
+        // the walk holds one batch, and the survey the records it returns.
         let threads = formation_threads(usize::MAX);
         let mut batch = Vec::with_capacity(threads);
         let mut failed = None;
-        self.formation
-            .implementation
-            .walk_admissible(self.statics, |specialization| {
-                batch.push(specialization.clone());
-                if batch.len() == threads {
-                    if let Err(error) = survey(std::mem::take(&mut batch)) {
-                        failed = Some(error);
-                        return false;
-                    }
+        self.domain.walk(self.statics, self.default, |specialization| {
+            batch.push(specialization.clone());
+            if batch.len() == threads {
+                if let Err(error) = survey(std::mem::take(&mut batch)) {
+                    failed = Some(error);
+                    return false;
                 }
-                true
-            })
-            .map_err(|error| TuneError::Declaration(error.to_string()))?;
+            }
+            true
+        })?;
         if let Some(error) = failed {
             return Err(error);
         }
@@ -7577,16 +7589,17 @@ fn planning(error: plan::PlanError) -> TuneError {
     TuneError::Declaration(format!("native launch plan: {error:?}"))
 }
 
-/// Entry parameters read only by launches that no admissible configuration
-/// activates at any of `shapes`: nothing measures them and no validation
-/// runs their code, so a search keeps their defaults. A parameter no launch
-/// reads affects every launch and is never one of them. With them, the
-/// launches each of `shapes` can run.
+/// Parameters read only by launches that no admissible configuration
+/// activates at any of `shapes`: an entry parameter only such launches read,
+/// and every parameter of such a launch. Nothing measures them and no
+/// validation runs their code, so a search keeps their defaults. A parameter
+/// no launch reads affects every launch and is never one of them. With them,
+/// the launches each of `shapes` can run.
 fn unserved_parameters(
     implementation: &NativeImplementation,
     statics: &NativeSpecialization,
     shapes: &[PointShape],
-) -> Result<(Vec<String>, Vec<plan::PlannedPoint>), TuneError> {
+) -> Result<(Vec<plan::ParameterAddress>, Vec<plan::PlannedPoint>), TuneError> {
     let points = plan::partition(implementation, statics, shapes)
         .map_err(planning)?
         .points;
@@ -7595,7 +7608,7 @@ fn unserved_parameters(
         .flat_map(|point| point.active.iter().copied())
         .collect::<std::collections::BTreeSet<_>>();
     let influence = Influence::of(implementation);
-    let unserved = implementation
+    let entries = implementation
         .params
         .iter()
         .map(|parameter| &parameter.name)
@@ -7607,9 +7620,140 @@ fn unserved_parameters(
                     .enumerate()
                     .all(|(launch, reads)| !reads.contains(name) || !active.contains(&launch))
         })
-        .cloned()
-        .collect();
-    Ok((unserved, points))
+        .map(|name| plan::ParameterAddress::Entry(name.clone()));
+    let launches = implementation
+        .launches
+        .iter()
+        .enumerate()
+        .filter(|(launch, _)| !active.contains(launch))
+        .flat_map(|(ordinal, launch)| {
+            launch
+                .params
+                .iter()
+                .map(move |parameter| plan::ParameterAddress::Launch {
+                    ordinal,
+                    name: parameter.name.clone(),
+                })
+        });
+    Ok((entries.chain(launches).collect(), points))
+}
+
+/// What a survey at its points walks and records: each configuration that
+/// runs work of its own there. A configuration that moves a parameter off
+/// its default which no launch it runs at any point reads runs, at every
+/// point, the work of the configuration with that parameter at its default:
+/// same launches, same keys ([`Influence`]). The survey records that one
+/// alone, as its measurements are the same. The walk's domain holds every
+/// parameter no admissible configuration can make read at a point
+/// ([`unserved_parameters`]) at its default, so walking it takes time in
+/// the configurations that run distinct work, never in the product of the
+/// domains of launches that do not run at the points.
+struct SurveyDomain {
+    /// The unit's implementation with its unserved parameters fixed.
+    implementation: NativeImplementation,
+    influence: Influence,
+    shapes: Vec<PointShape>,
+}
+
+impl SurveyDomain {
+    fn of(
+        implementation: &NativeImplementation,
+        statics: &NativeSpecialization,
+        default: &NativeSpecialization,
+        shapes: Vec<PointShape>,
+    ) -> Result<Self, TuneError> {
+        let (unserved, _) = unserved_parameters(implementation, statics, &shapes)?;
+        let mut walked = implementation.clone();
+        for address in &unserved {
+            let parameter = match address {
+                plan::ParameterAddress::Entry(name) => walked
+                    .params
+                    .iter_mut()
+                    .find(|parameter| parameter.name == *name),
+                plan::ParameterAddress::Launch { ordinal, name } => walked.launches[*ordinal]
+                    .params
+                    .iter_mut()
+                    .find(|parameter| parameter.name == *name),
+            }
+            .expect("an unserved parameter is declared");
+            let value = address.value(default);
+            parameter.values = vec![value];
+            parameter.default = NativeDefault::Value(NativeNatExpr::Constant(value));
+        }
+        Ok(Self {
+            influence: Influence::of(&walked),
+            implementation: walked,
+            shapes,
+        })
+    }
+
+    /// Visit, in declaration order, each admissible configuration that runs
+    /// work of its own at the points, until `visit` returns false.
+    fn walk(
+        &self,
+        statics: &NativeSpecialization,
+        default: &NativeSpecialization,
+        mut visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), TuneError> {
+        self.implementation
+            .walk_admissible(statics, |specialization| {
+                !self.runs_its_own(specialization, default) || visit(specialization)
+            })
+            .map_err(|error| TuneError::Declaration(error.to_string()))
+    }
+
+    /// Whether every parameter `specialization` moves off `default` is read
+    /// by a launch it runs at one of the points.
+    fn runs_its_own(
+        &self,
+        specialization: &NativeSpecialization,
+        default: &NativeSpecialization,
+    ) -> bool {
+        let running = (0..self.implementation.launches.len())
+            .filter(|&launch| self.runs(specialization, launch))
+            .collect::<Vec<_>>();
+        let entries = specialization
+            .params()
+            .iter()
+            .filter(|(name, value)| default.param(name) != Some(**value))
+            .all(|(name, _)| {
+                self.influence.everywhere.contains(name)
+                    || running
+                        .iter()
+                        .any(|launch| self.influence.launches[*launch].contains(name))
+            });
+        entries
+            && specialization
+                .launch_params()
+                .iter()
+                .filter(|((launch, name), value)| {
+                    default.launch_param(*launch, name) != Some(**value)
+                })
+                .all(|((launch, _), _)| running.contains(launch))
+    }
+
+    /// Whether `specialization` runs launch `launch` at one of the points.
+    /// A condition the point cannot decide is taken to hold.
+    fn runs(&self, specialization: &NativeSpecialization, launch: usize) -> bool {
+        let Some(when) = &self.implementation.launches[launch].when else {
+            return true;
+        };
+        let parameter = |name: &str| {
+            specialization
+                .launch_param(launch, name)
+                .or_else(|| specialization.param(name))
+        };
+        self.shapes.iter().any(|shape| {
+            let dimension = |name: &str| {
+                shape
+                    .dimensions
+                    .get(name)
+                    .copied()
+                    .or_else(|| specialization.static_value(name))
+            };
+            when.holds(&dimension, &parameter).unwrap_or(true)
+        })
+    }
 }
 
 fn labels(points: &[PreparedPoint<'_>]) -> Vec<PointRecord> {

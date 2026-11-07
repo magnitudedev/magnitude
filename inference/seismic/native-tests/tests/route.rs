@@ -1096,7 +1096,10 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
 /// What a candidate publishes at a point is determined by the work it runs
 /// there. Configurations that differ only in a parameter no launch working
 /// at the point reads share a key there: the device runs one of them for
-/// observation, once per witness, and the others take that observation.
+/// observation, once per witness, and the others take that observation. A
+/// survey records such configurations only where another point tells them
+/// apart: one whose moved parameter no launch it runs at any point reads
+/// runs the default's work everywhere and is not recorded.
 #[test]
 fn a_numerical_observation_is_made_once_per_point_and_key() {
     use std::cell::Cell;
@@ -1105,34 +1108,44 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
-    // The staged launch alone works at this size, whatever `SMALL` is: the
-    // mirrored launch's participant count changes nothing here.
-    let n = 32u64;
-    let witnesses = [
-        f32_tensor(&device, &[n], &exact_values(n as usize)),
-        f32_tensor(&device, &[n], &vec![1.; n as usize]),
-    ];
+    // At 32 the staged launch alone works, whatever `SMALL` is: the mirrored
+    // launch's participant count changes nothing there. At 200 the mirrored
+    // launch works where `SMALL` is 64, so that count is surveyed there.
+    let sizes = [32u64, 200];
+    let witnesses = sizes.map(|n| {
+        [
+            f32_tensor(&device, &[n], &exact_values(n as usize)),
+            f32_tensor(&device, &[n], &vec![1.; n as usize]),
+        ]
+    });
     let resets = Rc::new(Cell::new(0usize));
-    let counted = resets.clone();
+    let points = sizes
+        .iter()
+        .zip(&witnesses)
+        .map(|(n, witnesses)| {
+            let counted = resets.clone();
+            TuningPoint {
+                label: format!("n{n}"),
+                weight: 1.,
+                class: None,
+                cost: 1.,
+                workload: seismic::WorkloadRotation::All,
+                rotation: witnesses.iter().map(|x| gated_sum::Args { x }).collect(),
+                // Called once as a configuration is placed, and once before
+                // every observed invocation: the default's as the reference
+                // and a candidate's.
+                initialize: Some(Box::new(move || {
+                    counted.set(counted.get() + 1);
+                    Ok(())
+                })),
+                written: Default::default(),
+            }
+        })
+        .collect::<Vec<_>>();
     let survey = gated_sum::native_tune(
         &device,
         &NativeSpecialization::new(),
-        vec![TuningPoint {
-            label: "staged".into(),
-            weight: 1.,
-            class: None,
-            cost: 1.,
-            workload: seismic::WorkloadRotation::All,
-            rotation: witnesses.iter().map(|x| gated_sum::Args { x }).collect(),
-            // Called once as a configuration is placed, and once before
-            // every observed invocation: the default's as the reference
-            // and a candidate's.
-            initialize: Some(Box::new(move || {
-                counted.set(counted.get() + 1);
-                Ok(())
-            })),
-            written: Default::default(),
-        }],
+        points,
         NumericalRequirement::BitExact,
         Strategy::Survey(SurveyPlan {
             samples: 1,
@@ -1142,7 +1155,19 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
     )
     .unwrap();
     let default = &survey.served[0];
-    let mut keys = std::collections::BTreeSet::new();
+    let default_workers = |record: &seismic::ConfigurationRecord| {
+        record.configuration.params["cpu.workers.1"] == default.params["cpu.workers.1"]
+    };
+    // Where the mirrored launch never works (`SMALL` past both sizes), its
+    // participant count is recorded at its default alone.
+    assert!(
+        survey
+            .configurations
+            .iter()
+            .filter(|record| record.configuration.params["SMALL"] != 64)
+            .all(default_workers)
+    );
+    let mut keys = sizes.map(|_| std::collections::BTreeSet::new());
     for record in &survey.configurations {
         let Outcome::Measured { points, .. } = &record.outcome else {
             panic!("{:?}", record.outcome)
@@ -1153,29 +1178,34 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
             assert!(record.observations.is_empty());
             continue;
         }
-        // Every candidate holds the observation made under its own key.
-        let [observation] = record.observations[..] else {
-            panic!("{:?}", record.observations)
-        };
-        assert_eq!(survey.observations[observation].key, points[0].key);
-        assert_eq!(
-            survey.observations[observation].rotations.len(),
-            witnesses.len()
-        );
-        keys.insert(points[0].key.clone());
+        // Every candidate holds the observation made under its own key at
+        // each point.
+        assert_eq!(record.observations.len(), sizes.len(), "{:?}", record.observations);
+        for (point, (measured, keys)) in points.iter().zip(&mut keys).enumerate() {
+            let observation = record
+                .observations
+                .iter()
+                .map(|&index| &survey.observations[index])
+                .find(|observation| observation.point == format!("n{}", sizes[point]))
+                .unwrap();
+            assert_eq!(observation.key, measured.key);
+            assert_eq!(observation.rotations.len(), witnesses[point].len());
+            keys.insert(measured.key.clone());
+        }
     }
     let candidates = survey.configurations.len() - 1;
     assert!(
-        keys.len() < candidates,
-        "{candidates} candidates must share some of their {} keys for this to test reuse",
-        keys.len()
+        keys[0].len() < candidates,
+        "{candidates} candidates must share some of their {} keys at 32 for this to test reuse",
+        keys[0].len()
     );
-    assert_eq!(survey.observations.len(), keys.len());
+    let distinct = keys.iter().map(|keys| keys.len()).sum::<usize>();
+    assert_eq!(survey.observations.len(), distinct);
     // The device ran each witness once for the default and once per
-    // distinct key, not once per candidate.
+    // distinct key at each point, not once per candidate.
     assert_eq!(
         resets.get(),
-        survey.configurations.len() + witnesses.len() * (1 + keys.len())
+        sizes.len() * survey.configurations.len() + 2 * (sizes.len() + distinct)
     );
 }
 

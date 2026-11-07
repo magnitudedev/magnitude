@@ -3,7 +3,9 @@
 //!
 //! A process that installs a [`TuningSurvey`] replaces the search of every
 //! tuned entry instance (or of the named entries) by a survey: every
-//! admissible configuration is formed, measured with
+//! admissible configuration that runs work of its own at the surveyed
+//! points (one moving only parameters no launch it runs there reads runs
+//! its default's work) is formed, measured with
 //! [`TuningSurvey::samples`] samples per point, and validated, and the whole
 //! Seismic `TuningResult` (every raw sample of every configuration) is
 //! written to one JSON file per entry instance: the true cost of every
