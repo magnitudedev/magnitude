@@ -2040,7 +2040,8 @@ fn assessment(artifacts: &Artifacts, options: &EngineOptions) -> Result<Assessme
 /// the plan's structure and the machine's stored figures alone, against the
 /// window's measured mean step, each per sequence. Why it is unavailable,
 /// when an input is absent: the model unsupported here, this machine's
-/// costs or streamed figures unmeasured, no estimate at a count of slots.
+/// costs or streamed figures unmeasured, a plan that holds every expert
+/// (nothing streams to estimate), no estimate at a count of slots.
 fn estimated(
     assessment: &Assessment,
     engine: &Engine,
@@ -2080,7 +2081,7 @@ fn estimated(
     let host = window_host_slots(cell)?;
     // The bank the plan streams its experts through, whose slots are priced
     // at each count: none where the plan holds them whole.
-    let bank = draft.load().expert_bank().filter(|bank| !bank.whole()).ok_or("the plan holds its experts whole")?;
+    let bank = draft.load().expert_bank().filter(|bank| !bank.whole()).ok_or_else(|| unavailable("the plan holds its experts whole"))?;
     let mut by_slots = Vec::new();
     for slots in 1..=costs.experts {
         let held = magnitude_executor::assessment::HeldSlots { slots, host };
