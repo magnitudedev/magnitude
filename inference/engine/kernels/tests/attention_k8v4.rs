@@ -30,6 +30,14 @@ const GROUPED: Geometry = Geometry {
     s: 48,
 };
 
+/// Flash Next's attention geometry: 12 query heads a kv head of 256 columns.
+const SLICED: Geometry = Geometry {
+    kv: 2,
+    g: 12,
+    p: 32,
+    s: 192,
+};
+
 /// F16 coefficient elements of one head vector: a (scale, zero) pair per
 /// group.
 fn coefficient_elements(width: usize) -> usize {
@@ -2170,6 +2178,20 @@ fn decode_reads_spans_crossing_affine_history_slabs() {
 /// and the row's key count without walking the table serially.
 #[test]
 fn decode_reads_scattered_selected_runs() {
+    scattered_selected_runs(GROUPED);
+}
+
+/// A selected read at Flash Next's attention geometry (12 query heads a kv
+/// head, 256 columns): its matrix decode slices the columns four ways, so
+/// one team and two teams of slices each gather the runs' keys into tiles.
+#[test]
+fn decode_reads_scattered_selected_runs_in_column_slices() {
+    scattered_selected_runs(SLICED);
+}
+
+/// Rows reading scattered few-key runs (QSA's selected blocks) beside one
+/// long run, and a second row mixing runs of other lengths.
+fn scattered_selected_runs(geometry: Geometry) {
     let mut scattered = (0..70).map(|block| (8 * block, 8 * block + 4)).collect::<Vec<_>>();
     scattered.extend([(560, 573), (0, 0), (0, 0), (0, 0)]);
     let mut mixed = vec![(3, 9), (0, 0), (30, 34)];
@@ -2191,19 +2213,19 @@ fn decode_reads_scattered_selected_runs() {
         },
     ];
     let spans = rows[0].spans.len();
-    let encoded = Encoded::new(Case::new(GROUPED, 608, spans, &rows, 83));
+    let encoded = Encoded::new(Case::new(geometry, 608, spans, &rows, 83));
     let expected = encoded.expected();
     for device in seismic_native_tests::every_device() {
         let backend = device.backend();
-        for config in decode_configs(backend, GROUPED) {
-            let kernel = decode_kernel(&device, GROUPED, &config);
+        for config in decode_configs(backend, geometry) {
+            let kernel = decode_kernel(&device, geometry, &config);
             let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, false);
             let gated = kernel
                 .call(args!(attention_decode_k8v4, bound, encoded.case))
                 .unwrap()
                 .value;
             check(
-                &format!("{backend:?} affine scattered-run decode {config:?}"),
+                &format!("{backend:?} affine scattered-run decode g{} {config:?}", geometry.g),
                 &encoded,
                 &gated,
                 &bound,

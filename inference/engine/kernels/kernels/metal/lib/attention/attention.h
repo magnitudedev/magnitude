@@ -710,6 +710,36 @@ struct decode_slab_tile {
     }
 };
 
+// The history rows of a decode tile's keys: KEYS rows from `first` in
+// order, or (`gathered`) key k's row held by lane k in `row`, for a tile
+// whose keys come from several of a row's visible spans. Only keys below
+// `count` are read. `at` of gathered rows is a simdgroup exchange: every
+// lane calls it together (`gathered` is the simdgroup's).
+struct tile_rows {
+    int first;
+    int row;
+    uint count;
+    bool gathered;
+
+    static inline tile_rows contiguous(int first, uint count) { return tile_rows{first, 0, count, false}; }
+
+    inline int at(uint k) const {
+        return gathered ? simd_shuffle(row, ushort(k % 32)) : first + int(k);
+    }
+
+    // Key k's row of a table of `elements`-element rows: one resolved slab
+    // for contiguous keys (`slab`), the row's own for gathered ones.
+    template <typename T>
+    inline device const T *of(thread const decode_slab_tile<T> &slab, device const ulong *table,
+        ulong rows_per_slab, uint k, int t, ulong elements) const {
+        if (!gathered)
+            return slab.row(k, elements);
+        const uint rows = uint(rows_per_slab);
+        const uint index = uint(t) / rows;
+        return slab::region<T>(table, index) + ulong(uint(t) - index * rows) * elements;
+    }
+};
+
 // The rows of one kv head's keys and values that the direct form reads as
 // device operands: `rows` rows of [.., KV, W] elements from logical row
 // `first`. A tile of `keys` rows for the keys from `at` starts at `at`, or
@@ -794,10 +824,10 @@ struct dense_history {
     // P.V product as F16, exact for activation values within F16's range.
     typedef Scalar KeyOperand;
 
-    // One simdgroup's rows [first, first + KEYS) of columns [col0, col0 + WC)
-    // of one kv head in registers, eight elements per 16-byte piece split
-    // over the 32 lanes; rows at or past `end` are zero. Stored into tile
-    // regions of pitch WC + 8.
+    // One simdgroup's KEYS history rows (`tile_rows`) of columns
+    // [col0, col0 + WC) of one kv head in registers, eight elements per
+    // 16-byte piece split over the 32 lanes; keys past the rows' count are
+    // zero. Stored into tile regions of pitch WC + 8.
     template <uint KEYS, uint WC>
     struct decode_tile {
         enum : uint {
@@ -842,23 +872,25 @@ struct dense_history {
     };
 
     template <uint KEYS, uint WC>
-    inline void load_tile(thread decode_tile<KEYS, WC> &tile, int first, int end, uint kv_head, uint col0,
+    inline void load_tile(thread decode_tile<KEYS, WC> &tile, tile_rows rows, uint kv_head, uint col0,
         uint lane) const {
         constexpr uint PIECES = decode_tile<KEYS, WC>::PIECES;
-        const decode_slab_tile<Scalar> keys(key, rows_per_slab, first);
-        const decode_slab_tile<Scalar> values(value, rows_per_slab, first);
+        constexpr ulong ELEMENTS = SEISMIC_DIM_KV * ATTENTION_W;
+        const decode_slab_tile<Scalar> keys(key, rows_per_slab, rows.first);
+        const decode_slab_tile<Scalar> values(value, rows_per_slab, rows.first);
         ATTENTION_UNROLL
         for (uint n = 0; n < decode_tile<KEYS, WC>::COUNT; ++n) {
             const uint item = lane + n * 32;
-            const int t = first + int(item / PIECES);
+            const uint k = item / PIECES;
+            const int t = rows.at(k);
             tile.key[n] = uint4(0);
             tile.value[n] = uint4(0);
-            if (item < KEYS * PIECES && t < end) {
+            if (item < KEYS * PIECES && k < rows.count) {
                 const ulong column = ulong(kv_head) * ATTENTION_W + col0 + (item % PIECES) * 8;
                 tile.key[n] = *reinterpret_cast<device const uint4 *>(
-                    keys.row(item / PIECES, SEISMIC_DIM_KV * ATTENTION_W) + column);
+                    rows.of(keys, key, rows_per_slab, k, t, ELEMENTS) + column);
                 tile.value[n] = *reinterpret_cast<device const uint4 *>(
-                    values.row(item / PIECES, SEISMIC_DIM_KV * ATTENTION_W) + column);
+                    rows.of(values, value, rows_per_slab, k, t, ELEMENTS) + column);
             }
         }
     }
@@ -1015,11 +1047,11 @@ struct affine_history {
             end, kv_head, thread_index);
     }
 
-    // One simdgroup's code pieces of rows [first, first + KEYS) of columns
-    // [col0, col0 + WC) of one kv head, `stage`'s items split over the 32
-    // lanes: loaded into registers, then decoded into a tile region of pitch
-    // WC + 8 by the matrix decode. Rows at or past `end` hold zero codes and
-    // coefficients, which decode to zero.
+    // One simdgroup's code pieces of KEYS history rows (`tile_rows`) of
+    // columns [col0, col0 + WC) of one kv head, `stage`'s items split over
+    // the 32 lanes: loaded into registers, then decoded into a tile region of
+    // pitch WC + 8 by the matrix decode. Keys past the rows' count hold zero
+    // codes and coefficients, which decode to zero.
     template <uint B, uint KEYS, uint WC>
     struct pieces {
         enum : uint {
@@ -1031,24 +1063,25 @@ struct affine_history {
         half2 pair[COUNT];
 
         inline void load(device const ulong *code_table, device const ulong *coefficient_table,
-            ulong rows_per_slab, int first, int end, uint kv_head, uint col0, uint lane) {
+            ulong rows_per_slab, tile_rows rows, uint kv_head, uint col0, uint lane) {
             constexpr uint ROW_WORDS = lane_codes<B>::row_words;
             constexpr uint PAIRS = lane_codes<B>::pairs;
-            const decode_slab_tile<uint> codes(code_table, rows_per_slab, first);
-            const decode_slab_tile<half> coefficients(coefficient_table, rows_per_slab, first);
+            const decode_slab_tile<uint> codes(code_table, rows_per_slab, rows.first);
+            const decode_slab_tile<half> coefficients(coefficient_table, rows_per_slab, rows.first);
             ATTENTION_UNROLL
             for (uint n = 0; n < COUNT; ++n) {
                 const uint item = lane + n * 32;
                 const uint k = item / PIECES;
                 const uint column = col0 + (item % PIECES) * PER;
-                const int t = first + int(k);
+                const int t = rows.at(k);
                 words[n] = uint4(0);
                 pair[n] = half2(0.0h);
-                if (item < KEYS * PIECES && t < end) {
+                if (item < KEYS * PIECES && k < rows.count) {
                     words[n] = *reinterpret_cast<device const uint4 *>(
-                        codes.row(k, SEISMIC_DIM_KV * ROW_WORDS) + ulong(kv_head) * ROW_WORDS + column * B / 32);
+                        rows.of(codes, code_table, rows_per_slab, k, t, SEISMIC_DIM_KV * ROW_WORDS)
+                            + ulong(kv_head) * ROW_WORDS + column * B / 32);
                     pair[n] = *reinterpret_cast<device const half2 *>(
-                        coefficients.row(k, SEISMIC_DIM_KV * PAIRS * 2)
+                        rows.of(coefficients, coefficient_table, rows_per_slab, k, t, SEISMIC_DIM_KV * PAIRS * 2)
                             + (ulong(kv_head) * PAIRS + column / ATTENTION_GROUP) * 2);
                 }
             }
@@ -1113,10 +1146,10 @@ struct affine_history {
     };
 
     template <uint KEYS, uint WC>
-    inline void load_tile(thread decode_tile<KEYS, WC> &tile, int first, int end, uint kv_head, uint col0,
+    inline void load_tile(thread decode_tile<KEYS, WC> &tile, tile_rows rows, uint kv_head, uint col0,
         uint lane) const {
-        tile.key.load(key_codes, key_coefficients, rows_per_slab, first, end, kv_head, col0, lane);
-        tile.value.load(value_codes, value_coefficients, rows_per_slab, first, end, kv_head, col0, lane);
+        tile.key.load(key_codes, key_coefficients, rows_per_slab, rows, kv_head, col0, lane);
+        tile.value.load(value_codes, value_coefficients, rows_per_slab, rows, kv_head, col0, lane);
     }
 };
 
@@ -3548,7 +3581,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         threadgroup KeyOperand *stripe_key = key_region + offset * PITCH;
         threadgroup half *stripe_value = value_region + offset * PITCH;
         if (historical) {
-            history.load_tile(stripe, first, first + int(available), kv_head, 0, lane);
+            history.load_tile(stripe, tile_rows::contiguous(first, available), kv_head, 0, lane);
             stripe.store_key_direct(stripe_key, lane);
             stripe.store_value_direct(stripe_value, lane);
         } else {
@@ -3565,13 +3598,13 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     // packed tile was staged by `stage_packed`; other tiles are staged
     // here).
     auto absorb_tile = [&](bool live, bool historical, ulong span, bool inside, int token, uint count,
-                           threadgroup KeyOperand *keys, threadgroup half *values) {
+                           tile_rows history_rows, threadgroup KeyOperand *keys, threadgroup half *values) {
         typename History::template decode_tile<KEYS, WC> tile;
         simdgroup_matrix<float, 8, 8> scores[RB][KB];
         if (live) {
             if (!PACKED) {
                 if (historical) {
-                    history.load_tile(tile, token, token + int(count), kv_head, col0, lane);
+                    history.load_tile(tile, history_rows, kv_head, col0, lane);
                     if (DIRECT)
                         tile.store_key_direct(key_region, lane);
                     else
@@ -3732,17 +3765,116 @@ inline void decode_matrix(History history, device const Scalar *query, device co
 
     // A packed tile is staged by the whole threadgroup, then absorbed; the
     // barrier after P.V frees the regions for the next tile.
-    auto visit = [&](bool historical, ulong span, bool inside, int token, uint count) {
+    auto visit = [&](bool historical, ulong span, bool inside, int token, uint count, tile_rows history_rows) {
         if (PACKED) {
             stage_packed(historical, token, count);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        absorb_tile(true, historical, span, inside, token, count, key_region, value_region);
+        absorb_tile(true, historical, span, inside, token, count, history_rows, key_region, value_region);
         if (PACKED)
             threadgroup_barrier(mem_flags::mem_threadgroup);
     };
 
-    if (COLS == 1 || TEAMS == 1) {
+    // A single row's tiles gather keys across its visible spans. A selected
+    // read's spans are runs of a few keys (QSA's 4-key blocks), which tiled
+    // span by span would leave most of each KEYS-key tile empty: a tile here
+    // takes the range's history keys in order, KEYS at a time, key k's row
+    // held by lane k (`tile_rows`), so a range of n history keys takes
+    // ceil(n / KEYS) tiles however its spans fall. A tile within one run
+    // loads its rows as contiguous ones, as a span's tiles always did. The
+    // fresh span is tiled alone. A tile lies in the row's own intervals: nothing in it is masked.
+    // Spans that average a tile or more waste at most one partial tile each
+    // span by span, and take the span walk: only a table of runs shorter than
+    // a tile (R * KEYS > total keys) gathers.
+    constexpr bool GATHER = TOKENS == 1 && !PACKED;
+    if (GATHER && R * KEYS > total) {
+        // The walk: span `span` (`interval`, `length` keys at key offset
+        // `offset`), its part [position, end) of the team's range still to
+        // tile.
+        const span_start start = tile_locate(visible, fresh, row0, TOKENS, rows, R, first, lane);
+        ulong span = start.span;
+        uint offset = start.offset;
+        uint length = 0;
+        tile_interval interval{0, 0, 0, 0};
+        uint position = 0;
+        uint end = 0;
+        bool opened = false;
+        // The next tile of the range: its key count (0 past the range), and
+        // whether it is history, its first fresh key, and its rows.
+        auto next = [&](thread bool &historical, thread int &token, thread tile_rows &held) {
+            uint filled = 0;
+            int row = 0;
+            // The tile's first key's row and its runs: a tile of one run
+            // loads as contiguous rows.
+            int start = 0;
+            uint runs = 0;
+            for (;;) {
+                while (position >= end && span <= R && (!opened || offset + length < last)) {
+                    if (opened) {
+                        offset += length;
+                        ++span;
+                        if (span > R)
+                            break;
+                    }
+                    opened = true;
+                    interval = tile_span(visible, fresh, row0, TOKENS, rows, R, span);
+                    length = uint(interval.hi - interval.lo);
+                    position = metal::max(first, offset);
+                    end = metal::min(last, offset + length);
+                }
+                if (position >= end || (span == R && filled > 0))
+                    break;
+                const int at = interval.lo + int(position - offset);
+                if (span == R) {
+                    const uint count = metal::min(uint(KEYS), end - position);
+                    position += count;
+                    historical = false;
+                    token = at;
+                    held = tile_rows::contiguous(at, count);
+                    return count;
+                }
+                const uint taken = metal::min(uint(KEYS) - filled, end - position);
+                if (lane >= filled && lane < filled + taken)
+                    row = at + int(lane - filled);
+                if (runs == 0)
+                    start = at;
+                ++runs;
+                filled += taken;
+                position += taken;
+                if (filled == KEYS)
+                    break;
+            }
+            historical = true;
+            token = start;
+            held = runs == 1 ? tile_rows::contiguous(start, filled) : tile_rows{0, row, filled, true};
+            return filled;
+        };
+        bool historical = true;
+        int token = 0;
+        tile_rows held = tile_rows::contiguous(0, 0);
+        if (COLS == 1 || TEAMS == 1) {
+            for (uint count = next(historical, token, held); count > 0; count = next(historical, token, held))
+                visit(historical, R, true, token, count, held);
+        } else {
+            // Every team takes the most tiles of any team (`form_tiles`'s
+            // rounds): its history keys in tiles, then its fresh keys.
+            int fresh_lo, fresh_hi;
+            form_span(visible, fresh, row0, R, R, fresh_lo, fresh_hi);
+            const uint history_keys = total - uint(metal::max(fresh_hi - fresh_lo, 0));
+            uint rounds = 0;
+            for (uint t = 0; t < TEAMS; ++t) {
+                const uint team_first = metal::min(partition_lo + t * sub, partition_hi);
+                const uint team_last = metal::min(team_first + sub, partition_hi);
+                const uint split = metal::clamp(history_keys, team_first, team_last);
+                rounds = metal::max(rounds,
+                    (split - team_first + KEYS - 1) / KEYS + (team_last - split + KEYS - 1) / KEYS);
+            }
+            for (uint round = 0; round < rounds; ++round) {
+                const uint count = next(historical, token, held);
+                absorb_tile(count > 0, historical, R, true, token, count, held, key_region, value_region);
+            }
+        }
+    } else if (COLS == 1 || TEAMS == 1) {
         const span_start start = tile_locate(visible, fresh, row0, TOKENS, rows, R, first, lane);
         uint offset = start.offset;
         for (ulong span = start.span; span <= R && offset < last; ++span) {
@@ -3754,7 +3886,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
                 const int token = interval.lo + int(position - offset);
                 const uint count = metal::min(uint(KEYS), end - position);
                 visit(span < R, span, token >= interval.common_lo && token + int(count) <= interval.common_hi,
-                    token, count);
+                    token, count, tile_rows::contiguous(token, count));
             }
             offset += length;
         }
@@ -3798,8 +3930,8 @@ inline void decode_matrix(History history, device const Scalar *query, device co
             const int token = interval.lo + int(position - offset);
             const uint count = live ? metal::min(uint(KEYS), end - position) : 0;
             absorb_tile(live, span < R, span,
-                token >= interval.common_lo && token + int(count) <= interval.common_hi, token, count, key_region,
-                value_region);
+                token >= interval.common_lo && token + int(count) <= interval.common_hi, token, count,
+                tile_rows::contiguous(token, count), key_region, value_region);
             if (live)
                 position += KEYS;
         }
