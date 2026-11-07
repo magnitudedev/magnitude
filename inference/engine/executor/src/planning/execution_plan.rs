@@ -713,14 +713,23 @@ impl ExecutionPlanDraft {
         let rates = prices.rates();
         // A pass's misses are read at the most the bank and its host tier
         // can hold: the least a merged pass saves, whatever the settle
-        // grants the bank.
+        // grants the bank. The bank holds no more than its ceiling, nor
+        // than the room beside the mandatory part admits.
+        let room = room.room(&floor_charge, mandatory_bytes)?;
+        let admitted = reserved(points[0])?.saturating_add(room.free.min(room.ceiling));
+        let mut fits = points[0];
+        for &slots in &points {
+            if reserved(slots)? > admitted {
+                break;
+            }
+            fits = slots;
+        }
         let count = |slots: u64| usize::try_from(slots).map_err(|_| PlanError::Arithmetic("a bank's slots exceed usize"));
-        let most = crate::assessment::HeldSlots { slots: count(ceiling)?, host: count(bank.host_ceiling().unwrap_or(0))? };
+        let most = crate::assessment::HeldSlots { slots: count(fits)?, host: count(bank.host_ceiling().unwrap_or(0))? };
         let curves = vec![
             stepped(Holding::Bank(BankHolding::Experts), &points, &reserved, &seconds, rates.decode_steps_per_s)?,
             super::pass_rows_curve(&ladder, 0, &pass_bytes, &|pass| prices.prompt_seconds(pass, most), rates.requests_per_s, 0.0),
         ];
-        let room = room.room(&floor_charge, mandatory_bytes)?;
         let mut settled = None;
         let granted = settle_confirmed(curves, load_supply(room), |granted| -> Result<Result<(), NonZeroU64>, E> {
             let (slots, pass) = (points[granted[0]], ladder[granted[1]]);
@@ -1597,8 +1606,20 @@ mod tests {
     /// The recorded RTX 3090 with `host` bytes of host RAM free, CUDA's
     /// pooled graph memory as it measured it.
     fn rtx3090(host: u64) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
+        // CUDA's pooled driver memory as the RTX 3090 measured it.
+        let cost = seismic::GraphCost::Pooled { graph: 92_663, launch: 8_102, granule: 2 << 20 };
+        recorded(seismic::fixtures::recorded::rtx3090(), BackendName::Cuda, host, cost)
+    }
+
+    /// `topology`'s `backend` executor with `host` bytes of host RAM free,
+    /// its graphs costing `cost`.
+    fn recorded(
+        topology: seismic::DeviceTopology,
+        backend: BackendName,
+        host: u64,
+        cost: seismic::GraphCost,
+    ) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
         use crate::platform::{GraphPricing, MemoryReserves};
-        let topology = seismic::fixtures::recorded::rtx3090();
         let status = seismic::Status {
             sample: seismic::Sample {
                 taken: std::time::SystemTime::now(),
@@ -1620,9 +1641,7 @@ mod tests {
             runtime: Default::default(),
         };
         let reserves = MemoryReserves::of_machine(None);
-        let info = topology.executors().iter().find(|executor| executor.backend() == BackendName::Cuda).unwrap().clone();
-        // CUDA's pooled driver memory as the RTX 3090 measured it.
-        let cost = seismic::GraphCost::Pooled { graph: 92_663, launch: 8_102, granule: 2 << 20 };
+        let info = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap().clone();
         let device = crate::platform::selected(&topology, &status, &reserves, info, GraphPricing::Measured(cost)).unwrap();
         (topology, status, reserves, device)
     }
@@ -1742,5 +1761,44 @@ mod tests {
         // The cap, not the host's room, ends the tier.
         let ceiling = held.host_ceiling().unwrap();
         assert!(ceiling < held.widest().get() && held.host_slots <= ceiling, "{} host slots under a ceiling of {ceiling}", held.host_slots);
+    }
+
+    /// A merged pass's saving is its misses' reads at the most the bank
+    /// can hold, which is no more than the room admits, whatever its
+    /// ceiling: Gemma 26B q4 on the recorded M4 Pro, uncapped (its ceiling
+    /// every expert) but with room beside its mandatory part for half its
+    /// experts, reads the rest from storage, so passes that read them fewer
+    /// times save storage reads and the settle merges launches.
+    #[test]
+    fn a_pass_saves_the_misses_of_the_bank_the_room_admits() {
+        use crate::planning::fixtures::{LIMITS, gemma_moe_fixture_definition, gemma_moe_fixture_manifest};
+        let (_, _, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let definition = gemma_moe_fixture_definition();
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        let prices = Priced::Measured(crate::assessment::synthetic::plan_prices());
+        let whole = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, None, &prices).unwrap().into_draft();
+        let bank = whole.load().expert_bank().expect("a routed load banks its experts");
+        let half = bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
+        let room = |_: u64| PlanRoom { free: half, ceiling: half };
+        let (planned, ()) = draft
+            .with_held_experts(&definition, HeldBound::Unbounded, &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
+                Ok::<_, PlanError>(Ok(()))
+            })
+            .unwrap()
+            .unwrap_or_else(|no| panic!("Gemma 26B q4 streams beside half its experts: {no:?}"));
+        let held = planned.draft().load().expert_bank().unwrap();
+        assert!(held.slots < held.widest().get(), "{} of {} slots", held.slots, held.widest());
+        assert!(held.pass > PassLaunches::FLOOR, "{:?} beside {} streamed slots", held.pass, held.widest().get() - held.slots);
     }
 }
