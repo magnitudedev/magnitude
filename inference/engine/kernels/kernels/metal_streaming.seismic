@@ -117,7 +117,7 @@ native routed_down_project for metal from "metal/routed_down_project.metal":
     records (expert_down, tier_down)
     where K <= 32 and ceil_div(F, 32 * LANES) * ROWS <= 8
     launch routed_down_project:
-        params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32] default 16)
+        params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * K, 1, 1)
 
@@ -137,7 +137,7 @@ native routed_output_project for metal from "metal/routed_output_project.metal":
     records (expert_down, tier_down)
     where K < 32 and ceil_div(max(F, S), 32 * LANES) * ROWS <= 8
     launch routed_output_project:
-        params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32] default 16)
+        params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
         threadgroups (ceil_div(H, ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * (K + 1), 1, 1)
 

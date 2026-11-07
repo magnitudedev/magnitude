@@ -427,15 +427,17 @@ fn decode_output_join[M, H, SN, IN, K, SF, R](residual: &tensor[M, SN * H] f32,
 # Metal: the K choices and the shared expert project side by side, one
 # simdgroup each, over a tile of (32 / LANES) * ROWS output channels; each
 # lane group of LANES lanes owns ROWS channels and issues all their packet
-# loads at once, reading the product straight from device memory. The
-# projections are the rows16 GEMV's sums for the same LANES (so LANES is
-# arithmetic); they meet in threadgroup memory, and one thread per channel
-# carries the slot-order sum. A lane holds ROWS * ceil(F / (32 LANES))
-# weight packets in registers (at most 8: more spill). (CUDA: the mma16
+# loads at once, against the product row its simdgroup stages in
+# threadgroup memory. LANES sets each projection's summation order (so it is
+# arithmetic); down to 4 lanes, a short down row still keeps several loads
+# in flight a lane. The projections meet in threadgroup memory, and one
+# thread per channel carries the slot-order sum. A lane holds
+# ROWS * ceil(F / (32 LANES)) weight packets in registers (at most 8: more
+# spill). (CUDA: the mma16
 # swap-AB GEMV per choice in slot order.)
 native routed_output for metal from "metal/routed_output.metal":
     static (H, SN, IN, K, F, S)
-    params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32] default 16)
+    params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
     records (expert_down, tier_down)
     where K < 32 and ceil_div(max(F, S), 32 * LANES) * ROWS <= 8
     launch routed_output when XS > 0:
@@ -476,16 +478,17 @@ native routed_output for cuda from "cuda/routed_output.cu":
         threads_per_threadgroup (128, 1, 1)
 
 # Vulkan: project the expert choices and shared expert in separate workgroups,
-# then combine their A-rounded outputs in choice order. Decode lane groups
-# are whole subgroups. A tier-served choice's workgroups read its tier record
-# in place, over the link.
+# then combine their A-rounded outputs in choice order. A lane group of
+# LANES lanes owns ROWS channels; LANES sets the summation order (so it is
+# arithmetic). A tier-served choice's workgroups read its tier record in
+# place, over the link.
 native routed_output for vulkan from "vulkan/routed_output.comp":
     static (H, SN, IN, K, F, S)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16, 8] default 32)
     records (expert_down, tier_down)
     scratch projected bytes (M * (K + 1) * H * 2)
     launch routed_output_project:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M * (K + 1), 1)
+        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M * (K + 1), 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * max(operands(EDW), operands(SDW)) + min(ceil_div(max(F, S), 32), 288) * 72)
     launch routed_output_combine:
@@ -1532,7 +1535,7 @@ native routed_up for cpu from "cpu/routed_up.rs":
 # registers.)
 native routed_down for metal from "metal/routed_down.metal":
     static (H, K, F)
-    params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32] default 16)
+    params (ROWS in [2, 1, 4, 8] default 2, arithmetic LANES in [16, 32, 8, 4] default 16)
     records (expert_down, tier_down)
     where K <= 32 and ceil_div(F, 32 * LANES) * ROWS <= 8
     launch routed_down when XS > 0:
@@ -1581,10 +1584,10 @@ native routed_down for cuda from "cuda/routed_down.cu":
 # tier record in place, over the link.
 native routed_down for vulkan from "vulkan/routed_down.comp":
     static (H, K, F)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16, 8] default 32)
     records (expert_down, tier_down)
     launch routed_down:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M, 1)
+        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EDW) + min(ceil_div(F, 32), 288) * 72)
 

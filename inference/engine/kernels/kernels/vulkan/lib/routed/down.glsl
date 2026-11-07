@@ -29,6 +29,9 @@
 #endif
 
 #define DOWN_R SEISMIC_TUNE_ROWS
+// Lanes a weight row: a down row is short (20 packets at Flash Next's 640
+// columns), so fewer than a subgroup keep every lane loading.
+#define DOWN_LANES SEISMIC_TUNE_LANES
 
 // Choice (m, k)'s projection sums of workgroup tile `tile` into `totals`
 // (row r's at r * PROJECTION_GEMV_MAX_M): zero where the device computes
@@ -54,7 +57,7 @@ void routed_down_choice(const uint64_t m, const uint64_t k, const uint tile, out
         0ul, SEISMIC_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul), DOWN_OPERANDS);
     const projection_weights down = routed_source_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
         SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN), source, PACKETS_W0_STACKED_ROWS, uint(SEISMIC_DIM_F));
-    projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, DOWN_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
+    projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, DOWN_R, DOWN_LANES, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
         hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
 }
 
@@ -64,13 +67,13 @@ void routed_down_publish() {
     const uint tile = gl_WorkGroupID.x;
     const uint64_t m = gl_WorkGroupID.y;
     const uint hidden = uint(SEISMIC_DIM_H);
-    const uint first = projection_gemv_first_row(DOWN_R, 32u, tile);
+    const uint first = projection_gemv_first_row(DOWN_R, DOWN_LANES, tile);
     float totals[PROJECTION_GEMV_SUMS];
     for (uint64_t k = 0ul; k < SEISMIC_DIM_K; ++k) {
         routed_down_choice(m, k, tile, totals);
         [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
             const uint n = first + r;
-            if (r < DOWN_R && n < hidden && SEISMIC_LANE == r)
+            if (r < DOWN_R && n < hidden && SEISMIC_LANE % DOWN_LANES == r)
                 element_put(ROUTED_ACT, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, k, uint64_t(n)),
                     totals[r * PROJECTION_GEMV_MAX_M]);
         }

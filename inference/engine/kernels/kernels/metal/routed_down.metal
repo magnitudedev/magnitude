@@ -30,10 +30,11 @@
 #define ROUTED_DOWN_BODY                                                                                          \
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();                                                       \
     threadgroup float projected[uint(SEISMIC_DIM_K)][TILE];                                                       \
+    threadgroup uint4 staged[uint(SEISMIC_DIM_K)][4 * routed::down_stage()];                                      \
     const ulong m = group.y;                                                                                      \
     const uint first = group.x * TILE;                                                                            \
     routed::down_project<ROWS, LANES>(product, routes, sources, expert_down, tier_down, m, first, sg, lane,       \
-        projected[sg], seismic_words);                                                                            \
+        staged[sg], projected[sg], seismic_words);                                                                \
     threadgroup_barrier(mem_flags::mem_threadgroup);                                                              \
     const uint n = first + tid;                                                                                   \
     if (tid >= TILE || n >= uint(SEISMIC_DIM_H))                                                                  \

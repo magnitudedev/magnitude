@@ -234,10 +234,10 @@ native routed_site_request for vulkan from "vulkan/routed_site_request.comp":
 # (`lib/routed/down.glsl`), publishing each choice's projection.
 native routed_down_project for vulkan from "vulkan/routed_down_project.comp":
     static (H, K, F)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16, 8] default 32)
     records (expert_down, tier_down)
     launch routed_down_project:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M, 1)
+        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * operands(EDW) + min(ceil_div(F, 32), 288) * 72)
 
@@ -254,10 +254,10 @@ native routed_down_sited for vulkan from "vulkan/routed_down_sited.comp":
 # publishing into the result.
 native routed_output_project for vulkan from "vulkan/routed_output_project.comp":
     static (H, K, F, S)
-    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1)
+    params (SIMDGROUPS in [2, 4, 8] default 2, ROWS in [1, 2, 4] default 1, arithmetic LANES in [32, 16, 8] default 32)
     records (expert_down, tier_down)
     launch routed_output_project:
-        threadgroups (ceil_div(H, SIMDGROUPS * ROWS), M * (K + 1), 1)
+        threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), M * (K + 1), 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (256 + 32 * max(operands(EDW), operands(SDW)) + min(ceil_div(max(F, S), 32), 288) * 72)
 

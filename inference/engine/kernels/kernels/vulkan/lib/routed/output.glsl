@@ -34,6 +34,9 @@
 
 
 #define OUTPUT_R SEISMIC_TUNE_ROWS
+// Lanes a weight row: a down row is short (20 packets at Flash Next's 640
+// columns), so fewer than a subgroup keep every lane loading.
+#define OUTPUT_LANES SEISMIC_TUNE_LANES
 
 // The projection launch: each (row, choice)'s, and the shared expert's,
 // A-rounded down projection at ROUTED_PROJECTED_INDEX(m, slot, n) of the
@@ -43,7 +46,7 @@ void routed_output_projection() {
     const uint64_t m = gl_WorkGroupID.y / (SEISMIC_DIM_K + 1ul);
     const uint64_t choice = gl_WorkGroupID.y % (SEISMIC_DIM_K + 1ul);
     const uint hidden = uint(SEISMIC_DIM_H);
-    const uint first = projection_gemv_first_row(OUTPUT_R, 32u, tile);
+    const uint first = projection_gemv_first_row(OUTPUT_R, OUTPUT_LANES, tile);
     const uint bytes = ELEMENT_BYTES(ROUTED_ACT);
     float totals[PROJECTION_GEMV_SUMS], unused[PROJECTION_GEMV_SUMS];
     if (choice < SEISMIC_DIM_K) {
@@ -63,7 +66,7 @@ void routed_output_projection() {
                 0ul, SEISMIC_EXPERT_PRODUCT_STRIDE_2, uint(SEISMIC_DIM_F), 0ul), EXPERT_OPERANDS);
             const projection_weights down = routed_source_weights(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN),
                 SEISMIC_PTR(SEISMIC_BUFFER_TIER_DOWN), source, PACKETS_W0_STACKED_ROWS, uint(SEISMIC_DIM_F));
-            projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down,
+            projection_gemv_sums(PACKETS_W0, PACKETS_W0, false, OUTPUT_R, OUTPUT_LANES, 1u, PROJECTION_NORM_NONE, x, down, down,
                 1u, hidden, uint(SEISMIC_DIM_F), tile, totals, unused);
         }
     } else {
@@ -72,12 +75,12 @@ void routed_output_projection() {
             0ul, SEISMIC_SHARED_PRODUCT_STRIDE_1, uint(SEISMIC_DIM_S), 0ul), SHARED_OPERANDS);
         const projection_weights down = routed_weights(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN), PACKETS_W1_ROWS, 0ul,
             uint(SEISMIC_DIM_S));
-        projection_gemv_sums(PACKETS_W1, PACKETS_W1, false, OUTPUT_R, 32u, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
+        projection_gemv_sums(PACKETS_W1, PACKETS_W1, false, OUTPUT_R, OUTPUT_LANES, 1u, PROJECTION_NORM_NONE, x, down, down, 1u,
             hidden, uint(SEISMIC_DIM_S), tile, totals, unused);
     }
     [[unroll]] for (uint r = 0u; r < PROJECTION_GEMV_MAX_R; ++r) {
         const uint n = first + r;
-        if (r < OUTPUT_R && n < hidden && SEISMIC_LANE == r)
+        if (r < OUTPUT_R && n < hidden && SEISMIC_LANE % OUTPUT_LANES == r)
             element_put(ROUTED_PROJECTED_KIND, ROUTED_PROJECTED_BASE, ROUTED_PROJECTED_INDEX(m, choice, uint64_t(n)),
                 element_round(ROUTED_ACT, totals[r * PROJECTION_GEMV_MAX_M]));
     }

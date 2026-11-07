@@ -2,9 +2,9 @@
 // DECODE_ROWS), shared by `routed_down` and `routed_down_project`:
 // threadgroup (x, m) owns the TILE output channels of tile x for row m and
 // runs K simdgroups side by side, simdgroup k projecting choice k through its
-// expert's down rows (`routed::project_channels`:
-// each projection is the K1 GEMV's sum for the same LANES). The projections
-// meet in threadgroup memory; their sum is `lib/routed/down_sum.h`'s.
+// expert's down rows (`routed::project_channels`, staging its product row
+// in threadgroup memory). The projections meet in threadgroup memory; their
+// sum is `lib/routed/down_sum.h`'s.
 
 #define KERNEL_W0 SEISMIC_EXPERT_DOWN
 // The includer defines ROUTED_SOURCE_ROWS, the sources' rows: the entry's
@@ -19,15 +19,21 @@ template <uint ROWS, uint LANES> constexpr uint down_tile() {
     return (32u / LANES) * ROWS;
 }
 
+// The product packets each simdgroup stages at once (`project_channels`).
+constexpr uint down_stage() {
+    return stage_packets<uint(SEISMIC_DIM_K), (uint(SEISMIC_DIM_F) + 31u) / 32u>();
+}
+
 // Simdgroup `sg`'s projection of choice k = sg of row m into `projected`
 // (TILE channels from `first`), its down rows of `expert_down` as bound
 // (`choice_record`, `choice_weights`): a bank record of its table or a host
 // tier record of `tier_down` read in place, or a resident layer's expert of
-// its stack.
+// its stack, staging its product in `staged` (`down_stage() * 4`
+// words).
 template <uint ROWS, uint LANES, typename STACK>
 inline void down_project(device const uchar *product, device const int *routes, device const int *sources,
     device const STACK *expert_down, device const ulong *tier_down, ulong m, uint first, uint sg, uint lane,
-    threadgroup float *projected,
+    threadgroup uint4 *staged, threadgroup float *projected,
     constant ulong *seismic_words) {
     constexpr uint TILE = down_tile<ROWS, LANES>();
     const ulong k = sg;
@@ -48,8 +54,8 @@ inline void down_project(device const uchar *product, device const int *routes, 
     // which this choice's simdgroup forms alone.
     const auto x = projection::operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4>::lone_row(
         in, uint(SEISMIC_DIM_F), lane);
-    project_channels<packets::W0, ROWS, LANES, uint(SEISMIC_DIM_F)>(x, down, first, uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F),
-        projected, lane);
+    project_channels<packets::W0, ROWS, LANES, uint(SEISMIC_DIM_F), down_stage()>(x, down, first,
+        uint(SEISMIC_DIM_H), uint(SEISMIC_DIM_F), staged, projected, lane);
 }
 
 } // namespace routed

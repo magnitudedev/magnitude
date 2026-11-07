@@ -2317,7 +2317,8 @@ fn decode_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
 
 /// The decode output's mapping beside decode mapping `index`: the Metal
 /// output tiles its channels itself (ROWS channels per lane group of LANES
-/// lanes); elsewhere the output takes the expansion's mapping.
+/// lanes); the Vulkan output takes the expansion's mapping with its own
+/// LANES; elsewhere the output takes the expansion's mapping.
 fn output_mapping(
     device: &seismic::Device,
     index: usize,
@@ -2326,12 +2327,16 @@ fn output_mapping(
     const METAL: [[(&str, u64); 2]; 5] = [
         [("ROWS", 2), ("LANES", 16)],
         [("ROWS", 4), ("LANES", 32)],
-        [("ROWS", 1), ("LANES", 16)],
-        [("ROWS", 8), ("LANES", 16)],
+        [("ROWS", 1), ("LANES", 4)],
+        [("ROWS", 2), ("LANES", 8)],
         [("ROWS", 8), ("LANES", 32)],
     ];
     match device.backend() {
         seismic::BackendName::Metal => METAL[index % METAL.len()].to_vec(),
+        seismic::BackendName::Vulkan => {
+            const LANES: [u64; 3] = [32, 16, 8];
+            [mapping, &[("LANES", LANES[index % LANES.len()])]].concat()
+        }
         _ => mapping.to_vec(),
     }
 }
