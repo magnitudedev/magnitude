@@ -782,8 +782,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         banks: usize,
     ) -> Result<(), DomainError> {
         // No backing changes when neither plan adds a slab: the group's
-        // demands only admit slabs already backed. Reservation observes
-        // memory again before launching the selected group.
+        // demands only admit slabs already backed, so the charge stands as
+        // last read.
         let store = bindings.store(head)?;
         let claim = store.growth_claim(demands, queued, banks)?;
         if claim.minimum_bytes == 0 && claim.preferred_bytes == 0 {
@@ -1033,7 +1033,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.head_store.is_some() {
             self.grant_state_growth(bindings, true, &[], &[], requirements.head_banks())?;
         }
-        self.refresh_memory()?;
         Ok(())
     }
 

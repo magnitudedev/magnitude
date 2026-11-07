@@ -620,6 +620,9 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// What the rest of the host does to memory, read by read, and what
     /// sizes the expert bank's resizes from it.
     pace: RefCell<MemoryPace>,
+    /// The readings of the heap's charge taken ([`Self::refresh_memory`]).
+    #[cfg(test)]
+    refreshes: std::cell::Cell<usize>,
 }
 
 /// The resident decode launch of a number of rows at a depth,
@@ -789,6 +792,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if let Some(bank) = self.family.expert_bank() {
             bank.slow_host_landing();
         }
+    }
+
+    /// The readings of the heap's charge taken so far.
+    #[cfg(test)]
+    pub(crate) fn memory_refreshes(&self) -> usize {
+        self.refreshes.get()
     }
 
     /// The device the domain charges.
@@ -1539,6 +1548,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// ceiling stand as the last observation ([`Self::observe_memory`]) or
     /// claim read them, so the decode's own steps read nothing of the OS.
     pub fn refresh_memory(&self) -> Result<(), DomainError> {
+        #[cfg(test)]
+        self.refreshes.set(self.refreshes.get() + 1);
         let _rises = self.family.expert_bank().map(|bank| bank.hold_rises());
         self.memory.borrow_mut().account();
         self.classify_memory()
@@ -2070,8 +2081,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    /// Import and bind the optional component `lane` needs when it is unbound.
-    fn bind_component(&mut self, lane: ReservationLane) -> Result<(), DomainError> {
+    /// Import and bind the optional component `lane` needs when it is
+    /// unbound, and whether it did.
+    fn bind_component(&mut self, lane: ReservationLane) -> Result<bool, DomainError> {
         match lane {
             ReservationLane::Head if !self.family.head_is_bound() => {
                 let resident = self
@@ -2082,6 +2094,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .map_err(|error| DomainError::Input(error.to_string()))?;
                 self.family.bind_head(resident, &self.definition)?;
                 self.hold_bound_head()?;
+                Ok(true)
             }
             ReservationLane::Vision if !self.family.vision_is_bound() => {
                 let resident = self
@@ -2091,15 +2104,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .load()
                     .map_err(|error| DomainError::Input(error.to_string()))?;
                 self.family.bind_vision(resident, &self.definition)?;
+                Ok(true)
             }
-            _ => {}
+            _ => Ok(false),
         }
-        Ok(())
     }
 
     /// Reserve capacity for one group: the front queued step's slots when
     /// the group claims it, otherwise its provisioned state, advances and
     /// launch leases.
+    ///
+    /// It reads the heap's charge once, on entry. What changes the charge
+    /// later on this thread reads it again itself: each growth provisioning
+    /// grants (`grant_state_growth`, `grant_group`, `provision_output`,
+    /// `grow_vision`) once its allocation ran, and the reservation once an
+    /// import ran. Off this thread the charge only rises under the expert
+    /// bank's claim, which the heap already holds.
     pub fn reserve(
         &mut self,
         bindings: &mut StateBindings,
@@ -2124,7 +2144,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // Provisioning may relocate a shared tail into a fresh page. Recompute
         // row demand against that layout: the next append can now fit in place.
         let requirements = self.requirements(operations)?;
-        self.refresh_memory()?;
         // The import and binding of an unbound component run under one heap
         // claim for their peak, released once Seismic's charge reflects them.
         let claim = self
@@ -2133,18 +2152,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 self.claim_device_growth(required, staged, HoldingClass::Dormant)
             })
             .transpose()?;
-        let bound = self.bind_component(requirements.lane).and_then(|()| {
-            if requirements.priming_banks != 0 {
-                self.bind_component(ReservationLane::Head)
-            } else {
-                Ok(())
-            }
+        let imported = self.bind_component(requirements.lane).and_then(|lane| {
+            Ok(lane | (requirements.priming_banks != 0 && self.bind_component(ReservationLane::Head)?))
         });
         if let Some(claim) = claim {
             self.release_claim(claim);
         }
-        bound?;
-        self.refresh_memory()?;
+        if imported? {
+            self.refresh_memory()?;
+        }
         self.can_reserve(&requirements)
             .map_err(DomainError::Capacity)?;
         let reads_target = requirements.lane == ReservationLane::Head && self.head_reads_target();
@@ -2388,6 +2404,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             resize_held: ResizeHeld::default(),
             shrink_step: false,
             pace: RefCell::new(MemoryPace::new()),
+            #[cfg(test)]
+            refreshes: std::cell::Cell::new(0),
         };
         let bindings = StateBindings {
             target: target_state,

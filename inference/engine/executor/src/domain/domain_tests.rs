@@ -608,6 +608,29 @@ fn in_place_rows_reserve_without_a_free_page() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 4);
 }
 
+/// A reservation that grows nothing reads the heap's charge once: no
+/// provisioning or import ran to change it after the entry's reading.
+#[test]
+fn a_reservation_that_grows_nothing_reads_memory_once() {
+    let (mut domain, mut bindings) = fixture(None);
+    let request = RequestId(61);
+    open(&mut domain, &mut bindings, request);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    let committed = domain.committed_state_bytes();
+    let refreshes = domain.memory_refreshes();
+    let reservation = domain.reserve(&mut bindings, &[forward(request, 1)]).unwrap();
+    assert!(matches!(
+        reservation.into_resources(),
+        ReservedResources::Target(TargetGraphReservation::Launch(_))
+    ));
+    assert_eq!(domain.committed_state_bytes(), committed);
+    assert_eq!(domain.memory_refreshes() - refreshes, 1);
+}
+
 /// Continuing a checkpoint relocates a tail another request extended. The
 /// reservation must describe the new layout rather than demand a second page.
 #[test]
