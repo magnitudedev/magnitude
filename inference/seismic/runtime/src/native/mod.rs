@@ -2983,6 +2983,13 @@ impl DispatchList for StandaloneCalls<'_> {
     fn runs(&self) -> Option<Vec<PlanRun>> {
         None
     }
+
+    /// Standalone calls run as a served step runs one kernel's calls: a
+    /// tuning point's rotation cycles a model's layers, which the step
+    /// runs each after the one before.
+    fn chained(&self) -> bool {
+        true
+    }
 }
 
 /// One call as the encoder consumes it: everything but its buffers is
@@ -3058,6 +3065,12 @@ pub(crate) trait DispatchList {
     }
     /// Whether any boundary has timeline operations.
     fn has_timelines(&self) -> bool {
+        false
+    }
+    /// Whether each call runs after the one before it, whatever they reach:
+    /// a served step runs one kernel's calls (a model's layers) each after
+    /// its predecessor, so calls timed for it run so too ([`hazard`]).
+    fn chained(&self) -> bool {
         false
     }
     /// The stamps of sampled runs' marks at `boundary` (`spans`), in order.
