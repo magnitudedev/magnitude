@@ -1799,6 +1799,13 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
             self.published.borrow_mut().push((selected, settled));
             Ok(())
         }
+        fn finalize(
+            &mut self,
+            _: &Device,
+            _: &HashMap<TuningKey, NativeSpecialization>,
+        ) -> Result<(), CatalogFailure> {
+            self.conclude(false, true)
+        }
     }
     let Some(device) = metal() else {
         return;
@@ -1946,6 +1953,13 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
             Ok(false)
         }
         fn conclude(&mut self, _: bool, _: bool) -> Result<(), CatalogFailure> {
+            Ok(())
+        }
+        fn finalize(
+            &mut self,
+            _: &Device,
+            _: &HashMap<TuningKey, NativeSpecialization>,
+        ) -> Result<(), CatalogFailure> {
             Ok(())
         }
     }

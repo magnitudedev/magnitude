@@ -901,7 +901,7 @@ impl<'a> Preparation<'a> {
             // budget it was qualified within.
             let budget = self.tuning.settings().map(|settings| settings.budget);
             let key = crate::TuningCacheKey::of(&format!(
-                "readout-recipe-v7/budget={budget:?}/device={:?}/{weights}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/levels={levels:?}/dependency={dependency:?}/{digest}",
+                "readout-recipe-v8/budget={budget:?}/device={:?}/{weights}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/levels={levels:?}/dependency={dependency:?}/{digest}",
                 device.tuning_identity(),
                 self.epsilon.to_bits(),
                 softcap.to_bits(),
@@ -925,23 +925,23 @@ impl<'a> Preparation<'a> {
                 preparation.clone(),
                 levels,
             );
-            let Some(selected) = self.tuning.register_composed(Box::new(contender))? else {
+            if self.tuning.register_composed(Box::new(contender))?.is_none() {
                 continue;
-            };
-            // The choice and its costs are the record of the comparison
-            // against this load's canonical (`ReadoutContender::record`); a
-            // class without bounded levels is never selected.
-            let class_certified =
-                selected && levels == crate::programs::graph::readout::Levels::Certified;
-            if class_certified {
+            }
+            // The class's evidence is the record of its comparison against
+            // this load's canonical (`ReadoutContender::record`), settled or
+            // not: what it reads through the planes follows from it
+            // ([`QualifiedRecipe::reads`]), whatever its choice against packed.
+            let state = state.borrow();
+            let reads = state.reads(levels);
+            if reads == crate::programs::graph::readout::Levels::Certified {
                 certified.push(point.rows);
             }
-            let state = state.borrow();
             self.readout_classes.entry(scope).or_default().insert(
                 key.as_str().to_owned(),
                 ClassCost {
                     weight: state.weight,
-                    costs: state.costs.map(|costs| costs.stored(class_certified)),
+                    costs: state.costs.map(|costs| costs.stored(reads)),
                 },
             );
         }

@@ -2680,6 +2680,13 @@ pub(super) trait ComposedContender<'a> {
     /// retained before the recipe's work ended is stored unsettled: no
     /// later walk takes it for the recipe's choice.
     fn conclude(&mut self, selected: bool, settled: bool) -> Result<(), CatalogFailure>;
+    /// Retain what a contender never qualified measured, once every
+    /// prerequisite's choice (`chosen`) is final.
+    fn finalize(
+        &mut self,
+        device: &Device,
+        chosen: &HashMap<TuningKey, NativeSpecialization>,
+    ) -> Result<(), CatalogFailure>;
 }
 
 /// Actual census evidence prices a composed contender; no guessed grace period.
@@ -2852,7 +2859,7 @@ impl<'a> SearchedUnit<'a> for ComposedUnit<'a> {
     /// and releases what its census formed.
     fn finish(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
         if self.qualified.is_none() {
-            self.contender.conclude(false, true)?;
+            self.contender.finalize(tuner.device, &tuner.chosen)?;
             tuner.composed_choices.insert(self.key.1.clone(), false);
         }
         Ok(())
