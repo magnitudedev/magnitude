@@ -1,10 +1,12 @@
 // Read directory-selected slots, rows16 rows of the table's resident
 // representation, through the packet decoders, a thread per value, and round
-// once to the activation element.
+// once to the activation element. Slot s is row s % P of record s / P, read
+// where its storage holds the record (`records (slots)`).
 #define KERNEL_W0 SEISMIC_SLOTS
 #include "lib/core/activation.glsl"
 #include "lib/core/gathered.glsl"
 #include <seismic/packets.glsl>
+#include <seismic/slab.glsl>
 
 void stored_rows() {
     const uint64_t slots = SEISMIC_PTR(SEISMIC_BUFFER_SLOTS);
@@ -24,8 +26,10 @@ void stored_rows() {
             element_put(ELEMENT_ACT, rows, at, 0.0);
             continue;
         }
-        const packets_packet packet = packets_load(PACKETS_W0, slots + uint64_t(held) * geometry.stride, geometry,
-            column / 32u, width);
+        const uint64_t per = uint64_t(SEISMIC_DIM_P);
+        const uint64_t record = slab_region(slots, uint64_t(held) / per);
+        const packets_packet packet = packets_load(PACKETS_W0, record + (uint64_t(held) % per) * geometry.stride,
+            geometry, column / 32u, width);
         element_put(ELEMENT_ACT, rows, at, packets_value_at(PACKETS_W0, packet, column % 32u));
     }
 }
