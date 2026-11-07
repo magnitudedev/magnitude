@@ -62,7 +62,7 @@ impl CodegenPolicy {
 
     fn of_isa(isa: &dyn isa::TargetIsa) -> Self {
         Self {
-            compiler: format!("cranelift-codegen/{}", env!("SEISMIC_CRANELIFT_VERSION")),
+            compiler: format!("cranelift-codegen/{}", cranelift_codegen::VERSION),
             triple: isa.triple().to_string(),
             call_conv: isa.default_call_conv(),
             shared_flags: isa
