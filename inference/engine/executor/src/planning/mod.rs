@@ -60,7 +60,8 @@ pub use weights::{
     NGramBinding, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
     ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoutedBinding, ScalableWeight,
     SelectionBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlan, WeightScalePlan, WeightStorageIdentity,
-    resident_element, resident_elements, resident_layout, scaled_source_element, source_element,
+    held_storage, resident_element, resident_elements, resident_layout, scaled_source_element,
+    source_element, stored_weights,
 };
 
 pub(crate) use weights::{activation_dtype, elements, packing_run, resident_storage, value_packets};

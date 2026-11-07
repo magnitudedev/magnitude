@@ -2121,8 +2121,10 @@ fn push_weight(
         (WeightKind::Vision(_), None) => (Element::f32(), Element::dense(form.activation)),
         _ => (
             source,
-            resident_storage(
-                source,
+            held_storage(
+                stored.encoding,
+                scales,
+                width,
                 crate::import_transforms::scaled_activations(descriptor),
                 dense_resident,
                 form.layout,
@@ -2406,7 +2408,55 @@ pub fn resident_element(
     dense: DType,
     layout: Layout,
 ) -> Option<Element> {
-    resident_storage(source_element(encoding, width)?, activations, dense, layout)
+    held_storage(
+        encoding,
+        GgufScales::Own,
+        width,
+        activations,
+        dense,
+        layout,
+    )
+}
+
+/// The resident storage weight planning holds a stored weight of
+/// `encoding` in, its scales where `scales` says, in rows of `width`
+/// values: its source ([`scaled_source_element`]), then that source's
+/// resident storage ([`resident_storage`]) for products taking
+/// `activations` in `layout`. `None` when it has either none. The one
+/// classification weight planning (`push_weight`) and model admission (the
+/// engine's assessment) apply.
+pub fn held_storage(
+    encoding: Encoding,
+    scales: GgufScales,
+    width: u64,
+    activations: ScaledActivations,
+    dense: DType,
+    layout: Layout,
+) -> Option<Element> {
+    resident_storage(scaled_source_element(encoding, scales, width)?, activations, dense, layout)
+}
+
+/// The tensors of a component (`tensors`) weight planning reads as weights,
+/// each with where its scales are: under its grid of block scales where it
+/// is read under one ([`ImportTransform::scale_grid`], the rule the binder
+/// binds it by, `Tensors::companion_scale`, which also checks the grid),
+/// else its own. A grid is read only with its weight, so it is not among
+/// them.
+pub fn stored_weights(
+    tensors: &[TensorDescriptor],
+) -> impl Iterator<Item = (&TensorDescriptor, GgufScales)> {
+    let grid = |tensor: &TensorDescriptor| ImportTransform::scale_grid(&tensor.name, tensor.encoding);
+    let grids = tensors.iter().filter_map(grid).collect::<HashSet<_>>();
+    tensors
+        .iter()
+        .filter(move |tensor| !grids.contains(&tensor.name))
+        .map(move |tensor| {
+            let scales = match grid(tensor) {
+                Some(_) => GgufScales::E8m0Grid,
+                None => GgufScales::Own,
+            };
+            (tensor, scales)
+        })
 }
 
 /// The packet storage holding the values alone of a matrix stored as
@@ -2456,8 +2506,13 @@ pub fn resident_elements(layout: Layout) -> Vec<Element> {
             for encoding in Encoding::ALL {
                 for activations in [ScaledActivations::Rounded, ScaledActivations::Nvfp4] {
                     for width in [256, 32] {
-                        let resident = scaled_source_element(encoding, scales, width).and_then(
-                            |source| resident_storage(source, activations, dense, layout),
+                        let resident = held_storage(
+                            encoding,
+                            scales,
+                            width,
+                            activations,
+                            dense,
+                            layout,
                         );
                         match resident {
                             Some(element) if !elements.contains(&element) => elements.push(element),
@@ -2957,6 +3012,38 @@ mod scale_grid_tests {
             nbytes: SHAPE[0] * SHAPE[1],
         };
         (descriptor, weight)
+    }
+
+    /// A component's weights are read with their scales: an F8_E4M3 matrix
+    /// under its I8 `.scale` grid, which is read only with it; an NVFP4
+    /// weight's F32 `.scale` is a weight of its own, and so its weight's
+    /// scales are its blocks'.
+    #[test]
+    fn stored_weights_read_a_grid_with_its_weight() {
+        let tensor = |name: &str, encoding| TensorDescriptor {
+            name: name.into(),
+            shape: vec![64, 256],
+            encoding,
+            offset: 0,
+            nbytes: 0,
+        };
+        let tensors = [
+            tensor(WEIGHT, Encoding::F8E4M3),
+            tensor(SCALE, Encoding::I8),
+            tensor("blk.0.ffn_up.weight", Encoding::Nvfp4),
+            tensor("blk.0.ffn_up.scale", Encoding::F32),
+        ];
+        let read = stored_weights(&tensors)
+            .map(|(tensor, scales)| (tensor.name.as_str(), scales))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read,
+            [
+                (WEIGHT, GgufScales::E8m0Grid),
+                ("blk.0.ffn_up.weight", GgufScales::Own),
+                ("blk.0.ffn_up.scale", GgufScales::Own),
+            ]
+        );
     }
 
     /// A tile whose columns are no whole packets of the source (32 values,

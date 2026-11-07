@@ -2078,10 +2078,8 @@ pub fn gguf_packet_source(encoding: Encoding, scales: GgufScales) -> Option<Repr
 /// row is whole blocks).
 pub fn gguf_source(encoding: Encoding, scales: GgufScales, width: u64) -> Option<RepresentationId> {
     gguf_packet_source(encoding, scales).filter(|&source| {
-        let RepresentationKind::External(layout) = &representation_info(source).kind else {
-            unreachable!("a GGUF source is external storage")
-        };
-        width.is_multiple_of(u64::from(layout.logical_group))
+        let packet = external_packet(source).expect("a GGUF source is external storage");
+        width.is_multiple_of(u64::from(packet.logical_group))
     })
 }
 
@@ -2309,6 +2307,15 @@ pub fn decode_axes(id: RepresentationId) -> Option<DecodeAxes> {
     match representation_info(id).kind {
         RepresentationKind::PackedRows(_) => internals::packed(id).map(|representation| representation.decode_axes()),
         RepresentationKind::Packed(_) | RepresentationKind::Dense(_) | RepresentationKind::External(_) => None,
+    }
+}
+
+/// The packet of external (artifact-format) storage `id`; `None` for any
+/// other storage.
+pub fn external_packet(id: RepresentationId) -> Option<&'static ExternalPacketLayout> {
+    match &representation_info(id).kind {
+        RepresentationKind::External(packet) => Some(packet),
+        _ => None,
     }
 }
 
@@ -4963,9 +4970,7 @@ mod tests {
         assert_eq!(gguf_source(Encoding::Q8_0, GgufScales::E8m0Grid, 256), None);
         let source = gguf_source(Encoding::F8E4M3, GgufScales::E8m0Grid, 256).unwrap();
         assert_eq!(representation_info(source).name, "gguf_f8_e4m3_e8m0");
-        let RepresentationKind::External(packet) = &representation_info(source).kind else {
-            panic!("a GGUF source is external");
-        };
+        let packet = external_packet(source).unwrap();
         assert_eq!((packet.packet_size, packet.logical_group), (33, 32));
         for layout in Layout::ALL {
             let resident = conversion_destination(source, layout, OperandRecipe::Rounded).unwrap();

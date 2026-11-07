@@ -57,10 +57,14 @@ pub(crate) fn admit_transforms(
                     descriptor.name
                 ));
             }
-            // Each assembled block is one packet of the source: a tile's
-            // columns are whole packets of its values.
+            // Each assembled block is one packet of the source (a packed
+            // one: no dense source is read under a grid,
+            // `scaled_source_element`): a tile's columns are whole packets
+            // of its values.
             ImportTransform::ScaleBlocks { tensor, tile, .. }
-                if source.logical_group().is_none_or(|block| !tile[1].is_multiple_of(block)) =>
+                if !tile[1].is_multiple_of(
+                    source.logical_group().expect("a source under a grid has packets"),
+                ) =>
             {
                 return Err(format!(
                     "{:?}: scale grid {tensor:?} tiles it by {tile:?}, whose columns are no \

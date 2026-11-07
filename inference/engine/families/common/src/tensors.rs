@@ -132,17 +132,18 @@ impl<'a> Tensors<'a> {
         weight: &str,
         matrices: u64,
     ) -> Result<Option<ImportTransform>, HeaderError> {
-        let Some(stem) = weight.strip_suffix(".weight") else {
+        let (Some(stem), Some(name)) = (
+            weight.strip_suffix(".weight"),
+            ImportTransform::companion_scale(weight),
+        ) else {
             return Ok(None);
         };
         let stored = self.stored(weight)?;
-        let name = format!("{stem}.scale");
-        let scale = self.directory.tensor(&name);
-        if stored.encoding == Encoding::F8E4M3 {
-            let scale = scale.ok_or(HeaderError::MissingWeight(name))?;
+        if let Some(grid) = ImportTransform::scale_grid(weight, stored.encoding) {
+            let scale = self.directory.tensor(&grid).ok_or(HeaderError::MissingWeight(grid))?;
             return self.scale_grid(stored, scale).map(Some);
         }
-        let Some(scale) = scale else {
+        let Some(scale) = self.directory.tensor(&name) else {
             return Ok(None);
         };
         let input = self.directory.tensor(&format!("{stem}.input_scale"));
@@ -169,10 +170,9 @@ impl<'a> Tensors<'a> {
     /// Binds `scale` as the grid of UE8M0 block scales of the F8_E4M3
     /// matrix `weight` (`ImportTransform::ScaleBlocks`): I8 `[rows / r,
     /// columns / c]` for the tiles `[r, c]` it tiles the matrix by
-    /// (`ImportTransform::grid_tile`; DeepSeek's 128×128, a table's 1×32),
-    /// in a file declaring [`SCALE_ENCODING`] =
-    /// [`UE8M0`], since an I8 tensor's bytes are codes only by that
-    /// declaration. Any other scale is refused, naming it.
+    /// (`ImportTransform::grid_tile`), in a file declaring
+    /// [`SCALE_ENCODING`] = [`UE8M0`], since an I8 tensor's bytes are codes
+    /// only by that declaration. Any other scale is refused, naming it.
     fn scale_grid(
         &mut self,
         weight: &TensorDescriptor,

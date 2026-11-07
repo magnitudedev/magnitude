@@ -332,11 +332,7 @@ fn gguf_format_tests(out: &Path) {
             let Some(source) = registry::gguf_packet_source(encoding, scales) else {
                 continue;
             };
-            let registry::RepresentationKind::External(packet) =
-                &registry::representation_info(source).kind
-            else {
-                unreachable!("a GGUF source is external storage")
-            };
+            let packet = registry::external_packet(source).expect("a GGUF source is external storage");
             let block = u64::from(packet.logical_group);
             let suffix = match scales {
                 GgufScales::Own => "",

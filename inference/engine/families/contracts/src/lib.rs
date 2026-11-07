@@ -265,6 +265,30 @@ pub enum ImportTransform {
 }
 
 impl ImportTransform {
+    /// The stored companion scale of weight `<stem>.weight`: `<stem>.scale`
+    /// (`ScaleByTensor`'s tensor, or `ScaleBlocks`' grid).
+    pub fn companion_scale(weight: &str) -> Option<String> {
+        weight
+            .strip_suffix(".weight")
+            .map(|stem| format!("{stem}.scale"))
+    }
+
+    /// The stored grid of block scales (`ScaleBlocks`) a weight `weight` of
+    /// `encoding` is read under: the companion scale
+    /// ([`Self::companion_scale`]) of an F8_E4M3 weight, whose blocks carry
+    /// no scale of their own; `None` for a weight read under its own blocks'
+    /// scales. The one rule the binder binds a grid by and weight planning
+    /// classifies a component's tensors by.
+    pub fn scale_grid(
+        weight: &str,
+        encoding: magnitude_artifacts::gguf::Encoding,
+    ) -> Option<String> {
+        match encoding {
+            magnitude_artifacts::gguf::Encoding::F8E4M3 => Self::companion_scale(weight),
+            _ => None,
+        }
+    }
+
     /// The tile a stored grid `grid` of block scales gives a `shape` matrix,
     /// when the grid tiles it ([`Self::tiles`]): `[rows / g, columns / h]`
     /// for a `[g, h]` grid dividing it exactly.

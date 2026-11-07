@@ -40,7 +40,8 @@ use magnitude_executor::{
         PointRequests, Residency as FitResidency, StoredCosts, StoredMisses,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
-    resident_element, resident_layout, source_element, ExecutionPath, ExecutionPlanDraft,
+    held_storage, resident_layout, scaled_source_element, stored_weights, ExecutionPath,
+    ExecutionPlanDraft,
     KernelCache,
 };
 use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily, ScaledActivations};
@@ -1114,13 +1115,7 @@ fn admit(
     let target = headers.target();
     let fingerprint = ModelFingerprint::from_directory(target).ok();
     let mut refusals = Vec::new();
-    refusals.extend(unsupported_weights(
-        target
-            .tensors
-            .iter()
-            .map(|tensor| (tensor, Residency::Packed)),
-        layout,
-    ));
+    refusals.extend(unsupported_weights(&target.tensors, Residency::Packed, layout));
     let interpreted = interpret_header(
         target,
         headers.projector(),
@@ -1131,10 +1126,8 @@ fn admit(
     if let (Ok((_, interpreted, _)), Some(projector)) = (&interpreted, headers.projector()) {
         if interpreted.projector_unavailable.is_none() {
             refusals.extend(unsupported_weights(
-                projector
-                    .tensors
-                    .iter()
-                    .map(|tensor| (tensor, Residency::Dequantized)),
+                &projector.tensors,
+                Residency::Dequantized,
                 layout,
             ));
         }
@@ -1306,13 +1299,7 @@ fn admit_drafter(
     }
     let draft = headers.draft().expect("the draft component was just added");
     let mut refusals = Vec::new();
-    refusals.extend(unsupported_weights(
-        draft
-            .tensors
-            .iter()
-            .map(|tensor| (tensor, Residency::Packed)),
-        layout,
-    ));
+    refusals.extend(unsupported_weights(&draft.tensors, Residency::Packed, layout));
     let bound = bind_draft(family, definition.clone(), Some(draft));
     refusals.extend(bound.draft_unavailable.map(|reason| reason.unsupported()));
     if let Some(unsupported) = UnsupportedModel::union(refusals) {
@@ -1338,30 +1325,35 @@ enum Residency {
     Dequantized,
 }
 
-/// Every tensor whose stored encoding has no import here, counted per GGML
-/// type: the same element maps weight planning applies
-/// ([`source_element`], and [`resident_element`] in `layout`), so a type
-/// added to them is admitted here with no other change.
-fn unsupported_weights<'a>(
-    tensors: impl IntoIterator<Item = (&'a TensorDescriptor, Residency)>,
+/// Every tensor of a component (`tensors`) whose stored encoding has no
+/// import here, counted per GGML type: the same classification weight
+/// planning applies ([`stored_weights`], each weight with its scales and
+/// a grid companion with its weight, then [`scaled_source_element`] and,
+/// for a packed one, [`held_storage`] in `layout`), so a
+/// type added to them is admitted here with no other change.
+fn unsupported_weights(
+    tensors: &[TensorDescriptor],
+    residency: Residency,
     layout: Layout,
 ) -> Option<UnsupportedModel> {
     let mut counts = BTreeMap::<&'static str, u32>::new();
-    for (tensor, residency) in tensors {
+    for (tensor, scales) in stored_weights(tensors) {
         let width = tensor.shape.last().copied().unwrap_or(1);
-        let imported = source_element(tensor.encoding, width).is_some()
-            && match residency {
-                // Every encoding with a resident element has a W4A16 one.
-                Residency::Packed => resident_element(
-                    tensor.encoding,
-                    ScaledActivations::Rounded,
-                    width,
-                    DType::F32,
-                    layout,
-                )
-                .is_some(),
-                Residency::Dequantized => true,
-            };
+        let imported = match residency {
+            // Every encoding with a resident element has a W4A16 one.
+            Residency::Packed => held_storage(
+                tensor.encoding,
+                scales,
+                width,
+                ScaledActivations::Rounded,
+                DType::F32,
+                layout,
+            )
+            .is_some(),
+            Residency::Dequantized => {
+                scaled_source_element(tensor.encoding, scales, width).is_some()
+            }
+        };
         if !imported {
             *counts.entry(tensor.encoding.ggml_name()).or_default() += 1;
         }
@@ -1465,5 +1457,29 @@ mod tests {
         let again = read_store();
         assert_eq!(again.read(&own).0, Ok(Some(record)));
         assert_ne!(digest(&again), unmeasured, "the model's own record renews its key");
+    }
+
+    /// An F8_E4M3 weight with its I8 `.scale` grid is admitted as planning
+    /// holds it, the grid counted with its weight, on every backend's
+    /// layout.
+    #[test]
+    fn a_grid_scaled_f8_weight_is_admitted_where_planning_holds_it() {
+        use magnitude_artifacts::gguf::Encoding;
+        let tensor = |name: &str, shape: Vec<u64>, encoding| TensorDescriptor {
+            name: name.into(),
+            shape,
+            encoding,
+            offset: 0,
+            nbytes: 0,
+        };
+        let tensors = [
+            tensor("blk.0.attn_q_b.weight", vec![64, 256], Encoding::F8E4M3),
+            tensor("blk.0.attn_q_b.scale", vec![2, 8], Encoding::I8),
+        ];
+        for backend in seismic::BackendName::ALL {
+            let layout = backend.resident_layout();
+            let refused = unsupported_weights(&tensors, Residency::Packed, layout);
+            assert!(refused.is_none(), "{backend:?} {refused:?}");
+        }
     }
 }
