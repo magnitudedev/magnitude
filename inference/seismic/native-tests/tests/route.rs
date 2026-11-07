@@ -2808,6 +2808,47 @@ fn a_refused_growth_leaves_the_reserved_tensor_unchanged() {
     }
 }
 
+/// Where a device binds a reserved range as one buffer once every granule
+/// is backed (Metal), a change between that form and chunks holds the next
+/// form's buffers beside the view's until its release, which the device
+/// counts: the resize is charged them for that window, so the ledger never
+/// passes its bound. A growth to every granule whose bound leaves no room
+/// for them stays in chunks, which bind nothing directly; a shrink from the
+/// one buffer at no headroom forms its kept chunks in its place.
+#[test]
+fn a_reserved_tensor_takes_its_whole_form_only_within_its_grant() {
+    for device in reserving_devices() {
+        let backend = device.backend();
+        let reservation = device.info().reserving(ReservedContract::DeviceOnly).expect("it says how it reserves").expect("it reserves");
+        if !reservation.chunks.is_some_and(|chunks| chunks.whole) {
+            continue;
+        }
+        // 256 KiB rows, a whole number of them a granule.
+        let (rows, n) = (64u64, 1u64 << 16);
+        let (reserved, resizer) = Tensor::reserved(&device, Element::f32(), &[rows, n], rows / 2).unwrap();
+        let store = seismic::Ledger::Own(device.device_store());
+        // Room for the growth's own bytes, none for the chunks it would hold
+        // beside one buffer over the range.
+        let limit = device.device_ledger().charged + rows / 2 * n * 4;
+        device.bound(store, Some(limit)).unwrap();
+        let resizer = resizer.recommit(rows).unwrap();
+        assert_eq!(reserved.committed_rows(), rows, "{backend:?}");
+        assert!(!reserved.bindable(), "{backend:?}: a growth with no room beside its chunks stays in chunks");
+        assert!(device.device_ledger().charged <= limit, "{backend:?}");
+        device.bound(store, None).unwrap();
+        let resizer = resizer.recommit(rows - 8).unwrap().recommit(rows).unwrap();
+        assert!(reserved.bindable(), "{backend:?}: a growth with room takes the whole form");
+        let charged = device.device_ledger().charged;
+        device.bound(store, Some(charged)).unwrap();
+        let resizer = resizer.recommit(rows / 2).unwrap();
+        assert_eq!(reserved.committed_rows(), rows / 2, "{backend:?}");
+        assert!(!reserved.bindable(), "{backend:?}");
+        assert!(device.device_ledger().charged <= charged, "{backend:?}: a shrink in place is charged nothing beside");
+        device.bound(store, None).unwrap();
+        drop((reserved, resizer));
+    }
+}
+
 /// The device's single-allocation limit bounds each native allocation
 /// backing a reserved tensor, never its address range: a reservation past
 /// the limit with a small commitment is made. Where one allocation backs the

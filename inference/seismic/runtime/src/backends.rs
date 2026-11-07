@@ -1074,6 +1074,23 @@ impl OpenedKind {
 #[cfg(target_os = "macos")]
 struct MetalReserved(seismic_metal::ReservedBuffer);
 
+/// Whether `allocation`'s storage is a reservation in one buffer over its
+/// whole range now (`seismic_metal::ReservedBuffer::is_whole`).
+#[cfg(target_os = "macos")]
+pub(crate) fn bound_whole(allocation: &driver::Allocation) -> bool {
+    allocation
+        .storage()
+        .as_any()
+        .downcast_ref::<MetalReserved>()
+        .is_some_and(|MetalReserved(reserved)| reserved.is_whole())
+}
+
+/// No storage but Metal's binds a reserved range whole.
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn bound_whole(_allocation: &driver::Allocation) -> bool {
+    false
+}
+
 /// What a Metal launch binds for `allocation`: its buffer, or a reservation's
 /// buffer over its whole range.
 #[cfg(target_os = "macos")]
@@ -1135,45 +1152,82 @@ pub(crate) enum ReservedPending {
 }
 
 impl ReservedResizer {
-    /// The backend's prepare of exactly `bytes`; a refusal returns the
-    /// resizer.
-    pub(crate) fn prepare(self, bytes: u64) -> Result<ReservedPrepared, (Self, ExecutionError)> {
+    /// Whether its view is one buffer over the whole range (Metal's whole
+    /// form); never on a backend whose view has one form.
+    pub(crate) fn whole(&self) -> bool {
         match self {
-            Self::Cpu(resizer) => resizer.prepare(bytes).map(ReservedPrepared::Cpu).map_err(
-                |(resizer, failure)| {
+            #[cfg(target_os = "macos")]
+            Self::Metal(resizer) => resizer.form() == seismic_metal::ViewForm::Whole,
+            _ => false,
+        }
+    }
+
+    /// The backend's prepare of exactly `bytes`, a changed view in `form`,
+    /// a change of form's buffers formed where `forming` says; a refusal
+    /// returns the resizer.
+    ///
+    /// # Panics
+    /// Where `form` is not chunks formed beside on a backend whose view has
+    /// one form.
+    pub(crate) fn prepare(
+        self,
+        bytes: u64,
+        form: driver::ReservedForm,
+        forming: host::Forming,
+    ) -> Result<ReservedPrepared, (Self, ExecutionError)> {
+        let one_form = || {
+            assert_eq!(form, driver::ReservedForm::Chunks, "only Metal binds a reserved range whole");
+            assert_eq!(forming, host::Forming::Beside, "only Metal changes a view's form");
+        };
+        match self {
+            Self::Cpu(resizer) => {
+                one_form();
+                resizer.prepare(bytes).map(ReservedPrepared::Cpu).map_err(|(resizer, failure)| {
                     let error = ExecutionError::AllocationFailed(failure.to_string());
                     (Self::Cpu(resizer), error)
-                },
-            ),
+                })
+            }
             #[cfg(target_os = "macos")]
-            Self::Metal(resizer) => resizer
-                .prepare(bytes)
-                .map(ReservedPrepared::Metal)
-                .map_err(|(resizer, error)| (Self::Metal(resizer), error)),
-            Self::Cuda(resizer) => resizer
-                .prepare(bytes)
-                .map(ReservedPrepared::Cuda)
-                .map_err(|(resizer, error)| (Self::Cuda(resizer), error)),
+            Self::Metal(resizer) => {
+                let form = match form {
+                    driver::ReservedForm::Chunks => seismic_metal::ViewForm::Chunks,
+                    driver::ReservedForm::Whole => seismic_metal::ViewForm::Whole,
+                };
+                resizer
+                    .prepare_as(bytes, form, forming)
+                    .map(ReservedPrepared::Metal)
+                    .map_err(|(resizer, error)| (Self::Metal(resizer), error))
+            }
+            Self::Cuda(resizer) => {
+                one_form();
+                resizer
+                    .prepare(bytes)
+                    .map(ReservedPrepared::Cuda)
+                    .map_err(|(resizer, error)| (Self::Cuda(resizer), error))
+            }
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(resizer) => resizer
-                .prepare(bytes)
-                .map(ReservedPrepared::Vulkan)
-                .map_err(|(resizer, error)| (Self::Vulkan(resizer), error)),
+            Self::Vulkan(resizer) => {
+                one_form();
+                resizer
+                    .prepare(bytes)
+                    .map(ReservedPrepared::Vulkan)
+                    .map_err(|(resizer, error)| (Self::Vulkan(resizer), error))
+            }
         }
     }
 }
 
 impl ReservedPrepared {
-    /// Whether its install moves records device work already reaches
-    /// (`seismic_reservation::Backing::rebinds`).
-    pub(crate) fn rebinds(&self) -> bool {
+    /// How its install moves records device work already reaches
+    /// (`seismic_reservation::Backing::rebinding`).
+    pub(crate) fn rebinding(&self) -> host::Rebinding {
         match self {
-            Self::Cpu(prepared) => prepared.rebinds(),
+            Self::Cpu(prepared) => prepared.rebinding(),
             #[cfg(target_os = "macos")]
-            Self::Metal(prepared) => prepared.rebinds(),
-            Self::Cuda(prepared) => prepared.rebinds(),
+            Self::Metal(prepared) => prepared.rebinding(),
+            Self::Cuda(prepared) => prepared.rebinding(),
             #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(prepared) => prepared.rebinds(),
+            Self::Vulkan(prepared) => prepared.rebinding(),
         }
     }
 

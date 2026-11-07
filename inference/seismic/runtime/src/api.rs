@@ -1772,6 +1772,15 @@ pub mod tensor {
                 .is_none_or(|chunks| chunks.whole && !self.packed())
         }
 
+        /// Whether device work can bind this view now as a native port that
+        /// binds it directly ([`Self::binds_directly`]) does: always, but in
+        /// chunked reserved storage only while its backend holds one buffer
+        /// over the whole range, a form its resizes take only within their
+        /// grant, not wherever every granule is backed.
+        pub fn bindable(&self) -> bool {
+            !(self.chunked() && self.binds_directly()) || crate::backends::bound_whole(&self.allocation)
+        }
+
         /// Whether this view's records are packed in chunks with room left
         /// between them: its bytes are no one canonical range.
         fn packed(&self) -> bool {

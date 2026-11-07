@@ -59,6 +59,11 @@ pub trait Backing: Send + Sync + 'static {
     /// What applying a change leaves the view no longer holding, kept until
     /// no device work submitted before the change uses it.
     type Retired: Send + Sync;
+    /// The form a view takes, which the reservation's holder chooses where
+    /// a backing has more than one (Metal: a buffer over each granule, or
+    /// one buffer over a whole range); `()` where it has one. The default
+    /// is the form any granule count takes.
+    type Form: Copy + Default + Send + Sync;
     /// Bytes of one granule.
     fn granule(&self) -> usize;
     /// The granules the reservation spans.
@@ -73,26 +78,63 @@ pub trait Backing: Send + Sync + 'static {
     /// Write zero over `bytes` of backed granules, beside device work that
     /// uses the reservation but not those bytes.
     fn zero(&self, bytes: Range<u64>) -> Result<(), Self::Error>;
-    /// The view over the first `granules` granules, when the reservation is
-    /// formed.
-    fn view(&self, granules: usize) -> Result<Self::View, Self::Error>;
-    /// The change of the view from its `installed` granules to the first
-    /// `granules` (another count), formed without changing what device work
-    /// or the host see. Every granule the view or the change spans is
-    /// backed.
-    fn change(&self, installed: usize, granules: usize) -> Result<Self::Change, Self::Error>;
-    /// Whether applying `change` moves records device work already reaches
-    /// to other device addresses (Metal's change of form, which rewrites
-    /// every table entry): device work submitted before the change was
-    /// formed, which may not reach what it moves them to, must end before it
-    /// is applied. None by default.
-    fn rebinds(&self, _change: &Self::Change) -> bool {
-        false
+    /// The view over the first `granules` granules in `form`, when the
+    /// reservation is formed.
+    fn view(&self, granules: usize, form: Self::Form) -> Result<Self::View, Self::Error>;
+    /// The form `view` is in.
+    fn form(&self, view: &Self::View) -> Self::Form;
+    /// The change of the view from its `installed` granules in its form to
+    /// the first `granules` (another count) in `form`, formed without
+    /// changing what device work or the host see; a change of form's next
+    /// buffers formed where `forming` says. Every granule the view or the
+    /// change spans is backed.
+    fn change(
+        &self,
+        installed: (usize, Self::Form),
+        granules: usize,
+        form: Self::Form,
+        forming: Forming,
+    ) -> Result<Self::Change, Self::Error>;
+    /// Whether and how applying `change` moves records device work already
+    /// reaches to other device addresses ([`Rebinding`]). None by default.
+    fn rebinding(&self, _change: &Self::Change) -> Rebinding {
+        Rebinding::None
     }
     /// Apply `change` to `view`: device work encoded from now binds the
     /// result. What it retires is dropped by the change's release, before
     /// the granules it releases are unbacked.
     fn apply(&self, view: &mut Self::View, change: Self::Change) -> Self::Retired;
+}
+
+/// How applying a change moves records device work already reaches to other
+/// device addresses ([`Backing::rebinding`]), and so what device work must
+/// end before it is applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rebinding {
+    /// It moves none: device work runs beside the apply.
+    None,
+    /// Its next buffers were formed by the prepare beside the view's (Metal's
+    /// change of form): device work submitted before the prepare, which may
+    /// not reach them, must end before it is applied.
+    Beside,
+    /// The apply retires the view's buffers and forms the next ones in their
+    /// place, so that the two are never held together: no device work using
+    /// the reservation may run when it is applied.
+    InPlace,
+}
+
+/// Where a change of a view's form forms the next form's buffers, which
+/// only a change of form reads ([`Backing::change`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Forming {
+    /// By the prepare, beside the view's buffers, both held until the
+    /// release ([`Rebinding::Beside`]).
+    Beside,
+    /// By the install, in place of the view's buffers, which it retires
+    /// first ([`Rebinding::InPlace`]): only a change that needs nothing
+    /// formed beside it to go on serving, a shrink (Metal's from its whole
+    /// form).
+    InPlace,
 }
 
 /// A reserved host address range, unmapped when dropped: what the CPU
@@ -424,14 +466,19 @@ pub struct State<V> {
 
 impl<B: Backing> Reserved<B> {
     /// The reservation `backing` spans, its leading `committed` bytes
-    /// backed, and its resizer.
+    /// backed in the default form, and its resizer.
     ///
     /// # Panics
     /// If `committed` exceeds the reservation.
     pub fn new(backing: B, committed: u64) -> Result<(Arc<Self>, Resizer<B>), B::Error> {
+        Self::formed(backing, committed, B::Form::default())
+    }
+
+    /// [`Self::new`], the view in `form`.
+    pub fn formed(backing: B, committed: u64, form: B::Form) -> Result<(Arc<Self>, Resizer<B>), B::Error> {
         let backed = granules_of(&backing, committed);
         backing.back(0, backed)?;
-        let view = match backing.view(backed) {
+        let view = match backing.view(backed, form) {
             Ok(view) => view,
             Err(error) => {
                 backing.unback(0, backed);
@@ -488,11 +535,23 @@ impl<B: Backing> Resizer<B> {
     /// # Panics
     /// If `committed` exceeds the reservation.
     pub fn prepare(self, committed: u64) -> Result<Prepared<B>, (Self, B::Error)> {
+        self.prepare_as(committed, B::Form::default(), Forming::Beside)
+    }
+
+    /// The form the view is in now.
+    pub fn form(&self) -> B::Form {
+        self.reserved.backing.form(&self.reserved.state().view)
+    }
+
+    /// [`Self::prepare`], where the granules change the view's next one in
+    /// `form`, a change of form's buffers formed where `forming` says; where
+    /// they do not, the view keeps its form.
+    pub fn prepare_as(self, committed: u64, form: B::Form, forming: Forming) -> Result<Prepared<B>, (Self, B::Error)> {
         let backing = &self.reserved.backing;
         let granules = granules_of(backing, committed);
-        let (bytes, installed) = {
+        let (bytes, installed, installed_form) = {
             let state = self.reserved.state();
-            (state.bytes, state.granules)
+            (state.bytes, state.granules, backing.form(&state.view))
         };
         if granules > installed {
             if let Err(error) = backing.back(installed, granules) {
@@ -507,7 +566,7 @@ impl<B: Backing> Resizer<B> {
         };
         let change = zeroed.and_then(|()| match granules == installed {
             true => Ok(None),
-            false => backing.change(installed, granules).map(Some),
+            false => backing.change((installed, installed_form), granules, form, forming).map(Some),
         });
         let change = match change {
             Ok(change) => change,
@@ -545,11 +604,11 @@ struct Next<B: Backing> {
 }
 
 impl<B: Backing> Prepared<B> {
-    /// Whether its install moves records device work already reaches
-    /// ([`Backing::rebinds`]).
-    pub fn rebinds(&self) -> bool {
+    /// How its install moves records device work already reaches
+    /// ([`Backing::rebinding`]).
+    pub fn rebinding(&self) -> Rebinding {
         let next = self.next.as_ref().expect("a prepared commitment is held until it installs");
-        next.change.as_ref().is_some_and(|change| next.reserved.backing.rebinds(change))
+        next.change.as_ref().map_or(Rebinding::None, |change| next.reserved.backing.rebinding(change))
     }
 
     /// Publish the commitment: its length, and the view's change, which
@@ -642,6 +701,7 @@ impl Backing for Pages {
     type View = ();
     type Change = ();
     type Retired = ();
+    type Form = ();
 
     fn granule(&self) -> usize {
         self.0.granule
@@ -664,11 +724,13 @@ impl Backing for Pages {
         Ok(())
     }
 
-    fn view(&self, _: usize) -> Result<(), AllocationFailure> {
+    fn view(&self, _: usize, (): ()) -> Result<(), AllocationFailure> {
         Ok(())
     }
 
-    fn change(&self, _: usize, _: usize) -> Result<(), AllocationFailure> {
+    fn form(&self, (): &()) {}
+
+    fn change(&self, _: (usize, ()), _: usize, (): (), _: Forming) -> Result<(), AllocationFailure> {
         Ok(())
     }
 

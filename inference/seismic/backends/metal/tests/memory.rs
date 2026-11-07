@@ -6,7 +6,8 @@
 
 use seismic_compiler::executable::DeviceService;
 use seismic_metal::toolchain::MetalToolchain;
-use seismic_metal::{DeviceHandle, DirectBatch, DirectLaunch, MetalDevice};
+use seismic_reservation::Forming;
+use seismic_metal::{DeviceHandle, DirectBatch, DirectLaunch, MetalDevice, MetalResizer, ViewForm};
 use seismic_native_target::process::{return_freed_pages, ProcessMemory};
 use seismic_native_target::{ProgramEntry, ProgramSource, Toolchain};
 use std::sync::Mutex;
@@ -176,36 +177,56 @@ fn programs_formed_and_released_leave_only_what_metal_keeps_a_pipeline() {
 
 /// Metal counts a reservation's backed bytes once in the device's
 /// allocated size (`currentAllocatedSize`, which the device's grant is read
-/// from), as Seismic charges them: in each form (chunks while a granule is
-/// unbacked, one buffer over the range while every one is) and through each
-/// change between them.
+/// from), as Seismic charges them, in each form: chunks, or one buffer over
+/// the range while every granule is backed in the whole form. A change of
+/// form beside the view holds the next form's buffers beside it from its
+/// prepare to its release, the lesser form's bytes more, which its holder
+/// is charged for that window; a change in place holds nothing beside it.
 #[test]
 fn a_reservation_counts_its_backed_bytes_once_in_the_devices_allocated_size() {
     let _alone = ALONE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     const GRANULE: u64 = seismic_metal::device::RESERVATION_GRANULE as u64;
     const GRANULES: u64 = 64;
+    const ALL: u64 = GRANULES * GRANULE;
     let device = MetalDevice::open(DeviceHandle::system_default().unwrap()).unwrap();
     let allocated = || device.handle().current_allocated_bytes();
-    let resize = |resizer: seismic_metal::MetalResizer, bytes: u64| {
-        resizer.prepare(bytes).map_err(|(_, error)| error).unwrap().install().release()
+    let prepare_in = |resizer: MetalResizer, bytes: u64, form: ViewForm, forming: Forming| {
+        resizer.prepare_as(bytes, form, forming).map_err(|(_, error)| error).unwrap()
     };
+    let prepare = |resizer: MetalResizer, bytes: u64, form: ViewForm| prepare_in(resizer, bytes, form, Forming::Beside);
+    let resize = |resizer: MetalResizer, bytes: u64, form: ViewForm| prepare(resizer, bytes, form).install().release();
     // An empty reservation holds its record table alone, which a reservation
     // of the same range always does.
     let before = allocated();
-    let (buffer, resizer) = device.allocate_reserved(0, GRANULES * GRANULE, GRANULE, GRANULE).unwrap();
+    let (buffer, resizer) = device.allocate_reserved(0, ALL, GRANULE, GRANULE).unwrap();
     let table = allocated() - before;
     let backed = || allocated() - before - table;
-    let resizer = resize(resizer, GRANULES / 2 * GRANULE);
-    assert_eq!(backed(), GRANULES / 2 * GRANULE, "half the granules, as chunks");
-    let resizer = resize(resizer, GRANULES * GRANULE);
-    assert_eq!(backed(), GRANULES * GRANULE, "every granule, as one buffer");
-    let resizer = resize(resizer, (GRANULES - 1) * GRANULE);
-    assert_eq!(backed(), (GRANULES - 1) * GRANULE, "a shrink from every granule, as chunks");
-    let resizer = resize(resizer, GRANULES * GRANULE);
-    assert_eq!(backed(), GRANULES * GRANULE, "a growth back to every granule");
+    let resizer = resize(resizer, ALL / 2, ViewForm::Chunks);
+    assert_eq!(backed(), ALL / 2, "half the granules, as chunks");
+    let resizer = resize(resizer, ALL, ViewForm::Chunks);
+    assert!(!buffer.is_whole());
+    assert_eq!(backed(), ALL, "every granule, as chunks");
+    let resizer = resize(resizer, ALL - GRANULE, ViewForm::Chunks);
+    let prepared = prepare(resizer, ALL, ViewForm::Whole);
+    assert_eq!(backed(), (ALL - GRANULE) + ALL, "a growth into the whole form, beside the chunks");
+    let resizer = prepared.install().release();
+    assert!(buffer.is_whole());
+    assert_eq!(backed(), ALL, "every granule, as one buffer");
+    let prepared = prepare(resizer, ALL - GRANULE, ViewForm::Chunks);
+    assert_eq!(backed(), ALL + (ALL - GRANULE), "a shrink from the whole form, beside it");
+    let resizer = prepared.install().release();
+    assert_eq!(backed(), ALL - GRANULE, "a shrink from every granule, as chunks");
+    let resizer = resize(resizer, ALL, ViewForm::Whole);
+    let prepared = prepare_in(resizer, ALL / 4, ViewForm::Chunks, Forming::InPlace);
+    assert_eq!(backed(), ALL, "a shrink in place forms nothing beside the one buffer");
+    let pending = prepared.install();
+    assert_eq!(backed(), ALL / 4, "its install forms the kept chunks in the one buffer's place");
+    let resizer = pending.release();
+    assert_eq!(backed(), ALL / 4);
     drop((buffer, resizer));
     assert_eq!(allocated(), before);
-    let (formed, resizer) = device.allocate_reserved(GRANULES * GRANULE, GRANULES * GRANULE, GRANULE, GRANULE).unwrap();
-    assert_eq!(backed(), GRANULES * GRANULE, "a reservation formed with every granule backed");
+    let (formed, resizer) = device.allocate_reserved(ALL, ALL, GRANULE, GRANULE).unwrap();
+    assert!(formed.is_whole());
+    assert_eq!(backed(), ALL, "a reservation formed with every granule backed");
     drop((formed, resizer));
 }

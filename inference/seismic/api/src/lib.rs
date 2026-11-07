@@ -1554,6 +1554,13 @@ impl Tensor {
     pub fn committed_rows(&self) -> u64 {
         self.inner.committed_rows()
     }
+    /// Whether device work can bind this view now as a native port that
+    /// binds it directly does: always, but in chunked reserved storage only
+    /// while its backend holds one buffer over the whole range (Metal's
+    /// whole form, which a resize takes only within its grant).
+    pub fn bindable(&self) -> bool {
+        self.inner.bindable()
+    }
     pub fn read_to_host(&self) -> Result<Vec<u8>, TensorError> {
         self.inner.read_to_host()
     }
