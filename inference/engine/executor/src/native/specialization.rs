@@ -225,7 +225,6 @@ impl<'a> Tuning<'a> {
     pub fn register_composed(
         &mut self,
         contender: Box<dyn ComposedContender<'a> + 'a>,
-        rows: u64,
     ) -> Result<Option<bool>, CatalogFailure> {
         match self {
             Self::Tuner(tuner) => tuner.register_composed(contender),
@@ -234,6 +233,10 @@ impl<'a> Tuning<'a> {
                 current,
                 ..
             } => {
+                let terms = &invocations.objective.terms;
+                let served = current.represented(|launch| {
+                    contender.serves(launch, terms[launch.term].metric.phase)
+                });
                 invocations
                     .units
                     .entry((
@@ -242,9 +245,7 @@ impl<'a> Tuning<'a> {
                         std::collections::BTreeMap::new(),
                     ))
                     .or_default()
-                    .add(&current.represented(|launch| {
-                        (launch.rows > rows / 2 && launch.rows <= rows).then_some(rows)
-                    }));
+                    .add(&served);
                 Ok(None)
             }
             Self::Listing(_) => Ok(None),
