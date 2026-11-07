@@ -25,9 +25,9 @@ use seismic::{BuildError, Element, Tensor};
 
 /// Banks of a tuning arena: the zero seed, the bank the slot reads and the
 /// bank it publishes to.
-const TUNING_BANKS: u64 = 3;
+pub(crate) const TUNING_BANKS: u64 = 3;
 /// The bank each tuning slot publishes to; the only bank a state entry writes.
-const PUBLISHED_BANK: u64 = 2;
+pub(crate) const PUBLISHED_BANK: u64 = 2;
 
 /// The recurrent geometry a specialization fixes, and every layer sharing it.
 #[derive(Clone)]
@@ -337,18 +337,27 @@ pub(crate) struct RecurrentStepTuning(pub RecurrentState);
 #[derive(Clone)]
 pub(crate) struct RecurrentChunkTuning(pub RecurrentState);
 
-/// One request slot's tables for a case of `rows` rows: it reads bank 1 with
-/// no tape rows and publishes to the case's published bank after every row.
+/// One request slot's tables for a case of `rows` rows, published as the
+/// served launch of the rows' class publishes them. A chunked class's rows
+/// are a prefill chunk, which publishes its state after every row. A step
+/// class's rows of one sequence are a drafter's verification, which
+/// publishes after its committed row and records the rest on the tape
+/// (`OwnedAdvanceBindings`): those tape writes are part of the served
+/// launch's cost, and a case that published every row would rank
+/// configurations without them. The slot reads bank 1 with no tape rows.
 pub(crate) struct SlotTables {
-    segments: Tensor,
-    stop: Tensor,
-    previous_bank: Tensor,
-    previous_tape: Tensor,
-    following_bank: Tensor,
+    pub segments: Tensor,
+    pub stop: Tensor,
+    pub previous_bank: Tensor,
+    pub previous_tape: Tensor,
+    pub following_bank: Tensor,
+    /// The tape rows the arena's banks hold: every row the slot records,
+    /// and one, the least a store holds, when it records none.
+    pub tape_rows: u64,
 }
 
 impl SlotTables {
-    fn new(inputs: &mut TuningInputs<'_, '_>, rows: u64) -> Result<Self, BuildError> {
+    pub(crate) fn new(inputs: &mut TuningInputs<'_, '_>, rows: u64) -> Result<Self, BuildError> {
         let tables = inputs.batch(rows, 0, &[Vec::new()], 0)?;
         let slots = tables.actual_slots;
         let segments = tables.segments[..=slots]
@@ -356,10 +365,11 @@ impl SlotTables {
             .flatten()
             .copied()
             .collect::<Vec<_>>();
-        let stop = tables.segments[..slots]
+        let (stop, recorded): (Vec<_>, Vec<_>) = tables.segments[..slots]
             .iter()
-            .map(|[start, end]| end - start)
-            .collect::<Vec<_>>();
+            .map(|[start, end]| served_publication(rows, end - start))
+            .unzip();
+        let recorded = recorded.into_iter().max().unwrap_or(0);
         let banks = slots as u64;
         Ok(Self {
             segments: inputs.i32s(&[banks + 1, 2], &segments)?,
@@ -367,14 +377,26 @@ impl SlotTables {
             previous_bank: inputs.i32s(&[banks], &tables.bank[..slots])?,
             previous_tape: inputs.i32s(&[banks], &vec![0; slots])?,
             following_bank: inputs.i32s(&[banks], &tables.following_bank[..slots])?,
+            tape_rows: recorded.max(1),
         })
     }
 }
 
-/// A tuning arena's window banks of pseudo-random activations.
+/// The row after which a slot of `count` of a case's `rows` rows publishes
+/// its state, and the rows it records on the tape, as the served launch of
+/// the rows' class does ([`SlotTables`]).
+pub(crate) fn served_publication(rows: u64, count: i32) -> (i32, u64) {
+    // Every slot holds at least one row.
+    let stop = if chunked(rows) { count } else { 1 };
+    (stop, (count - stop) as u64)
+}
+
+/// A tuning arena's window banks of pseudo-random activations, holding
+/// `tables`' tape rows.
 fn window_state(
     inputs: &mut TuningInputs<'_, '_>,
     shape: &RecurrentShape,
+    tables: &SlotTables,
     activation: Element,
     seed: u64,
 ) -> Result<CaseState, BuildError> {
@@ -382,7 +404,7 @@ fn window_state(
         activation,
         &[
             TUNING_BANKS,
-            shape.convolution_width - 1 + TUNING_TAPE_ROWS,
+            shape.convolution_width - 1 + tables.tape_rows,
             shape.channels(),
         ],
         seed,
@@ -391,10 +413,11 @@ fn window_state(
 }
 
 /// A tuning arena's delta and tape banks of pseudo-random state (seeds
-/// `seed + 3` and `seed + 4`).
+/// `seed + 3` and `seed + 4`), holding `tables`' tape rows.
 fn delta_tape_states(
     inputs: &mut TuningInputs<'_, '_>,
     shape: &RecurrentShape,
+    tables: &SlotTables,
     seed: u64,
 ) -> Result<(CaseState, CaseState), BuildError> {
     let delta = inputs.activation(
@@ -406,7 +429,7 @@ fn delta_tape_states(
         Element::f32(),
         &[
             TUNING_BANKS,
-            TUNING_TAPE_ROWS,
+            tables.tape_rows,
             (shape.value_heads + shape.key_heads) * shape.width + shape.value_heads,
         ],
         seed + 4,
@@ -442,11 +465,6 @@ struct RecurrentCodes {
     grouped: bool,
     gate_function: i32,
 }
-
-/// Tape rows of a tuning case's banks: one, the least a store holds. Cases
-/// publish after every row (stop = rows), so the tape is never written and
-/// its size does not change the cost.
-const TUNING_TAPE_ROWS: u64 = 1;
 
 impl RecurrentState {
     fn bindings(&self) -> String {
@@ -490,8 +508,8 @@ impl RecurrentState {
     ) -> Result<RecurrentStateCase, BuildError> {
         let shape = &self.shape;
         let tables = SlotTables::new(inputs, rows)?;
-        let window = window_state(inputs, shape, self.activation, seed + 2)?;
-        let (delta, tape) = delta_tape_states(inputs, shape, seed)?;
+        let window = window_state(inputs, shape, &tables, self.activation, seed + 2)?;
+        let (delta, tape) = delta_tape_states(inputs, shape, &tables, seed)?;
         Ok(RecurrentStateCase {
             projection: inputs.activation(
                 self.activation,
@@ -639,11 +657,18 @@ impl EntryTuning for RecurrentProjectConvolvedTuning {
             .zip(projections)
             .enumerate()
             .map(|(index, (scope, project))| {
+                let tables = SlotTables::new(inputs, point.rows)?;
                 Ok(RecurrentProjectConvolvedCase {
                     project,
                     convolution: inputs.weight(scope, WeightKind::RecurrentConvolution)?,
-                    tables: SlotTables::new(inputs, point.rows)?,
-                    window: window_state(inputs, shape, self.0.activation, 4 * index as u64 + 2)?,
+                    window: window_state(
+                        inputs,
+                        shape,
+                        &tables,
+                        self.0.activation,
+                        4 * index as u64 + 2,
+                    )?,
+                    tables,
                     slab_banks: TUNING_BANKS as u32,
                 })
             })
@@ -743,7 +768,8 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
             .enumerate()
             .map(|(index, scope)| {
                 let seed = 4 * index as u64;
-                let (delta, tape) = delta_tape_states(inputs, shape, seed)?;
+                let tables = SlotTables::new(inputs, point.rows)?;
+                let (delta, tape) = delta_tape_states(inputs, shape, &tables, seed)?;
                 Ok(RecurrentStepConvolvedCase {
                     projection: inputs.activation(
                         state.activation,
@@ -758,7 +784,7 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
                     rate: inputs.weight(scope, WeightKind::RecurrentDecay)?,
                     time_bias: inputs.weight(scope, WeightKind::RecurrentTimeBias)?,
                     recurrent_norm: inputs.weight(scope, WeightKind::RecurrentNorm)?,
-                    tables: SlotTables::new(inputs, point.rows)?,
+                    tables,
                     delta,
                     tape,
                     slab_banks: TUNING_BANKS as u32,

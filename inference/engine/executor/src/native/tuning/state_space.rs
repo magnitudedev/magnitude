@@ -12,6 +12,7 @@
 //! validation run.
 
 use super::cases::{packing_statics, projection_shape, scale_extent};
+use super::recurrent::{PUBLISHED_BANK, SlotTables, TUNING_BANKS};
 use super::{CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs};
 use crate::operators::InputForm;
 use crate::operators::gated_delta::graph::chunked;
@@ -19,16 +20,6 @@ use crate::{StateSpaceBinding, StateSpaceShape};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, attention_project, state_space_chunk, state_space_step};
 use seismic::{BuildError, Element, Tensor};
-
-/// Banks of a tuning arena: the zero seed, the bank the slot reads and the
-/// bank it publishes to.
-const TUNING_BANKS: u64 = 3;
-/// The bank each tuning slot publishes to; the only bank a state entry writes.
-const PUBLISHED_BANK: u64 = 2;
-/// Tape rows of a tuning case's banks: one, the least a store holds. Cases
-/// publish after every row (stop = rows), so the tape is never written and
-/// its size does not change the cost.
-const TUNING_TAPE_ROWS: u64 = 1;
 
 /// `attention_project` as the state-space input projection.
 #[derive(Clone)]
@@ -302,11 +293,7 @@ pub(crate) struct StateSpaceStateCase {
     rate: Tensor,
     time_bias: Tensor,
     skip: Tensor,
-    segments: Tensor,
-    stop: Tensor,
-    previous_bank: Tensor,
-    previous_tape: Tensor,
-    following_bank: Tensor,
+    tables: SlotTables,
     window: CaseState,
     state: CaseState,
     tape: CaseState,
@@ -322,23 +309,12 @@ impl StateSpaceState {
         seed: u64,
     ) -> Result<StateSpaceStateCase, BuildError> {
         let shape = &self.shape;
-        let tables = inputs.batch(rows, 0, &[Vec::new()], 0)?;
-        let slots = tables.actual_slots;
-        let segments = tables.segments[..=slots]
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<Vec<_>>();
-        let stop = tables.segments[..slots]
-            .iter()
-            .map(|[start, end]| end - start)
-            .collect::<Vec<_>>();
-        let banks = slots as u64;
+        let tables = SlotTables::new(inputs, rows)?;
         let window = inputs.activation(
             self.activation,
             &[
                 TUNING_BANKS,
-                shape.convolution_width - 1 + TUNING_TAPE_ROWS,
+                shape.convolution_width - 1 + tables.tape_rows,
                 shape.channels(),
             ],
             seed + 2,
@@ -350,7 +326,7 @@ impl StateSpaceState {
         )?;
         let tape = inputs.activation(
             Element::f32(),
-            &[TUNING_BANKS, TUNING_TAPE_ROWS, shape.tape_width()],
+            &[TUNING_BANKS, tables.tape_rows, shape.tape_width()],
             seed + 4,
         )?;
         let published = PUBLISHED_BANK..PUBLISHED_BANK + 1;
@@ -365,11 +341,7 @@ impl StateSpaceState {
             rate: inputs.weight(scope, WeightKind::RecurrentDecay)?,
             time_bias: inputs.weight(scope, WeightKind::RecurrentTimeBias)?,
             skip: inputs.weight(scope, WeightKind::StateSpaceSkip)?,
-            segments: inputs.i32s(&[banks + 1, 2], &segments)?,
-            stop: inputs.i32s(&[banks], &stop)?,
-            previous_bank: inputs.i32s(&[banks], &tables.bank[..slots])?,
-            previous_tape: inputs.i32s(&[banks], &vec![0; slots])?,
-            following_bank: inputs.i32s(&[banks], &tables.following_bank[..slots])?,
+            tables,
             window: inputs.slab_state(window, TUNING_BANKS, published.clone())?,
             state: inputs.slab_state(state, TUNING_BANKS, published.clone())?,
             tape: inputs.slab_state(tape, TUNING_BANKS, published)?,
@@ -425,11 +397,11 @@ macro_rules! state_entry {
                     rate: &case.rate,
                     time_bias: &case.time_bias,
                     skip: &case.skip,
-                    segments: &case.segments,
-                    stop: &case.stop,
-                    previous_bank: &case.previous_bank,
-                    previous_tape: &case.previous_tape,
-                    following_bank: &case.following_bank,
+                    segments: &case.tables.segments,
+                    stop: &case.tables.stop,
+                    previous_bank: &case.tables.previous_bank,
+                    previous_tape: &case.tables.previous_tape,
+                    following_bank: &case.tables.following_bank,
                     window: case.window.tensor_mut(),
                     state: case.state.tensor_mut(),
                     tape: case.tape.tensor_mut(),
