@@ -832,8 +832,11 @@ pub struct Measurement {
     pub failures: Vec<ExecutorCostsError>,
     /// What the job's points were made in and from, which its caller
     /// releases once it has reported the job: every record is stored by
-    /// then, and releasing it is no part of the job's time (a GB10's CPU
-    /// took 54 ms over a job's rotations and kernels, 2026-10-22).
+    /// then. Dropping it waits for the compiles the formation began before
+    /// the deadline and tears the device down (0.44-0.50 s past a GB10's
+    /// CUDA job, 2026-11-07), so a job's own process ends without dropping
+    /// it, as by a kill, unless what its compiles formed is kept in the
+    /// platform's cache ([`Held::platform_cached`]).
     pub held: Held,
 }
 
@@ -841,6 +844,17 @@ pub struct Measurement {
 pub struct Held {
     _backings: Backings,
     _programs: Option<Formed>,
+    platform_cached: bool,
+}
+
+impl Held {
+    /// Whether the job's device keeps what its compiles formed in the
+    /// platform's own cache (`seismic::Device::platform_cached`), which only
+    /// the process's normal exit leaves written: its process drops this,
+    /// so the compiles begun before the deadline end, then exits normally.
+    pub fn platform_cached(&self) -> bool {
+        self.platform_cached
+    }
 }
 
 /// A job's programs and the thread forming them, which ends with the job
@@ -4548,6 +4562,7 @@ impl<'a, 'd> Walks<'a, 'd> {
     /// releases once it has reported the job.
     pub(super) fn held(self) -> Held {
         Held {
+            platform_cached: self.measured.device.platform_cached(),
             _backings: self.measured.backings,
             _programs: self.measured.programs.into_inner(),
         }

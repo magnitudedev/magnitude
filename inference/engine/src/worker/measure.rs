@@ -21,7 +21,7 @@
 use super::client::{handshake, receive};
 use super::protocol::{EngineBuild, HostMessage, WorkerMessage};
 use super::transport::{HostTransport, MessageSender};
-use super::WorkerExit;
+use super::{Held, Served, WorkerExit};
 use magnitude_executor::assessment::{requests, PointRequests};
 use magnitude_executor::{KernelCache, DEFAULT_KERNEL_CACHE_BYTES};
 use seismic::measure::{Attempt, JsonFileStore, Outcome, Reason, Record, StoreError};
@@ -231,16 +231,16 @@ pub fn release_killed(
 
 /// A Measure: run the job of `request` and report each attempt and each
 /// record it stores, then what could not be measured. The process ends
-/// after the outcome.
+/// after the outcome, with what the job's points still hold.
 pub(super) fn measure_only(
     request: MeasureRequest,
     mut sender: impl MessageSender<WorkerMessage>,
-) -> WorkerExit {
+) -> Served {
     let hello = WorkerMessage::Hello {
         build: EngineBuild::current(),
     };
     if let Err(error) = sender.send(hello) {
-        return WorkerExit::TransportFailed(error.to_string());
+        return WorkerExit::TransportFailed(error.to_string()).into();
     }
     let mut lost = None;
     let MeasureEnd { failures, held } = measure_machine(&request, &mut |event| {
@@ -252,15 +252,37 @@ pub(super) fn measure_only(
             lost = sender.send(message).err().map(|error| error.to_string());
         }
     });
-    if let Some(error) = lost {
-        return WorkerExit::TransportFailed(error);
+    let exit = match lost {
+        Some(error) => WorkerExit::TransportFailed(error),
+        None => match sender.send(WorkerMessage::MeasureFinished { failures }) {
+            Ok(()) => WorkerExit::Measured,
+            Err(error) => WorkerExit::TransportFailed(error.to_string()),
+        },
+    };
+    // Every record is stored: what the points hold is released as the
+    // process ends, past the job's report ([`end_measured`]).
+    Served {
+        exit,
+        _held: held.map(|points| Held::Measurement { _points: points }),
     }
-    let sent = sender.send(WorkerMessage::MeasureFinished { failures });
-    // Released once the job is reported.
-    drop(held);
-    match sent {
-        Ok(()) => WorkerExit::Measured,
-        Err(error) => WorkerExit::TransportFailed(error.to_string()),
+}
+
+/// End a measurement job's process with `code` once the job is reported,
+/// with what its points hold (`held`). It ends at once, what they hold
+/// released by the system, as by a kill, with no teardown and no wait for
+/// compiles still forming, except where what the job's compiles formed is
+/// kept in the platform's cache (`Held::platform_cached`): that process
+/// drops what its points hold, so the compiles it began end, and exits
+/// normally, its exit handlers leaving the platform's cache written, as a
+/// Prepare's does. A job that held nothing exits normally.
+pub fn end_measured(held: Option<magnitude_executor::assessment::Held>, code: i32) -> ! {
+    match held {
+        Some(points) if points.platform_cached() => {
+            drop(points);
+            std::process::exit(code)
+        }
+        Some(_) => magnitude_service_utils::process::end(code),
+        None => std::process::exit(code),
     }
 }
 

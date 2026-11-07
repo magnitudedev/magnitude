@@ -403,6 +403,12 @@ impl Device {
     pub fn backend(&self) -> BackendName {
         self.inner.info().backend()
     }
+    /// Whether this device's toolchain keeps what it compiles in the
+    /// platform's own cache (Metal's shader cache), which the process's
+    /// normal exit leaves written.
+    pub fn platform_cached(&self) -> bool {
+        self.inner.platform_cached()
+    }
     /// The host threads this device's own execution keeps busy while its
     /// work runs: a CPU device's worker pool's participants, the submitting
     /// thread among them; an accelerator's submitting thread alone.

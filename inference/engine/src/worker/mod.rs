@@ -128,7 +128,7 @@ pub fn serve_worker(transport: impl WorkerTransport) -> Served {
         })) => (manifest, unprepared),
         Ok(Some(HostMessage::Prepare { manifest })) => return prepare_only(manifest, sender).into(),
         Ok(Some(HostMessage::Measure { request })) => {
-            return measure::measure_only(request, sender).into()
+            return measure::measure_only(request, sender)
         }
         Ok(Some(_)) => {
             return WorkerExit::ProtocolViolation("expected Load, Prepare or Measure".into()).into()
@@ -139,33 +139,45 @@ pub fn serve_worker(transport: impl WorkerTransport) -> Served {
     serve(manifest, unprepared, receiver, Box::new(sender))
 }
 
-/// How a worker's serving ended: its exit, and the load it served, if it
-/// loaded one: stopped, every durable effect it owed made
-/// (`magnitude_executor::settle`), a shutdown answered. Dropping it joins
-/// the load's teardown; a worker process instead ends with
-/// [`Self::end_process`], cutting that teardown short.
+/// How a worker's serving ended: its exit, and what its work still holds
+/// on the device, if it held any once its every durable effect was made: a
+/// load it served, stopped (`magnitude_executor::settle`) with a shutdown
+/// answered, or a measurement job's points, reported with every record
+/// stored. Dropping it joins that teardown; a worker process instead ends
+/// with [`Self::end_process`], cutting it short.
 #[must_use]
 pub struct Served {
     pub exit: WorkerExit,
-    /// Held for its drop, which joins the load's teardown.
-    _loaded: Option<Loaded>,
+    /// Held for its drop, which joins its teardown.
+    _held: Option<Held>,
+}
+
+/// What a worker's work holds on the device after its last durable effect.
+enum Held {
+    Load { _load: Loaded },
+    /// The points' storage and programs, and the thread forming them,
+    /// whose drop waits for the compiles it began before the job's deadline.
+    Measurement { _points: magnitude_executor::assessment::Held },
 }
 
 impl From<WorkerExit> for Served {
     fn from(exit: WorkerExit) -> Self {
-        Self { exit, _loaded: None }
+        Self { exit, _held: None }
     }
 }
 
 impl Served {
     /// End this worker process with `code`. A process that served a load
-    /// ends at once: what the load still holds is released by the process's
-    /// end, as by a kill, with no teardown of its own, which on CUDA takes
-    /// longer than the kernel's. Any other exits normally, its exit handlers
-    /// run (a Prepare's leave the system's compiled-kernel caches written).
+    /// ends at once: what it still holds is released by the process's end,
+    /// as by a kill, with no teardown of its own, which on CUDA takes longer
+    /// than the kernel's. A measurement job's ends as
+    /// [`measure::end_measured`] ends it. Any other exits normally, its exit
+    /// handlers run (a Prepare's leave the system's compiled-kernel caches
+    /// written).
     pub fn end_process(self, code: i32) -> ! {
-        match self._loaded {
-            Some(_) => magnitude_service_utils::process::end(code),
+        match self._held {
+            Some(Held::Load { .. }) => magnitude_service_utils::process::end(code),
+            Some(Held::Measurement { _points: points }) => measure::end_measured(Some(points), code),
             None => std::process::exit(code),
         }
     }
@@ -249,7 +261,7 @@ fn serve(
                 return WorkerExit::TransportFailed(error.to_string()).into();
             }
             let (exit, loaded) = Session::new(outbound, signal, loaded).run();
-            Served { exit, _loaded: Some(loaded) }
+            Served { exit, _held: Some(Held::Load { _load: loaded }) }
         }
         // Nothing of the model was placed, and everything the attempt
         // opened was dropped before this answer.

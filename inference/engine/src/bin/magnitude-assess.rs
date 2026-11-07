@@ -22,7 +22,7 @@ use magnitude_engine::{
     },
     error::UnsupportedModel,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
-    worker::measure::{measure_machine, MeasureEnd, MeasureEvent, MeasureJob, MeasureRequest},
+    worker::measure::{end_measured, measure_machine, MeasureEnd, MeasureEvent, MeasureJob, MeasureRequest},
 };
 use magnitude_executor::{
     assessment::{
@@ -288,11 +288,12 @@ fn run() -> Result<bool, String> {
                 }
             },
         );
-        drop(held);
         for failure in &failures {
             eprintln!("magnitude-assess: not measured: {failure}");
         }
-        return Ok(failures.is_empty());
+        // Every record is stored: the job's process ends as the service's
+        // measurement worker's does.
+        end_measured(held, if failures.is_empty() { 0 } else { 1 });
     }
     let catalog = Devices::discover(&served).map_err(|error| error.to_string())?;
     let structure = AssessmentStructure::discover(

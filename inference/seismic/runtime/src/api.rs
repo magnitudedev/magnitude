@@ -712,6 +712,12 @@ pub mod device {
         pub fn topology(&self) -> &Arc<DeviceTopology> {
             &self.topology
         }
+        /// Whether this device's toolchain keeps what it compiles in the
+        /// platform's own cache (`seismic_native_target::Load::PlatformCached`),
+        /// which the process's normal exit leaves written.
+        pub fn platform_cached(&self) -> bool {
+            self.programs.platform_cached()
+        }
         /// The host threads this device's own execution keeps busy while
         /// its work runs: a CPU device's worker pool's participants, the
         /// submitting thread among them; an accelerator's submitting thread
