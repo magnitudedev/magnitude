@@ -445,6 +445,35 @@ impl HostRecords {
         }
     }
 
+    /// Move kept record `from`'s expert to ready record `to`, `from` ready
+    /// then: the expert never leaves the tier, so its word stays claimed and
+    /// no read, whoever's, can claim it while it moves. Its expert.
+    ///
+    /// The one change of two records that [`Self::set`] does not make, as
+    /// `set` changes one record and releases the word of an expert leaving
+    /// it. Of the indices `set` keeps, a move changes only those keyed by
+    /// record: `ready` (`to` leaves it, `from` joins), `kept` (the expert's
+    /// record) and `answering`. Those keyed by expert or counted by group
+    /// stay as they are, the same expert kept alone or as a copy: `alone`,
+    /// `holdings`, `lacking` and `landing`; neither record is graced or
+    /// claimed (`graced`, `claimed`).
+    fn relocate(&mut self, from: u32, to: u32) -> Staged {
+        let moved = self.records[from as usize];
+        let staged = moved.present().expect("a kept record keeps its expert");
+        assert!(matches!(moved, Host::Kept(_) | Host::Answering(..)), "record {from} moves only kept");
+        assert!(self.ready.remove(&to) && self.records[to as usize] == Host::Ready, "record {from} moves to a ready record, not {to}");
+        self.records[to as usize] = moved;
+        self.records[from as usize] = Host::Ready;
+        self.ready.insert(from);
+        self.kept.insert(staged, to);
+        for answering in &mut self.answering {
+            if *answering == from {
+                *answering = to;
+            }
+        }
+        staged
+    }
+
     /// Map `staged`'s entry to `record`, or unmap it (none), from the first
     /// step not yet begun (`LandingMap::store`).
     fn store(&self, (layer, expert): Staged, record: Option<u32>) {
@@ -1123,13 +1152,7 @@ impl HostRecords {
             self.set(record, Host::Ready);
         }
         for &(from, to) in &moves {
-            let moved = self.records[from as usize];
-            let staged = moved.present().expect("a kept record keeps its expert");
-            self.set(from, Host::Ready);
-            // Lacked for this instant between flights, where no request is
-            // posted, so no read claims it.
-            assert!(self.inbound.claim(staged), "{staged:?} claimed by a read while its record moves between flights");
-            self.set(to, moved);
+            let staged = self.relocate(from, to);
             self.store(staged, Some(to));
         }
         assert!(self.records[records as usize..].iter().all(|&content| content == Host::Ready), "a shrink keeps nothing past it");
