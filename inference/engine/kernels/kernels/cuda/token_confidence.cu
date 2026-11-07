@@ -39,7 +39,7 @@ extern "C" __global__ void token_confidence_merge(SEISMIC_KERNEL_PARAMS) {
     const int *rows = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROWS));
     const int *selection = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_SELECTION));
     const float *partials = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS));
-    float *confidence = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    float *confidence = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_CONFIDENCE));
     const u64 row = (u64)blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= SEISMIC_DIM_M)
         return;
@@ -53,7 +53,7 @@ extern "C" __global__ void token_confidence_merge(SEISMIC_KERNEL_PARAMS) {
             total += in[part * 2 + 1] * expf(in[part * 2] - maximum);
     const float *line = logits + u64(rows[row * SEISMIC_ROWS_STRIDE_0]) * SEISMIC_LOGITS_STRIDE_0;
     const int *selected = selection + row * SEISMIC_SELECTION_STRIDE_0;
-    confidence[row * SEISMIC_RESULT_0_STRIDE_0] = selected[SEISMIC_SELECTION_STRIDE_1] == 0
+    confidence[row * SEISMIC_CONFIDENCE_STRIDE_0] = selected[SEISMIC_SELECTION_STRIDE_1] == 0
         ? expf(line[u64(selected[0]) * SEISMIC_LOGITS_STRIDE_1] - maximum) / total
         : 0.0f;
 }

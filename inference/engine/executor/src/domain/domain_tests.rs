@@ -1735,7 +1735,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             request,
             outcome: Outcome::Head {
                 proposals: Vec::new(),
-                confidence: None,
+                confidence: Vec::new(),
             },
             advance: Some(Advance::Step(head_advance)),
             primed: None,
@@ -2234,7 +2234,6 @@ fn target_with_pending_priming(
         workspace: (workspace, output),
         output: crate::programs::HeadOutput {
             selections: None,
-            confidence: None,
             landed_reads: Vec::new(),
         },
     });

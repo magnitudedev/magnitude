@@ -661,12 +661,12 @@ pub enum Outcome {
     Forward {
         rows: Vec<RowResult>,
     },
-    /// One selection per requested proposal, in chain order, with each
-    /// one's probability under the readout logits it was selected from when
-    /// the head publishes it.
+    /// One selection per requested proposal, in chain order, with the
+    /// drafter's confidence in each: its probability under the readout
+    /// logits it was selected from.
     Head {
         proposals: Vec<Selected>,
-        confidence: Option<Vec<f32>>,
+        confidence: Vec<f32>,
     },
     Encode {
         features: FeatureRef,

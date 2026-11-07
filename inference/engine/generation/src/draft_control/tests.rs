@@ -495,6 +495,98 @@ fn confidence_leaves_text_whose_proposals_are_all_right_verified_at_full_width()
     );
 }
 
+/// A streamed load's launches, priced by what they take on it: a verified
+/// row's cost is mostly its experts' reads, so rows cost far more than on a
+/// resident load. Flash Next q4 at a 227-slot bank (M4 Max, replayed): plain
+/// 28.0 ms, a 4-row verification 1.66 times that.
+const STREAMED: Costs = Costs {
+    draft: |generated| match generated {
+        0 => 0.0,
+        1 => 2.0,
+        2..=3 => 4.5,
+        4..=7 => 9.0,
+        _ => 18.0,
+    },
+    verify: |rows| match rows {
+        1 => 28.0,
+        2 => 36.4,
+        3..=4 => 46.5,
+        5..=8 => 70.0,
+        _ => 120.0,
+    },
+};
+
+/// A streamed load whose rows cost more than drafting can earn: Qwen3.6
+/// 35B-A3B q4 at a 6 GiB cap (M4 Pro, measured settled), a 4-row
+/// verification 3.45 times a plain step.
+const STARVED: Costs = Costs {
+    draft: |generated| match generated {
+        0 => 0.0,
+        1..=3 => 5.1,
+        4..=7 => 6.5,
+        _ => 10.0,
+    },
+    verify: |rows| match rows {
+        1 => 37.9,
+        2 => 84.0,
+        3..=4 => 130.6,
+        5..=8 => 230.0,
+        _ => 450.0,
+    },
+};
+
+/// Flash Next's MTP head on prose that continues a passage (measured: 62.5%
+/// of first proposals right, then 50% and 60% of those reaching the next).
+const CONTINUED: [f64; WIDEST] = [
+    0.625, 0.3125, 0.1875, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+];
+
+/// The verify rule prices a row by the launches measured on the load, so on
+/// a streamed load it weighs a row by its reads: low-acceptance text drafts
+/// where that pays, verifying only the proposals its head is confident in,
+/// faster than plain decoding and than any fixed width.
+#[test]
+fn a_streamed_load_verifies_only_the_rows_worth_their_reads() {
+    let blind = Stream::of(&[(3_000, CONTINUED)]);
+    let confident = blind.clone().confident(telling);
+    let without = adaptive(&blind, STREAMED, &warmed(&blind, STREAMED));
+    let with = adaptive(&confident, STREAMED, &warmed(&confident, STREAMED));
+    let plain = fixed(&blind, STREAMED, 0);
+    let (width, best) = fastest_fixed(&blind, STREAMED);
+    assert!(
+        with.milliseconds < best * 0.97
+            && with.milliseconds < without.milliseconds * 0.97
+            && with.milliseconds < plain * 0.85,
+        "with confidence {:.0} ms, without {:.0} ms, fixed {width} {best:.0} ms, plain {plain:.0} ms: {}",
+        with.milliseconds,
+        without.milliseconds,
+        with.rounds()
+    );
+    let declining = with
+        .rounds
+        .iter()
+        .filter(|(choice, _)| choice.generated > 0 && choice.verified < choice.generated)
+        .count();
+    assert!(declining * 4 >= with.rounds.len(), "{}", with.rounds());
+}
+
+/// Where a streamed row's reads cost more than its expected tokens at any
+/// confidence, the rule verifies nothing and the load decodes plain, but for
+/// its looks.
+#[test]
+fn a_streamed_load_whose_rows_cost_more_than_they_earn_decodes_plain() {
+    let confident = Stream::of(&[(3_000, REJECTED)]).confident(telling);
+    let run = adaptive(&confident, STARVED, &warmed(&confident, STARVED));
+    let plain = fixed(&confident, STARVED, 0);
+    assert!(
+        run.milliseconds <= plain * 1.03,
+        "adaptive {:.0} ms, plain {plain:.0} ms: {}",
+        run.milliseconds,
+        run.rounds()
+    );
+    assert!(run.share(0, 0..2_980) >= 0.9, "{}", run.rounds());
+}
+
 #[test]
 fn the_last_tokens_of_a_request_are_still_drafted() {
     let stream = Stream::of(&[(256, PERFECT)]);

@@ -25,7 +25,7 @@
 //! Selections are step-major: proposal `k` of slot `s` is result row
 //! `k · slots + s`.
 
-use super::{DeviceSubmission, HeadOutput, HeadProgram};
+use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::{self, InputForm, Join, Mixer, SublayerInput};
 use crate::{
@@ -1510,7 +1510,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         Some(entries.sample),
         &mut constants,
     )?
-    .0;
+    .logits;
     let result = graph.local_for(
         entries.sample,
         "result",
@@ -1744,17 +1744,23 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         .map(|row| i32::try_from(row).map_err(|_| "draft row exceeds i32"))
         .collect::<Result<Vec<_>, _>>()?;
     let logit_rows = GraphConstant::i32(&mut graph, &logit_rows)?;
-    let confidence = graph
-        .enqueue(
+    let mut confidence = graph
+        .local_for(
             entries.confidence,
+            "confidence",
             &[("M", selected), ("N", outputs), ("V", readout_vocabulary)],
-            token_confidence::WorkflowArgs {
-                logits: (&logits).into(),
-                rows: logit_rows.port().tensor().into(),
-                selection: result.tensor().into(),
-            },
         )?
-        .value;
+        .tensor()
+        .clone();
+    readout::confidence(
+        &mut graph,
+        entries.confidence,
+        &logits,
+        logit_rows.port().tensor(),
+        result.tensor().into(),
+        (&mut confidence).into(),
+        (selected, outputs, readout_vocabulary),
+    )?;
     constants.push(logit_rows);
     graph.export(&confidence)?;
     let output = result.tensor().clone();
@@ -3652,26 +3658,24 @@ impl NativeDraftProgram {
         let owner = output.publish(outputs);
         let selections = (steps > 0)
             .then(|| {
-                owner
-                    .tensor(&graph.output)
-                    .ok_or_else(|| invalid("draft graph omitted its selections"))
-            })
-            .transpose()?;
-        let confidence = graph
-            .block
-            .as_ref()
-            .filter(|_| steps > 0)
-            .map(|block| {
-                owner
-                    .tensor(&block.confidence)
-                    .ok_or_else(|| invalid("draft graph omitted its confidence"))
+                let block = graph
+                    .block
+                    .as_ref()
+                    .ok_or_else(|| invalid("a drafting draft graph has no block"))?;
+                Ok::<_, SubmitError>(HeadSelections {
+                    tokens: owner
+                        .tensor(&graph.output)
+                        .ok_or_else(|| invalid("draft graph omitted its selections"))?,
+                    confidence: owner
+                        .tensor(&block.confidence)
+                        .ok_or_else(|| invalid("draft graph omitted its confidence"))?,
+                })
             })
             .transpose()?;
         Ok((
             completion,
             HeadOutput {
                 selections,
-                confidence,
                 landed_reads: landed.into_iter().map(SelectedRead::submitted).collect(),
             },
         ))

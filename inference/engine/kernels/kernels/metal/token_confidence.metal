@@ -44,7 +44,7 @@ kernel void token_confidence_merge(
     device const int *rows [[buffer(SEISMIC_BUFFER_ROWS)]],
     device const int *selection [[buffer(SEISMIC_BUFFER_SELECTION)]],
     device const float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
-    device float *confidence [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    device float *confidence [[buffer(SEISMIC_BUFFER_CONFIDENCE)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint row [[thread_position_in_grid]]) {
     if (row >= SEISMIC_DIM_M) return;
@@ -58,7 +58,7 @@ kernel void token_confidence_merge(
             total += in[part * 2u + 1u] * metal::exp(in[part * 2u] - maximum);
     device const float *line = logits + ulong(rows[ulong(row) * SEISMIC_ROWS_STRIDE_0]) * SEISMIC_LOGITS_STRIDE_0;
     device const int *selected = selection + ulong(row) * SEISMIC_SELECTION_STRIDE_0;
-    confidence[ulong(row) * SEISMIC_RESULT_0_STRIDE_0] = selected[SEISMIC_SELECTION_STRIDE_1] == 0
+    confidence[ulong(row) * SEISMIC_CONFIDENCE_STRIDE_0] = selected[SEISMIC_SELECTION_STRIDE_1] == 0
         ? metal::exp(line[ulong(selected[0]) * SEISMIC_LOGITS_STRIDE_1] - maximum) / total
         : 0.0f;
 }

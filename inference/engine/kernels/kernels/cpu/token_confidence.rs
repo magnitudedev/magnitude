@@ -39,5 +39,5 @@ fn token_confidence_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
         0.0
     };
     // SAFETY: each work item writes its own row.
-    unsafe { cx.result_0().set([row], probability) };
+    unsafe { cx.arg_confidence().set([row], probability) };
 }

@@ -525,15 +525,15 @@ fn head_parts(operation: &Operation) -> (Vec<TokenId>, Vec<(u8, u8)>, usize, Vec
 
 /// Reconcile a head transaction as the service does.
 fn reconcile_head(generation: &mut Generation, operation: &Operation, proposals: &[(u32, u8)]) {
-    reconcile_confident_head(generation, operation, proposals, None);
+    reconcile_confident_head(generation, operation, proposals, vec![0.5; proposals.len()]);
 }
 
-/// Reconcile a head transaction that gives its confidence in each proposal.
+/// Reconcile a head transaction with its confidence in each proposal.
 fn reconcile_confident_head(
     generation: &mut Generation,
     operation: &Operation,
     proposals: &[(u32, u8)],
-    confidence: Option<Vec<f32>>,
+    confidence: Vec<f32>,
 ) {
     let outcome = Outcome::Head {
         proposals: proposals
@@ -2010,8 +2010,9 @@ fn adaptive_drafting_fits_the_tokens_a_request_has_left() {
 
 /// Whatever a draft policy generates and verifies, a request commits exactly
 /// the tokens its target selects: a draft only decides how many of them one
-/// round commits. Fixed budgets and the adaptive policy, with the drafter's
-/// confidences or without, produce one answer.
+/// round commits. Fixed budgets and the adaptive policy, with confidences
+/// that tell the drafter's right proposals from its wrong ones or that tell
+/// nothing, produce one answer.
 #[test]
 fn every_draft_policy_commits_the_targets_own_tokens() {
     use magnitude_generation::{DraftBudget, TimedLaunch};
@@ -2055,8 +2056,9 @@ fn every_draft_policy_commits_the_targets_own_tokens() {
                     .clone()
                     .map(|slot| (drafted(from + slot), 0))
                     .collect::<Vec<_>>();
-                let confidence =
-                    confident.then(|| slots.map(|slot| confidence(from + slot)).collect());
+                let confidence = slots
+                    .map(|slot| if confident { confidence(from + slot) } else { 0.5 })
+                    .collect();
                 generation.timed(TimedLaunch::Draft, Some(Duration::from_millis(2)), 1, 4);
                 reconcile_confident_head(generation, operation, &proposals, confidence);
             }

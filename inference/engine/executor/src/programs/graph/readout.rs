@@ -26,7 +26,7 @@ use magnitude_family_contracts::{
 use magnitude_kernels::{
     feature_rows, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
     readout_planes_rows, readout_project_rows, readout_refine_rows, readout_top_rows, sample_rows,
-    shape_rows,
+    shape_rows, token_confidence,
 };
 use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, Entry, NativeGraphClassSlice,
@@ -1254,6 +1254,24 @@ pub(crate) struct ProjectionGeometry {
     pub columns: u64,
 }
 
+/// A vocabulary projection's logits, and a certified projection's own
+/// selection inputs and whole-vocabulary view.
+pub(crate) struct Readout {
+    /// The projected rows' logits: exact, or a certified projection's exact
+    /// logits at its survivors and −inf elsewhere.
+    pub logits: WorkflowTensor,
+    pub certified: Option<CertifiedReadout>,
+}
+
+pub(crate) struct CertifiedReadout {
+    /// The sampler inputs its levels read, score divisors included.
+    pub selecting: SelectionInputs,
+    /// Its first level's logits of every vocabulary row, each within its
+    /// radius of the exact logit: the only logits of the whole vocabulary a
+    /// certified projection computes.
+    pub view: WorkflowTensor,
+}
+
 /// One authority for normalization, canonical token mapping, coefficient
 /// scaling, capping, and physical vocabulary projection. Proposal policies
 /// consume the result; they do not own a private projection recipe.
@@ -1267,7 +1285,7 @@ pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
     softcap: f32,
     sampler: Option<G::Binding<'a, sample_rows::Entry>>,
     constants: &mut Vec<crate::programs::native_constants::GraphConstant>,
-) -> Result<(WorkflowTensor, Option<SelectionInputs>), GraphError> {
+) -> Result<Readout, GraphError> {
     if let ProjectionEntries::Qualified {
         packed,
         progressive,
@@ -1289,10 +1307,10 @@ pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
             let [parts, normalized] = form.dimensions(geometry.hidden);
             let dims = [("M", geometry.rows), ("O", geometry.projected), ("V", geometry.vocabulary),
                 ("D", geometry.hidden), parts, normalized, ("WS", *scale_extent)];
-            Ok((graph.enqueue(entry, &dims, readout_head_rows::WorkflowArgs {
+            Ok(Readout { logits: graph.enqueue(entry, &dims, readout_head_rows::WorkflowArgs {
                 hidden: hidden.into(), norm: norm.into(), weight: weight.tensor().into(),
                 out_rows: out_rows.into(), weight_scale: scale.tensor().into(), epsilon, softcap,
-            })?.value, None))
+            })?.value, certified: None })
         }
         (ReadoutInput::PreparedFeatures { features, canonical_rows }, ProjectionEntries::PreparedPacked(entry),
             ProjectionPorts::Packed { weight, scale, scale_extent }) => {
@@ -1306,10 +1324,10 @@ pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
             let indexed = canonical_rows.map(|rows| rows.reshape(&[geometry.projected, 1, geometry.columns]));
             let token_rows = match indexed.as_ref() { Some(rows) => rows.into(),
                 None => empty.as_ref().expect("implicit canonical rows own an empty operand").into() };
-            Ok((graph.enqueue(entry, &dims, readout_project_rows::WorkflowArgs {
+            Ok(Readout { logits: graph.enqueue(entry, &dims, readout_project_rows::WorkflowArgs {
                 features: features.into(), weight: weight.tensor().into(), token_rows,
                 weight_scale: scale.tensor().into(), softcap,
-            })?.value, None))
+            })?.value, certified: None })
         }
         (ReadoutInput::RawRms { hidden, norm, form, out_rows, epsilon }, ProjectionEntries::Progressive(entries),
             ProjectionPorts::Progressive { depth, planes }) => {
@@ -1332,8 +1350,9 @@ pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
 
 /// The projection of `rows` onto a progressive head of `[vocabulary,
 /// hidden]`: with the radii, a certified selection's three levels (logits
-/// exact at its survivors, -inf elsewhere) and the sampler inputs they read,
-/// score divisors included; otherwise the full exact pass.
+/// exact at its survivors, -inf elsewhere), the sampler inputs they read,
+/// score divisors included, and the first level's view; otherwise the full
+/// exact pass.
 pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: ProgressiveEntries<'a, G>,
@@ -1343,7 +1362,7 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
     (vocabulary, hidden): (u64, u64),
     epsilon: f32,
     softcap: f32,
-) -> Result<(WorkflowTensor, Option<SelectionInputs>), GraphError> {
+) -> Result<Readout, GraphError> {
     let [parts, normalized] = rows.form.dimensions(hidden);
     // The entries read the rows as their `[M, PT, D]` parts.
     let partials = rows.hidden.reshape(&[rows.rows, rows.form.parts, hidden]);
@@ -1374,7 +1393,10 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
                 },
             )?
             .value;
-        return Ok((logits, None));
+        return Ok(Readout {
+            logits,
+            certified: None,
+        });
     };
     let selecting = SelectionInputs {
         temperature: Some(graph.input_for(entries.top, "temperature", &dimensions)?),
@@ -1458,7 +1480,13 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
-    Ok((logits, Some(selecting)))
+    Ok(Readout {
+        logits,
+        certified: Some(CertifiedReadout {
+            selecting,
+            view: first.r0,
+        }),
+    })
 }
 
 /// A projecting readout's head and selection suffix.
@@ -1553,7 +1581,7 @@ fn head_topology<'a, G: GraphDraft + 'a>(
         }
         _ => return Err("readout head entries disagree with the physical projection".into()),
     };
-    let (logits, inputs) = project_readout(
+    let Readout { logits, certified } = project_readout(
         &mut graph,
         projection_entries,
         &head,
@@ -1590,8 +1618,8 @@ fn head_topology<'a, G: GraphDraft + 'a>(
             selected: None,
         });
     };
-    let inputs = match inputs {
-        Some(inputs) => inputs,
+    let inputs = match certified {
+        Some(certified) => certified.selecting,
         None => selection_inputs(&mut graph, sampler, class.selected, vocabulary)?,
     };
     let mut result = graph.local_for(
@@ -2042,6 +2070,36 @@ where
         draws,
         temperature,
     })
+}
+
+/// Each of `selected` selections' probability under the whole vocabulary's
+/// logits it was selected from (`token_confidence`), into `confidence`:
+/// selection `m` reads row `rows[m]` of `logits`' `projected` rows. Those
+/// are a projection's exact logits as its sampler read them (shaped in
+/// place when shaped), or a certified projection's first view
+/// ([`CertifiedReadout::view`]), whose exact logits are only its
+/// survivors'. Every drafter's confidence in its proposals is this one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn confidence<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entry: G::Binding<'a, token_confidence::Entry>,
+    logits: &WorkflowTensor,
+    rows: &WorkflowTensor,
+    selection: WorkflowTensorRef<'_>,
+    confidence: WorkflowTensorMut<'_>,
+    (selected, projected, vocabulary): (u64, u64, u64),
+) -> Result<(), GraphError> {
+    graph.enqueue::<token_confidence::Entry>(
+        entry,
+        &[("M", selected), ("N", projected), ("V", vocabulary)],
+        token_confidence::WorkflowArgs {
+            logits: logits.into(),
+            rows: rows.into(),
+            selection,
+            confidence,
+        },
+    )?;
+    Ok(())
 }
 
 /// Selection controls of a padded selection class from a pass's packed

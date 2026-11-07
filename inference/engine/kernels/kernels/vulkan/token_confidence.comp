@@ -39,7 +39,7 @@ void token_confidence_merge() {
     const uint64_t logits = SEISMIC_PTR(SEISMIC_BUFFER_LOGITS);
     const uint64_t selection = SEISMIC_PTR(SEISMIC_BUFFER_SELECTION);
     const uint64_t partials = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS);
-    const uint64_t confidence = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t confidence = SEISMIC_PTR(SEISMIC_BUFFER_CONFIDENCE);
     const uint64_t row = gl_GlobalInvocationID.x;
     if (row >= SEISMIC_DIM_M)
         return;
@@ -61,5 +61,5 @@ void token_confidence_merge() {
     const float probability = element_i32_index(selection, selected + SEISMIC_SELECTION_STRIDE_1) == 0
         ? exp(element_f32_at(line + uint64_t(token) * SEISMIC_LOGITS_STRIDE_1 * 4ul) - maximum) / total
         : 0.0;
-    element_f32_put(confidence + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul, probability);
+    element_f32_put(confidence + row * SEISMIC_CONFIDENCE_STRIDE_0 * 4ul, probability);
 }

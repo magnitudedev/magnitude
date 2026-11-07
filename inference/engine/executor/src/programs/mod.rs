@@ -53,16 +53,22 @@ pub type CompletedHeadWork = CompletedWork<HeadLaunchCore, HeadOutput>;
 
 /// What a head step leaves the host.
 pub struct HeadOutput {
-    /// The step's selections, `[steps, slot class, 2]` (token, status) rows
-    /// in step-major order; absent for a causal-only head.
-    pub selections: Option<GraphOutputTensor>,
-    /// Each selection's probability under the readout logits it was
-    /// selected from, `[steps · slot class]` f32 in the selections' order;
-    /// absent for a head that publishes none.
-    pub confidence: Option<GraphOutputTensor>,
+    /// The step's selections, with the drafter's confidence in each; absent
+    /// for a causal-only head.
+    pub selections: Option<HeadSelections>,
     /// The step's landed reads of table rows its device work selected
     /// (`DeviceTable::read_selected`), completed once the step completed.
     pub landed_reads: Vec<crate::device_table::SubmittedRead>,
+}
+
+/// A drafting head step's selections.
+pub struct HeadSelections {
+    /// `[steps, slot class, 2]` (token, status) rows in step-major order.
+    pub tokens: GraphOutputTensor,
+    /// Each selection's probability under the readout logits it was
+    /// selected from (`readout::confidence`), `[steps · slot class]` f32 in
+    /// the tokens' order.
+    pub confidence: GraphOutputTensor,
 }
 
 impl HeadOutput {

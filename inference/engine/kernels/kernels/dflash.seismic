@@ -156,13 +156,13 @@ native draft_confidence for cpu from "cpu/draft_confidence.rs":
         shared_bytes ((D + R) * 4)
 
 
-# A draft's confidence in each of its M selected proposals: the proposal's
+# A drafter's confidence in each of its M selected proposals: the proposal's
 # probability under the softmax of its readout logits, row `rows[m]` of the
-# draft's N projected rows, and 0 for a selection that failed (nonzero
-# status).
+# N projected rows, and 0 for a selection that failed (nonzero status).
+# Written in place, so a chained head's passes fill one step-major tensor as
+# their selections do.
 fn token_confidence[M, N, V](logits: &tensor[N, V] f32, rows: &tensor[M] i32,
-    selection: &tensor[M, 2] i32) -> tensor[M] f32:
-    let mut confidence = tensor[M] f32
+    selection: &tensor[M, 2] i32, confidence: &mut tensor[M] f32):
     parallel for row in 0..M:
         let line = rows[row]
         let maximum = reduce(logits[line], 0, max)
@@ -170,7 +170,6 @@ fn token_confidence[M, N, V](logits: &tensor[N, V] f32, rows: &tensor[M] i32,
         confidence[row] = 0.0
         if selection[row, 1] == 0:
             confidence[row] = exp(logits[line, selection[row, 0]] - maximum) / total
-    return confidence
 
 # Every backend: two launches. The partition reduces each of 64 contiguous
 # vocabulary slices of a selection's row to its maximum and its sum of

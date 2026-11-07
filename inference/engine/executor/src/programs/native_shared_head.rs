@@ -12,10 +12,12 @@
 //! through the head's own table and selects. A further pass embeds that
 //! selection and conditions on the pass's normalized output projected back to
 //! the target's width, so no proposal returns to the host before the chain
-//! ends. No pass writes history: the head keeps none.
+//! ends. Each pass publishes its selections' probabilities under the logits
+//! it selected them from (`readout::confidence`). No pass writes history:
+//! the head keeps none.
 
 use super::native_draft::widen;
-use super::{DeviceSubmission, HeadOutput, HeadProgram};
+use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::block::{
     BlockControlPorts, BlockLane, BlockStatePorts, BlockSublayers, CheckedFeedForwardEntries,
@@ -47,6 +49,7 @@ use magnitude_family_contracts::{Decoder, ModelDefinition, WeightKind, WeightRol
 use magnitude_kernels::{
     cluster_token_rows, draft_top_k, embedding_rows, place_logits_rows, project_rows,
     readout_features_rows, readout_project_rows, sample_rows, shape_rows, tap_rows,
+    token_confidence,
 };
 use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, NativeGraph, NativeGraphFamily,
@@ -201,6 +204,7 @@ struct SharedHeadEntries<'a, 'e, G: GraphDraft + 'a> {
     chain: G::Binding<'a, project_rows::Entry>,
     shape: G::Binding<'a, shape_rows::Entry>,
     sample: G::Binding<'a, sample_rows::Entry>,
+    confidence: G::Binding<'a, token_confidence::Entry>,
 }
 
 struct ClusterEntries<'a, G: GraphDraft + 'a> {
@@ -239,6 +243,9 @@ struct SharedHeadGraphParts<P> {
     weights: Vec<(WeightPort, NativePort)>,
     /// Selections `[steps · slots, 2]`, step-major.
     output: WorkflowTensor,
+    /// Each selection's probability under the logits it was selected from,
+    /// `[steps · slots]` in the selections' order.
+    confidence: WorkflowTensor,
 }
 
 type PreparedSharedHeadGraph = SharedHeadGraphParts<NativeGraphPlan>;
@@ -364,6 +371,16 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         "result",
         &[("M", class.steps * slots), ("V", vocabulary)],
     )?;
+    // Each pass's selections' confidences, beside them step-major; a pass's
+    // selection `s` was drawn from its logits row `s`, as `out_rows` reads.
+    let confidence = graph
+        .local_for(
+            entries.confidence,
+            "confidence",
+            &[("M", class.steps * slots), ("N", slots), ("V", vocabulary)],
+        )?
+        .tensor()
+        .clone();
     let mut passes = Vec::with_capacity(class.steps as usize);
     // The hidden rows the next pass conditions on.
     let mut chained: Option<WorkflowTensor> = None;
@@ -556,7 +573,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
             let order = token_order
                 .as_ref()
                 .ok_or("clustered proposal ordering is absent")?;
-            let (cluster_scores, _) = readout::project_readout(
+            let cluster_scores = readout::project_readout(
                 &mut graph,
                 readout::ProjectionEntries::PreparedPacked(cluster.centroids),
                 centroids,
@@ -575,7 +592,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 0.0,
                 None,
                 &mut constants,
-            )?;
+            )?
+            .logits;
             let top_dims = [
                 ("M", slots),
                 ("V", policy.clusters),
@@ -616,7 +634,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     },
                 )?
                 .value;
-            let (compact, _) = readout::project_readout(
+            let compact = readout::project_readout(
                 &mut graph,
                 entries.projection.borrowed(),
                 &own_table,
@@ -635,7 +653,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 0.0,
                 None,
                 &mut constants,
-            )?;
+            )?
+            .logits;
             let placement_dims = [("M", slots), ("V", vocabulary), ("S", columns)];
             let logits_port = graph.local_for(cluster.placement, "logits", &placement_dims)?;
             let mut logits = logits_port.tensor().clone();
@@ -650,7 +669,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
             )?;
             logits
         } else {
-            let (logits, inputs) = readout::project_readout(
+            let readout::Readout { logits, certified } = readout::project_readout(
                 &mut graph,
                 entries.projection.borrowed(),
                 &own_table,
@@ -681,15 +700,18 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 Some(entries.sample),
                 &mut constants,
             )?;
-            projection_selection = inputs;
+            projection_selection = certified;
             logits
         };
         let mut result = selections
             .tensor()
             .slice_leading(step * slots, (step + 1) * slots);
-        let inputs = match projection_selection {
-            Some(inputs) => inputs,
-            None => readout::selection_inputs(&mut graph, entries.sample, slots, vocabulary)?,
+        let (inputs, view) = match projection_selection {
+            Some(certified) => (certified.selecting, Some(certified.view)),
+            None => (
+                readout::selection_inputs(&mut graph, entries.sample, slots, vocabulary)?,
+                None,
+            ),
         };
         let selection = readout::sample(
             &mut graph,
@@ -701,6 +723,16 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
             class.shaped,
             inputs,
             (&mut result).into(),
+        )?;
+        let mut step_confidence = confidence.slice_leading(step * slots, (step + 1) * slots);
+        readout::confidence(
+            &mut graph,
+            entries.confidence,
+            view.as_ref().unwrap_or(&logits),
+            out_rows.port().tensor(),
+            (&result).into(),
+            (&mut step_confidence).into(),
+            (slots, slots, vocabulary),
         )?;
         passes.push(PassPorts {
             blocks,
@@ -737,6 +769,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
     }
     let output = selections.tensor_mut().clone();
     graph.export(&output)?;
+    graph.export(&confidence)?;
     constants.extend(halves);
     constants.push(out_rows);
     if let Some(order) = token_order {
@@ -750,6 +783,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         constants,
         weights,
         output,
+        confidence,
     })
 }
 
@@ -857,6 +891,7 @@ pub(crate) fn checked_shared_head_family_storage(
                 chain: &checked.chain[..],
                 shape: &checked.selection[..],
                 sample: &checked.selection[..],
+                confidence: &checked.selection[..],
             },
             load,
             geometry,
@@ -955,6 +990,7 @@ impl PreparedSharedHeadGraphs {
                     chain: &kernels.chain,
                     shape: &kernels.shape,
                     sample: &kernels.sample,
+                    confidence: &kernels.confidence,
                 },
                 load,
                 geometry,
@@ -973,6 +1009,7 @@ impl PreparedSharedHeadGraphs {
                     constants: parts.constants,
                     weights: parts.weights,
                     output: parts.output,
+                    confidence: parts.confidence,
                 },
             );
         }
@@ -1288,14 +1325,18 @@ impl NativeSharedHeadProgram {
             .map_err(device)?;
         let landed_reads = landed.into_iter().map(SelectedRead::submitted).collect();
         let owner = output.publish(outputs);
-        let selections = owner
-            .tensor(&graph.output)
-            .ok_or_else(|| invalid("head graph omitted its selections"))?;
+        let selections = HeadSelections {
+            tokens: owner
+                .tensor(&graph.output)
+                .ok_or_else(|| invalid("head graph omitted its selections"))?,
+            confidence: owner
+                .tensor(&graph.confidence)
+                .ok_or_else(|| invalid("head graph omitted its confidence"))?,
+        };
         Ok((
             completion,
             HeadOutput {
                 selections: Some(selections),
-                confidence: None,
                 landed_reads,
             },
         ))

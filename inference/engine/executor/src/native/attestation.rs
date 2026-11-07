@@ -226,6 +226,9 @@ pub(crate) struct AttestedHead {
     /// Token selection over the draft vocabulary.
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
+    /// Each proposal's probability under the readout logits it was selected
+    /// from.
+    pub confidence: NativeKernel<token_confidence::Entry>,
 }
 
 #[derive(Clone)]
@@ -262,6 +265,9 @@ pub(crate) struct AttestedSharedHead {
     pub chain: NativeKernel<project_rows::Entry>,
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
+    /// Each proposal's probability under the readout logits it was selected
+    /// from.
+    pub confidence: NativeKernel<token_confidence::Entry>,
 }
 
 /// A separate draft's entries: per layer in draft order, then the block
@@ -1068,6 +1074,11 @@ impl AttestedPrograms {
                         .sample_rows
                         .clone()
                         .ok_or_else(|| missing("sample_rows", "fixed"))?,
+                    confidence: prepared
+                        .glue
+                        .token_confidence
+                        .clone()
+                        .ok_or_else(|| missing("token_confidence", "shared head"))?,
                 })
             })
             .transpose()?;
@@ -1208,6 +1219,11 @@ impl AttestedPrograms {
                         .sample
                         .clone()
                         .ok_or_else(|| missing("sample_rows", "draft"))?,
+                    confidence: prepared
+                        .glue
+                        .token_confidence
+                        .clone()
+                        .ok_or_else(|| missing("token_confidence", "head"))?,
                 })
             })
             .transpose()?;
@@ -1257,8 +1273,9 @@ impl AttestedPrograms {
                         .sample
                         .clone()
                         .ok_or_else(|| missing("sample_rows", "draft"))?,
-                    confidence: handles
-                        .confidence
+                    confidence: prepared
+                        .glue
+                        .token_confidence
                         .clone()
                         .ok_or_else(|| missing("token_confidence", "draft"))?,
                     widen: handles

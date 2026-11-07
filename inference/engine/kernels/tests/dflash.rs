@@ -350,15 +350,22 @@ fn token_confidence_is_the_selected_probability(device: &Device) {
         &i32_bytes(&selection_values),
     )
     .unwrap();
-    let confidence = kernel
+    let mut confidence = Tensor::from_host(
+        device,
+        Element::f32(),
+        &[rows as u64],
+        &f32_bytes(&vec![f32::NAN; rows]),
+    )
+    .unwrap();
+    kernel
         .call(token_confidence::Args {
             logits: &logits,
             rows: &Tensor::from_host(device, Element::i32(), &[rows as u64], &i32_bytes(&row_map))
                 .unwrap(),
             selection: &selection,
+            confidence: &mut confidence,
         })
-        .unwrap()
-        .value;
+        .unwrap();
     let actual = confidence
         .read_to_host()
         .unwrap()

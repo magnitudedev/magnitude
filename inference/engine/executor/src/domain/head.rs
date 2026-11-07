@@ -750,7 +750,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         output.complete_landed_reads().map_err(DomainError::Submit)?;
         let HeadOutput {
             selections,
-            confidence,
             landed_reads: _,
         } = output;
         let slots = core.batch().actual_slots();
@@ -759,26 +758,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 "head slot count differs from request count",
             ));
         }
-        let selected = match selections {
-            Some(selections) => {
-                decode_selected(&selections.tensor().read_to_host().map_err(|error| {
-                    DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
-                })?)
-                .map_err(DomainError::invariant)?
-            }
-            None => Vec::new(),
+        let read = |tensor: &crate::GraphOutputTensor| {
+            tensor.tensor().read_to_host().map_err(|error| {
+                DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
+            })
         };
-        let slot_class = selected.len().checked_div(steps).unwrap_or(0);
-        if steps != 0 && (slot_class < slots || selected.len() != steps * slot_class) {
-            return Err(DomainError::invariant(
-                "head selections differ from the batch's steps and slots",
-            ));
-        }
-        let confidence = confidence
-            .map(|confidence| {
-                let bytes = confidence.tensor().read_to_host().map_err(|error| {
-                    DomainError::Device(crate::DeviceError::Transfer(error.to_string()))
-                })?;
+        let (selected, confidence) = match selections {
+            Some(selections) => {
+                let selected =
+                    decode_selected(&read(&selections.tokens)?).map_err(DomainError::invariant)?;
+                let bytes = read(&selections.confidence)?;
                 let confidence = bytes
                     .chunks_exact(4)
                     .map(|word| f32::from_le_bytes(word.try_into().expect("four bytes")))
@@ -788,9 +777,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         "head confidences differ from its selections",
                     ));
                 }
-                Ok(confidence)
-            })
-            .transpose()?;
+                (selected, confidence)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        let slot_class = selected.len().checked_div(steps).unwrap_or(0);
+        if steps != 0 && (slot_class < slots || selected.len() != steps * slot_class) {
+            return Err(DomainError::invariant(
+                "head selections differ from the batch's steps and slots",
+            ));
+        }
         let passes = core.batch().passes();
         if std::env::var_os("MAGNITUDE_TRACE_DRAFT").is_some() {
             for (slot, (request, _, proposals)) in requests.iter().enumerate() {
@@ -848,11 +844,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         proposals: (0..proposals)
                             .map(|step| selected[step * slot_class + slot])
                             .collect(),
-                        confidence: confidence.as_ref().map(|confidence| {
-                            (0..proposals)
-                                .map(|step| confidence[step * slot_class + slot])
-                                .collect()
-                        }),
+                        confidence: (0..proposals)
+                            .map(|step| confidence[step * slot_class + slot])
+                            .collect(),
                     },
                     advance: advance.map(Advance::Step),
                     primed: None,

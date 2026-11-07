@@ -679,9 +679,7 @@ impl MethodState for DrafterState {
         };
         if head != *operation
             || selected.len() != proposals.len()
-            || confidence
-                .as_ref()
-                .is_some_and(|confidence| confidence.len() != selected.len())
+            || confidence.len() != selected.len()
         {
             return Err(format!(
                 "{name} drafter outcome differs from its transaction"
@@ -703,9 +701,7 @@ impl MethodState for DrafterState {
                 control.drafted(
                     proposals.len(),
                     &proposal,
-                    confidence
-                        .as_ref()
-                        .map(|confidence| &confidence[..proposal.len()]),
+                    Some(&confidence[..proposal.len()]),
                 );
             }
             self.proposal = Some(proposal);

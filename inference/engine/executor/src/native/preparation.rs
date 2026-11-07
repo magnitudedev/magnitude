@@ -1061,6 +1061,10 @@ impl<'a> Preparation<'a> {
                     vocabulary: self.vocabulary,
                 },
             )?,
+            token_confidence: match plan.drafts_with_head() || plan.draft().is_some() {
+                true => fixed!(self.spec, token_confidence, String::new()),
+                false => None,
+            },
             conditioning_overlay: fixed!(self.spec, conditioning_overlay, "fixed"),
             selection_notice: match plan.notices_selection() {
                 true => fixed!(self.spec, selection_notice, "fixed"),
@@ -3497,7 +3501,6 @@ impl<'a> Preparation<'a> {
                 vocabulary: self.vocabulary,
             },
         )?;
-        let confidence = fixed!(self.spec, token_confidence, String::new());
         let widen = fixed!(
             self.spec,
             widen_rows,
@@ -3544,7 +3547,6 @@ impl<'a> Preparation<'a> {
         draft.head = head;
         draft.shape = shape;
         draft.sample = sample;
-        draft.confidence = confidence;
         draft.widen = widen;
         draft.markov = markov;
         Ok(())
