@@ -33,7 +33,10 @@ def test_the_epsilon_is_read_from_whichever_key_the_converter_wrote():
     assert reference(**{"attention.layer_norm_rms_epsilon": 1e-6}, expert_used_count=2).eps == 1e-6
     with pytest.raises(ValueError, match="neither"):
         reference(expert_used_count=2)
-    with pytest.raises(ValueError, match="not one"):
+    # ggml-org's converter states it under both keys, as one value.
+    assert reference(**{"attention.layer_norm_epsilon": 1e-5, "attention.layer_norm_rms_epsilon": 1e-5},
+                     expert_used_count=2).eps == 1e-5
+    with pytest.raises(ValueError, match="not one value"):
         reference(**{"attention.layer_norm_epsilon": 1e-5, "attention.layer_norm_rms_epsilon": 1e-6}, expert_used_count=2)
 
 

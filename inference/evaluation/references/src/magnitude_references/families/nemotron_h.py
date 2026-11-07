@@ -73,13 +73,14 @@ class NemotronHReference(Reference):
         self.kv_heads = kv
         self.head_count = package.key("attention.head_count")
         self.head_dim = package.key("attention.key_length")
-        # Converters since Nemotron 3.5 write only `layer_norm_epsilon`, earlier ones only
-        # `layer_norm_rms_epsilon`: exactly one is stated.
-        stated = [suffix for suffix in ("attention.layer_norm_rms_epsilon", "attention.layer_norm_epsilon")
-                  if f"{package.architecture}.{suffix}" in package.metadata]
+        # The released config's one `layer_norm_epsilon` is every RMS norm's. Converters write it
+        # as `layer_norm_epsilon` (since Nemotron 3.5), `layer_norm_rms_epsilon` (before), or both
+        # (ggml-org's): the header must state it, and one value wherever it states it.
+        stated = {package.key(suffix) for suffix in ("attention.layer_norm_rms_epsilon", "attention.layer_norm_epsilon")
+                  if f"{package.architecture}.{suffix}" in package.metadata}
         if len(stated) != 1:
-            raise ValueError(f"the header states {stated or 'neither'} of the layer-norm epsilons, not one")
-        self.eps = package.key(stated[0])
+            raise ValueError(f"the header states {sorted(stated) or 'neither'} as the layer-norm epsilon, not one value")
+        (self.eps,) = stated
         self.inner = package.key("ssm.inner_size")
         self.state_size = package.key("ssm.state_size")
         self.ssm_heads = package.key("ssm.time_step_rank")
