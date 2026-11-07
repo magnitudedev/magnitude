@@ -6,7 +6,9 @@ A window passes when, over its whole span:
 - CPU and every reported GPU are idle on average;
 - macOS thermal pressure is nominal throughout;
 - no utilization probe failed.
-Missing readings never pass: an unverifiable host fails explicitly after the timeout.
+Missing readings never pass: an unverifiable host fails explicitly after the timeout. A host
+declared to have no temperature sensors (`temperatures` false, a cloud VM) is judged on
+idleness alone; any sensors it does report are still judged.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ class GateSettings:
     max_cpu_pct: float = 15.0
     max_gpu_pct: float = 5.0
     timeout_seconds: float = 900.0
+    temperatures: bool = True
 
 
 @dataclass(frozen=True)
@@ -66,7 +69,7 @@ def judge(samples: List[Sample], settings: GateSettings) -> Verdict:
     reasons: List[str] = []
     channels: Dict[str, dict] = {}
     groups = [g for g in GROUPS if covered[-1].reading.group_values(g)]
-    if not groups:
+    if not groups and settings.temperatures:
         latest_errors = covered[-1].reading.errors
         reasons.append(f"no temperature sensors (errors: {latest_errors})")
     for group in groups:

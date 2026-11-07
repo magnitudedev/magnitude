@@ -1,6 +1,7 @@
 """Thermal gate stability logic over synthetic readings."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -111,3 +112,11 @@ def test_wait_times_out_with_readings(tmp_path):
         wait(FixedProbe(lambda: reading(cpu_busy=90)), settings, tmp_path / "gate.jsonl")
     assert raised.value.latest.utilization_pct["cpu"] == 90
     assert "cpu busy" in str(raised.value)
+
+
+def test_a_host_without_sensors_is_judged_on_idleness():
+    settings = replace(SETTINGS, temperatures=False)
+    idle = judge(series(lambda t: reading(cpu=None, gpu=None, errors={"thermal": "none"})), settings)
+    assert idle.passed, idle.reasons
+    busy = judge(series(lambda t: reading(cpu=None, gpu=None, cpu_busy=40)), settings)
+    assert not busy.passed and "cpu busy" in busy.reasons[0]

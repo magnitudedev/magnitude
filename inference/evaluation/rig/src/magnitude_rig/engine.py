@@ -43,7 +43,7 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -547,7 +547,7 @@ def _jobs(run: Run, codes: dict[str, int]) -> None:
         side = request.sides[0]
         settings = [
             argument
-            for name, value in vars(GATE).items()
+            for name, value in vars(replace(GATE, temperatures=run.remote.temperatures)).items()
             for argument in (f"--{name.replace('_', '-')}", str(value))
         ]
         argv, env = run.host_module(side, "gate", "--log", run.remote.path("runs", run.run_id, "thermal-gate.jsonl"), *settings)

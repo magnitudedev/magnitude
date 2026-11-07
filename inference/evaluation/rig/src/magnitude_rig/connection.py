@@ -112,6 +112,7 @@ class Remote:
     env: dict[str, str]  # the host's own step environment, `~` expanded on the host
     backends: tuple[str, ...]  # what the host can run, probed on connect
     ready: bool  # `mrig setup` verified the host
+    temperatures: bool = True  # the host exposes temperature sensors (`HostConfig.temperatures`)
 
     def command(self, argv: list[str], *, login: bool = False, cwd: str | None = None) -> list[str]:
         """The ssh argv running `argv` on the host (in a login shell when asked, on POSIX)."""
@@ -180,7 +181,10 @@ def connect(config: HostConfig) -> Remote:
     line = windows_command(argv) if windows else shlex.join(argv)
     probed = json.loads(_ssh(config, line, stdin=bootstrap.encode()).strip().splitlines()[-1])
     probed["backends"] = tuple(probed["backends"])
-    return Remote(config.alias, config.local, windows, system, machine, python, **probed)
+    return Remote(
+        config.alias, config.local, windows, system, machine, python, **probed,
+        temperatures=config.temperatures,
+    )
 
 
 SETUP_TOOLS = ("cargo", "rustc", "uv", "rsync")
