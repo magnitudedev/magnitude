@@ -38,7 +38,14 @@ pub(crate) fn descriptor(name: &str, shape: &[u64]) -> WeightDescriptor {
 /// sharing one key-value head (Vulkan prefill needs a query group of at
 /// least two).
 pub(crate) fn fixture_definition() -> ModelDefinition {
-    const HIDDEN: u64 = 128;
+    fixture_definition_of(HIDDEN)
+}
+
+/// The planning fixture's hidden width.
+pub(crate) const HIDDEN: u64 = 128;
+
+/// [`fixture_definition`] at hidden width `hidden`.
+pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
     const WIDTH: u64 = 64;
     const FEATURES: u64 = 128;
     const VOCABULARY: u64 = 256;
@@ -50,14 +57,14 @@ pub(crate) fn fixture_definition() -> ModelDefinition {
         heads: 2,
         kv_heads: 1,
         width: WIDTH,
-        query: descriptor("qg", &[2 * 2 * WIDTH, HIDDEN]),
+        query: descriptor("qg", &[2 * 2 * WIDTH, hidden]),
         gate: AttentionGate::Interleaved {
             function: GateFunction::Sigmoid,
         },
         query_norm: HeadNorm::Rms(rms("qn", WIDTH)),
         key_value: KeyValue::Owned {
-            key: descriptor("k", &[WIDTH, HIDDEN]),
-            value: ValueSource::Projected(descriptor("v", &[WIDTH, HIDDEN])),
+            key: descriptor("k", &[WIDTH, hidden]),
+            value: ValueSource::Projected(descriptor("v", &[WIDTH, hidden])),
             key_norm: HeadNorm::Rms(rms("kn", WIDTH)),
             value_norm: ValueNorm::None,
             domain: HistoryDomain::Token,
@@ -72,16 +79,16 @@ pub(crate) fn fixture_definition() -> ModelDefinition {
         reads: HistoryReads::Visible,
         media_rows: MediaRowAttention::Causal,
         sinks: None,
-        output: descriptor("o", &[HIDDEN, 2 * WIDTH]),
+        output: descriptor("o", &[hidden, 2 * WIDTH]),
     };
     let dense = DenseFfn {
         intermediate: FEATURES,
         up: FeedForwardUp::Gated {
             activation: ActivationFunction::Silu,
-            gate: descriptor("gate", &[FEATURES, HIDDEN]),
-            up: descriptor("up", &[FEATURES, HIDDEN]),
+            gate: descriptor("gate", &[FEATURES, hidden]),
+            up: descriptor("up", &[FEATURES, hidden]),
         },
-        down: descriptor("down", &[HIDDEN, FEATURES]),
+        down: descriptor("down", &[hidden, FEATURES]),
     };
     ModelDefinition {
         family: magnitude_family_contracts::FamilyId("resource-fixture".into()),
@@ -92,12 +99,12 @@ pub(crate) fn fixture_definition() -> ModelDefinition {
         inputs: InputSemantics { coordinate_axes: 1 },
         decoder: Decoder {
             activation_dtype: ActivationDType::BF16,
-            hidden: HIDDEN,
+            hidden,
             vocabulary: VOCABULARY,
             context_limit: 128,
             residual: ResidualForm::Single,
             entry: EntryForm {
-                embedding: descriptor("embedding", &[VOCABULARY, HIDDEN]),
+                embedding: descriptor("embedding", &[VOCABULARY, hidden]),
                 scale: EmbeddingScale::Unit,
                 norm: None,
                 per_layer: None,
@@ -106,20 +113,20 @@ pub(crate) fn fixture_definition() -> ModelDefinition {
             blocks: vec![Block {
                 sublayers: vec![
                     Sublayer {
-                        input: InputNorm::Rms(rms("input_norm", HIDDEN)),
+                        input: InputNorm::Rms(rms("input_norm", hidden)),
                         op: Operator::Attention(Box::new(attention)),
                         output: OutputForm::Residual,
                     },
                     Sublayer {
-                        input: InputNorm::Rms(rms("ffn_norm", HIDDEN)),
+                        input: InputNorm::Rms(rms("ffn_norm", hidden)),
                         op: Operator::DenseFfn(Box::new(dense)),
                         output: OutputForm::Residual,
                     },
                 ],
             }],
             exit: ExitForm {
-                norm: ExitNorm::Rms(rms("output_norm", HIDDEN)),
-                output: descriptor("output", &[VOCABULARY, HIDDEN]),
+                norm: ExitNorm::Rms(rms("output_norm", hidden)),
+                output: descriptor("output", &[VOCABULARY, hidden]),
                 softcap: None,
             },
         },
@@ -183,10 +190,12 @@ pub(crate) fn fixture_manifest(definition: &ModelDefinition) -> PackageManifest 
 /// The planning fixture over four hyper-connection streams: its lone
 /// attention mixer reads through a mix site and scatters into the
 /// streams, and its exit is a hyper-connection head, with no output
-/// norm.
+/// norm. Its hidden width is the mix sites' (`mix_site_hidden`), so
+/// every backend's kernels admit it.
 pub fn hyper_connection_fixture_definition() -> ModelDefinition {
     use magnitude_family_contracts::{HyperConnectionMixing, HyperConnections};
-    let mut definition = fixture_definition();
+    let hidden = mix_site_hidden();
+    let mut definition = fixture_definition_of(hidden);
     let decoder = &mut definition.decoder;
     decoder.residual = ResidualForm::HyperConnections(HyperConnections {
         streams: STREAMS,
@@ -195,9 +204,9 @@ pub fn hyper_connection_fixture_definition() -> ModelDefinition {
     // A dense feed-forward has no streams form: the block is its mixer.
     let sublayers = &mut decoder.blocks[0].sublayers;
     sublayers.truncate(1);
-    sublayers[0].input = InputNorm::HyperConnectionMix(site("attn_hc", true));
+    sublayers[0].input = InputNorm::HyperConnectionMix(site("attn_hc", true, hidden));
     sublayers[0].output = OutputForm::Scatter;
-    decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output_hc", false));
+    decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output_hc", false, hidden));
     definition
 }
 
@@ -205,10 +214,50 @@ pub fn hyper_connection_fixture_definition() -> ModelDefinition {
 const STREAMS: u64 = 4;
 const RANK: u64 = 64;
 
-/// A mix site of the fixture geometry, with inject weights when
+/// The smallest multiple of the planning fixture's hidden width at which
+/// every backend's `stream_mix_down` declares a configuration for the
+/// hyper-connection fixtures' mix sites (`STREAMS` streams, rank `RANK`),
+/// with and without inject weights: read from each backend's declared
+/// domain, so no fixture built at it names a shape a backend has no
+/// configuration for.
+pub(crate) fn mix_site_hidden() -> u64 {
+    use seismic::{BackendName, NativeSpecialization, NativeSpecializationError};
+    let implementations = BackendName::ALL.map(|backend| {
+        seismic::generated::native_implementation_for_backend::<magnitude_kernels::stream_mix_down::Entry>(backend)
+            .expect("the kernels bundle resolves `stream_mix_down`")
+            .unwrap_or_else(|| panic!("{backend:?} implements `stream_mix_down`"))
+    });
+    let admits = |implementation: &seismic::NativeImplementation, hidden: u64, injected: bool| {
+        let statics = implementation.statics.iter().fold(NativeSpecialization::new(), |statics, name| {
+            let value = match name.as_str() {
+                "H" => hidden,
+                "S" => STREAMS,
+                "LR" => RANK,
+                "C" => u64::from(injected),
+                other => unreachable!("`stream_mix_down` declares no static `{other}`"),
+            };
+            statics.with_static(name.clone(), value)
+        });
+        match implementation.admits(&statics) {
+            Ok(()) => true,
+            Err(NativeSpecializationError::Inadmissible) => false,
+            Err(error) => panic!("`stream_mix_down`'s domain is evaluable: {error}"),
+        }
+    };
+    (1..=64)
+        .map(|multiple| multiple * HIDDEN)
+        .find(|&hidden| {
+            implementations
+                .iter()
+                .all(|implementation| admits(implementation, hidden, true) && admits(implementation, hidden, false))
+        })
+        .expect("every backend's `stream_mix_down` admits a mix site at some fixture hidden width")
+}
+
+/// A mix site at hidden width `hidden`, with inject weights when
 /// `injected`.
-fn site(prefix: &str, injected: bool) -> magnitude_family_contracts::HyperConnectionWeights {
-    let wide = STREAMS * fixture_definition().decoder.hidden;
+fn site(prefix: &str, injected: bool, hidden: u64) -> magnitude_family_contracts::HyperConnectionWeights {
+    let wide = STREAMS * hidden;
     magnitude_family_contracts::HyperConnectionWeights {
         norm: RmsNorm {
             weight: descriptor(&format!("{prefix}_norm"), &[wide]),
@@ -259,7 +308,7 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
         up,
     };
     let mixing = |prefix: &str, op: Operator| Sublayer {
-        input: InputNorm::HyperConnectionMix(site(prefix, true)),
+        input: InputNorm::HyperConnectionMix(site(prefix, true, hidden)),
         op,
         output: OutputForm::Scatter,
     };

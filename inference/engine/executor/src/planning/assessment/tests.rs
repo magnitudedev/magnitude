@@ -293,11 +293,14 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         SharedExpert, SharedExpertGate, VocabularyProjection, WeightDescriptor,
     };
 
-    let mut definition = crate::planning::fixtures::fixture_definition();
+    // At the width every backend's mix sites admit: the test later puts
+    // the hyper-connection fixture's decoder under the same head.
+    let hidden = crate::planning::fixtures::mix_site_hidden();
+    let mut definition = crate::planning::fixtures::fixture_definition_of(hidden);
     let descriptor =
         |name: &str, shape: &[u64]| WeightDescriptor::stored(format!("head_{name}"), shape);
     let rms = |name: &str| RmsNorm {
-        weight: descriptor(name, &[128]),
+        weight: descriptor(name, &[hidden]),
         epsilon: 1e-6,
     };
     // The head block is the target block (attention, dense) under head
@@ -345,7 +348,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
             input: HeadInput::Combine {
                 embedding_norm: rms("embedding_norm"),
                 hidden_norm: rms("hidden_norm"),
-                combine: descriptor("combine", &[128, 256]),
+                combine: descriptor("combine", &[hidden, 2 * hidden]),
             },
             blocks: vec![head_layer],
             output_norm: ExitNorm::Rms(rms("output_norm")),
@@ -562,7 +565,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         selected: 2,
         intermediate: 64,
         router: Router {
-            weight: descriptor("router", &[4, 128]),
+            weight: descriptor("router", &[4, hidden]),
             input: RouterInput::Operator,
             score: ScoreFunction::Softmax,
             selection: ExpertSelection::TopK { bias: None },
@@ -570,20 +573,20 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
             scale: 1.0,
         },
         expert_up: silu(
-            descriptor("expert_gate", &[4, 64, 128]),
-            descriptor("expert_up", &[4, 64, 128]),
+            descriptor("expert_gate", &[4, 64, hidden]),
+            descriptor("expert_up", &[4, 64, hidden]),
         ),
-        expert_down: descriptor("expert_down", &[4, 128, 64]),
+        expert_down: descriptor("expert_down", &[4, hidden, 64]),
         expert_scale: None,
         latent: None,
         shared: Some(SharedExpert {
             intermediate: 64,
             up: silu(
-                descriptor("shared_gate", &[64, 128]),
-                descriptor("shared_up", &[64, 128]),
+                descriptor("shared_gate", &[64, hidden]),
+                descriptor("shared_up", &[64, hidden]),
             ),
-            down: descriptor("shared_down", &[128, 64]),
-            gate: SharedExpertGate::Sigmoid(descriptor("shared_router", &[128])),
+            down: descriptor("shared_down", &[hidden, 64]),
+            gate: SharedExpertGate::Sigmoid(descriptor("shared_router", &[hidden])),
         }),
     };
     for weight in [
@@ -676,12 +679,12 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
     let HeadInput::Combine { hidden_norm, .. } = &mut head.input else {
         unreachable!()
     };
-    hidden_norm.weight.shape = vec![512];
+    hidden_norm.weight.shape = vec![4 * hidden];
     for (index, sublayer) in head.blocks[0].sublayers.iter_mut().enumerate() {
         site.norm.weight.name = format!("head_mix_{index}_norm");
         site.down.name = format!("head_mix_{index}_down");
         site.up.name = format!("head_mix_{index}_up");
-        site.inject = Some(descriptor(&format!("mix_{index}_inject"), &[4, 512]));
+        site.inject = Some(descriptor(&format!("mix_{index}_inject"), &[4, 4 * hidden]));
         sublayer.input = InputNorm::HyperConnectionMix(site.clone());
         sublayer.output = magnitude_family_contracts::OutputForm::Scatter;
     }
@@ -715,7 +718,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         crate::planning::fixtures::LIMITS,
     )
     .unwrap();
-    assert_eq!(load.residual_conditioning(), Some(512));
+    assert_eq!(load.residual_conditioning(), Some(4 * hidden));
     let method = PlannedMethod::Mtp {
         greedy_proposals: 3,
         sampled_proposals: 3,

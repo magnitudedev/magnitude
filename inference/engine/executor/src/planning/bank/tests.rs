@@ -23,8 +23,12 @@ impl ModelLoadPlan {
 /// hold every slot), so no cap admits one.
 #[test]
 fn a_fixture_of_more_experts_admits_a_partial_bank() {
-    use crate::planning::fixtures::{qwen4exp_fixture_definition_of, streamed_experts_manifest};
-    let granules = |host_addressed| seismic::Reservation { granule: 2 << 20, host_addressed, chunks: None };
+    use crate::planning::fixtures::{HIDDEN, mix_site_hidden, qwen4exp_fixture_definition_of, streamed_experts_manifest};
+    // 2 MiB granules at the planning fixture's width, scaled with the
+    // fixtures' hidden width as their expert records are, so a granule
+    // holds the same share of the bank at any width.
+    let granule = (2 << 20) * mix_site_hidden() / HIDDEN;
+    let granules = |host_addressed| seismic::Reservation { granule, host_addressed, chunks: None };
     for (backend, reservation, host) in [
         (seismic::BackendName::Metal, granules(true), HostTier::Unified),
         (seismic::BackendName::Cuda, granules(false), HostTier::Linked(granules(true))),
