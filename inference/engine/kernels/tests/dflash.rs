@@ -60,25 +60,27 @@ fn specialization(
 }
 
 fn taps_write_their_column_blocks(device: &Device) {
-    let implementation = tap_rows::native_implementation(device)
-        .unwrap()
-        .expect("tap_rows has a native implementation on every device");
     for (rows, width, taps) in [(1usize, 64usize, 2usize), (5, 96, 3), (17, 128, 5)] {
         let extents = [
             ("M", rows as u64),
             ("D", width as u64),
             ("T", taps as u64),
         ];
-        let kernel = tap_rows::native_for_device_with(
-            device,
-            tap_rows::Elements { A: Element::bf16() },
-            &specialization(
-                &implementation.statics,
-                |fixed| implementation.default_specialization(fixed).unwrap(),
-                &extents,
-            ),
-        )
-        .unwrap();
+        let entry = tap_rows::native_entry_with(tap_rows::Elements { A: Element::bf16() });
+        let implementation = entry
+            .offered(device)
+            .unwrap()
+            .expect("tap_rows has a native implementation at its elements");
+        let kernel = entry
+            .prepare(
+                device,
+                &specialization(
+                    &implementation.statics,
+                    |fixed| implementation.default_specialization(fixed).unwrap(),
+                    &extents,
+                ),
+            )
+            .unwrap();
         let sentinel = vec![7.0f32; rows * taps * width];
         let mut buffer = Tensor::from_host(
             device,
@@ -124,9 +126,6 @@ fn taps_write_their_column_blocks(device: &Device) {
 }
 
 fn features_gather_the_published_rows(device: &Device) {
-    let implementation = feature_rows::native_implementation(device)
-        .unwrap()
-        .expect("feature_rows has a native implementation on every device");
     for (rows, width, published) in [(1usize, 64usize, vec![0i32]), (9, 96, vec![8, 0, 3])] {
         let outputs = published.len();
         let extents = [
@@ -134,16 +133,21 @@ fn features_gather_the_published_rows(device: &Device) {
             ("O", outputs as u64),
             ("D", width as u64),
         ];
-        let kernel = feature_rows::native_for_device_with(
-            device,
-            feature_rows::Elements { A: Element::bf16() },
-            &specialization(
-                &implementation.statics,
-                |fixed| implementation.default_specialization(fixed).unwrap(),
-                &extents,
-            ),
-        )
-        .unwrap();
+        let entry = feature_rows::native_entry_with(feature_rows::Elements { A: Element::bf16() });
+        let implementation = entry
+            .offered(device)
+            .unwrap()
+            .expect("feature_rows has a native implementation at its elements");
+        let kernel = entry
+            .prepare(
+                device,
+                &specialization(
+                    &implementation.statics,
+                    |fixed| implementation.default_specialization(fixed).unwrap(),
+                    &extents,
+                ),
+            )
+            .unwrap();
         let fused_values = values(rows * width, 11);
         let fused = Tensor::from_host(
             device,
@@ -184,25 +188,27 @@ fn features_gather_the_published_rows(device: &Device) {
 }
 
 fn confidence_declines_below_the_threshold(device: &Device) {
-    let implementation = draft_confidence::native_implementation(device)
-        .unwrap()
-        .expect("draft_confidence has a native implementation on every device");
     let (slots, width, rank) = (6usize, 128usize, 32usize);
     let extents = [
         ("S", slots as u64),
         ("D", width as u64),
         ("R", rank as u64),
     ];
-    let kernel = draft_confidence::native_for_device_with(
-        device,
-        draft_confidence::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &extents,
-        ),
-    )
-    .unwrap();
+    let entry = draft_confidence::native_entry_with(draft_confidence::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
+        .unwrap()
+        .expect("draft_confidence has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &extents,
+            ),
+        )
+        .unwrap();
     let feature_values = values(slots * width, 3)
         .into_iter()
         .map(bf16_round)

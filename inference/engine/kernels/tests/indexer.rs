@@ -474,17 +474,10 @@ fn native(device: &Device, case: &Case) -> Outcome {
     } else {
         statics.iter().fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(*name, *value))
     };
-    let specialization = seismic::generated::native_implementation::<indexer_select::Entry>(device)
-        .unwrap()
-        .unwrap()
-        .default_specialization(&specialization)
-        .unwrap();
-    let kernel = indexer_select::native_for_device_with(
-        device,
-        indexer_select::Elements { A: case.element },
-        &specialization,
-    )
-    .unwrap();
+    let entry = indexer_select::native_entry_with(indexer_select::Elements { A: case.element });
+    let specialization =
+        entry.offered(device).unwrap().unwrap().default_specialization(&specialization).unwrap();
+    let kernel = entry.prepare(device, &specialization).unwrap();
     let (visible, _, spans) = case.token_spans();
     let controls = case.controls();
     let rows_tensor = |rows: usize, values: &[f32]| {

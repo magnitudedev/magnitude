@@ -5031,10 +5031,12 @@ fn head_logits_match_the_host(
             mappings
         };
         for &mapping in mappings {
+            let entry = readout_project_rows::native_entry_with(readout_project_rows::Elements {
+                A: act.element(),
+                OW: repr.resident(&device),
+            });
             let specialization = if is_cpu(device) {
-                let implementation = readout_project_rows::native_implementation(device)
-                    .unwrap()
-                    .unwrap();
+                let implementation = entry.offered(device).unwrap().unwrap();
                 let statics = implementation
                     .statics
                     .iter()
@@ -5048,15 +5050,7 @@ fn head_logits_match_the_host(
             } else {
                 prepared_projection_specialization_on(device, &[("V", v), ("D", d)], mapping)
             };
-            let kernel = readout_project_rows::native_for_device_with(
-                device,
-                readout_project_rows::Elements {
-                    A: act.element(),
-                    OW: repr.resident(&device),
-                },
-                &specialization,
-            )
-            .unwrap();
+            let kernel = entry.prepare(device, &specialization).unwrap();
             let logits = kernel
                 .call(readout_project_rows::Args {
                     features: &act_tensor(device, act, &[rows, d], &features),

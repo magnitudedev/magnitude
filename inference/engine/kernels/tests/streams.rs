@@ -5,6 +5,7 @@
 //! streams, rank 320).
 
 mod common;
+mod declared;
 
 use magnitude_kernels::{repeat_rows, stream_mix_down, stream_mix_up};
 use seismic_lang::{
@@ -144,24 +145,21 @@ fn devices() -> Vec<seismic::Device> {
     seismic_native_tests::first_and_cpu(&[Cuda, Metal], &[Cuda, Metal, Vulkan, Cpu])
 }
 
-/// The declared defaults of `E` at `statics` (none on the CPU).
-fn defaults<E: seismic::Entry>(
+/// `entry` prepared at its declared defaults as its bound elements form it,
+/// each static it declares taken from `statics` (the CPU declares none).
+fn at_defaults<E: seismic::Entry>(
     device: &seismic::Device,
+    entry: seismic::BoundEntry<E>,
     statics: &[(&str, u64)],
-) -> seismic::NativeSpecialization {
-    let statics = if device.backend() == seismic::BackendName::Cpu {
-        seismic::NativeSpecialization::new()
-    } else {
-        statics.iter().fold(
-            seismic::NativeSpecialization::new(),
-            |spec, (name, value)| spec.with_static(*name, *value),
-        )
-    };
-    seismic::generated::native_implementation::<E>(device)
-        .unwrap()
-        .unwrap()
-        .default_specialization(&statics)
-        .unwrap()
+) -> Result<seismic::NativeKernel<E>, seismic::LoadError> {
+    let specialization = declared::declared_default(device, &entry, |name| {
+        statics
+            .iter()
+            .find(|(given, _)| *given == name)
+            .unwrap_or_else(|| panic!("static {name} is given"))
+            .1
+    });
+    entry.prepare(device, &specialization)
 }
 
 /// Every value within `absolute + relative * |portable|` of the portable
@@ -356,15 +354,15 @@ impl Case {
             ("LR", r as u64),
             ("C", self.c as u64),
         ];
-        let mixed = stream_mix_down::native_for_device_with(
+        let mixed = at_defaults(
             device,
-            stream_mix_down::Elements {
+            stream_mix_down::native_entry_with(stream_mix_down::Elements {
                 NW: seismic::Element::f32(),
                 DW: seismic::Element::bf16(),
                 IW: seismic::Element::f32(),
                 A: seismic::Element::bf16(),
-            },
-            &defaults::<stream_mix_down::Entry>(device, &statics),
+            }),
+            &statics,
         )
         .unwrap()
         .call(stream_mix_down::Args {
@@ -377,14 +375,14 @@ impl Case {
         .unwrap();
         let low = expected[0].iter().map(|v| *v as f32).collect::<Vec<_>>();
         let inverse = expected[2].iter().map(|v| *v as f32).collect::<Vec<_>>();
-        let gated = stream_mix_up::native_for_device_with(
+        let gated = at_defaults(
             device,
-            stream_mix_up::Elements {
+            stream_mix_up::native_entry_with(stream_mix_up::Elements {
                 UW: seismic::Element::bf16(),
                 NW: seismic::Element::f32(),
                 A: seismic::Element::bf16(),
-            },
-            &defaults::<stream_mix_up::Entry>(device, &statics[..3]),
+            }),
+            &statics[..3],
         )
         .unwrap()
         .call(stream_mix_up::Args {
@@ -512,9 +510,10 @@ fn native_repeat_rows_matches_portable_body() {
                     Input::Tensor(DType::F32, vec![s], scales.clone()),
                 ],
             );
-            let repeated = repeat_rows::native_for_device(
+            let repeated = at_defaults(
                 &device,
-                &defaults::<repeat_rows::Entry>(&device, &[]),
+                repeat_rows::native_entry(),
+                &[],
             )
             .unwrap()
             .call(repeat_rows::Args {

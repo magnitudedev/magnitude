@@ -1,3 +1,5 @@
+mod declared;
+
 use magnitude_kernels::{
     attention_output, gated_delta_chunk, gated_delta_project, gated_delta_step, repack_weight,
 };
@@ -30,28 +32,20 @@ fn packed_stages_on(device: &seismic::Device) {
     let layout = device.backend().resident_layout();
     let q8 = seismic::Element::stored("q8g32s", layout).unwrap();
     let bf16 = seismic::Element::bf16();
-    // One key and one value head of width 32 over a 32-wide hidden row, at
-    // each entry's first declared configuration.
-    fn declared_defaults<E: seismic::Entry>(
+    // One key and one value head of width 32 over a 32-wide hidden row, each
+    // entry prepared at its declared default configuration.
+    fn at_defaults<E: seismic::Entry>(
         device: &seismic::Device,
-    ) -> seismic::NativeSpecialization {
-        let implementation = seismic::generated::native_implementation::<E>(device)
-            .unwrap()
-            .unwrap();
-        let statics = implementation.statics.iter().fold(
-            seismic::NativeSpecialization::new(),
-            |statics, name| {
-                let value = match name.as_str() {
-                    "H" | "D" | "W" | "NM" => 32,
-                    "NK" | "NV" | "Q" | "PT" | "SN" => 1,
-                    "IN" => 0,
-                    "QB" | "ZB" | "OB" | "OS" => 0,
-                    _ => panic!("unexpected static {name}"),
-                };
-                statics.with_static(name.clone(), value)
-            },
-        );
-        implementation.default_specialization(&statics).unwrap()
+        entry: seismic::BoundEntry<E>,
+    ) -> seismic::NativeKernel<E> {
+        let specialization = declared::declared_default(device, &entry, |name| match name {
+            "H" | "D" | "W" | "NM" => 32,
+            "NK" | "NV" | "Q" | "PT" | "SN" => 1,
+            "C" => 2,
+            "IN" | "QB" | "ZB" | "OB" | "OS" => 0,
+            _ => panic!("unexpected static {name}"),
+        });
+        entry.prepare(device, &specialization).unwrap()
     }
     let resident = |shape: &[u64]| {
         let values = shape.iter().product::<u64>() as usize;
@@ -64,20 +58,13 @@ fn packed_stages_on(device: &seismic::Device) {
         let external =
             seismic::Tensor::from_host(&device, q8_external, &[1, shape[0], shape[1]], &bytes)
                 .unwrap();
-        let specialization = repack_weight::native_implementation(device)
-            .unwrap()
-            .unwrap()
-            .default_specialization(&seismic::NativeSpecialization::new())
-            .unwrap();
-        repack_weight::native_for_device_with(
-            &device,
-            repack_weight::Elements {
+        at_defaults(
+            device,
+            repack_weight::native_entry_with(repack_weight::Elements {
                 E: q8_external,
                 U: q8,
-            },
-            &specialization,
+            }),
         )
-        .unwrap()
         .call(repack_weight::Args { source: &external })
         .unwrap()
         .value
@@ -137,19 +124,17 @@ fn packed_stages_on(device: &seismic::Device) {
     let convolution = tensor(&device, &[96, 2], &[0.0; 192]);
     let rate = tensor(&device, &[1], &[0.0]);
     let time_bias = tensor(&device, &[1], &[0.0]);
-    let projection = gated_delta_project::native_for_device_with(
-        &device,
-        gated_delta_project::Elements {
+    let projection = at_defaults(
+        device,
+        gated_delta_project::native_entry_with(gated_delta_project::Elements {
             NW: bf16,
             QW: q8,
             GW: q8,
             AW: q8,
             BW: q8,
             A: bf16,
-        },
-        &declared_defaults::<gated_delta_project::Entry>(&device),
+        }),
     )
-    .unwrap()
     .call(gated_delta_project::Args {
         hidden: &hidden,
         input_norm: &norm,
@@ -163,30 +148,10 @@ fn packed_stages_on(device: &seismic::Device) {
     })
     .unwrap()
     .value;
-    let step_implementation = gated_delta_step::native_implementation(device)
-        .unwrap()
-        .unwrap();
-    let step_statics = step_implementation.statics.iter().fold(
-        seismic::NativeSpecialization::new(),
-        |statics, name| {
-            let value = match name.as_str() {
-                "NK" | "NV" => 1,
-                "W" => 32,
-                "C" => 2,
-                _ => panic!("unexpected static {name}"),
-            };
-            statics.with_static(name.clone(), value)
-        },
-    );
-    let step_specialization = step_implementation
-        .default_specialization(&step_statics)
-        .unwrap();
-    let gated = gated_delta_step::native_for_device_with(
-        &device,
-        gated_delta_step::Elements { RN: bf16, A: bf16 },
-        &step_specialization,
+    let gated = at_defaults(
+        device,
+        gated_delta_step::native_entry_with(gated_delta_step::Elements { RN: bf16, A: bf16 }),
     )
-    .unwrap()
     .call(gated_delta_step::Args {
         projection: &projection,
         convolution: &convolution,
@@ -209,12 +174,10 @@ fn packed_stages_on(device: &seismic::Device) {
     })
     .unwrap()
     .value;
-    let recurrent = attention_output::native_for_device_with(
-        &device,
-        attention_output::Elements { OW: q8, A: bf16 },
-        &declared_defaults::<attention_output::Entry>(&device),
+    let recurrent = at_defaults(
+        device,
+        attention_output::native_entry_with(attention_output::Elements { OW: q8, A: bf16 }),
     )
-    .unwrap()
     .call(attention_output::Args {
         hidden: &hidden,
         inject: &no_inject(&device, hidden.extents()[0]),

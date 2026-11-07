@@ -637,24 +637,26 @@ fn host_models_match_the_portable_bodies() {
 // Natives.
 
 fn features_match(device: &Device, case: &Features) {
-    let implementation = corrector_features::native_implementation(device)
+    let entry = corrector_features::native_entry_with(corrector_features::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("corrector_features has a native implementation on every device");
-    let kernel = corrector_features::native_for_device_with(
-        device,
-        corrector_features::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &[
-                ("M", case.rows as u64),
-                ("V", case.vocabulary as u64),
-                ("K", case.top_k as u64),
-                ("H", case.width as u64),
-            ],
-        ),
-    )
-    .unwrap();
+        .expect("corrector_features has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &[
+                    ("M", case.rows as u64),
+                    ("V", case.vocabulary as u64),
+                    ("K", case.top_k as u64),
+                    ("H", case.width as u64),
+                ],
+            ),
+        )
+        .unwrap();
     let result = kernel
         .call(corrector_features::Args {
             logits: &f32_tensor(device, &[case.rows, case.vocabulary], &case.logits),
@@ -685,9 +687,6 @@ fn rows_match(device: &Device) {
     let input = values(rows * width, 12);
     let bias = values(width, 13);
     let residual = values(rows * width, 14);
-    let implementation = corrector_rows::native_implementation(device)
-        .unwrap()
-        .expect("corrector_rows has a native implementation on every device");
     for (form, with_residual, output) in [
         (0, true, Element::f32()),
         (0, false, Element::bf16()),
@@ -695,20 +694,25 @@ fn rows_match(device: &Device) {
         (2, false, Element::f32()),
     ] {
         let residual_rows = usize::from(with_residual);
-        let kernel = corrector_rows::native_for_device_with(
-            device,
-            corrector_rows::Elements { Y: output },
-            &specialization(
-                &implementation.statics,
-                |fixed| implementation.default_specialization(fixed).unwrap(),
-                &[
-                    ("M", rows as u64),
-                    ("N", width as u64),
-                    ("R", residual_rows as u64),
-                ],
-            ),
-        )
-        .unwrap();
+        let entry = corrector_rows::native_entry_with(corrector_rows::Elements { Y: output });
+        let implementation = entry
+            .offered(device)
+            .unwrap()
+            .expect("corrector_rows has a native implementation at its elements");
+        let kernel = entry
+            .prepare(
+                device,
+                &specialization(
+                    &implementation.statics,
+                    |fixed| implementation.default_specialization(fixed).unwrap(),
+                    &[
+                        ("M", rows as u64),
+                        ("N", width as u64),
+                        ("R", residual_rows as u64),
+                    ],
+                ),
+            )
+            .unwrap();
         let result = kernel
             .call(corrector_rows::Args {
                 values: &f32_tensor(device, &[rows, width], &input),
@@ -842,24 +846,26 @@ fn attention_matches(device: &Device, blocks: usize, nodes: usize, heads: usize,
         .map(|value| value / 4.0)
         .collect::<Vec<_>>();
     let bias = values(heads * nodes * nodes, 25);
-    let implementation = corrector_attention::native_implementation(device)
+    let entry = corrector_attention::native_entry_with(corrector_attention::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("corrector_attention has a native implementation on every device");
-    let kernel = corrector_attention::native_for_device_with(
-        device,
-        corrector_attention::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &[
-                ("S", blocks as u64),
-                ("N", nodes as u64),
-                ("NH", heads as u64),
-                ("W", width as u64),
-            ],
-        ),
-    )
-    .unwrap();
+        .expect("corrector_attention has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &[
+                    ("S", blocks as u64),
+                    ("N", nodes as u64),
+                    ("NH", heads as u64),
+                    ("W", width as u64),
+                ],
+            ),
+        )
+        .unwrap();
     let result = kernel
         .call(corrector_attention::Args {
             qkv: &f32_tensor(device, &[blocks, nodes, 3, heads, width], &qkv),
@@ -893,23 +899,25 @@ fn factors_match(device: &Device) {
         .into_iter()
         .map(bf16_round)
         .collect::<Vec<_>>();
-    let implementation = corrector_factors::native_implementation(device)
+    let entry = corrector_factors::native_entry_with(corrector_factors::Elements { A: Element::bf16() });
+    let implementation = entry
+        .offered(device)
         .unwrap()
-        .expect("corrector_factors has a native implementation on every device");
-    let kernel = corrector_factors::native_for_device_with(
-        device,
-        corrector_factors::Elements { A: Element::bf16() },
-        &specialization(
-            &implementation.statics,
-            |fixed| implementation.default_specialization(fixed).unwrap(),
-            &[
-                ("S", blocks as u64),
-                ("N", nodes as u64),
-                ("H", width as u64),
-            ],
-        ),
-    )
-    .unwrap();
+        .expect("corrector_factors has a native implementation at its elements");
+    let kernel = entry
+        .prepare(
+            device,
+            &specialization(
+                &implementation.statics,
+                |fixed| implementation.default_specialization(fixed).unwrap(),
+                &[
+                    ("S", blocks as u64),
+                    ("N", nodes as u64),
+                    ("H", width as u64),
+                ],
+            ),
+        )
+        .unwrap();
     let result = kernel
         .call(corrector_factors::Args {
             nodes: &tensor(

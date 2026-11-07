@@ -122,26 +122,37 @@ fn same_value(actual: f32, expected: f32) -> bool {
         || (actual.is_nan() && expected.is_nan())
 }
 
+/// `embedding_rows` over a bf16 table at its declared defaults, width D
+/// static where the backend declares it (the CPU declares no static width).
+fn embedding_rows_at(device: &Device, width: usize) -> seismic::NativeKernel<embedding_rows::Entry> {
+    let entry = embedding_rows::native_entry_with(embedding_rows::Elements {
+        EW: Element::bf16(),
+        A: Element::bf16(),
+    });
+    let statics = match is_cpu(device) {
+        true => NativeSpecialization::new(),
+        false => NativeSpecialization::new().with_static("D", width as u64),
+    };
+    let spec = entry.offered(device).unwrap().unwrap().default_specialization(&statics).unwrap();
+    entry.prepare(device, &spec).unwrap()
+}
+
 fn stored_rows_native(
     device: &Device,
     width: u64,
     resident: Element,
 ) -> seismic::NativeKernel<stored_rows::Entry> {
-    let spec = NativeSpecialization::new().with_static("W", width);
-    let spec = seismic::generated::native_implementation::<stored_rows::Entry>(device)
+    let entry = stored_rows::native_entry_with(stored_rows::Elements {
+        E: resident,
+        A: Element::bf16(),
+    });
+    let spec = entry
+        .offered(device)
         .unwrap()
         .unwrap()
-        .default_specialization(&spec)
+        .default_specialization(&NativeSpecialization::new().with_static("W", width))
         .unwrap();
-    stored_rows::native_for_device_with(
-        device,
-        stored_rows::Elements {
-            E: resident,
-            A: Element::bf16(),
-        },
-        &spec,
-    )
-    .unwrap()
+    entry.prepare(device, &spec).unwrap()
 }
 
 /// The portable body's rows, from its interpreter.
@@ -403,23 +414,7 @@ fn embedding_rows_through_a_hashed_directory_read_the_slots_it_names() {
         .flat_map(|pair| [found(&dense, pair[0]).map_or(-1, |slot| slot as i32), pair[1]])
         .collect::<Vec<_>>();
     for device in devices() {
-        let kernel = embedding_rows::native_for_device_with(
-            &device,
-            embedding_rows::Elements {
-                EW: Element::bf16(),
-                A: Element::bf16(),
-            },
-            &seismic::generated::native_implementation::<embedding_rows::Entry>(&device)
-                .unwrap()
-                .unwrap()
-                .default_specialization(&match is_cpu(&device) {
-                    // The CPU declares no static width.
-                    true => NativeSpecialization::new(),
-                    false => NativeSpecialization::new().with_static("D", width as u64),
-                })
-                .unwrap(),
-        )
-        .unwrap();
+        let kernel = embedding_rows_at(&device, width);
         let table = tensor(
             &device,
             Element::bf16(),
@@ -486,22 +481,7 @@ fn a_row_that_names_no_table_row_reads_zeros() {
         (hashed, [buckets as u64, 2]),
     ];
     for device in devices() {
-        let embedding = embedding_rows::native_for_device_with(
-            &device,
-            embedding_rows::Elements {
-                EW: Element::bf16(),
-                A: Element::bf16(),
-            },
-            &seismic::generated::native_implementation::<embedding_rows::Entry>(&device)
-                .unwrap()
-                .unwrap()
-                .default_specialization(&match is_cpu(&device) {
-                    true => NativeSpecialization::new(),
-                    false => NativeSpecialization::new().with_static("D", width as u64),
-                })
-                .unwrap(),
-        )
-        .unwrap();
+        let embedding = embedding_rows_at(&device, width);
         let table = tensor(&device, Element::bf16(), &[slots as u64, width as u64], &values);
         let slots_tensor = Tensor::from_host(
             &device,
