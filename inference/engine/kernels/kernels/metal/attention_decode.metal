@@ -100,7 +100,7 @@ kernel void attention_decode_partial(
         reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon, scale * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN,
         kv_head, partition, group.z, thread_index, simd, lane);
 #else
-    const uint total = attention::form_total(visible, fresh, row, R);
+    const uint total = attention::form_total(visible, fresh, row, R, lane);
     const uint span_keys = attention::partition_span(total, SEISMIC_TUNE_SPAN, PARTS);
     const uint partition_lo = partition * span_keys;
     if (partition_lo >= total)
@@ -147,8 +147,9 @@ kernel void attention_decode_partial(
     const uint sub = (partition_hi - partition_lo + GROUPS - 1) / GROUPS;
     const uint first = partition_lo + (simd / SLICES) * sub;
     const uint last = metal::min(first + sub, partition_hi);
-    uint offset = 0;
-    for (ulong span = 0; span <= R && offset < last; ++span) {
+    const attention::span_start start = attention::form_locate(visible, fresh, row, R, first, lane);
+    uint offset = start.offset;
+    for (ulong span = start.span; span <= R && offset < last; ++span) {
         const bool historical = span < R;
         int lo, hi;
         attention::form_span(visible, fresh, row, R, span, lo, hi);

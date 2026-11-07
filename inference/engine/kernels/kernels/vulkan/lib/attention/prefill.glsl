@@ -229,6 +229,37 @@ uint prefill_span_tiles(ivec4 interval) {
     return interval.y > interval.x ? uint(interval.y - interval.x + int(PREFILL_KEYS) - 1) / PREFILL_KEYS : 0u;
 }
 
+// The key tiles of span `index` (none past the fresh span).
+uint prefill_index_tiles(uint64_t visible, uint64_t fresh, uint64_t tile_first, uint64_t rows, uint64_t spans,
+    uint64_t index) {
+    return index > spans ? 0u : prefill_span_tiles(prefill_interval(visible, fresh, tile_first, rows, spans, index));
+}
+
+// The query tile's key tiles over all its spans. Lane l counts spans l, l +
+// 32, ...; the whole subgroup calls it.
+uint prefill_total_tiles(uint64_t visible, uint64_t fresh, uint64_t tile_first, uint64_t rows, uint64_t spans) {
+    uint total = 0u;
+    for (uint64_t index = SEISMIC_LANE; index <= spans; index += 32ul)
+        total += prefill_index_tiles(visible, fresh, tile_first, rows, spans, index);
+    return seismic_subgroup_add(total);
+}
+
+// The span holding the query tile's key tile `tile` (in span order) and the
+// tiles before it: the first span in 0..=spans whose tiles end past `tile`,
+// or (spans + 1, total) when there is none. The whole subgroup calls it, 32
+// spans at a time.
+uvec2 prefill_locate_tile(uint64_t visible, uint64_t fresh, uint64_t tile_first, uint64_t rows, uint64_t spans,
+    uint tile) {
+    uint carried = 0u;
+    for (uint64_t base = 0ul; base <= spans; base += 32ul) {
+        uint found;
+        if (reduce_lanes_locate(prefill_index_tiles(visible, fresh, tile_first, rows, spans, base + SEISMIC_LANE),
+                tile, carried, found))
+            return uvec2(uint(base) + found, carried);
+    }
+    return uvec2(uint(spans) + 1u, carried);
+}
+
 // The lane's 16 scaled, masked scores of the tile starting at key `first`;
 // a key outside the row's span bounds scores -inf (bounds are read only
 // outside the common interval).
@@ -287,9 +318,7 @@ void prefill_list() {
     if (thread == 0u)
         seismic_shared_u32[threads] = 0u;
     barrier();
-    uint total = 0u;
-    for (uint64_t index = 0ul; index <= spans; ++index)
-        total += prefill_span_tiles(prefill_interval(visible, fresh, tile_first, rows, spans, index));
+    const uint total = prefill_total_tiles(visible, fresh, tile_first, rows, spans);
     for (uint first_candidate = 0u; first_candidate < total; first_candidate += threads) {
         const uint candidate = first_candidate + thread;
         bool read = false;
@@ -418,9 +447,7 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     barrier();
 #endif
 
-    uint total_tiles = 0u;
-    for (uint64_t index = 0ul; index <= spans; ++index)
-        total_tiles += prefill_span_tiles(prefill_interval(visible, fresh, tile_first, rows, spans, index));
+    uint total_tiles = prefill_total_tiles(visible, fresh, tile_first, rows, spans);
 #ifndef PREFILL_DECODE
     // A WorkList's key tiles are its query tile's listed ones.
     if (PREFILL_SELECTED)
@@ -448,6 +475,11 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
 #endif
     const uint tiles_lo = part * per;
     const uint tiles_hi = min(tiles_lo + per, total_tiles);
+    // The partition's walk over the spans starts on the span holding its
+    // first tile and ends past its last.
+    const uvec2 located = PREFILL_SELECTED_PASS
+        ? uvec2(0u)
+        : prefill_locate_tile(visible, fresh, tile_first, rows, spans, tiles_lo);
 
     // The subgroup's block: matrix rows 16 sg .. of the tile's QT x G rows;
     // the lane's softmax row is lane % 16. When G does not divide ROWS, the
@@ -520,8 +552,9 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
                 flash_accumulate(p_half, 0u, width, width, 0u, o);
         }
 #endif
-        uint tiles_before = 0u;
-        for (uint64_t index = 0ul; index <= spans && !PREFILL_SELECTED_PASS; ++index) {
+        uint tiles_before = located.y;
+        for (uint64_t index = located.x; index <= spans && tiles_before < tiles_hi && !PREFILL_SELECTED_PASS;
+             ++index) {
             const ivec4 interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
             const uint span_tiles = prefill_span_tiles(interval);
             const uint span_first = tiles_before;

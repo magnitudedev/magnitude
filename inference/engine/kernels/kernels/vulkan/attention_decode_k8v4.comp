@@ -74,12 +74,14 @@ void attention_decode_k8v4_merge() { prefill_decode_merge(); }
 #define DECODE_KEYWISE (SEISMIC_TUNE_KEYWISE != 0)
 
 // The keywise batch calls of a row's keys [first, last): one per
-// ATTENTION_KEYS keys of each slab's part of each historical span.
+// ATTENTION_KEYS keys of each slab's part of each historical span, counted
+// from the span holding `first`. The whole subgroup calls it.
 uint decode_keywise_batches(
     uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans, uint slab_rows, uint first, uint last) {
+    const uvec2 located = attention_locate(visible, fresh, row, spans, first);
     uint batches = 0u;
-    uint offset = 0u;
-    for (uint64_t span = 0ul; span < spans && offset < last; ++span) {
+    uint offset = located.y;
+    for (uint64_t span = located.x; span < spans && offset < last; ++span) {
         int lo, hi;
         attention_span(visible, fresh, row, spans, span, lo, hi);
         const uint length = uint(max(hi - lo, 0));
@@ -258,7 +260,8 @@ void attention_decode_k8v4_partial() {
         // carries a cursor through its keys (span, slab part, position), moved
         // between calls; out of keys, it stays on its last part with empty
         // batches. A group with no historical keys stays on the partition's
-        // first, which is one whenever any group has batches.
+        // first, which is one whenever any group has batches. The cursor
+        // starts on the span holding its first key.
         uint busiest = 0u;
         for (uint group = 0u; group < attention_key_groups(); ++group) {
             const uvec2 keys = attention_key_range(partition_lo, partition_hi, group);
@@ -266,8 +269,9 @@ void attention_decode_k8v4_partial() {
         }
         const uint batches = decode_keywise_batches(visible, fresh, row, spans, slab_rows, range.x, range.y);
         uint position = batches > 0u ? range.x : partition_lo;
-        uint64_t span = 0ul;
-        uint offset = 0u;
+        const uvec2 start = attention_locate(visible, fresh, row, spans, position);
+        uint64_t span = start.x;
+        uint offset = start.y;
         uint length = 0u;
         int lo, hi;
         uint part_start = position;
@@ -296,8 +300,10 @@ void attention_decode_k8v4_partial() {
             position += n;
         }
     }
-    uint offset = 0u;
-    for (uint64_t span = 0ul; span <= spans && offset < range.y; ++span) {
+    // The walk starts on the span holding the group's first key.
+    const uvec2 located = attention_locate(visible, fresh, row, spans, range.x);
+    uint offset = located.y;
+    for (uint64_t span = located.x; span <= spans && offset < range.y; ++span) {
         const bool historical = span < spans;
         int lo, hi;
         attention_span(visible, fresh, row, spans, span, lo, hi);

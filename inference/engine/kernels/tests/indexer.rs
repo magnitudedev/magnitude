@@ -25,7 +25,7 @@ const SB: usize = 4;
 /// Physical rows of a token-history slab: spans break at its edges.
 const SLAB_ROWS: usize = 64;
 const WINDOW_ROWS: usize = 64;
-const BLOCK_ROWS: usize = 32;
+const BLOCK_ROWS: usize = 512;
 
 /// One launch over rows at positions `first..first + rows` of one sequence.
 struct Case {
@@ -598,6 +598,9 @@ fn decode_rows_select_segments() {
     check(&Case::new(2, 42, 4, 16, true, 1), "decode");
     // One row whose block is complete at its own position.
     check(&Case::new(1, 47, 4, 16, true, 2), "decode own block");
+    // A long row: its keys, bitmap words and runs spread over every thread
+    // of the select launch.
+    check(&Case::new(1, 1500, 64, 400, true, 9), "decode long");
 }
 
 #[test]

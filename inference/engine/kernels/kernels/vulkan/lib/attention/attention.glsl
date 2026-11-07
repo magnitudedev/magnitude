@@ -1,10 +1,11 @@
 // Shared pieces of the attention family entries (`attention_decode`,
 // `attention_prefill` and their K8/V4 forms): the per-head preparation
 // (optional RMS norm and amplitude-scaled partial M-RoPE) held in one
-// subgroup's registers, a row's span walk, decode partition bounds, the
-// online-softmax absorb, the fixed-order merge of partial states, the decode
-// partition publication and gated merge, and the
-// K/V append. The counterpart of `metal/lib/attention/attention.h`.
+// subgroup's registers, a row's span total and key location (subgroup
+// cooperative), decode partition bounds, the online-softmax absorb, the
+// fixed-order merge of partial states, the decode partition publication and
+// gated merge, and the K/V append. The counterpart of
+// `metal/lib/attention/attention.h`.
 //
 // Every dense operand is bound canonically (row-major, unit innermost
 // stride), so rows are addressed from their logical offsets. Activations are
@@ -12,6 +13,7 @@
 // multiple of 32 and each of a subgroup's 32 lanes owns E = W / 32
 // contiguous columns.
 #include "../core/activation.glsl"
+#include "../core/reduce.glsl"
 #include "../core/rotary.glsl"
 
 #define ATTENTION_W uint(2ul * SEISMIC_DIM_P + SEISMIC_DIM_S)
@@ -152,15 +154,37 @@ void attention_span(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spa
     hi = element_i32_at(at + 4ul);
 }
 
+// The number of keys of span `index` of `row` (none past the fresh span).
+uint attention_span_length(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans, uint64_t index) {
+    if (index > spans)
+        return 0u;
+    int lo, hi;
+    attention_span(visible, fresh, row, spans, index, lo, hi);
+    return uint(max(hi - lo, 0));
+}
+
 // The total number of keys a row sees: its visible spans, then its fresh span.
+// Lane l sums spans l, l + 32, ...; the whole subgroup calls it.
 uint attention_visible_total(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans) {
     uint total = 0u;
-    for (uint64_t index = 0ul; index <= spans; ++index) {
-        int lo, hi;
-        attention_span(visible, fresh, row, spans, index, lo, hi);
-        total += uint(max(hi - lo, 0));
+    for (uint64_t index = SEISMIC_LANE; index <= spans; index += 32ul)
+        total += attention_span_length(visible, fresh, row, spans, index);
+    return seismic_subgroup_add(total);
+}
+
+// The span of `row` holding its key `key` and the span's first key: the first
+// span s in 0..=spans whose keys end past `key`, or (spans + 1, total) when
+// the row has no such key. Spans before it hold no key at or after `key`. The
+// whole subgroup calls it, 32 spans at a time.
+uvec2 attention_locate(uint64_t visible, uint64_t fresh, uint64_t row, uint64_t spans, uint key) {
+    uint carried = 0u;
+    for (uint64_t base = 0ul; base <= spans; base += 32ul) {
+        uint found;
+        if (reduce_lanes_locate(attention_span_length(visible, fresh, row, spans, base + SEISMIC_LANE), key, carried,
+                found))
+            return uvec2(uint(base) + found, carried);
     }
-    return total;
+    return uvec2(uint(spans) + 1u, carried);
 }
 
 // Keys per decode partition for a row seeing `total` keys: at least `span`,
@@ -424,7 +448,8 @@ void attention_store_gated(uint64_t query, uint64_t gate, uint64_t result, uint6
 
 // The decode merge of one (query head, row) column over the row's `spans`
 // visible spans: the row's non-empty partitions in partition order, then the
-// output gate. A row that sees no key attends to zero.
+// output gate. A row that sees no key attends to zero. Whole subgroups call it
+// (each finds the row's total keys).
 void attention_decode_gate(uint64_t query, uint64_t gate, uint64_t visible, uint64_t fresh, uint64_t result,
     uint64_t partials, uint64_t statistics, uint64_t spans, uint64_t head, uint64_t row, uint column, uint span,
     uint parts) {

@@ -12,6 +12,7 @@
 // innermost stride); rows and heads are addressed through their ABI strides.
 
 #include "../core/activation.cuh"
+#include "../core/reduce.cuh"
 #include <seismic/slab.cuh>
 
 namespace attention {
@@ -120,14 +121,29 @@ __device__ __forceinline__ Span span(const Inputs &in, u64 row, u64 span, u64 sp
     return Span{ATTENTION_FRESH(in, row, 0), ATTENTION_FRESH(in, row, 1)};
 }
 
-// The total number of keys a row sees: its visible spans, then its fresh span.
-__device__ __forceinline__ long long visible_total(const Inputs &in, u64 row, u64 spans) {
-    long long total = 0;
-    for (u64 index = 0; index <= spans; ++index) {
+// The key counts of a row's spans: its visible spans, then its fresh span.
+struct VisibleLengths {
+    const Inputs &in;
+    u64 row;
+    u64 spans;
+    __device__ __forceinline__ long long operator()(u64 index) const {
         const Span s = span(in, row, index, spans);
-        total += s.hi > s.lo ? s.hi - s.lo : 0;
+        return s.hi > s.lo ? s.hi - s.lo : 0;
     }
-    return total;
+};
+
+// The total number of keys a row sees (`reduce::span_total`; the whole warp
+// calls it).
+__device__ __forceinline__ long long visible_total(const Inputs &in, u64 row, u64 spans, int lane) {
+    return reduce::span_total(spans + 1, VisibleLengths{in, row, spans}, lane);
+}
+
+// The span holding key `key` of a row and the ordinal of its first key
+// (`reduce::span_locate`; the whole warp calls it); (spans + 1, total) past the
+// row's keys.
+__device__ __forceinline__ reduce::Located visible_locate(const Inputs &in, u64 row, u64 spans, long long key,
+                                                          int lane) {
+    return reduce::span_locate(spans + 1, key, VisibleLengths{in, row, spans}, lane);
 }
 
 #endif

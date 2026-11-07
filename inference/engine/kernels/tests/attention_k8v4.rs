@@ -2163,6 +2163,56 @@ fn decode_reads_spans_crossing_affine_history_slabs() {
     }
 }
 
+/// A selected read's decode rows: many short scattered runs (the indexer's
+/// Segments form, 4-key blocks with gaps), a run crossing a slab edge, empty
+/// spans between and after them, more spans than a simdgroup's lanes, at
+/// every decode configuration: the entry finds each partition's first span
+/// and the row's key count without walking the table serially.
+#[test]
+fn decode_reads_scattered_selected_runs() {
+    let mut scattered = (0..70).map(|block| (8 * block, 8 * block + 4)).collect::<Vec<_>>();
+    scattered.extend([(560, 573), (0, 0), (0, 0), (0, 0)]);
+    let mut mixed = vec![(3, 9), (0, 0), (30, 34)];
+    mixed.extend((0..40).map(|block| (40 + 12 * block, 44 + 12 * block)));
+    mixed.extend([(0, 0)].repeat(scattered.len() - mixed.len() - 1));
+    mixed.push((540, 572));
+    let rows = [
+        Row {
+            spans: scattered,
+            fresh: (0, 1),
+            destination: 573,
+            position: 573,
+        },
+        Row {
+            spans: mixed,
+            fresh: (1, 2),
+            destination: 574,
+            position: 572,
+        },
+    ];
+    let spans = rows[0].spans.len();
+    let encoded = Encoded::new(Case::new(GROUPED, 608, spans, &rows, 83));
+    let expected = encoded.expected();
+    for device in seismic_native_tests::every_device() {
+        let backend = device.backend();
+        for config in decode_configs(backend, GROUPED) {
+            let kernel = decode_kernel(&device, GROUPED, &config);
+            let mut bound = Bound::new_with_slab_rows(&device, &encoded, 32, false);
+            let gated = kernel
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .unwrap()
+                .value;
+            check(
+                &format!("{backend:?} affine scattered-run decode {config:?}"),
+                &encoded,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
+    }
+}
+
 // 300 history rows are 10 key tiles: the split configurations split the first
 // sequence's history spans over two partitions and merge them. One affine
 // group per vector keeps the interpreter's prefill affordable; the Qwen

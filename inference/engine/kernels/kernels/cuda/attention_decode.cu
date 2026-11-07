@@ -129,7 +129,7 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     // Equal partitions of the row's keys, then equal key-group ranges of this
     // one.
     const u64 spans = SEISMIC_DIM_R;
-    const long long total = attention::visible_total(in, row, spans);
+    const long long total = attention::visible_total(in, row, spans, lane);
     const attention::Range partition =
         attention::partition(attention::Range{0, total}, (total + PARTS - 1) / PARTS, part);
     const attention::Range slice = attention::partition(
@@ -138,8 +138,10 @@ extern "C" __global__ void __launch_bounds__(WARPS * 32)
     attention::Heads<H> state;
     attention::clear(state);
 
-    long long offset = 0;
-    for (u64 span = 0; span <= spans && offset < slice.hi; ++span) {
+    // The walk starts at the span holding the slice's first key.
+    const reduce::Located start = attention::visible_locate(in, row, spans, slice.lo, lane);
+    long long offset = start.offset;
+    for (u64 span = start.span; span <= spans && offset < slice.hi; ++span) {
         const attention::Span s = attention::span(in, row, span, spans);
         const long long length = s.hi > s.lo ? s.hi - s.lo : 0;
         const long long first = max(slice.lo, offset);

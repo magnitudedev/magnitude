@@ -726,6 +726,7 @@ mod internals {
                     "SEISMIC_KERNEL",
                     "SEISMIC_SUBGROUP_LANES",
                     "SEISMIC_LANE",
+                    "SEISMIC_LANE_BASE",
                     "SEISMIC_SUBGROUP",
                     "SEISMIC_SUBGROUPS",
                     "SEISMIC_HAS_FLOAT16",

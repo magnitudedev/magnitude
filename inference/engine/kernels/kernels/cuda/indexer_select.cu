@@ -8,18 +8,26 @@
 //           spans, then its own), RMS-normed and rotated at the coordinates
 //           stored with the first, stored in the F32 block plane.
 // score:    block per (tile of 8 * 32 blocks, row); the query heads prepared
-//           once into shared memory, each warp scores 32 blocks.
-// select:   block per row; radix select over the scores' bits finds the K-th
-//           best score T, blocks above T and the first equal ones in block
-//           order are marked, with every block from the tail on, as the
-//           row's bitmap.
-// segments: one warp per row (C > 0); the marked blocks' keys mapped through
-//           the row's spans, as runs within slabs.
+//           once into shared memory, each warp scores 32 blocks, walking the
+//           block spans from its first block's.
+// select:   block of 256 threads per row; a radix select over the scores'
+//           bits finds the K-th best score T (each pass's histogram takes one
+//           atomic per distinct digit of a warp, the digit is found by a scan
+//           of the bins), blocks above T and the first equal ones in block
+//           order (ranked by a scan of each thread's count) are marked, with
+//           every block from the tail on, as the row's bitmap. With C > 0 it
+//           then emits the row's runs: the span offsets are scanned into
+//           scratch, each thread counts the runs starting in its share
+//           of the keys, and a scan of the counts places each run.
+//
+// The warp-cooperative span walks (`reduce::span_total`,
+// `reduce::span_locate`) and the block scans are lib/core/reduce.cuh's.
 //
 // Dynamic extents, strides and parameters read `seismic_words`: every helper
 // using one takes `seismic_words_value`.
 
 #include "lib/core/activation.cuh"
+#include "lib/core/reduce.cuh"
 #include <seismic/slab.cuh>
 
 namespace indexer {
@@ -82,28 +90,47 @@ struct Spans {
     const int *spans;
     u64 count, span_stride, bound_stride;
 
-    __device__ __forceinline__ u32 rows() const {
-        u32 total = 0;
-        for (u64 span = 0; span < count; ++span) {
-            const int lo = spans[span * span_stride];
-            const int hi = spans[span * span_stride + bound_stride];
-            total += hi > lo ? static_cast<u32>(hi - lo) : 0u;
-        }
-        return total;
+    __device__ __forceinline__ int lo(u64 span) const { return spans[span * span_stride]; }
+    __device__ __forceinline__ u32 length(u64 span) const {
+        const int first = lo(span);
+        const int last = spans[span * span_stride + bound_stride];
+        return last > first ? static_cast<u32>(last - first) : 0u;
     }
 
-    // The physical row of row `ordinal` of the spans, then of `own` (the
-    // row's own, after them).
-    __device__ __forceinline__ int row(u32 ordinal, int own) const {
-        u32 before = 0;
-        for (u64 span = 0; span < count; ++span) {
-            const int lo = spans[span * span_stride];
-            const int hi = spans[span * span_stride + bound_stride];
-            const u32 length = hi > lo ? static_cast<u32>(hi - lo) : 0u;
-            if (ordinal < before + length) return lo + static_cast<int>(ordinal - before);
-            before += length;
-        }
-        return own;
+    // The rows of the spans (`reduce::span_total`; the whole warp calls it).
+    __device__ __forceinline__ u32 rows(int lane) const {
+        return static_cast<u32>(reduce::span_total(count, [&](u64 span) { return length(span); }, lane));
+    }
+};
+
+// A walk over the rows of a row's spans in ordinal order: the span holding
+// the current rows, its first row's ordinal and the ordinal past its rows.
+struct Cursor {
+    Spans spans;
+    u64 span;
+    int lo;
+    u32 first, end;
+
+    // At the span holding row `ordinal` (`reduce::span_locate`; the whole warp
+    // calls it).
+    __device__ __forceinline__ Cursor(const Spans &walked, u32 ordinal, int lane) : spans(walked) {
+        const reduce::Located at =
+            reduce::span_locate(spans.count, ordinal, [&](u64 index) { return spans.length(index); }, lane);
+        enter(at.span, static_cast<u32>(at.offset));
+    }
+
+    __device__ __forceinline__ void enter(u64 index, u32 offset) {
+        span = index;
+        first = offset;
+        lo = span < spans.count ? spans.lo(span) : 0;
+        end = span < spans.count ? first + spans.length(span) : first;
+    }
+
+    // The physical row of row `ordinal` of the spans (at or past the rows
+    // asked for before), then `own` (the row's own, after them).
+    __device__ __forceinline__ int row(u32 ordinal, int own) {
+        while (span < spans.count && ordinal >= end) enter(span + 1, end);
+        return span < spans.count ? lo + static_cast<int>(ordinal - first) : own;
     }
 };
 
@@ -117,6 +144,224 @@ __device__ __forceinline__ Spans block_spans(const int *block_visible, u64 row,
 // Bitmap words per row (32 blocks each), and the blocks they hold.
 __device__ __forceinline__ u32 bitmap_words(const seismic_words_t &seismic_words_value) {
     return static_cast<u32>(SEISMIC_DIM_B);
+}
+
+constexpr u32 THREADS = 256;
+
+// Marks the bitmap words [0, words) of a row with more complete blocks than
+// `selected`, from the bits of its scores `bits` (which order as the
+// non-negative scores do). Shared memory: `bins` [256], `partials` the block
+// scans' warp totals, `state` (prefix, count still to take). The whole block
+// calls it.
+__device__ __forceinline__ void mark(const u32 *bits, u32 complete, u32 selected, u32 *bitmap, u32 words,
+                                     u32 *bins, u32 *partials, u32 *state) {
+    const u32 thread = threadIdx.x;
+    const int lane = static_cast<int>(thread % 32);
+    if (thread == 0) {
+        state[0] = 0;
+        state[1] = selected;
+    }
+    // Four 8-bit passes, most significant first: the K-th best score's
+    // digit is the bin holding the remaining-th best of the scores matching
+    // the digits found so far.
+    u32 mask = 0;
+    for (int digit = 3; digit >= 0; --digit) {
+        const u32 shift = static_cast<u32>(digit) * 8u;
+        bins[thread] = 0;
+        __syncthreads();
+        const u32 prefix = state[0];
+        const u32 remaining = state[1];
+        // One atomic per distinct digit of a warp: its lowest lane adds the
+        // count of the warp's lanes holding it.
+        for (u32 base = 0; base < complete; base += THREADS) {
+            const u32 block = base + thread;
+            const u32 u = block < complete ? bits[block] : 0u;
+            const bool counted = block < complete && (u & mask) == prefix;
+            const u32 value = counted ? (u >> shift) & 255u : 256u;
+            const u32 peers = __match_any_sync(0xffffffffu, value);
+            if (counted && lane == __ffs(peers) - 1) atomicAdd(&bins[value], static_cast<u32>(__popc(peers)));
+        }
+        __syncthreads();
+        // Thread t holds bin 255 - t: the scan counts the matching scores in
+        // the bins above it, and the digit is the highest bin whose scores
+        // reach the remaining-th.
+        const u32 bin = 255u - thread;
+        const u32 count = bins[bin];
+        u32 matching;
+        const u32 above = reduce::group_exclusive_add(count, partials, matching);
+        if (remaining <= above + count && (thread == 0 || above < remaining)) {
+            state[0] = prefix | (bin << shift);
+            state[1] = remaining - above;
+        }
+        mask |= 255u << shift;
+    }
+    __syncthreads();
+    const u32 threshold = state[0];
+    const u32 take = state[1];
+    // Each thread marks whole words; the scores equal to the threshold are
+    // ranked in block order by a scan of each thread's count.
+    const u32 per = (words + THREADS - 1) / THREADS;
+    const u32 word_lo = min(thread * per, words);
+    const u32 word_hi = min(word_lo + per, words);
+    u32 equal = 0;
+    for (u32 block = word_lo * 32; block < min(word_hi * 32, complete); ++block) equal += bits[block] == threshold;
+    u32 equals;
+    u32 rank = reduce::group_exclusive_add(equal, partials, equals);
+    for (u32 word = word_lo; word < word_hi; ++word) {
+        u32 value = 0;
+        for (u32 bit = 0; bit < 32; ++bit) {
+            const u32 block = word * 32 + bit;
+            bool read = block >= complete;
+            if (!read) {
+                const u32 u = bits[block];
+                if (u > threshold) {
+                    read = true;
+                } else if (u == threshold) {
+                    read = rank < take;
+                    ++rank;
+                }
+            }
+            value |= read ? (1u << bit) : 0u;
+        }
+        bitmap[word] = value;
+    }
+}
+
+// A row's runs: entry e's [start, end) at `out` + e * `entry_stride`, its end
+// `bound_stride` past its start; runs past `capacity` are dropped.
+struct Runs {
+    int *out;
+    u64 entry_stride, bound_stride;
+    u32 capacity;
+
+    __device__ __forceinline__ void start(u32 entry, int stored) const {
+        if (entry < capacity) out[entry * entry_stride] = stored;
+    }
+    __device__ __forceinline__ void end(u32 entry, int stored) const {
+        if (entry < capacity) out[entry * entry_stride + bound_stride] = stored;
+    }
+};
+
+// The stored rows of a row's keys in key order, from the span offsets
+// `span_first` [count + 1]: at the span holding the first key asked for (the
+// last span starting at or before it: an empty span ends where it starts),
+// then past each span's end.
+struct Keys {
+    const Spans &spans;
+    const u32 *span_first;
+    u64 span;
+    int lo;
+    u32 first, end;
+
+    // `key` is below the total, span_first[count].
+    __device__ __forceinline__ Keys(const Spans &walked, const u32 *offsets, u32 key)
+        : spans(walked), span_first(offsets) {
+        u64 low = 0, high = spans.count;
+        while (high - low > 1) {
+            const u64 middle = (low + high) / 2;
+            if (span_first[middle] <= key) low = middle;
+            else high = middle;
+        }
+        enter(low);
+    }
+
+    __device__ __forceinline__ void enter(u64 index) {
+        span = index;
+        first = span_first[span];
+        end = span_first[span + 1];
+        lo = spans.lo(span);
+    }
+
+    // The stored row of `key` (at or past the keys asked for before).
+    __device__ __forceinline__ int stored(u32 key) {
+        while (key >= end) enter(span + 1);
+        return lo + static_cast<int>(key - first);
+    }
+};
+
+// Emits a row's runs: the stored rows of its keys `keys` (in key order, the
+// key k in block k / SB) where the row reads them, as [start, end) runs each
+// within one slab of `slab_rows` rows, then empty runs up to the capacity. A
+// key is read when its block's bit is set in the row's `bitmap` [words], or
+// past the bitmap's blocks. Shared memory: `partials` the block scans' warp
+// totals, `span_first` [count + 1]. The whole block calls it.
+__device__ __forceinline__ void emit(const Spans &keys, const u32 *bitmap, u32 words, const Runs &runs,
+                                     int slab_rows, u32 *partials, u32 *span_first) {
+    const u32 thread = threadIdx.x;
+    // span_first[s]: the keys of the spans before s; span_first[count]: the
+    // total.
+    u32 total = 0;
+    for (u64 base = 0; base < keys.count; base += THREADS) {
+        const u64 span = base + thread;
+        u32 chunk;
+        const u32 before = reduce::group_exclusive_add(span < keys.count ? keys.length(span) : 0u, partials, chunk);
+        if (span < keys.count) span_first[span] = total + before;
+        total += chunk;
+    }
+    if (thread == 0) span_first[keys.count] = total;
+    __syncthreads();
+    const u32 blocks = 32u * words;
+    const u32 block_rows = static_cast<u32>(SB);
+    auto read = [&](u32 key) {
+        const u32 block = key / block_rows;
+        return block >= blocks || ((bitmap[block / 32] >> (block % 32)) & 1u) != 0u;
+    };
+    // Thread t's keys [key_lo, key_hi). A run starts at a read key unless the
+    // key before is read, stored one row before it, and the key does not
+    // begin a slab; it ends at a read key the key after does not continue.
+    // The walk reads the key before the share (whether a run continues into
+    // it) and the key after (whether the share's last run ends in it), and
+    // skips the rest of an unread block.
+    const u32 share = (total + THREADS - 1) / THREADS;
+    const u32 key_lo = min(thread * share, total);
+    const u32 key_hi = min(key_lo + share, total);
+    // The first walk counts the share's run starts, the second (`write`)
+    // places its runs from `entry`.
+    u32 starts = 0;
+    u32 entry = 0;
+    auto walk = [&](bool write) {
+        auto start = [&](int stored) {
+            if (write)
+                runs.start(++entry, stored);
+            else
+                ++starts;
+        };
+        auto end = [&](int stored) {
+            if (write)
+                runs.end(entry, stored);
+        };
+        if (key_lo >= key_hi) return;
+        Keys cursor(keys, span_first, key_lo > 0 ? key_lo - 1 : key_lo);
+        bool previous = key_lo > 0 && read(key_lo - 1);
+        int previous_stored = previous ? cursor.stored(key_lo - 1) : 0;
+        for (u32 key = key_lo;;) {
+            if (key >= total || !read(key)) {
+                if (previous && key > key_lo) end(previous_stored + 1);
+                if (key == key_hi) return;
+                previous = false;
+                key = min((key / block_rows + 1) * block_rows, key_hi);
+                continue;
+            }
+            const int stored = cursor.stored(key);
+            const bool continues = previous && previous_stored + 1 == stored && stored % slab_rows != 0;
+            if (!continues && previous && key > key_lo) end(previous_stored + 1);
+            if (key == key_hi) return;
+            if (!continues) start(stored);
+            previous = true;
+            previous_stored = stored;
+            ++key;
+        }
+    };
+    walk(false);
+    u32 count;
+    // The run open at the share's first key, if any, began in an earlier
+    // share: its index is the share's first minus one.
+    entry = reduce::group_exclusive_add(starts, partials, count) - 1u;
+    walk(true);
+    for (u32 empty = count + thread; empty < runs.capacity; empty += THREADS) {
+        runs.start(empty, 0);
+        runs.end(empty, 0);
+    }
 }
 
 } // namespace indexer
@@ -157,15 +402,16 @@ extern "C" __global__ void indexer_select_complete(SEISMIC_KERNEL_PARAMS) {
                              SEISMIC_DIM_R, SEISMIC_WINDOW_VISIBLE_STRIDE_1, SEISMIC_WINDOW_VISIBLE_STRIDE_2};
     const int own = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW_DESTINATIONS))
         [row * SEISMIC_WINDOW_DESTINATIONS_STRIDE_0];
-    const u32 earlier = window_spans.rows();
+    const u32 earlier = window_spans.rows(lane);
     const u32 skipped = earlier > static_cast<u32>(SB - 1) ? earlier - static_cast<u32>(SB - 1) : 0u;
+    Cursor members(window_spans, skipped, lane);
     const u32 *window = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW_KEYS));
     int first_member = own;
     float sum[E];
 #pragma unroll
     for (int i = 0; i < E; ++i) sum[i] = 0.0f;
     for (int member = 0; member < SB; ++member) {
-        const int at = member + 1 < SB ? window_spans.row(skipped + static_cast<u32>(member), own) : own;
+        const int at = member + 1 < SB ? members.row(skipped + static_cast<u32>(member), own) : own;
         if (member == 0) first_member = at;
         const float *raw = reinterpret_cast<const float *>(
             slab::row(window, static_cast<u64>(at), SEISMIC_PARAM_WINDOW_SLAB_ROWS, W * sizeof(float)));
@@ -200,7 +446,7 @@ extern "C" __global__ void indexer_select_score(SEISMIC_KERNEL_PARAMS) {
         block_spans(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_VISIBLE)), row, seismic_words_value);
     const int own = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_DESTINATIONS))
         [row * SEISMIC_BLOCK_DESTINATIONS_STRIDE_0];
-    const u32 complete = blocks.rows() + (own >= 0 ? 1u : 0u);
+    const u32 complete = blocks.rows(lane) + (own >= 0 ? 1u : 0u);
     const u32 first = blockIdx.x * 256u;
     if (first >= complete) return;
     const Storage *query = reinterpret_cast<const Storage *>(SEISMIC_PTR(SEISMIC_BUFFER_QUERY));
@@ -231,8 +477,9 @@ extern "C" __global__ void indexer_select_score(SEISMIC_KERNEL_PARAMS) {
     const float root = sqrtf(static_cast<float>(W));
     const u32 begin = first + static_cast<u32>(warp) * 32u;
     const u32 last = min(min(first + 256u, complete), begin + 32u);
+    Cursor cursor(blocks, begin, lane);
     for (u32 block = begin; block < last; ++block) {
-        const int at = blocks.row(block, own);
+        const int at = cursor.row(block, own);
         const float *k = reinterpret_cast<const float *>(
             slab::row(block_keys, static_cast<u64>(at), SEISMIC_PARAM_BLOCK_SLAB_ROWS, W * sizeof(float)));
         float kx[E];
@@ -252,157 +499,41 @@ extern "C" __global__ void indexer_select_score(SEISMIC_KERNEL_PARAMS) {
     }
 }
 
+
 extern "C" __global__ void indexer_select_select(SEISMIC_KERNEL_PARAMS) {
     using namespace indexer;
-    constexpr u32 THREADS = 256;
-    __shared__ u32 histogram[256];
-    __shared__ u32 counts[THREADS];
-    __shared__ u32 state[2];
+    extern __shared__ u32 select_shared[];
+    u32 *bins = select_shared;          // [256]
+    u32 *partials = bins + 256;         // [8]: the scans' warp sums
+    u32 *state = partials + 8;          // [4]
     const u64 row = blockIdx.x;
-    const u32 thread = threadIdx.x;
+    const int lane = static_cast<int>(threadIdx.x % 32);
     const Spans blocks =
         block_spans(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_VISIBLE)), row, seismic_words_value);
     const int own = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_DESTINATIONS))
         [row * SEISMIC_BLOCK_DESTINATIONS_STRIDE_0];
-    const u32 complete = blocks.rows() + (own >= 0 ? 1u : 0u);
-    const u32 written = bitmap_words(seismic_words_value);
+    const u32 complete = blocks.rows(lane) + (own >= 0 ? 1u : 0u);
+    const u32 words = bitmap_words(seismic_words_value);
     u32 *bitmap = reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER)) + row * SEISMIC_RESULT_1_STRIDE_0;
-    const u32 *bits = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SCORES)) +
-                      row * 32 * SEISMIC_DIM_B;
     const int requested = static_cast<int>(static_cast<u32>(SEISMIC_PARAM_SELECTED));
     const u32 selected = requested > 0 ? static_cast<u32>(requested) : 0u;
     if (complete <= selected) {
-        for (u32 word = thread; word < written; word += THREADS) bitmap[word] = 0xffffffffu;
-        return;
+        for (u32 word = threadIdx.x; word < words; word += THREADS) bitmap[word] = 0xffffffffu;
+    } else {
+        mark(reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SCORES)) + row * 32 * SEISMIC_DIM_B,
+             complete, selected, bitmap, words, bins, partials, state);
     }
-    if (thread == 0) {
-        state[0] = 0;
-        state[1] = selected;
-    }
-    u32 mask = 0;
-    for (int digit = 3; digit >= 0; --digit) {
-        for (u32 bin = thread; bin < 256; bin += THREADS) histogram[bin] = 0;
-        __syncthreads();
-        const u32 prefix = state[0];
-        const u32 shift = static_cast<u32>(digit) * 8u;
-        for (u32 block = thread; block < complete; block += THREADS) {
-            const u32 u = bits[block];
-            if ((u & mask) == prefix) atomicAdd(&histogram[(u >> shift) & 255u], 1u);
-        }
-        __syncthreads();
-        if (thread == 0) {
-            u32 remaining = state[1];
-            u32 value = 0;
-            for (int bin = 255; bin >= 0; --bin) {
-                const u32 count = histogram[bin];
-                if (count >= remaining) {
-                    value = static_cast<u32>(bin);
-                    break;
-                }
-                remaining -= count;
-            }
-            state[0] = prefix | (value << shift);
-            state[1] = remaining;
-        }
-        mask |= 255u << shift;
-        __syncthreads();
-    }
-    const u32 threshold = state[0];
-    const u32 take = state[1];
-    const u32 per = (written + THREADS - 1) / THREADS;
-    const u32 word_lo = min(thread * per, written);
-    const u32 word_hi = min(word_lo + per, written);
-    u32 equal = 0;
-    for (u32 block = word_lo * 32; block < min(word_hi * 32, complete); ++block) equal += bits[block] == threshold;
-    counts[thread] = equal;
-    __syncthreads();
-    u32 rank = 0;
-    for (u32 other = 0; other < thread; ++other) rank += counts[other];
-    for (u32 word = word_lo; word < word_hi; ++word) {
-        u32 value = 0;
-        for (u32 bit = 0; bit < 32; ++bit) {
-            const u32 block = word * 32 + bit;
-            bool read = block >= complete;
-            if (!read) {
-                const u32 u = bits[block];
-                if (u > threshold) {
-                    read = true;
-                } else if (u == threshold) {
-                    read = rank < take;
-                    ++rank;
-                }
-            }
-            value |= read ? (1u << bit) : 0u;
-        }
-        bitmap[word] = value;
-    }
-}
-
-extern "C" __global__ void indexer_select_segments(SEISMIC_KERNEL_PARAMS) {
-    using namespace indexer;
-    const u64 row = blockIdx.x;
-    const int lane = threadIdx.x % 32;
+    const u32 capacity = static_cast<u32>(SEISMIC_DIM_C);
+    if (capacity == 0) return;
     // The row's keys in its R visible spans (its fresh rows, its tail,
-    // attention reads itself).
-    const Spans keys{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE)) +
-                         row * SEISMIC_VISIBLE_STRIDE_0,
+    // attention reads itself), read where the bitmap this block wrote marks
+    // their blocks.
+    __syncthreads();
+    const Spans keys{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE)) + row * SEISMIC_VISIBLE_STRIDE_0,
                      SEISMIC_DIM_R, SEISMIC_VISIBLE_STRIDE_1, SEISMIC_VISIBLE_STRIDE_2};
-    auto bound = [&](u64 span, int which) {
-        return span < keys.count ? keys.spans[span * keys.span_stride + which * keys.bound_stride] : 0;
-    };
-    int *segments = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
-    const u32 words = bitmap_words(seismic_words_value);
-    const u32 *bitmap = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER)) + row * SEISMIC_RESULT_1_STRIDE_0;
-    const u32 c = static_cast<u32>(SEISMIC_DIM_C);
-    const int slab_rows = static_cast<int>(SEISMIC_PARAM_SLAB_ROWS);
-    auto store = [&](u32 entry, int start, int end) {
-        const u64 at = row * SEISMIC_RESULT_0_STRIDE_0 + entry * SEISMIC_RESULT_0_STRIDE_1;
-        segments[at] = start;
-        segments[at + SEISMIC_RESULT_0_STRIDE_2] = end;
-    };
-    const u32 total = keys.rows();
-    u32 count = 0;
-    int start = 0, end = 0;
-    bool open = false;
-    u32 last_key = 0;
-    u64 span = 0;
-    u32 span_first = 0;
-    int span_lo = bound(0, 0);
-    int span_hi = bound(0, 1);
-    const u32 last_word = min(words, (total + 32u * SB - 1) / (32u * SB));
-    for (u32 base = 0; base < last_word; base += 32) {
-        const u32 word_index = base + lane;
-        const u32 word = word_index < last_word ? bitmap[word_index] : 0u;
-        for (u32 pending = __ballot_sync(0xffffffffu, word != 0u); pending != 0u; pending &= pending - 1u) {
-            const int at = __ffs(pending) - 1;
-            const u32 value = __shfl_sync(0xffffffffu, word, at);
-            if (lane != 0) continue;
-            for (u32 bit = 0; bit < 32; ++bit) {
-                if ((value & (1u << bit)) == 0u) continue;
-                const u32 block = (base + at) * 32 + bit;
-                for (u32 key = block * SB; key < min((block + 1) * SB, total); ++key) {
-                    while (key >= span_first + static_cast<u32>(max(span_hi - span_lo, 0))) {
-                        span_first += static_cast<u32>(max(span_hi - span_lo, 0));
-                        ++span;
-                        span_lo = bound(span, 0);
-                        span_hi = bound(span, 1);
-                    }
-                    const int stored = span_lo + static_cast<int>(key - span_first);
-                    if (open && key == last_key + 1 && stored == end && stored % slab_rows != 0) {
-                        ++end;
-                    } else {
-                        if (open && count < c) store(count++, start, end);
-                        open = true;
-                        start = stored;
-                        end = stored + 1;
-                    }
-                    last_key = key;
-                }
-            }
-        }
-    }
-    if (lane == 0) {
-        if (open && count < c) store(count++, start, end);
-        for (; count < c; ++count) store(count, 0, 0);
-    }
+    emit(keys, bitmap, words,
+         Runs{reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + row * SEISMIC_RESULT_0_STRIDE_0,
+              SEISMIC_RESULT_0_STRIDE_1, SEISMIC_RESULT_0_STRIDE_2, capacity},
+         static_cast<int>(SEISMIC_PARAM_SLAB_ROWS), partials,
+         reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SPANS)) + row * (SEISMIC_DIM_R + 1));
 }

@@ -1065,9 +1065,9 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     };
     // A WorkList's key tiles are its query tile's listed ones.
     const bool listing = selection.words > 0;
-    int total_tiles = 0;
-    for (int index = 0; index <= spans; ++index) total_tiles += span_tiles(index);
-    if (listing) total_tiles = static_cast<int>(selection.listed[block.tile]);
+    const int total_tiles = listing
+        ? static_cast<int>(selection.listed[block.tile])
+        : static_cast<int>(reduce::span_total(static_cast<u64>(spans) + 1, span_tiles, lane));
     const int parts = block.parts;
     const int per = max(Rows::MIN_TILES, (total_tiles + parts - 1) / parts);
     const int active = max(1, (total_tiles + per - 1) / per);
@@ -1080,19 +1080,18 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     rows.partitioned(block, active);
     const int tiles_lo = partition * per;
     const int count = max(0, min(per, total_tiles - tiles_lo));
-    // Tile `index` of the query tile's sequence.
+    // Tile `index` of the query tile's sequence (`reduce::span_locate` over
+    // the span tiles; the whole warp calls it).
     auto nth = [&](int index) {
         if (listing) {
             if (index >= total_tiles) return Tile{spans + 1, 0, index};
             const int *entry = selection.lists + (static_cast<long long>(block.tile) * selection.capacity + index) * 2;
             return Tile{entry[0], entry[1], index};
         }
-        for (int span = 0; span <= spans; ++span) {
-            const int n = span_tiles(span);
-            if (index < n) return Tile{span, table[span * 4 + 0] + index * KEYS};
-            index -= n;
-        }
-        return Tile{spans + 1, 0};
+        const reduce::Located at = reduce::span_locate(static_cast<u64>(spans) + 1, index, span_tiles, lane);
+        const int span = static_cast<int>(at.span);
+        if (span > spans) return Tile{spans + 1, 0};
+        return Tile{span, table[span * 4 + 0] + (index - static_cast<int>(at.offset)) * KEYS};
     };
     // Fresh tile `tile` into operand stage b (the keys' piece, and with the
     // last piece the values' window from column0), by `threads` threads of

@@ -413,28 +413,61 @@ inline tile_interval tile_span(device const int *visible, device const int *fres
     return interval;
 }
 
+// The span table is walked cooperatively: every lane of a simdgroup calls
+// these together, each taking the spans lane, lane + 32, ..., so a table of
+// R spans (a selected read's decode rows see hundreds of runs) costs R / 32
+// loads a lane rather than a serial walk.
+
 // The keys a decode row tile sees: its spans' unions.
 inline uint tile_total(device const int *visible, device const int *fresh, ulong row0, uint tokens, ulong rows,
-    ulong spans) {
+    ulong spans, uint lane) {
     uint total = 0;
-    for (ulong index = 0; index <= spans; ++index) {
+    for (ulong index = lane; index <= spans; index += 32) {
         const tile_interval interval = tile_span(visible, fresh, row0, tokens, rows, spans, index);
         total += uint(interval.hi - interval.lo);
     }
-    return total;
+    return simd_sum(total);
+}
+
+// Where key `key` of a decode row tile's key sequence lies: the first span
+// whose keys reach past it and the keys before that span. Past the last key,
+// span spans + 1 and the tile's key count.
+struct span_start {
+    ulong span;
+    uint offset;
+};
+inline span_start tile_locate(device const int *visible, device const int *fresh, ulong row0, uint tokens,
+    ulong rows, ulong spans, uint key, uint lane) {
+    uint offset = 0;
+    for (ulong base = 0; base <= spans; base += 32) {
+        const ulong index = base + lane;
+        uint length = 0;
+        if (index <= spans) {
+            const tile_interval interval = tile_span(visible, fresh, row0, tokens, rows, spans, index);
+            length = uint(interval.hi - interval.lo);
+        }
+        const uint before = offset + simd_prefix_exclusive_sum(length);
+        const uint hits = uint(uint64_t(simd_ballot(index <= spans && key < before + length)));
+        if (hits != 0) {
+            const uint at = metal::ctz(hits);
+            return span_start{base + at, simd_shuffle(before, ushort(at))};
+        }
+        offset += simd_sum(length);
+    }
+    return span_start{spans + 1, offset};
 }
 
 // The KEYS-key tiles of a decode row tile's keys [first, last) (its spans'
 // unions, in `form_span` order): each span's part of the range is tiled
 // separately.
 inline uint form_tiles(device const int *visible, device const int *fresh, ulong row0, uint tokens, ulong rows,
-    ulong spans, uint first, uint last, uint keys) {
+    ulong spans, uint first, uint last, uint keys, uint lane) {
     uint tiles = 0;
-    uint offset = 0;
-    for (ulong index = 0; index <= spans && offset < last; ++index) {
+    const span_start start = tile_locate(visible, fresh, row0, tokens, rows, spans, first, lane);
+    uint offset = start.offset;
+    for (ulong index = start.span; index <= spans && offset < last; ++index) {
         const tile_interval interval = tile_span(visible, fresh, row0, tokens, rows, spans, index);
-        const int lo = interval.lo, hi = interval.hi;
-        const uint length = uint(metal::max(hi - lo, 0));
+        const uint length = uint(metal::max(interval.hi - interval.lo, 0));
         const uint begin = metal::max(first, offset);
         const uint end = metal::min(last, offset + length);
         if (begin < end)
@@ -445,14 +478,14 @@ inline uint form_tiles(device const int *visible, device const int *fresh, ulong
 }
 
 // The total number of keys a row sees under `form_span`.
-inline uint form_total(device const int *visible, device const int *fresh, ulong row, ulong spans) {
-    uint total = 0;
-    for (ulong index = 0; index <= spans; ++index) {
-        int lo, hi;
-        form_span(visible, fresh, row, spans, index, lo, hi);
-        total += uint(metal::max(hi - lo, 0));
-    }
-    return total;
+inline uint form_total(device const int *visible, device const int *fresh, ulong row, ulong spans, uint lane) {
+    return tile_total(visible, fresh, row, 1, row + 1, spans, lane);
+}
+
+// Where key `key` of a row's keys under `form_span` lies (`tile_locate`).
+inline span_start form_locate(device const int *visible, device const int *fresh, ulong row, ulong spans, uint key,
+    uint lane) {
+    return tile_locate(visible, fresh, row, 1, row + 1, spans, key, lane);
 }
 
 // One attended column of query head `head` of `row` times its gate: value
@@ -492,7 +525,7 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
     // The partitions of the row's tile (TOKENS of the launch's `rows` in the
     // matrix form; one row otherwise).
     const ulong row0 = row / TOKENS * TOKENS;
-    const uint total = tile_total(visible, fresh, row0, TOKENS, rows, spans);
+    const uint total = tile_total(visible, fresh, row0, TOKENS, rows, spans, lane);
     const uint span_keys = partition_span(total, SPAN, PARTS);
     const uint active = (total + span_keys - 1) / span_keys;
     const ulong first = (row * KV * G + head) * PARTS;
@@ -3416,7 +3449,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     // sequence is its spans' unions, a row's keys outside its own interval
     // masked.
     const ulong row0 = tile * TOKENS;
-    const uint total = tile_total(visible, fresh, row0, TOKENS, rows, R);
+    const uint total = tile_total(visible, fresh, row0, TOKENS, rows, R, lane);
     const uint span_keys = partition_span(total, span_min, PARTS);
     const uint partition_lo = partition * span_keys;
     if (partition_lo >= total)
@@ -3710,8 +3743,9 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     };
 
     if (COLS == 1 || TEAMS == 1) {
-        uint offset = 0;
-        for (ulong span = 0; span <= R && offset < last; ++span) {
+        const span_start start = tile_locate(visible, fresh, row0, TOKENS, rows, R, first, lane);
+        uint offset = start.offset;
+        for (ulong span = start.span; span <= R && offset < last; ++span) {
             const tile_interval interval = tile_span(visible, fresh, row0, TOKENS, rows, R, span);
             const uint length = uint(interval.hi - interval.lo);
             const uint begin = metal::max(first, offset);
@@ -3733,13 +3767,14 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         for (uint t = 0; t < TEAMS; ++t) {
             const uint team_first = metal::min(partition_lo + t * sub, partition_hi);
             rounds = metal::max(rounds, form_tiles(visible, fresh, row0, TOKENS, rows, R, team_first,
-                metal::min(team_first + sub, partition_hi), KEYS));
+                metal::min(team_first + sub, partition_hi), KEYS, lane));
         }
         // The walk: span `span` (the tile's union `interval`, `length` keys
         // at key offset `offset`), its part [position, end) of the team's
         // range still to tile.
-        ulong span = 0;
-        uint offset = 0;
+        const span_start start = tile_locate(visible, fresh, row0, TOKENS, rows, R, first, lane);
+        ulong span = start.span;
+        uint offset = start.offset;
         uint length = 0;
         tile_interval interval{0, 0, 0, 0};
         uint position = 0;

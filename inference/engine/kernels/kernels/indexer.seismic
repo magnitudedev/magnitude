@@ -219,15 +219,24 @@ fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
 # Metal, CUDA and Vulkan: `append` (a threadgroup per row), `complete` (a
 # simdgroup per row that completes a block), then in a class that scores
 # `score` (a threadgroup per 256 blocks of a row, the row's query heads
-# prepared in threadgroup memory, a simdgroup per 32 blocks), `select` (a
-# threadgroup per row: a radix select over the scores' bits, which order as
-# the non-negative scores do, then the marking in block order) and, for
-# Segments, `segments` (a simdgroup per row walking the marked blocks).
-# Scratch: the scores of every row's complete blocks.
+# prepared in threadgroup memory, a simdgroup per 32 blocks) and `select` (a
+# threadgroup of 256 threads per row). `select` finds the K-th best score by
+# a radix select over the scores' bits (which order as the non-negative
+# scores do): each pass's histogram takes one atomic per distinct digit of a
+# simdgroup, and the digit is found by a parallel scan of the bins. It marks
+# the bitmap in block order (the equal scores ranked by a scan of each
+# thread's count), then, for Segments, emits the runs: the row's span
+# offsets are scanned into scratch, each thread counts the runs starting in
+# its share of the keys, and a scan of the counts places each run.
+# Threadgroup memory: the bins [256], the scans' 8 simdgroup sums and the
+# select state [4].
+# Scratch: the scores of every row's complete blocks and, for Segments, each
+# row's span offsets [R + 1].
 native indexer_select for metal from "metal/indexer_select.metal":
     static (H, P, S, SB)
     where (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and H <= 8
     scratch scores bytes (M * 32 * B * 4) when B > 0
+    scratch spans bytes (M * (R + 1) * 4) when C > 0
     launch indexer_select_append:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (128, 1, 1)
@@ -241,15 +250,13 @@ native indexer_select for metal from "metal/indexer_select.metal":
     launch indexer_select_select when B > 0:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((256 + 256 + 2) * 4)
-    launch indexer_select_segments when C > 0:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (32, 1, 1)
+        shared_bytes ((256 + 8 + 4) * 4)
 
 native indexer_select for cuda from "cuda/indexer_select.cu":
     static (H, P, S, SB)
     where (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and H <= 8
     scratch scores bytes (M * 32 * B * 4) when B > 0
+    scratch spans bytes (M * (R + 1) * 4) when C > 0
     launch indexer_select_append:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (128, 1, 1)
@@ -263,14 +270,13 @@ native indexer_select for cuda from "cuda/indexer_select.cu":
     launch indexer_select_select when B > 0:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-    launch indexer_select_segments when C > 0:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (32, 1, 1)
+        shared_bytes ((256 + 8 + 4) * 4)
 
 native indexer_select for vulkan from "vulkan/indexer_select.comp":
     static (H, P, S, SB)
     where (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and H <= 8
     scratch scores bytes (M * 32 * B * 4) when B > 0
+    scratch spans bytes (M * (R + 1) * 4) when C > 0
     launch indexer_select_append:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (128, 1, 1)
@@ -284,10 +290,7 @@ native indexer_select for vulkan from "vulkan/indexer_select.comp":
     launch indexer_select_select when B > 0:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
-        shared_bytes ((256 + 256 + 2) * 4)
-    launch indexer_select_segments when C > 0:
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (32, 1, 1)
+        shared_bytes ((256 + 8 + 4) * 4)
 
 # CPU: `append` and `complete` per row, then `select` per row (prepare,
 # score, select, emit) in a class that scores.

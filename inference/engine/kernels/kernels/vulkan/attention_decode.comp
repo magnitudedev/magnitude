@@ -154,8 +154,10 @@ void attention_decode_partial() {
 
     const uvec2 range = attention_key_range(partition_lo, partition_hi, attention_key_group(sg));
     const uint first = range.x, last = range.y;
-    uint offset = 0u;
-    for (uint64_t span = 0ul; span <= spans && offset < last; ++span) {
+    // The walk starts on the span holding the group's first key.
+    const uvec2 located = attention_locate(visible, fresh, row, spans, first);
+    uint offset = located.y;
+    for (uint64_t span = located.x; span <= spans && offset < last; ++span) {
         const bool historical = span < spans;
         int lo, hi;
         attention_span(visible, fresh, row, spans, span, lo, hi);

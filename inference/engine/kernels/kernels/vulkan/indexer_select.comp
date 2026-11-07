@@ -7,17 +7,26 @@
 //           raw keys (F32, members in order: the last SB - 1 rows of its
 //           window spans, then its own), RMS-normed and rotated at the
 //           coordinates stored with the first, stored in the F32 block plane.
+//           The span of the first member is located by a subgroup scan of
+//           the span extents, and a cursor walks on from it.
 // score:    workgroup per (tile of 8 * 32 blocks, row); the query heads
-//           prepared once into group memory, each subgroup scores 32 blocks.
-// select:   workgroup per row; radix select over the scores' bits finds the
-//           K-th best score T, blocks above T and the first equal ones in
-//           block order are marked, with every block from the tail on, as
-//           the row's bitmap.
-// segments: one subgroup per row (C > 0); lane 0 maps the marked blocks'
-//           keys through the row's spans, as runs within slabs.
+//           prepared once into group memory, each subgroup scores 32 blocks
+//           from the block span holding its first, located the same way.
+// select:   workgroup of 256 invocations per row. A radix select over the
+//           scores' bits (4 passes of 8 bits) finds the K-th best score T:
+//           each pass's histogram takes one atomic per distinct digit of a
+//           subgroup, and the digit is the bin whose workgroup scan of the
+//           counts above it brackets the remaining rank. Blocks above T and
+//           the first equal ones in block order (ranked by a scan of each
+//           invocation's equal count) are marked, with every block from the
+//           tail on, as the row's bitmap. With C > 0 it then emits the runs:
+//           the row's span offsets are scanned into scratch, each
+//           invocation counts the runs starting in its share of the keys, and
+//           a scan of the counts places each run.
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
 #include "lib/core/activation.glsl"
+#include "lib/core/reduce.glsl"
 #include "lib/core/rotary.glsl"
 
 #define INDEXER_W uint(2ul * SEISMIC_DIM_P + SEISMIC_DIM_S)
@@ -71,30 +80,58 @@ void indexer_norm_rotary(inout float x[INDEXER_E], uint64_t norm, uint64_t coord
     }
 }
 
-// The rows of `count` [lo, hi) spans at `spans`, in order.
-uint indexer_span_rows(uint64_t spans, uint64_t count) {
-    uint total = 0u;
-    for (uint64_t span = 0ul; span < count; ++span) {
-        const int lo = element_i32_at(spans + span * 8ul);
-        const int hi = element_i32_at(spans + span * 8ul + 4ul);
-        total += hi > lo ? uint(hi - lo) : 0u;
-    }
-    return total;
+// The rows of [lo, hi) span `span` at `spans` (none past `count`).
+uint indexer_span_extent(uint64_t spans, uint64_t count, uint64_t span) {
+    if (span >= count)
+        return 0u;
+    const int lo = element_i32_at(spans + span * 8ul);
+    const int hi = element_i32_at(spans + span * 8ul + 4ul);
+    return hi > lo ? uint(hi - lo) : 0u;
 }
 
-// The physical row of row `ordinal` of those spans, then of `own` (the
-// row's own, after them).
-int indexer_span_row(uint64_t spans, uint64_t count, uint ordinal, int own) {
-    uint before = 0u;
-    for (uint64_t span = 0ul; span < count; ++span) {
-        const int lo = element_i32_at(spans + span * 8ul);
-        const int hi = element_i32_at(spans + span * 8ul + 4ul);
-        const uint extent = hi > lo ? uint(hi - lo) : 0u;
-        if (ordinal < before + extent)
-            return lo + int(ordinal - before);
-        before += extent;
+// The rows of `count` spans at `spans`. Lane l sums spans l, l + 32, ...; the
+// whole subgroup calls it.
+uint indexer_span_rows(uint64_t spans, uint64_t count) {
+    uint total = 0u;
+    for (uint64_t span = SEISMIC_LANE; span < count; span += 32ul)
+        total += indexer_span_extent(spans, count, span);
+    return seismic_subgroup_add(total);
+}
+
+// A position in the rows of `count` spans, in order: span `span` (`count`
+// past them), its first ordinal, its first row and its rows.
+struct indexer_cursor {
+    uint64_t span;
+    uint first;
+    int lo;
+    uint extent;
+};
+
+// The cursor on the span holding row `ordinal` of those spans (past them
+// when there is none). The whole subgroup calls it, 32 spans at a time.
+indexer_cursor indexer_locate(uint64_t spans, uint64_t count, uint ordinal) {
+    uint carried = 0u;
+    for (uint64_t base = 0ul; base < count; base += 32ul) {
+        uint found;
+        if (reduce_lanes_locate(indexer_span_extent(spans, count, base + SEISMIC_LANE), ordinal, carried, found)) {
+            const uint64_t span = base + found;
+            return indexer_cursor(span, carried, element_i32_at(spans + span * 8ul),
+                indexer_span_extent(spans, count, span));
+        }
     }
-    return own;
+    return indexer_cursor(count, carried, 0, 0u);
+}
+
+// The physical row of row `ordinal` of those spans, then of `own` (the row's
+// own, after them), advancing `cursor` to it; ordinals never decrease.
+int indexer_span_row(uint64_t spans, uint64_t count, inout indexer_cursor cursor, uint ordinal, int own) {
+    while (cursor.span < count && ordinal >= cursor.first + cursor.extent) {
+        cursor.first += cursor.extent;
+        ++cursor.span;
+        cursor.lo = cursor.span < count ? element_i32_at(spans + cursor.span * 8ul) : 0;
+        cursor.extent = indexer_span_extent(spans, count, cursor.span);
+    }
+    return cursor.span < count ? cursor.lo + int(ordinal - cursor.first) : own;
 }
 
 // Row `row`'s block spans, and its own block (or -1).
@@ -106,20 +143,15 @@ int indexer_own_block(uint64_t row) {
     return element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_DESTINATIONS) + row * 4ul);
 }
 
-// Row `row`'s complete blocks: those of its block spans, then its own.
+// Row `row`'s complete blocks: those of its block spans, then its own. The
+// whole subgroup calls it.
 uint indexer_complete(uint64_t row) {
     return indexer_span_rows(indexer_block_spans(row), SEISMIC_DIM_R) + (indexer_own_block(row) >= 0 ? 1u : 0u);
 }
 
-int indexer_block_row(uint64_t row, uint block) {
-    return indexer_span_row(indexer_block_spans(row), SEISMIC_DIM_R, block, indexer_own_block(row));
-}
-
-// Bound `bound` of row `row`'s visible span `span` (0 past the R spans).
-int indexer_key_bound(uint64_t row, uint64_t span, uint bound) {
-    if (span < SEISMIC_DIM_R)
-        return element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE) + ((row * SEISMIC_DIM_R + span) * 2ul + bound) * 4ul);
-    return 0;
+// Row `row`'s visible spans.
+uint64_t indexer_key_spans(uint64_t row) {
+    return SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE) + row * SEISMIC_DIM_R * 8ul;
 }
 
 void indexer_select_append() {
@@ -152,12 +184,14 @@ void indexer_select_complete() {
     const int own = element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW_DESTINATIONS) + row * 4ul);
     const uint earlier = indexer_span_rows(spans, SEISMIC_DIM_R);
     const uint skipped = earlier > INDEXER_SB - 1u ? earlier - (INDEXER_SB - 1u) : 0u;
+    indexer_cursor cursor = indexer_locate(spans, SEISMIC_DIM_R, skipped);
     int first_member = own;
     float sum[INDEXER_E];
     [[unroll]] for (uint i = 0u; i < INDEXER_E; ++i)
         sum[i] = 0.0;
     for (uint member = 0u; member < INDEXER_SB; ++member) {
-        const int at = member + 1u < INDEXER_SB ? indexer_span_row(spans, SEISMIC_DIM_R, skipped + member, own) : own;
+        const int at =
+            member + 1u < INDEXER_SB ? indexer_span_row(spans, SEISMIC_DIM_R, cursor, skipped + member, own) : own;
         if (member == 0u)
             first_member = at;
         const uint64_t raw = slab_row(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW_KEYS), uint(at),
@@ -201,8 +235,14 @@ void indexer_select_score() {
     const float root = sqrt(float(INDEXER_W));
     const uint begin = first + simd * 32u;
     const uint last = min(min(first + 256u, complete), begin + 32u);
+    if (begin >= last)
+        return;
+    // The subgroup's blocks from the block span holding its first.
+    const uint64_t spans = indexer_block_spans(row);
+    const int own = indexer_own_block(row);
+    indexer_cursor cursor = indexer_locate(spans, SEISMIC_DIM_R, begin);
     for (uint block = begin; block < last; ++block) {
-        const int at = indexer_block_row(row, block);
+        const int at = indexer_span_row(spans, SEISMIC_DIM_R, cursor, block, own);
         const uint64_t k = slab_row(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_KEYS), uint(at),
             uint(SEISMIC_PARAM_BLOCK_SLAB_ROWS), INDEXER_KEY_BYTES);
         float kx[INDEXER_E];
@@ -223,157 +263,228 @@ void indexer_select_score() {
     }
 }
 
-// Shared u32: [0, 256) histogram, [256, 256 + threads) per-thread equal
-// counts, then (prefix, remaining).
+// The select workgroup's invocations and its group memory (u32 offsets): the
+// histogram bins [256], the scan words [8] (the subgroup totals of each
+// workgroup scan) and the select state [4] (prefix, remaining).
+#define INDEXER_THREADS 256u
+
+// The row's span offsets [R + 1] in scratch: the keys before each span, then
+// the row's.
+uint indexer_offset(uint64_t row, uint span) {
+    return element_u32_at(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SPANS) + (row * (SEISMIC_DIM_R + 1ul) + span) * 4ul);
+}
+void indexer_set_offset(uint64_t row, uint span, uint value) {
+    element_u32_put(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SPANS) + (row * (SEISMIC_DIM_R + 1ul) + span) * 4ul, value);
+}
+#define INDEXER_BINS 0u
+#define INDEXER_SCAN 256u
+#define INDEXER_STATE 264u
+
+// Run `index` of row `row`'s segments gets bound `bound` (start or end) when
+// it is one of the C.
+void indexer_put_bound(uint64_t row, int index, uint bound, int value) {
+    if (index >= 0 && index < int(SEISMIC_DIM_C))
+        element_i32_put(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)
+            + ((row * SEISMIC_DIM_C + uint64_t(index)) * 2ul + bound) * 4ul, value);
+}
+
+// The runs of row `row`'s read keys starting in keys [k0, k1) of its `total`
+// (keys in span order, the span offsets in scratch). Key k is read when
+// its block k / SB is marked in `bitmap` or lies past its 32 B blocks, and is
+// stored at its span's first row plus its place in the span. A run starts at
+// a read key unless the previous key is read, stored one row before it, and
+// the key does not start a slab. Returns the runs starting in the keys; with `emit`,
+// writes them from index `opened` + 1 (`opened` is the run open at k0, begun
+// before it): each start at its run's first key, each end at its last, which
+// the next key (read beyond k1 when it exists) decides.
+uint indexer_runs(uint64_t row, uint64_t bitmap, uint total, uint k0, uint k1, const bool emit, int opened) {
+    if (k0 >= k1)
+        return 0u;
+    const uint r = uint(SEISMIC_DIM_R);
+    const uint slab_rows = uint(SEISMIC_PARAM_SLAB_ROWS);
+    const uint64_t spans = indexer_key_spans(row);
+    // The span holding the key before k0 (or k0 itself), found by bisection
+    // as the last span whose offset is at most it: a non-empty span.
+    const uint kstart = k0 > 0u ? k0 - 1u : 0u;
+    uint span = 0u;
+    for (uint high = r - 1u; span < high;) {
+        const uint middle = (span + high + 1u) / 2u;
+        if (indexer_offset(row, middle) <= kstart)
+            span = middle;
+        else
+            high = middle - 1u;
+    }
+    uint span_first = indexer_offset(row, span);
+    uint span_next = indexer_offset(row, span + 1u);
+    int span_lo = element_i32_at(spans + uint64_t(span) * 8ul);
+    uint block = 0xffffffffu;
+    bool block_read = false;
+    bool previous_read = false;
+    int previous_stored = 0;
+    uint starts = 0u;
+    int index = opened;
+    const uint kend = min(k1 + 1u, total);
+    for (uint k = kstart; k < kend; ++k) {
+        if (k / INDEXER_SB != block) {
+            block = k / INDEXER_SB;
+            block_read = block >= uint(INDEXER_BLOCKS)
+                || ((element_u32_at(bitmap + uint64_t(block / 32u) * 4ul) >> (block % 32u)) & 1u) != 0u;
+        }
+        if (!block_read) {
+            // The run through the previous key ends there; the block's other
+            // keys are unread too.
+            if (emit && k > k0 && previous_read)
+                indexer_put_bound(row, index, 1u, previous_stored + 1);
+            previous_read = false;
+            k = min((block + 1u) * INDEXER_SB, kend) - 1u;
+            continue;
+        }
+        while (k >= span_next) {
+            ++span;
+            span_first = span_next;
+            span_next = indexer_offset(row, span + 1u);
+            span_lo = element_i32_at(spans + uint64_t(span) * 8ul);
+        }
+        const int stored = span_lo + int(k - span_first);
+        const bool continues = previous_read && previous_stored + 1 == stored && stored % int(slab_rows) != 0;
+        if (emit && k > k0 && previous_read && !continues)
+            indexer_put_bound(row, index, 1u, previous_stored + 1);
+        if (k >= k0 && k < k1 && !continues) {
+            ++starts;
+            ++index;
+            if (emit)
+                indexer_put_bound(row, index, 0u, stored);
+        }
+        previous_read = true;
+        previous_stored = stored;
+    }
+    // The row's last key ends its run.
+    if (emit && k1 == total && previous_read)
+        indexer_put_bound(row, index, 1u, previous_stored + 1);
+    return starts;
+}
+
 void indexer_select_select() {
-    const uint threads = gl_WorkGroupSize.x;
-    const uint thread = gl_LocalInvocationIndex;
+    const uint thread = SEISMIC_SUBGROUP * 32u + SEISMIC_LANE;
     const uint64_t row = gl_WorkGroupID.x;
     const uint complete = indexer_complete(row);
     const uint written = INDEXER_WORDS;
     const uint64_t bitmap = SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER) + row * uint64_t(written) * 4ul;
     const uint64_t bits = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SCORES) + row * INDEXER_BLOCKS * 4ul;
-    const uint state = 256u + threads;
     const uint selected = uint(max(int(SEISMIC_PARAM_SELECTED), 0));
     if (complete <= selected) {
-        for (uint word = thread; word < written; word += threads)
+        for (uint word = thread; word < written; word += INDEXER_THREADS)
             element_u32_put(bitmap + uint64_t(word) * 4ul, 0xffffffffu);
-        return;
-    }
-    if (thread == 0u) {
-        seismic_shared_u32[state] = 0u;
-        seismic_shared_u32[state + 1u] = selected;
-    }
-    uint mask = 0u;
-    for (int digit = 3; digit >= 0; --digit) {
-        for (uint bin = thread; bin < 256u; bin += threads)
-            seismic_shared_u32[bin] = 0u;
-        barrier();
-        const uint prefix = seismic_shared_u32[state];
-        const uint shift = uint(digit) * 8u;
-        for (uint block = thread; block < complete; block += threads) {
-            const uint u = element_u32_at(bits + uint64_t(block) * 4ul);
-            if ((u & mask) == prefix)
-                atomicAdd(seismic_shared_u32[(u >> shift) & 255u], 1u);
-        }
-        barrier();
+    } else {
         if (thread == 0u) {
-            uint remaining = seismic_shared_u32[state + 1u];
+            seismic_shared_u32[INDEXER_STATE] = 0u;
+            seismic_shared_u32[INDEXER_STATE + 1u] = selected;
+        }
+        uint mask = 0u;
+        for (int digit = 3; digit >= 0; --digit) {
+            seismic_shared_u32[INDEXER_BINS + thread] = 0u;
+            barrier();
+            const uint prefix = seismic_shared_u32[INDEXER_STATE];
+            const uint remaining = seismic_shared_u32[INDEXER_STATE + 1u];
+            const uint shift = uint(digit) * 8u;
+            for (uint base = 0u; base < complete; base += INDEXER_THREADS) {
+                const uint block = base + thread;
+                const uint u = block < complete ? element_u32_at(bits + uint64_t(block) * 4ul) : 0u;
+                bool pending = block < complete && (u & mask) == prefix;
+                const uint value = (u >> shift) & 255u;
+                // One atomic per distinct digit of the subgroup: the first
+                // pending lane's digit, counted over the lanes holding it.
+                for (uint lanes = reduce_lanes_ballot(pending); lanes != 0u; lanes = reduce_lanes_ballot(pending)) {
+                    const uint leader = uint(findLSB(lanes));
+                    const uint chosen = seismic_shuffle(value, leader);
+                    const uint holding = reduce_lanes_ballot(pending && value == chosen);
+                    if (SEISMIC_LANE == leader)
+                        atomicAdd(seismic_shared_u32[INDEXER_BINS + chosen], uint(bitCount(holding)));
+                    pending = pending && value != chosen;
+                }
+            }
+            barrier();
+            // Invocation t takes bin 255 - t: the scan gives the candidates
+            // in the bins above it, and the bin holding the remaining rank
+            // fixes the digit (bin 255 when nothing remains: no score
+            // exceeds the threshold and no equal one is taken).
+            const uint bin = 255u - thread;
+            const uint count = seismic_shared_u32[INDEXER_BINS + bin];
+            uint candidates;
+            const uint above = reduce_group_exclusive_add(count, INDEXER_SCAN, candidates);
+            if (remaining <= above + count && (thread == 0u || above < remaining)) {
+                seismic_shared_u32[INDEXER_STATE] = prefix | (bin << shift);
+                seismic_shared_u32[INDEXER_STATE + 1u] = remaining - above;
+            }
+            mask |= 255u << shift;
+            barrier();
+        }
+        const uint threshold = seismic_shared_u32[INDEXER_STATE];
+        const uint take = seismic_shared_u32[INDEXER_STATE + 1u];
+        // Each invocation marks a run of whole words; the scores equal to the
+        // threshold are taken in block order, ranked by a scan of each
+        // invocation's count.
+        const uint per = (written + INDEXER_THREADS - 1u) / INDEXER_THREADS;
+        const uint word_lo = min(thread * per, written);
+        const uint word_hi = min(word_lo + per, written);
+        uint equals = 0u;
+        for (uint block = word_lo * 32u; block < min(word_hi * 32u, complete); ++block)
+            equals += element_u32_at(bits + uint64_t(block) * 4ul) == threshold ? 1u : 0u;
+        uint all_equal;
+        uint rank = reduce_group_exclusive_add(equals, INDEXER_SCAN, all_equal);
+        for (uint word = word_lo; word < word_hi; ++word) {
             uint value = 0u;
-            for (int bin = 255; bin >= 0; --bin) {
-                const uint count = seismic_shared_u32[uint(bin)];
-                if (count >= remaining) {
-                    value = uint(bin);
-                    break;
-                }
-                remaining -= count;
-            }
-            seismic_shared_u32[state] = prefix | (value << shift);
-            seismic_shared_u32[state + 1u] = remaining;
-        }
-        mask |= 255u << shift;
-        barrier();
-    }
-    const uint threshold = seismic_shared_u32[state];
-    const uint take = seismic_shared_u32[state + 1u];
-    const uint per = (written + threads - 1u) / threads;
-    const uint word_lo = min(thread * per, written);
-    const uint word_hi = min(word_lo + per, written);
-    uint equals = 0u;
-    for (uint block = word_lo * 32u; block < min(word_hi * 32u, complete); ++block)
-        equals += element_u32_at(bits + uint64_t(block) * 4ul) == threshold ? 1u : 0u;
-    seismic_shared_u32[256u + thread] = equals;
-    barrier();
-    uint rank = 0u;
-    for (uint other = 0u; other < thread; ++other)
-        rank += seismic_shared_u32[256u + other];
-    for (uint word = word_lo; word < word_hi; ++word) {
-        uint value = 0u;
-        for (uint bit = 0u; bit < 32u; ++bit) {
-            const uint block = word * 32u + bit;
-            bool read = block >= complete;
-            if (!read) {
-                const uint u = element_u32_at(bits + uint64_t(block) * 4ul);
-                if (u > threshold) {
-                    read = true;
-                } else if (u == threshold) {
-                    read = rank < take;
-                    ++rank;
-                }
-            }
-            value |= read ? (1u << bit) : 0u;
-        }
-        element_u32_put(bitmap + uint64_t(word) * 4ul, value);
-    }
-}
-
-void indexer_select_segments() {
-    if (SEISMIC_LANE != 0u)
-        return;
-    const uint64_t row = gl_WorkGroupID.x;
-    const uint words = INDEXER_WORDS;
-    const uint64_t bitmap = SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER) + row * uint64_t(words) * 4ul;
-    const uint64_t segments = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
-    const uint c = uint(SEISMIC_DIM_C);
-    const uint64_t r = SEISMIC_DIM_R;
-    const int slab_rows = int(SEISMIC_PARAM_SLAB_ROWS);
-    // The row's keys in its R visible spans (its fresh rows, its tail,
-    // attention reads itself).
-    uint total = 0u;
-    for (uint64_t span = 0ul; span < r; ++span) {
-        const int lo = indexer_key_bound(row, span, 0u);
-        const int hi = indexer_key_bound(row, span, 1u);
-        total += hi > lo ? uint(hi - lo) : 0u;
-    }
-    uint count = 0u;
-    int start = 0;
-    int end = 0;
-    bool open = false;
-    uint last_key = 0u;
-    uint64_t span = 0ul;
-    uint span_first = 0u;
-    int span_lo = indexer_key_bound(row, 0ul, 0u);
-    int span_hi = indexer_key_bound(row, 0ul, 1u);
-    const uint last_word = min(words, (total + 32u * INDEXER_SB - 1u) / (32u * INDEXER_SB));
-    for (uint word_index = 0u; word_index < last_word; ++word_index) {
-        const uint value = element_u32_at(bitmap + uint64_t(word_index) * 4ul);
-        if (value == 0u)
-            continue;
-        for (uint bit = 0u; bit < 32u; ++bit) {
-            if ((value & (1u << bit)) == 0u)
-                continue;
-            const uint block = word_index * 32u + bit;
-            for (uint key = block * INDEXER_SB; key < min((block + 1u) * INDEXER_SB, total); ++key) {
-                while (key >= span_first + uint(max(span_hi - span_lo, 0))) {
-                    span_first += uint(max(span_hi - span_lo, 0));
-                    ++span;
-                    span_lo = indexer_key_bound(row, span, 0u);
-                    span_hi = indexer_key_bound(row, span, 1u);
-                }
-                const int stored = span_lo + int(key - span_first);
-                if (open && key == last_key + 1u && stored == end && stored % slab_rows != 0) {
-                    ++end;
-                } else {
-                    if (open && count < c) {
-                        element_i32_put(segments + ((row * uint64_t(c) + count) * 2ul) * 4ul, start);
-                        element_i32_put(segments + ((row * uint64_t(c) + count) * 2ul + 1ul) * 4ul, end);
-                        ++count;
+            for (uint bit = 0u; bit < 32u; ++bit) {
+                const uint block = word * 32u + bit;
+                bool read = block >= complete;
+                if (!read) {
+                    const uint u = element_u32_at(bits + uint64_t(block) * 4ul);
+                    if (u > threshold) {
+                        read = true;
+                    } else if (u == threshold) {
+                        read = rank < take;
+                        ++rank;
                     }
-                    open = true;
-                    start = stored;
-                    end = stored + 1;
                 }
-                last_key = key;
+                value |= read ? (1u << bit) : 0u;
             }
+            element_u32_put(bitmap + uint64_t(word) * 4ul, value);
         }
     }
-    if (open && count < c) {
-        element_i32_put(segments + ((row * uint64_t(c) + count) * 2ul) * 4ul, start);
-        element_i32_put(segments + ((row * uint64_t(c) + count) * 2ul + 1ul) * 4ul, end);
-        ++count;
+    if (SEISMIC_DIM_C == 0ul)
+        return;
+
+    // The runs of the row's keys in its R visible spans (its fresh rows, its
+    // tail, attention reads itself), from the bitmap this workgroup wrote.
+    memoryBarrierBuffer();
+    barrier();
+    const uint r = uint(SEISMIC_DIM_R);
+    const uint64_t spans = indexer_key_spans(row);
+    // The span offsets [R + 1], 256 spans per scan.
+    uint total = 0u;
+    for (uint base = 0u; base < r; base += INDEXER_THREADS) {
+        const uint span = base + thread;
+        uint chunk;
+        const uint before = reduce_group_exclusive_add(indexer_span_extent(spans, r, span), INDEXER_SCAN, chunk);
+        if (span < r)
+            indexer_set_offset(row, span, total + before);
+        total += chunk;
     }
-    for (; count < c; ++count) {
-        element_i32_put(segments + ((row * uint64_t(c) + count) * 2ul) * 4ul, 0);
-        element_i32_put(segments + ((row * uint64_t(c) + count) * 2ul + 1ul) * 4ul, 0);
+    if (thread == 0u)
+        indexer_set_offset(row, r, total);
+    memoryBarrierBuffer();
+    barrier();
+    // Invocation t's share of the keys; the scan of the runs starting in
+    // each share places them.
+    const uint share = (total + INDEXER_THREADS - 1u) / INDEXER_THREADS;
+    const uint k0 = min(thread * share, total);
+    const uint k1 = min(k0 + share, total);
+    uint runs;
+    const uint first_run = reduce_group_exclusive_add(indexer_runs(row, bitmap, total, k0, k1, false, 0), INDEXER_SCAN,
+        runs);
+    indexer_runs(row, bitmap, total, k0, k1, true, int(first_run) - 1);
+    for (uint entry = runs + thread; entry < uint(SEISMIC_DIM_C); entry += INDEXER_THREADS) {
+        indexer_put_bound(row, int(entry), 0u, 0);
+        indexer_put_bound(row, int(entry), 1u, 0);
     }
 }
