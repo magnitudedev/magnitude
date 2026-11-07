@@ -366,6 +366,14 @@ impl StreamedLayers {
         let step = inputs.unhinted(steps.iter().map(|(loads, count)| (loads.as_slice(), *count)));
         StreamedStep { compute_seconds, exposed_seconds: step.total - compute_seconds, total_seconds: step.total }
     }
+
+    /// The seconds a prompt pass of `rows` rows waits on its misses' reads
+    /// holding `held`: the step model's ([`Self::step_seconds`]) at those
+    /// rows, the generic model's misses, with no compute beside them to
+    /// cover them; none where `held` makes the bank whole.
+    pub fn pass_reads(&self, read: ReadLine, held: HeldSlots, rows: f64) -> f64 {
+        self.step_seconds(None, read, held, rows, FormSeconds { resident: 0., streamed: 0. }).total_seconds
+    }
 }
 
 /// What a file miss of a layer of `host`'s lines takes past its read: with no
@@ -425,6 +433,12 @@ impl DecodePrice {
     /// What holding `to` rather than `from` saves a step, in seconds.
     pub fn saving(&self, from: HeldSlots, to: HeldSlots) -> f64 {
         self.step(from).total_seconds - self.step(to).total_seconds
+    }
+
+    /// The seconds a prompt pass of `rows` rows waits on its misses' reads
+    /// holding `held` ([`StreamedLayers::pass_reads`]).
+    pub fn pass_reads(&self, held: HeldSlots, rows: f64) -> f64 {
+        self.layers.pass_reads(self.read, held, rows)
     }
 
     /// The model store's read line its file reads take.

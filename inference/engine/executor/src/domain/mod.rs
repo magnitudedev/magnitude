@@ -624,6 +624,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// owner takes it ([`Self::take_running_release`]): the storage it
     /// resizes and what the process held as it was decided.
     running_release: Option<(crate::planning::BankTier, MemoryMoment)>,
+    /// A prompt group's places' seconds as last priced
+    /// (`serving_heap::PlacesPrompt`); cleared as the load's measures
+    /// change.
+    places_prompt: RefCell<Option<serving_heap::PlacesPrompt>>,
 }
 
 impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
@@ -832,6 +836,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         tracing::info!(costs = measures.costs.as_ref().err().map_or("measured", String::as_str), "the load is priced");
         self.measures = Some(measures);
+        *self.places_prompt.get_mut() = None;
         Ok(())
     }
 
@@ -2710,6 +2715,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             #[cfg(test)]
             refreshes: std::cell::Cell::new(0),
             running_release: None,
+            places_prompt: RefCell::new(None),
         };
         let bindings = StateBindings {
             target: target_state,

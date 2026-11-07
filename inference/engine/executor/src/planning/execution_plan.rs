@@ -684,9 +684,14 @@ impl ExecutionPlanDraft {
         };
         let seconds = |slots: u64| prices.step_seconds(crate::assessment::HeldSlots::bank(slots as usize));
         let rates = prices.rates();
+        // A pass's misses are read at the most the bank and its host tier
+        // can hold: the least a merged pass saves, whatever the settle
+        // grants the bank.
+        let count = |slots: u64| usize::try_from(slots).map_err(|_| PlanError::Arithmetic("a bank's slots exceed usize"));
+        let most = crate::assessment::HeldSlots { slots: count(ceiling)?, host: count(bank.host_ceiling().map_or(0, NonZeroU64::get))? };
         let curves = vec![
             stepped(Holding::Bank(BankHolding::Experts), &points, &reserved, &seconds, rates.decode_steps_per_s)?,
-            super::pass_rows_curve(&ladder, 0, &pass_bytes, &|pass| prices.prompt_seconds(pass), rates.requests_per_s, 0.0),
+            super::pass_rows_curve(&ladder, 0, &pass_bytes, &|pass| prices.prompt_seconds(pass, most), rates.requests_per_s, 0.0),
         ];
         let room = room.room(&floor_charge, mandatory_bytes)?;
         let mut settled = None;
@@ -1607,7 +1612,8 @@ mod tests {
         let Priced::Measured(plan_prices) = &prices else { unreachable!("the prices are measured") };
         let priced = plan_prices.of_bank(planned.draft(), &definition).unwrap();
         let step = |slots: usize| priced.step_seconds(crate::assessment::HeldSlots::bank(slots));
-        let prompt = |launches: usize| priced.prompt_seconds(PassLaunches::new(NonZeroUsize::new(launches).unwrap()));
+        let whole = crate::assessment::HeldSlots::bank(bank.slots as usize);
+        let prompt = |launches: usize| priced.prompt_seconds(PassLaunches::new(NonZeroUsize::new(launches).unwrap()), whole);
         assert_eq!(
             (bank.slots, bank.ceiling),
             (128, 128),
@@ -1630,7 +1636,7 @@ mod tests {
         let Priced::Measured(prices) = &prices else { unreachable!("the prices are measured") };
         let prices = prices.of_bank(planned.draft(), &definition).unwrap();
         assert!(
-            prices.prompt_seconds(bank.pass) <= prices.prompt_seconds(PassLaunches::FLOOR),
+            prices.prompt_seconds(bank.pass, whole) <= prices.prompt_seconds(PassLaunches::FLOOR, whole),
             "{:?}'s prefill is slower than 512-row passes'",
             bank.pass
         );

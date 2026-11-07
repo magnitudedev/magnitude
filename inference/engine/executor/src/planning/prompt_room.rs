@@ -91,8 +91,11 @@ pub(crate) fn places_curve(
 /// `pass` launches of `region_rows` rows each, on the executor's costs
 /// (`pass`, the step model's [`ExpertPass`]): each pass reads, at every
 /// routed layer, the union its rows choose of the layer's `(experts,
-/// selected)` (`estimate::expert_union`), and computes their choices. Fewer,
-/// longer passes read each expert fewer times; generic machine figures and
+/// selected)` (`estimate::expert_union`), and computes their choices; and
+/// it reads from storage the misses of that union a partial bank does not
+/// hold (`reads`, a pass's seconds by its rows; none where the bank holds
+/// every expert). Fewer, longer passes read each expert fewer times, from
+/// the device's memory and from storage alike; generic machine figures and
 /// header shapes only.
 pub(crate) fn routed_prompt_seconds(
     passes: &ExpertPass,
@@ -100,6 +103,7 @@ pub(crate) fn routed_prompt_seconds(
     region_rows: u64,
     prompt_rows: u64,
     pass: PassLaunches,
+    reads: &dyn Fn(u64) -> f64,
 ) -> f64 {
     let pass_rows = region_rows * pass.get() as u64;
     let one = |rows: u64| -> f64 {
@@ -110,7 +114,8 @@ pub(crate) fn routed_prompt_seconds(
                 let union = crate::assessment::estimate::expert_union(experts, selected, rows);
                 passes.seconds(layer, union, (rows * selected) as f64)
             })
-            .sum()
+            .sum::<f64>()
+            + reads(rows)
     };
     let (whole, rest) = (prompt_rows / pass_rows, prompt_rows % pass_rows);
     whole as f64 * one(pass_rows) + if rest > 0 { one(rest) } else { 0.0 }
@@ -132,8 +137,15 @@ pub(crate) fn grouped(chunks: usize, places: usize, group: impl Fn(usize) -> f64
 /// ([`routed_prompt_seconds`]): a pass merges only the launches of one
 /// group, so a group of more places runs fewer passes where the plan's pass
 /// covers more than one launch.
-pub(crate) fn routed_group_seconds(passes: &ExpertPass, layers: &[(u64, u64)], region_rows: u64, steps: usize, pass: PassLaunches) -> f64 {
-    routed_prompt_seconds(passes, layers, region_rows, steps as u64 * region_rows, pass)
+pub(crate) fn routed_group_seconds(
+    passes: &ExpertPass,
+    layers: &[(u64, u64)],
+    region_rows: u64,
+    steps: usize,
+    pass: PassLaunches,
+    reads: &dyn Fn(u64) -> f64,
+) -> f64 {
+    routed_prompt_seconds(passes, layers, region_rows, steps as u64 * region_rows, pass, reads)
 }
 
 #[cfg(test)]

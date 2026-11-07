@@ -142,9 +142,12 @@ impl BankPrices {
         self.layers.step_seconds(None, self.read, held, 1.0, self.compute).total_seconds
     }
 
-    /// The prior's prompt's routed seconds in passes of `pass` launches.
-    pub(crate) fn prompt_seconds(&self, pass: PassLaunches) -> f64 {
-        super::routed_prompt_seconds(&self.pass, &self.routed, self.region_rows, self.prompt_rows, pass)
+    /// The prior's prompt's routed seconds in passes of `pass` launches
+    /// holding `held`: each pass's compute and the reads of its misses
+    /// ([`StreamedLayers::pass_reads`]).
+    pub(crate) fn prompt_seconds(&self, pass: PassLaunches, held: HeldSlots) -> f64 {
+        let reads = |rows: u64| self.layers.pass_reads(self.read, held, rows as f64);
+        super::routed_prompt_seconds(&self.pass, &self.routed, self.region_rows, self.prompt_rows, pass, &reads)
     }
 
     pub(crate) fn rates(&self) -> WorkloadRates {
