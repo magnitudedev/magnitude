@@ -123,6 +123,9 @@ pub struct Reader {
     pub(crate) volume: VolumeReads,
     /// Its requests made and not yet ended ([`Self::outstanding`]).
     outstanding: Arc<std::sync::atomic::AtomicUsize>,
+    /// Its hold on the engine's read buffers while any clone of it lives
+    /// ([`scheduler::Buffers`]).
+    _buffers: Arc<scheduler::Reading>,
 }
 
 impl Reader {
@@ -160,7 +163,12 @@ impl Reader {
         let path: Arc<Path> = source.path().into();
         let volume = VolumeReads::of(file, urgent)?;
         scheduler::deepen(volume.shape.workers())?;
-        Ok(Self { file: Arc::new(SourceFile { path, size: source.size(), through }), volume, outstanding: Arc::default() })
+        Ok(Self {
+            file: Arc::new(SourceFile { path, size: source.size(), through }),
+            volume,
+            outstanding: Arc::default(),
+            _buffers: Arc::new(scheduler::reading()),
+        })
     }
 
     /// Its requests made and not yet ended, as a handle that reads them

@@ -101,6 +101,18 @@ pub(crate) struct Engine {
     pub(crate) buffers: Buffers,
 }
 
+/// The bytes the process's read engine keeps in buffers between pieces:
+/// none once no reader is open ([`Buffers`]).
+pub fn read_buffers() -> u64 {
+    engine().buffers.bytes()
+}
+
+/// A hold on the engine's read buffers for a reader that opens
+/// ([`Buffers::reading`]).
+pub(crate) fn reading() -> Reading {
+    engine().buffers.reading()
+}
+
 /// Start workers until the pool holds `count` ([`Engine::deepen`]).
 pub(crate) fn deepen(count: usize) -> Result<(), Error> {
     engine().deepen(count)
@@ -261,23 +273,95 @@ fn work(engine: &'static Engine, flight: &Mutex<Option<Flight>>) {
 }
 
 /// The buffers pieces that do not land straight are read into, kept for
-/// the pieces after them, each the least power of two of [`LEAST_READ`]s
-/// that holds its piece and reused only for a piece of that size. Those in
-/// use hold at most a link's depths (or one read) of each size, since no
-/// more is in flight, so those kept never hold more.
+/// the pieces after them while any reader is open ([`Self::reading`]), each
+/// the least power of two of [`LEAST_READ`]s that holds its piece and
+/// reused only for a piece of that size. Those in use hold at most a link's
+/// depths (or one read) of each size, since no more is in flight, so those
+/// kept never hold more. How many that is depends on how the pieces
+/// happened to overlap, so none outlives the last reader: once it closes,
+/// the process holds no read buffer, whatever its reads were.
 #[derive(Default)]
-pub(crate) struct Buffers(Mutex<HashMap<usize, Vec<Buffer>>>);
+pub(crate) struct Buffers(Mutex<Kept>);
+
+/// The buffers kept, by size, and the readers open.
+#[derive(Default)]
+struct Kept {
+    readers: usize,
+    sizes: HashMap<usize, Vec<Buffer>>,
+}
+
+/// One open reader's hold on the buffers ([`Buffers::reading`]): the last
+/// one dropped releases every buffer kept.
+pub(crate) struct Reading(&'static Buffers);
+
+impl std::fmt::Debug for Reading {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Reading")
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        // Released past the lock.
+        let _released = {
+            let mut kept = self.0 .0.lock().expect("read buffers");
+            kept.readers -= 1;
+            (kept.readers == 0).then(|| std::mem::take(&mut kept.sizes))
+        };
+    }
+}
 
 impl Buffers {
+    /// Hold the buffers for a reader that opens: kept until the last
+    /// reader's hold is dropped.
+    pub(crate) fn reading(&'static self) -> Reading {
+        self.0.lock().expect("read buffers").readers += 1;
+        Reading(self)
+    }
+
+    /// The bytes of the buffers kept.
+    fn bytes(&self) -> u64 {
+        let kept = self.0.lock().expect("read buffers");
+        kept.sizes.iter().map(|(size, buffers)| (size * buffers.len()) as u64).sum()
+    }
+
     /// A buffer of at least `length` bytes.
     pub(crate) fn take(&self, length: usize) -> Buffer {
         let size = length.max(LEAST_READ as usize).next_power_of_two();
-        let kept = self.0.lock().expect("read buffers").get_mut(&size).and_then(Vec::pop);
+        let kept = self.0.lock().expect("read buffers").sizes.get_mut(&size).and_then(Vec::pop);
         kept.unwrap_or_else(|| Buffer::new(size))
     }
 
-    /// Keep `buffer` for a piece after.
+    /// Keep `buffer` for a piece after, while a reader is open; a piece of
+    /// a request that outlived every reader releases its own.
     pub(crate) fn give(&self, mut buffer: Buffer) {
-        self.0.lock().expect("read buffers").entry(buffer.bytes_mut().len()).or_default().push(buffer);
+        let mut kept = self.0.lock().expect("read buffers");
+        if kept.readers > 0 {
+            kept.sizes.entry(buffer.bytes_mut().len()).or_default().push(buffer);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Buffers;
+    use crate::disk::LEAST_READ;
+
+    /// Buffers are kept between pieces while a reader is open, and none
+    /// outlives the last: a buffer given back with none open is released.
+    #[test]
+    fn no_read_buffer_outlives_the_last_reader() {
+        let buffers: &'static Buffers = Box::leak(Box::default());
+        let (first, second) = (buffers.reading(), buffers.reading());
+        buffers.give(buffers.take(1));
+        buffers.give(buffers.take(1 << 20));
+        let both = LEAST_READ + (1 << 20);
+        assert_eq!(buffers.bytes(), both);
+        drop(first);
+        assert_eq!(buffers.bytes(), both, "a reader is still open");
+        drop(second);
+        assert_eq!(buffers.bytes(), 0);
+        buffers.give(buffers.take(1));
+        assert_eq!(buffers.bytes(), 0, "no reader is open");
     }
 }
