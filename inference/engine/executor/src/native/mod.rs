@@ -234,7 +234,7 @@ mod qualification_tests {
         if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
         }
-        let device = catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens");
+        let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
         // Native Metal residents use the rows16 layout.
         let rows16 =
             |representation| Element::stored(representation, seismic::Layout::Rows16).unwrap();

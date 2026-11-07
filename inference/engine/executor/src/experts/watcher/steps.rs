@@ -1070,9 +1070,7 @@ impl ExpertStep {
             // Parks of no layer, on the CPU's timeline: kernels wait in
             // place, so nothing registers.
             parks: {
-                let cpu = seismic::Devices::discover(&[])
-                    .unwrap()
-                    .open_backend(seismic::BackendName::Cpu)
+                let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu)
                     .unwrap();
                 Arc::new(super::Parks::new(seismic::Timeline::new(&cpu).unwrap(), Vec::new(), events))
             },

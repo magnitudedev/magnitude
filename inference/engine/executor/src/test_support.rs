@@ -19,6 +19,36 @@ pub(crate) fn process_placement() -> MutexGuard<'static, ()> {
     PLACEMENT.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// How every test of the process opens a device: with the one artifact
+/// store the process shares ([`seismic::MemoryStore`]). A load forms its
+/// programs on its device, and a device lives only while a test holds it;
+/// through the store each program is compiled once in the process however
+/// many tests load it, not once per load. Every open passes the same store,
+/// so no test asks a device another test holds open for a different one
+/// (`seismic::OpenError::ArtifactStoreConflict`).
+pub(crate) fn device_options() -> seismic::DeviceOptions {
+    static STORE: std::sync::OnceLock<std::sync::Arc<seismic::MemoryStore>> = std::sync::OnceLock::new();
+    seismic::DeviceOptions {
+        artifacts: Some(STORE.get_or_init(Default::default).clone()),
+        ..Default::default()
+    }
+}
+
+/// Open executor `id` of `catalog` as every test does ([`device_options`]).
+pub(crate) fn open(catalog: &seismic::Devices, id: seismic::ExecutorId) -> Result<seismic::Device, seismic::OpenError> {
+    catalog.open_with(id, device_options())
+}
+
+/// Open the first executor of `backend` in `catalog` as every test does
+/// ([`device_options`]).
+#[cfg(test)]
+pub(crate) fn open_backend(
+    catalog: &seismic::Devices,
+    backend: seismic::BackendName,
+) -> Result<seismic::Device, seismic::OpenError> {
+    catalog.open_backend_with(backend, device_options())
+}
+
 /// Whether a test runs on `backend` ([`seismic::testing::selected`]): the
 /// runner requests it or none, and discovery found an available executor
 /// of it. Such a test runs on each backend this holds for, and fails where

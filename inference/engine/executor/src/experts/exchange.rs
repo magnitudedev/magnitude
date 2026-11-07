@@ -207,7 +207,7 @@ mod tests {
     #[test]
     fn the_hosts_wait_rule_is_the_kernels() {
         let module = module();
-        let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let table = SlotTable::file(1, 1);
         let slots = ExchangeTable::new(Tensor::shared(&device, Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
         let q = (7u64 << 32) | 5;
@@ -226,7 +226,7 @@ mod tests {
     /// final for its step.
     #[test]
     fn an_answer_only_moves_forward() {
-        let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let table = SlotTable::scratch(2, 2);
         let slots = ExchangeTable::new(Tensor::shared(&device, Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
         let lane = constants::SCRATCH_ROUND;
@@ -251,7 +251,7 @@ mod tests {
     /// one within a few PULSE_MS, for as long as it lives.
     #[test]
     fn a_table_pulses_from_its_making() {
-        let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let table = SlotTable::scratch(3, 2);
         let slots = ExchangeTable::new(Tensor::shared(&device, Element::i32(), &[table.words()]).unwrap(), table, &Pulse::new()).unwrap();
         let beats = || {

@@ -1000,8 +1000,7 @@ mod tests {
             .into_iter()
             .filter(|&backend| crate::test_support::available(&catalog, backend));
         for backend in available {
-            let device = catalog
-                .open_backend(backend)
+            let device = crate::test_support::open_backend(&catalog, backend)
                 .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"));
             let weight =
                 Element::stored("q8g32s", resident_layout(ExecutionPath::Native, backend)).unwrap();

@@ -207,7 +207,7 @@ mod tests {
     use super::*;
 
     fn map(experts: u64) -> StampedMap {
-        let cpu = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let words = experts * MAP_WORDS;
         let tensor = seismic::Tensor::shared(&cpu, seismic::Element::i32(), &[experts, MAP_WORDS]).unwrap();
         StampedMap::new(Words::new(tensor, words, 7).unwrap())

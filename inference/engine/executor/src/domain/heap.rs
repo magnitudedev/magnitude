@@ -721,14 +721,14 @@ mod tests {
 
     fn cpu_heap() -> DeviceHeap {
         let catalog = Rc::new(Devices::discover(&[]).unwrap());
-        let device = Rc::new(catalog.open_backend(BackendName::Cpu).unwrap());
+        let device = Rc::new(crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap());
         DeviceHeap::open(catalog, MemoryReserves::of_machine(None), device).unwrap()
     }
 
     #[test]
     fn a_host_in_the_normal_band_lets_a_running_operation_continue() {
         let catalog = Devices::discover(&[]).unwrap();
-        let device = catalog.open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
         assert_eq!(
             require_normal(&catalog, &device, &MemoryReserves::of_machine(None), HostRoom::Load(LoadStage::Loading)),
             Ok(())

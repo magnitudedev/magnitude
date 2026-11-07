@@ -124,7 +124,7 @@ fn a_stored_pool_stays_within_what_a_loads_reads_leave() {
 /// on.
 #[test]
 fn this_machine_sizes_beside_its_device() {
-    let cpu = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+    let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
     assert!(cpu.host_threads() >= 1, "a CPU device's pool has its submitter");
     // The read engine's share of the host, as a probe measures it, to the
     // nearest whole core: GB10's 0.77–1.38 reserves one in every process.

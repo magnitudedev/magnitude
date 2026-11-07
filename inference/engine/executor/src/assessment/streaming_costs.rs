@@ -1980,7 +1980,7 @@ mod tests {
         let topology = catalog.topology();
         let available = topology.executors().iter().filter(|info| matches!(info.availability(), seismic::Availability::Available));
         for info in available {
-            let device = catalog.open(info.id()).unwrap_or_else(|error| panic!("an available executor opens: {error}"));
+            let device = crate::test_support::open(&catalog, info.id()).unwrap_or_else(|error| panic!("an available executor opens: {error}"));
             let store = seismic::measure::HeldStore::default();
             let unrecorded = GraphMemory::stored(device.topology(), device.info(), &store).unwrap();
             GraphMemory::record(&device, &store).unwrap();
@@ -2004,8 +2004,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!backends.is_empty(), "the host has a CUDA or Vulkan executor");
         for backend in backends {
-            let device = devices
-                .open_backend(backend)
+            let device = crate::test_support::open_backend(&devices, backend)
                 .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"));
             let store = seismic::measure::HeldStore::default();
             let mut measurer = Measurer::new(crate::SEARCH_SETTINGS.error_rate, crate::MIN_SAMPLE_SECONDS);
@@ -2023,7 +2022,7 @@ mod tests {
     /// measured; none stands before they are.
     #[test]
     fn a_cpu_sites_points_are_read_as_measured() {
-        let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let tensor = |matrix| RecordTensor { source: Element::f32(), resident: Element::f32(), matrix };
         let form = CpuForm {
             record: RecordTensors { gate: None, up: tensor([32, 64]), down: tensor([64, 32]) },
@@ -2078,9 +2077,7 @@ mod tests {
     #[ignore]
     fn the_seed_copy_at_a_prompt_groups_shape() {
         use magnitude_kernels::{routed_copy, routed_list_grid};
-        let device = seismic::Devices::discover(&[])
-            .expect("devices are discovered")
-            .open_backend(seismic::BackendName::Cuda)
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).expect("devices are discovered"), seismic::BackendName::Cuda)
             .expect("a CUDA device opens");
         let byte = Element::bool();
         let per = 589_824u64;
@@ -2233,8 +2230,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut measured = Vec::new();
         for &backend in &available {
-            let device = devices
-                .open_backend(backend)
+            let device = crate::test_support::open_backend(&devices, backend)
                 .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"));
             move_lines_are_measured_at_the_banks_own_form(&device);
             measured.push(backend);

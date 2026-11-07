@@ -966,9 +966,7 @@ mod tests {
     }
 
     fn metal() -> Device {
-        seismic::Devices::discover(&[])
-            .unwrap()
-            .open_backend(BackendName::Metal)
+        crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Metal)
             .unwrap()
     }
 

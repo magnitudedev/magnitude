@@ -243,8 +243,7 @@ pub(crate) mod tests {
             &crate::platform::MemoryReserves::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
-        let device = catalog
-            .open(catalog.resolve(selected.info.selector()).unwrap())
+        let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
             .unwrap_or_else(|error| panic!("the selected device opens: {error}"));
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
@@ -344,8 +343,7 @@ pub(crate) mod tests {
             &crate::platform::MemoryReserves::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
-        let device = catalog
-            .open(catalog.resolve(selected.info.selector()).unwrap())
+        let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
             .unwrap_or_else(|error| panic!("the selected device opens: {error}"));
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
@@ -417,8 +415,7 @@ pub(crate) mod tests {
             &crate::platform::MemoryReserves::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
-        let device = catalog
-            .open(catalog.resolve(selected.info.selector()).unwrap())
+        let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
             .unwrap_or_else(|error| panic!("the selected device opens: {error}"));
         let definition = fixture_definition();
         let manifest = fixture_manifest(&definition);
@@ -742,8 +739,7 @@ pub(crate) mod tests {
                 &crate::platform::MemoryReserves::of_machine(None),
             )
             .unwrap_or_else(|error| panic!("an available {backend:?} device is selected: {error}"));
-            let device = catalog
-                .open(catalog.resolve(selected.info.selector()).unwrap())
+            let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
                 .unwrap_or_else(|error| panic!("the selected {backend:?} device opens: {error}"));
             let draft = ExecutionPlanner::prepare(
                 &selected,

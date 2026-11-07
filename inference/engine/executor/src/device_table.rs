@@ -1154,9 +1154,7 @@ mod tests {
     /// keeps.
     fn device_table(kept: Option<&Path>) -> Rc<DeviceTable> {
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let device = catalog
-            .open_backend(seismic::testing::requested_backend().unwrap_or(BackendName::Cpu))
-            .unwrap();
+        let device = crate::test_support::open_backend(&catalog, seismic::testing::requested_backend().unwrap_or(BackendName::Cpu)).unwrap();
         let table = DeviceTable::new(
             &device,
             Element::f32(),

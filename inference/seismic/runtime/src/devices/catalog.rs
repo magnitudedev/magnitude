@@ -138,6 +138,11 @@ impl Devices {
     /// Low-level control: opens the first discovered executor of a backend.
     /// Managed callers select by requirements and open by identity.
     pub fn open_backend(&self, backend: BackendName) -> Result<Arc<DeviceInner>, OpenError> {
+        self.open_backend_with(backend, DeviceOptions::default())
+    }
+
+    /// [`Devices::open_backend`] with `options`, as [`Devices::open_with`].
+    pub fn open_backend_with(&self, backend: BackendName, options: DeviceOptions) -> Result<Arc<DeviceInner>, OpenError> {
         let topology = self.topology();
         let executor = topology
             .executors()
@@ -152,7 +157,7 @@ impl Devices {
                     .map(|diagnostic| diagnostic.message.clone())
                     .collect(),
             })?;
-        self.open(executor.id())
+        self.open_with(executor.id(), options)
     }
 
     /// The status of `executor` of `topology`: a sample of the stores and

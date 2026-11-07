@@ -432,9 +432,7 @@ mod tests {
     /// the file fails its request, and the requests after it read.
     #[test]
     fn reads_land_in_staging_and_a_failed_one_fails_its_request_alone() {
-        let device = seismic::Devices::discover(&[])
-            .unwrap()
-            .open_backend(BackendName::Cpu)
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
             .unwrap();
         let path = std::env::temp_dir().join(format!("expert-source-{}", std::process::id()));
         let bytes = (0..64 * 1024).map(|index| (index % 251) as u8).collect::<Vec<_>>();
@@ -469,9 +467,7 @@ mod tests {
     #[test]
     #[ignore]
     fn uncached_reads_land_in_a_host_reserved_bank_in_place() {
-        let device = seismic::Devices::discover(&[])
-            .expect("devices are discovered")
-            .open_backend(BackendName::Cuda)
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).expect("devices are discovered"), BackendName::Cuda)
             .expect("a CUDA device opens");
         const RECORD: u64 = 2 << 20;
         let (bank, _resizer) =
@@ -505,7 +501,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_read_lands_in_the_last_record_of_a_chunked_bank() {
-        let device = seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Metal).unwrap();
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Metal).unwrap();
         const RECORD: u64 = 589824;
         const LENT: u64 = 655360;
         const COUNT: u64 = 64;
@@ -638,7 +634,8 @@ mod tests {
     }
 
     fn cuda() -> seismic::Device {
-        seismic::Devices::discover(&[]).expect("devices are discovered").open_backend(BackendName::Cuda).expect("a CUDA device opens")
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        crate::test_support::open_backend(&catalog, BackendName::Cuda).expect("a CUDA device opens")
     }
 
     /// `layers` read as a prompt's conveyor reads them: one demand job per

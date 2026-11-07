@@ -1700,7 +1700,7 @@ mod causal_cache_tests {
     #[test]
     fn compressed_causal_rows_read_prepared_prior_but_media_keeps_dense_block() {
         let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-        let device = catalog.open_backend(seismic::BackendName::Cpu).expect("the CPU backend opens");
+        let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu).expect("the CPU backend opens");
         let device = Rc::new(device);
         for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
             let (store, mut bindings) = StateStore::new(

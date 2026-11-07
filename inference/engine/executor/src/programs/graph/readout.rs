@@ -2719,7 +2719,7 @@ mod select_tests {
     #[test]
     fn a_selection_is_confident_by_the_logits_it_was_drawn_from() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let device = catalog.open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
         let (rows, vocabulary) = (2u64, 300u64);
         let extents = [
             ("M", rows),

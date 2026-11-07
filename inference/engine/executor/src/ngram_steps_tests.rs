@@ -1335,8 +1335,7 @@ fn load(
     )
     .unwrap_or_else(|error| panic!("{backend:?}: an available device is selected: {error}"));
     let device = Rc::new(
-        catalog
-            .open(catalog.resolve(selected.info.selector()).unwrap())
+        crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
             .unwrap_or_else(|error| panic!("{backend:?}: the selected device opens: {error}")),
     );
     let capacity = ResourceCapacity {

@@ -778,7 +778,7 @@ mod tests {
     /// whose first two records the lender lends, mapped through a real map;
     /// and the map's view.
     fn bank() -> (BankRecords, MapView) {
-        let cpu = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let words = EXPERTS as u64 * MAP_WORDS;
         let tensor = seismic::Tensor::shared(&cpu, seismic::Element::i32(), &[EXPERTS as u64, MAP_WORDS]).unwrap();
         let map = StampedMap::new(Words::new(tensor, words, 0).unwrap());

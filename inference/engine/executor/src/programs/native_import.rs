@@ -288,7 +288,7 @@ mod tests {
         use std::{fs, sync::Arc};
 
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let device = catalog.open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
         let values = (0..(1024 * 1024 + 16))
             .map(|index| (index as u8).wrapping_mul(17))
             .collect::<Vec<_>>();
@@ -375,7 +375,7 @@ mod tests {
         if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
         }
-        let device = catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens");
+        let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
         let source_element = Element::named("gguf_q5_k").unwrap();
         for layout in [seismic::Layout::Rows16, seismic::Layout::Mma16] {
             let resident_element = Element::stored("q5k", layout).unwrap();
@@ -427,7 +427,7 @@ mod tests {
         if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
         }
-        let device = catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens");
+        let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
         let source_element = Element::named("gguf_q5_k").unwrap();
         let resident_element = Element::stored("q5k", seismic::Layout::Rows16).unwrap();
         let shape = [17_u64, 512];
@@ -498,7 +498,7 @@ mod tests {
         if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
         }
-        let device = catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens");
+        let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
         let source_element = Element::named("gguf_q5_k").unwrap();
         let resident_element = Element::stored("q5k", seismic::Layout::Rows16).unwrap();
         let shape = [17_u64, 512];
@@ -613,7 +613,7 @@ mod tests {
         if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
         }
-        let device = catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens");
+        let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
         let packed_element = Element::named("gguf_q5_k").unwrap();
         let resident_element = Element::stored("q5k", seismic::Layout::Rows16).unwrap();
         let dense_element = Element::f32();

@@ -584,7 +584,8 @@ mod tests {
     /// taking one are a Vulkan host's checks, run on one by name with
     /// `--ignored`.
     fn boundary_device() -> seismic::Device {
-        Devices::discover(&[]).expect("devices are discovered").open_backend(BackendName::Vulkan).expect("a Vulkan device opens")
+        let catalog = Devices::discover(&[]).expect("devices are discovered");
+        crate::test_support::open_backend(&catalog, BackendName::Vulkan).expect("a Vulkan device opens")
     }
 
     fn slots(device: &seismic::Device, table: SlotTable) -> ExchangeTable {
@@ -758,7 +759,7 @@ mod tests {
     /// a registration ends its wait, and once the load stopped it ends.
     #[test]
     fn the_keeper_waits_for_a_change_and_ends_once_stopped() {
-        let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let parks = Arc::new(parks(&device));
         let register = {
             let parks = parks.clone();
@@ -781,7 +782,7 @@ mod tests {
     /// requested).
     #[test]
     fn the_keeper_answers_a_park_reached_at_any_moment() {
-        let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let parks = Arc::new(parks(&device));
         let keeper = Parks::keep(parks.clone()).unwrap();
         let wait = ParkSite { layer: 0, kind: ParkKind::TierWait };
@@ -805,7 +806,7 @@ mod tests {
     /// the device reaches the park, and its answer opens the park.
     #[test]
     fn the_keeper_announces_a_rounds_arrival() {
-        let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let parks = Arc::new(parks(&device));
         let keeper = Parks::keep(parks.clone()).unwrap();
         let round = ParkSite { layer: 0, kind: ParkKind::Round(0) };
@@ -841,7 +842,7 @@ mod tests {
     /// exactly one, however often it is looked at, until it opens.
     #[test]
     fn the_keeper_announces_only_what_a_host_job_waits_for() {
-        let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let parks = Arc::new(parks(&device));
         let keeper = Parks::keep(parks.clone()).unwrap();
         let wait = ParkSite { layer: 0, kind: ParkKind::TierWait };
@@ -881,7 +882,7 @@ mod tests {
     /// their order.
     #[test]
     fn retiring_a_step_removes_its_parks() {
-        let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
         let parks = parks(&device);
         let site = ParkSite { layer: 0, kind: ParkKind::TierWait };
         for (value, sequence) in [(1, 3), (3, 4), (5, 3), (7, 5)] {

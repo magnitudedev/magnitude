@@ -58,7 +58,7 @@ fn a_resize_step_that_panics_is_reported_and_the_thread_runs_on() {
 /// slot 3 joins, joined 2 and 3 and stopped there.
 #[test]
 fn a_growth_joins_each_slot_as_every_tensor_backs_it() {
-    let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
     let row = device
         .info()
         .reserving(seismic::ReservedContract::DeviceOnly)

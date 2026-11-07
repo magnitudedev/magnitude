@@ -1281,7 +1281,7 @@ mod tests {
     /// [`tier`], writing real maps: plain words where `resolution` reads
     /// after the store, else stamped.
     fn mapped(records: u32, layers: usize, members: &[(usize, usize)], resolution: Resolution) -> (HostRecords, Maps) {
-        let cpu = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let steps = std::sync::Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
         steps.begin_through(1000);
         let mut maps = vec![None; layers];

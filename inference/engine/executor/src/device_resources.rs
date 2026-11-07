@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn standalone_feature_census_is_shared_and_does_not_retain_allocations() {
         let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-        let device = catalog.open_backend(seismic::BackendName::Cpu).expect("the CPU backend opens");
+        let device = crate::test_support::open_backend(&catalog, seismic::BackendName::Cpu).expect("the CPU backend opens");
         let domain = ResourceDomain::new(ResourceDomainId::new("census").unwrap(), Rc::new(device));
         let feature = domain
             .publish_features(

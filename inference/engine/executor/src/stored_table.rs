@@ -1385,9 +1385,7 @@ mod tests {
     /// The requested test backend's device, else the CPU's: off the CPU a
     /// timeline's host and device sides are apart.
     fn device() -> seismic::Device {
-        seismic::Devices::discover(&[])
-            .unwrap()
-            .open_backend(seismic::testing::requested_backend().unwrap_or(BackendName::Cpu))
+        crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::testing::requested_backend().unwrap_or(BackendName::Cpu))
             .unwrap()
     }
 
@@ -1682,7 +1680,7 @@ mod tests {
         let devices = seismic::Devices::discover(&[]).unwrap();
         let mut backends = Vec::new();
         for backend in [BackendName::Cpu, BackendName::Metal] {
-            let Ok(device) = devices.open_backend(backend) else {
+            let Ok(device) = crate::test_support::open_backend(&devices, backend) else {
                 continue;
             };
             backends.push(backend);

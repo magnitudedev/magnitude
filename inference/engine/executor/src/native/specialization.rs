@@ -687,7 +687,7 @@ mod tests {
         if !crate::test_support::available(&catalog, BackendName::Metal) {
             return;
         }
-        let device = catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens");
+        let device = crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens");
         let implementation =
             seismic::generated::native_implementation::<routed_output::Entry>(&device)
                 .unwrap()

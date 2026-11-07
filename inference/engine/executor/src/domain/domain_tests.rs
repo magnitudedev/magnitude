@@ -2663,8 +2663,7 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
         .into_iter()
         .filter(|&backend| crate::test_support::available(&catalog, backend))
         .map(|backend| {
-            catalog
-                .open_backend(backend)
+            crate::test_support::open_backend(&catalog, backend)
                 .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"))
         })
         .collect::<Vec<_>>();
@@ -2793,9 +2792,7 @@ fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::Stored
         std::process::id()
     ));
     std::fs::write(&path, vec![0x11u8; (ROWS * ROW_BYTES) as usize]).unwrap();
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(seismic::BackendName::Cpu)
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu)
         .unwrap();
     let table = Arc::new(
         StoredTable::new(

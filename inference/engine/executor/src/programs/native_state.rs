@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn prepared_graph_copies_within_held_slabs() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let device = catalog.open_backend(BackendName::Cpu).expect("the CPU backend opens");
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).expect("the CPU backend opens");
         let element = Element::f32();
         let kernel = copy_rows::native_for_device_with(
             &device,

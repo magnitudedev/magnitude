@@ -1826,7 +1826,7 @@ mod tests {
         const ROWS: u64 = 4096;
         let path = std::env::temp_dir().join(format!("magnitude-imported-table-{}.bin", std::process::id()));
         std::fs::write(&path, vec![0u8; 100 + ROWS as usize * 90]).unwrap();
-        let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let descriptor = WeightDescriptor::stored("ngram", [ROWS, 160]);
         let table = Arc::new(
             StoredTable::new(
@@ -1986,7 +1986,7 @@ mod tests {
         use magnitude_family_qwen4exp::Qwen4ExpFamily;
 
         let devices = seismic::Devices::discover(&[]).unwrap();
-        let device = devices.open_backend(seismic::BackendName::Metal).unwrap();
+        let device = crate::test_support::open_backend(&devices, seismic::BackendName::Metal).unwrap();
         for model in [
             "qwen3.8-flash-next:gguf:q4",
             "qwen3.8-flash-next:gguf:nvfp4",
@@ -2115,7 +2115,7 @@ mod tests {
     /// keeps every one of the target's.
     #[test]
     fn each_importers_bytes_are_its_own_imports() {
-        let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let weight = |name: &str, elements: u64| {
             let key = ResidencyKey {
                 artifact: magnitude_artifacts::ArtifactIdentity([0; 32]),

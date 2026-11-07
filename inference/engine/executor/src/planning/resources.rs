@@ -1760,9 +1760,7 @@ mod slab_plan_tests {
                 + banks.slab_bytes
         );
         let device = Rc::new(
-            seismic::Devices::discover(&[])
-                .unwrap()
-                .open_backend(BackendName::Cpu)
+            crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
                 .unwrap(),
         );
         let store = plan.allocate(device).unwrap();

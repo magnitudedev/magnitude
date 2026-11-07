@@ -6,7 +6,7 @@ use seismic::cpu::{Bf16, Dense};
 use std::time::{Duration, Instant};
 
 fn cpu() -> seismic::Device {
-    seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap()
+    crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap()
 }
 
 const RECORDS: usize = 3;

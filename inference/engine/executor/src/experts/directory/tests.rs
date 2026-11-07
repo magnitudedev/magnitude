@@ -337,7 +337,7 @@ fn free_records_are_placed_without_ranking_the_held() {
 /// `count` words of a CPU tensor of `shape`, each `fill`, as a load's bank
 /// words are.
 fn cpu_words(shape: &[u64], fill: i32) -> crate::experts::Words {
-    let cpu = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+    let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
     let tensor = seismic::Tensor::shared(&cpu, seismic::Element::i32(), shape).unwrap();
     crate::experts::Words::new(tensor, shape.iter().product(), fill).unwrap()
 }

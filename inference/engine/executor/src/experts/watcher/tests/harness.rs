@@ -286,7 +286,7 @@ pub(super) const DECODE: Conveying = Conveying { conveyed: 1, lent: 0, bytes: RE
 
 /// The CPU device the harness's words and records live on.
 pub(super) fn cpu() -> seismic::Device {
-    seismic::Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap()
+    crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap()
 }
 
 /// `count` words on `device`, each `initial`.

@@ -273,8 +273,7 @@ pub fn fixture_of(
     let selected = platform::select_device(&catalog, ExecutionPath::Native, device_request, &reserves)
         .unwrap_or_else(|error| panic!("{device_request} selects a device: {error}"));
     let device = Rc::new(
-        catalog
-            .open(catalog.resolve(selected.info.selector()).unwrap())
+        crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap())
             .unwrap_or_else(|error| panic!("the selected device opens: {error}")),
     );
     let definition = Rc::new(definition);

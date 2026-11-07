@@ -490,7 +490,7 @@ mod tests {
     /// again.
     #[test]
     fn a_job_measures_in_order_within_its_time_and_the_next_resumes() {
-        let device = seismic::Devices::discover(&[]).unwrap().open_backend(seismic::BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let root = std::env::temp_dir().join(format!("point-requests-job-{}", std::process::id()));
         let store = seismic::measure::JsonFileStore::new(&root);
         let requests = [PointRequest::HostMemory { readers: 2 }, PointRequest::HostMemory { readers: 1 }];

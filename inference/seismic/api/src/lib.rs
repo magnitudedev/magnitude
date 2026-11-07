@@ -334,6 +334,13 @@ impl Devices {
             .map(|inner| Device { inner })
     }
 
+    /// [`Devices::open_backend`] with `options`, as [`Devices::open_with`].
+    pub fn open_backend_with(&self, backend: BackendName, options: DeviceOptions) -> Result<Device, OpenError> {
+        self.inner
+            .open_backend_with(backend, options)
+            .map(|inner| Device { inner })
+    }
+
     /// The status of `executor` of `topology`: a sample of the stores and
     /// of the executor's grants, with what this process's opened executors
     /// hold.

@@ -717,9 +717,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         backends.push(BackendName::Metal);
         for backend in backends {
-            let device = seismic::Devices::discover(&[])
-                .unwrap()
-                .open_backend(backend)
+            let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), backend)
                 .unwrap();
             let charged = || device.device_ledger().charged;
             let before = charged();
@@ -739,7 +737,7 @@ mod tests {
     #[test]
     fn binding_claim_matches_distinct_physical_constant_charge() {
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let device = catalog.open_backend(BackendName::Cpu).unwrap();
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cpu).unwrap();
         let mut graph = device.native_graph();
         let first = GraphConstant::i32(&mut graph, &[1, 2, 3]).unwrap();
         let tied = GraphConstant::i32(&mut graph, &[1, 2, 3]).unwrap();

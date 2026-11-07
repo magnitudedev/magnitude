@@ -370,9 +370,7 @@ fn persisted_point_weights_preserve_cache_identity() {
 
 #[test]
 fn stored_cpu_choice_accepts_device_owned_parameters() {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
     let implementation = seismic::generated::native_implementation::<shape_rows::Entry>(&device)
         .unwrap()
@@ -402,9 +400,7 @@ fn stored_cpu_choice_accepts_device_owned_parameters() {
 /// reports them, so the load after the search forms none of them itself.
 #[test]
 fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
     let mut spec =
         crate::native::specialization::Specializer::count_untuned(&device, Default::default());
@@ -451,9 +447,7 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
 
 #[test]
 fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
     let measured = |shapes: &[PointShape], activation, budget: Duration| {
         tuning_key_material(
@@ -707,7 +701,7 @@ fn rotations_take_distinct_layers_spread_over_depth() {
 fn metal() -> Option<Device> {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     crate::test_support::available(&catalog, BackendName::Metal)
-        .then(|| catalog.open_backend(BackendName::Metal).expect("an available Metal executor opens"))
+        .then(|| crate::test_support::open_backend(&catalog, BackendName::Metal).expect("an available Metal executor opens"))
 }
 
 /// A dependant (a streamed layer's route of its resident route) is a unit
@@ -3631,9 +3625,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
 /// Prepare refuses to reopen it.
 #[test]
 fn stored_cpu_fallback_matches_the_device_default() {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
     let stored = seismic::generated::native_implementation::<shape_rows::Entry>(&device)
         .unwrap()
@@ -3667,9 +3659,7 @@ fn stored_cpu_fallback_matches_the_device_default() {
 /// NEON), the declared F32 form stays the default.
 #[test]
 fn cpu_projection_default_form_follows_the_tier_integer_dots() {
-    let device = seismic::Devices::discover(&[])
-        .unwrap()
-        .open_backend(BackendName::Cpu)
+    let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), BackendName::Cpu)
         .unwrap();
     let implementation = dense_output_implementation(&device);
     let statics = implementation
@@ -3763,7 +3753,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         &crate::platform::MemoryReserves::of_machine(None),
     )
     .unwrap();
-    let device = catalog.open(catalog.resolve(selected.info.selector()).unwrap()).unwrap();
+    let device = crate::test_support::open(&catalog, catalog.resolve(selected.info.selector()).unwrap()).unwrap();
     // The planning fixture (an attention block, which every backend runs)
     // three times, the later ones its first's mixer (tied), each with its
     // feed-forward routed over experts of its own: by a softmax score

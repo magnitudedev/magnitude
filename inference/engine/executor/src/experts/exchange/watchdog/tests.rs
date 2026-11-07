@@ -18,7 +18,7 @@ use std::path::Path;
 use std::sync::mpsc;
 
 fn slots(table: SlotTable) -> ExchangeTable {
-    let device = Devices::discover(&[]).unwrap().open_backend(BackendName::Cpu).unwrap();
+    let device = crate::test_support::open_backend(&Devices::discover(&[]).unwrap(), BackendName::Cpu).unwrap();
     ExchangeTable::new(Tensor::shared(&device, Element::i32(), &[table.words()]).unwrap(), table, &super::super::Pulse::new()).unwrap()
 }
 
