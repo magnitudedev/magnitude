@@ -107,6 +107,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(&before[before.len().saturating_sub(count)..])
     }
 
+    /// What each stored table's steps read after they were queued, by the
+    /// block whose n-gram input reads it (`StoredTable::waits`).
+    pub fn stored_table_waits(&self) -> Result<Vec<(usize, crate::stored_table::TableWaits)>, String> {
+        Ok(self.family.stored_tables()?.into_iter().map(|(block, table)| (block, table.waits())).collect())
+    }
+
     /// Record that the target group `operations` feeds its tokens.
     pub(super) fn feed_tokens(&mut self, operations: &[Operation]) -> Result<(), String> {
         for operation in operations {

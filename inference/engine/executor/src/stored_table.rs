@@ -33,6 +33,9 @@
 //! behind it drains. The other slots' rows are published and read as
 //! usual. Rows are read without filling the file cache (`Reader`,
 //! `CachePolicy::Uncached`).
+//!
+//! The table counts the rows its filler read for each step after the step
+//! was queued (`TableWaits`).
 
 use crate::device_table::KeptRows;
 use crate::planning::DirectoryForm;
@@ -45,6 +48,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
+
+/// What a stored table's steps read after they were queued: the rows its
+/// filler read for a step, which the step's gate waited on. A step of rows
+/// the host knew is waited on for rows no slot held; a step of rows the
+/// device selected reads its rows once its notice reaches the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableWaits {
+    /// Steps of host-known rows, those of them that read rows after they were
+    /// queued, and those rows.
+    pub known_steps: u64,
+    pub known_waited: u64,
+    pub known_rows: u64,
+    /// Steps of selected rows, and the rows read for them.
+    pub selected_steps: u64,
+    pub selected_rows: u64,
+}
 
 /// How the host converts a stored table's rows from `stored`, their
 /// encoding in the artifact, into `resident`, the representation its slots
@@ -364,6 +383,7 @@ struct Shared {
     arrived: Condvar,
     state: Mutex<State>,
     failures: Mutex<BTreeMap<u64, StepFailure>>,
+    waits: Mutex<TableWaits>,
     /// The last step the filler took, and the last whose gate it opened.
     taken: AtomicU64,
     opened: AtomicU64,
@@ -470,6 +490,7 @@ impl StoredTable {
                 served: vec![false; slots as usize],
             }),
             failures: Mutex::new(BTreeMap::new()),
+            waits: Mutex::new(TableWaits::default()),
             taken: AtomicU64::new(0),
             opened: AtomicU64::new(0),
             kept,
@@ -533,10 +554,15 @@ impl StoredTable {
             .take((state.records * self.shared.record_rows) as usize)
             .collect::<Vec<_>>();
         match self.shared.bring(&mut state, 0, &[rows], true) {
-            Ok(None) => Ok(()),
-            Ok(Some(failure)) => Err(failure.error),
+            Ok((None, _)) => Ok(()),
+            Ok((Some(failure), _)) => Err(failure.error),
             Err(error) => Err(error),
         }
+    }
+
+    /// What its steps read after they were queued, so far.
+    pub fn waits(&self) -> TableWaits {
+        *self.shared.waits.lock().expect("stored table waits lock")
     }
 
     /// The records whose slots hold rows now.
@@ -747,7 +773,20 @@ impl Shared {
                 .expect("stored table stack lock")
                 .read(&distinct.into_iter().collect::<Vec<_>>(), selected);
             let mut state = self.state.lock().expect("stored table lock");
-            let failure = self.bring(&mut state, step, &rows, true)?;
+            let (failure, read) = self.bring(&mut state, step, &rows, true)?;
+            let mut waits = self.waits.lock().expect("stored table waits lock");
+            match selected {
+                true => {
+                    waits.selected_steps += 1;
+                    waits.selected_rows += read;
+                }
+                false => {
+                    waits.known_steps += 1;
+                    waits.known_waited += u64::from(read > 0);
+                    waits.known_rows += read;
+                }
+            }
+            drop(waits);
             if step == KEPT_AFTER_STEPS {
                 self.keep(&state);
             }
@@ -802,14 +841,14 @@ impl Shared {
     /// into free slots and published. `served`: steps named the rows. The
     /// rows that could not be read are not published, and fail the batch
     /// slots that named them (`Ok(Some)`); a failure that is no row's fails
-    /// the step (`Err`).
+    /// the step (`Err`). Beside it, the rows it read.
     fn bring(
         &self,
         state: &mut State,
         step: u64,
         rows: &[Vec<u64>],
         served: bool,
-    ) -> Result<Option<StepFailure>, String> {
+    ) -> Result<(Option<StepFailure>, u64), String> {
         // Each row once, with the batch slots that name it.
         let mut naming = BTreeMap::<u64, Vec<usize>>::new();
         for (slot, rows) in rows.iter().enumerate() {
@@ -936,10 +975,11 @@ impl Shared {
             state.directory.rebuild();
         }
         self.publish(state)?;
-        Ok((!failed.is_empty()).then(|| StepFailure {
+        let failure = (!failed.is_empty()).then(|| StepFailure {
             slots: FailedSlots::Only(failed),
             error: format!("stored table rows: {}", errors.join("; ")),
-        }))
+        });
+        Ok((failure, absent.len() as u64))
     }
 
     /// Where slot `slot` lies in the slots' storage: its row of its record,

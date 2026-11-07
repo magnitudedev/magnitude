@@ -537,6 +537,14 @@ pub trait ProgramFamily: 'static {
     /// held whole.
     fn expert_bank(&self) -> Option<&dyn ElasticBank>;
 
+    /// The load's stored tables by the target block whose n-gram input
+    /// reads each (`ResidentRoles::stored_blocks`). Test families hold none.
+    fn stored_tables(
+        &self,
+    ) -> Result<std::collections::BTreeMap<usize, std::sync::Arc<crate::stored_table::StoredTable>>, String> {
+        Ok(Default::default())
+    }
+
     fn bound_constant_bytes(&self) -> Result<u64, &'static str> {
         self.target_constant_bytes()?
             .checked_add(self.optional_constant_bytes()?)
@@ -801,6 +809,12 @@ impl ProgramFamily for NativeFamily {
 
     fn expert_bank(&self) -> Option<&dyn ElasticBank> {
         self.bank.as_ref().map(|bank| bank as &dyn ElasticBank)
+    }
+
+    fn stored_tables(
+        &self,
+    ) -> Result<std::collections::BTreeMap<usize, std::sync::Arc<crate::stored_table::StoredTable>>, String> {
+        self.resident.sublayers.stored_blocks()
     }
 
     fn target_constant_bytes(&self) -> Result<u64, &'static str> {

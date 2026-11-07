@@ -168,6 +168,25 @@ pub fn run(
             "sited": costs.layers.iter().map(|layer| layer.sited).sum::<u64>(),
         })
     });
+    // What each stored table's steps read after they were queued.
+    let tables = engine
+        .domain
+        .stored_table_waits()?
+        .into_iter()
+        .map(|(block, waits)| {
+            json!({
+                "block": block,
+                "known_steps": waits.known_steps,
+                "known_waited": waits.known_waited,
+                "known_rows": waits.known_rows,
+                "selected_steps": waits.selected_steps,
+                "selected_rows": waits.selected_rows,
+            })
+        })
+        .collect::<Vec<_>>();
+    if !tables.is_empty() {
+        eprintln!("magnitude-harness: stored table reads after their steps were queued: {}", json!(tables));
+    }
     let metadata = json!({
         "producer": "harness",
         "model": artifacts.model,
@@ -175,6 +194,7 @@ pub fn run(
         "vocabulary": vocabulary,
         "rows": rows,
         "experts": experts,
+        "stored_tables": tables,
     });
     let path = stem.with_extension("json");
     std::fs::write(

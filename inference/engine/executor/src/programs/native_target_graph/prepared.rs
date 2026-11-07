@@ -1069,14 +1069,7 @@ impl PreparedTargetGraphs {
             }),
             _ => return Err("resident per-layer weights disagree with the prepared graphs".into()),
         };
-        let stored = resident
-            .sublayers
-            .stored_tables()
-            .map(|(role, table)| match role.scope {
-                WeightScope::TargetSublayer(index) => Ok((index.block as usize, table.clone())),
-                scope => Err(format!("a stored table of scope {scope:?}")),
-            })
-            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        let stored = resident.sublayers.stored_blocks()?;
         let notice = self
             .notice_rows
             .map(|rows| SelectionNotice::new(&resident.embedding.tensor().device(), rows))

@@ -76,6 +76,18 @@ impl ResidentRoles {
             .filter_map(|(role, weight)| weight.table().stored().map(|table| (*role, table)))
     }
 
+    /// The stored tables by the target block whose n-gram input reads each.
+    pub(crate) fn stored_blocks(
+        &self,
+    ) -> Result<std::collections::BTreeMap<usize, std::sync::Arc<crate::stored_table::StoredTable>>, String> {
+        self.stored_tables()
+            .map(|(role, table)| match role.scope {
+                WeightScope::TargetSublayer(index) => Ok((index.block as usize, table.clone())),
+                scope => Err(format!("a stored table of scope {scope:?}")),
+            })
+            .collect()
+    }
+
     fn import(
         weights: Vec<(WeightRole, &magnitude_family_contracts::WeightDescriptor)>,
         residency: &mut ResidencyStore,
