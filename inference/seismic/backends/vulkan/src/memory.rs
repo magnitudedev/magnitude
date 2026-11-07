@@ -568,7 +568,7 @@ impl Memory {
                 size(within(candidate, true, available))
             }) {
                 Ok(block) => return Ok(block),
-                Err(ExecutionError::AllocationCapacity { .. }) => {}
+                Err(error) if error.capacity_refusal().is_some() => {}
                 Err(error) => return Err(error),
             }
         }
@@ -818,12 +818,21 @@ fn create_block(
         Err(result) => {
             unsafe { device.destroy_buffer(buffer, None) };
             return Err(match result {
-                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY => {
-                    ExecutionError::AllocationCapacity {
-                        required: bytes.into(),
-                        available: 0,
+                // The driver's own refusal, with its budget read now.
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+                    let budget = memory_owner.memory_budget();
+                    ExecutionError::DeviceRefused {
+                        required: bytes,
+                        reading: seismic_compiler::errors::RefusalReading::HeapBudget {
+                            budget: budget.heap_budget_bytes,
+                            usage: budget.heap_usage_bytes,
+                        },
                     }
                 }
+                vk::Result::ERROR_OUT_OF_HOST_MEMORY => ExecutionError::DeviceRefused {
+                    required: bytes,
+                    reading: seismic_compiler::errors::RefusalReading::Host,
+                },
                 other => {
                     ExecutionError::AllocationFailed(format!("vkAllocateMemory failed: {other}"))
                 }

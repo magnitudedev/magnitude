@@ -7,7 +7,7 @@ use crate::driver::{
     Context, Driver, DriverError, HostMapped, PinnedUpload, RangeMemory, ReservedMemory, Stream,
 };
 use crate::{Cuda, CudaLaunchMode};
-use seismic_compiler::errors::ExecutionError;
+use seismic_compiler::errors::{ExecutionError, RefusalReading};
 use seismic_compiler::executable::{
     CompiledBufferView, CompiledLocalClassTotals, CompiledLocalLayout, DeviceService,
     ExecutableAllocationId, ExecutableCommand, ExecutableKernelId, ExecutionEnvironment,
@@ -60,6 +60,14 @@ pub struct Device {
 pub struct MemoryInfo {
     pub free_bytes: u64,
     pub total_bytes: u64,
+}
+
+/// `context`'s device memory as a refusal reads it ([`memory_info`]).
+pub(crate) fn device_free(context: &Context) -> RefusalReading {
+    memory_info(context).map_or(RefusalReading::Unread, |info| RefusalReading::DeviceFree {
+        free: info.free_bytes,
+        total: info.total_bytes,
+    })
 }
 
 /// `cuMemGetInfo` on `context`: device-wide free memory and the total
@@ -118,6 +126,11 @@ impl Device {
     }
     pub fn ordinal(&self) -> u32 {
         self.context.ordinal() as u32
+    }
+
+    /// The device's memory as a refusal reads it ([`device_free`]).
+    pub(crate) fn refusal_reading(&self) -> RefusalReading {
+        device_free(&self.context)
     }
 
     /// `cuMemGetInfo` on this opened context: device-wide free memory (other
@@ -242,7 +255,7 @@ impl Device {
         };
         let (reserved, granule) = (host(reserved)?, host(granule)?);
         let memory = ReservedMemory::new(&self.context, reserved, granule, memory, account)
-            .map_err(allocation_error(reserved as u64))?;
+            .map_err(allocation_error(reserved as u64, || device_free(&self.context)))?;
         let (reservation, resizer) = Reserved::new(memory, committed)?;
         Ok((Buffer::reserved(reservation), resizer))
     }
@@ -962,15 +975,15 @@ fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
 /// `CUDA_ERROR_OUT_OF_MEMORY`.
 pub(crate) const OUT_OF_MEMORY: i32 = 2;
 
-pub(crate) fn allocation_error(bytes: u64) -> impl FnOnce(DriverError) -> ExecutionError {
+pub(crate) fn allocation_error(
+    bytes: u64,
+    reading: impl FnOnce() -> RefusalReading,
+) -> impl FnOnce(DriverError) -> ExecutionError {
     move |error| {
         if error.is_device_loss() {
             ExecutionError::DeviceLost(error.to_string())
         } else if error.code == OUT_OF_MEMORY {
-            ExecutionError::AllocationCapacity {
-                required: bytes.into(),
-                available: 0,
-            }
+            ExecutionError::DeviceRefused { required: bytes, reading: reading() }
         } else {
             ExecutionError::AllocationFailed(error.to_string())
         }

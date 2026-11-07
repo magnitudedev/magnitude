@@ -261,7 +261,7 @@ impl Registered {
         wanted: usize,
         charge: impl Fn() -> Result<Hold, seismic_compiler::errors::ExecutionError>,
     ) -> Result<usize, seismic_compiler::errors::ExecutionError> {
-        let failed = |error: DriverError| crate::executor::allocation_error((wanted * self.range.granule()) as u64)(error);
+        let failed = |error: DriverError| crate::executor::allocation_error((wanted * self.range.granule()) as u64, || seismic_compiler::errors::RefusalReading::Host)(error);
         let mut state = self.state();
         let first_new = state.holds.len();
         if wanted <= state.committed {

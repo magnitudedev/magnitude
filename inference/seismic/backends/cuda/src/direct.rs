@@ -484,7 +484,7 @@ impl DirectGraphBuilder {
         // what its census takes; any other failure the submission's.
         let required = crate::graph_cost::census_bytes(&self.device, census);
         let refused = |error: driver::DriverError| match error.code {
-            crate::executor::OUT_OF_MEMORY => ExecutionError::AllocationCapacity { required: required.into(), available: 0 },
+            crate::executor::OUT_OF_MEMORY => ExecutionError::DeviceRefused { required, reading: self.device.refusal_reading() },
             _ => submission(error),
         };
         let exec = self.graph.instantiate().map_err(refused)?;

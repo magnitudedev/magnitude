@@ -106,7 +106,7 @@ impl Blocks {
                         )
                     })?,
                 )
-                .map_err(crate::executor::allocation_error(size))?;
+                .map_err(crate::executor::allocation_error(size, || crate::executor::device_free(&self.context)))?;
                 let block = Arc::new(Block {
                     _charge: charge,
                     allocation,

@@ -368,14 +368,7 @@ pub(crate) trait Refusal {
 
 impl Refusal for ExecutionError {
     fn refusal(&self) -> Option<(u64, u64)> {
-        match self {
-            // A demand beyond u64 is never free.
-            ExecutionError::AllocationCapacity {
-                required,
-                available,
-            } => Some((u64::try_from(required).unwrap_or(u64::MAX), *available)),
-            _ => None,
-        }
+        self.capacity_refusal()
     }
 }
 

@@ -1044,7 +1044,7 @@ impl ReservedMemory {
                     extra.push(charge()?);
                 }
                 self.commit_created(*memory, *location, handles, wanted)
-                    .map_err(crate::executor::allocation_error(bytes as u64))?;
+                    .map_err(crate::executor::allocation_error(bytes as u64, || crate::executor::device_free(&self.context)))?;
                 charges.truncate(wanted);
                 charges.extend(extra);
                 Ok(bytes)
@@ -1669,7 +1669,7 @@ impl HostMapped {
     ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
         // CU_MEMHOSTALLOC_DEVICEMAP
         const DEVICE_MAP: c_uint = 2;
-        let failed = || crate::executor::allocation_error(bytes as u64);
+        let failed = || crate::executor::allocation_error(bytes as u64, || seismic_compiler::errors::RefusalReading::Host);
         let charge = account.reserve(bytes.max(1) as u64)?;
         let _current = context.enter().map_err(failed())?;
         let mut host = std::ptr::null_mut();
@@ -1766,7 +1766,7 @@ impl PinnedUpload {
         account: &Arc<dyn seismic_compiler::executable::MemoryAccount>,
         bytes: usize,
     ) -> Result<Self, seismic_compiler::errors::ExecutionError> {
-        let failed = || crate::executor::allocation_error(bytes as u64);
+        let failed = || crate::executor::allocation_error(bytes as u64, || seismic_compiler::errors::RefusalReading::Host);
         let charge = account.reserve(bytes.max(1) as u64)?;
         let _current = context.enter().map_err(failed())?;
         let mut pointer = std::ptr::null_mut();

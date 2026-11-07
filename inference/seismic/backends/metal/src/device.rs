@@ -89,6 +89,18 @@ impl DeviceHandle {
         self.device.currentAllocatedSize() as u64
     }
 
+    /// The device's refusal of `bytes` it did not allocate, its working set
+    /// read at the refusal.
+    pub(crate) fn refused(&self, bytes: u64) -> ExecutionError {
+        ExecutionError::DeviceRefused {
+            required: bytes,
+            reading: seismic_compiler::errors::RefusalReading::WorkingSet {
+                recommended: self.recommended_working_set_bytes(),
+                allocated: self.current_allocated_bytes(),
+            },
+        }
+    }
+
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
     }
@@ -629,11 +641,8 @@ impl Granules {
             )
         })
         // As for an allocated buffer, Metal states no reason for a buffer it
-        // does not create: the device's memory refused it.
-        .ok_or(ExecutionError::AllocationCapacity {
-            required: (bytes as u64).into(),
-            available: 0,
-        })
+        // does not create: the device refused it.
+        .ok_or_else(|| self.device.refused(bytes as u64))
     }
 
     /// The chunks over granules `[from, to)`, wired.
@@ -998,12 +1007,9 @@ impl MetalDevice {
                 .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
         })
         // Metal states no reason for a buffer it does not create; within
-        // `maxBufferLength` it is the device's memory that refused it, a
-        // capacity refusal as every backend reports one.
-        .ok_or(ExecutionError::AllocationCapacity {
-            required: bytes.into(),
-            available: 0,
-        })?;
+        // `maxBufferLength` it is the device that refused it, with its
+        // working set as it reads now.
+        .ok_or_else(|| self.handle.refused(bytes))?;
         let wired = WiredAllocation::wire(&self.residency, vec![buffer.clone()]);
         Ok(WritableMetalBuffer(MetalBuffer {
             buffer,

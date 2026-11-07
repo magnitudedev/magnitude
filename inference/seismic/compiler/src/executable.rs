@@ -2219,8 +2219,8 @@ fn acquire_with_completed_reclamation<B>(
     complete: impl FnOnce() -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
     match resources.acquire_instance(bank, bytes, alignment) {
-        Err(ExecutionError::AllocationCapacity { .. })
-            if available.iter().any(|other| *other != bank) =>
+        Err(error)
+            if error.capacity_refusal().is_some() && available.iter().any(|other| *other != bank) =>
         {
             complete()?;
             let retired = available

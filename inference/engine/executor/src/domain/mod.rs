@@ -192,17 +192,14 @@ impl From<ClaimRefusal> for DomainError {
 
 impl From<magnitude_state::Error> for DomainError {
     fn from(error: magnitude_state::Error) -> Self {
+        let refusal = match &error {
+            magnitude_state::Error::Tensor(seismic::TensorError::Execution(execution)) => execution.capacity_refusal(),
+            _ => None,
+        };
+        if let Some((required, available)) = refusal {
+            return Self::Capacity(crate::CapacityError { resource: crate::ResourceKind::DeviceMemory, required, available });
+        }
         match error {
-            magnitude_state::Error::Tensor(seismic::TensorError::Execution(
-                seismic::ExecutionError::AllocationCapacity {
-                    required,
-                    available,
-                },
-            )) => Self::Capacity(crate::CapacityError {
-                resource: crate::ResourceKind::DeviceMemory,
-                required: u64::try_from(&required).unwrap_or(u64::MAX),
-                available,
-            }),
             magnitude_state::Error::Tensor(seismic::TensorError::Execution(
                 seismic::ExecutionError::AllocationFailed(_),
             )) => Self::Capacity(crate::CapacityError {

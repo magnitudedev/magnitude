@@ -804,11 +804,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Err(error)
                     if choice == GrowthChoice::Preferred
                         && matches!(
-                            error,
-                            magnitude_state::Error::Tensor(seismic::TensorError::Execution(
-                                seismic::ExecutionError::AllocationCapacity { .. }
-                                    | seismic::ExecutionError::AllocationFailed(_)
-                            ))
+                            &error,
+                            magnitude_state::Error::Tensor(seismic::TensorError::Execution(execution))
+                                if execution.capacity_refusal().is_some()
+                                    || matches!(execution, seismic::ExecutionError::AllocationFailed(_))
                         ) =>
                 {
                     continue;
@@ -1610,14 +1609,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 /// refused the bytes, otherwise a device failure.
 fn growth_failure(error: seismic::TensorError, bytes: u64, growth: &str) -> DomainError {
     match error {
-        seismic::TensorError::Execution(
-            seismic::ExecutionError::AllocationCapacity { .. }
-            | seismic::ExecutionError::AllocationFailed(_),
-        ) => DomainError::Capacity(CapacityError {
-            resource: ResourceKind::DeviceMemory,
-            required: bytes,
-            available: 0,
-        }),
+        seismic::TensorError::Execution(ref execution)
+            if execution.capacity_refusal().is_some()
+                || matches!(execution, seismic::ExecutionError::AllocationFailed(_)) =>
+        {
+            DomainError::Capacity(CapacityError {
+                resource: ResourceKind::DeviceMemory,
+                required: bytes,
+                available: execution.capacity_refusal().map_or(0, |(_, available)| available),
+            })
+        }
         other => DomainError::Device(crate::DeviceError::Execution(format!("{growth}: {other}"))),
     }
 }

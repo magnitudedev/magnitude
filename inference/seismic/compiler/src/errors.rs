@@ -173,6 +173,13 @@ pub enum ExecutionError {
         required: seismic_lang::expr::BigUint,
         available: u64,
     },
+    /// The driver itself refused an allocation of `required` bytes that
+    /// every ledger admitted, with its own reading of the memory it refused
+    /// from, taken at the refusal.
+    DeviceRefused {
+        required: u64,
+        reading: RefusalReading,
+    },
     /// A closed executable violated a compiler-owned construction premise.
     ConstructionContradiction(String),
     SubmissionFailed(String),
@@ -185,6 +192,68 @@ pub enum ExecutionError {
         issue: Box<ExecutionError>,
         completion: Box<ExecutionError>,
     },
+}
+
+/// A driver's own reading of the memory it refused an allocation from
+/// ([`ExecutionError::DeviceRefused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalReading {
+    /// Metal's working set: `recommendedMaxWorkingSetSize` and the
+    /// process's `currentAllocatedSize`.
+    WorkingSet { recommended: u64, allocated: u64 },
+    /// CUDA's `cuMemGetInfo` of the device.
+    DeviceFree { free: u64, total: u64 },
+    /// Vulkan's `VK_EXT_memory_budget` over the device's own heaps.
+    HeapBudget { budget: u64, usage: u64 },
+    /// Host memory the driver takes for itself or pins for the device,
+    /// which it reports no figure of.
+    Host,
+    /// The driver's figure could not be read at the refusal.
+    Unread,
+}
+
+impl RefusalReading {
+    /// The bytes the driver's reading leaves free to allocate; none where
+    /// it reports no figure.
+    pub fn room(&self) -> u64 {
+        match *self {
+            Self::WorkingSet { recommended, allocated } => recommended.saturating_sub(allocated),
+            Self::DeviceFree { free, .. } => free,
+            Self::HeapBudget { budget, usage } => budget.saturating_sub(usage),
+            Self::Host | Self::Unread => 0,
+        }
+    }
+}
+
+impl ExecutionError {
+    /// The capacity refusal this error is, as the bytes required and the
+    /// bytes available: a ledger's ([`Self::AllocationCapacity`], a demand
+    /// beyond u64 never free) or the driver's own
+    /// ([`Self::DeviceRefused`], available as its reading's room). Every
+    /// caller that classifies a refusal reads it here alone.
+    pub fn capacity_refusal(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::AllocationCapacity { required, available } => {
+                Some((u64::try_from(required).unwrap_or(u64::MAX), *available))
+            }
+            Self::DeviceRefused { required, reading } => Some((*required, reading.room())),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for RefusalReading {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkingSet { recommended, allocated } => {
+                write!(f, "its working set holds {allocated} of the {recommended} bytes Metal recommends")
+            }
+            Self::DeviceFree { free, total } => write!(f, "the device has {free} of its {total} bytes free"),
+            Self::HeapBudget { budget, usage } => write!(f, "its heaps use {usage} of a {budget}-byte budget"),
+            Self::Host => f.write_str("the driver's host memory was exhausted"),
+            Self::Unread => f.write_str("its memory could not be read"),
+        }
+    }
 }
 
 /// A checked source operation that stopped execution, with display location.
@@ -347,6 +416,9 @@ impl fmt::Display for ExecutionError {
                 f,
                 "allocation requires {required} bytes; {available} bytes available"
             ),
+            Self::DeviceRefused { required, reading } => {
+                write!(f, "the driver refused an allocation of {required} bytes: {reading}")
+            }
             Self::ConstructionContradiction(detail) => {
                 write!(f, "closed executable construction contradiction: {detail}")
             }

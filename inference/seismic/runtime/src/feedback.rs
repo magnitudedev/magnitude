@@ -643,14 +643,13 @@ fn packed_input(
 
 fn call_error(error: CallError) -> ObservationError {
     match error {
-        CallError::Execution(ExecutionError::AllocationCapacity {
-            required,
-            available,
-        }) => ObservationError::Capacity {
-            required,
-            limit: available,
+        CallError::Execution(error) => match error.capacity_refusal() {
+            Some((required, available)) => ObservationError::Capacity {
+                required: required.into(),
+                limit: available,
+            },
+            None => ObservationError::Execution(error),
         },
-        CallError::Execution(error) => ObservationError::Execution(error),
         CallError::Invocation(InvocationError::AllocationCapacity {
             required,
             available,
