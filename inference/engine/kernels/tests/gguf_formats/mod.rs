@@ -14,25 +14,9 @@ include!(concat!(env!("OUT_DIR"), "/gguf_format_tests.rs"));
 #[allow(unused_imports)]
 pub(crate) use gguf_format_tests;
 
-/// The tests' pseudo-random source: a 64-bit LCG yielding its high 31 bits.
-pub struct Rng(pub u64);
-
-impl Rng {
-    pub fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (self.0 >> 33) as u32
-    }
-    pub fn byte(&mut self) -> u8 {
-        self.next() as u8
-    }
-    /// Uniform in [0, 1).
-    pub fn fraction(&mut self) -> f32 {
-        (self.next() >> 8) as f32 / (1u32 << 24) as f32
-    }
-}
+#[path = "../random/mod.rs"]
+mod random;
+pub use random::Rng;
 
 /// A GGUF-imported element: weights stored as `encoding`, converted by the
 /// registry into the element whose products take `operands`.

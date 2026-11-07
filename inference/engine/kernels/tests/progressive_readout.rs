@@ -4,6 +4,9 @@
 //! Tests return early when no device of either backend is available.
 
 mod common;
+mod random;
+
+use random::Rng;
 
 use magnitude_kernels::{
     readout_exact_rows, readout_planes_rows, readout_refine_rows, readout_top_rows,
@@ -76,21 +79,6 @@ fn width_param(device: &Device) -> &'static str {
         "SIMDGROUPS"
     } else {
         "WARPS"
-    }
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as u32
-    }
-    fn uniform(&mut self, low: f32, high: f32) -> f32 {
-        low + (high - low) * (self.next() as f32 / (1u64 << 31) as f32)
     }
 }
 

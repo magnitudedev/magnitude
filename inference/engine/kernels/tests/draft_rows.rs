@@ -5,7 +5,10 @@
 //! the entry's contract. The table takes every form a target embedding table
 //! a draft head reads is stored in (Q8_0, Q4_0, Q4_K, Q6_K, BF16).
 
+mod random;
+
 use magnitude_kernels::{draft_rows, repack_weight};
+use random::Rng;
 use seismic::{Device, Element, Layout, NativeSpecialization, Tensor};
 
 fn f16_bits(value: f32) -> u16 {
@@ -17,20 +20,12 @@ fn bf16_round(value: f32) -> f32 {
     f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
 }
 
-struct Random(u64);
-
-impl Random {
-    fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (self.0 >> 33) as u32
-    }
+impl Rng {
     fn code(&mut self) -> i8 {
         (self.next() % 255) as i8
     }
-    fn symmetric(&mut self) -> f32 {
+    /// Uniform over the thousandths in [-1, 1].
+    fn thousandths(&mut self) -> f32 {
         (self.next() % 2001) as f32 / 1000.0 - 1.0
     }
 }
@@ -105,7 +100,7 @@ fn table_weight(
     rows: usize,
     columns: usize,
     scale: f32,
-    random: &mut Random,
+    random: &mut Rng,
 ) -> (Tensor, Vec<f32>) {
     let Some(GgufBlocks {
         external,
@@ -116,7 +111,7 @@ fn table_weight(
     }) = form.gguf()
     else {
         let values = (0..rows * columns)
-            .map(|_| bf16_round(scale * random.symmetric()))
+            .map(|_| bf16_round(scale * random.thousandths()))
             .collect::<Vec<_>>();
         return (
             bf16_tensor(device, &[rows as u64, columns as u64], &values),
@@ -130,7 +125,7 @@ fn table_weight(
             .map(|_| random.next() as u8)
             .collect::<Vec<_>>();
         for &(offset, codes) in scales {
-            let factor = scale / codes * (0.5 + 0.5 * (random.symmetric() + 1.0));
+            let factor = scale / codes * (0.5 + 0.5 * (random.thousandths() + 1.0));
             block[offset..offset + 2].copy_from_slice(&f16_bits(factor).to_le_bytes());
         }
         bytes.extend(block);
@@ -175,7 +170,7 @@ fn q8_weight(
     rows: usize,
     columns: usize,
     scale: f32,
-    random: &mut Random,
+    random: &mut Rng,
 ) -> (Tensor, Vec<f32>) {
     assert_eq!(columns % 32, 0);
     let scale_bits = f16_bits(scale);
@@ -357,18 +352,18 @@ fn draft_rows_match_on(device: &Device) {
         (192, 4, 65),
     ] {
         let kernel = prepare(width, false);
-        let mut random = Random(width as u64 * 31 + rows as u64);
+        let mut random = Rng(width as u64 * 31 + rows as u64);
         let (table, table_values) = q8_weight(&device, vocabulary, width, 0.03125, &mut random);
         let (combine, combine_values) =
             q8_weight(&device, width, 2 * width, 0.0078125, &mut random);
         let embedding_norm_values = (0..width)
-            .map(|_| bf16_round(1.0 + 0.25 * random.symmetric()))
+            .map(|_| bf16_round(1.0 + 0.25 * random.thousandths()))
             .collect::<Vec<_>>();
         let hidden_norm_values = (0..width)
-            .map(|_| bf16_round(1.0 + 0.25 * random.symmetric()))
+            .map(|_| bf16_round(1.0 + 0.25 * random.thousandths()))
             .collect::<Vec<_>>();
         let conditioning_values = (0..rows * width)
-            .map(|_| bf16_round(2.0 * random.symmetric()))
+            .map(|_| bf16_round(2.0 * random.thousandths()))
             .collect::<Vec<_>>();
         // Selection rows (token, status); the last is a failed selection,
         // which embeds zeros.
@@ -537,11 +532,11 @@ fn draft_rows_preserve_distinct_f32_streams() {
         let width = 64;
         let streams = 4;
         for rows in [1, 4, 5, 16, 17, 65] {
-            let mut random = Random(291 + rows as u64);
+            let mut random = Rng(291 + rows as u64);
             let (table, tv) = q8_weight(&device, 3, width, 0.03125, &mut random);
             let (combine, cv) = q8_weight(&device, width, 2 * width, 0.0078125, &mut random);
             let hv = (0..rows * streams * width)
-                .map(|i| random.symmetric() * (1 + i / width % streams) as f32 + 0.00317)
+                .map(|i| random.thousandths() * (1 + i / width % streams) as f32 + 0.00317)
                 .collect::<Vec<_>>();
             let hn = (0..streams * width)
                 .map(|i| bf16_round(0.5 + i as f32 / (streams * width) as f32))
@@ -687,7 +682,7 @@ fn draft_rows_match_with_table(
     if device.backend() == seismic::BackendName::Cpu {
         statics = statics.with_param("INT8", 0);
     }
-    let mut random = Random(width as u64 * 131 + rows as u64 * 7 + form as u64);
+    let mut random = Rng(width as u64 * 131 + rows as u64 * 7 + form as u64);
     let (table, table_values) =
         table_weight(device, form, layout, vocabulary, width, 1.0, &mut random);
     let kernel = draft_rows::native_for_device_with(
@@ -705,13 +700,13 @@ fn draft_rows_match_with_table(
     .unwrap();
     let (combine, combine_values) = q8_weight(device, width, 2 * width, 0.0009765625, &mut random);
     let embedding_norm_values = (0..width)
-        .map(|_| bf16_round(1.0 + 0.25 * random.symmetric()))
+        .map(|_| bf16_round(1.0 + 0.25 * random.thousandths()))
         .collect::<Vec<_>>();
     let hidden_norm_values = (0..width)
-        .map(|_| bf16_round(1.0 + 0.25 * random.symmetric()))
+        .map(|_| bf16_round(1.0 + 0.25 * random.thousandths()))
         .collect::<Vec<_>>();
     let conditioning_values = (0..rows * width)
-        .map(|_| bf16_round(2.0 * random.symmetric()))
+        .map(|_| bf16_round(2.0 * random.thousandths()))
         .collect::<Vec<_>>();
     // The last and odd rows of the table, then spread rows.
     let token_values = (0..rows)

@@ -13,6 +13,9 @@
 //! the result's RMS.
 
 mod common;
+mod random;
+
+use random::Rng;
 
 use magnitude_kernels::{
     vision_attention, vision_clamp, vision_gated_convolution, vision_linear, vision_norm,
@@ -43,25 +46,7 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
-struct Rng(u64);
-
 impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(
-            seed.wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407),
-        )
-    }
-    fn next(&mut self) -> u32 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (self.0 >> 33) as u32
-    }
-    fn symmetric(&mut self) -> f32 {
-        ((self.next() >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
-    }
     fn values(&mut self, count: usize, scale: f32) -> Vec<f32> {
         (0..count).map(|_| self.symmetric() * scale).collect()
     }
@@ -332,7 +317,7 @@ fn patch_stem_matches_its_portable_body() {
                 DType::F32,
                 &[nt, rows, 4],
                 (0..nt * rows * 4)
-                    .map(|_| (rng.symmetric() + 1.0) / 2.0)
+                    .map(|_| rng.fraction())
                     .collect(),
             );
             let expected = interpret(
@@ -917,7 +902,7 @@ fn position_matches_its_portable_body() {
             DType::F32,
             &[rows, 4],
             (0..rows * 4)
-                .map(|_| (rng.symmetric() + 1.0) / 2.0)
+                .map(|_| rng.fraction())
                 .collect(),
         );
         let expected = interpret(

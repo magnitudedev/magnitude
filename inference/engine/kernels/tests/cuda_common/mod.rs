@@ -24,12 +24,6 @@ pub use mapped::Mapped;
 #[allow(unused_imports)]
 pub(crate) use gguf_formats::gguf_format_tests;
 
-impl Rng {
-    pub fn uniform(&mut self, low: f32, high: f32) -> f32 {
-        low + (high - low) * (self.next() as f32 / (1u64 << 31) as f32)
-    }
-}
-
 /// The magnitude of the weights' values, packed and dense.
 pub const WEIGHT_SCALE: f32 = 0.05;
 

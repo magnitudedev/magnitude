@@ -108,17 +108,8 @@ impl Act {
 }
 
 impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(
-            seed.wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407),
-        )
-    }
     fn below(&mut self, n: u32) -> u32 {
         self.next() % n
-    }
-    fn symmetric(&mut self) -> f32 {
-        self.fraction() * 2.0 - 1.0
     }
 }
 
