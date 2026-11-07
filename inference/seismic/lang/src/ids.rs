@@ -278,38 +278,75 @@ impl fmt::Debug for BinderId {
     }
 }
 
-/// Process-global registry identities, scoped by `REGISTRY_REVISION`.
+/// Process-global registry identities. An identity is its entry's key
+/// (`registry::Table::key`): a digest of what names the entry among the
+/// rows of its table, so registering another entry changes no existing
+/// identity, nor anything compared, hashed, ordered, printed or serialized
+/// by it. It also carries the entry's position in this process's table,
+/// which only indexes that table ([`Self::position`]).
 macro_rules! registry_id {
     ($(#[$doc:meta])* $name:ident, $table:ident) => {
         $(#[$doc])*
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(u32);
+        #[derive(Clone, Copy)]
+        pub struct $name {
+            key: u32,
+            position: u32,
+        }
         impl $name {
-            pub(crate) const fn new(index: u32) -> Self { Self(index) }
-            /// The identity's position in its registry table.
-            pub const fn index(self) -> usize { self.0 as usize }
+            pub(crate) const fn new(key: u32, position: u32) -> Self {
+                Self { key, position }
+            }
+            /// The entry's stable key, unchanged by any other entry the
+            /// registry adds: what persisted identities hold.
+            pub const fn key(self) -> u32 {
+                self.key
+            }
+            /// The entry's position in its registry table in this process:
+            /// an index into that table alone, which another entry the
+            /// registry adds can move, so nothing persisted holds it.
+            pub const fn position(self) -> usize {
+                self.position as usize
+            }
+        }
+        impl PartialEq for $name {
+            fn eq(&self, other: &Self) -> bool {
+                self.key == other.key
+            }
+        }
+        impl Eq for $name {}
+        impl PartialOrd for $name {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for $name {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                self.key.cmp(&other.key)
+            }
+        }
+        impl std::hash::Hash for $name {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.key.hash(state)
+            }
         }
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "{}#{}", stringify!($name), self.0)
+                write!(f, "{}#{:08x}", stringify!($name), self.key)
             }
         }
-        /// Registry identities serialize as their index; the bundle header
-        /// pins `REGISTRY_REVISION`, and decoding rejects an index outside
-        /// the table.
+        /// Registry identities serialize as their key, and decoding
+        /// rejects a key no entry of the table has.
         impl Serialize for $name {
             fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                self.0.serialize(serializer)
+                self.key.serialize(serializer)
             }
         }
         impl<'de> Deserialize<'de> for $name {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                let index = u32::deserialize(deserializer)?;
-                if (index as usize) < crate::registry::table_len(crate::registry::Table::$table) {
-                    Ok(Self(index))
-                } else {
-                    Err(D::Error::custom(concat!(stringify!($name), " outside the registry")))
-                }
+                let key = u32::deserialize(deserializer)?;
+                crate::registry::position(crate::registry::Table::$table, key)
+                    .map(|position| Self::new(key, position))
+                    .ok_or_else(|| D::Error::custom(concat!(stringify!($name), " outside the registry")))
             }
         }
     };

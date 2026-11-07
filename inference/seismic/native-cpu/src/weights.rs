@@ -5225,7 +5225,7 @@ mod tests {
             let extents = [rows as u64, k as u64];
             let length = registry::canonical_bytes(conversion.source, &extents)
                 .unwrap_or_else(|| panic!("{name}: no source bytes of {extents:?}"));
-            let mut state = 0x2545_f491_4f6c_dd1du64 ^ conversion.id.index() as u64;
+            let mut state = 0x2545_f491_4f6c_dd1du64 ^ conversion.id.position() as u64;
             let mut source = (0..length)
                 .map(|_| {
                     state ^= state << 13;

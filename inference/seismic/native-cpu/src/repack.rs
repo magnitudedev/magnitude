@@ -470,7 +470,7 @@ pub fn convert(
     if registry::canonical_bytes(conversion.source, extents)? != source.len() as u64 {
         return None;
     }
-    let executors = &executors()[conversion.id.index()];
+    let executors = &executors()[conversion.id.position()];
     Some(match &executors.rows {
         Some(rows) => rows.tensor(extents, source)?,
         None => executors
@@ -503,7 +503,7 @@ fn conversion(
 ) -> Option<&'static RowConversion> {
     executors()[registry::representation_conversion(source, target)?
         .id
-        .index()]
+        .position()]
     .rows
     .as_ref()
 }

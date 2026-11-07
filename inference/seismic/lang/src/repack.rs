@@ -879,7 +879,7 @@ impl WordTable {
                 .iter()
                 .map(|_| OnceLock::new())
                 .collect()
-        })[conversion.id.index()]
+        })[conversion.id.position()]
         .get_or_init(|| Self::build(conversion))
     }
 
@@ -1922,7 +1922,7 @@ mod tests {
         let layout = conversion.source_layout;
         let packets = 64;
         let mut source = registry::pseudo_random_bytes(
-            conversion.id.index() as u64,
+            conversion.id.position() as u64,
             (packets * layout.packet_size) as usize,
         );
         conversion.admit_source(&mut source);

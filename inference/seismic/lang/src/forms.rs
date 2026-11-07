@@ -105,10 +105,10 @@ fn values(backend: BackendName, id: RepresentationId) -> Option<&'static [u32]> 
         let representations = registry::representations();
         let mut values = vec![None; representations.len()];
         for info in representations {
-            values[info.id.index()] = admitted(backend, info.id);
+            values[info.id.position()] = admitted(backend, info.id);
         }
         values
-    })[id.index()]
+    })[id.position()]
     .as_deref()
 }
 

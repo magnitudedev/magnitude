@@ -1608,7 +1608,7 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 32] = [
 /// The tensor's prefix as a function-like macro over its axes, emitted for
 /// Vulkan sources (`render_representation`): `<prefix>(F)` =
 /// `F(<TUPLE_AXES>, <CODING_AXES>)`, its representation's identity
-/// (registry position + 1), its form (`SEISMIC_FORM_*`), a dense form's
+/// (its registry key, nonzero), its form (`SEISMIC_FORM_*`), a dense form's
 /// dtype (`SEISMIC_DTYPE_*`), its storage group (`_LOGICAL_GROUP`) and a row
 /// form's decode axes, 0 where it has none. A selector `SEISMIC_AXIS_<AXIS>`
 /// takes one of them, and `SEISMIC_AXES_NONE(F)` is the tuple of no tensor
@@ -1617,7 +1617,7 @@ const CODING_AXES: [(&str, fn(&Coded) -> String); 32] = [
 /// pastes no tokens.
 #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
 fn render_axes_tuple(out: &mut String, prefix: &str, info: &registry::RepresentationInfo) {
-    let id = info.id.index() + 1;
+    let id = info.id.key();
     let form = info.kind.form();
     let dtype = match &info.kind {
         registry::RepresentationKind::Dense(dtype) => {

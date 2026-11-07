@@ -2181,7 +2181,7 @@ mod tests {
             ] {
                 let packets = extents[0] * extents[1].div_ceil(group);
                 let mut source = registry::pseudo_random_bytes(
-                    conversion.id.index() as u64 ^ extents[1],
+                    conversion.id.position() as u64 ^ extents[1],
                     (packets * u64::from(layout.packet_size)) as usize,
                 );
                 conversion.admit_source(&mut source);
@@ -2249,7 +2249,7 @@ mod tests {
                 let extents = [rows, u64::from(columns)];
                 let packets = rows * u64::from(columns / layout.logical_group);
                 let mut source = registry::pseudo_random_bytes(
-                    conversion.id.index() as u64,
+                    conversion.id.position() as u64,
                     (packets * u64::from(layout.packet_size)) as usize,
                 );
                 conversion.admit_source(&mut source);

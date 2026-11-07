@@ -329,7 +329,7 @@ pub(crate) fn elements() -> impl Iterator<Item = &'static str> {
 
 /// The component index of element `element`, or `None` when it has none.
 fn component(element: RepresentationId) -> Option<usize> {
-    COMPONENT_OF[element.index()]
+    COMPONENT_OF[element.position()]
 }
 
 /// The components of storage element `element` (`registry::storage_of`) on

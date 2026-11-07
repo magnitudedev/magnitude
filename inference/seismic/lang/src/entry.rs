@@ -1852,7 +1852,7 @@ impl CheckedProgramSubject {
         for (name, representation) in &self.elements {
             hash.update((name.len() as u64).to_le_bytes());
             hash.update(name.as_bytes());
-            hash.update((representation.index() as u64).to_le_bytes());
+            hash.update(representation.key().to_le_bytes());
         }
         hash.finalize().into()
     }

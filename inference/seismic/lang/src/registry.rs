@@ -276,7 +276,9 @@ pub enum SourceDialect {
 
 /// Revision of the whole registry. Any semantic change to a primitive,
 /// capability, intrinsic, or representation changes this string, and with it
-/// every cache identity.
+/// every cache identity. Registering a new entry changes no other entry's
+/// meaning nor its identity (`ids::registry_id`, keyed by what names it), so
+/// it changes no revision.
 pub const REGISTRY_REVISION: &str = "seismic-registry-v17";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2051,9 +2053,35 @@ pub(crate) enum Table {
     Representation,
     RepresentationConversion,
 }
-/// The number of rows of `table`.
-pub(crate) fn table_len(table: Table) -> usize {
-    internals::table_len(table)
+impl Table {
+    /// The key of the entry of this table that `name` names among its rows
+    /// (a representation's name; a conversion's endpoints; a capability's
+    /// backend and namespace; an intrinsic's capability, name and overload):
+    /// the low 31 bits of a SHA-256 of the table and the name, so that a
+    /// native source carries it as a signed 32-bit literal. A function of
+    /// the entry's own name alone, it is the same in every registry that
+    /// holds the entry, whatever else it holds. Every key of a table is
+    /// distinct and nonzero (`internals::Positions`).
+    pub(crate) fn key(self, name: &str) -> u32 {
+        use sha2::Digest as _;
+        let mut hash = sha2::Sha256::new();
+        hash.update(b"seismic-registry-key-v1\0");
+        hash.update(match self {
+            Self::Capability => "capability",
+            Self::Intrinsic => "intrinsic",
+            Self::Representation => "representation",
+            Self::RepresentationConversion => "representation-conversion",
+        });
+        hash.update([0]);
+        hash.update(name.as_bytes());
+        let digest: [u8; 32] = hash.finalize().into();
+        u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]) & 0x7fff_ffff
+    }
+}
+/// The position in this process's `table` of its entry keyed `key`; `None`
+/// when no entry of it is.
+pub(crate) fn position(table: Table, key: u32) -> Option<u32> {
+    internals::position(table, key)
 }
 /// The registry's own `'static` copy of an intrinsic or opaque-value name it
 /// declares, or `None` when the registry declares no such name.
@@ -2310,8 +2338,9 @@ pub fn f16_to_f32(value: u16) -> f32 {
 
 pub(crate) mod internals {
     //! The interned tables. Built once from the crate-private
-    //! `intrinsics::capability_rows` and `repr::REPRS` tables; every id is an
-    //! index into these vectors and is valid for the process lifetime.
+    //! `intrinsics::capability_rows` and `repr::REPRS` tables; every id is
+    //! its entry's key (`Table::key`) and its position in these vectors, and
+    //! is valid for the process lifetime.
     //! Capabilities are contiguous per backend and intrinsics contiguous per
     //! capability so backend/capability slices are direct sub-slices.
 
@@ -2334,7 +2363,42 @@ pub(crate) mod internals {
         representations: Vec<RepresentationInfo>,
         /// Built from the representations once they are static
         /// ([`conversions`]): a conversion holds its endpoints' layouts.
-        conversions: OnceLock<Vec<RepresentationConversion>>,
+        conversions: OnceLock<(Vec<RepresentationConversion>, Positions)>,
+        capability_positions: Positions,
+        intrinsic_positions: Positions,
+        representation_positions: Positions,
+    }
+
+    /// The position of each entry of one table by its key, built with the
+    /// table: two entries of one key, or a zero key (a native source's
+    /// absent tensor), are an invariant violation of the registry.
+    pub(super) struct Positions(std::collections::HashMap<u32, u32>);
+
+    impl Positions {
+        fn of(table: Table, keys: impl IntoIterator<Item = (u32, usize)>) -> Self {
+            let mut positions = std::collections::HashMap::new();
+            for (key, position) in keys {
+                assert_ne!(key, 0, "a {table:?} entry is keyed zero");
+                let position = u32::try_from(position).expect("a registry table fits u32 positions");
+                if let Some(other) = positions.insert(key, position) {
+                    panic!("{table:?} entries {other} and {position} share key {key:08x}: rename one");
+                }
+            }
+            Self(positions)
+        }
+    }
+
+    /// The id of the entry named `name` (`Table::key`) at `position` of
+    /// `table`.
+    fn identify<Id>(table: Table, name: &str, position: usize, id: fn(u32, u32) -> Id) -> Id {
+        id(
+            table.key(name),
+            u32::try_from(position).expect("a registry table fits u32 positions"),
+        )
+    }
+
+    fn representation_id(name: &str, position: usize) -> RepresentationId {
+        identify(Table::Representation, name, position, RepresentationId::new)
     }
 
     fn build() -> Tables {
@@ -2343,7 +2407,7 @@ pub(crate) mod internals {
         let mut representations = Vec::new();
         for dtype in DType::ALL {
             representations.push(RepresentationInfo {
-                id: RepresentationId::new(representations.len() as u32),
+                id: representation_id(dtype.name(), representations.len()),
                 name: dtype.name(),
                 representation: dtype.name(),
                 layout: Layout::Packet,
@@ -2355,9 +2419,10 @@ pub(crate) mod internals {
         }
         for repr in REPRS {
             for &operands in repr.operand_recipes() {
+                let name = element_name(repr.name, operands, Layout::Packet);
                 representations.push(RepresentationInfo {
-                    id: RepresentationId::new(representations.len() as u32),
-                    name: element_name(repr.name, operands, Layout::Packet),
+                    id: representation_id(name, representations.len()),
+                    name,
                     representation: repr.name,
                     layout: Layout::Packet,
                     kind: RepresentationKind::Packed(packed_layout(repr)),
@@ -2388,7 +2453,7 @@ pub(crate) mod internals {
         // `ImportSource::acquire`).
         for (name, packet_size, logical_group, _) in external_specs {
             representations.push(RepresentationInfo {
-                id: RepresentationId::new(representations.len() as u32),
+                id: representation_id(name, representations.len()),
                 name,
                 representation: name,
                 layout: Layout::Packet,
@@ -2419,9 +2484,10 @@ pub(crate) mod internals {
                 .expect("external conversion names a registered packed representation");
             for layout in [Layout::Rows16, Layout::Rows8, Layout::Mma16, Layout::Rows32] {
                 for &operands in repr.operand_recipes() {
+                    let name = element_name(resident, operands, layout);
                     representations.push(RepresentationInfo {
-                        id: RepresentationId::new(representations.len() as u32),
-                        name: element_name(resident, operands, layout),
+                        id: representation_id(name, representations.len()),
+                        name,
                         representation: repr.name,
                         layout,
                         kind: RepresentationKind::PackedRows(row_layout(repr, layout)),
@@ -2432,7 +2498,11 @@ pub(crate) mod internals {
                 }
             }
         }
-        let dense_id = |dtype: DType| RepresentationId::new(u32::from(dtype.ordinal()));
+        let representation_positions = Positions::of(
+            Table::Representation,
+            representations.iter().map(|info| (info.id.key(), info.id.position())),
+        );
+        let dense_id = |dtype: DType| representations[usize::from(dtype.ordinal())].id;
 
         let rows = capability_rows();
         let mut capabilities: Vec<CapabilityInfo> = Vec::new();
@@ -2450,7 +2520,12 @@ pub(crate) mod internals {
                 {
                     Some(index) => capabilities[index].id,
                     None => {
-                        let id = CapabilityId::new(capabilities.len() as u32);
+                        let id = identify(
+                            Table::Capability,
+                            &format!("{}/{}", backend.as_str(), row.capability),
+                            capabilities.len(),
+                            CapabilityId::new,
+                        );
                         capabilities.push(CapabilityInfo {
                             id,
                             backend,
@@ -2460,7 +2535,18 @@ pub(crate) mod internals {
                         id
                     }
                 };
-                let id = IntrinsicId::new(intrinsics.len() as u32);
+                // An overload is named by its place among the earlier rows
+                // of its capability and name.
+                let overload = overloads
+                    .iter()
+                    .find(|(owner, name, _)| *owner == capability && *name == row.name)
+                    .map_or(0, |(_, _, rows)| rows.len());
+                let id = identify(
+                    Table::Intrinsic,
+                    &format!("{}/{}/{}#{overload}", backend.as_str(), row.capability, row.name),
+                    intrinsics.len(),
+                    IntrinsicId::new,
+                );
                 let result = match row.result {
                     RowResult::Scalar(dtype) => IntrinsicResultType::Scalar(dtype),
                     RowResult::Owned(dtype, axes) => IntrinsicResultType::Owned {
@@ -2533,14 +2619,14 @@ pub(crate) mod internals {
                     numerical: row.numerics.clone(),
                 });
                 denotations.push(row.denotation);
-                intrinsic_ranges[capability.index()].1 = intrinsics.len();
+                intrinsic_ranges[capability.position()].1 = intrinsics.len();
                 match overloads
                     .iter_mut()
                     .find(|(owner, name, _)| *owner == capability && *name == row.name)
                 {
                     Some((_, _, rows)) => {
                         let categories = |row: IntrinsicId| {
-                            intrinsics[row.index()]
+                            intrinsics[row.position()]
                                 .arguments
                                 .iter()
                                 .map(|argument| &argument.category)
@@ -2558,6 +2644,14 @@ pub(crate) mod internals {
             }
             capability_ranges.push((start, capabilities.len()));
         }
+        let capability_positions = Positions::of(
+            Table::Capability,
+            capabilities.iter().map(|info| (info.id.key(), info.id.position())),
+        );
+        let intrinsic_positions = Positions::of(
+            Table::Intrinsic,
+            intrinsics.iter().map(|signature| (signature.id.key(), signature.id.position())),
+        );
         Tables {
             capabilities,
             capability_ranges,
@@ -2567,6 +2661,9 @@ pub(crate) mod internals {
             overloads,
             representations,
             conversions: OnceLock::new(),
+            capability_positions,
+            intrinsic_positions,
+            representation_positions,
         }
     }
 
@@ -2574,7 +2671,7 @@ pub(crate) mod internals {
     /// external source into every element of its resident representation.
     fn conversions(
         representations: &'static [RepresentationInfo],
-    ) -> Vec<RepresentationConversion> {
+    ) -> (Vec<RepresentationConversion>, Positions) {
         let mut conversions: Vec<RepresentationConversion> = Vec::new();
         for gguf in GGUF_SOURCES {
             let source = representations
@@ -2602,7 +2699,12 @@ pub(crate) mod internals {
                     destination.name
                 );
                 conversions.push(RepresentationConversion {
-                    id: RepresentationConversionId::new(conversions.len() as u32),
+                    id: identify(
+                        Table::RepresentationConversion,
+                        &format!("{}->{}", source.name, destination.name),
+                        conversions.len(),
+                        RepresentationConversionId::new,
+                    ),
                     source: source.id,
                     destination: destination.id,
                     source_layout,
@@ -2611,7 +2713,11 @@ pub(crate) mod internals {
                 });
             }
         }
-        conversions
+        let positions = Positions::of(
+            Table::RepresentationConversion,
+            conversions.iter().map(|conversion| (conversion.id.key(), conversion.id.position())),
+        );
+        (conversions, positions)
     }
 
     /// The physical planes of one packed representation, per storage group.
@@ -3747,7 +3853,7 @@ pub(crate) mod internals {
             .map(|c| c.id)
     }
     pub(super) fn capability_info(id: CapabilityId) -> &'static CapabilityInfo {
-        tables().capabilities.get(id.index()).unwrap_or_else(|| {
+        tables().capabilities.get(id.position()).unwrap_or_else(|| {
             panic!("StaticRegistry produced a CapabilityId outside its capability table (§13.3.1)")
         })
     }
@@ -3767,7 +3873,7 @@ pub(crate) mod internals {
             .map_or(&[], |(_, _, rows)| rows.as_slice())
     }
     pub(super) fn intrinsic_signature(id: IntrinsicId) -> &'static IntrinsicSignature {
-        tables().intrinsics.get(id.index()).unwrap_or_else(|| {
+        tables().intrinsics.get(id.position()).unwrap_or_else(|| {
             panic!("StaticRegistry produced an IntrinsicId outside its intrinsic table (§13.3.1)")
         })
     }
@@ -3775,7 +3881,7 @@ pub(crate) mod internals {
         let t = tables();
         let (start, end) = *t
             .intrinsic_ranges
-            .get(capability.index())
+            .get(capability.position())
             .unwrap_or_else(|| {
                 panic!(
                     "StaticRegistry produced a CapabilityId outside its intrinsic ranges (§13.3.1)"
@@ -3790,7 +3896,7 @@ pub(crate) mod internals {
             .map(|r| r.id)
     }
     pub(super) fn representation_info(id: RepresentationId) -> &'static RepresentationInfo {
-        tables().representations.get(id.index()).unwrap_or_else(|| {
+        tables().representations.get(id.position()).unwrap_or_else(|| {
             panic!("StaticRegistry produced a RepresentationId outside its representation table (§13.3.1)")
         })
     }
@@ -3806,6 +3912,9 @@ pub(crate) mod internals {
             .find(|conversion| conversion.source == source && conversion.destination == destination)
     }
     pub(super) fn representation_conversions() -> &'static [RepresentationConversion] {
+        &conversion_table().0
+    }
+    fn conversion_table() -> &'static (Vec<RepresentationConversion>, Positions) {
         let tables = tables();
         tables
             .conversions
@@ -3814,21 +3923,22 @@ pub(crate) mod internals {
     pub(super) fn representation_conversion_info(
         id: RepresentationConversionId,
     ) -> &'static RepresentationConversion {
-        representation_conversions().get(id.index()).unwrap_or_else(|| {
+        representation_conversions().get(id.position()).unwrap_or_else(|| {
             panic!("StaticRegistry produced a RepresentationConversionId outside its conversion table (§13.3.1)")
         })
     }
     pub(super) fn dense(dtype: DType) -> RepresentationId {
-        RepresentationId::new(u32::from(dtype.ordinal()))
+        tables().representations[usize::from(dtype.ordinal())].id
     }
-    pub(super) fn table_len(table: Table) -> usize {
+    pub(super) fn position(table: Table, key: u32) -> Option<u32> {
         let t = tables();
-        match table {
-            Table::Capability => t.capabilities.len(),
-            Table::Intrinsic => t.intrinsics.len(),
-            Table::Representation => t.representations.len(),
-            Table::RepresentationConversion => representation_conversions().len(),
-        }
+        let Positions(positions) = match table {
+            Table::Capability => &t.capability_positions,
+            Table::Intrinsic => &t.intrinsic_positions,
+            Table::Representation => &t.representation_positions,
+            Table::RepresentationConversion => &conversion_table().1,
+        };
+        positions.get(&key).copied()
     }
     pub(super) fn declared_name(name: &str) -> Option<&'static str> {
         static NAMES: OnceLock<std::collections::HashSet<&'static str>> = OnceLock::new();
@@ -3853,7 +3963,7 @@ pub(crate) mod internals {
     }
 
     pub(super) fn intrinsic_denotation(id: IntrinsicId) -> IntrinsicDenotation {
-        *tables().denotations.get(id.index()).unwrap_or_else(|| {
+        *tables().denotations.get(id.position()).unwrap_or_else(|| {
             panic!("StaticRegistry produced an IntrinsicId outside its denotation table (§13.3.1)")
         })
     }
@@ -3955,6 +4065,44 @@ mod tests {
         assert_eq!(representation_info(dense(DType::BF16)).name, "bf16");
     }
 
+    /// Every registry id is its entry's key, a function of the entry's own
+    /// name alone (`Table::key`), so an entry the registry adds moves no
+    /// other's: these keys are what a stored identity of each holds, and
+    /// stay as pinned whatever is registered beside them. Each id decodes
+    /// back from its key to its own row.
+    #[test]
+    fn registry_ids_are_keyed_by_their_entries_alone() {
+        for info in representations() {
+            assert_eq!(info.id.key(), Table::Representation.key(info.name), "{}", info.name);
+            assert_eq!(position(Table::Representation, info.id.key()), Some(info.id.position() as u32));
+            assert_eq!(representation_info(info.id).name, info.name);
+        }
+        for conversion in representation_conversions() {
+            let name = |id| representation_info(id).name;
+            let named = format!("{}->{}", name(conversion.source), name(conversion.destination));
+            assert_eq!(conversion.id.key(), Table::RepresentationConversion.key(&named));
+            assert_eq!(representation_conversion_info(conversion.id).id, conversion.id);
+        }
+        for backend in BackendName::ALL {
+            for info in capabilities(backend) {
+                let named = format!("{}/{}", backend.as_str(), info.name);
+                assert_eq!(info.id.key(), Table::Capability.key(&named));
+            }
+        }
+        for (name, key) in [
+            ("bf16", 0x3ea6_6b24),
+            ("q4k", 0x6fa9_755d),
+            ("q4k@rows8", 0x01b9_0318),
+            ("q8g32s", 0x3798_44ef),
+            ("q8g32s@rows16", 0x22c8_712e),
+            ("gguf_q4_k", 0x4ab2_f455),
+            ("gguf_q8_0", 0x1f9a_479c),
+        ] {
+            assert_eq!(representation(name).map(|id| id.key()), Some(key), "{name}");
+        }
+        assert_eq!(position(Table::Representation, 0), None);
+    }
+
     #[test]
     fn overloads_resolve_each_row_by_its_operands() {
         for backend in BackendName::ALL {
@@ -3962,7 +4110,7 @@ mod tests {
                 for signature in intrinsics(info.id) {
                     let overload = intrinsic_overloads(info.id, signature.name);
                     assert!(overload.contains(&signature.id));
-                    assert!(overload.windows(2).all(|pair| pair[0] < pair[1]));
+                    assert!(overload.windows(2).all(|pair| pair[0].position() < pair[1].position()));
                     let operands = signature
                         .arguments
                         .iter()
