@@ -94,6 +94,34 @@ pub(crate) fn thread_cpu_seconds() -> Result<f64, Error> {
     Ok((kernel + user) as f64 * 1e-7)
 }
 
+/// The processor seconds every thread of the process has run.
+#[cfg(unix)]
+pub(crate) fn process_cpu_seconds() -> Result<f64, Error> {
+    let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: the clock writes the one `timespec` it is given.
+    if unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(time.tv_sec as f64 + time.tv_nsec as f64 * 1e-9)
+}
+
+#[cfg(windows)]
+pub(crate) fn process_cpu_seconds() -> Result<f64, Error> {
+    use std::os::windows::io::RawHandle;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> RawHandle;
+        fn GetProcessTimes(process: RawHandle, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    }
+    let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+    // SAFETY: the process's pseudo-handle, and four `FILETIME`s (each
+    // 100 ns ticks in a u64) the call writes.
+    if unsafe { GetProcessTimes(GetCurrentProcess(), &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok((kernel + user) as f64 * 1e-7)
+}
+
 /// The volume `file` lies on.
 #[cfg(unix)]
 pub(crate) fn volume_key(file: &File) -> Result<Volume, Error> {

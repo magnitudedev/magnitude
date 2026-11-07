@@ -92,10 +92,12 @@ impl EarlierChoice {
 
 impl Curve {
     /// The rule a curve is kept by, a term of a stored curve's key, so a
-    /// curve probed by another is probed again: 5, every point kept,
-    /// windows from one read, and each lone time a step's whole request's
-    /// (4 timed one record of it; [`EarlierChoice`] the rule before).
-    pub const SCHEMA: u64 = 5;
+    /// curve probed by another is probed again: 6, every point kept,
+    /// windows from one read, each lone time a step's whole request's, and
+    /// the request's range line through the engine, its knee (5 had none
+    /// and took the knee of the power-of-two read sizes; 4 timed one record
+    /// of a request; [`EarlierChoice`] the rule before).
+    pub const SCHEMA: u64 = 6;
 }
 
 /// Each volume's lines, by volume.

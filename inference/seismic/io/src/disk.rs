@@ -27,7 +27,7 @@ pub(crate) use volume::VolumeReads;
 #[cfg(all(test, unix))]
 pub(crate) use platform::drop_pages;
 #[cfg(test)]
-pub(crate) use probe::{full_rate, grid, WIDEST_WINDOW};
+pub(crate) use probe::{full_rate, grid, Request, WIDEST_WINDOW};
 
 use platform::{evict, open_cached, uncached};
 

@@ -1303,7 +1303,8 @@ pub enum StoredVolume {
 /// reads or evicts a file to time it. Each point of the curve is three
 /// terms (its rate, spread and cores, keyed by its read size and window),
 /// each lone time two (its seconds and their error, keyed by its read
-/// size).
+/// size), each point of its range line three (keyed by its depth in
+/// ranges).
 pub struct VolumeCosts;
 
 impl VolumeCosts {
@@ -1340,7 +1341,7 @@ impl VolumeCosts {
     ) -> Result<Option<StoredVolume>, ExecutorCostsError> {
         let identity = executor_identity(topology, executor)?;
         let term = |schema: u64, term: &str, at: &[(&str, u64)]| measured(store, &Self::key(&identity, file, urgent, schema, term, at)?, "volume record");
-        let (grid, lone) = seismic_io::Curve::grid(urgent);
+        let (grid, lone, depths) = seismic_io::Curve::grid(urgent);
         let schema = seismic_io::Curve::SCHEMA;
         let mut points = Vec::with_capacity(grid.len());
         for (read, window) in grid {
@@ -1360,8 +1361,21 @@ impl VolumeCosts {
             };
             lones.push(seismic_io::Lone { read, seconds, error });
         }
+        // A range line ends at its first flat depth ("A volume's curve"):
+        // its points are the depths stored before the first missing one.
+        let mut ranges = Vec::with_capacity(depths.len());
+        for depth in depths {
+            let at = [("depth", depth)];
+            let (Some(rate), Some(spread), Some(cores)) = (term(schema, "range_rate", &at)?, term(schema, "range_spread", &at)?, term(schema, "range_cores", &at)?) else {
+                break;
+            };
+            ranges.push(seismic_io::Curve::range_point(urgent.expect("a range line is a request's"), depth, rate, spread, cores));
+        }
+        if urgent.is_some() && ranges.is_empty() {
+            points.clear();
+        }
         if !points.is_empty() {
-            return Ok(Some(StoredVolume::Current(seismic_io::Curve { points, lone: lones })));
+            return Ok(Some(StoredVolume::Current(seismic_io::Curve { points, lone: lones, ranges })));
         }
         let schema = seismic_io::EarlierChoice::SCHEMA;
         let (window, demand, read, demand_read, cores) = (term(schema, "window", &[])?, term(schema, "demand", &[])?, term(schema, "read", &[])?, term(schema, "demand_read", &[])?, term(schema, "cores", &[])?);
@@ -1388,7 +1402,11 @@ impl VolumeCosts {
             [("rate", point.rate), ("spread", point.spread), ("cores", point.cores)].map(|(term, value)| (term, at.clone(), value))
         });
         let lone = curve.lone.iter().flat_map(|lone| [("lone", lone.seconds), ("lone_error", lone.error)].map(|(term, value)| (term, vec![("read", lone.read)], value)));
-        for (term, at, value) in points.chain(lone) {
+        let ranges = curve.ranges.iter().flat_map(|point| {
+            let at = vec![("depth", point.window / point.read)];
+            [("range_rate", point.rate), ("range_spread", point.spread), ("range_cores", point.cores)].map(|(term, value)| (term, at.clone(), value))
+        });
+        for (term, at, value) in points.chain(lone).chain(ranges) {
             let timing = Timing { median: value, interval: None, samples: 1 };
             store.store(&Self::key(&identity, file, urgent, schema, term, &at)?, &Record::Measured(timing)).map_err(|cause| error(&cause))?;
         }

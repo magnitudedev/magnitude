@@ -2,7 +2,7 @@ use super::*;
 use crate::accounting::{Book, Wait};
 #[cfg(unix)]
 use crate::disk::drop_pages;
-use crate::disk::{full_rate, grid, Shape, VolumeReads, LEAST_READ, WIDEST_WINDOW};
+use crate::disk::{full_rate, grid, Request, Shape, VolumeReads, LEAST_READ, WIDEST_WINDOW};
 use crate::scheduler::{pieces, Engine, Part, Piece, Queue, Queued, RequestState, Span};
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -680,10 +680,12 @@ fn a_reader_reads_by_the_earlier_choice_until_the_curve_holds_its_request() {
     assert_eq!((adopted.due, adopted.knee, adopted.ahead_read, adopted.due_read), (8 << 20, 4 << 20, 256 << 10, 1 << 20));
     assert_eq!(read_cores([&source], &urgent).unwrap(), 1.5);
     let point = |window: u64, rate: f64| Point { read: LEAST_READ, window, rate: rate * 1e9, spread: 0.01e9, cores: 2. };
-    let curve = Curve { points: vec![point(LEAST_READ, 0.4), point(4 * LEAST_READ, 1.5), point(16 * LEAST_READ, 3.)], lone: vec![Lone { read: LEAST_READ, seconds: 1e-3, error: 1e-5 }] };
+    let ranges = vec![Curve::range_point(&urgent, 1, 0.5e9, 0.01e9, 1.), Curve::range_point(&urgent, 2, 0.9e9, 0.01e9, 1.)];
+    let curve = Curve { points: vec![point(LEAST_READ, 0.4), point(4 * LEAST_READ, 1.5), point(16 * LEAST_READ, 3.)], lone: vec![Lone { read: LEAST_READ, seconds: 1e-3, error: 1e-5 }], ranges };
     adopt_volume(&source, Some(&urgent), &curve).unwrap();
     let probed = Reader::open_urgent(&path, CachePolicy::Uncached, &urgent).unwrap().volume.shape;
-    assert_eq!(probed, Shape::of(&curve.points, Some((&urgent, &curve.lone))), "the curve, once it holds the request");
+    let request = Request { urgent: &urgent, lone: &curve.lone, ranges: &curve.ranges };
+    assert_eq!(probed, Shape::of(&curve.points, Some(request)), "the curve, once it holds the request");
     assert_eq!(read_cores([&source], &urgent).unwrap(), 2.);
     std::fs::remove_file(path).unwrap();
 }
@@ -752,8 +754,9 @@ fn recorded(lines: &[(u64, &[(u64, f64)])]) -> Vec<Point> {
 /// deep in 128 KiB ones, 16 MiB either way, so it reads ahead 16 MiB deep in
 /// the wider. The M4 Pro's flattens at 4.02 GB/s 8 deep in 256 KiB reads,
 /// 128 KiB ones never reach it: 2 MiB ahead. GB10's 128 KiB line reaches
-/// 10.09 GB/s at 8 MiB and is flat after: it reads ahead 8 MiB deep and due
-/// at the line's widest, 32 MiB.
+/// 10.09 GB/s at 8 MiB and is flat after: with no request it reads ahead
+/// 8 MiB deep; a request's knee is its range line's, and its due depth the
+/// 128 KiB line's widest, 32 MiB.
 #[test]
 fn a_links_depths_come_from_its_curve() {
     let mib = 1024 * 1024;
@@ -771,9 +774,12 @@ fn a_links_depths_come_from_its_curve() {
     assert_eq!((shape.ahead_read, shape.knee), (2 * LEAST_READ, 2 * mib));
     let gb10 = recorded(&[(LEAST_READ, &[(1, 0.438), (16, 6.02), (32, 9.66), (64, 10.09), (128, 10.12), (256, 10.10)])]);
     let lone = [Lone { read: LEAST_READ, seconds: 0.634e-3, error: 0.02e-3 }];
+    let shape = Shape::of(&gb10, None);
+    assert_eq!((shape.ahead_read, shape.knee), (LEAST_READ, 8 * mib));
     let expert = Urgent { parts: vec![589_824, 589_824, 720_896], records: 1 };
-    let shape = Shape::of(&gb10, Some((&expert, &lone)));
-    assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (LEAST_READ, 8 * mib, LEAST_READ, 32 * mib));
+    let ranges = range_line(&expert, &[(1, 1.2), (2, 2.3), (4, 4.2), (8, 7.0), (16, 9.9), (32, 10.0)]);
+    let shape = Shape::of(&gb10, Some(Request { urgent: &expert, lone: &lone, ranges: &ranges }));
+    assert_eq!((shape.ahead_read, shape.knee, shape.due_read, shape.due), (8 * LEAST_READ, 16 * expert.range(), LEAST_READ, 32 * mib));
 }
 
 /// A due depth holds a step's whole request: where the due size's line
@@ -787,9 +793,52 @@ fn a_due_depth_holds_a_steps_whole_request() {
     let internal = recorded(&[(read, &[(1, 2.1), (2, 3.6), (4, 5.05), (8, 4.6), (16, 4.5), (32, 4.5)])]);
     let lone = [Lone { read, seconds: 3.1e-3, error: 0.05e-3 }];
     let step = Urgent { parts: vec![589_824, 589_824, 720_896], records: 8 };
-    assert_eq!(Shape::of(&internal, Some((&step, &lone))).due, 16 * mib, "eight experts' 15.2 MB whole");
+    let ranges = range_line(&step, &[(1, 1.9), (2, 3.2), (4, 3.9), (8, 3.95), (16, 3.9), (32, 3.9)]);
+    assert_eq!(Shape::of(&internal, Some(Request { urgent: &step, lone: &lone, ranges: &ranges })).due, 16 * mib, "eight experts' 15.2 MB whole");
     let one = Urgent { records: 1, ..step };
-    assert_eq!(Shape::of(&internal, Some((&one, &lone))).due, 4 * mib, "the line's full-rate window holds one");
+    assert_eq!(Shape::of(&internal, Some(Request { urgent: &one, lone: &lone, ranges: &ranges })).due, 4 * mib, "the line's full-rate window holds one");
+}
+
+/// A request's knee is its range line's: an M4 Pro's internal drive reads
+/// its 580–710 KiB ranges at full rate 4 deep through the engine, about
+/// 2.5 MB, where its 1 MiB reads' line peaks at 4 MiB; its reads ahead are
+/// cut whole, each range one piece, as the line read them.
+#[test]
+fn a_requests_knee_is_its_range_lines() {
+    let mib = 1024 * 1024;
+    let read = 8 * LEAST_READ;
+    let internal = recorded(&[(read, &[(1, 2.1), (2, 3.6), (4, 5.05), (8, 4.6), (16, 4.5), (32, 4.5)])]);
+    let lone = [Lone { read, seconds: 3.1e-3, error: 0.05e-3 }];
+    let step = Urgent { parts: vec![589_824, 589_824, 720_896], records: 8 };
+    assert_eq!(Shape::of(&internal, None).knee, 4 * mib, "the 1 MiB reads' knee");
+    let ranges = range_line(&step, &[(1, 1.9), (2, 3.2), (4, 3.9), (8, 3.95), (16, 3.9), (32, 3.9)]);
+    let shape = Shape::of(&internal, Some(Request { urgent: &step, lone: &lone, ranges: &ranges }));
+    assert_eq!((shape.knee, shape.ahead_read), (4 * step.range(), read), "four ranges, each one piece");
+    assert_eq!(step.depths(), vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 18, 22, 27, 33, 41], "every depth to 8, a quarter more past it, to 32 MiB of 704 KiB ranges");
+}
+
+/// A request's probe reads its range line through the engine at each of
+/// its depths, and its link reads ahead to that line's knee, whole ranges.
+#[cfg(unix)]
+#[test]
+fn a_requests_probe_reads_its_range_line() {
+    let _volume = temporary_volume();
+    let path = temporary("range-line", &vec![7u8; 1 << 20]);
+    let source = OpenFile::open(&path).unwrap();
+    let urgent = Urgent { parts: vec![40_000, 24_000, 64_000], records: 2 };
+    let curve = probe_volume(&source, Some(&urgent)).unwrap();
+    let depths = curve.ranges.iter().map(|point| point.window / point.read).collect::<Vec<_>>();
+    assert!(urgent.depths().starts_with(&depths) && !depths.is_empty(), "{depths:?}: its depths in order, to its first flat one");
+    assert!(curve.ranges.iter().all(|point| point.rate > 0.), "{:?}", curve.ranges);
+    let shape = link_shape(&source, Some(&urgent)).unwrap();
+    assert_eq!(shape.knee % urgent.range(), 0, "a knee of whole ranges");
+    assert_eq!(shape.ahead_read, LEAST_READ, "the least read holding the widest range");
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A request's range line at each depth, GB/s, with a spread of 2%.
+fn range_line(urgent: &Urgent, line: &[(u64, f64)]) -> Vec<Point> {
+    line.iter().map(|&(depth, rate)| Curve::range_point(urgent, depth, rate * 1e9, 0.02 * rate * 1e9, 1.)).collect()
 }
 
 /// A request's due pieces are cut at the size its lone record is served
@@ -803,10 +852,11 @@ fn due_pieces_are_cut_at_the_size_a_lone_request_is_soonest() {
     ]);
     let lone = [Lone { read: LEAST_READ, seconds: 0.7e-3, error: 1e-5 }, Lone { read: 8 * LEAST_READ, seconds: 0.6e-3, error: 1e-5 }];
     let request = Urgent { parts: vec![589_824, 589_824, 720_896], records: 8 };
-    let shape = Shape::of(&points, Some((&request, &lone)));
+    let ranges = range_line(&request, &[(1, 2.), (8, 6.)]);
+    let shape = Shape::of(&points, Some(Request { urgent: &request, lone: &lone, ranges: &ranges }));
     assert_eq!((shape.ahead_read, shape.due_read), (8 * LEAST_READ, 8 * LEAST_READ));
     let lone = [Lone { read: LEAST_READ, seconds: 0.5e-3, error: 1e-5 }, Lone { read: 8 * LEAST_READ, seconds: 0.6e-3, error: 1e-5 }];
-    assert_eq!(Shape::of(&points, Some((&request, &lone))).due_read, LEAST_READ);
+    assert_eq!(Shape::of(&points, Some(Request { urgent: &request, lone: &lone, ranges: &ranges })).due_read, LEAST_READ);
     assert_eq!(request.reads(), vec![LEAST_READ, 2 * LEAST_READ, 4 * LEAST_READ, 8 * LEAST_READ]);
     assert_eq!(Urgent { parts: vec![4096], records: 1 }.reads(), vec![LEAST_READ]);
 }
