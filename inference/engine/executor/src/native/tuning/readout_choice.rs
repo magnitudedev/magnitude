@@ -1810,6 +1810,35 @@ mod tests {
             .collect()
     }
 
+    /// `chosen` with its tuning parameter `name` (of launch `launch`, or the
+    /// declaration's own where none) at a legal value other than the one it
+    /// holds, the canonical head's declaration read on `device`: a choice
+    /// another load may hold, whatever the declaration's default is.
+    fn differing(
+        device: &seismic::Device,
+        recipe: ReadoutRecipe,
+        chosen: &NativeSpecialization,
+        launch: Option<usize>,
+        name: &str,
+    ) -> NativeSpecialization {
+        let implementation = recipe.head_entry().offered(device).unwrap().unwrap();
+        let (parameters, held) = match launch {
+            None => (&implementation.params, chosen.param(name)),
+            Some(launch) => (&implementation.launches[launch].params, chosen.launch_param(launch, name)),
+        };
+        let parameter = parameters.iter().find(|parameter| parameter.name == name).unwrap();
+        parameter
+            .values
+            .iter()
+            .filter(|&&value| Some(value) != held)
+            .map(|&value| match launch {
+                None => chosen.clone().with_param(name, value),
+                Some(launch) => chosen.clone().with_launch_param(launch, name, value),
+            })
+            .find(|other| implementation.validate(other).is_ok())
+            .unwrap_or_else(|| panic!("{name} has a legal value other than {held:?}"))
+    }
+
     /// A canonical head choice as it serves the compared rows: one that
     /// differs only in what other row counts run (on Metal the row count
     /// from which the batched launch serves, on CUDA the large-batch GEMM's
@@ -1821,8 +1850,14 @@ mod tests {
             let backend = device.backend();
             let (recipe, compared) = recipe_on(&device);
             let (other, rows) = match backend {
-                BackendName::Metal => (compared.clone().with_param("BATCH_FROM", 3), 4),
-                _ => (compared.clone().with_launch_param(4, "ROTATE", 1), 65),
+                // The two batch from different rows: at the fewer, one
+                // batches and the other runs the GEMV.
+                BackendName::Metal => {
+                    let other = differing(&device, recipe, &compared, None, "BATCH_FROM");
+                    let rows = compared.param("BATCH_FROM").min(other.param("BATCH_FROM")).unwrap();
+                    (other, rows)
+                }
+                _ => (differing(&device, recipe, &compared, Some(4), "ROTATE"), 65),
             };
             let served = |specialization: &NativeSpecialization, rows| {
                 recipe.served_canonical(&device, specialization, rows).unwrap()
@@ -1852,8 +1887,8 @@ mod tests {
                 _ => plain.clone().with_launch_param(1, "KSPLIT", 2),
             };
             let alike = match backend {
-                BackendName::Metal => plain.clone().with_param("BATCH_FROM", 3),
-                _ => plain.clone().with_launch_param(4, "ROTATE", 1),
+                BackendName::Metal => differing(&device, recipe, &plain, None, "BATCH_FROM"),
+                _ => differing(&device, recipe, &plain, Some(4), "ROTATE"),
             };
             let root = std::env::temp_dir().join(format!(
                 "magnitude-readout-records-{backend:?}-{}",
