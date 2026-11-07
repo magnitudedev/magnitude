@@ -1892,6 +1892,15 @@ mod internals {
                 format!("arg_{ordinal}")
             };
             match &parameter.kind {
+                // A host port is in the words but bound to no buffer
+                // (`abi::bound`): the kernel never accesses it.
+                ParameterSummaryKind::Tensor {
+                    access: TensorAccess::Host { .. },
+                    rank,
+                    ..
+                } => {
+                    word += *rank as usize * 2;
+                }
                 ParameterSummaryKind::Tensor { rank, element, .. } => {
                     let rank = *rank as usize;
                     tensor(out, &name, cpu_view(element, &elements), buffer, word, rank);
@@ -2975,6 +2984,40 @@ mod native_tests {
             BuildError::NativeAbi { symbol, .. } => assert_eq!(symbol, "SEISMIC_TUNE_WIDTH"),
             other => panic!("unexpected error: {other}"),
         }
+        fs::remove_dir_all(&root).expect("remove fixture directory");
+    }
+
+    /// A host port occupies its extent and stride words but no buffer
+    /// (`abi::bound`), so the CPU context numbers the buffers after it from
+    /// the first bound one.
+    #[test]
+    fn cpu_host_ports_take_words_but_no_buffer() {
+        let root = fixture("cpu-host-port");
+        let source = root.join("ops.seismic");
+        fs::write(&source, "fn scale[N](layout: &host tensor[N] i32, x: &tensor[N] f32) -> tensor[N] f32:\n    let mut output = tensor[N] f32\n    for i in 0..N:\n        output[i] = x[i]\n    return output\n\nnative scale for cpu from \"native/scale.rs\":\n    launch scale:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n").expect("Seismic fixture");
+        fs::write(root.join("native/scale.rs"), "fn scale<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {\n    let i = group[0] as usize;\n    unsafe { cx.result_0().set([i], cx.arg_x().get([i])) };\n}\n").expect("CPU fixture");
+        let artifacts = Build::new("fixture")
+            .source(&source)
+            .std(false)
+            .out_dir(root.join("out"))
+            .run()
+            .expect("a CPU entry with a host port builds");
+        let generated = fs::read_to_string(&artifacts.bindings).expect("generated bindings");
+        let accessor = |name: &str| {
+            let start = generated
+                .find(&format!("pub fn {name}(&self)"))
+                .unwrap_or_else(|| panic!("`{name}` is generated"));
+            let end = start + generated[start..].find(" }\n").expect("accessor end");
+            generated[start..end].to_owned()
+        };
+        // Word 0 is N, words 1 and 2 are the host port's extent and stride.
+        let x = accessor("arg_x");
+        assert!(x.contains("self.invocation.buffer(0)"), "{x}");
+        assert!(x.contains("[self.invocation.word(3)], [self.invocation.word(4)]"), "{x}");
+        let result = accessor("result_0");
+        assert!(result.contains("self.invocation.buffer(1)"), "{result}");
+        assert!(result.contains("[self.invocation.word(5)], [self.invocation.word(6)]"), "{result}");
+        assert!(!generated.contains("pub fn arg_layout("));
         fs::remove_dir_all(&root).expect("remove fixture directory");
     }
 
