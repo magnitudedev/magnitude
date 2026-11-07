@@ -108,14 +108,12 @@ fn attention_output[M, D, SN, IN, Q, W, OS, OB](hidden: &tensor[M, SN * D] f32, 
 # scratch, over the gated rows (the weights' factors a simdgroup per weight
 # row), for weights admitted to it (`form(OW, PACK)`); devices without the
 # packed path run the staged tile, with its results.
-# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
-# 0.85x the time batched that they took on the GEMV (30 opens, at most
-# 0.90x), and 0.86x for a 2560-wide model. Fewer than 3 rows and more than 4
-# launch alike either way.
 native attention_output for metal from "metal/attention_output.metal":
     static (D, SN, IN, Q, W, OS, OB)
-    params (arithmetic BATCH_FROM in [3, 5, 9] default 3, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
+    params (arithmetic BATCH_FROM in [3, 5, 9] default least where BATCH_FROM >= 5 or (BATCH_FROM >= 3 and (GEMV_WIDTH < 512 or (Q * W % 256 == 0 and form(OW, MATRIX) == 1))), arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
         arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
+    let GEMV_WEIGHT_ROWS = D
+    let GEMV_WIDTH = Q * W
     where Q * W > 0 and (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0 and form(OW, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and OB > 0 and form(OW, PACK_RESIDUE) == 1)) and (MATRIX == 0 or (Q * W % 256 == 0 and form(OW, MATRIX) == 1))
     scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * D * 4) when M > 16 and M <= 64
@@ -127,7 +125,7 @@ native attention_output for metal from "metal/attention_output.metal":
     scratch weight_scales bytes (D * 4) when M > 64 and PACK == 1
     scratch staged bytes (M * Q * W * 2) when M >= BATCH_FROM and operands(OW) == 1
     launch attention_output_gemv when M < 2:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32, 8] default 16)
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32, 8] default least where LANES >= 16 or GEMV_WIDTH < 512)
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
@@ -160,12 +158,12 @@ native attention_output for metal from "metal/attention_output.metal":
         threadgroups (ceil_div(D, 32), ceil_div(M, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
     launch attention_output_gemv_rows when M >= 3 and M < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default 2, arithmetic LANES in [8, 16, 32] default 8)
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default least where ROWS >= 2 or GEMV_WEIGHT_ROWS <= 1024 or (GEMV_WEIGHT_ROWS > 4096 and GEMV_WEIGHT_ROWS <= 65536), arithmetic LANES in [8, 16, 32] default 8)
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
     launch attention_output_gemv_pair when M == 2 and M < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default 2, arithmetic LANES in [8, 16, 32] default 8)
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1, 4] default least where ROWS >= 2 or GEMV_WEIGHT_ROWS <= 1024 or (GEMV_WEIGHT_ROWS > 4096 and GEMV_WEIGHT_ROWS <= 65536), arithmetic LANES in [8, 16, 32] default 8)
         threadgroups (ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(Q * W, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
@@ -384,10 +382,13 @@ fn attention_project[M, D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB](
 # weights the operand does not serve and for the zero tiles of mode 1. PACK
 # is admitted where a segment's weights are (`form(W, PACK)`), and RESIDUE 2
 # where a bounded segment's codes take the residue (`form(W, PACK_RESIDUE)`).
+# Defaults: the GEMV rule (`dense_rows.seismic`).
 native attention_project for metal from "metal/attention_project.metal":
     static (D, PT, NM, Q, GR, K, V, QS, GS, KS, VS, QB, GB, KB, VB)
-    params (arithmetic BATCH_FROM in [5, 3, 9] default 5, form TALL in [1, 0] default 1, arithmetic form PACK in [0, 1] default 0,
+    params (arithmetic BATCH_FROM in [5, 3, 9] default least where BATCH_FROM >= 5 or (BATCH_FROM >= 3 and GEMV_WIDTH < 512), form TALL in [1, 0] default 1, arithmetic form PACK in [0, 1] default 0,
         arithmetic form RESIDUE in [1, 2] default 1)
+    let GEMV_WEIGHT_ROWS = Q + GR + K + V
+    let GEMV_WIDTH = D
     where D > 0 and (TALL == 0 or D % 128 == 0) and (PACK == 0 or (TALL == 1 and D % 256 == 0 and D < 1048576 and Q % 32 == 0 and GR % 32 == 0 and K % 32 == 0 and V % 32 == 0 and ((Q > 0 and form(QW, PACK) == 1) or (GR > 0 and form(GW, PACK) == 1) or (K > 0 and form(KW, PACK) == 1) or (V > 0 and form(VW, PACK) == 1)))) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and ((QB > 0 and form(QW, PACK_RESIDUE) == 1) or (GB > 0 and form(GW, PACK_RESIDUE) == 1) or (KB > 0 and form(KW, PACK_RESIDUE) == 1) or (VB > 0 and form(VW, PACK_RESIDUE) == 1))))
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * D * 2) when M > 16
     scratch packed bytes (ceil_div(M, 128) * 128 * D * 2 + 1024) when M > 64 and PACK == 1
@@ -399,7 +400,7 @@ native attention_project for metal from "metal/attention_project.metal":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch attention_project_gemv when M < 2:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32, 8] default 16)
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32, 8] default least where LANES >= 16 or GEMV_WIDTH < 512)
         threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
@@ -432,7 +433,7 @@ native attention_project for metal from "metal/attention_project.metal":
             ceil_div(M, TALL_M), 1)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
     launch attention_project_gemv_rows when M >= 3 and M < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [8, 16, 32] default 8)
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default least where ROWS >= 2 or GEMV_WEIGHT_ROWS <= 1024 or (GEMV_WEIGHT_ROWS > 4096 and GEMV_WEIGHT_ROWS <= 65536), arithmetic LANES in [8, 16, 32] default 8)
         threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
@@ -440,7 +441,7 @@ native attention_project for metal from "metal/attention_project.metal":
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
     launch attention_project_gemv_pair when M == 2 and M < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default 1, arithmetic LANES in [8, 16, 32] default 8)
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2, 4] default least where ROWS >= 2 or GEMV_WEIGHT_ROWS <= 1024 or (GEMV_WEIGHT_ROWS > 4096 and GEMV_WEIGHT_ROWS <= 65536), arithmetic LANES in [8, 16, 32] default 8)
         threadgroups (ceil_div(Q, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(GR, SIMDGROUPS * ROWS * 32 / LANES)
             + ceil_div(K, SIMDGROUPS * ROWS * 32 / LANES)
