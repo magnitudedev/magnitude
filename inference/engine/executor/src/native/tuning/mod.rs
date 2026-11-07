@@ -179,7 +179,7 @@ pub(crate) use weights::{TuningWeights, weight_plan};
 use super::CatalogFailure;
 use super::specialization::{UntunedEntries, UntunedFormation};
 use crate::ModelLoadPlan;
-use crate::kernel_cache::{KernelCache, TuningCacheKey};
+use crate::kernel_cache::{KernelCache, StoredEvidence, TuningCacheKey};
 use crate::operators::InputForm;
 use crate::programs::invocation_demand::Launch;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
@@ -4973,10 +4973,17 @@ impl<'a> Tuner<'a> {
             true => None,
             false => cache.tuning::<StoredChoice>(&key),
         };
+        let stored = stored
+            .map(|(choice, evidence)| stating_weighed(cache, &key, choice, evidence))
+            .transpose()?;
         // A provisional record is what a search abandoned before its optional
         // work stopped left: the unit has no choice yet, and is searched
-        // again as if nothing were stored.
-        let hit = match stored.filter(|(choice, _)| choice.settled) {
+        // again as if nothing were stored. A record selected for fewer
+        // points than this load weighs serves none of them: its choice
+        // leaves the launches only those points run at their defaults, so
+        // the unit is searched for this load's workload, whose record then
+        // replaces it.
+        let hit = match stored.filter(|(choice, _)| choice.settled && choice.covers(shapes)) {
             None => None,
             Some((choice, evidence)) if choice.requirement == requirement => {
                 Some((choice, Receipt::Stored(evidence)))
@@ -5194,6 +5201,33 @@ fn survey_plan(entry: &str) -> Option<seismic::SurveyPlan> {
     survey::plan(entry)
 }
 
+/// `choice`, stored under `key` with `evidence`, as it states the points
+/// its search weighed. A record stored before choices stated them is stated
+/// once from its evidence and stored again, so later loads read the choice
+/// alone.
+fn stating_weighed(
+    cache: &KernelCache,
+    key: &TuningCacheKey,
+    choice: StoredChoice,
+    evidence: StoredEvidence,
+) -> Result<(StoredChoice, StoredEvidence), String> {
+    if choice.weighed.is_some() {
+        return Ok((choice, evidence));
+    }
+    let result = evidence.read()?;
+    let choice = StoredChoice {
+        weighed: Some(record::weighed(&result)),
+        ..choice
+    };
+    cache.store_tuning(key, &choice, &result);
+    // The store names the evidence it now holds; a store that could not
+    // write keeps the record it had, and its evidence.
+    let evidence = cache
+        .tuning::<StoredChoice>(key)
+        .map_or(evidence, |(_, evidence)| evidence);
+    Ok((choice, evidence))
+}
+
 #[cfg(not(feature = "tuning-survey"))]
 fn survey_plan(_entry: &str) -> Option<seismic::SurveyPlan> {
     None
@@ -5208,7 +5242,9 @@ fn survey_plan(_entry: &str) -> Option<seismic::SurveyPlan> {
 /// result is read only under the budget it was searched within. How it was
 /// otherwise searched (settings, workload weights, the points timed) is not:
 /// a better search never invalidates a result that is still correct; see
-/// [`SEARCH_VERSION`]. Neither is the caller's α: it judges the stored
+/// [`SEARCH_VERSION`]. Which points the search weighed the record states,
+/// and a load weighing a point it did not reads no record
+/// ([`StoredChoice::covers`]). Neither is the caller's α: it judges the stored
 /// measurements and changes none, so a load under another α reads the same
 /// record and chooses from it again ([`seismic::reselect`]).
 fn tuning_key_material(

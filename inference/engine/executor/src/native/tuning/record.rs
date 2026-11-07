@@ -19,6 +19,7 @@ use seismic::{
     TuningMethod, TuningResult,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// What a load needs of a unit's record: the choice, what it was chosen
@@ -48,6 +49,24 @@ pub(crate) struct StoredChoice {
     pub first_rejection: Option<String>,
     pub chosen: ChosenEvidence,
     pub settled: bool,
+    /// The points the search weighed (above zero): the served classes the
+    /// choice was selected for. The key does not hold the load's weights,
+    /// so a load that weighs a point the search did not reads the record as
+    /// missing ([`StoredChoice::covers`]) and selects the unit for its own
+    /// workload. `None` only in a record stored before the choice stated
+    /// them, whose evidence's points say ([`weighed`]).
+    #[serde(default)]
+    pub weighed: Option<BTreeSet<String>>,
+}
+
+/// The points `result`'s search weighed: those of weight above zero.
+pub(crate) fn weighed(result: &TuningResult) -> BTreeSet<String> {
+    result
+        .points
+        .iter()
+        .filter(|point| point.weight > 0.)
+        .map(|point| point.label.clone())
+        .collect()
 }
 
 /// What a unit's evidence holds of its chosen configuration: what a load
@@ -175,7 +194,22 @@ impl StoredChoice {
             first_rejection,
             chosen: ChosenEvidence::of(result),
             settled: true,
+            weighed: Some(weighed(result)),
         }
+    }
+
+    /// Whether the choice was selected for every point `shapes` weigh. A
+    /// choice selected for more serves a load that weighs fewer: its search
+    /// timed each of them.
+    pub(crate) fn covers(&self, shapes: &[PointShape]) -> bool {
+        let weighed = self
+            .weighed
+            .as_ref()
+            .expect("a read record states what its search weighed");
+        shapes
+            .iter()
+            .filter(|shape| shape.weight > 0.)
+            .all(|shape| weighed.contains(&shape.label))
     }
 
     /// The choice as a search publishes it before its optional work stops:
