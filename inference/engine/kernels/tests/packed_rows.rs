@@ -32,15 +32,20 @@ fn packed_stages_on(device: &seismic::Device) {
     let layout = device.backend().resident_layout();
     let q8 = seismic::Element::stored("q8g32s", layout).unwrap();
     let bf16 = seismic::Element::bf16();
-    // One key and one value head of width 32 over a 32-wide hidden row, each
-    // entry prepared at its declared default configuration.
+    // One key and four value heads of width 32 over a 64-wide hidden row, a
+    // geometry every backend's declarations admit (CUDA's projection takes H
+    // in multiples of 64, its step NV in multiples of 4), each entry prepared
+    // at its declared default configuration.
     fn at_defaults<E: seismic::Entry>(
         device: &seismic::Device,
         entry: seismic::BoundEntry<E>,
     ) -> seismic::NativeKernel<E> {
         let specialization = declared::declared_default(device, &entry, |name| match name {
-            "H" | "D" | "W" | "NM" => 32,
-            "NK" | "NV" | "Q" | "PT" | "SN" => 1,
+            "H" | "D" | "NM" => HIDDEN,
+            "W" => WIDTH,
+            "NK" => KEYS,
+            "NV" | "Q" => VALUES,
+            "PT" | "SN" => 1,
             "C" => 2,
             "IN" | "QB" | "ZB" | "OB" | "OS" => 0,
             _ => panic!("unexpected static {name}"),
@@ -79,16 +84,18 @@ fn packed_stages_on(device: &seismic::Device) {
         seismic::Tensor::from_host(&device, bf16, shape, &bytes).unwrap()
     };
     let epsilon = 1e-5;
-    let hidden_values = (0..32)
-        .map(|index| index as f32 / 32.0 + 0.25)
+    let (hidden_width, width) = (HIDDEN as usize, WIDTH as usize);
+    let (keys, values) = (KEYS as usize, VALUES as usize);
+    let channels = (2 * keys + values) * width;
+    let hidden_values = (0..hidden_width)
+        .map(|index| index as f32 / hidden_width as f32 + 0.25)
         .collect::<Vec<_>>();
-    let hidden = tensor(&device, &[1, 32], &hidden_values);
-    let norm = bf16_tensor(&[32], &vec![1.0; 32]);
-    let zero_weight = resident(&[32, 32]);
+    let hidden = tensor(&device, &[1, HIDDEN], &hidden_values);
+    let input_norm = bf16_tensor(&[HIDDEN], &vec![1.0; hidden_width]);
+    let recurrent_norm = bf16_tensor(&[WIDTH], &vec![1.0; width]);
 
-    // One key and one value head of width 32, a two-tap convolution, and a
-    // two-bank state arena (bank 0 read, bank 1 published) with one tape row
-    // (u [1, 32] | k [1, 32] | d [1]).
+    // A two-tap convolution and a two-bank state arena (bank 0 read, bank 1
+    // published) with one tape row (u [NV, W] | k [NK, W] | d [NV]).
     let segments = indices(&device, &[2, 2], &[0, 1, 1, 1]);
     let stop = indices(&device, &[1], &[1]);
     let previous_bank = indices(&device, &[1], &[0]);
@@ -101,15 +108,15 @@ fn packed_stages_on(device: &seismic::Device) {
         vec![
             seismic::SlabRegion {
                 element: bf16,
-                row_shape: vec![2, 96],
+                row_shape: vec![2, channels as u64],
             },
             seismic::SlabRegion {
                 element: seismic::Element::f32(),
-                row_shape: vec![1, 32, 32],
+                row_shape: vec![VALUES, WIDTH, WIDTH],
             },
             seismic::SlabRegion {
                 element: seismic::Element::f32(),
-                row_shape: vec![1, 65],
+                row_shape: vec![1, ((values + keys) * width + values) as u64],
             },
         ],
     )
@@ -118,12 +125,14 @@ fn packed_stages_on(device: &seismic::Device) {
     let mut window = slabs.logical_region(0).unwrap();
     let mut delta = slabs.logical_region(1).unwrap();
     let mut tape = slabs.logical_region(2).unwrap();
-    let qkv_weight = resident(&[96, 32]);
-    let alpha_weight = resident(&[1, 32]);
-    let beta_weight = resident(&[1, 32]);
-    let convolution = tensor(&device, &[96, 2], &[0.0; 192]);
-    let rate = tensor(&device, &[1], &[0.0]);
-    let time_bias = tensor(&device, &[1], &[0.0]);
+    let qkv_weight = resident(&[channels as u64, HIDDEN]);
+    let gate_weight = resident(&[VALUES * WIDTH, HIDDEN]);
+    let alpha_weight = resident(&[VALUES, HIDDEN]);
+    let beta_weight = resident(&[VALUES, HIDDEN]);
+    let output_weight = resident(&[HIDDEN, VALUES * WIDTH]);
+    let convolution = tensor(&device, &[channels as u64, 2], &vec![0.0; channels * 2]);
+    let rate = tensor(&device, &[VALUES], &vec![0.0; values]);
+    let time_bias = tensor(&device, &[VALUES], &vec![0.0; values]);
     let projection = at_defaults(
         device,
         gated_delta_project::native_entry_with(gated_delta_project::Elements {
@@ -137,9 +146,9 @@ fn packed_stages_on(device: &seismic::Device) {
     )
     .call(gated_delta_project::Args {
         hidden: &hidden,
-        input_norm: &norm,
+        input_norm: &input_norm,
         qkv_weight: &qkv_weight,
-        gate_weight: &zero_weight,
+        gate_weight: &gate_weight,
         alpha_weight: &alpha_weight,
         beta_weight: &beta_weight,
         epsilon,
@@ -157,7 +166,7 @@ fn packed_stages_on(device: &seismic::Device) {
         convolution: &convolution,
         rate: &rate,
         time_bias: &time_bias,
-        recurrent_norm: &norm,
+        recurrent_norm: &recurrent_norm,
         segments: &segments,
         stop: &stop,
         previous_bank: &previous_bank,
@@ -182,7 +191,7 @@ fn packed_stages_on(device: &seismic::Device) {
         hidden: &hidden,
         inject: &no_inject(&device, hidden.extents()[0]),
         gated: &gated,
-        output_weight: &zero_weight,
+        output_weight: &output_weight,
         output_scale: &tensor(&device, &[0], &[]),
         output_bound: &tensor(&device, &[0], &[]),
     })
@@ -190,6 +199,12 @@ fn packed_stages_on(device: &seismic::Device) {
     .value;
     assert_close(&read_f32(&recurrent), &hidden_values);
 }
+
+/// The test's geometry: `H`, `W`, `NK` and `NV`.
+const HIDDEN: u64 = 64;
+const WIDTH: u64 = 32;
+const KEYS: u64 = 1;
+const VALUES: u64 = 4;
 
 fn i32_bytes(values: &[i32]) -> Vec<u8> {
     values
