@@ -1735,6 +1735,280 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32>
         out
     }
 
+    /// [`Self::dot_q8_eight`]'s NEON form: per packet the eight rows' exact
+    /// sums of a group in two vectors, a row a lane, and each lane's combine
+    /// a fused multiply-add in group order, as a row's own.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn dot_q8_eight_neon<
+        C: Codes,
+        const STORAGE: usize,
+        const R: usize,
+        const M: usize,
+        V: Vectors,
+    >(
+        rows: &[Row; R],
+        b: usize,
+        packets: usize,
+        x: [&Q8Block; M],
+    ) -> [[f32; M]; R] {
+        use std::arch::aarch64::*;
+        let halves = const { groups_per_packet(GROUP) };
+        let x = x[0];
+        let block = Block::of::<STORAGE>(&rows[0], b);
+        let zero = unsafe { vdupq_n_s32(0) };
+        let mut sums = unsafe { [vdupq_n_f32(0.0); 2] };
+        for local in packets_of(packets) {
+            let activations = x.codes[PACKET * local..].as_ptr();
+            let (first, second) = unsafe { (vld1q_s8(activations), vld1q_s8(activations.add(16))) };
+            let at = block.at::<STORAGE>(local);
+            let mut products = [[zero; 8]; 2];
+            for r in 0..8 {
+                let weights = unsafe { C::neon(at.lane(r, &rows[0])) };
+                unsafe {
+                    if halves == 1 {
+                        products[0][r] = packed_neon::sdot(
+                            packed_neon::sdot(zero, weights[0], first),
+                            weights[1],
+                            second,
+                        );
+                    } else {
+                        products[0][r] = packed_neon::sdot(zero, weights[0], first);
+                        products[1][r] = packed_neon::sdot(zero, weights[1], second);
+                    }
+                }
+            }
+            for (h, products) in products.iter().enumerate().take(halves) {
+                // Pairwise adds reduce each row's four lanes: rows 0..4,
+                // then rows 4..8, a row a lane.
+                let exact = unsafe {
+                    [
+                        vpaddq_s32(
+                            vpaddq_s32(products[0], products[1]),
+                            vpaddq_s32(products[2], products[3]),
+                        ),
+                        vpaddq_s32(
+                            vpaddq_s32(products[4], products[5]),
+                            vpaddq_s32(products[6], products[7]),
+                        ),
+                    ]
+                };
+                // Lane r's fields are a supers group further on.
+                let (fields, stride) = (
+                    at.plane(RowPlaneRole::Supers),
+                    rows[0].groups[RowPlaneRole::Supers as usize],
+                );
+                let codes = activation_sum(x, local, h, halves == 1);
+                let group = at.local::<GROUP>(h);
+                let mut scales = unsafe { S::read8_neon(fields.add(S::BYTES * group), stride) };
+                if CODE_EXPONENT != 0 {
+                    for scales in &mut scales {
+                        *scales = unsafe { vmulq_n_f32(*scales, const { power2(CODE_EXPONENT) }) };
+                    }
+                }
+                let biases = BIAS.then(|| unsafe {
+                    S::read8_neon(fields.add(S::BYTES * (STORAGE / GROUP + group)), stride)
+                });
+                for half in 0..2 {
+                    sums[half] = unsafe {
+                        vfmaq_f32(sums[half], scales[half], vcvtq_f32_s32(exact[half]))
+                    };
+                    if let Some(biases) = biases {
+                        sums[half] = unsafe {
+                            vfmaq_f32(sums[half], biases[half], vdupq_n_f32(codes as f32))
+                        };
+                    }
+                }
+            }
+        }
+        let mut lanes = [0.0f32; 8];
+        unsafe {
+            vst1q_f32(lanes.as_mut_ptr(), sums[0]);
+            vst1q_f32(lanes.as_mut_ptr().add(4), sums[1]);
+        }
+        let mut out = [[0.0f32; M]; R];
+        for r in 0..R {
+            out[r][0] = x.d * lanes[r];
+        }
+        out
+    }
+
+    /// [`Self::dot_q8_four`]'s NEON form: per packet the four blocks' exact
+    /// sums of a group in one vector, a block a lane, and each lane's
+    /// combine a fused multiply-add in group order, as a block's own.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn dot_q8_four_neon<
+        C: Codes,
+        const STORAGE: usize,
+        const R: usize,
+        const M: usize,
+        V: Vectors,
+    >(
+        rows: &[Row; R],
+        b: usize,
+        packets: usize,
+        x: [&Q8Block; M],
+    ) -> [[f32; M]; R] {
+        use std::arch::aarch64::*;
+        let halves = const { groups_per_packet(GROUP) };
+        let zero = unsafe { vdupq_n_s32(0) };
+        let mut out = [[0.0f32; M]; R];
+        for (out, row) in out.iter_mut().zip(rows) {
+            let block = Block::of::<STORAGE>(row, b);
+            let mut sums = unsafe { vdupq_n_f32(0.0) };
+            for local in packets_of(packets) {
+                let at = block.at::<STORAGE>(local);
+                let weights = unsafe { C::neon(at) };
+                let mut products = [[zero; 4]; 2];
+                for m in 0..4 {
+                    let activations = x[m].codes[PACKET * local..].as_ptr();
+                    unsafe {
+                        let (first, second) =
+                            (vld1q_s8(activations), vld1q_s8(activations.add(16)));
+                        if halves == 1 {
+                            products[0][m] = packed_neon::sdot(
+                                packed_neon::sdot(zero, weights[0], first),
+                                weights[1],
+                                second,
+                            );
+                        } else {
+                            products[0][m] = packed_neon::sdot(zero, weights[0], first);
+                            products[1][m] = packed_neon::sdot(zero, weights[1], second);
+                        }
+                    }
+                }
+                let coefficients = unsafe { Self::decode::<STORAGE>(at) };
+                for (h, products) in products.iter().enumerate().take(halves) {
+                    let exact = unsafe {
+                        vcvtq_f32_s32(vpaddq_s32(
+                            vpaddq_s32(products[0], products[1]),
+                            vpaddq_s32(products[2], products[3]),
+                        ))
+                    };
+                    let (scale, bias) = coefficients[h];
+                    sums = unsafe { vfmaq_n_f32(sums, exact, scale) };
+                    if BIAS {
+                        let mut codes = [0.0f32; 4];
+                        for m in 0..4 {
+                            codes[m] = activation_sum(x[m], local, h, halves == 1) as f32;
+                        }
+                        sums = unsafe { vfmaq_n_f32(sums, vld1q_f32(codes.as_ptr()), bias) };
+                    }
+                }
+            }
+            let mut lanes = [0.0f32; 4];
+            unsafe { vst1q_f32(lanes.as_mut_ptr(), sums) };
+            for ((out, lane), x) in out.iter_mut().zip(lanes).zip(x.iter()) {
+                *out = x.d * lane;
+            }
+        }
+        out
+    }
+
+    /// The eight rows of one rows8 tile against four activation blocks on
+    /// NEON. Per packet the four blocks' codes are transposed into vectors
+    /// of their 4-byte chunks (a block a lane), so a by-element dot of a
+    /// weight chunk accumulates a row's four blocks in one vector with no
+    /// reduction; each row's combine with its coefficient (a lane of the
+    /// tile's eight, read as vectors) is a fused multiply-add in group order,
+    /// as [`Self::dot_q8_four_neon`]'s.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    unsafe fn dot_q8_tile_neon<
+        C: Codes,
+        const STORAGE: usize,
+        const R: usize,
+        const M: usize,
+        V: Vectors,
+    >(
+        rows: &[Row; R],
+        b: usize,
+        packets: usize,
+        x: [&Q8Block; M],
+    ) -> [[f32; M]; R] {
+        use std::arch::aarch64::*;
+        let halves = const { groups_per_packet(GROUP) };
+        let block = Block::of::<STORAGE>(&rows[0], b);
+        let zero = unsafe { vdupq_n_s32(0) };
+        let mut sums = unsafe { [vdupq_n_f32(0.0); 8] };
+        for local in packets_of(packets) {
+            let at = block.at::<STORAGE>(local);
+            let load = |half: usize| {
+                packed_neon::chunks4(std::array::from_fn(|m| unsafe {
+                    vld1q_s8(x[m].codes[PACKET * local + 16 * half..].as_ptr())
+                }))
+            };
+            let chunks = [load(0), load(1)];
+            let (fields, stride) = (
+                at.plane(RowPlaneRole::Supers),
+                rows[0].groups[RowPlaneRole::Supers as usize],
+            );
+            for h in 0..halves {
+                let group = at.local::<GROUP>(h);
+                let mut scales = unsafe { S::read8_neon(fields.add(S::BYTES * group), stride) };
+                if CODE_EXPONENT != 0 {
+                    for scales in &mut scales {
+                        *scales = unsafe { vmulq_n_f32(*scales, const { power2(CODE_EXPONENT) }) };
+                    }
+                }
+                let biased = BIAS.then(|| unsafe {
+                    let mut codes = [0.0f32; 4];
+                    for m in 0..4 {
+                        codes[m] = activation_sum(x[m], local, h, halves == 1) as f32;
+                    }
+                    (
+                        S::read8_neon(fields.add(S::BYTES * (STORAGE / GROUP + group)), stride),
+                        vld1q_f32(codes.as_ptr()),
+                    )
+                });
+                // The weight halves (16 values each) this group's sum covers.
+                let parts = if halves == 1 { 0..2 } else { h..h + 1 };
+                macro_rules! row {
+                    ($r:literal, $vector:literal, $lane:literal) => {{
+                        let weights = unsafe { C::neon(at.lane($r, &rows[0])) };
+                        let mut exact = zero;
+                        for part in parts.clone() {
+                            let (w, c) = (weights[part], chunks[part]);
+                            unsafe {
+                                exact = packed_neon::sdot_lane::<0>(exact, c[0], w);
+                                exact = packed_neon::sdot_lane::<1>(exact, c[1], w);
+                                exact = packed_neon::sdot_lane::<2>(exact, c[2], w);
+                                exact = packed_neon::sdot_lane::<3>(exact, c[3], w);
+                            }
+                        }
+                        let exact = unsafe { vcvtq_f32_s32(exact) };
+                        sums[$r] = unsafe {
+                            vfmaq_laneq_f32::<$lane>(sums[$r], exact, scales[$vector])
+                        };
+                        if let Some((biases, codes)) = biased {
+                            sums[$r] = unsafe {
+                                vfmaq_laneq_f32::<$lane>(sums[$r], codes, biases[$vector])
+                            };
+                        }
+                    }};
+                }
+                row!(0, 0, 0);
+                row!(1, 0, 1);
+                row!(2, 0, 2);
+                row!(3, 0, 3);
+                row!(4, 1, 0);
+                row!(5, 1, 1);
+                row!(6, 1, 2);
+                row!(7, 1, 3);
+            }
+        }
+        let mut out = [[0.0f32; M]; R];
+        for (out, sums) in out.iter_mut().zip(sums) {
+            let mut lanes = [0.0f32; 4];
+            unsafe { vst1q_f32(lanes.as_mut_ptr(), sums) };
+            for ((out, lane), x) in out.iter_mut().zip(lanes).zip(x.iter()) {
+                *out = x.d * lane;
+            }
+        }
+        out
+    }
+
     /// The (scale, bias) of coefficient group `local` of the storage group
     /// whose supers fields are at `fields`.
     #[inline(always)]
@@ -1782,6 +2056,18 @@ impl<S: Scale, const GROUP: usize, const BIAS: bool, const CODE_EXPONENT: i32> C
         #[cfg(target_arch = "x86_64")]
         if M == 4 && V::QUANTIZED_DOTS >= 1 {
             return unsafe { Self::dot_q8_four::<C, STORAGE, R, M, V>(rows, b, packets, x) };
+        }
+        #[cfg(target_arch = "aarch64")]
+        if M == 1 && V::QUANTIZED_DOTS >= 1 && Row::same_tile(rows) {
+            return unsafe { Self::dot_q8_eight_neon::<C, STORAGE, R, M, V>(rows, b, packets, x) };
+        }
+        #[cfg(target_arch = "aarch64")]
+        if M == 4 && V::QUANTIZED_DOTS >= 1 && Row::same_tile(rows) {
+            return unsafe { Self::dot_q8_tile_neon::<C, STORAGE, R, M, V>(rows, b, packets, x) };
+        }
+        #[cfg(target_arch = "aarch64")]
+        if M == 4 && V::QUANTIZED_DOTS >= 1 {
+            return unsafe { Self::dot_q8_four_neon::<C, STORAGE, R, M, V>(rows, b, packets, x) };
         }
         let mut out = [[0.0f32; M]; R];
         for (out, row) in out.iter_mut().zip(rows) {
@@ -2570,6 +2856,47 @@ mod packed_neon {
         acc
     }
 
+    /// `acc` plus, in lane `j`, the signed byte dot of `a`'s bytes
+    /// `4j..4j + 4` with `b`'s bytes `4 LANE..4 LANE + 4`.
+    ///
+    /// # Safety
+    /// The CPU has `dotprod`.
+    #[inline]
+    #[target_feature(enable = "dotprod")]
+    pub(super) unsafe fn sdot_lane<const LANE: i32>(
+        mut acc: int32x4_t,
+        a: int8x16_t,
+        b: int8x16_t,
+    ) -> int32x4_t {
+        unsafe {
+            std::arch::asm!(
+                "sdot {acc:v}.4s, {a:v}.16b, {b:v}.4b[{lane}]",
+                acc = inout(vreg) acc,
+                a = in(vreg) a,
+                b = in(vreg) b,
+                lane = const LANE,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+        }
+        acc
+    }
+
+    /// Four rows' sixteen bytes as four vectors of their 4-byte chunks:
+    /// vector `c` holds chunk `c` of rows 0..4, a row a lane.
+    #[inline(always)]
+    pub(super) fn chunks4(rows: [int8x16_t; 4]) -> [int8x16_t; 4] {
+        unsafe {
+            let [a, b, c, d] = rows.map(|row| vreinterpretq_s32_s8(row));
+            let (ab0, ab1) = (vtrn1q_s32(a, b), vtrn2q_s32(a, b));
+            let (cd0, cd1) = (vtrn1q_s32(c, d), vtrn2q_s32(c, d));
+            let pair = |x: int32x4_t, y: int32x4_t, high: bool| {
+                let (x, y) = (vreinterpretq_s64_s32(x), vreinterpretq_s64_s32(y));
+                vreinterpretq_s8_s64(if high { vtrn2q_s64(x, y) } else { vtrn1q_s64(x, y) })
+            };
+            [pair(ab0, cd0, false), pair(ab1, cd1, false), pair(ab0, cd0, true), pair(ab1, cd1, true)]
+        }
+    }
+
     /// The 32-value dot of two signed packets.
     ///
     /// # Safety
@@ -3195,6 +3522,21 @@ pub unsafe fn gemm_q8_rows<W: Format, V: Vectors>(
     let mut accumulators = [[0.0f32; 8]; 4];
     let rows =
         std::array::from_fn::<_, 8, _>(|r| geometry.row(rows.wrapping_add(r * geometry.stride)));
+    // NEON takes a rows8 tile's eight rows at once: their coefficients are
+    // adjacent, and read as vectors.
+    #[cfg(target_arch = "aarch64")]
+    if Row::same_tile(&rows) {
+        for b in 0..blocks {
+            let activations = std::array::from_fn(|m| &x[m * blocks + b]);
+            let products = unsafe { W::dot_q8::<8, 4, V>(&rows, b, k, activations) };
+            for r in 0..8 {
+                for m in 0..4 {
+                    accumulators[m][r] += products[r][m];
+                }
+            }
+        }
+        return accumulators;
+    }
     for b in 0..blocks {
         let activations = std::array::from_fn(|m| &x[m * blocks + b]);
         for r in 0..8 {
