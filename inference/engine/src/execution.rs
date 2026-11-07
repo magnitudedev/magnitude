@@ -27,11 +27,7 @@ use magnitude_family_contracts::{HeadHistory, InputLayout, PreparedModelInput, T
 use seismic::{BackendName, Devices, ExecutorSelector};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-/// How often a weight import observes its memory domains' band. The import
-/// runs under one claim for as long as the weights take to become resident.
-const IMPORT_OBSERVATION_INTERVAL: Duration = Duration::from_millis(100);
+use std::time::Instant;
 
 /// A constructed executor domain with the facts readiness reports.
 pub(crate) struct NativeDomain {
@@ -792,7 +788,10 @@ pub(crate) fn build(
                     completed_bytes,
                     total_bytes,
                 });
-                if band_observed.elapsed() >= IMPORT_OBSERVATION_INTERVAL {
+                // The import runs under one claim until the weights are
+                // resident; it reads its domains' band at the reading
+                // interval the reserves' margin holds the host's take over.
+                if band_observed.elapsed() >= platform::READING_INTERVAL {
                     band_observed = Instant::now();
                     require_normal(&import_catalog, &import_device, &reserves, import_room)?;
                 }

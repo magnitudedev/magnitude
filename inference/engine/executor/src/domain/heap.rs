@@ -179,6 +179,10 @@ impl StatusReading for Devices {
 /// and Seismic's enforced limit is refreshed from the same reading.
 pub struct DeviceHeap {
     reading: Rc<dyn StatusReading>,
+    /// The reserves the heap opened with: the machine's figures and what
+    /// was known before this load measured anything.
+    known: MemoryReserves,
+    /// `known` with what the load measures now ([`Self::measure`]).
     reserves: MemoryReserves,
     device: Rc<Device>,
     capacity_bytes: u64,
@@ -200,9 +204,12 @@ pub struct DeviceHeap {
 }
 
 impl DeviceHeap {
-    /// Hold every fit from the next reading on at what the load measured:
-    /// host RAM's motion and a device's own memory's, and its release
-    /// latency once one finished (`platform::MemoryReserves::measured`).
+    /// Hold every fit from the next reading on at what the load measures
+    /// now: host RAM's motion and a device's own memory's, and its release
+    /// latency once one finished (`platform::MemoryReserves::measured`),
+    /// over what was known when it opened. A motion is the pace's sustained
+    /// take, which falls again once a take stops, so each measure starts
+    /// from what was known rather than from every earlier measure's peak.
     pub(crate) fn measure(
         &mut self,
         host: Option<StoreMotion>,
@@ -211,8 +218,14 @@ impl DeviceHeap {
         release: Option<crate::platform::ReleaseRate>,
         releasable: crate::platform::Releasable,
     ) {
-        let measured = self.reserves.measured(host, device).releasing(release, releasable);
+        let measured = self.known.measured(host, device).releasing(release, releasable);
         self.reserves = latency.map_or(measured, |latency| measured.with_latency(latency));
+    }
+
+    /// The rate the load releases at, as its reserves hold it
+    /// (`platform::MemoryReserves::release_rate`).
+    pub(crate) fn release_rate(&self) -> crate::platform::ReleaseRate {
+        self.reserves.release_rate()
     }
 
     /// The heap of `device`, observed once, for a load
@@ -231,6 +244,7 @@ impl DeviceHeap {
             .stable_bytes;
         let mut heap = Self {
             reading,
+            known: reserves,
             reserves,
             device,
             capacity_bytes,

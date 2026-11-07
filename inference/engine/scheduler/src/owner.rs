@@ -640,13 +640,10 @@ pub struct Ran {
 /// observations may fail continuously, before the model unloads.
 const MEMORY_ESCALATION_NS: u64 = 1_000_000_000;
 
-/// How often the owner observes memory without another reason to run: the
-/// interval a load's reserves hold the host's motion over
+/// How often the owner observes memory without another reason to run, in
+/// nanoseconds: the interval a load's reserves hold the host's motion over
 /// ([`magnitude_executor::platform::READING_INTERVAL`]).
-const OBSERVATION_INTERVAL: std::time::Duration = magnitude_executor::platform::READING_INTERVAL;
-
-/// [`OBSERVATION_INTERVAL`] in nanoseconds.
-const OBSERVATION_INTERVAL_NS: u64 = OBSERVATION_INTERVAL.as_nanos() as u64;
+const OBSERVATION_INTERVAL_NS: u64 = magnitude_executor::platform::READING_INTERVAL.as_nanos() as u64;
 
 /// One probe of every domain the loaded model uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1344,7 +1341,7 @@ impl<F: ProgramFamily> Service<F> {
         // A request arriving in Reclaim waits while the ladder gives memory
         // back: it is refused only once the ladder's next release would be
         // the model's unload (`MemoryStep::release_for_reclaim`).
-        match self.domain.probe_memory(OBSERVATION_INTERVAL) {
+        match self.domain.probe_memory() {
             Err(error @ DomainError::Reclaim(_)) => self.refused_for_memory(&error),
             observed => {
                 observed.map_err(AdmissionError::from)?;
@@ -1763,7 +1760,7 @@ trait MemoryStep: MemoryHost + Sized {
             let resizing = self.memory().resizing();
             self.memory().room_owed.probed(resizing);
             self.memory().next_observation = now.saturating_add(OBSERVATION_INTERVAL_NS);
-            let observation = memory_observation(self.domain().probe_memory(OBSERVATION_INTERVAL)).map_err(memory)?;
+            let observation = memory_observation(self.domain().probe_memory()).map_err(memory)?;
             let next = self.memory().condition.observe(observation, now);
             self.enter_memory_condition(next);
             // Each reading settles the heap afresh: its supply holds the
@@ -1854,7 +1851,7 @@ trait MemoryStep: MemoryHost + Sized {
             if self.release_for_reclaim(bindings)? {
                 let now = self.now();
                 self.memory().condition = self.memory().condition.released(now);
-                let after = memory_observation(self.domain().probe_memory(OBSERVATION_INTERVAL)).map_err(memory)?;
+                let after = memory_observation(self.domain().probe_memory()).map_err(memory)?;
                 let next = self.memory().condition.observe(after, now);
                 self.enter_memory_condition(next);
             }
@@ -2182,7 +2179,7 @@ trait MemoryStep: MemoryHost + Sized {
     /// Whether a fresh reading is still in the Reclaim band. A failed reading
     /// cannot measure a release, so it stops releasing.
     fn reclaim_needed(&mut self) -> Result<bool, RequestError> {
-        Ok(memory_observation(self.domain().probe_memory(OBSERVATION_INTERVAL))
+        Ok(memory_observation(self.domain().probe_memory())
             .map_err(invariant("memory observation"))?
             == MemoryObservation::Reclaim)
     }

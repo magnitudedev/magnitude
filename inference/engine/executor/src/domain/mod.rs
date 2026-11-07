@@ -7,7 +7,9 @@ use crate::batching::{
     ValidatedTargetBatch,
 };
 use crate::memory::{ClaimId, HoldingClass, MemoryHeap};
-use crate::platform::{DomainReading, DomainRole, DomainThresholds, MemoryBand, ReleaseRate, Releasable, StoreMotion};
+use crate::platform::{
+    DomainReading, DomainRole, DomainThresholds, MemoryBand, READING_INTERVAL, ReleaseRate, Releasable, StoreMotion,
+};
 use crate::programs::{Chain, ProgramSubmission};
 use crate::programs::graph::readout;
 use crate::{
@@ -1044,14 +1046,23 @@ impl<'d> MemoryProbe<'d> {
     /// [`ExecutorDomain::probe_memory`], beside `bank`: the readings the
     /// memory pace is measured from, taken while no bank resize runs are
     /// settled ones.
-    fn probe(&self, bank: Option<&dyn ElasticBank>, reading_interval: Duration) -> Result<(), DomainError> {
+    fn probe(&self, bank: Option<&dyn ElasticBank>) -> Result<(), DomainError> {
         let readings = self.observe(bank)?;
         let host = self.host_witness(&readings);
-        self.pace.borrow_mut().observe(&readings, &self.domain.device().ledgers().own_claims(), host, !self.resizing, reading_interval);
+        let releasable = bank.map(releasable).transpose()?.unwrap_or_default();
+        let release = self.memory.borrow().release_rate();
+        self.pace.borrow_mut().observe(
+            &readings,
+            &self.domain.device().ledgers().own_claims(),
+            host,
+            !self.resizing,
+            releasable,
+            release,
+            Instant::now(),
+        );
         // Every fit from the next reading on holds the line at the motion
         // and release latency measured now.
         let motions = self.pace.borrow().motions();
-        let releasable = bank.map(releasable).transpose()?.unwrap_or_default();
         self.memory.borrow_mut().measure(motions.host, motions.device, motions.latency, motions.release, releasable);
         match readings.into_iter().find(|reading| reading.band == MemoryBand::Reclaim) {
             Some(reading) => Err(DomainError::Reclaim(reading)),
@@ -1059,7 +1070,7 @@ impl<'d> MemoryProbe<'d> {
         }
     }
 
-    /// Host RAM's witness of the process's releases at a probe that read
+    /// Host RAM's witness of what the process holds resident at a probe that read
     /// `readings` (`MemoryPace`): what the system counts the process holding
     /// out of free memory, which falls by a release as free memory rises by
     /// it. A Metal device's allocations are wired through its residency set,
@@ -1138,14 +1149,10 @@ impl<'d> MemoryProbe<'d> {
         if self.resizing {
             return None;
         }
-        let interval = {
-            let pace = self.pace.borrow();
-            if !pace.due(Instant::now()) {
-                return None;
-            }
-            pace.reading_interval
-        };
-        if let Err(DomainError::Blind(_)) = self.probe(Some(bank), interval) {
+        if !self.pace.borrow().due(Instant::now()) {
+            return None;
+        }
+        if let Err(DomainError::Blind(_)) = self.probe(Some(bank)) {
             return None;
         }
         let kind = bank.holding_storage(BankHolding::Experts).expect("an expert bank holds its experts");
@@ -1322,8 +1329,6 @@ impl ResizeHeld {
 /// headroom's.
 struct MemoryPace {
     domains: BTreeMap<seismic::StoreId, DomainPace>,
-    /// The interval the owner reads memory at, as its probes say.
-    reading_interval: Duration,
     /// When memory was last read; none before the first probe.
     read: Option<Instant>,
     /// The last finished release's latency; zero before the first.
@@ -1357,18 +1362,20 @@ struct DomainPace {
     /// What the process released that its witness has yet to drop. None
     /// is owed from a reading above the line.
     unseen: u64,
-    /// The witness of the process's releases in the store at this reading;
-    /// none in a device's own memory, or where none is read.
+    /// What the process holds resident in the store at this reading, as its
+    /// witness reads it: what a release lowers and what backing its own
+    /// charge raises; none in a device's own memory, or where none is read.
     witness: Option<u64>,
-    /// The memory available at this reading: headroom, charge and `unseen`.
-    available: u64,
-    /// The probe the rate is measured from, and the memory available then.
-    base: (Instant, u64),
-    /// The rest of the host's taking over the latest span from `base`, in
-    /// bytes a second.
+    /// What the rest of the host had not taken at each witnessed probe a
+    /// span apart (`MemoryPace::observe`'s `untaken`), oldest first, back
+    /// to the first at or before the rate's window
+    /// ([`DomainPace::sustained`]); without a witness, since the charge
+    /// last changed.
+    untaken: std::collections::VecDeque<(Instant, u64)>,
+    /// The rate the rest of the host's taking sustains over the window a
+    /// margin holds a take across, in bytes a second
+    /// ([`DomainPace::sustained`]).
     rate: f64,
-    /// The fastest `rate` measured since the load's first probe.
-    fastest: f64,
     /// Available memory's fluctuation over its readings since the domain
     /// last left Reclaim.
     fluctuation: Fluctuation,
@@ -1382,10 +1389,37 @@ struct DomainPace {
     /// the bank borrows (`platform::StoreFit::borrowable_bytes`).
     borrowable: Option<u64>,
     /// The spans in which the rest of the host took more than the steady
-    /// fluctuation, since `first`: another program's asks.
-    takes: u32,
+    /// fluctuation, since `first`: another program's asks; none before
+    /// the first.
+    takes: Option<Takes>,
     /// The domain's first probe.
     first: Instant,
+}
+
+/// Another program's asks a domain's pace has read ([`DomainPace::takes`]):
+/// how many, and the sum of each one's rate across its span, whose mean is
+/// the rate the host's asks take memory at, which borrowed room is priced
+/// by.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Takes {
+    count: std::num::NonZeroU32,
+    rate_sum: f64,
+}
+
+impl Takes {
+    /// These asks and one more, at `rate` across its span; the first where
+    /// none was read.
+    fn with(takes: Option<Self>, rate: f64) -> Self {
+        takes.map_or(Self { count: std::num::NonZeroU32::MIN, rate_sum: rate }, |takes| Self {
+            count: takes.count.checked_add(1).expect("a load reads fewer than 2^32 asks"),
+            rate_sum: takes.rate_sum + rate,
+        })
+    }
+
+    /// The asks' mean rate across their spans.
+    fn mean(&self) -> f64 {
+        self.rate_sum / f64::from(self.count.get())
+    }
 }
 
 /// Available memory's fluctuation in steady state: the largest fall between
@@ -1440,11 +1474,34 @@ enum Shortfall {
 pub const MEMORY_TRACE: &str = "magnitude_memory_reading";
 
 impl DomainPace {
+    /// The rate the rest of the host sustains taking at `at`, where it has
+    /// not taken `now` bytes: the fall from the last of the earlier probes
+    /// `untaken` at or before `at − window` (its oldest while it reaches no
+    /// further back) to `now`, over the span since that probe or the whole
+    /// `window` where that is longer, never negative. The window is
+    /// the span a margin holds a take across (`MemoryPace::observe`): a
+    /// take that stops within it threatens what a release lands by no more
+    /// than its share of the window, and one that sustains it reads as
+    /// itself. So a transient fall, however steep across one reading span
+    /// (an import's wiring, a compiler service's burst), sets no rate of
+    /// its own past the window, while a steady take reads at its rate once
+    /// the window holds it.
+    fn sustained(untaken: &std::collections::VecDeque<(Instant, u64)>, at: Instant, now: u64, window: Duration) -> f64 {
+        let start = at.checked_sub(window);
+        let Some(&(then, was)) =
+            untaken.iter().rev().find(|(then, _)| start.is_some_and(|start| *then <= start)).or(untaken.front())
+        else {
+            return 0.0;
+        };
+        let span = window.max(at.duration_since(then));
+        was.saturating_sub(now) as f64 / span.as_secs_f64()
+    }
+
     /// An allocation domain's wait bound (`MemoryPace::wait_bound`): none
-    /// in a domain that grows nothing, or before the host took memory.
+    /// in a domain that grows nothing, or while the host takes none of it.
     fn wait_bound(&self) -> Option<f64> {
-        (self.role == DomainRole::Allocation && self.fastest > 0.0)
-            .then(|| self.thresholds.planning_bytes.saturating_sub(self.thresholds.emergency_bytes) as f64 / self.fastest)
+        (self.role == DomainRole::Allocation && self.rate > 0.0)
+            .then(|| self.thresholds.planning_bytes.saturating_sub(self.thresholds.emergency_bytes) as f64 / self.rate)
     }
 }
 
@@ -1453,7 +1510,6 @@ impl MemoryPace {
     fn new() -> Self {
         Self {
             domains: BTreeMap::new(),
-            reading_interval: Duration::ZERO,
             read: None,
             latency: Duration::ZERO,
             release: None,
@@ -1463,23 +1519,30 @@ impl MemoryPace {
     /// Whether memory is due a reading at `now`: a reading interval since
     /// the last, or none read yet.
     fn due(&self, now: Instant) -> bool {
-        self.read.is_none_or(|read| now.duration_since(read) >= self.reading_interval)
+        self.read.is_none_or(|read| now.duration_since(read) >= READING_INTERVAL)
     }
 
     /// Fold in a probe of every domain, the process charging each store as
-    /// `charges` say and host RAM's witness of its releases reading `host`,
-    /// `settled` if no bank resize runs, and memory read every
-    /// `reading_interval`.
+    /// `charges` say and host RAM's witness of what it holds resident
+    /// reading `host`, `settled` if no bank resize runs, memory read every
+    /// [`READING_INTERVAL`], the load able to release `releasable` now at
+    /// `release`, read `at`.
+    ///
+    /// Each domain's take rate is the one sustained over the span its
+    /// margin holds a take across (`platform::StoreMotion::margin`): from
+    /// noticing it within a reading interval, through the first release's
+    /// latency, to the last of the bytes the load can release there
+    /// landing at the release rate.
     fn observe(
         &mut self,
         readings: &[DomainReading],
         charges: &[(seismic::StoreId, u64)],
         host: Option<u64>,
         settled: bool,
-        reading_interval: Duration,
+        releasable: Releasable,
+        release: ReleaseRate,
+        at: Instant,
     ) {
-        let at = Instant::now();
-        self.reading_interval = reading_interval;
         self.read = Some(at);
         for reading in readings {
             let charged = charges
@@ -1495,7 +1558,7 @@ impl MemoryPace {
                 charged,
                 "memory read"
             );
-            let before = self.domains.remove(&reading.domain);
+            let mut before = self.domains.remove(&reading.domain);
             let shown = reading.headroom_bytes.saturating_add(charged);
             let witness = host.filter(|_| reading.identity == seismic::StoreIdentity::HostRam);
             let unseen = match (reading.band, &before) {
@@ -1508,30 +1571,60 @@ impl MemoryPace {
                 }
                 _ => 0,
             };
-            let available = shown + unseen;
-            let mut took = false;
-            let (base, rate) = match &before {
-                // A fall of the charge is a release the host may not show
-                // yet: the fall of available memory it makes is no taking,
-                // and what the host took across it is unknown until a span
-                // from here measures it. A rate from before it, carried over
-                // the release's latency, would project a taking long over.
-                Some(before) if charged < before.charged => ((at, available), 0.0),
-                Some(before) if at.duration_since(before.base.0) >= reading_interval => {
-                    let (then, was) = before.base;
-                    took = was.saturating_sub(available) > before.fluctuation.largest;
-                    ((at, available), was.saturating_sub(available) as f64 / at.duration_since(then).as_secs_f64())
-                }
-                Some(before) => (before.base, before.rate),
-                None => ((at, available), 0.0),
+            // What the rest of the host has not taken, for its motion: the
+            // headroom and what the process holds there as its witness
+            // shows. A reservation is charged before its pages are backed,
+            // so the headroom falls as the process backs its own charge
+            // (an import's wiring, a bank's first fill); read against the
+            // charge, that fall is another program's take, at the rate the
+            // process backs pages. A release lowers the witness as the host
+            // frees its pages, so it moves nothing here and the history
+            // stands across it. With no witness (a device's own memory, a
+            // host that reports neither wired bytes nor a footprint) the
+            // headroom and the charge, measured as `Fluctuation::read`
+            // measures: only across spans of an unchanged charge. Such a
+            // span holds no release the host has yet to show begin, and one
+            // it shows late within it raises the headroom, so it can read a
+            // take low, never invent one; a span across which the charge
+            // changed restarts the history.
+            let host_ram = reading.identity == seismic::StoreIdentity::HostRam;
+            let untaken = witness.map_or(shown, |held| reading.headroom_bytes.saturating_add(held));
+            let restarts = witness.is_none() && before.as_ref().is_some_and(|before| before.charged != charged);
+            let releasable = match reading.identity {
+                seismic::StoreIdentity::HostRam => releasable.host,
+                _ => releasable.device,
             };
-            let fastest = before.as_ref().map_or(rate, |before| before.fastest.max(rate));
-            let (takes, first) = before.as_ref().map_or((0, at), |before| (before.takes + u32::from(took), before.first));
+            let window =
+                READING_INTERVAL + self.latency + Duration::from_secs_f64(releasable as f64 / release.bytes_per_second());
+            let mut took = None;
+            let (untaken_at, rate) = match before.as_mut().map(|before| (before.untaken.back().copied(), before)) {
+                _ if restarts => ([(at, untaken)].into(), 0.0),
+                Some((Some((then, was)), before)) if at.duration_since(then) >= READING_INTERVAL => {
+                    let fall = was.saturating_sub(untaken);
+                    took = (fall > before.fluctuation.largest)
+                        .then(|| fall as f64 / at.duration_since(then).as_secs_f64());
+                    let rate = DomainPace::sustained(&before.untaken, at, untaken, window);
+                    let mut history = std::mem::take(&mut before.untaken);
+                    history.push_back((at, untaken));
+                    // Keep the last at or before the window's start, which
+                    // anchors its fall, and everything after it.
+                    let start = at.checked_sub(window);
+                    while history.len() > 1 && start.is_some_and(|start| history[1].0 <= start) {
+                        history.pop_front();
+                    }
+                    (history, rate)
+                }
+                Some((Some(_), before)) => (std::mem::take(&mut before.untaken), before.rate),
+                Some((None, _)) | None => ([(at, untaken)].into(), 0.0),
+            };
+            let before_takes = before.as_ref().and_then(|before| before.takes);
+            let takes = took.map_or(before_takes, |rate| Some(Takes::with(before_takes, rate)));
+            let first = before.as_ref().map_or(at, |before| before.first);
             let fluctuation = match reading.band {
                 MemoryBand::Reclaim => Fluctuation::default(),
                 MemoryBand::Normal => {
                     let mut fluctuation = before.map(|before| before.fluctuation).unwrap_or_default();
-                    fluctuation.read(available, charged, settled);
+                    fluctuation.read(untaken, charged, settled);
                     fluctuation
                 }
             };
@@ -1545,12 +1638,10 @@ impl MemoryPace {
                     band: reading.band,
                     unseen,
                     witness,
-                    available,
-                    base,
+                    untaken: untaken_at,
                     rate,
-                    fastest,
                     fluctuation,
-                    host: reading.identity == seismic::StoreIdentity::HostRam,
+                    host: host_ram,
                     grant_left: (reading.constraint == crate::platform::MemoryConstraint::Grant).then_some(reading.ceiling_bytes),
                     borrowable: reading.borrowable_bytes,
                     takes,
@@ -1601,8 +1692,8 @@ impl MemoryPace {
     /// (`platform::StoreMotion`), which its reserves hold their margin at:
     /// host RAM's, a device's own memory's (the largest of its allocation
     /// domains'), each the steady fluctuation of available memory and the
-    /// fastest rate the rest of the host took it at, none where no domain
-    /// of it measured a take; and the last finished release's latency, none
+    /// rate the rest of the host sustains taking it at now
+    /// ([`DomainPace::sustained`]), none where no domain of it reads a take; and the last finished release's latency, none
     /// before one. A measured motion only ever raises what was known
     /// (`platform::MemoryReserves::measured`), whose take rate starts at
     /// the machine's page-fill rate; and the slowest finished release's
@@ -1613,8 +1704,8 @@ impl MemoryPace {
             self.domains
                 .values()
                 .filter(|pace| pace.host == host && (host || pace.role == DomainRole::Allocation))
-                .filter(|pace| pace.fastest > 0.0)
-                .map(|pace| StoreMotion::new(pace.fluctuation.largest, pace.fastest))
+                .filter(|pace| pace.rate > 0.0)
+                .map(|pace| StoreMotion::new(pace.fluctuation.largest, pace.rate))
                 .reduce(StoreMotion::with)
         };
         PaceMotions {
@@ -1635,9 +1726,10 @@ impl MemoryPace {
     /// that by compressing other programs' data, up to the borrowing line.
     /// Its price, in serving seconds saved per second per byte, is what
     /// holding a byte of it costs another program: each ask it makes waits
-    /// for the byte about `1 / fastest` seconds (a release hands it back at
-    /// the rate the host takes it), and asks come `takes / elapsed` times a
-    /// second, so `takes / (elapsed × fastest)`; zero while no ask was seen,
+    /// for the byte about `1 / t` seconds, `t` the mean rate its asks took
+    /// memory at (a release hands it back at the rate the host takes it),
+    /// and asks come `takes / elapsed` times a second, so
+    /// `takes / (elapsed × t)`; zero while no ask was seen,
     /// where borrowing harms no one. The device's hard limit is the grant
     /// left where a grant bounds the domain. An exchange's gain is earned
     /// over `horizon`, how long the settle's decision stands.
@@ -1650,10 +1742,9 @@ impl MemoryPace {
         };
         let borrowable = pace.borrowable.map_or(0, |line| pace.thresholds.ceiling(line).saturating_sub(free));
         let elapsed = self.read.map_or(0.0, |read| read.duration_since(pace.first).as_secs_f64());
-        let borrow_price = match pace.takes {
-            0 => 0.0,
-            takes => f64::from(takes) / (elapsed.max(self.reading_interval.as_secs_f64()) * pace.fastest),
-        };
+        let borrow_price = pace.takes.map_or(0.0, |takes| {
+            f64::from(takes.count.get()) / (elapsed.max(READING_INTERVAL.as_secs_f64()) * takes.mean())
+        });
         Some(value::Supply {
             free,
             owed,
@@ -1677,13 +1768,13 @@ impl MemoryPace {
     /// (`ExpertBank::release_running`), down to its floor at most, so from
     /// the planning line `P` the rest of the host may take what lies
     /// above the domain's emergency reserve `E`
-    /// (`DomainThresholds::emergency_bytes`), at the fastest rate `r`
-    /// measured of it since the load's first probe: `W = (P − E) / r`, the
+    /// (`DomainThresholds::emergency_bytes`), at the rate `r` the host
+    /// sustains taking it at now ([`DomainPace::sustained`]): `W = (P − E) / r`, the
     /// least of any allocation domain. The reserve is the region a load must
     /// not run into, whatever lies past it on the host: the worker's kill
     /// where the OS reports no pressure level, critical pressure and
     /// compression on macOS, failed allocations in a device's own memory.
-    /// None while no allocation domain has seen the host take memory.
+    /// None while the host takes memory from no allocation domain.
     fn wait_bound(&self) -> Option<f64> {
         self.domains
             .values()
@@ -1693,7 +1784,7 @@ impl MemoryPace {
 
     /// From a shrink's decision to the next one's effect.
     fn horizon(&self) -> Duration {
-        self.reading_interval + 2 * self.latency
+        READING_INTERVAL + 2 * self.latency
     }
 
     /// A release of `bytes` finished, as `times` say: its latency, and its

@@ -812,7 +812,7 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
 /// probe, as the owner settles, the most valuable per byte first, with
 /// nothing of an owner's; none before the bank is priced.
 fn paying(domain: &mut ExecutorDomain<TestFamily>) -> Vec<crate::planning::BankTier> {
-    domain.probe_memory(std::time::Duration::from_millis(100)).unwrap();
+    domain.probe_memory().unwrap();
     let settled = domain.settle_memory(&crate::OwnerHoldings::default()).unwrap();
     let mut kinds = Vec::new();
     for grant in settled.grants {
@@ -953,7 +953,7 @@ fn a_bank_grown_before_the_first_group_leaves_its_places_room() {
         // miss every size (a step always pays the read's latency): each
         // growth by a row is worth its bytes alone, so room alone stops it.
         price_growth(&mut domain, &mut bindings, misses_by(100, &[(1, 8), (2, 4), (3, 2), (4, 1)]));
-        domain.probe_memory(std::time::Duration::from_millis(100)).unwrap();
+        domain.probe_memory().unwrap();
         let row = bank_row(&domain);
         let room = |domain: &ExecutorDomain<TestFamily>| {
             domain.growth_room(crate::planning::BankTier::Bank, super::borrowing::Room::Committed).unwrap().0
@@ -1019,15 +1019,13 @@ fn a_full_device_leaves_the_host_stores_room() {
         band: MemoryBand::Normal,
         unseen: 0,
         witness: None,
-        available: 0,
-        base: (Instant::now(), 0),
+        untaken: Default::default(),
         rate: 0.0,
-        fastest: 0.0,
         fluctuation: Fluctuation::default(),
         host: false,
         grant_left: None,
         borrowable: None,
-        takes: 0,
+        takes: None,
         first: std::time::Instant::now(),
     };
     let mut pace = MemoryPace::new();
@@ -1128,7 +1126,7 @@ fn a_measurement_claim_shrinks_the_bank_and_holds_its_growth() {
         let row = bank_row(&domain);
         price_growth(&mut domain, &mut bindings, misses_at(3, 100));
         // A probe in the Reclaim band reads memory as any does.
-        match domain.probe_memory(std::time::Duration::from_millis(100)) {
+        match domain.probe_memory() {
             Ok(()) | Err(DomainError::Reclaim(_)) => {}
             Err(error) => panic!("{error}"),
         }
@@ -1452,8 +1450,26 @@ const PACE_GB: u64 = 1_000_000_000;
 
 /// One reading of `store` with `headroom` bytes against a 10 GB planning
 /// line, the process charging `charged` and its releases' witness reading
-/// `witness`.
-fn read_pace(pace: &mut MemoryPace, store: seismic::StoreId, headroom: u64, charged: u64, witness: u64, interval: Duration) {
+/// `witness`, with nothing releasable, at the last reading's instant (now
+/// for the first), so no span reaches the reading interval and no rate
+/// plays a part.
+fn read_pace(pace: &mut MemoryPace, store: seismic::StoreId, headroom: u64, charged: u64, witness: u64) {
+    let at = pace.read.unwrap_or_else(Instant::now);
+    read_pace_at(pace, store, headroom, charged, Some(witness), at, 0);
+}
+
+/// [`read_pace`] read `at`, its witness reading `witness` (none where none
+/// is read), the load able to release `releasable` bytes of host RAM.
+#[allow(clippy::too_many_arguments)]
+fn read_pace_at(
+    pace: &mut MemoryPace,
+    store: seismic::StoreId,
+    headroom: u64,
+    charged: u64,
+    witness: Option<u64>,
+    at: Instant,
+    releasable: u64,
+) {
     let topology = seismic::Devices::discover(&[]).unwrap().topology();
     let thresholds = crate::platform::DomainThresholds { planning_bytes: 10 * PACE_GB, emergency_bytes: 2 * PACE_GB };
     let reading = DomainReading {
@@ -1471,7 +1487,13 @@ fn read_pace(pace: &mut MemoryPace, store: seismic::StoreId, headroom: u64, char
         displacing: false,
         band: if headroom <= thresholds.planning_bytes { MemoryBand::Reclaim } else { MemoryBand::Normal },
     };
-    pace.observe(&[reading], &[(store, charged)], Some(witness), true, interval);
+    let releasable = crate::platform::Releasable { host: releasable, device: 0 };
+    pace.observe(&[reading], &[(store, charged)], witness, true, releasable, pace_release(), at);
+}
+
+/// The release rate the pace's readings are taken beside: 10 GB/s.
+fn pace_release() -> crate::platform::ReleaseRate {
+    crate::platform::ReleaseRate::new(10.0 * PACE_GB as f64)
 }
 
 /// The host shows each release `lag` readings late, whatever `lag`, its
@@ -1482,8 +1504,6 @@ fn read_pace(pace: &mut MemoryPace, store: seismic::StoreId, headroom: u64, char
 fn a_release_the_host_shows_late_is_not_released_again() {
     const RUNG: u64 = 2 * PACE_GB;
     let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
-    // No span reaches the interval: the rate plays no part.
-    let interval = Duration::from_secs(3600);
     for lag in 0..8 {
         let mut pace = MemoryPace::new();
         let (mut charged, mut releases) = (20 * PACE_GB, Vec::<(usize, u64)>::new());
@@ -1491,7 +1511,7 @@ fn a_release_the_host_shows_late_is_not_released_again() {
             let taken = if at < 20 { 3 } else { 6 } * PACE_GB;
             let shown: u64 = releases.iter().filter(|(when, _)| when + lag <= at).map(|(_, bytes)| bytes).sum();
             let unshown = releases.iter().map(|(_, bytes)| bytes).sum::<u64>() - shown;
-            read_pace(&mut pace, store, (10 * PACE_GB + shown).saturating_sub(taken), charged, charged + unshown, interval);
+            read_pace(&mut pace, store, (10 * PACE_GB + shown).saturating_sub(taken), charged, charged + unshown);
             if let Shortfall::Short(bytes) = pace.shortfall(store, charged) {
                 let released = bytes.div_ceil(RUNG) * RUNG;
                 charged -= released;
@@ -1509,18 +1529,94 @@ fn a_release_the_host_shows_late_is_not_released_again() {
 #[test]
 fn only_what_the_witness_has_yet_to_drop_is_credited() {
     let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
-    let interval = Duration::from_secs(3600);
     let mut pace = MemoryPace::new();
-    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
-    read_pace(&mut pace, store, 8 * PACE_GB, 19 * PACE_GB, 19 * PACE_GB, interval);
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB);
+    read_pace(&mut pace, store, 8 * PACE_GB, 19 * PACE_GB, 19 * PACE_GB);
     assert_eq!(pace.shortfall(store, 19 * PACE_GB), Shortfall::Short(2 * PACE_GB), "shown at once");
-    read_pace(&mut pace, store, 8 * PACE_GB, 18 * PACE_GB, 19 * PACE_GB, interval);
+    read_pace(&mut pace, store, 8 * PACE_GB, 18 * PACE_GB, 19 * PACE_GB);
     assert_eq!(pace.shortfall(store, 18 * PACE_GB), Shortfall::Short(PACE_GB), "a GB unseen");
-    read_pace(&mut pace, store, 9 * PACE_GB, 18 * PACE_GB, 18 * PACE_GB, interval);
+    read_pace(&mut pace, store, 9 * PACE_GB, 18 * PACE_GB, 18 * PACE_GB);
     assert_eq!(pace.shortfall(store, 18 * PACE_GB), Shortfall::Short(PACE_GB), "shown now");
     // The host takes a GB with none unseen: all of it is short.
-    read_pace(&mut pace, store, 8 * PACE_GB, 18 * PACE_GB, 18 * PACE_GB, interval);
+    read_pace(&mut pace, store, 8 * PACE_GB, 18 * PACE_GB, 18 * PACE_GB);
     assert_eq!(pace.shortfall(store, 18 * PACE_GB), Shortfall::Short(2 * PACE_GB));
+}
+
+/// The process backing its own charge is no other program's take: a
+/// reservation charged before its pages are wired (an import, a bank's
+/// first fill) lowers the headroom by what its witness rises, and the pace
+/// measures no motion from it, so no margin follows; the same fall with the
+/// witness still is another program's, and is measured.
+#[test]
+fn backing_the_process_s_own_charge_measures_no_take() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let start = Instant::now();
+    let mut pace = MemoryPace::new();
+    let read = |pace: &mut MemoryPace, reading: u32, headroom: u64, witness: u64| {
+        read_pace_at(pace, store, headroom, 29 * PACE_GB, Some(witness), start + READING_INTERVAL * reading, 0);
+    };
+    // 22 GB charged at once, then wired over the next readings, as a
+    // 28 GB-capped load's import on a 48 GB Mac reads.
+    read(&mut pace, 0, 40 * PACE_GB, 8 * PACE_GB);
+    read(&mut pace, 1, 29 * PACE_GB, 19 * PACE_GB);
+    read(&mut pace, 2, 18 * PACE_GB, 30 * PACE_GB);
+    assert!(pace.motions().host.is_none(), "the process's own backing is measured as no take");
+    // Another program takes 4 GB: the headroom falls, the witness holds.
+    read(&mut pace, 3, 14 * PACE_GB, 30 * PACE_GB);
+    let motion = pace.motions().host.expect("another program's take is measured");
+    assert!(motion.take_rate() > 0.0);
+}
+
+/// A take the pace reads is the one sustained over the span a margin holds
+/// it across: 100 ms readings, 20 GB releasable at 10 GB/s, so a 2.1 s
+/// window. Another program's 22 GB fall within one reading span (220 GB/s
+/// across it) reads as at most its share of the window, and once the
+/// readings stay flat for the window it reads no take at all, so no margin
+/// follows it.
+#[test]
+fn a_transient_fall_sets_no_take_past_its_window() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let start = Instant::now();
+    let mut pace = MemoryPace::new();
+    let read = |pace: &mut MemoryPace, reading: u64, headroom: u64| {
+        read_pace_at(pace, store, headroom, 20 * PACE_GB, Some(20 * PACE_GB), start + READING_INTERVAL * reading as u32, 20 * PACE_GB);
+    };
+    for reading in 0..30 {
+        read(&mut pace, reading, 30 * PACE_GB);
+    }
+    assert!(pace.motions().host.is_none(), "flat readings take nothing");
+    read(&mut pace, 30, 8 * PACE_GB);
+    let rate = pace.domains[&store].rate;
+    assert!(rate > 0.0 && rate <= 22.0 * PACE_GB as f64 / 2.1 * (1.0 + 1e-9), "{rate} B/s: a share of the window, not the span's 220 GB/s");
+    for reading in 31..51 {
+        read(&mut pace, reading, 8 * PACE_GB);
+        assert!(pace.domains[&store].rate > 0.0, "reading {reading}: the fall is within the window");
+    }
+    read(&mut pace, 51, 8 * PACE_GB);
+    assert_eq!(pace.domains[&store].rate, 0.0, "the window holds no fall once flat for it");
+    assert!(pace.motions().host.is_none(), "a take that stopped sets no margin");
+}
+
+/// A take that sustains reads as itself: another program taking 2 GB/s in
+/// 100 ms readings reads 2 GB/s once the 2.1 s window holds it, and the
+/// margin's motion is that rate.
+#[test]
+fn a_sustained_take_reads_at_its_rate() {
+    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
+    let start = Instant::now();
+    let mut pace = MemoryPace::new();
+    for reading in 0..=100u64 {
+        let headroom = 40 * PACE_GB - reading * PACE_GB / 5;
+        read_pace_at(&mut pace, store, headroom, 20 * PACE_GB, Some(20 * PACE_GB), start + READING_INTERVAL * reading as u32, 20 * PACE_GB);
+        let rate = pace.domains[&store].rate;
+        match reading {
+            0 => assert_eq!(rate, 0.0),
+            1..=20 => assert!(rate > 0.0 && rate < 2.0 * PACE_GB as f64, "reading {reading}: {rate} B/s, the window not yet full"),
+            _ => assert!((rate / (2.0 * PACE_GB as f64) - 1.0).abs() < 1e-9, "reading {reading}: {rate} B/s"),
+        }
+    }
+    let motion = pace.motions().host.expect("a sustained take is measured");
+    assert!((motion.take_rate() / (2.0 * PACE_GB as f64) - 1.0).abs() < 1e-9);
 }
 
 /// A release after the reading a decision uses is credited too; a reading
@@ -1528,19 +1624,18 @@ fn only_what_the_witness_has_yet_to_drop_is_credited() {
 #[test]
 fn the_credit_counts_releases_after_the_reading_until_memory_is_above_the_line() {
     let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
-    let interval = Duration::from_secs(3600);
     let mut pace = MemoryPace::new();
-    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB);
     assert_eq!(pace.shortfall(store, 20 * PACE_GB), Shortfall::Short(3 * PACE_GB));
     assert_eq!(pace.shortfall(store, 19 * PACE_GB), Shortfall::Short(2 * PACE_GB), "released after the reading");
     assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Covered);
-    read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB, interval);
+    read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB);
     assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Covered, "unseen at this reading");
-    read_pace(&mut pace, store, 11 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB, interval);
+    read_pace(&mut pace, store, 11 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB);
     assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Above);
-    read_pace(&mut pace, store, 9 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB, interval);
+    read_pace(&mut pace, store, 9 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB);
     assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Short(PACE_GB), "the old release is not credited again");
-    read_pace(&mut pace, store, 9 * PACE_GB, 16 * PACE_GB, 17 * PACE_GB, interval);
+    read_pace(&mut pace, store, 9 * PACE_GB, 16 * PACE_GB, 17 * PACE_GB);
     assert_eq!(pace.shortfall(store, 16 * PACE_GB), Shortfall::Covered);
 }
 
@@ -1550,35 +1645,65 @@ fn the_credit_counts_releases_after_the_reading_until_memory_is_above_the_line()
 #[test]
 fn a_release_the_host_never_shows_yields_to_more_taken() {
     let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
-    let interval = Duration::from_secs(3600);
     let mut pace = MemoryPace::new();
-    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB);
     assert_eq!(pace.shortfall(store, 20 * PACE_GB), Shortfall::Short(3 * PACE_GB));
     // 3 GB released; the witness never falls by it.
     for reading in 0..30 {
-        read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB, interval);
+        read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB);
         assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Covered, "reading {reading} after the release");
     }
     // The host takes a GB more.
-    read_pace(&mut pace, store, 6 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB, interval);
+    read_pace(&mut pace, store, 6 * PACE_GB, 17 * PACE_GB, 20 * PACE_GB);
     assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Short(PACE_GB));
 }
 
-/// The process's own release, unseen, is no taking by the host, and the
-/// taking measured before it is not projected past it: the host that took
-/// memory may have stopped. The next span measures it again.
+/// The process's own release is no taking by the host and ends none: its
+/// witness falls by what the headroom rises, so a steady 1 GB/s take by
+/// another program reads at its rate on every reading, across a 2 GB
+/// release as before it, and a release with nothing taken reads none.
+/// Without a witness the take is measured only across spans of an
+/// unchanged charge: a release shown in its own reading or two readings
+/// late invents no take (nothing reads above the steady 1 GB/s, no ask
+/// counted faster), and the steady take reads at its rate again within a
+/// window of the release showing.
 #[test]
-fn a_release_ends_the_measured_taking_until_a_span_after_it() {
+fn a_release_keeps_the_measured_taking() {
     let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
-    let mut pace = MemoryPace::new();
-    for charged in [20, 17, 17] {
-        read_pace(&mut pace, store, 7 * PACE_GB, charged * PACE_GB, charged * PACE_GB, Duration::ZERO);
-        assert_eq!(pace.domains[&store].fastest, 0.0, "at a charge of {charged} GB");
+    let start = Instant::now();
+    // 0.1 GB taken a reading; 2 GB released at reading 10, shown `lag`
+    // readings later, its witness falling as it shows (or none read).
+    let run = |witnessed: bool, lag: u64, taking: bool| {
+        let mut pace = MemoryPace::new();
+        let mut rates = Vec::new();
+        for reading in 0..20u64 {
+            let released = if reading >= 10 { 2 * PACE_GB } else { 0 };
+            let shown = if reading >= 10 + lag { released } else { 0 };
+            let taken = if taking { reading * PACE_GB / 10 } else { 0 };
+            let headroom = 20 * PACE_GB - taken + shown;
+            let charged = 20 * PACE_GB - released;
+            let witness = witnessed.then_some(20 * PACE_GB - shown);
+            read_pace_at(&mut pace, store, headroom, charged, witness, start + READING_INTERVAL * reading as u32, 0);
+            rates.push(pace.domains[&store].rate);
+        }
+        (rates, pace.domains[&store].takes)
+    };
+    let (rates, _) = run(true, 0, true);
+    assert_eq!(rates[0], 0.0);
+    for (reading, rate) in rates.iter().enumerate().skip(1) {
+        assert!((rate / PACE_GB as f64 - 1.0).abs() < 1e-6, "reading {reading}: {rate} B/s");
     }
-    read_pace(&mut pace, store, 6 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB, Duration::ZERO);
-    assert!(pace.domains[&store].rate > 0.0, "the host took a GB");
-    read_pace(&mut pace, store, 6 * PACE_GB, 15 * PACE_GB, 15 * PACE_GB, Duration::ZERO);
-    assert_eq!(pace.domains[&store].rate, 0.0, "released across this span");
+    let (rates, takes) = run(true, 0, false);
+    assert!(rates.iter().all(|rate| *rate == 0.0) && takes.is_none(), "a release with nothing taken reads none");
+    for lag in [0, 2] {
+        let (rates, takes) = run(false, lag, true);
+        let steady = PACE_GB as f64 * (1.0 + 1e-6);
+        assert!(rates.iter().all(|rate| *rate <= steady), "no witness, shown {lag} readings late: {rates:?}");
+        assert!(takes.is_none_or(|takes| takes.mean() <= steady), "no witness, shown {lag} readings late: {takes:?}");
+        for (reading, rate) in rates.iter().enumerate().skip(10 + lag as usize + 1) {
+            assert!((rate / PACE_GB as f64 - 1.0).abs() < 1e-6, "no witness, shown {lag} late, reading {reading}: {rate} B/s");
+        }
+    }
 }
 
 /// A release that lands in a span in which the host takes as much is seen by
@@ -1590,13 +1715,12 @@ fn a_release_ends_the_measured_taking_until_a_span_after_it() {
 #[test]
 fn a_release_the_host_takes_as_it_lands_is_not_credited() {
     let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
-    let interval = Duration::from_secs(3600);
     let mut pace = MemoryPace::new();
-    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB);
     assert_eq!(pace.shortfall(store, 20 * PACE_GB), Shortfall::Short(3 * PACE_GB));
     // 3 GB released, and the host takes 3 GB in the same span.
     for reading in 0..3 {
-        read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB, interval);
+        read_pace(&mut pace, store, 7 * PACE_GB, 17 * PACE_GB, 17 * PACE_GB);
         assert_eq!(pace.shortfall(store, 17 * PACE_GB), Shortfall::Short(3 * PACE_GB), "reading {reading} after the release");
     }
 }
@@ -1621,15 +1745,13 @@ fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
         band: MemoryBand::Normal,
         unseen: 0,
         witness: None,
-        available: 0,
-        base: (Instant::now(), 0),
+        untaken: Default::default(),
         rate: 0.0,
-        fastest: 0.0,
         fluctuation: Fluctuation::default(),
         host: false,
         grant_left: None,
         borrowable: None,
-        takes: 0,
+        takes: None,
         first: std::time::Instant::now(),
     };
     let mut pace = MemoryPace::new();
@@ -1673,7 +1795,6 @@ fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
     const GB: u64 = 1_000_000_000;
     let ms = std::time::Duration::from_millis;
     let mut pace = MemoryPace::new();
-    pace.reading_interval = ms(100);
     assert_eq!(pace.horizon(), ms(100));
     pace.released(GB, &times(0, 120));
     assert_eq!(pace.horizon(), ms(340));
@@ -1692,23 +1813,22 @@ fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
 #[test]
 fn memory_is_due_a_reading_once_an_interval_has_passed() {
     let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
-    let interval = Duration::from_millis(100);
     let mut pace = MemoryPace::new();
     assert!(pace.due(Instant::now()), "before any reading");
-    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB, interval);
+    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB);
     let read = pace.read.expect("a reading is timed");
     assert!(!pace.due(read + Duration::from_millis(99)));
-    assert!(pace.due(read + interval));
+    assert!(pace.due(read + READING_INTERVAL));
 }
 
 /// The wait bound is what the host may take from the planning line to the
-/// emergency reserve at the fastest rate it was measured taking: 8 GB at
-/// 1 GB/s is 8 s. None in a domain seen taking nothing, nor in one that
-/// grows nothing; none of a pace before any probe.
+/// emergency reserve at the rate it sustains taking now: 8 GB at 1 GB/s is
+/// 8 s. None in a domain taking nothing now, nor in one that grows nothing;
+/// none of a pace before any probe.
 #[test]
-fn the_wait_bound_is_the_reserve_between_the_lines_at_the_fastest_taking() {
+fn the_wait_bound_is_the_reserve_between_the_lines_at_the_sustained_taking() {
     const GB: u64 = 1_000_000_000;
-    let domain = |role, fastest| DomainPace {
+    let domain = |role, rate| DomainPace {
         role,
         headroom: 0,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 10 * GB, emergency_bytes: 2 * GB },
@@ -1716,15 +1836,13 @@ fn the_wait_bound_is_the_reserve_between_the_lines_at_the_fastest_taking() {
         band: MemoryBand::Normal,
         unseen: 0,
         witness: None,
-        available: 0,
-        base: (Instant::now(), 0),
-        rate: 0.0,
-        fastest,
+        untaken: Default::default(),
+        rate,
         fluctuation: Fluctuation::default(),
         host: false,
         grant_left: None,
         borrowable: None,
-        takes: 0,
+        takes: None,
         first: std::time::Instant::now(),
     };
     assert_eq!(domain(DomainRole::Allocation, 1e9).wait_bound(), Some(8.0));
@@ -1736,14 +1854,14 @@ fn the_wait_bound_is_the_reserve_between_the_lines_at_the_fastest_taking() {
 /// What a serving load measured of the rest of the host's motion, which
 /// its reserves then hold their margin at: nothing on a quiet host (the
 /// reserves keep the machine's page-fill rate), and once the host took
-/// memory, the steady fluctuation and the fastest take, host RAM's and a
+/// memory, the steady fluctuation and the sustained take, host RAM's and a
 /// device's own memory's each their own; and the last release's latency
 /// once one finished.
 #[test]
 fn a_serving_load_measures_the_hosts_motion_and_its_release_latency() {
     const GB: u64 = 1_000_000_000;
     let [host, device] = [(); 2].map(|()| seismic::Devices::discover(&[]).unwrap().topology().host_ram().id());
-    let domain = |host: bool, fastest: f64, fluctuation: u64| DomainPace {
+    let domain = |host: bool, rate: f64, fluctuation: u64| DomainPace {
         role: DomainRole::Allocation,
         headroom: 0,
         thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
@@ -1751,15 +1869,13 @@ fn a_serving_load_measures_the_hosts_motion_and_its_release_latency() {
         band: MemoryBand::Normal,
         unseen: 0,
         witness: None,
-        available: 0,
-        base: (Instant::now(), 0),
-        rate: 0.0,
-        fastest,
+        untaken: Default::default(),
+        rate,
         fluctuation: Fluctuation { settled: None, largest: fluctuation },
         host,
         grant_left: None,
         borrowable: None,
-        takes: 0,
+        takes: None,
         first: Instant::now(),
     };
     let none = PaceMotions { host: None, device: None, latency: None, release: None };
@@ -3089,7 +3205,8 @@ fn selected_histories_follow_blocks_across_rollback() {
 /// The supply a settle reads from the latest probe: free room above the
 /// planning line, the shortfall below it owed, borrowed room up to the
 /// line borrowing is held within, at no price while no other program was
-/// seen asking and at `takes / (elapsed × fastest)` once one was, and the
+/// seen asking and at `takes / (elapsed × t)` once one was, `t` the mean
+/// rate of its asks, and the
 /// grant's hard limit where one bounds the store.
 #[test]
 fn the_supply_reads_the_latest_probe() {
@@ -3104,19 +3221,16 @@ fn the_supply_reads_the_latest_probe() {
         band: if headroom > 2 * GB { MemoryBand::Normal } else { MemoryBand::Reclaim },
         unseen: 0,
         witness: None,
-        available: 0,
-        base: (now, 0),
+        untaken: Default::default(),
         rate: 0.0,
-        fastest: 4.0 * GB as f64,
         fluctuation: Fluctuation::default(),
         host: true,
         grant_left: Some(30 * GB),
         borrowable: Some(20 * GB),
-        takes,
+        takes: std::num::NonZeroU32::new(takes).map(|count| Takes { count, rate_sum: f64::from(takes) * 4.0 * GB as f64 }),
         first: now - Duration::from_secs(10),
     };
     let mut pace = MemoryPace::new();
-    pace.reading_interval = Duration::from_millis(100);
     pace.read = Some(now);
     pace.domains.insert(store, pace_of(5 * GB, 0));
     let supply = pace.supply(store, 0, Duration::from_secs(60)).unwrap();

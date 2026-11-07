@@ -1504,7 +1504,7 @@ fn load(
         .measure_load(pricing.measures(crate::assessment::Priced::Pending(pending.into()), crate::assessment::Priced::Pending(pending.into())), &mut bindings)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     domain.serve().unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    domain.probe_memory(std::time::Duration::from_millis(100)).unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    domain.probe_memory().unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     (domain, bindings, pass_rows, pricing)
 }
 

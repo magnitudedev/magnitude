@@ -812,7 +812,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// reading.
     #[cfg(test)]
     pub(crate) fn grow_settled(&mut self, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
-        self.probe_memory(std::time::Duration::from_millis(100))?;
+        self.probe_memory()?;
         let settled = self.settle_memory(&OwnerHoldings::default())?;
         match settled.grants.first() {
             Some(grant) => self.grow_expert_bank(&grant.clone(), wake),

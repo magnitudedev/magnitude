@@ -575,15 +575,13 @@ pub fn with_room<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, room: u64) {
         band: MemoryBand::Normal,
         unseen: 0,
         witness: None,
-        available: 0,
-        base: (std::time::Instant::now(), 0),
+        untaken: Default::default(),
         rate: 0.0,
-        fastest: 0.0,
         fluctuation: Fluctuation::default(),
         host: false,
         grant_left: None,
         borrowable: None,
-        takes: 0,
+        takes: None,
         first: std::time::Instant::now(),
     });
 }

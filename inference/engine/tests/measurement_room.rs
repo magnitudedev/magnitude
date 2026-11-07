@@ -20,7 +20,6 @@ use magnitude_scheduler::{
 };
 use owner_host::Host;
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 
 mod owner_host;
 
@@ -42,7 +41,7 @@ fn limits() -> ServiceLimits {
 /// holds above its floor, read through a claim no device holds.
 fn room(domain: &mut ExecutorDomain<TestFamily>) -> (u64, u64) {
     domain
-        .probe_memory(Duration::from_millis(100))
+        .probe_memory()
         .expect("the host's memory is in the Normal band, where no reclaim release runs");
     let beyond = u64::MAX / 4;
     domain.claim_measurement_room(beyond);

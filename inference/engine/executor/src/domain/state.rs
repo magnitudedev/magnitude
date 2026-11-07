@@ -825,10 +825,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// not admitted again, so memory the host takes from under a running
     /// growth is the band it puts the domain in, never a refusal.
     /// Its readings are the ones the memory pace is measured from
-    /// (`MemoryPace`): the owner probes every `reading_interval`, and again
-    /// after each release while memory is short.
-    pub fn probe_memory(&mut self, reading_interval: std::time::Duration) -> Result<(), DomainError> {
-        self.memory_probe().probe(self.family.expert_bank(), reading_interval)
+    /// (`MemoryPace`): the owner probes every
+    /// [`crate::platform::READING_INTERVAL`], and again after each release
+    /// while memory is short.
+    pub fn probe_memory(&mut self) -> Result<(), DomainError> {
+        self.memory_probe().probe(self.family.expert_bank())
     }
 
     /// Claim the peak new charge of one physical operation from the heap:
