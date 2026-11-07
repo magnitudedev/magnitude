@@ -393,12 +393,6 @@ impl Core {
         steps.untaint_before(read);
     }
 
-    /// The reads that bring expert `expert` of `layer` into staging record
-    /// `record` of each of its pools.
-    pub(super) fn reads(&self, layer: usize, expert: usize, record: u32) -> Vec<Read> {
-        self.table.reads(layer, expert, record)
-    }
-
     /// The landing of expert `expert` of `layer` from staging record
     /// `record` of each of its pools into tier record `tier` of its group,
     /// mapped in its tier map (`experts::landing`).
@@ -463,7 +457,7 @@ impl Core {
     /// base of a slot of its scratch.
     pub(super) fn reads_to(&self, layer: usize, expert: usize, conveyor: &Conveyor, record: u32) -> Vec<Read> {
         match conveyor.slot_of(record) {
-            None => self.reads_into(layer, expert, |pool| (&conveyor.pools()[pool], u64::from(record))),
+            None => self.table.reads_into(layer, expert, |pool| (&conveyor.pools()[pool], u64::from(record))),
             Some(slot) => {
                 let slots = self.layers[layer].slots.as_ref().expect("a slot carries an expert only where the host addresses the scratch");
                 self.layers[layer]
@@ -477,11 +471,5 @@ impl Core {
                     .collect()
             }
         }
-    }
-
-    /// The reads that bring expert `expert` of `layer` into record `into`
-    /// names (its records and index) of each of its pools, by pool.
-    pub(super) fn reads_into<'a>(&self, layer: usize, expert: usize, into: impl Fn(usize) -> (&'a Records, u64)) -> Vec<Read> {
-        self.table.reads_into(layer, expert, into)
     }
 }

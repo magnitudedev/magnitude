@@ -430,6 +430,24 @@ fn give_up(core: &mut Core, prefetch: &Prefetch, shared: &Shared, layer: usize, 
     }
 }
 
+/// Tier records for a posted read's landings of `experts` at `layer`, the
+/// device parked at `parked`, in order: each claimed while the tier has
+/// one, and none for it and every later one once it is short. The one rule
+/// a posted read's landings claim by, as residency serves its request and
+/// as they resume (`Decode::resume`), so they claim in the order they were
+/// read.
+fn posted_claims(core: &mut Core, layer: usize, experts: impl IntoIterator<Item = usize>, parked: (crate::experts::directory::Point, u64)) -> Vec<Option<Grant>> {
+    let mut short = false;
+    experts
+        .into_iter()
+        .map(|expert| {
+            let grant = if short { None } else { posted_claim(core, (layer, expert), parked) };
+            short |= grant.is_none();
+            grant
+        })
+        .collect()
+}
+
 /// Whether step `sequence`'s request at `layer` ended: its step retired or
 /// failed, or its request failed. Nothing waits on its answers.
 fn request_ended(core: &Core, shared: &Shared, layer: usize, sequence: Step) -> bool {
@@ -478,18 +496,15 @@ impl Decode {
                 continue;
             }
             let steps = shared.steps.group_of(at.point.sequence).1;
+            let landings = std::mem::take(&mut unclaimed.landings);
+            let grants = posted_claims(core, layer, landings.iter().map(|landing| landing.expert), (at.point, steps));
             let mut claimed = Vec::new();
-            let mut landings = std::mem::take(&mut unclaimed.landings).into_iter();
-            for landing in landings.by_ref() {
-                match posted_claim(core, (layer, landing.expert), (at.point, steps)) {
+            for (landing, grant) in landings.into_iter().zip(grants) {
+                match grant {
                     Some(grant) => claimed.push((landing, grant)),
-                    None => {
-                        unclaimed.landings.push(landing);
-                        break;
-                    }
+                    None => unclaimed.landings.push(landing),
                 }
             }
-            unclaimed.landings.extend(landings);
             if !claimed.is_empty() {
                 land(core, prefetch, shared, &unclaimed, claimed, None);
                 progressed = true;
@@ -555,7 +570,7 @@ impl Decode {
             if waits.record {
                 crate::experts::landing::LandingAccount::add(&shared.landings.waited, waits.named.elapsed());
             }
-            let reads = core.reads(layer, expert, record);
+            let reads = core.table.reads(layer, expert, record);
             let count = reads.len();
             let landing = Named {
                 landing: parked_landing(core, grant, record, waits.at.point, steps),
@@ -689,7 +704,7 @@ impl Decode {
         // (`Self::resume`).
         let read = read.map(|read| {
             let grants = match read.posting {
-                Ok(_) => read.landings.iter().map(|&(expert, ..)| posted_claim(core, (layer, expert), (point, steps))).collect(),
+                Ok(_) => posted_claims(core, layer, read.landings.iter().map(|&(expert, ..)| expert), (point, steps)),
                 Err(_) => Vec::new(),
             };
             (read, grants)

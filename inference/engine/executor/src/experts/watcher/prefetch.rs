@@ -850,7 +850,7 @@ impl Prefetch {
             return Err(Short::Tier);
         };
         let tier = grant.record();
-        let reads = core.reads(target, expert, record);
+        let reads = core.table.reads(target, expert, record);
         let bytes = reads.iter().map(crate::experts::source::Read::bytes).sum::<u64>();
         let landing = core.landing(grant, record);
         match post(&core.table, reads, priority) {
