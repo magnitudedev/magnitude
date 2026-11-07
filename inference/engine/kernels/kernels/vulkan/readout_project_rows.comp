@@ -47,7 +47,7 @@ void readout_project_rows_gemv() {
         }
     }
     const projection_weights w = projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), PACKETS_W0_ROWS,
-        HEAD_K, table, SEISMIC_TOKEN_ROWS_STRIDE_2);
+        HEAD_K, table, SEISMIC_TOKEN_ROWS_STRIDE_2, 0u);
     projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, 1u, PROJECTION_NORM_NONE,
         prepared_input(), prepared_output(), w, w, 1u, SEISMIC_DIM_I == 1 ? 1u : uint(SEISMIC_DIM_S), HEAD_K, SEISMIC_DIM_I == 1 ? 0u : gl_WorkGroupID.x);
 }

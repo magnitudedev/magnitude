@@ -1020,6 +1020,30 @@ __device__ __forceinline__ void gemv_group(const Ready &ready, u32 M, u64 kblock
                                                  part, staging);
 }
 
+// A weight read over a window of its K for a GEMV (a K split's share):
+// superblocks `first` .. of every row, whole superblocks of 4 k-blocks, so a
+// GEMV over `kblocks` k-blocks reads k-blocks 4 * first .. 4 * first +
+// kblocks - 1 of the stored rows. The GEMV of `gemv_mma_group` reads a
+// weight only through these accessors; the staged, records and entry-order
+// GEMVs address k-blocks otherwise.
+template <class W> struct Window : W {
+    static_assert(!GemvStaged<W>::value && !GemvRecords<W>::value && !GemvEntries<W>::value,
+                  "a windowed weight runs the MMA GEMV");
+    u64 first;
+    __device__ __forceinline__ Window(const W &w, u64 superblock) : W(w), first(superblock) {}
+    __device__ __forceinline__ typename W::Super fetch_superblock(u64 tile, u64 superblock, u64 kblocks,
+                                                                  u32 lane) const {
+        return W::fetch_superblock(tile, first + superblock, 4 * first + kblocks, lane);
+    }
+    __device__ __forceinline__ typename W::Super fetch_superblock_permuted(u64 tile, u64 superblock, u64 kblocks,
+                                                                           u32 lane) const {
+        return W::fetch_superblock_permuted(tile, first + superblock, 4 * first + kblocks, lane);
+    }
+    __device__ __forceinline__ typename W::Block block(u64 tile, u64 superblock, u32 lane) const {
+        return W::block(tile, first + superblock, lane);
+    }
+};
+
 // Launch shape of a GEMV: WARPS warps per block in groups of KSPLIT; a group
 // owns TPW tiles for up to 8 * NB activation rows. Threads per block = 32 *
 // WARPS; tile groups per block = WARPS / KSPLIT.

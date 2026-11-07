@@ -50,7 +50,7 @@ projection_epilogue dense_output_output() {
 }
 
 projection_weights dense_output_down() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), PACKETS_W0_ROWS, uint(SEISMIC_DIM_F), 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), PACKETS_W0_ROWS, uint(SEISMIC_DIM_F), 0ul, 1ul, 0u);
 }
 
 // The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound

@@ -55,7 +55,7 @@ projection_epilogue attention_output_output() {
 }
 
 projection_weights attention_output_weight() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT), PACKETS_W0_ROWS, OUTPUT_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT), PACKETS_W0_ROWS, OUTPUT_K, 0ul, 1ul, 0u);
 }
 
 // The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound

@@ -10,7 +10,7 @@
 
 // Rows of the weight tensor at `base` starting at row `first`.
 projection_weights routed_weights(uint64_t base, packets_rows16 geometry, uint64_t first, uint k) {
-    return projection_weights(base + first * geometry.stride, geometry, k, 0ul, 1ul);
+    return projection_weights(base + first * geometry.stride, geometry, k, 0ul, 1ul, 0u);
 }
 
 // The weights of record `record` of the expert-stacked weight bound as the

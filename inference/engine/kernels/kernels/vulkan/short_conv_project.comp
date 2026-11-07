@@ -60,13 +60,13 @@ projection_epilogue short_conv_project_c() {
 }
 
 projection_weights short_conv_project_b() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_B_WEIGHT), PACKETS_W0_ROWS, CONV_H, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_B_WEIGHT), PACKETS_W0_ROWS, CONV_H, 0ul, 1ul, 0u);
 }
 projection_weights short_conv_project_x() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_X_WEIGHT), PACKETS_W2_ROWS, CONV_H, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_X_WEIGHT), PACKETS_W2_ROWS, CONV_H, 0ul, 1ul, 0u);
 }
 projection_weights short_conv_project_cw() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT), PACKETS_W1_ROWS, CONV_H, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT), PACKETS_W1_ROWS, CONV_H, 0ul, 1ul, 0u);
 }
 
 // The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound

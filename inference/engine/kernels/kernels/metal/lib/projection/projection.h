@@ -1050,11 +1050,17 @@ struct gemv_emit<true> {
 // (a multiple of LANES). Weight packets are double-buffered in registers: a
 // lane loads its next packet before accumulating the current one, and its
 // first packet before the staging, so the weight stream never waits on it.
+// `first_packet` is the stored packet of the GEMV's packet 0: a GEMV over a
+// range of whole packets of the weight rows (K split by stream in
+// `stream_mix_down`) reads packets first_packet .. first_packet +
+// ceil(k / 32) - 1, the rows' stored length unchanged. It is the call's
+// argument, not a field of the weight view, so no other reader of a view
+// (the GEMMs among them) carries it.
 template <typename W, typename U, bool PAIRED, uint R, uint MAXM, uint LANES, bool COLUMNS = false, typename In,
     typename Out>
 inline void gemv_body(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     thread const Weights<U> &u, uint m_rows, uint rows, uint k, uint tile,
-    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane) {
+    threadgroup uchar *shared, uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
     static_assert(LANES == 32 || LANES == 16 || LANES == 8, "a GEMV lane group is 8, 16 or 32 lanes");
     typedef typename In::activation A;
     uint group = lane / LANES, sub = lane % LANES;
@@ -1069,7 +1075,7 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
     if (active) {
         at.locate(w, u, first_row, rows);
         if (sub < packets)
-            current.load(w, u, at, sub);
+            current.load(w, u, at, first_packet + sub);
     }
     uint chunk = min(packets, (gemv_stage_packet_rows / MAXM) / LANES * LANES);
     threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
@@ -1088,7 +1094,7 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
         if (active) {
             for (uint local = sub; local < count; local += LANES) {
                 if (first + local + LANES < packets)
-                    next.load(w, u, at, first + local + LANES);
+                    next.load(w, u, at, first_packet + first + local + LANES);
                 gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, words);
                 current = next;
             }
@@ -1106,9 +1112,9 @@ inline void gemv(thread const In &in, thread const Out &out, thread const Weight
 template <typename W, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
 inline void gemv_runtime(thread const In &in, thread const Out &out, thread const Weights<W> &w,
     uint m_rows, uint rows, uint k, uint tile, threadgroup uchar *shared,
-    uint simdgroups, uint sg, uint lane) {
+    uint simdgroups, uint sg, uint lane, uint first_packet = 0) {
     gemv_body<W, W, false, R, MAXM, LANES>(in, out, w, w, m_rows, rows, k, tile, shared,
-        simdgroups, sg, lane);
+        simdgroups, sg, lane, first_packet);
 }
 
 // `gemv_runtime` with a column epilogue (`gemv_emit<true>`).

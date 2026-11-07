@@ -3,6 +3,7 @@
 // of zero rows, the exit site's, has no tiles), and the streams' inverses.
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #define KERNEL_W1 SEISMIC_INJECT_WEIGHT
+#include "lib/core/arrive.h"
 #include "lib/projection/projection.h"
 
 typedef element::Act activation;
@@ -17,6 +18,8 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device float *inject [[buffer(SEISMIC_RESULT_1_BUFFER)]],                           \
     device float *inverse [[buffer(SEISMIC_RESULT_2_BUFFER)]],                          \
     device uchar *normalized [[buffer(SEISMIC_BUFFER_SCRATCH_NORMALIZED)]],             \
+    arrive::coherent_device<float> partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]], \
+    device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],           \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define STREAM_MIX_DOWN_OPERANDS                                                        \
@@ -45,6 +48,23 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     }                                                                                   \
     const auto x = projection::shared_norm(in, squares)
 
+// One stream's F32 partial sums of the down | inject outputs: output n of row
+// m from stream s at partials[(m * S + s) * outputs + column + n].
+struct StreamPartial {
+    arrive::coherent_device<float> y;
+    ulong row;
+    ulong column;
+    void store(uint m, uint n, float value) const { y[ulong(m) * row + column + n] = value; }
+};
+
+// Below BATCH_FROM rows the projection is split along its K = S * H inputs by
+// stream: threadgroup `tile` serves stream tile / tiles and its row tile
+// tile % tiles of down | inject (`tiles` a stream). It normalizes only its
+// stream, from that stream's square sums (the first row tile of a stream
+// publishes its inverses), so no threadgroup repeats another stream's norm,
+// and its outputs are F32 partial sums over the stream's packets. The last
+// threadgroup to arrive adds every output's S partials in stream order and
+// applies the epilogues.
 #ifdef SEISMIC_FORMING_STREAM_MIX_DOWN_GEMV
 template <uint ROWS, uint LANES>
 kernel void stream_mix_down_gemv(STREAM_MIX_DOWN_ARGUMENTS,
@@ -54,16 +74,50 @@ kernel void stream_mix_down_gemv(STREAM_MIX_DOWN_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     STREAM_MIX_DOWN_OPERANDS;
+    const uint streams = uint(SEISMIC_DIM_S), width = uint(SEISMIC_DIM_H);
+    const uint outputs = low_rows + inject_rows;
     const uint per = simdgroups * ROWS * (32u / LANES);
     const uint rows = uint(SEISMIC_DIM_M);
     const uint t0 = (low_rows + per - 1) / per;
-    STREAM_MIX_DOWN_SQUARES(rows);
-    if (tile < t0)
+    const uint tiles = t0 + (inject_rows + per - 1) / per;
+    const uint stream = tile / tiles, local = tile % tiles;
+    const ulong first = ulong(stream) * width;
+    const projection::GroupRms<activation, norm_element, projection::AllRows> part{
+        hidden + first * SEISMIC_HIDDEN_STRIDE_2, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2,
+        norm + first * SEISMIC_NORM_STRIDE_1 * norm_element::bytes, SEISMIC_NORM_STRIDE_1,
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), width, {}, width};
+    PROJECTION_SQUARES_SHARED(squares, decltype(part)::parts);
+    projection::threadgroup_squares_runtime(part, rows, squares, simdgroups, sg, lane);
+    if (local == 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        projection::publish_inverses(part, rows, squares, inverse + ulong(stream) * SEISMIC_RESULT_2_STRIDE_1,
+            SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, sg * 32 + lane, simdgroups * 32);
+    }
+    const auto x = projection::shared_norm(part, squares);
+    const StreamPartial sums{partials, ulong(streams) * outputs, ulong(stream) * outputs};
+    if (local < t0) {
         PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W0, ROWS, MAXM, LANES>(
-            x, low_out, down_w, rows, low_rows, k, tile, shared, simdgroups, sg, lane));
-    else
+            x, sums, down_w, rows, low_rows, width, local, shared, simdgroups, sg, lane, stream * (width / 32u)));
+    } else {
+        const StreamPartial injected{partials, sums.row, sums.column + low_rows};
         PROJECTION_FOR_ROWS(rows, projection::gemv_runtime<packets::W1, ROWS, MAXM, LANES>(
-            x, inject_out, inject_w, rows, inject_rows, k, tile - t0, shared, simdgroups, sg, lane));
+            x, injected, inject_w, rows, inject_rows, width, local - t0, shared, simdgroups, sg, lane,
+            stream * (width / 32u)));
+    }
+    threadgroup uint last;
+    const uint thread_index = sg * 32 + lane, threads = simdgroups * 32;
+    if (!arrive::last(arrivals, streams * tiles, &last, thread_index))
+        return;
+    for (uint item = thread_index; item < rows * outputs; item += threads) {
+        const uint m = item / outputs, n = item % outputs;
+        float sum = 0.0f;
+        for (uint s = 0; s < streams; ++s)
+            sum += partials[(ulong(m) * streams + s) * outputs + n];
+        if (n < low_rows)
+            low_out.store(m, n, sum);
+        else
+            inject_out.store(m, n - low_rows, sum);
+    }
 }
 #endif
 

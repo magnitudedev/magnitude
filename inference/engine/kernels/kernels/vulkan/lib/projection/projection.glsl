@@ -330,6 +330,7 @@ struct projection_weights {
     uint k;
     uint64_t table;     // 0: rows in order
     uint64_t table_stride;
+    uint packet_first;  // the stored packet of packet 0 (a window of whole packets; `k` stays the row's)
 };
 
 uint64_t projection_weights_row(projection_weights w, uint n) {
@@ -338,7 +339,7 @@ uint64_t projection_weights_row(projection_weights w, uint n) {
 }
 
 packets_packet projection_packet(const int kind, projection_weights w, uint n, uint p) {
-    return packets_load(kind, projection_weights_row(w, n), w.geometry, p, w.k);
+    return packets_load(kind, projection_weights_row(w, n), w.geometry, w.packet_first + p, w.k);
 }
 
 // ---------------------------------------------------------------------------

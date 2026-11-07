@@ -2,10 +2,13 @@
 // streams, then one segmented projection down | inject (an inject segment of
 // zero rows, the exit site's, has no tiles), and the streams' inverses. The
 // Vulkan form of `metal/stream_mix_down.metal` over
-// `lib/projection/projection.glsl`: the library's GEMV prologue has one norm
-// group per row, so `stage` normalizes every stream into scratch (and
-// publishes its inverse) at every row count, and both classes read the
-// staged rows.
+// `lib/projection/projection.glsl`. The GEMV classes split K by stream: a
+// workgroup normalizes one stream (the library's GEMV prologue, one norm
+// group a row; the stream's first workgroup publishes its inverses) and
+// projects it over a row tile of down | inject into F32 partial sums, which
+// `combine` adds in stream order through the epilogues. Past 8 rows `stage`
+// normalizes every stream into scratch (and publishes its inverse) for the
+// GEMM.
 #define KERNEL_W0 SEISMIC_DOWN_WEIGHT
 #define KERNEL_W1 SEISMIC_INJECT_WEIGHT
 #include "lib/core/activation.glsl"
@@ -44,10 +47,10 @@ projection_prologue stream_mix_down_staged() {
 }
 
 projection_weights stream_mix_down_down() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), PACKETS_W0_ROWS, MIX_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), PACKETS_W0_ROWS, MIX_K, 0ul, 1ul, 0u);
 }
 projection_weights stream_mix_down_inject() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_INJECT_WEIGHT), PACKETS_W1_ROWS, MIX_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_INJECT_WEIGHT), PACKETS_W1_ROWS, MIX_K, 0ul, 1ul, 0u);
 }
 
 projection_epilogue stream_mix_down_low_out() {
@@ -70,28 +73,64 @@ void stream_mix_down_stage() {
             + (uint64_t(m) * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(stream) * SEISMIC_RESULT_2_STRIDE_1) * 4ul, inverse);
 }
 
+#define MIX_OUTPUTS (MIX_LOW_ROWS + MIX_INJECT_ROWS)
+#define MIX_PARTIALS SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS)
+
 // The GEMV with the activation-row bound `maxm` (`projection_gemv`: one bound
-// per pipeline, so one entry per bound).
+// per pipeline, so one entry per bound): workgroup `tile` serves stream
+// tile / tiles over its row tile tile % tiles of down | inject, output n of
+// row m at partials[(m * S + s) * outputs + n].
 void stream_mix_down_gemv_bounded(const uint maxm) {
     const uint per = projection_gemv_rows(SEISMIC_TUNE_SIMDGROUPS, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES);
-    const uint rows = uint(SEISMIC_DIM_M), tile = gl_WorkGroupID.x;
+    const uint rows = uint(SEISMIC_DIM_M), width = uint(SEISMIC_DIM_H), streams = uint(SEISMIC_DIM_S);
     const uint t0 = (MIX_LOW_ROWS + per - 1u) / per;
-    const projection_prologue x = stream_mix_down_staged();
-    if (tile < t0) {
-        const projection_weights w = stream_mix_down_down();
-        projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm, PROJECTION_NORM_NONE,
-            x, stream_mix_down_low_out(), w, w, rows, MIX_LOW_ROWS, MIX_K, tile);
+    const uint tiles = t0 + (MIX_INJECT_ROWS + per - 1u) / per;
+    const uint stream = gl_WorkGroupID.x / tiles, local = gl_WorkGroupID.x % tiles;
+    const uint64_t first = uint64_t(stream) * width;
+    const projection_prologue x = projection_rms(MIX_ACT,
+        SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN) + first * SEISMIC_HIDDEN_STRIDE_2 * 4ul, SEISMIC_HIDDEN_STRIDE_0,
+        SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_NORM) + first * SEISMIC_NORM_STRIDE_1 * ELEMENT_BYTES(MIX_NORM),
+        SEISMIC_NORM_STRIDE_1, MIX_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), width, 0ul);
+    const uint64_t row = uint64_t(streams) * MIX_OUTPUTS, column = uint64_t(stream) * MIX_OUTPUTS;
+    if (local < t0) {
+        projection_weights w = stream_mix_down_down();
+        w.packet_first = stream * (width / 32u);
+        projection_gemv(PACKETS_W0, PACKETS_W0, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
+            PROJECTION_NORM_SHARED, x, projection_store(ELEMENT_F32, MIX_PARTIALS, row, 1ul, column), w, w, rows,
+            MIX_LOW_ROWS, width, local);
     } else {
-        const projection_weights w = stream_mix_down_inject();
+        projection_weights w = stream_mix_down_inject();
+        w.packet_first = stream * (width / 32u);
         projection_gemv(PACKETS_W1, PACKETS_W1, false, SEISMIC_TUNE_ROWS, SEISMIC_TUNE_LANES, maxm,
-            PROJECTION_NORM_NONE, x, stream_mix_down_inject_out(), w, w, rows, MIX_INJECT_ROWS, MIX_K, tile - t0);
+            PROJECTION_NORM_SHARED, x, projection_store(ELEMENT_F32, MIX_PARTIALS, row, 1ul, column + MIX_LOW_ROWS),
+            w, w, rows, MIX_INJECT_ROWS, width, local - t0);
     }
+    if (local == 0u && gl_LocalInvocationIndex < rows)
+        element_f32_put(SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER) + (uint64_t(gl_LocalInvocationIndex)
+            * SEISMIC_RESULT_2_STRIDE_0 + uint64_t(stream) * SEISMIC_RESULT_2_STRIDE_1) * 4ul,
+            projection_gemv_inverse(x, gl_LocalInvocationIndex));
 }
 
 void stream_mix_down_gemv1() { stream_mix_down_gemv_bounded(1u); }
 void stream_mix_down_gemv2() { stream_mix_down_gemv_bounded(2u); }
 void stream_mix_down_gemv4() { stream_mix_down_gemv_bounded(4u); }
 void stream_mix_down_gemv8() { stream_mix_down_gemv_bounded(8u); }
+
+// Output n of row m: its S partials added in stream order, through the
+// epilogue of its segment.
+void stream_mix_down_combine() {
+    const uint item = gl_GlobalInvocationID.x;
+    if (item >= uint(SEISMIC_DIM_M) * MIX_OUTPUTS)
+        return;
+    const uint m = item / MIX_OUTPUTS, n = item % MIX_OUTPUTS;
+    float sum = 0.0;
+    for (uint s = 0u; s < uint(SEISMIC_DIM_S); ++s)
+        sum += element_f32_at(MIX_PARTIALS + (uint64_t(m * uint(SEISMIC_DIM_S) + s) * MIX_OUTPUTS + n) * 4ul);
+    if (n < MIX_LOW_ROWS)
+        projection_put(stream_mix_down_low_out(), m, n, sum);
+    else
+        projection_put(stream_mix_down_inject_out(), m, n - MIX_LOW_ROWS, sum);
+}
 
 // Workgroup column n belongs to the segment whose tiles hold it.
 void stream_mix_down_gemm() {

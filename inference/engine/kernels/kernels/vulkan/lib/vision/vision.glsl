@@ -189,7 +189,7 @@ void vision_gemm(const int wk, projection_prologue in_, vision_epilogue out_, pr
 // Dense weight rows of a row-major matrix of `rows` (its slot's,
 // <seismic/packets.glsl>).
 projection_weights vision_weights(uint64_t base, packets_rows16 rows, uint k) {
-    return projection_weights(base, rows, k, 0ul, 1ul);
+    return projection_weights(base, rows, k, 0ul, 1ul, 0u);
 }
 
 // ---------------------------------------------------------------------------

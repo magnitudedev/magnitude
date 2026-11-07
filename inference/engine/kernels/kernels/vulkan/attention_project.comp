@@ -54,16 +54,16 @@ projection_prologue attention_project_input() {
 }
 
 projection_weights attention_project_query() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_WEIGHT), PACKETS_W0_ROWS, PROJECT_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_WEIGHT), PACKETS_W0_ROWS, PROJECT_K, 0ul, 1ul, 0u);
 }
 projection_weights attention_project_gate() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), PACKETS_W1_ROWS, PROJECT_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), PACKETS_W1_ROWS, PROJECT_K, 0ul, 1ul, 0u);
 }
 projection_weights attention_project_key() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT), PACKETS_W2_ROWS, PROJECT_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT), PACKETS_W2_ROWS, PROJECT_K, 0ul, 1ul, 0u);
 }
 projection_weights attention_project_value() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT), PACKETS_W3_ROWS, PROJECT_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT), PACKETS_W3_ROWS, PROJECT_K, 0ul, 1ul, 0u);
 }
 
 // Each segment's result, after its weight's second-level scale where it has
