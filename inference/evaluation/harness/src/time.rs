@@ -567,7 +567,7 @@ fn prefill_cell(
             .flat_map(|step| step.submissions)
             .collect::<Vec<_>>();
         submissions.extend(trace.collect().map_err(|error| error.to_string())?);
-        let attributed = attribution(&submissions, 1, f64::INFINITY);
+        let attributed = attribution(&submissions, 1, (f64::NEG_INFINITY, f64::INFINITY));
         let prefill = match whole(&attributed_groups) {
             true => attributed_prefill(&attributed, &attributed_groups),
             false => Err("the attributed prefill did not run whole as prompt groups".to_owned()),
@@ -946,8 +946,9 @@ fn measure(
         let mut span = (f64::NAN, f64::NAN);
         let mut cpu = (0.0, 0.0);
         // Each thread kind's processor time, and the quota's throttling, at
-        // the window's start.
+        // the window's start and end.
         let (mut threads, mut throttling) = (None, None);
+        let (mut threads_end, mut throttling_end) = (None, None);
         // The load's graphs recorded and updated at the window's start.
         let mut graphs = engine.graph_replays();
         // A streamed load's per-layer expert costs at the window's ends.
@@ -1017,11 +1018,20 @@ fn measure(
                     json!(timing.selection_to_commit.map(|gap| gap.as_secs_f64() * MS));
             }
             span.1 = step.end;
-            cpu.1 = process_cpu_seconds();
+            // The window's end, read together where the process time always
+            // was: nothing run after the last step (an attribution's steps)
+            // counts in its figures.
+            if index + 1 == time.steps {
+                cpu.1 = process_cpu_seconds();
+                threads_end = thread_cpu_seconds();
+                throttling_end = throttled();
+            }
             expert_costs.push((engine.domain.expert_costs(), rest.and_then(|rest| rest.host_slots())));
             summaries.push(summary);
             submissions.extend(step.submissions);
         }
+        let threads = threads.zip(threads_end);
+        let throttling = throttling.zip(throttling_end);
         let expert_steps = expert_costs
             .into_iter()
             .map(|(costs, host_slots)| expert_step(costs, host_slots))
@@ -1150,18 +1160,24 @@ fn measure(
     } else {
         let trace = traced(engine, TraceDetail::Launches)?;
         let mut attributed = Vec::new();
-        let mut attributed_end = f64::NEG_INFINITY;
-        for _ in 0..time.attribution_steps {
-            // Attributed steps are untimed, so each collects its own launches
-            // even under lookahead.
+        // The window, from a leading step's end (`from`) to the last
+        // attributed step's (`until`). Under lookahead the leading step was
+        // queued before the trace opened, so its launches are not traced;
+        // each step after it is queued behind the one before and starts
+        // after that one's end, so the window holds exactly the attributed
+        // steps' launches. Attributed steps are untimed, so each collects
+        // its own launches even under lookahead.
+        let mut attributed_step = || {
             let operations = make(sequences)?;
             let mut refs = sequences.iter_mut().collect::<Vec<_>>();
             let (step, _) = engine.step(operations, &mut refs, Some(&trace))?;
-            attributed_end = step.end;
             attributed.extend(step.submissions);
-        }
+            Ok::<_, String>(step.end)
+        };
+        let from = attributed_step()?;
+        let until = (0..time.attribution_steps).try_fold(from, |_, _| attributed_step())?;
         attributed.extend(collect(&trace)?);
-        attribution(&attributed, time.attribution_steps, attributed_end)
+        attribution(&attributed, time.attribution_steps, (from, until))
     };
     // The window's steps' times, each from the completion before it.
     let mut intervals = summaries[1..]
@@ -1176,18 +1192,18 @@ fn measure(
     // steady state: every shape it runs ran before the window.
     window["graphs"] = graph_counts(engine.graph_replays().since(graphs), time.steps - 1);
     window["process_cpu_ms_per_step"] = json!((cpu.1 - cpu.0) * MS / (time.steps - 1) as f64);
-    window["thread_cpu"] = match (threads, thread_cpu_seconds()) {
-        (Some(before), Some(after)) => thread_cpu_per_step(&before, &after, time.steps - 1),
-        _ => Value::Null,
+    window["thread_cpu"] = match threads {
+        Some((before, after)) => thread_cpu_per_step(&before, &after, time.steps - 1),
+        None => Value::Null,
     };
     // Whether the quota throttled the process in the window: its periods
     // throttled and the time, per step.
-    window["throttled"] = match (throttling, throttled()) {
-        (Some(before), Some(after)) => json!({
+    window["throttled"] = match throttling {
+        Some((before, after)) => json!({
             "periods_per_step": (after.0 - before.0) as f64 / (time.steps - 1) as f64,
             "ms_per_step": (after.1 - before.1) as f64 / 1000. / (time.steps - 1) as f64,
         }),
-        _ => Value::Null,
+        None => Value::Null,
     };
     Ok(json!({
         "warm_steps": time.warm,
