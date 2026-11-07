@@ -1,7 +1,7 @@
 use super::specialization::{Specializer, Tuning};
 use super::tuning::readout_choice::{
     ClassCost, QualifiedRecipe, ReadoutContender, ReadoutRecipe, RecipePreparation, RecipeState,
-    bounds_rows, stores_planes,
+    class_levels, stores_planes,
 };
 use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
@@ -613,12 +613,13 @@ enum ReadoutReader {
 }
 
 impl ReadoutReader {
-    /// Whether the reader's graphs read the bounded levels at a class they
-    /// certify. A separate draft's proposals' confidences read every logit,
-    /// so it reads the views through their full pass at every class: its
-    /// classes are priced for its scope's stored form and certify nothing.
-    fn certifies(self) -> bool {
-        !matches!(self, Self::Draft)
+    /// Whether the reader's selections are proposals: every reader's but the
+    /// target readout's. A proposal is only ever verified against the
+    /// target's own selection, so its graphs read the planes' first view
+    /// ([`crate::programs::graph::readout::Levels::View`]) and certify
+    /// nothing; the target's selections are the output, read exactly.
+    fn proposes(self) -> bool {
+        !matches!(self, Self::Target(_))
     }
 }
 
@@ -886,7 +887,7 @@ impl<'a> Preparation<'a> {
         let weights = readout_weights(packed, norm_plan);
         let mut certified = Vec::new();
         for rows in selected_rows {
-            let bounded = bounds_rows(reader.certifies(), rows, device.backend());
+            let levels = class_levels(reader.proposes(), rows, device.backend());
             let point = super::tuning::PointShape {
                 label: format!("m{rows}"),
                 weight: 1.0,
@@ -900,7 +901,7 @@ impl<'a> Preparation<'a> {
             // budget it was qualified within.
             let budget = self.tuning.settings().map(|settings| settings.budget);
             let key = crate::TuningCacheKey::of(&format!(
-                "readout-recipe-v6/budget={budget:?}/device={:?}/{weights}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/bounded={bounded}/dependency={dependency:?}/{digest}",
+                "readout-recipe-v7/budget={budget:?}/device={:?}/{weights}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/levels={levels:?}/dependency={dependency:?}/{digest}",
                 device.tuning_identity(),
                 self.epsilon.to_bits(),
                 softcap.to_bits(),
@@ -922,7 +923,7 @@ impl<'a> Preparation<'a> {
                 state.clone(),
                 dependency.clone(),
                 preparation.clone(),
-                bounded,
+                levels,
             );
             let Some(selected) = self.tuning.register_composed(Box::new(contender))? else {
                 continue;
@@ -930,7 +931,8 @@ impl<'a> Preparation<'a> {
             // The choice and its costs are the record of the comparison
             // against this load's canonical (`ReadoutContender::record`); a
             // class without bounded levels is never selected.
-            let class_certified = selected && bounded;
+            let class_certified =
+                selected && levels == crate::programs::graph::readout::Levels::Certified;
             if class_certified {
                 certified.push(point.rows);
             }
@@ -3531,10 +3533,10 @@ impl<'a> Preparation<'a> {
                 .map(ProjectionKernels::RawPacked),
         };
         // A draft through the target's projection reads it as it is stored:
-        // its planes, through their full pass, when the scope is stored as
-        // them. It certifies no class of its own (its proposals' confidences
-        // read every logit), but its classes, every launch row class, are
-        // priced for the scope's stored form like any reader's.
+        // its planes, through their first view, when the scope is stored as
+        // them. It certifies no class of its own (its selections are
+        // proposals), but its classes, every launch row class, are priced for
+        // the scope's stored form like any reader's.
         if draft_plan.projection_scope() == WeightScope::Target {
             let draft = self
                 .tuning

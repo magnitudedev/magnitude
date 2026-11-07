@@ -114,6 +114,40 @@ pub(crate) fn certified_rows(backend: BackendName) -> u64 {
     }
 }
 
+/// The most rows the progressive levels' kernels serve on any backend that
+/// declares them (`PROGRESSIVE_ROWS`).
+pub(crate) const LEVEL_ROWS: u64 = 8;
+
+/// What a progressive projection computes for its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Levels {
+    /// The planes' full pass: every vocabulary row's exact logit.
+    Full,
+    /// The certified levels: the exact logit of every vocabulary row that
+    /// can be selected, -inf elsewhere, so the selection is the full
+    /// readout's.
+    Certified,
+    /// The first level alone: its view of every vocabulary row, each within
+    /// its radius of the exact logit. A proposal reads it: verification
+    /// checks every proposal against the target's own selection, so a
+    /// proposal drawn from the view costs at most acceptance, never output.
+    View,
+}
+
+impl Levels {
+    /// The levels a proposing reader's class of `rows` rows reads through
+    /// planes: the view wherever the levels serve its rows, the full pass
+    /// beyond them.
+    pub(crate) fn proposing(rows: u64) -> Self {
+        if rows <= LEVEL_ROWS { Self::View } else { Self::Full }
+    }
+
+    /// Whether they read the radii: every level does, the full pass not.
+    pub(crate) fn reads_radius(self) -> bool {
+        self != Self::Full
+    }
+}
+
 /// The planned vocabulary projection of a readout.
 #[derive(Clone, Copy)]
 pub(crate) enum HeadPlans<'p> {
@@ -216,7 +250,7 @@ impl<'p> HeadPlans<'p> {
     pub(crate) fn ports<G: GraphDraft>(
         self,
         graph: &mut G,
-        certified: bool,
+        levels: Levels,
     ) -> Result<ProjectionPorts, GraphError> {
         Ok(match self.selected() {
             Self::Packed(weight) => ProjectionPorts::Packed {
@@ -228,7 +262,8 @@ impl<'p> HeadPlans<'p> {
                 depth: planes[0]
                     .progressive_depth()
                     .ok_or("progressive projection has no code depth")?,
-                planes: Self::read_planes(planes, certified)
+                levels,
+                planes: Self::read_planes(planes, levels)
                     .map(|(plane, weight)| Ok((plane, graph.port(weight.resident, &weight.shape)?)))
                     .collect::<Result<_, GraphError>>()?,
             },
@@ -236,15 +271,15 @@ impl<'p> HeadPlans<'p> {
         })
     }
 
-    /// The planes a progressive projection reads: every plane through the
-    /// certified levels, all but the radii through the full pass.
+    /// The planes a progressive projection reads through `levels`: every
+    /// plane through the levels, all but the radii through the full pass.
     pub(crate) fn read_planes(
         planes: [&'p crate::WeightPlan; 5],
-        certified: bool,
+        levels: Levels,
     ) -> impl Iterator<Item = (ProgressivePlane, &'p crate::WeightPlan)> {
         ProgressivePlane::ALL
             .into_iter()
-            .filter(move |plane| certified || *plane != ProgressivePlane::Radius)
+            .filter(move |plane| levels.reads_radius() || *plane != ProgressivePlane::Radius)
             .map(move |plane| (plane, Self::plane(&planes, plane)))
     }
 
@@ -275,9 +310,10 @@ pub(crate) enum ProjectionPorts {
         scale: NativePort,
         scale_extent: u64,
     },
-    /// The planes the graph reads.
+    /// The planes the graph reads, and what it computes from them.
     Progressive {
         depth: ProgressiveCodeDepth,
+        levels: Levels,
         planes: Vec<(ProgressivePlane, NativePort)>,
     },
 }
@@ -1073,7 +1109,8 @@ pub(crate) struct ProgressiveEntries<'a, G: GraphDraft + 'a> {
     pub planes: G::Binding<'a, readout_planes_rows::Entry>,
 }
 
-/// The planes a progressive projection reads: the radii only when certified.
+/// The planes a progressive projection reads: the radii only through its
+/// levels.
 pub(crate) struct ProgressivePorts<'p> {
     pub depth: ProgressiveCodeDepth,
     pub top: &'p WorkflowTensor,
@@ -1123,8 +1160,9 @@ pub(crate) enum ProjectionEntries<'a, G: GraphDraft + 'a> {
 
 impl<'a, G: GraphDraft + 'a> ProjectionEntries<'a, G> {
     /// Host-selected row indices are owned upload inputs of the raw recipe
-    /// `ports` select: the packed projection's, or the planes' full pass,
-    /// even when this projection also offers a qualified contender.
+    /// `ports` select: the packed projection's, or the planes' first entry
+    /// at their levels (the full pass, or the first level), even when this
+    /// projection also offers a qualified contender.
     pub(crate) fn raw_out_rows(
         &self,
         graph: &mut G,
@@ -1140,9 +1178,19 @@ impl<'a, G: GraphDraft + 'a> ProjectionEntries<'a, G> {
             }
             (
                 Self::Qualified { progressive, .. } | Self::Progressive(progressive),
-                ProjectionPorts::Progressive { .. },
-            ) => graph
-                .input_for::<readout_planes_rows::Entry>(progressive.planes, "out_rows", dimensions),
+                ProjectionPorts::Progressive { levels, .. },
+            ) => match levels {
+                Levels::Full => graph.input_for::<readout_planes_rows::Entry>(
+                    progressive.planes,
+                    "out_rows",
+                    dimensions,
+                ),
+                Levels::Certified | Levels::View => graph.input_for::<readout_top_rows::Entry>(
+                    progressive.top,
+                    "out_rows",
+                    dimensions,
+                ),
+            },
             _ => Err("raw row indices require a raw projection of their representation".into()),
         }
     }
@@ -1345,11 +1393,11 @@ pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
             })?.value, certified: None })
         }
         (ReadoutInput::RawRms { hidden, norm, form, out_rows, epsilon }, ProjectionEntries::Progressive(entries),
-            ProjectionPorts::Progressive { depth, planes }) => {
+            ProjectionPorts::Progressive { depth, levels, planes }) => {
             if geometry.columns != geometry.vocabulary { return Err("progressive full projection columns disagree with its table".into()); }
             let plane = |requested| planes.iter().find(|(kind, _)| *kind == requested).map(|(_, port)| port.tensor());
             let missing = || "progressive projection plane is absent".to_owned();
-            progressive_projection(graph, entries, sampler.ok_or("progressive projection requires selection score authority")?,
+            progressive_projection(graph, entries, *levels, sampler,
                 ProgressivePorts { depth: *depth,
                     top: plane(ProgressivePlane::Top).ok_or_else(missing)?,
                     bit3: plane(ProgressivePlane::Next).ok_or_else(missing)?,
@@ -1357,26 +1405,29 @@ pub(crate) fn project_readout<'a, G: GraphDraft + 'a>(
                     scales: plane(ProgressivePlane::Scales).ok_or_else(missing)?,
                     radius: plane(ProgressivePlane::Radius) },
                 ProgressiveRows { hidden, norm, form, out_rows, rows: geometry.rows, projected: geometry.projected, selected: geometry.selected },
-                (geometry.vocabulary, geometry.hidden), epsilon, softcap)
+                (geometry.vocabulary, geometry.hidden), epsilon, softcap, constants)
         }
         _ => Err("readout feature semantics, physical representation, and projection capability disagree".into()),
     }
 }
 
 /// The projection of `rows` onto a progressive head of `[vocabulary,
-/// hidden]`: with the radii, a certified selection's three levels (logits
-/// exact at its survivors, -inf elsewhere), the sampler inputs they read,
-/// score divisors included, and the first level's view; otherwise the full
-/// exact pass.
+/// hidden]` through `levels`: the full exact pass; a certified selection's
+/// three levels (logits exact at its survivors, -inf elsewhere), the sampler
+/// inputs they read, score divisors included, and the first level's view; or
+/// the first level's view alone, as every vocabulary row's logits.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
     graph: &mut G,
     entries: ProgressiveEntries<'a, G>,
-    sampler: G::Binding<'a, sample_rows::Entry>,
+    levels: Levels,
+    sampler: Option<G::Binding<'a, sample_rows::Entry>>,
     planes: ProgressivePorts<'_>,
     rows: ProgressiveRows<'_>,
     (vocabulary, hidden): (u64, u64),
     epsilon: f32,
     softcap: f32,
+    constants: &mut Vec<crate::programs::native_constants::GraphConstant>,
 ) -> Result<Readout, GraphError> {
     let [parts, normalized] = rows.form.dimensions(hidden);
     // The entries read the rows as their `[M, PT, D]` parts.
@@ -1390,7 +1441,12 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
         normalized,
         ("P", u64::from(planes.depth.rest_planes())),
     ];
-    let Some(radius) = planes.radius else {
+    let radius = match (levels, planes.radius) {
+        (Levels::Full, None) => None,
+        (Levels::Certified | Levels::View, Some(radius)) => Some(radius),
+        _ => return Err("a progressive projection reads the radii exactly at its levels".into()),
+    };
+    let Some(radius) = radius else {
         let logits = graph
             .enqueue::<readout_planes_rows::Entry>(
                 entries.planes,
@@ -1413,6 +1469,22 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
             certified: None,
         });
     };
+    if levels == Levels::View {
+        return Ok(Readout {
+            logits: view(
+                graph,
+                entries.top,
+                &dimensions,
+                (&planes, radius),
+                (&rows, &partials),
+                vocabulary,
+                (epsilon, softcap),
+                constants,
+            )?,
+            certified: None,
+        });
+    }
+    let sampler = sampler.ok_or("certified levels require selection score authority")?;
     let selecting = SelectionInputs {
         temperature: Some(graph.input_for(entries.top, "temperature", &dimensions)?),
         ..selection_inputs(graph, sampler, rows.selected, vocabulary)?
@@ -1504,6 +1576,50 @@ pub(crate) fn progressive_projection<'a, G: GraphDraft + 'a>(
     })
 }
 
+/// The first level's view of `rows` alone: `readout_top_rows` with every
+/// projected row greedy and unconstrained, its logits taken and its bound
+/// left unread. Nothing selects through its threshold, so its selection
+/// controls are constants rather than a sampler's inputs.
+fn view<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    top: G::Binding<'a, readout_top_rows::Entry>,
+    dimensions: &[(&str, u64)],
+    (planes, radius): (&ProgressivePorts<'_>, &WorkflowTensor),
+    (rows, partials): (&ProgressiveRows<'_>, &WorkflowTensorView),
+    vocabulary: u64,
+    (epsilon, softcap): (f32, f32),
+    constants: &mut Vec<crate::programs::native_constants::GraphConstant>,
+) -> Result<WorkflowTensor, GraphError> {
+    use crate::programs::native_constants::GraphConstant;
+    let projected = rows.projected;
+    let draws = GraphConstant::u32_zeros(graph, projected, 6)?;
+    let mask = GraphConstant::u32_zeros(graph, projected, vocabulary.div_ceil(32))?;
+    let temperature = GraphConstant::f32(graph, &vec![1.0; projected as usize])?;
+    let constrained = GraphConstant::i32(graph, &vec![0; projected as usize])?;
+    let first = graph.enqueue::<readout_top_rows::Entry>(
+        top,
+        dimensions,
+        readout_top_rows::WorkflowArgs {
+            softcap,
+            hidden: partials.into(),
+            norm: rows.norm.into(),
+            top: planes.top.into(),
+            bit3: planes.bit3.into(),
+            rest: planes.rest.into(),
+            scales: planes.scales.into(),
+            radius: radius.into(),
+            out_rows: rows.out_rows.into(),
+            draws: draws.port().tensor().into(),
+            temperature: temperature.port().tensor().into(),
+            mask: mask.port().tensor().into(),
+            constrained: constrained.port().tensor().into(),
+            epsilon,
+        },
+    )?;
+    constants.extend([draws, mask, temperature, constrained]);
+    Ok(first.r0)
+}
+
 /// A projecting readout's head and selection suffix.
 struct Projected<G> {
     graph: G,
@@ -1559,7 +1675,8 @@ fn head_topology<'a, G: GraphDraft + 'a>(
             ..
         }
     );
-    let head = plans.ports(&mut graph, certified)?;
+    let levels = if certified { Levels::Certified } else { Levels::Full };
+    let head = plans.ports(&mut graph, levels)?;
     let (rows, projection_entries) = match (entries, &head) {
         (HeadEntries::Packed(entry), ProjectionPorts::Packed { scale_extent, .. })
             if !certified =>

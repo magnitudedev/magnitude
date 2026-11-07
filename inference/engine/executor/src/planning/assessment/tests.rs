@@ -1031,6 +1031,32 @@ fn a_separate_draft_reads_the_projection_as_it_is_stored() {
             prepared: false,
             rows: vec![1],
         };
+        let limits = fixture_limits(false);
+        let state_of = |load: &ModelLoadPlan, proposals| {
+            crate::ResourcePlanner::state_plan(
+                &definition,
+                load,
+                PlannedMethod::DFlash {
+                    proposals,
+                    widths: crate::DraftWidths::Adaptive,
+                },
+                KvCodec::Dense,
+                limits,
+                crate::ResourceCapacity {
+                    domain_bytes: 512 << 20,
+                    tensor_operations: crate::TensorOperations::Absent,
+                },
+            )
+            .unwrap()
+        };
+        let class = |proposals| crate::programs::native_draft::DraftGraphClass {
+            entry_rows: 1,
+            slots: 1,
+            proposals,
+            shaped: false,
+            windowed: true,
+            device: false,
+        };
         let selected = load.clone().finalize_readout(std::slice::from_ref(&target_choice));
         if owns_output {
             // The target's projection is not Q8_0 here: nothing to select.
@@ -1042,24 +1068,26 @@ fn a_separate_draft_reads_the_projection_as_it_is_stored() {
                 plan.draft().unwrap().projection(),
                 crate::ReadoutHead::Qualified { .. }
             ));
+            // Its proposing rows read the planes' first view, whose graphs
+            // seal at one proposal and at several.
+            let state = state_of(&selected, 3);
+            let geometry = crate::programs::native_draft::DraftGeometry::new(
+                &definition,
+                state.head_state().unwrap(),
+            )
+            .unwrap();
+            let family = crate::programs::native_draft::checked_draft_family_storage(
+                BackendName::Metal,
+                &selected,
+                plan.draft().unwrap(),
+                &geometry,
+                [class(1), class(3)],
+            )
+            .unwrap();
+            assert!(family.storage.workspace > 0 && family.storage.output > 0);
         }
         let load = load.finalize_readout(&[]).unwrap();
-        let limits = fixture_limits(false);
-        let state = crate::ResourcePlanner::state_plan(
-            &definition,
-            &load,
-            PlannedMethod::DFlash {
-                proposals: 1,
-                widths: crate::DraftWidths::Adaptive,
-            },
-            KvCodec::Dense,
-            limits,
-            crate::ResourceCapacity {
-                domain_bytes: 512 << 20,
-                tensor_operations: crate::TensorOperations::Absent,
-            },
-        )
-        .unwrap();
+        let state = state_of(&load, 1);
         let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
         let draft_plan = plan.draft().unwrap();
         // The draft's block pass projects every proposing row through
@@ -1086,20 +1114,12 @@ fn a_separate_draft_reads_the_projection_as_it_is_stored() {
             state.head_state().unwrap(),
         )
         .unwrap();
-        let class = crate::programs::native_draft::DraftGraphClass {
-            entry_rows: 1,
-            slots: 1,
-            proposals: 1,
-            shaped: false,
-            windowed: true,
-            device: false,
-        };
         let family = crate::programs::native_draft::checked_draft_family_storage(
             BackendName::Metal,
             &load,
             draft_plan,
             &geometry,
-            [class],
+            [class(1)],
         )
         .unwrap();
         assert!(family.storage.workspace > 0 && family.storage.output > 0);

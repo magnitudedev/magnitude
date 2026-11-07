@@ -455,25 +455,15 @@ fn head_graph_topology<'a, G: GraphDraft + 'a>(
     head: CausalHeadBlock<'_>,
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
-    backend: BackendName,
 ) -> Result<HeadGraphParts<G::Plan>, GraphError> {
-    head_graph_draft(
-        graph,
-        entries,
-        load,
-        geometry,
-        head,
-        feed_forward,
-        class,
-        backend,
-    )?
+    head_graph_draft(graph, entries, load, geometry, head, feed_forward, class)?
     .map_plan(|graph| graph.seal())
 }
 
-/// A head graph's passes. A progressive projection certifies its drafting
-/// slots' selections up to the backend's certified bound (a proposal is only
-/// ever verified, so a certified selection serves every slot it fits) and
-/// projects every draft-vocabulary row beyond it.
+/// A head graph's passes. A progressive projection gives its drafting slots
+/// the first level's view of every draft-vocabulary row (a proposal is only
+/// ever verified, so it needs no exact logit), and its full pass past the
+/// rows the levels serve.
 #[allow(clippy::too_many_arguments)]
 fn head_graph_draft<'a, G: GraphDraft + 'a>(
     mut graph: G,
@@ -483,7 +473,6 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     head: CausalHeadBlock<'_>,
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
-    backend: BackendName,
 ) -> Result<HeadGraphParts<G>, GraphError> {
     if class.entry_rows == 0
         || class.slots == 0
@@ -596,12 +585,12 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     } else {
         Some(weight!(head, WeightKind::OutputNorm))
     };
-    let certified = readout::HeadPlans::for_recipe(load, WeightScope::Target, head, true)?
-        .certifies(class.slots, backend);
+    // A proposal is only ever verified, so its slots read the first view
+    // of a projection stored as planes (`readout::Levels::View`).
     let projection = (class.steps > 0)
         .then(|| {
             readout::HeadPlans::for_recipe(load, WeightScope::Target, head, true)?
-                .ports(&mut graph, certified)
+                .ports(&mut graph, readout::Levels::proposing(class.slots))
         })
         .transpose()?;
 
@@ -1294,7 +1283,6 @@ fn certify_head_family(
             head,
             binding.feed_forward,
             largest,
-            backend,
         )?;
         let template = draft
             .plan
@@ -1377,7 +1365,6 @@ pub(crate) fn verify_head_family_certificates(
             head,
             binding.feed_forward,
             class,
-            backend,
         )?;
         let charged = exact
             .plan
@@ -1483,7 +1470,6 @@ impl PreparedHeadGraphs {
             head,
             block.binding.feed_forward,
             class,
-            target_device.backend(),
         )
         .map_err(|error| invalid(error.to_string()))
     }
