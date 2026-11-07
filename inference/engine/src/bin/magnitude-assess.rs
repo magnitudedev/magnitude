@@ -31,7 +31,7 @@ use magnitude_executor::{
     },
     platform::{DeviceRequest, MemoryReserves},
 };
-use seismic::{Devices, DiagnosticSource, Element, StoreId, StoreIdentity};
+use seismic::{Devices, DiagnosticSource, Element, ExecutorSelector, StoreId, StoreIdentity};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -51,15 +51,18 @@ struct Options {
     /// The measurement job's time, its service's by default.
     time: Duration,
     /// This process is the measurement job of the process that started it
-    /// ([`bounded_job`]): measure, and assess nothing.
-    job_only: bool,
+    /// ([`bounded_job`]), of the executor that process selected: measure,
+    /// and assess nothing.
+    job: Option<ExecutorSelector>,
     /// Print the topology, its discovery diagnostics, its measurements and
     /// the executor costs rather than assess models.
     topology: bool,
     models: Vec<ModelPackagePaths>,
 }
 
-/// The flag a job's own process is started with ([`bounded_job`]).
+/// The flag a job's own process is started with ([`bounded_job`]), with the
+/// executor its starter selected, so the job discovers the machine once, as
+/// its measurement does, and not again to select it.
 const JOB_ONLY: &str = "--measurement-job-only";
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --kernels DIR \
@@ -82,7 +85,7 @@ fn parse() -> Result<Options, String> {
     let mut seconds = MEASUREMENT_SECONDS;
     let mut method = ModelMethod::Auto;
     let mut topology = false;
-    let mut job_only = false;
+    let mut job = None;
     let mut models = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -124,7 +127,13 @@ fn parse() -> Result<Options, String> {
                 }
             }
             "--topology" => topology = true,
-            JOB_ONLY => job_only = true,
+            JOB_ONLY => {
+                job = Some(
+                    value(&argument, &mut args)?
+                        .parse()
+                        .map_err(|error| format!("{JOB_ONLY}: {error}"))?,
+                )
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -163,7 +172,7 @@ fn parse() -> Result<Options, String> {
         breakdown,
         time: Duration::try_from_secs_f64(seconds)
             .map_err(|error| format!("--seconds: {error}"))?,
-        job_only,
+        job,
         topology,
         models,
     })
@@ -181,7 +190,7 @@ const JOB_KILLED_AT: u32 = 2;
 /// counts as ended this job, and one that ends two is recorded unobtainable,
 /// so a point that hangs does not hang every job. The seconds it took, and
 /// whether it ended on its own with nothing unmeasured.
-fn bounded_job(time: Duration) -> Result<(f64, bool), String> {
+fn bounded_job(time: Duration, executor: ExecutorSelector) -> Result<(f64, bool), String> {
     let limit = time * JOB_KILLED_AT;
     eprintln!(
         "magnitude-assess: measuring this machine, {:.0} s, killed at {:.0} s",
@@ -193,6 +202,7 @@ fn bounded_job(time: Duration) -> Result<(f64, bool), String> {
     let mut job = std::process::Command::new(std::env::current_exe().map_err(|error| error.to_string())?)
         .args(std::env::args_os().skip(1))
         .arg(JOB_ONLY)
+        .arg(executor.to_string())
         .stdout(std::process::Stdio::null())
         .spawn()
         .map_err(|error| format!("the measurement job: {error}"))?;
@@ -256,24 +266,7 @@ fn run() -> Result<bool, String> {
             served.push(directory);
         }
     }
-    let catalog = Devices::discover(&served).map_err(|error| error.to_string())?;
-    let structure = AssessmentStructure::discover(
-        &catalog,
-        options.device,
-        Some(options.kernels.as_path()),
-        MemoryReserves::standard(),
-        ModelPolicy::default(),
-        standard_service_limits(),
-    )
-    .map_err(|error| error.to_string())?;
-    let executor = &structure.selected.info;
-    eprintln!(
-        "magnitude-assess: {} ({})",
-        executor.name(),
-        executor.backend().as_str()
-    );
-
-    if options.job_only {
+    if let Some(executor) = options.job {
         // Measured as the job measures: what is stored is kept, and each
         // record stored now is printed.
         let started = Instant::now();
@@ -281,7 +274,7 @@ fn run() -> Result<bool, String> {
             &MeasureRequest {
                 paths: served,
                 kernels: options.kernels.clone(),
-                executor: executor.selector(),
+                executor,
                 // Nothing preempts the tool's job; its process names it.
                 job: MeasureJob(u64::from(std::process::id())),
                 time: options.time,
@@ -301,6 +294,23 @@ fn run() -> Result<bool, String> {
         }
         return Ok(failures.is_empty());
     }
+    let catalog = Devices::discover(&served).map_err(|error| error.to_string())?;
+    let structure = AssessmentStructure::discover(
+        &catalog,
+        options.device,
+        Some(options.kernels.as_path()),
+        MemoryReserves::standard(),
+        ModelPolicy::default(),
+        standard_service_limits(),
+    )
+    .map_err(|error| error.to_string())?;
+    let executor = &structure.selected.info;
+    eprintln!(
+        "magnitude-assess: {} ({})",
+        executor.name(),
+        executor.backend().as_str()
+    );
+
     // The models are prepared from their headers; the measurements are
     // the executor's own, whatever the models read.
     let prepared = options
@@ -314,7 +324,7 @@ fn run() -> Result<bool, String> {
             )
         })
         .collect::<Vec<_>>();
-    let (measure_seconds, measured) = bounded_job(options.time)?;
+    let (measure_seconds, measured) = bounded_job(options.time, executor.selector())?;
     let measurements = structure.stored_measurements(&options.kernels);
 
     if options.topology {
