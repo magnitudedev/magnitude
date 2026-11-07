@@ -2,7 +2,7 @@ use super::*;
 use crate::accounting::{Book, Wait};
 #[cfg(unix)]
 use crate::disk::drop_pages;
-use crate::disk::{full_rate, grid, Request, Shape, VolumeReads, LEAST_READ, WIDEST_WINDOW};
+use crate::disk::{full_rate, grid, Request, Shape, VolumeLines, VolumeReads, LEAST_READ, WIDEST_WINDOW};
 use crate::scheduler::{pieces, Engine, Part, Piece, Queue, Queued, RequestState, Span};
 use std::collections::HashMap;
 #[cfg(unix)]
@@ -815,6 +815,30 @@ fn a_requests_knee_is_its_range_lines() {
     let shape = Shape::of(&internal, Some(Request { urgent: &step, lone: &lone, ranges: &ranges }));
     assert_eq!((shape.knee, shape.ahead_read), (4 * step.range(), read), "four ranges, each one piece");
     assert_eq!(step.depths(), vec![1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 15, 18, 22, 27, 33, 41], "every depth to 8, a quarter more past it, to 32 MiB of 704 KiB ranges");
+}
+
+/// A request reads by the curve it adopted, whatever another request of
+/// the volume adopts after it: a load's reads keep their shape when the
+/// bank's request adopts its own curve of the same volume, and a second load
+/// in the process reads as the first did.
+#[test]
+fn a_requests_shape_is_its_own_curves() {
+    let step = Urgent { parts: vec![589_824, 589_824, 720_896], records: 8 };
+    let loads = Curve { points: recorded(&[(LEAST_READ, &[(1, 1.2), (2, 2.3), (4, 3.6), (8, 4.4), (16, 4.5), (32, 4.5)])]), lone: Vec::new(), ranges: Vec::new() };
+    let decode = Curve {
+        points: recorded(&[(LEAST_READ, &[(1, 1.1), (2, 2.0), (4, 3.0), (8, 4.0), (16, 4.4), (32, 4.6), (64, 4.7)]), (8 * LEAST_READ, &[(1, 2.1), (2, 3.6), (4, 5.05), (8, 5.1)])]),
+        lone: vec![Lone { read: 8 * LEAST_READ, seconds: 3.1e-3, error: 0.05e-3 }],
+        ranges: range_line(&step, &[(1, 1.9), (2, 3.2), (4, 3.9), (8, 3.95), (16, 3.9)]),
+    };
+    let mut volume = VolumeLines::default();
+    volume.adopt(None, &loads, 1 << 34);
+    let alone = volume.shape(None);
+    volume.adopt(Some(&step), &decode, 1 << 34);
+    let bank = volume.shape(Some(&step));
+    assert_eq!(volume.shape(None), alone, "the bank's curve leaves the loads' reads as they were");
+    volume.adopt(None, &loads, 1 << 34);
+    assert_eq!((volume.shape(None), volume.shape(Some(&step))), (alone, bank), "a second load reads as the first");
+    assert_eq!(alone, Shape::of(&loads.points, None));
 }
 
 /// A request's probe reads its range line through the engine at each of

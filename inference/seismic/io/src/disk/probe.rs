@@ -279,36 +279,30 @@ pub(crate) struct VolumeLines {
     requests: HashMap<Option<Urgent>, Adopted>,
 }
 
-/// What a request last adopted: the curve, with its lone times and range
-/// line; or the rule before's five figures, where only those are stored.
+/// What a request last adopted: its curve (its read sizes' points as
+/// probed for it, its lone times and range line), which alone sets how it
+/// reads, whatever other requests of the volume adopt after it; or the rule
+/// before's five figures, where only those are stored.
 enum Adopted {
-    Curve { lone: Vec<Lone>, ranges: Vec<Point> },
+    Curve(Curve),
     Earlier(EarlierChoice),
 }
 
 impl VolumeLines {
-    /// How `urgent` reads the volume: as it last adopted; else by the curve
-    /// other requests hold, its due pieces at the size read ahead; else at
-    /// the search's bounds.
+    /// How `urgent` reads the volume: by the curve it last adopted; else by
+    /// the lines other requests hold, its due pieces at the size read ahead;
+    /// else at the search's bounds.
     pub(crate) fn shape(&self, urgent: Option<&Urgent>) -> Shape {
-        let points = self.lines.values().flat_map(|(_, points)| points.iter().copied()).collect::<Vec<_>>();
         match self.requests.get(&urgent.cloned()) {
             Some(Adopted::Earlier(earlier)) => earlier.shape(),
-            Some(Adopted::Curve { lone, ranges }) => Shape::of(&points, urgent.map(|urgent| Request { urgent, lone, ranges })),
-            None if points.is_empty() => Shape::PENDING,
-            None => Shape::of(&points, None),
+            Some(Adopted::Curve(curve)) => {
+                Shape::of(&curve.points, urgent.map(|urgent| Request { urgent, lone: &curve.lone, ranges: &curve.ranges }))
+            }
+            None => {
+                let points = self.lines.values().flat_map(|(_, points)| points.iter().copied()).collect::<Vec<_>>();
+                if points.is_empty() { Shape::PENDING } else { Shape::of(&points, None) }
+            }
         }
-    }
-
-    /// The curve `urgent`'s probe holds: its read sizes' points and its lone
-    /// times.
-    pub(crate) fn curve(&self, urgent: Option<&Urgent>) -> Curve {
-        let points = reads_of(urgent).iter().flat_map(|read| self.lines.get(read).into_iter().flat_map(|(_, points)| points.iter().copied())).collect();
-        let (lone, ranges) = match self.requests.get(&urgent.cloned()) {
-            Some(Adopted::Curve { lone, ranges }) => (lone.clone(), ranges.clone()),
-            _ => (Vec::new(), Vec::new()),
-        };
-        Curve { points, lone, ranges }
     }
 
     /// Hold `curve`, probed for `urgent` through a file of `size` bytes:
@@ -322,7 +316,7 @@ impl VolumeLines {
         for (read, points) in lines {
             self.lines.insert(read, (size, points));
         }
-        self.requests.insert(urgent.cloned(), Adopted::Curve { lone: curve.lone.clone(), ranges: curve.ranges.clone() });
+        self.requests.insert(urgent.cloned(), Adopted::Curve(curve.clone()));
     }
 
     /// Read `urgent` by the rule before's `choice`.
@@ -343,8 +337,10 @@ impl VolumeLines {
             }
             None => (Vec::new(), Vec::new()),
         };
-        self.requests.insert(urgent.cloned(), Adopted::Curve { lone, ranges });
-        Ok(self.curve(urgent))
+        let points = reads_of(urgent).iter().flat_map(|read| self.lines.get(read).into_iter().flat_map(|(_, points)| points.iter().copied())).collect();
+        let curve = Curve { points, lone, ranges };
+        self.requests.insert(urgent.cloned(), Adopted::Curve(curve.clone()));
+        Ok(curve)
     }
 
     /// Probe `reads`' lines not yet probed through a file as large as
