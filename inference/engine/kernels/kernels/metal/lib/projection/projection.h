@@ -375,12 +375,20 @@ struct Mix {
     ulong norm_stride;
     uint width;
     float streams;
-    void store(uint m, uint n, float value) const {
-        const float normalized = x[ulong(m) * x0 + ulong(n) * x1] * inverse[ulong(m) * inverse0
-            + ulong(n / width) * inverse1] * element::at<N>(norm, ulong(n) * norm_stride);
-        const float gate = 1.0f / (1.0f + metal::exp(-value));
-        y[ulong(m) * stride0 + ulong(n) * stride1] = gate * normalized / streams;
+    // What output (m, n) reads besides its sum, which no sum feeds
+    // (`early`).
+    struct early {
+        float normalized;
+    };
+    early load_early(uint m, uint n) const {
+        return {x[ulong(m) * x0 + ulong(n) * x1] * inverse[ulong(m) * inverse0 + ulong(n / width) * inverse1]
+            * element::at<N>(norm, ulong(n) * norm_stride)};
     }
+    void store(uint m, uint n, float value, thread const early &e) const {
+        const float gate = 1.0f / (1.0f + metal::exp(-value));
+        y[ulong(m) * stride0 + ulong(n) * stride1] = gate * e.normalized / streams;
+    }
+    void store(uint m, uint n, float value) const { store(m, n, value, load_early(m, n)); }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
         store(m, n + 1u, second);
@@ -825,6 +833,28 @@ private:
         const float amax = row_maximum<THREADS>(in, m, inverse, partials, thread_index);
         const Nvfp4Rows<In, OneGlobal> formed{in, {nvfp4::global_scale(amax)}};
         device_normalize_with<THREADS, Order>(formed, m, 0, inverse, x, columns, thread_index);
+    }
+};
+
+// An epilogue's loads that no sum feeds, which a GEMV whose lanes each emit
+// at most one output issues with its first weight loads (`gemv_body`), so
+// they are not a dependent round trip after the lane-group sum. The same
+// values in the same arithmetic as the epilogue's own store. An epilogue
+// that declares none (every one but `Mix`) stores as `emit` does.
+template <typename Out>
+struct early {
+    struct values {};
+    static values load(thread const Out &, uint, uint) { return values{}; }
+    static void store(thread const Out &out, uint m, uint n, float value, thread const values &) {
+        out.store(m, n, value);
+    }
+};
+template <typename N>
+struct early<Mix<N>> {
+    typedef typename Mix<N>::early values;
+    static values load(thread const Mix<N> &out, uint m, uint n) { return out.load_early(m, n); }
+    static void store(thread const Mix<N> &out, uint m, uint n, float value, thread const values &e) {
+        out.store(m, n, value, e);
     }
 };
 

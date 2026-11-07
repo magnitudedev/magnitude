@@ -172,16 +172,26 @@ template <bool COLUMNS>
 struct gemv_emit;
 template <>
 struct gemv_emit<false> {
+    // Whether each lane emits at most one output, so the lane loads that
+    // output's epilogue values ahead (`early`).
+    template <bool PAIRED, uint R, uint MAXM, uint LANES>
+    static constexpr bool ahead() {
+        return !PAIRED && R * MAXM <= LANES;
+    }
     template <bool PAIRED, uint R, uint MAXM, uint LANES, typename Out>
     static void run(thread const Out &out, thread float (&acc)[R][MAXM], thread float (&acc2)[R][MAXM],
-        uint m_rows, uint rows, uint first_row, uint sub) {
+        uint m_rows, uint rows, uint first_row, uint sub, thread const typename early<Out>::values &loaded) {
         for (uint r = 0; r < R; ++r) {
             for (uint m = 0; m < MAXM; ++m) {
                 if (m < m_rows) {
                     float total = gemv_group_sum<LANES>(acc[r][m]);
                     float total2 = PAIRED ? gemv_group_sum<LANES>(acc2[r][m]) : 0.0f;
-                    if (sub == (r * MAXM + m) % LANES && first_row + r < rows)
-                        emit<PAIRED>::run(out, m, first_row + r, total, total2);
+                    if (sub == (r * MAXM + m) % LANES && first_row + r < rows) {
+                        if constexpr (ahead<PAIRED, R, MAXM, LANES>())
+                            early<Out>::store(out, m, first_row + r, total, loaded);
+                        else
+                            emit<PAIRED>::run(out, m, first_row + r, total, total2);
+                    }
                 }
             }
         }
@@ -189,9 +199,13 @@ struct gemv_emit<false> {
 };
 template <>
 struct gemv_emit<true> {
+    template <bool PAIRED, uint R, uint MAXM, uint LANES>
+    static constexpr bool ahead() {
+        return false;
+    }
     template <bool PAIRED, uint R, uint MAXM, uint LANES, typename Out>
     static void run(thread const Out &out, thread float (&acc)[R][MAXM], thread float (&)[R][MAXM],
-        uint m_rows, uint rows, uint first_row, uint sub) {
+        uint m_rows, uint rows, uint first_row, uint sub, thread const typename early<Out>::values &) {
         static_assert(!PAIRED, "a column epilogue is plain");
         for (uint r = 0; r < R; ++r) {
             float column[MAXM];
@@ -243,6 +257,12 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
         if (sub < packets)
             current.load(w, u, at, first_packet + sub);
     }
+    // The epilogue values of the output this lane emits, with its first
+    // packet (`early`): lane sub emits output r * MAXM + m == sub.
+    typename early<Out>::values loaded = {};
+    if (gemv_emit<COLUMNS>::template ahead<PAIRED, R, MAXM, LANES>() && active && sub < R * MAXM
+        && sub % MAXM < m_rows && first_row + sub / MAXM < rows)
+        loaded = early<Out>::load(out, sub % MAXM, first_row + sub / MAXM);
     uint chunk = min(packets, (gemv_stage_packet_rows / MAXM) / LANES * LANES);
     threadgroup uint4 *words = reinterpret_cast<threadgroup uint4 *>(shared);
     float acc[R][MAXM], acc2[R][MAXM];
@@ -266,7 +286,7 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
             }
         }
     }
-    gemv_emit<COLUMNS>::template run<PAIRED, R, MAXM, LANES>(out, acc, acc2, m_rows, rows, first_row, sub);
+    gemv_emit<COLUMNS>::template run<PAIRED, R, MAXM, LANES>(out, acc, acc2, m_rows, rows, first_row, sub, loaded);
 }
 
 template <typename W, uint SG, uint R, uint MAXM, uint LANES = 32, typename In, typename Out>
