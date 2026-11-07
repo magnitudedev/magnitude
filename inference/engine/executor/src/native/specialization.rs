@@ -524,7 +524,9 @@ impl<'a> Specializer<'a> {
     /// parameters are at that unit's choice ([`Tuner::following`]), so its
     /// results carry the prerequisite's bits, and it is tuned in the others.
     /// `None`, preparing nothing, while the tuner's round searches the
-    /// prerequisite: the next round prepares it.
+    /// prerequisite: the tuner forms its canonical program at every
+    /// arithmetic it could follow beside that search, and the next round
+    /// prepares it at the one it does.
     pub fn tuned_following<T: EntryTuning, P: EntryTuning>(
         &mut self,
         tuning: &mut Tuning<'_>,
@@ -538,9 +540,15 @@ impl<'a> Specializer<'a> {
             prerequisite,
             (<T::Entry as Entry>::NAME, &bindings),
             implementation,
-            fixed,
+            fixed.clone(),
         )?
         else {
+            // Deferred: formed now at every choice its prerequisite can
+            // end at.
+            if let Tuning::Tuner(tuner) = tuning {
+                let followed = self.implementation(&prerequisite.entry(), &prerequisite.bindings())?;
+                tuner.anticipate(case, implementation, &fixed, followed)?;
+            }
             return Ok(None);
         };
         self.specialized(tuning, case, implementation, fixed)

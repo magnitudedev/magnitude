@@ -412,8 +412,28 @@ pub(crate) trait Workers<U: Unit> {
     /// compile formed and what it took.
     fn ended(&mut self) -> Vec<(usize, U::Formed, Duration)>;
     /// Wait for the next compile to end, no longer than `within` when one
-    /// is given: none when none ended in that time.
+    /// is given: none when none ended in that time, or a spare compile
+    /// ended instead.
     fn wait(&mut self, within: Option<Duration>) -> Option<(usize, U::Formed, Duration)>;
+    /// Whether a spare compile waits to start ([`Threads::spare`]): work
+    /// no piece waits for, which runs only on threads no priced work takes.
+    fn spare_waiting(&self) -> bool {
+        false
+    }
+    /// The threads spare compiles run on now.
+    fn spare_running(&self) -> usize {
+        0
+    }
+    /// Start the next spare compile on a free thread.
+    fn start_spare(&mut self) {}
+    /// What the spare compiles not yet ended take to end on every thread:
+    /// they end within the budget, so the allocator ends this far before
+    /// it.
+    fn spare_owed(&self) -> Duration {
+        Duration::ZERO
+    }
+    /// Run every spare compile to its end, on every thread.
+    fn drain_spare(&mut self) {}
 }
 
 /// A piece of work the allocator started, and what it took.
@@ -703,11 +723,11 @@ pub(crate) fn allocate<U: Unit>(
     context: &mut U::Context,
     clock: &impl Clock,
     workers: &mut impl Workers<U>,
-    total: Duration,
+    budget: Duration,
     mut longest: Duration,
 ) -> (Report, Result<(), U::Failure>) {
     let mut report = Report {
-        budget: total,
+        budget,
         ..Report::default()
     };
     let mut sealed = vec![false; units.len()];
@@ -750,6 +770,9 @@ pub(crate) fn allocate<U: Unit>(
         }
         opened = Some(opening);
         apart = Duration::ZERO;
+        // The spare compiles end within the budget: the priced work ends
+        // before what they have left.
+        let total = budget.saturating_sub(workers.spare_owed());
         let ended = workers.ended();
         if !ended.is_empty() {
             crowded.fill(false);
@@ -1290,6 +1313,34 @@ pub(crate) fn allocate<U: Unit>(
                 }
             }
         };
+        // The device is about to be busy. With no priced compile waiting
+        // for threads or bytes, a free thread runs a spare compile, held to
+        // the host bytes a compile's thread is priced at.
+        if !crowded.contains(&true) && !starved.contains(&true) {
+            while workers.spare_waiting() && workers.free() > 0 {
+                let thread = U::compile_host(context).max(workers.compile_host());
+                let flying = flights
+                    .iter()
+                    .fold(
+                        units[unit].host_footprint(context).unwrap_or(0),
+                        |sum, flight| {
+                            sum.saturating_add(
+                                units[flight.unit].host_footprint(context).unwrap_or(0),
+                            )
+                            .saturating_add(if flight.formed.is_none() {
+                                flight.compile_host
+                            } else {
+                                0
+                            })
+                        },
+                    )
+                    .saturating_add(thread.saturating_mul(workers.spare_running() as u64));
+                if !U::host_free(context).admits(thread, flying) {
+                    break;
+                }
+                workers.start_spare();
+            }
+        }
         let held = ending[unit];
         let performing = clock.now();
         // Preserve the original cutoff and terminal obligations even when
@@ -1356,13 +1407,19 @@ pub(crate) fn allocate<U: Unit>(
     // what they formed is dropped.
     let draining = clock.now();
     while flights.iter().any(|flight| flight.formed.is_none()) {
-        let (unit, _, took) = workers.wait(None).expect("a compile in flight ends");
+        // A spare compile that ended frees its thread; the wait goes on.
+        let Some((unit, _, took)) = workers.wait(None) else {
+            continue;
+        };
         flights
             .iter_mut()
             .find(|flight| flight.unit == unit)
             .expect("a compile that ended was started")
             .formed = Some(took);
     }
+    // The spare compiles run to their end on every thread, within what
+    // the budget kept for them.
+    workers.drain_spare();
     report.ending.draining = clock.now().saturating_sub(draining);
     report.abandoned = flights
         .into_iter()
@@ -1437,8 +1494,16 @@ pub(crate) struct Threads<U: Unit> {
     needs: fn(&U::Forming) -> usize,
     /// The threads of each compile in flight, by its unit.
     taken: Vec<(usize, usize)>,
-    sender: std::sync::mpsc::Sender<(usize, std::thread::Result<U::Formed>, Duration)>,
-    receiver: std::sync::mpsc::Receiver<(usize, std::thread::Result<U::Formed>, Duration)>,
+    sender: std::sync::mpsc::Sender<Ended<U::Formed>>,
+    receiver: std::sync::mpsc::Receiver<Ended<U::Formed>>,
+    /// Spare compiles not yet started ([`Threads::spare`]), in order.
+    spare: std::collections::VecDeque<Box<dyn FnOnce() + Send>>,
+    /// Spare compiles in flight, each on one thread.
+    spare_running: usize,
+    /// What a spare compile is taken to take: its observations once one
+    /// ended, the price it was queued with before.
+    spare_price: Duration,
+    spare_taken: seismic::Observed,
     /// The burst of compiles in flight, from the first started with none
     /// running to the last to end.
     burst: Option<Burst>,
@@ -1450,6 +1515,13 @@ pub(crate) struct Threads<U: Unit> {
     /// Each burst that showed a thread's compile to hold more than it was
     /// priced at: the price it was admitted on and what it held.
     mispriced: Vec<(u64, u64)>,
+}
+
+/// A compile that ended on a worker: a unit's, with what it formed and
+/// took, or a spare one, with what it took.
+enum Ended<F> {
+    Compile(usize, std::thread::Result<F>, Duration),
+    Spare(std::thread::Result<()>, Duration),
 }
 
 /// A burst of compiles: the process's footprint when it began, the peak of
@@ -1480,10 +1552,23 @@ impl<U: Unit> Threads<U> {
             taken: Vec::new(),
             sender,
             receiver,
+            spare: std::collections::VecDeque::new(),
+            spare_running: 0,
+            spare_price: Duration::ZERO,
+            spare_taken: seismic::Observed::default(),
             burst: None,
             compile_host,
             mispriced: Vec::new(),
         }
+    }
+
+    /// Queue `jobs`, compiles no piece waits for, each on one thread and
+    /// taken to take `price` until one has ended. They start only on
+    /// threads no priced work takes ([`allocate`]), and all end before the
+    /// allocator does.
+    pub fn spare(&mut self, jobs: Vec<Box<dyn FnOnce() + Send>>, price: Duration) {
+        self.spare.extend(jobs);
+        self.spare_price = price;
     }
 
     /// The bursts that held more for each thread than a compile was priced
@@ -1492,13 +1577,47 @@ impl<U: Unit> Threads<U> {
         &self.mispriced
     }
 
-    /// A compile ended: its threads are free. A compile that panicked
-    /// panics the load here, where its end is read.
-    fn joined(
-        &mut self,
-        (unit, formed, took): (usize, std::thread::Result<U::Formed>, Duration),
-    ) -> (usize, U::Formed, Duration) {
-        self.taken.retain(|(compiling, _)| *compiling != unit);
+    /// The threads compiles run on now, priced and spare.
+    fn running(&self) -> usize {
+        self.taken.iter().map(|(_, threads)| threads).sum::<usize>() + self.spare_running
+    }
+
+    /// A compile is about to start on `threads` more threads: a burst
+    /// begins with the first one.
+    fn starting(&mut self, threads: usize) {
+        if self.running() == 0 {
+            self.burst = seismic::ProcessMemory::footprint_now()
+                .zip(seismic::ProcessMemory::footprint_peak())
+                .map(|(footprint, peak)| Burst {
+                    footprint,
+                    peak,
+                    threads: 0,
+                });
+        }
+        let running = self.running() + threads;
+        if let Some(burst) = &mut self.burst {
+            burst.threads = burst.threads.max(running);
+        }
+    }
+
+    /// A compile ended and its threads are free. A compile that panicked
+    /// panics the load here, where its end is read. Returns a unit's
+    /// compile, none for a spare one.
+    fn joined(&mut self, ended: Ended<U::Formed>) -> Option<(usize, U::Formed, Duration)> {
+        let ended = match ended {
+            Ended::Compile(unit, formed, took) => {
+                self.taken.retain(|(compiling, _)| *compiling != unit);
+                Some((unit, formed, took))
+            }
+            Ended::Spare(formed, took) => {
+                self.spare_running -= 1;
+                self.spare_taken.observe(took.as_secs_f64());
+                if let Err(panic) = formed {
+                    std::panic::resume_unwind(panic);
+                }
+                None
+            }
+        };
         // The burst is over when its last compile ends. If the peak of the
         // process's footprint rose in it, the peak was reached while its
         // compiles ran, and what it rose by over the burst's start is what
@@ -1508,7 +1627,7 @@ impl<U: Unit> Threads<U> {
         // is one mark for the life of the process. A burst that held more
         // than its compiles were priced at raises the price to what it
         // held, and is kept as a mispricing.
-        if self.taken.is_empty() {
+        if self.running() == 0 {
             if let Some(burst) = self.burst.take() {
                 let peak = seismic::ProcessMemory::footprint_peak();
                 if let Some(peak) = peak.filter(|peak| *peak > burst.peak && burst.threads > 0) {
@@ -1522,10 +1641,10 @@ impl<U: Unit> Threads<U> {
                 }
             }
         }
-        match formed {
+        ended.map(|(unit, formed, took)| match formed {
             Ok(formed) => (unit, formed, took),
             Err(panic) => std::panic::resume_unwind(panic),
-        }
+        })
     }
 }
 
@@ -1539,9 +1658,7 @@ where
     }
 
     fn free(&self) -> usize {
-        self.workers
-            .width()
-            .saturating_sub(self.taken.iter().map(|(_, threads)| threads).sum())
+        self.workers.width().saturating_sub(self.running())
     }
 
     fn compile_host(&self) -> u64 {
@@ -1549,34 +1666,22 @@ where
     }
 
     fn start(&mut self, unit: usize, forming: U::Forming) {
-        if self.taken.is_empty() {
-            self.burst = seismic::ProcessMemory::footprint_now()
-                .zip(seismic::ProcessMemory::footprint_peak())
-                .map(|(footprint, peak)| Burst {
-                    footprint,
-                    peak,
-                    threads: 0,
-                });
-        }
-        self.taken.push((unit, (self.needs)(&forming)));
-        if let Some(burst) = &mut self.burst {
-            burst.threads = burst
-                .threads
-                .max(self.taken.iter().map(|(_, threads)| threads).sum());
-        }
+        let threads = (self.needs)(&forming);
+        self.starting(threads);
+        self.taken.push((unit, threads));
         let (run, sender) = (self.run, self.sender.clone());
         self.workers.spawn(move || {
             let began = std::time::Instant::now();
             let formed =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || run(forming)));
             // The allocator reads every compile it started before it ends.
-            let _ = sender.send((unit, formed, began.elapsed()));
+            let _ = sender.send(Ended::Compile(unit, formed, began.elapsed()));
         });
     }
 
     fn ended(&mut self) -> Vec<(usize, U::Formed, Duration)> {
         let ended = self.receiver.try_iter().collect::<Vec<_>>();
-        ended.into_iter().map(|ended| self.joined(ended)).collect()
+        ended.into_iter().filter_map(|ended| self.joined(ended)).collect()
     }
 
     fn wait(&mut self, within: Option<Duration>) -> Option<(usize, U::Formed, Duration)> {
@@ -1594,7 +1699,57 @@ where
                 .recv()
                 .expect("the allocator holds a sender of its own"),
         };
-        Some(self.joined(ended))
+        self.joined(ended)
+    }
+
+    fn spare_waiting(&self) -> bool {
+        !self.spare.is_empty()
+    }
+
+    fn spare_running(&self) -> usize {
+        self.spare_running
+    }
+
+    fn start_spare(&mut self) {
+        let job = self.spare.pop_front().expect("a spare compile waits");
+        self.starting(1);
+        self.spare_running += 1;
+        let sender = self.sender.clone();
+        self.workers.spawn(move || {
+            let began = std::time::Instant::now();
+            let formed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            let _ = sender.send(Ended::Spare(formed, began.elapsed()));
+        });
+    }
+
+    fn spare_owed(&self) -> Duration {
+        let left = self.spare.len() + self.spare_running;
+        if left == 0 {
+            return Duration::ZERO;
+        }
+        let price = self
+            .spare_taken
+            .price()
+            .map_or(self.spare_price, Duration::from_secs_f64);
+        price * left.div_ceil(self.workers.width().max(1)) as u32
+    }
+
+    fn drain_spare(&mut self) {
+        loop {
+            while !self.spare.is_empty() && Workers::<U>::free(self) > 0 {
+                self.start_spare();
+            }
+            if self.spare.is_empty() && self.spare_running == 0 {
+                return;
+            }
+            let ended = self
+                .receiver
+                .recv()
+                .expect("the allocator holds a sender of its own");
+            if self.joined(ended).is_some() {
+                unreachable!("the allocator drains its compiles before its spare ones");
+            }
+        }
     }
 }
 
