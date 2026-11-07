@@ -2879,6 +2879,13 @@ impl<F: ProgramFamily> Service<F> {
                 )))),
             };
         }
+        // The table rows of the tokens the host knows it will feed, its path
+        // from where its state resumes, are prefetched ahead of their steps.
+        let position = generation.resident_position();
+        let path = generation.prompt().iter().chain(generation.generated()).skip(position).copied().collect::<Vec<_>>();
+        if let Err(error) = self.domain.prefetch_prompt(id, position, &path) {
+            return Err(fatal(invariant("stored table prefetch")(error)));
+        }
         record.prefix_source = hit.map(|hit| hit.id());
         // Its host answers it admitted only now: one refused before this
         // never was.

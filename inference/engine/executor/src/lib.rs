@@ -57,7 +57,7 @@ mod resident_weights;
 mod resources;
 
 pub use completion::{Completed, Completion, CompletionWake};
-pub use stored_table::TableWaits;
+pub use stored_table::{Prefetched, TableWaits};
 pub use device_resources::{
     ConditioningRange, ConditioningRef, FeatureRef, ImageRef, LogitsRef, ResourceDomain,
     ResourceError, WeakFeatureRef,

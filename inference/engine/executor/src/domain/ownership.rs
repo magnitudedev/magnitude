@@ -222,6 +222,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if holds_chain {
             self.drain_queue().map_err(|error| error.to_string())?;
         }
+        self.release_prefetches(&[request])?;
         self.head.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
@@ -287,6 +288,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// again.
     pub fn release_state(&mut self, requests: &[RequestId]) -> Result<u64, String> {
         let bytes = self.reclaimable(requests)?;
+        // Prefetched for the residency that ends; a state opened again
+        // prefetches its own.
+        self.release_prefetches(requests)?;
         for request in requests {
             let installed = self
                 .input

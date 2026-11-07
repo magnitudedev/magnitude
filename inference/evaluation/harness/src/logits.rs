@@ -132,10 +132,15 @@ pub fn run(
         for (group, chunk) in indices.chunks(batch).enumerate() {
             let mut walks = Vec::with_capacity(chunk.len());
             for &index in chunk {
+                let sequence = engine.open_sequence()?;
+                let tokens = engine::tokens(&rendered[index].tokens);
+                // Every row is teacher-forced: the whole sequence is known,
+                // as a prompt is when its request is admitted.
+                engine.prefetch(&sequence, &tokens)?;
                 walks.push(Walk {
-                    sequence: engine.open_sequence()?,
+                    sequence,
                     rendered: &rendered[index],
-                    tokens: engine::tokens(&rendered[index].tokens),
+                    tokens,
                     base: bases[index],
                 });
             }
@@ -168,7 +173,8 @@ pub fn run(
             "sited": costs.layers.iter().map(|layer| layer.sited).sum::<u64>(),
         })
     });
-    // What each stored table's steps read after they were queued.
+    // What each stored table's steps read after they were queued: none of
+    // host-known rows once their prefetch held them.
     let tables = engine
         .domain
         .stored_table_waits()?

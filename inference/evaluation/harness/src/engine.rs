@@ -497,6 +497,17 @@ impl Engine {
         })
     }
 
+    /// Prefetch the stored-table rows the sequence reads as it feeds
+    /// `tokens` from its position (`ExecutorDomain::prefetch_prompt`), and
+    /// wait until the tables have taken them: what a step then reads after it
+    /// is queued is what no prefetch held.
+    pub fn prefetch(&self, sequence: &Sequence, tokens: &[TokenId]) -> Result<(), String> {
+        for prefetched in self.domain.prefetch_prompt(sequence.request, sequence.position, tokens)? {
+            prefetched.wait();
+        }
+        Ok(())
+    }
+
     pub fn close(&mut self, sequence: Sequence) -> Result<(), String> {
         self.domain.close(sequence.request)
     }

@@ -107,6 +107,51 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(&before[before.len().saturating_sub(count)..])
     }
 
+    /// Prefetch the stored-table rows `request`'s sequence will read when
+    /// its target feeds `tokens` (host-known: a prompt, resumed rows) at
+    /// `position`, following the tokens it holds before it: each n-gram
+    /// input's row rule (`NGramHash::rows`) over them, the rows its steps
+    /// will name, held for the request until they are read or it ends
+    /// (`StoredTable::prefetch`), leaving one launch's rows of each table
+    /// unheld. What a waiter for the prefetches waits on; the domain's work
+    /// does not.
+    pub fn prefetch_prompt(
+        &self,
+        request: RequestId,
+        position: usize,
+        tokens: &[crate::TokenId],
+    ) -> Result<Vec<crate::stored_table::Prefetched>, String> {
+        let tables = self.family.stored_tables()?;
+        let launch = self.execution.policy().limits().max_launch_rows;
+        let tokens = tokens.iter().map(|token| u64::from(token.0)).collect::<Vec<_>>();
+        crate::operators::row_rules(&self.definition.decoder)
+            .into_iter()
+            .filter_map(|(block, hash)| tables.get(&block).map(|table| (table, hash)))
+            .map(|(table, hash)| {
+                let preceding = self
+                    .preceding_tokens(request, position, hash.context as usize)?
+                    .iter()
+                    .map(|token| u64::from(token.0))
+                    .collect::<Vec<_>>();
+                let heads = usize::try_from(hash.heads().map_err(|error| error.to_string())?)
+                    .map_err(|_| "an n-gram input's heads exceed the host's")?;
+                let reserve = heads.checked_mul(launch).ok_or("a launch's table rows overflow")?;
+                table.prefetch(request.0, hash.rows(&preceding, &tokens), reserve)
+            })
+            .collect()
+    }
+
+    /// The prefetches of `requests`, which ended, are no longer held
+    /// (`StoredTable::release`).
+    pub(super) fn release_prefetches(&self, requests: &[RequestId]) -> Result<(), String> {
+        for table in self.family.stored_tables()?.values() {
+            for request in requests {
+                table.release(request.0)?;
+            }
+        }
+        Ok(())
+    }
+
     /// What each stored table's steps read after they were queued, by the
     /// block whose n-gram input reads it (`StoredTable::waits`).
     pub fn stored_table_waits(&self) -> Result<Vec<(usize, crate::stored_table::TableWaits)>, String> {

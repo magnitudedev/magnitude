@@ -40,8 +40,12 @@
 //! the importer's own transforms (`import_transforms::assemble_row`) before
 //! it is converted.
 //!
-//! The table counts the rows its filler read for each step after the step
-//! was queued (`TableWaits`).
+//! A request's prompt rows are prefetched (`StoredTable::prefetch`) when its
+//! state opens: the filler reads them into free slots while no step waits,
+//! one step's rows at a time, and holds each until a step that names it has
+//! read it, or the request ends (`StoredTable::release`). The table counts
+//! the rows its filler read for each step after the step was queued
+//! (`TableWaits`).
 
 use crate::device_table::KeptRows;
 use crate::planning::DirectoryForm;
@@ -50,7 +54,8 @@ use magnitude_family_contracts::WeightDescriptor;
 use seismic_io::{Reader, Ended, Range, Want};
 use seismic::cpu::repack::RowConversion;
 use seismic::Element;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -66,8 +71,8 @@ pub struct RowRange {
 
 /// What a stored table's steps read after they were queued: the rows its
 /// filler read for a step, which the step's gate waited on. A step of rows
-/// the host knew is waited on for rows no slot held; a step of rows the
-/// device selected reads its rows once its notice reaches the host.
+/// the host knew is waited on only for rows no prefetch held; a step of rows
+/// the device selected reads its rows once its notice reaches the host.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableWaits {
     /// Steps of host-known rows, those of them that read rows after they were
@@ -78,6 +83,40 @@ pub struct TableWaits {
     /// Steps of selected rows, and the rows read for them.
     pub selected_steps: u64,
     pub selected_rows: u64,
+}
+
+/// What a prefetch's waiter waits on: the filler drops its end once it has
+/// taken the prefetch, or stopped it.
+pub struct Prefetched(mpsc::Receiver<std::convert::Infallible>);
+
+impl Prefetched {
+    /// Wait until the filler has taken the prefetch.
+    pub fn wait(self) {
+        // Nothing is ever sent: the sender's drop ends the wait.
+        let _ = self.0.recv();
+    }
+}
+
+/// What keeps a slot's row: the latest step that named it (0 for none),
+/// free once the read timeline reaches that step; or a prefetch's hold for
+/// steps not yet queued, which no read frees: only a step that names the
+/// row, or the holders' release, ends it. The hold is never a timeline
+/// value, so no timeline's comparison (CUDA's wraps a 32-bit word) can
+/// read it as reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Named {
+    Step(u64),
+    Held,
+}
+
+impl Named {
+    /// Whether the slot is free by `read`: its step's read is done.
+    fn free(self, read: &seismic::Timeline) -> Result<bool, seismic::ExecutionError> {
+        match self {
+            Self::Step(step) => read.reached(step),
+            Self::Held => Ok(false),
+        }
+    }
 }
 
 /// How the host converts a stored table's rows from `stored`, their
@@ -254,12 +293,33 @@ struct Job {
     rows: StepRows,
 }
 
-/// What the filler is given: steps, taken in queue order.
+/// What the filler is given: steps, taken in queue order before anything
+/// else; and prefetches and releases, in order, taken while no step waits.
 #[derive(Default)]
 struct Jobs {
     steps: VecDeque<Job>,
+    background: VecDeque<Background>,
     /// The table dropped: the filler takes the steps queued, and stops.
     closed: bool,
+}
+
+enum Background {
+    /// Hold `rows` for `holder`, at most `reserve` of them at a time, and
+    /// leave `reserve` slots unheld: one step's rows.
+    Prefetch {
+        holder: u64,
+        rows: Vec<u64>,
+        reserve: usize,
+        done: mpsc::Sender<std::convert::Infallible>,
+    },
+    /// `holder` ended: its holds go.
+    Release { holder: u64 },
+}
+
+/// The filler's next work.
+enum Work {
+    Step(Job),
+    Background(Background),
 }
 
 /// Where a stored table's slots lie: `[records, record_rows, width]` rows,
@@ -411,11 +471,14 @@ struct State {
     /// The leading records whose slots hold rows: every one committed.
     records: u64,
     directory: SlotDirectory,
-    /// Per slot, the latest step that named its row; 0 for none.
-    named: Vec<u64>,
+    /// Per slot, what keeps its row.
+    named: Vec<Named>,
     /// Per slot, whether a step named its row, here or when the table was
     /// last served.
     served: Vec<bool>,
+    /// The rows prefetches hold (their slots `Named::Held`), each with the
+    /// holders holding it.
+    holds: HashMap<u64, Vec<u64>>,
 }
 
 impl StoredTable {
@@ -522,8 +585,9 @@ impl StoredTable {
             state: Mutex::new(State {
                 records,
                 directory,
-                named: vec![0; slots as usize],
+                named: vec![Named::Step(0); slots as usize],
                 served: vec![false; slots as usize],
+                holds: HashMap::new(),
             }),
             failures: Mutex::new(BTreeMap::new()),
             waits: Mutex::new(TableWaits::default()),
@@ -596,6 +660,25 @@ impl StoredTable {
         }
     }
 
+    /// Hold `rows` (a request's prompt rows, in prompt order, with repeats)
+    /// for `holder` ahead of the steps that will name them: the filler reads
+    /// the ones no slot holds into free slots while no step waits, at most
+    /// `reserve` (one step's rows) at a time, and holds each until a step
+    /// that names it has read it, or `holder` is released. It opens no gate,
+    /// and stops where holding more would leave fewer than `reserve` slots
+    /// unheld, or no slot is free: steps read the rest.
+    pub fn prefetch(&self, holder: u64, rows: Vec<u64>, reserve: usize) -> Result<Prefetched, String> {
+        let (done, waiter) = mpsc::channel();
+        self.shared.submit(Background::Prefetch { holder, rows, reserve: reserve.max(1), done })?;
+        Ok(Prefetched(waiter))
+    }
+
+    /// `holder` ended: the rows it holds that no step named are free once no
+    /// other holder holds them.
+    pub fn release(&self, holder: u64) -> Result<(), String> {
+        self.shared.submit(Background::Release { holder })
+    }
+
     /// What its steps read after they were queued, so far.
     pub fn waits(&self) -> TableWaits {
         *self.shared.waits.lock().expect("stored table waits lock")
@@ -666,8 +749,11 @@ impl StoredTable {
         if records < state.records {
             let held = records as usize * record_rows;
             state.directory.limit(held);
-            state.named[held..].fill(0);
+            state.named[held..].fill(Named::Step(0));
             state.served[held..].fill(false);
+            // The rows the released records held are no longer held.
+            let State { holds, directory, .. } = &mut *state;
+            holds.retain(|row, _| directory.slot(*row).is_some());
             state.records = records;
             if let Err(error) = self.shared.publish(state) {
                 return (resizer, Err(error));
@@ -774,23 +860,54 @@ impl crate::settle::Owed for StoredTable {
 }
 
 impl Shared {
-    /// The filler: each step in queue order, until the table drops with
-    /// every step taken.
+    /// Give the filler `background` work, behind every step.
+    fn submit(&self, background: Background) -> Result<(), String> {
+        {
+            let mut jobs = self.jobs.lock().expect("stored table jobs lock");
+            if jobs.closed {
+                return Err("the stored table's filler has stopped".into());
+            }
+            jobs.background.push_back(background);
+        }
+        self.arrived.notify_one();
+        Ok(())
+    }
+
+    /// The filler: each step in queue order, and its other work while no
+    /// step waits, until the table drops with every step taken.
     fn fill(&self) {
         loop {
-            let job = {
+            let work = {
                 let mut jobs = self.jobs.lock().expect("stored table jobs lock");
                 loop {
                     if let Some(job) = jobs.steps.pop_front() {
-                        break job;
+                        break Work::Step(job);
                     }
                     if jobs.closed {
                         return;
                     }
+                    if let Some(background) = jobs.background.pop_front() {
+                        break Work::Background(background);
+                    }
                     jobs = self.arrived.wait(jobs).expect("stored table jobs lock");
                 }
             };
-            self.fill_step(job);
+            match work {
+                Work::Step(job) => self.fill_step(job),
+                Work::Background(Background::Prefetch { holder, mut rows, reserve, done }) => {
+                    // One step's rows at a time: a step queued meanwhile is
+                    // taken before the rest.
+                    let rest = rows.split_off(reserve.min(rows.len()));
+                    if self.prefetch(holder, &rows, reserve) && !rest.is_empty() {
+                        self.jobs
+                            .lock()
+                            .expect("stored table jobs lock")
+                            .background
+                            .push_front(Background::Prefetch { holder, rows: rest, reserve, done });
+                    }
+                }
+                Work::Background(Background::Release { holder }) => self.release(holder),
+            }
         }
     }
 
@@ -858,6 +975,7 @@ impl Shared {
         let queued = {
             let mut jobs = self.jobs.lock().unwrap_or_else(PoisonError::into_inner);
             jobs.closed = true;
+            jobs.background.clear();
             jobs.steps.drain(..).map(|job| job.step).max()
         };
         let opened = self.opened.load(Ordering::SeqCst);
@@ -872,12 +990,92 @@ impl Shared {
         let _ = self.gate.signal(last);
     }
 
+    /// Hold `rows` for `holder` in slots free now ([`StoredTable::prefetch`]):
+    /// the rows a slot holds are held where they are, and the others read
+    /// into free slots, never waiting for one. Whether it may hold more.
+    fn prefetch(&self, holder: u64, rows: &[u64], reserve: usize) -> bool {
+        let mut guard = self.state.lock().expect("stored table lock");
+        let state = &mut *guard;
+        let slots = (state.records * self.record_rows) as usize;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut absent = Vec::new();
+        let mut more = true;
+        // A row outside the table fails the step that names it.
+        for &row in rows.iter().filter(|row| **row < self.rows && seen.insert(**row)) {
+            if let Some(slot) = state.directory.use_slot(row) {
+                state.named[slot as usize] = Named::Held;
+                hold(&mut state.holds, row, holder);
+                continue;
+            }
+            if state.holds.len() + absent.len() + reserve >= slots {
+                more = false;
+                break;
+            }
+            absent.push(row);
+        }
+        let mut taken = Vec::with_capacity(absent.len());
+        let mut claimed = HashSet::with_capacity(absent.len());
+        for _ in &absent {
+            let (named, read) = (&state.named, &self.read);
+            let kept = |slot: usize| Ok::<_, seismic::ExecutionError>(claimed.contains(&slot) || !named[slot].free(read)?);
+            match state.directory.try_free(kept) {
+                Ok(Some((slot, _))) => {
+                    // Free until its row is read in.
+                    state.named[slot] = Named::Step(0);
+                    claimed.insert(slot);
+                    taken.push(slot);
+                }
+                // No slot is free now, or the device cannot say: steps read
+                // the rest.
+                Ok(None) | Err(_) => {
+                    more = false;
+                    break;
+                }
+            }
+        }
+        absent.truncate(taken.len());
+        // A row that cannot be read is left to its step, which fails on it.
+        // A fill, wanted at no instant: no step waits on it.
+        let errors = self.read_rows(&absent, &taken, Want::undated(0.));
+        for ((row, slot), error) in absent.iter().zip(&taken).zip(errors) {
+            if error.is_none() {
+                state.directory.hold(*row, *slot, true);
+                state.served[*slot] = false;
+                state.named[*slot] = Named::Held;
+                hold(&mut state.holds, *row, holder);
+            }
+        }
+        // A crowded directory is rebuilt by the next step, which waits for
+        // the reads before it. The directory is host-shared storage the
+        // table allocated: a write to it failing is a defect.
+        self.publish(state).expect("the stored table's directory is written in place");
+        more
+    }
+
+    /// `holder`'s holds go: a row no other holder holds is free once every
+    /// step that named it has read it.
+    fn release(&self, holder: u64) {
+        let mut state = self.state.lock().expect("stored table lock");
+        let State { holds, directory, named, .. } = &mut *state;
+        holds.retain(|row, holders| {
+            holders.retain(|held| *held != holder);
+            let kept = !holders.is_empty();
+            if let (false, Some(slot)) = (kept, directory.slot(*row)) {
+                if named[slot as usize] == Named::Held {
+                    named[slot as usize] = Named::Step(0);
+                }
+            }
+            kept
+        });
+    }
+
     /// Hold every row `rows` names per batch slot for step `step` (0 before
     /// the first step): rows a slot holds are named; the others are read
     /// into free slots and published. `served`: steps named the rows. The
     /// rows that could not be read are not published, and fail the batch
     /// slots that named them (`Ok(Some)`); a failure that is no row's fails
-    /// the step (`Err`). Beside it, the rows it read.
+    /// the step (`Err`). Beside it, the rows it read. A step naming a row a
+    /// prefetch holds takes the hold over: the row is held until it read it.
     fn bring(
         &self,
         state: &mut State,
@@ -910,7 +1108,10 @@ impl Shared {
         for row in naming.keys().copied() {
             match state.directory.use_slot(row) {
                 Some(slot) => {
-                    state.named[slot as usize] = step;
+                    if state.named[slot as usize] == Named::Held {
+                        state.holds.remove(&row);
+                    }
+                    state.named[slot as usize] = Named::Step(step);
                     state.served[slot as usize] |= served;
                 }
                 None => absent.push(row),
@@ -926,31 +1127,33 @@ impl Shared {
                 // read it: this step, or one whose read is not done, or not
                 // known to be (the device cannot say, which fails the step).
                 let kept = |slot: usize| {
-                    Ok(claimed.contains(&slot) || (step != 0 && named[slot] == step) || !read.reached(named[slot])?)
+                    Ok(claimed.contains(&slot) || (step != 0 && named[slot] == Named::Step(step)) || !named[slot].free(read)?)
                 };
                 let free = state.directory.try_free(kept).map_err(|error: seismic::ExecutionError| format!("the stored table's reads: {error}"))?;
                 if let Some((slot, _)) = free {
                     break slot;
                 }
-                // Every slot holds a row a step still reads: wait for the
-                // oldest such read.
+                // Every slot holds a row a step still reads, or a prefetch
+                // holds: wait for the oldest such read.
                 let oldest = state.named[..held]
                     .iter()
-                    .copied()
-                    .filter(|named| *named != step)
+                    .filter_map(|named| match *named {
+                        Named::Step(named) if named != step => Some(named),
+                        Named::Step(_) | Named::Held => None,
+                    })
                     .min()
                     .ok_or("a step names more rows than the table has slots")?;
                 if !self.read.wait(oldest, SLOT_WAIT).map_err(|error| format!("the stored table's reads: {error}"))? {
                     return Err("no slot of the stored table came free".into());
                 }
             };
-            state.named[slot] = step;
+            state.named[slot] = Named::Step(step);
             claimed.insert(slot);
             taken.push(slot);
         }
         // Read the absent rows into their slots, then publish those that
         // were read; a row that was not leaves its slot free.
-        let unread = self.read_rows(&absent, &taken);
+        let unread = self.read_rows(&absent, &taken, Want::now());
         for ((row, slot), error) in absent.iter().zip(&taken).zip(unread) {
             match error {
                 None => {
@@ -981,17 +1184,15 @@ impl Shared {
     }
 
     /// Read `absent`'s rows as stored, a range of each of the table's row
-    /// tensors per row, due now (a step waits on them), then assemble and
-    /// convert each into its slot of `taken`: per row, why it was not, if it
-    /// was not.
-    fn read_rows(&self, absent: &[u64], taken: &[usize]) -> Vec<Option<String>> {
+    /// tensors per row, wanted as `want`, then assemble and convert each into
+    /// its slot of `taken`: per row, why it was not, if it was not.
+    fn read_rows(&self, absent: &[u64], taken: &[usize], want: Want) -> Vec<Option<String>> {
         let mut unread = vec![None; absent.len()];
         if absent.is_empty() {
             return unread;
         }
         // Every range's bytes of every absent row, a buffer per range, read
         // as one request per range, all in flight together.
-        let want = Want::now();
         let buffers = self
             .ranges
             .iter()
@@ -1100,10 +1301,17 @@ impl Shared {
     }
 }
 
+/// `holder` holds `row` (once, however often it asks).
+fn hold(holds: &mut HashMap<u64, Vec<u64>>, row: u64, holder: u64) {
+    let holders = holds.entry(row).or_default();
+    if !holders.contains(&holder) {
+        holders.push(holder);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
     use seismic_io::CachePolicy;
     use seismic::{BackendName, Element};
 
@@ -1301,6 +1509,55 @@ mod tests {
     /// Mark step `value`'s read done, as the device does after its read.
     fn read_done(step: &StoredStep) {
         step.read.signal(step.value).unwrap();
+    }
+
+    /// Rows prefetched ahead of the steps that name them are read before
+    /// those steps are queued, which then read none; a step of rows no
+    /// prefetch held reads its own. A prefetch leaves one step's rows of
+    /// slots unheld, and holds its rows until a step that names them has
+    /// read them (other steps take other slots), or its holder is released.
+    #[test]
+    fn prefetched_rows_are_read_before_their_steps_and_held_until_read() {
+        let (path, table) = table("prefetch", 64, DirectoryForm::Hashed);
+        let run = |rows: std::ops::Range<u64>| {
+            let step = table.queue(StepRows::Known(vec![rows.collect()])).unwrap();
+            assert!(step.gate.wait(step.value, Duration::from_secs(10)).unwrap());
+            assert_eq!(table.failure(step.value), None);
+            read_done(&step);
+        };
+        let held = |rows: &[u64]| rows.iter().filter(|row| found(&table, **row).is_some()).count();
+        // Sixty rows asked, some twice: 48 held, leaving a step's 16 slots.
+        let prompt = (0..60).map(|row| row * 5).collect::<Vec<_>>();
+        let asked = prompt.iter().chain(&prompt[..10]).copied().collect();
+        table.prefetch(1, asked, 16).unwrap().wait();
+        assert_eq!(held(&prompt), 48);
+        assert_eq!(held(&prompt[..48]), 48);
+        assert_eq!(table.waits(), TableWaits::default());
+        // Steps of other rows take the unheld slots, never a held one.
+        run(1000..1016);
+        run(2000..2016);
+        assert_eq!(held(&prompt[..48]), 48);
+        for chunk in prompt[..48].chunks(16) {
+            let step = table.queue(StepRows::Known(vec![chunk.to_vec()])).unwrap();
+            assert!(step.gate.wait(step.value, Duration::from_secs(10)).unwrap());
+            for row in chunk {
+                assert_eq!(found(&table, *row), Some(slot_row(*row)));
+            }
+            read_done(&step);
+        }
+        let waits = table.waits();
+        assert_eq!((waits.known_steps, waits.known_waited, waits.known_rows), (5, 2, 32));
+        // Read by their steps, they are held no more: a step takes every slot.
+        run(3000..3064);
+        // Nor are a released holder's rows.
+        table.prefetch(2, (3500..3540).collect(), 16).unwrap().wait();
+        assert_eq!(held(&(3500..3540).collect::<Vec<_>>()), 40);
+        table.release(2).unwrap();
+        // Taken after the release.
+        table.prefetch(3, Vec::new(), 16).unwrap().wait();
+        run(3600..3664);
+        drop(table);
+        std::fs::remove_file(path).unwrap();
     }
 
     /// The E4M3 value of `code` (S.EEEE.MMM, bias 7, NaN at S.1111.111),
