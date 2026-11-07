@@ -2406,6 +2406,8 @@ enum RouteSubmission {
         outcome: Result<(), ExecutionError>,
         /// Execution interval on the [`trace::host_seconds`] clock.
         interval: (f64, f64),
+        /// Each launch's interval at launch detail (`cpu::run_timed`).
+        launches: Option<Vec<Option<(f64, f64)>>>,
     },
     #[cfg(target_os = "macos")]
     Metal(seismic_metal::DirectSubmission),
@@ -2577,8 +2579,21 @@ fn encode(
     let mut buffers = Vec::new();
     match &first.route {
         NativeRoute::Cpu(route) => {
+            if timed.is_some() {
+                let (outcome, interval, launches) =
+                    cpu::run_timed(&route.opened, list, repetitions);
+                return Ok(RouteSubmission::Cpu {
+                    outcome,
+                    interval,
+                    launches: Some(launches),
+                });
+            }
             let (outcome, interval) = cpu::run(&route.opened, list, repetitions);
-            Ok(RouteSubmission::Cpu { outcome, interval })
+            Ok(RouteSubmission::Cpu {
+                outcome,
+                interval,
+                launches: None,
+            })
         }
         #[cfg(target_os = "macos")]
         NativeRoute::Metal { opened, .. } => {

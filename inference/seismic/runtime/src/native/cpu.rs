@@ -258,6 +258,69 @@ pub(super) fn run(
     (Ok(()), (now, end))
 }
 
+/// [`run`] at launch detail: every launch runs as a pool job of its own, so
+/// its interval is the device time of that launch alone. Returns the
+/// outcome, the interval of the whole run and each launch's interval in
+/// encode order (`None` for an inactive launch), on the [`host_seconds`]
+/// clock.
+pub(super) fn run_timed(
+    opened: &Arc<CpuOpened>,
+    list: &impl DispatchList,
+    repetitions: usize,
+) -> (Result<(), ExecutionError>, (f64, f64), Vec<Option<(f64, f64)>>) {
+    let executor = opened.executor();
+    let mut pointers = Vec::new();
+    let mut storages = Vec::new();
+    let mut weights = Vec::new();
+    let calls = calls(list, &mut pointers, &mut storages, &mut weights);
+    let tables = Tables {
+        pointers: &pointers,
+        storages: &storages,
+        weights: &weights,
+    };
+    let now = host_seconds();
+    let mut intervals = Vec::new();
+    for _ in 0..repetitions {
+        for boundary in 0..=calls.len() {
+            for operation in list.timelines(boundary) {
+                let TimelineKind::Cpu(timeline) = operation.timeline.kind() else {
+                    unreachable!("a run binds timelines of its own device");
+                };
+                match operation.node {
+                    TimelineNode::Wait => timeline.wait_unbounded(operation.value),
+                    TimelineNode::Signal => timeline.signal(operation.value),
+                }
+            }
+            let Some(call) = calls.get(boundary) else {
+                continue;
+            };
+            let mut steps = match steps(std::slice::from_ref(call), tables, executor.workers()) {
+                Ok(steps) => steps.into_iter(),
+                Err(error) => return (Err(error), (now, host_seconds()), intervals),
+            };
+            for launch in call.0.launches {
+                if launch.is_none() {
+                    intervals.push(None);
+                    continue;
+                }
+                let step = steps.next().expect("every active launch forms a step");
+                let (outcome, interval) = executor.run_native(
+                    &Steps {
+                        steps: vec![step],
+                        repetitions: 1,
+                    },
+                    host_seconds,
+                );
+                intervals.push(Some(interval));
+                if outcome.is_err() {
+                    return (outcome, (now, interval.1), intervals);
+                }
+            }
+        }
+    }
+    (Ok(()), (now, host_seconds()), intervals)
+}
+
 /// One call of a submission: its dispatch, the range of its buffers in the
 /// [`Tables`], and its scalar-result storage.
 type Call<'l> = (Dispatch<'l>, std::ops::Range<usize>, *mut u64);
