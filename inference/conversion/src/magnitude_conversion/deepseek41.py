@@ -40,7 +40,8 @@ MAX_UE8M0 = 246  # the largest byte whose E4M3 products are exact in F32 (`infer
 ALIGNMENT = 4096
 _EXPERT_SCALE = re.compile(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.scale$")
 # The checkpoint states its chat format only as Python (`encoding/encoding.py`), which no GGUF reader runs. The text
-# file carries its Jinja translation.
+# file carries its Jinja translation, which the engine's chat tests render equal to the encoding
+# (`engine/chat/tests/real_tokenizer.rs`, against `magnitude_references.deepseek41_chat`).
 CHAT_TEMPLATE = (Path(__file__).parent / "deepseek41.jinja").read_text(encoding="utf-8")
 
 

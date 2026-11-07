@@ -340,8 +340,19 @@ def _value(kind: GGUFValueType, value, item: GGUFValueType | None) -> bytes:
     raise ValueError(f"unsupported GGUF value type {kind}")
 
 
+def encode_header(metadata: dict[str, Value], tensors: list[TensorInfo], alignment: int) -> bytes:
+    """A GGUF v3 header, the inverse of `parse_header`, padded to `alignment`."""
+    header = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(metadata)))
+    for key, value in metadata.items():
+        header += _string(key) + struct.pack("<I", value.kind) + _value(value.kind, value.value, value.item)
+    for info in tensors:
+        header += _string(info.name) + struct.pack(f"<I{len(info.shape)}QIQ", len(info.shape), *info.shape,
+                                                   info.type, info.offset)
+    return bytes(header + bytes(-len(header) % alignment))
+
+
 class Writer:
-    """Streaming GGUF v3 writer, the inverse of `parse_header`: declare the tensor directory, then write
+    """Streaming GGUF v3 writer of `encode_header`'s header: declare the tensor directory, then write
     each tensor's bytes in declaration order (so arbitrarily large tensors never sit in memory together)."""
 
     def __init__(self, path: Path, metadata: dict[str, Value]):
@@ -357,13 +368,7 @@ class Writer:
         self.offset += -(-info.nbytes // self.alignment) * self.alignment
 
     def begin(self) -> None:
-        header = bytearray(b"GGUF" + struct.pack("<IQQ", 3, len(self.order), len(self.metadata)))
-        for key, value in self.metadata.items():
-            header += _string(key) + struct.pack("<I", value.kind) + _value(value.kind, value.value, value.item)
-        for info in self.order:
-            header += _string(info.name) + struct.pack(f"<I{len(info.shape)}QIQ", len(info.shape), *info.shape,
-                                                       info.type, info.offset)
-        header += bytes(-len(header) % self.alignment)
+        header = encode_header(self.metadata, self.order, self.alignment)
         self.stream = self.path.open("wb")
         self.stream.write(header)
         self.data_start, self.next = len(header), 0

@@ -133,6 +133,24 @@ impl Profile {
                 false,
                 false,
             ),
+            // DeepSeek V3's pieces (DeepSeek V4.1's `tokenizer.json`): digit
+            // groups of one to three, then CJK ideograph and kana runs, then
+            // letter runs that may follow one ASCII punctuation mark. llama.cpp
+            // reads `joyai-llm` with the same three expressions, merges ranked
+            // and no BOS by default (cd959bae, `llama-vocab.cpp:327-335`,
+            // `:2724-2727`).
+            ("gpt2", Some("joyai-llm")) => byte_level(
+                &[
+                    (r"\p{N}{1,3}", Isolated),
+                    ("[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+", Isolated),
+                    (
+                        r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##,
+                        Isolated,
+                    ),
+                ],
+                false,
+                false,
+            ),
             // GPT-4o pieces: case-split letter runs with trailing contractions.
             ("gpt2", Some("llama4")) => byte_level(
                 &[(
@@ -199,6 +217,9 @@ const INTERPRETED_KEYS: &[&str] = &[
     // sequence.
     "tokenizer.ggml.add_sep_token",
     "tokenizer.ggml.add_space_prefix",
+    // Decoding emits every piece's bytes as they are: it never cleans up the
+    // spaces before punctuation.
+    "tokenizer.ggml.clean_spaces",
     "tokenizer.ggml.suppress_tokens",
 ];
 
@@ -308,6 +329,7 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
     for key in [
         "tokenizer.ggml.add_eos_token",
         "tokenizer.ggml.add_space_prefix",
+        "tokenizer.ggml.clean_spaces",
     ] {
         if flag(payload, key)? == Some(true) {
             unsupported.push(UnsupportedReason::UnrecognizedMetadata { key: key.into() });
