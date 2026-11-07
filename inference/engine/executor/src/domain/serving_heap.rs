@@ -273,7 +273,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(crate::planning::places_curve(
             held,
             held + prompt.len() - 1,
-            &|places| bytes[places - held],
+            // The class room the plan reserves is the places' already: no
+            // growth of the bank takes it (`class_reserve`), so it costs
+            // them nothing of the room the bank's slots compete for.
+            &|places| bytes[places - held].saturating_sub(self.class_reserve),
             &|places| prompt[places - held],
             rates.requests_per_s,
         ))
@@ -673,7 +676,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(BankStep::AtLimit);
         };
-        let unborn = self.unborn(grant.kind.storage());
+        let unborn = self.bank_unborn(grant.kind.storage());
         let mode = match grant.borrowed {
             0 => crate::platform::FitMode::Live,
             _ => crate::platform::FitMode::Borrow,

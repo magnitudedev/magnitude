@@ -941,6 +941,52 @@ fn the_bank_grows_on_the_prior_before_a_decode_is_counted() {
     }
 }
 
+/// The class room a plan reserves is the places' from the plan on
+/// (`class_reserve`): a partial bank that grows before the first group
+/// takes its places grows only into the room beside it, never by timing,
+/// and the group then takes every place from the room kept for it.
+#[test]
+fn a_bank_grown_before_the_first_group_leaves_its_places_room() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked_chain(backend, 4, 1);
+        // Each slot saves fewer reads than the one before it, and some reads
+        // miss every size (a step always pays the read's latency): each
+        // growth by a row is worth its bytes alone, so room alone stops it.
+        price_growth(&mut domain, &mut bindings, misses_by(100, &[(1, 8), (2, 4), (3, 2), (4, 1)]));
+        domain.probe_memory(std::time::Duration::from_millis(100)).unwrap();
+        let row = bank_row(&domain);
+        let room = |domain: &ExecutorDomain<TestFamily>| {
+            domain.growth_room(crate::planning::BankTier::Bank, super::borrowing::Room::Committed).unwrap().0
+        };
+        assert!(room(&domain) > 4 * row, "{backend:?}: the device has room for the bank");
+        // The plan's class keeps all but a row and a half of the room: the
+        // least reserve that leaves the growth no more (the room is the
+        // device's less the reserve, within the bank's own reservation).
+        let leaves = |domain: &mut ExecutorDomain<TestFamily>, reserve: u64| {
+            domain.class_reserve = reserve;
+            room(domain)
+        };
+        let (mut low, mut high) = (0u64, u64::MAX / 2);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            match leaves(&mut domain, mid) <= row + row / 2 {
+                true => high = mid,
+                false => low = mid + 1,
+            }
+        }
+        let reserve = low;
+        let left = leaves(&mut domain, reserve);
+        assert!(left > row && left <= row + row / 2, "{backend:?}: the reserve leaves a row and a half ({left} of {row})");
+        assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        assert!(
+            matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 2, .. }),
+            "{backend:?}: the bank grows by the row beside the class's room"
+        );
+        assert_eq!(domain.class_reserve, reserve, "{backend:?}: no growth takes the class's room");
+        assert_eq!(group_places_opened((domain, bindings)), 3, "{backend:?}: the group takes its places from the room kept for them");
+    }
+}
+
 /// Regrowth after an ask is one growth to the settled size: the ask takes
 /// the bank down in one shrink to what covers it, and the next settle
 /// grows it back in one resize, not a slot a reading.

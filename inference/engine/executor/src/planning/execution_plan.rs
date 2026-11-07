@@ -735,7 +735,7 @@ impl ExecutionPlanDraft {
         let mut over = |slots: u64, pass: PassLaunches| -> Result<_, E> {
             let draft = resized(slots, pass)?;
             let charge = held.charge(definition, &draft)?;
-            let needed = match draft.holds_group_class() {
+            let needed = match draft.load.holds_group_class() {
                 true => Self::allocated(&charge.charge().with_group_class().map_err(PlanError::ResourcePlanning)?)?,
                 false => Self::allocated(charge.charge())?,
             };
@@ -839,14 +839,6 @@ impl ExecutionPlanDraft {
             .decoder
             .context_limit
             .div_ceil(self.policy.limits.max_launch_rows as u64)
-    }
-
-    /// Whether the draft leaves room for its prompt groups' class of its
-    /// chain places (`AssessmentMemoryCharge::with_group_class`): where its
-    /// settle granted passes of several launches, which a group's places
-    /// merge.
-    pub fn holds_group_class(&self) -> bool {
-        self.load.bank.as_ref().is_some_and(|bank| bank.pass > PassLaunches::FLOOR)
     }
 
     /// The bank of a draft that streams its experts.
@@ -1173,11 +1165,11 @@ impl<'a> StableRoom<'a> {
 
     /// The stable fit of `draft` charged `charge`: with its prompt groups'
     /// class of the plan's chain places where the load reserves it
-    /// ([`ExecutionPlanDraft::holds_group_class`],
+    /// ([`super::ModelLoadPlan::holds_group_class`],
     /// `AssessmentMemoryCharge::with_group_class`), as the settle's room
     /// holds it. The one confirm a load's plan and its assessment make.
     pub fn fit(&self, draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<super::AssessmentFit, PlanError> {
-        let charge = match draft.holds_group_class() {
+        let charge = match draft.load.holds_group_class() {
             true => charge.clone().with_group_class().map_err(PlanError::ResourcePlanning)?,
             false => charge.clone(),
         };

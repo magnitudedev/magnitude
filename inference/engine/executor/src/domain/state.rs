@@ -1065,6 +1065,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .map(|grown| self.resources.hold_class(grown));
             self.release_claim(claim);
             if held.is_ok() {
+                self.class_reserve = self.class_reserve.saturating_sub(bytes);
                 let wait = wait.map_or("none".to_owned(), |wait| format!("{wait:.1} s"));
                 tracing::info!("prompt groups hold {places} places, {bytes} bytes more; wait bound {wait}");
             }
@@ -1082,6 +1083,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             };
         }
         Ok(())
+    }
+
+    /// The class room the plan reserves beyond the places held
+    /// (`ModelLoadPlan::holds_group_class`): growing the class to the
+    /// chain's capacity, in the bank's device store; none where the plan
+    /// reserves none.
+    pub(super) fn planned_class_reserve(&mut self) -> u64 {
+        if !self.execution.load().holds_group_class() {
+            return 0;
+        }
+        let held = self.resources.group_places().get();
+        let (_, bytes) = self
+            .class_bytes(held, self.chain_capacity().get())
+            .expect("invariant violated: the plan charged a group class it cannot price");
+        *bytes.last().expect("a class's bytes hold the places held")
     }
 
     /// What growing the prompt-group class from `held` places to each count
@@ -1226,11 +1242,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// back now in `room`, and the unborn state its claim leaves beside it:
     /// what the heap's claim of them admits there
     /// (`DeviceHeap::reserved_room`, the one test the claim then passes,
-    /// beside the workload's unborn state), less its store's fluctuation
+    /// beside the workload's unborn state and the plan's class reserve,
+    /// [`Self::bank_unborn`]), less its store's fluctuation
     /// (`MemoryPace::fluctuation`) and, in device storage's store, the
     /// measurement job's claim. Refused in the Reclaim band, or blind.
     pub(super) fn growth_room(&self, kind: crate::planning::BankTier, room: Room) -> Result<(u64, u64), ClaimRefusal> {
-        let unborn = self.unborn(kind.storage());
+        let unborn = self.bank_unborn(kind.storage());
         let mode = match room {
             Room::Committed => crate::platform::FitMode::Live,
             Room::Borrowed => crate::platform::FitMode::Borrow,
@@ -1281,6 +1298,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             self.committed_state_bytes(),
             [(self.family.head_is_bound(), bytes.head_weights), (self.family.vision_is_bound(), bytes.vision_weights)],
         )
+    }
+
+    /// What a growth of the expert bank in `kind` storage leaves beside it:
+    /// the unborn state and components ([`Self::unborn`]) and, in device
+    /// storage's store, the class room the plan reserves that no group holds
+    /// yet (`class_reserve`), which a group's places take and the bank never
+    /// does.
+    pub(super) fn bank_unborn(&self, kind: seismic::Contract) -> u64 {
+        let reserve = if self.beside_device(kind) { self.class_reserve } else { 0 };
+        self.unborn(kind).saturating_add(reserve)
     }
 
     /// The room beside the workload in `kind` storage's store: what a growth
@@ -1493,6 +1520,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             true => SlotRelease::Began,
             false => SlotRelease::None,
         };
+        // A class released to the floor gives its places' room back to the
+        // plan's reserve, which no growth of the bank takes.
+        if reclaim {
+            self.class_reserve = self.planned_class_reserve();
+        }
         Ok((released, slots))
     }
 

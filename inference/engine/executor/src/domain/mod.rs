@@ -595,6 +595,14 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The service's measurement job's claim beside the model, which the
     /// bank's shrink makes room for (`ExecutorDomain::measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
+    /// What of the prompt-group class the plan reserves room for
+    /// (`ModelLoadPlan::holds_group_class`: the class of the chain's places)
+    /// no group holds yet, in device storage: no growth of the bank takes
+    /// it, so a group's places find it however the bank grew before them.
+    /// Set as the domain is made, falling as groups hold places
+    /// (`grant_group`) and whole again once Reclaim releases the class to
+    /// its floor; none where the plan reserves none.
+    class_reserve: u64,
     /// Identity of the next target flight.
     next_flight: u64,
     host_turn: Option<in_flight::HostTurn>,
@@ -2704,6 +2712,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             planned: Vec::new(),
             workload: None,
             measurement_claim: None,
+            class_reserve: 0,
             next_flight: 0,
             host_turn: None,
             poisoned: BTreeMap::new(),
@@ -2717,6 +2726,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             running_release: None,
             places_prompt: RefCell::new(None),
         };
+        let mut domain = domain;
+        domain.class_reserve = domain.planned_class_reserve();
         let bindings = StateBindings {
             target: target_state,
             head: head_state,
