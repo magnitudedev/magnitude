@@ -959,6 +959,43 @@ impl<E: Entry> Clone for Formation<E> {
     }
 }
 
+/// A walk's program: its formation on the walk's backend, and its source
+/// identity there, derived the first time a step keys a point by it and
+/// read by every step after, never derived again ([`ProgramSet::new`]). A
+/// formation without one keeps why, which fails only the steps that name
+/// it.
+pub(super) struct Program<E: Entry> {
+    formation: Formation<E>,
+    backend: seismic::BackendName,
+    identity: std::sync::OnceLock<Result<KernelIdentity, ExecutorCostsError>>,
+}
+
+impl<E: Entry> Clone for Program<E> {
+    fn clone(&self) -> Self {
+        Self {
+            formation: self.formation.clone(),
+            backend: self.backend,
+            identity: self.identity.clone(),
+        }
+    }
+}
+
+impl<E: Entry> Program<E> {
+    fn of(formation: Formation<E>, backend: seismic::BackendName) -> Self {
+        Self { formation, backend, identity: std::sync::OnceLock::new() }
+    }
+
+    /// Its source identity on the set's backend ([`Formation::identity`]).
+    fn identity(&self) -> Result<KernelIdentity, ExecutorCostsError> {
+        self.identity.get_or_init(|| self.formation.identity(self.backend)).clone()
+    }
+
+    /// Formed on `device` ([`Formation::form`]).
+    fn form(&self, device: &Device, rows: Option<u64>) -> Result<NativeKernel<E>, ExecutorCostsError> {
+        self.formation.form(device, rows)
+    }
+}
+
 /// The rows a formed projection serves: one, a decode step's, or the
 /// matrix throughput's ([`Sizes`]). A kernel formed for one forms only the
 /// launches those rows select, and is never called at others.
@@ -1059,16 +1096,16 @@ impl<E: Entry> Formation<E> {
 struct ProgramSet {
     sizes: Sizes,
     /// Each measured format with its F and program.
-    expands: Vec<(Element, u64, Formation<dense_expand::Entry>)>,
+    expands: Vec<(Element, u64, Program<dense_expand::Entry>)>,
     /// The format the composition chain's projections are resident in.
     chain: Element,
     /// The chain's down projection, at its format's F.
-    output: Formation<dense_output::Entry>,
-    dense: Formation<attention_decode::Entry>,
-    affine: Formation<attention_decode_k8v4::Entry>,
-    copy: Formation<conditioning_overlay::Entry>,
+    output: Program<dense_output::Entry>,
+    dense: Program<attention_decode::Entry>,
+    affine: Program<attention_decode_k8v4::Entry>,
+    copy: Program<conditioning_overlay::Entry>,
     /// An expert bank's record moves, over records of the chain's format.
-    moves: Formation<routed_move::Entry>,
+    moves: Program<routed_move::Entry>,
 }
 
 impl ProgramSet {
@@ -1082,8 +1119,10 @@ impl ProgramSet {
     }
 
     /// The programs of `formats` ([`measured_formats`]) at `sizes` on an
-    /// executor whose largest allocation is `largest`, the chain in `chain`.
+    /// executor of `backend` whose largest allocation is `largest`, the
+    /// chain in `chain`.
     fn new(
+        backend: seismic::BackendName,
         sizes: Sizes,
         formats: &[Element],
         chain: Element,
@@ -1093,23 +1132,23 @@ impl ProgramSet {
             .iter()
             .map(|&format| {
                 let features = features(sizes, format, largest)?;
-                Ok((format, features, expand(format, features)))
+                Ok((format, features, Program::of(expand(format, features), backend)))
             })
             .collect::<Result<Vec<_>, ExecutorCostsError>>()?;
         Ok(Self {
             sizes,
-            output: output(chain, features(sizes, chain, largest)?),
+            output: Program::of(output(chain, features(sizes, chain, largest)?), backend),
             expands,
             chain,
-            dense: attend::<attention_decode::Entry>(KvCodec::Dense)?,
-            affine: attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?,
-            copy: copy(),
-            moves: moves(chain),
+            dense: Program::of(attend::<attention_decode::Entry>(KvCodec::Dense)?, backend),
+            affine: Program::of(attend::<attention_decode_k8v4::Entry>(KvCodec::AffineK8V4)?, backend),
+            copy: Program::of(copy(), backend),
+            moves: Program::of(moves(chain), backend),
         })
     }
 
     /// `format`'s F and program.
-    fn expand(&self, format: Element) -> (u64, &Formation<dense_expand::Entry>) {
+    fn expand(&self, format: Element) -> (u64, &Program<dense_expand::Entry>) {
         let (_, features, formation) = self
             .expands
             .iter()
@@ -2795,7 +2834,7 @@ trait Attention: Entry + Sized {
     fn entry() -> BoundEntry<Self>;
     fn args(case: &mut AttendCase) -> Self::Args<'_>;
     /// Its program in the walk's set.
-    fn program(programs: &ProgramSet) -> &Formation<Self>;
+    fn program(programs: &ProgramSet) -> &Program<Self>;
     /// Its kernel as formed.
     fn formed(programs: &Programs) -> &Forming<Self>;
 }
@@ -2807,7 +2846,7 @@ impl Attention for attention_decode::Entry {
     fn args(case: &mut AttendCase) -> Self::Args<'_> {
         case.dense()
     }
-    fn program(programs: &ProgramSet) -> &Formation<Self> {
+    fn program(programs: &ProgramSet) -> &Program<Self> {
         &programs.dense
     }
     fn formed(programs: &Programs) -> &Forming<Self> {
@@ -2824,7 +2863,7 @@ impl Attention for attention_decode_k8v4::Entry {
     fn args(case: &mut AttendCase) -> Self::Args<'_> {
         case.affine()
     }
-    fn program(programs: &ProgramSet) -> &Formation<Self> {
+    fn program(programs: &ProgramSet) -> &Program<Self> {
         &programs.affine
     }
     fn formed(programs: &Programs) -> &Forming<Self> {
@@ -3055,7 +3094,6 @@ impl Drop for Releases {
 /// point so they run for as long as it is timed (a case of the point's
 /// making is dropped once the point is made).
 fn move_timing<T: Times>(
-    backend: seismic::BackendName,
     programs: &ProgramSet,
     times: &mut T,
     share: Share,
@@ -3069,7 +3107,7 @@ fn move_timing<T: Times>(
         // releases before timing them (`released_rows`), which measured none.
         true => [&moved[..], &[("releasing_rows", RELEASED_ROWS)]].concat(),
     };
-    let identities = vec![programs.moves.identity(backend)?];
+    let identities = vec![programs.moves.identity()?];
     let mut build = move |device: &Device, formed: &Programs, _: &mut Backings| {
         let kernel = formed.kernel(&formed.moves)?;
         let mut case = MoveCase::new(device, record).map_err(Unformed::Now)?;
@@ -3561,15 +3599,14 @@ fn walk<T: Times>(
             backend.as_str()
         )))
     })?;
-    let programs = ProgramSet::new(Sizes::of(backend), formats, chain, largest)?;
+    let programs = ProgramSet::new(backend, Sizes::of(backend), formats, chain, largest)?;
     let (routes, placements) = Route::all(topology, executor)?;
     let routes = routes.iter().collect::<Vec<_>>();
     let steps = plan(&routes, formats, moves_records(backend)?);
     // Each step is one point, after the probe.
     let points = 1 + steps.len();
     let walk = Walk {
-        backend,
-        copy: programs.copy.identity(backend)?,
+        copy: programs.copy.identity()?,
         programs,
         cache: largest_cache(topology, executor),
         largest,
@@ -3653,7 +3690,6 @@ pub(super) fn walk_points(topology: &DeviceTopology, executor: &Executor, scope:
 /// first), the largest cache serving them and the largest allocation, what
 /// a history rotation may take, and a point's share of the job.
 struct Walk<'r> {
-    backend: seismic::BackendName,
     programs: ProgramSet,
     copy: KernelIdentity,
     routes: Vec<&'r Route>,
@@ -3853,7 +3889,6 @@ impl Walk<'_> {
     /// storage's first route, rotating through the sets that span the cache.
     fn probe<T: Times>(&self, share: Share, times: &mut T) -> Result<WeightRate, Stop<T::Missing>> {
         weight_rate(
-            self.backend,
             &self.programs,
             Element::bf16(),
             self.routes[0],
@@ -3877,7 +3912,6 @@ impl Walk<'_> {
                 let route = self.routes[index];
                 let rate = |rotated, times: &mut T, share| {
                     weight_rate(
-                        self.backend,
                         &self.programs,
                         format,
                         route,
@@ -3975,7 +4009,6 @@ impl Walk<'_> {
                     None => share,
                 };
                 let matrix = matrix(
-                    self.backend,
                     &self.programs,
                     format,
                     self.routes[0],
@@ -3988,8 +4021,8 @@ impl Walk<'_> {
                     read.matrices.push((format, matrix));
                 }
             }
-            Step::Moves => read.moves = Some(move_timing(self.backend, &self.programs, times, share, false)?),
-            Step::Releases => read.releases = Some(move_timing(self.backend, &self.programs, times, share, true)?),
+            Step::Moves => read.moves = Some(move_timing(&self.programs, times, share, false)?),
+            Step::Releases => read.releases = Some(move_timing(&self.programs, times, share, true)?),
         }
         Ok(())
     }
@@ -4010,16 +4043,15 @@ impl Walk<'_> {
         times: &mut T,
         share: Share,
     ) -> Result<ChainRead, Stop<T::Missing>> {
-        let backend = self.backend;
         let programs = &self.programs;
         let chain_format = programs.chain;
         let device_route = self.routes[0];
         let depth = HISTORY_DEPTHS[0];
         let (features, expand_chain) = programs.expand(chain_format);
         let kernels = vec![
-            expand_chain.identity(backend)?,
-            programs.dense.identity(backend)?,
-            programs.output.identity(backend)?,
+            expand_chain.identity()?,
+            programs.dense.identity()?,
+            programs.output.identity()?,
             self.copy.clone(),
         ];
         // A layer's time as the walk's records price it: its projections'
@@ -4162,7 +4194,6 @@ impl ChainRead {
 /// one row, its calls rotating through the sets that span the cache where
 /// `rotated`, else over one argument set.
 fn weight_rate<T: Times>(
-    backend: seismic::BackendName,
     programs: &ProgramSet,
     format: Element,
     route: &Route,
@@ -4176,7 +4207,7 @@ fn weight_rate<T: Times>(
     let sets = weight_sets(cache, bytes, rotated);
     let timing = times.time(
         PointSpec::new(
-            vec![formation.identity(backend)?],
+            vec![formation.identity()?],
             &[("rows", 1)],
             &weight_point(features, sets, route),
         ),
@@ -4221,7 +4252,6 @@ fn weight_point(features: u64, sets: u64, route: &Route) -> [(&'static str, u64)
 /// `dense_expand` program at the executor's matrix rows ([`Sizes`]) over
 /// one argument set (arithmetic, which a cache does not serve).
 fn matrix<T: Times>(
-    backend: seismic::BackendName,
     programs: &ProgramSet,
     format: Element,
     route: &Route,
@@ -4232,7 +4262,7 @@ fn matrix<T: Times>(
     let rows = Rows::Matrix.count(programs.sizes);
     let timing = times.time(
         PointSpec::new(
-            vec![formation.identity(backend)?],
+            vec![formation.identity()?],
             &[("rows", rows)],
             &weight_point(features, 1, route),
         ),
@@ -4292,7 +4322,7 @@ impl Walk<'_> {
             return Ok(());
         }
         let programs = &self.programs;
-        let identity = E::program(programs).identity(self.backend)?;
+        let identity = E::program(programs).identity()?;
         let per_token = token_bytes(layout)?;
         let route = self.routes[0];
         let point = |depth: u64, sets: u64| {
@@ -4658,7 +4688,7 @@ impl ExecutorCosts {
         let chain = chain_element(backend).ok_or_else(|| {
             ExecutorCostsError(format!("{CHAIN_FORMAT:?} has no resident form on {}", backend.as_str()))
         })?;
-        let programs = ProgramSet::new(Sizes::of(backend), &measured_formats(backend), chain, largest)?;
+        let programs = ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, largest)?;
         let (routes, _) = Route::all(topology, executor)?;
         let weights = programs
             .expands
@@ -4882,7 +4912,7 @@ mod tests {
         let backend = seismic::BackendName::Cpu;
         let chain = chain_element(backend).unwrap();
         let programs =
-            ProgramSet::new(Sizes::of(backend), &measured_formats(backend), chain, 1 << 34)
+            ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34)
                 .unwrap();
         let (features, _) = programs.expand(chain);
         let depth = HISTORY_DEPTHS[0] as f64;
@@ -5027,6 +5057,7 @@ mod tests {
     fn every_walk_program_gives_its_statics_on_every_backend() {
         for backend in seismic::BackendName::ALL {
             let programs = ProgramSet::new(
+                backend,
                 Sizes::of(backend),
                 &measured_formats(backend),
                 chain_element(backend).unwrap(),
@@ -5034,18 +5065,40 @@ mod tests {
             )
             .unwrap();
             let mut statics = vec![
-                programs.output.statics(backend),
-                programs.dense.statics(backend),
-                programs.affine.statics(backend),
-                programs.copy.statics(backend),
+                programs.output.formation.statics(backend),
+                programs.dense.formation.statics(backend),
+                programs.affine.formation.statics(backend),
+                programs.copy.formation.statics(backend),
             ];
             // The moves where the walk reads them.
             if moves_records(backend).unwrap() {
-                statics.push(programs.moves.statics(backend));
+                statics.push(programs.moves.formation.statics(backend));
             }
-            statics.extend(programs.expands.iter().map(|(_, _, expand)| expand.statics(backend)));
+            statics.extend(programs.expands.iter().map(|(_, _, expand)| expand.formation.statics(backend)));
             for given in statics {
                 given.unwrap_or_else(|error| panic!("{backend:?}: {}", error.0));
+            }
+        }
+    }
+
+    /// The identity a walk's program keys its points by is the one its
+    /// formation derives on the set's backend, on every backend: the set
+    /// derives it once, and no key or record changes.
+    #[test]
+    fn a_walk_program_keys_by_the_identity_its_formation_derives() {
+        fn same<E: Entry>(program: &Program<E>, backend: seismic::BackendName) {
+            assert_eq!(program.identity(), program.formation.identity(backend), "{backend:?}: {}", E::NAME);
+        }
+        for backend in seismic::BackendName::ALL {
+            let chain = chain_element(backend).unwrap();
+            let programs = ProgramSet::new(backend, Sizes::of(backend), &measured_formats(backend), chain, 1 << 34).unwrap();
+            same(&programs.output, backend);
+            same(&programs.dense, backend);
+            same(&programs.affine, backend);
+            same(&programs.copy, backend);
+            same(&programs.moves, backend);
+            for (_, _, expand) in &programs.expands {
+                same(expand, backend);
             }
         }
     }
