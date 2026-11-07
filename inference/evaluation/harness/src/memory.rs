@@ -304,6 +304,9 @@ fn plan(
         weight_cap,
         ..ModelPolicy::default()
     };
+    let devices = Devices::discover(&[]).map_err(|error| error.to_string())?;
+    let topology = devices.topology();
+    let reserves = MemoryReserves::of_machine(kernel_cache.as_deref().zip(Some(&*topology)));
     let resolved = EngineConfiguration {
         package: PackageOptions {
             target: target.to_path_buf(),
@@ -316,18 +319,17 @@ fn plan(
         path: ExecutionPath::Native,
         device,
         kernel_cache,
-        reserves: MemoryReserves::standard(),
+        reserves,
     }
     .resolve()
     .map_err(|error| error.to_string())?;
     let (host, manifest) = (Arc::new(resolved.host), resolved.manifest);
     // The charge: the manifest the worker loads, planned on the same device.
-    let devices = Devices::discover(&[]).map_err(|error| error.to_string())?;
     let structure = AssessmentStructure::discover(
         &devices,
         device,
         manifest.kernel_cache.as_deref(),
-        MemoryReserves::standard(),
+        reserves,
         policy,
         standard_service_limits(),
     )
@@ -396,7 +398,7 @@ pub fn recommit(backend: BackendName, commitments: &[u64]) -> Result<(), String>
 /// `backend`'s device, opened as the service opens it.
 fn open_platform(backend: BackendName) -> Result<OpenedPlatform, String> {
     let text = |error: &dyn std::fmt::Display| error.to_string();
-    let reserves = MemoryReserves::standard();
+    let reserves = MemoryReserves::of_machine(None);
     let catalog = Devices::discover(&[]).map_err(|error| text(&error))?;
     let selected = select_device(&catalog, ExecutionPath::Native, DeviceRequest::Backend(backend), &reserves)
         .map_err(|error| text(&error))?;

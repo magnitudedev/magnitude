@@ -11,7 +11,7 @@ use std::time::UNIX_EPOCH;
 
 use futures_util::future::BoxFuture;
 use magnitude_engine::worker::protocol::MemoryObservation;
-use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves};
+use magnitude_executor::platform::{Fit, HostRoom, MemoryReserves, VolumeReserves};
 use magnitude_service_contracts::{
     ExecutionBackend, HardwareAccessPath, HardwareBackendDiagnostic, HardwareDeviceId,
     HardwareDeviceKind, HardwareDeviceMemory, HardwareDiagnosticSource, HardwareExecutor,
@@ -81,6 +81,7 @@ impl ResidentMemory for ModelInstances {
 pub struct HardwareInventory {
     inventory: Arc<Inventory>,
     reserves: MemoryReserves,
+    volumes: Arc<VolumeReserves>,
     serving: ServingDevice,
     machine: Arc<MachineDescription>,
     resident: Arc<dyn ResidentMemory>,
@@ -93,12 +94,14 @@ impl HardwareInventory {
     pub fn new(
         inventory: Arc<Inventory>,
         reserves: MemoryReserves,
+        volumes: Arc<VolumeReserves>,
         serving: ServingDevice,
         resident: Arc<dyn ResidentMemory>,
     ) -> Self {
         Self {
             inventory,
             reserves,
+            volumes,
             serving,
             machine: Arc::new(MachineDescription::discover()),
             resident,
@@ -111,6 +114,7 @@ impl HardwareInventory {
     fn snapshot_with(
         inventory: &Inventory,
         reserves: &MemoryReserves,
+        volumes: &VolumeReserves,
         serving: ServingDevice,
         machine: &MachineDescription,
         resident: Option<&MemoryObservation>,
@@ -125,7 +129,7 @@ impl HardwareInventory {
             sample: inventory.sample(&topology, &every),
             runtime: RuntimeStatus::default(),
         };
-        let mut snapshot = snapshot(&topology, &status, reserves, serving, machine)?;
+        let mut snapshot = snapshot(&topology, &status, reserves, volumes, serving, machine)?;
         if let Some(resident) = resident {
             merge_resident(&mut snapshot.device_memory, resident);
         }
@@ -187,12 +191,20 @@ impl HardwareProvider for HardwareInventory {
     fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>> {
         let inventory = Arc::clone(&self.inventory);
         let reserves = self.reserves;
+        let volumes = Arc::clone(&self.volumes);
         let serving = self.serving;
         let machine = Arc::clone(&self.machine);
         Box::pin(async move {
             let resident = self.resident.observe().await;
             magnitude_service_utils::blocking::run(move || {
-                Self::snapshot_with(&inventory, &reserves, serving, &machine, resident.as_ref())
+                Self::snapshot_with(
+                    &inventory,
+                    &reserves,
+                    &volumes,
+                    serving,
+                    &machine,
+                    resident.as_ref(),
+                )
             })
             .await
         })
@@ -211,10 +223,11 @@ fn snapshot(
     topology: &DeviceTopology,
     status: &Status,
     reserves: &MemoryReserves,
+    volumes: &VolumeReserves,
     serving: ServingDevice,
     machine: &MachineDescription,
 ) -> Result<HardwareSnapshot, InventoryError> {
-    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable);
+    let fit = Fit::new(topology, status, reserves, HostRoom::Allocatable).with_volumes(volumes);
     let path_index = |id| {
         let index = topology
             .access_paths()
@@ -582,7 +595,8 @@ mod tests {
         let serving = ServingDevice::of(seismic::ExecutorSelector::HostCpu);
         let observed = HardwareInventory::snapshot_with(
             &inventory,
-            &MemoryReserves::standard(),
+            &MemoryReserves::of_machine(None),
+            &VolumeReserves::new(None),
             serving,
             &MachineDescription::discover(),
             None,

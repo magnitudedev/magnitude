@@ -61,7 +61,7 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
         path: ExecutionPath::Native,
         device: "cpu".parse::<DeviceRequest>().unwrap(),
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap();

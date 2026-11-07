@@ -124,14 +124,12 @@ impl ModelInstances {
     pub fn start(environment: ResidencyEnvironment) -> Self {
         let environment = Arc::new(environment);
         let (client, inbox) = ResidencyClient::channel();
-        // The reserves of what this process may use, as fit reads them: within a container's memory
-        // limit, not the whole host's RAM. Without a reading, the whole host's, the larger.
+        // The reserves of what this process may use, as fit reads them: the kernel's own line.
+        // Without a reading, no line is known: the line the OS reports none of.
         let topology = environment.catalog.topology();
         let thresholds = match environment.catalog.inventory().host_status() {
             Ok(host) => Fit::host_ram(&topology, &host, &environment.reserves, HostRoom::Allocatable).thresholds,
-            Err(_) => environment
-                .reserves
-                .for_domain(&seismic::StoreKind::HostRam, topology.host_ram().capacity().value),
+            Err(_) => environment.reserves.thresholds(&seismic::StoreKind::HostRam, 0),
         };
         let supervisor = MemorySupervisor::start(
             Arc::clone(&environment.host_memory),
@@ -713,7 +711,10 @@ impl EngineResidency {
         // with none it is the load, one worker. Otherwise it places nothing and ends, a
         // Prepare worker searches what is missing and is proven gone, and a second Load worker
         // serves what is stored (the engine's one sequence, `load_prepared`).
-        let manifest = resolved.manifest.clone();
+        // The load's reserves hold their margin at the host's motion as the service measured it
+        // up to now.
+        let mut manifest = resolved.manifest.clone();
+        manifest.reserves = manifest.reserves.measured(Some(environment.host_memory.motion()), None);
         // The sequence runs on a blocking thread, which outlives this task when the load is
         // stopped: it starts each worker through `sequence`, which a stop closes, and holds it
         // until it is done with every worker, which the stop waits for.

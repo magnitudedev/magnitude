@@ -59,7 +59,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
             .map(|device| device.parse::<DeviceRequest>().unwrap())
             .unwrap_or(DeviceRequest::Automatic),
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap();

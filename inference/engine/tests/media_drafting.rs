@@ -181,7 +181,7 @@ fn run(arguments: &Arguments) -> Result<(), String> {
         path: ExecutionPath::Native,
         device: arguments.device,
         kernel_cache: arguments.cache_dir.clone(),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .map_err(|error| error.to_string())?;

@@ -1780,7 +1780,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let tier = bank.holding_storage(holding)?;
         let held = self.resize_held.finish(started, tier, holding);
         match &finished {
-            super::BankResized::Shrunk { times, .. } => self.pace.borrow_mut().released(times),
+            super::BankResized::Shrunk { released, times, .. } => self.pace.borrow_mut().released(*released, times),
             // A growth's claim was the heap's hold on what it backs, which
             // Seismic now charges; a shrink beside it leaves it held.
             super::BankResized::Grown { .. } | super::BankResized::Stopped { .. } | super::BankResized::GrowthRefused { .. } => {

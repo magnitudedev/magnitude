@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
-use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover, ModelAssessment,
@@ -113,7 +112,8 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
     let ServedStore {
         store: inventory,
         devices: catalog,
-    } = open_served_store(config, MemoryReserves::standard()).await?;
+        ..
+    } = open_served_store(config).await?;
     let kernels = inventory.derived_cache().kernel_directory();
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);

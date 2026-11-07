@@ -50,7 +50,7 @@ fn prepare_every_entry(
         .find(|path| path.exists())
         .unwrap_or_else(|| panic!("none of {candidates:?} exists under {home}"));
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    let reserves = MemoryReserves::standard();
+    let reserves = MemoryReserves::of_machine(None);
     let selected = platform::select_device(
         &catalog,
         ExecutionPath::Native,

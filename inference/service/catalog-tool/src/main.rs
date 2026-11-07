@@ -349,10 +349,9 @@ async fn open_catalog_models(
     let mut config = InventoryConfig::with_roots(model_store, cache_root)
         .context("invalid catalog-build inventory configuration")?;
     config.add_hugging_face_caches(hf_caches);
-    let space = Arc::new(magnitude_executor::platform::volume_space(
-        config.root.clone(),
-        magnitude_executor::platform::MemoryReserves::standard(),
-    ));
+    let kernels = magnitude_service_models::ModelCache::new(&config.cache_root).kernel_directory();
+    let volumes = Arc::new(magnitude_executor::platform::VolumeReserves::new(Some(kernels)));
+    let space = Arc::new(volumes.space(config.root.clone()));
     Ok(Arc::new(ManagedModelStore::open(config, space).await?))
 }
 

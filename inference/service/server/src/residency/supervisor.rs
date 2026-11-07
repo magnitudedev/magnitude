@@ -23,7 +23,7 @@ use magnitude_engine::error::{RequestError, UnloadCause};
 use magnitude_engine::worker::EngineClient;
 use magnitude_engine::worker::protocol::MemoryObservation;
 use magnitude_executor::platform::{
-    DomainThresholds, Fit, HostDistress, HostEmergency, HostRoom, MemoryReserves, Recovery,
+    DomainThresholds, Fit, HostDistress, HostEmergency, StoreMotion, HostRoom, MemoryReserves, MotionMeter, Recovery,
 };
 use magnitude_service_contracts::models::{ModelInstanceId, ModelReleaseReason};
 use seismic::Devices;
@@ -56,18 +56,29 @@ pub struct HostMemorySample {
 
 pub trait HostMemoryObserver: Send + Sync + 'static {
     fn sample(&self) -> Result<HostMemorySample, String>;
+    /// Fold in a resident load's reading of host RAM at `at`: `available` bytes beside the
+    /// `charged` bytes its Seismic charge holds, both read by the worker in one observation
+    /// ([`load_reading`]), so the load's own imports are never taken for another program's.
+    fn observed_load(&self, at: std::time::Instant, available: u64, charged: u64);
+    /// How the rest of the host moves memory, as the observer measured it from the loads'
+    /// readings: what a load's reserves hold their margin at (`MemoryReserves::measured`).
+    fn motion(&self) -> StoreMotion;
 }
 
 /// System RAM observed through the service's own device catalog.
 pub struct SeismicHostMemory {
     catalog: Arc<Devices>,
     reserves: MemoryReserves,
+    /// Every resident load's reading of host RAM beside its charge: the host's motion, which the
+    /// next load starts from.
+    meter: std::sync::Mutex<MotionMeter>,
 }
 
 impl SeismicHostMemory {
-    /// Host RAM of `catalog`'s inventory, read through fit with `reserves`.
+    /// Host RAM of `catalog`'s inventory, read through fit with `reserves`, its motion measured
+    /// from the reserves' own (the machine's figure, `MemoryReserves::of_machine`).
     pub fn new(catalog: Arc<Devices>, reserves: MemoryReserves) -> Self {
-        Self { catalog, reserves }
+        Self { catalog, reserves, meter: std::sync::Mutex::new(MotionMeter::new(reserves.host_motion())) }
     }
 }
 
@@ -88,6 +99,14 @@ impl HostMemoryObserver for SeismicHostMemory {
             distress: host.distress,
             emergency: Fit::host_emergency(&topology, &reading, &self.reserves),
         })
+    }
+
+    fn observed_load(&self, at: std::time::Instant, available: u64, charged: u64) {
+        self.meter.lock().expect("motion meter lock poisoned").read(at, available, Some(charged));
+    }
+
+    fn motion(&self) -> StoreMotion {
+        self.meter.lock().expect("motion meter lock poisoned").motion()
     }
 }
 
@@ -410,6 +429,9 @@ impl Inner {
                 // A closed engine is the worker check's to report.
                 Err(_) => return,
             };
+            if let Some((available, charged)) = load_reading(&observation) {
+                self.observer.observed_load(std::time::Instant::now(), available, charged);
+            }
             let allocation = match instance_allocation(context_window_tokens, &observation.census) {
                 Ok(allocation) => allocation,
                 // A census outside the contract's bounds is the engine's failure.
@@ -434,6 +456,24 @@ impl Inner {
             }
         }
     }
+}
+
+/// A worker's reading of host RAM in one observation: its available bytes and what the load's
+/// census counts charged there, every class; none where the observation read no host RAM.
+fn load_reading(observation: &MemoryObservation) -> Option<(u64, u64)> {
+    let available = observation
+        .stores
+        .iter()
+        .find(|store| store.store == seismic::StoreIdentity::HostRam)?
+        .headroom_bytes;
+    let charged = observation
+        .census
+        .stores
+        .iter()
+        .filter(|store| store.store == seismic::StoreIdentity::HostRam)
+        .map(|store| store.model_bytes + store.context_bytes + store.compute_bytes + store.auxiliary_bytes)
+        .sum();
+    Some((available, charged))
 }
 
 /// The residency failure code of an engine that stopped serving.
@@ -468,6 +508,48 @@ mod tests {
                 }),
             }
         }
+
+        fn observed_load(&self, _at: std::time::Instant, _available: u64, _charged: u64) {}
+
+        fn motion(&self) -> StoreMotion {
+            StoreMotion::new(0, 1e9)
+        }
+    }
+
+    /// The meter reads a load's import from the one observation that holds both its fall in
+    /// host RAM and its charge: an import between two censuses moves both together at the next,
+    /// and no host sample between them reaches the meter, so it measures no take.
+    #[test]
+    fn a_loads_import_between_censuses_measures_no_take() {
+        const GB: u64 = 1_000_000_000;
+        let observation = |available: u64, charged: u64| MemoryObservation {
+            census: magnitude_engine::census::AllocationCensus {
+                stores: vec![magnitude_executor::StoreAllocation {
+                    store: seismic::StoreIdentity::HostRam,
+                    model_bytes: charged,
+                    context_bytes: 0,
+                    compute_bytes: 0,
+                    auxiliary_bytes: 0,
+                }],
+                serving: magnitude_engine::census::ServingCensus {
+                    group_places: std::num::NonZeroUsize::MIN,
+                    group_capacity: std::num::NonZeroUsize::MIN,
+                    experts: None,
+                },
+            },
+            stores: vec![magnitude_engine::worker::protocol::StoreHeadroom {
+                store: seismic::StoreIdentity::HostRam,
+                headroom_bytes: available,
+            }],
+        };
+        let prior = StoreMotion::new(0, GB as f64);
+        let mut meter = MotionMeter::new(prior);
+        let start = std::time::Instant::now();
+        for (second, (available, charged)) in [(20 * GB, 0), (15 * GB, 5 * GB), (12 * GB, 8 * GB)].into_iter().enumerate() {
+            let (available, charged) = load_reading(&observation(available, charged)).expect("host RAM read");
+            meter.read(start + CENSUS_INTERVAL * second as u32, available, Some(charged));
+        }
+        assert_eq!(meter.motion(), prior);
     }
 
     #[derive(Default)]

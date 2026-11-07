@@ -116,7 +116,7 @@ fn a_repeated_assessment_keeps_nothing() {
     let directory = tempfile::tempdir().unwrap();
     let packages = packages(directory.path());
     let setup =
-        recorded::m4_pro_setup(MemoryReserves::standard(), ModelPolicy::default(), standard_service_limits());
+        recorded::m4_pro_setup(MemoryReserves::of_machine(None), ModelPolicy::default(), standard_service_limits());
     let mut passes = Vec::new();
     for pass in 0..2 {
         let started = std::time::Instant::now();

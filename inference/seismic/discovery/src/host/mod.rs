@@ -177,6 +177,7 @@ impl HostSampler {
             limit_visibility: sample.limit_visibility,
             displacement,
             kernel_pressure: sample.kernel_pressure,
+            free_target: sample.free_target,
             held: sample.held,
             displaced_bytes: sample.displaced_bytes,
         })
@@ -243,6 +244,7 @@ pub(crate) struct HostSample {
     pub(crate) limits: Vec<ProcessMemoryLimit>,
     pub(crate) limit_visibility: LimitVisibility,
     pub(crate) kernel_pressure: Option<KernelPressure>,
+    pub(crate) free_target: Option<u64>,
     pub(crate) held: Option<HostHeld>,
     pub(crate) displaced_bytes: Option<u64>,
 }
@@ -283,6 +285,13 @@ pub struct HostStatus {
     /// The kernel's own pressure classification. `None` on a platform
     /// without one.
     pub kernel_pressure: Option<KernelPressure>,
+    /// The free memory the kernel keeps for itself and reclaims toward,
+    /// which `allocatable` still counts: below it, taking memory makes the
+    /// kernel reclaim, and where nothing cheap is left to reclaim, compress
+    /// or swap another program's data. The line a load's reserve starts
+    /// from. `Some(0)` where `allocatable` already leaves it out; `None` on
+    /// a platform that reports no such line.
+    pub free_target: Option<u64>,
     /// What the OS holds that neither `allocatable` nor `obtainable`
     /// counts ([`HostHeld`]). `None` on a platform that counts none.
     pub held: Option<HostHeld>,

@@ -8,13 +8,15 @@
 mod policy;
 mod qualification;
 mod selection;
+mod volume;
 
 pub(crate) use policy::refresh_device_ceiling;
 pub use policy::{
     DemandFit, DisplacementBaseline, DomainReading, DomainRole, DomainThresholds, Fit, FitMode, FitRefusal, HostDistress, HostEmergency,
-    HostRoom, LoadStage, MemoryBand, MemoryConstraint, MemoryPolicyError, MemoryReserves, PlacementFit, RECOVERY_STABLE_TIME,
-    Recovery, Serving, StorageDemand, StoreFit, observe_domains,
+    StoreMotion, HostRoom, ReleaseRate, Releasable, Releasing, LoadStage, MemoryBand, MemoryConstraint, MemoryPolicyError, MemoryReserves, MotionMeter, PlacementFit,
+    READING_INTERVAL, RECOVERY_STABLE_TIME, Recovery, Serving, StorageDemand, StoreFit, observe_domains,
 };
+pub use volume::{VolumeReserve, VolumeReserves};
 pub use qualification::{
     FitReading, GraphPricing, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice, graph_pricing, host_tier, open_selected, select_device, select_recorded,
     selected,
@@ -23,20 +25,6 @@ pub use selection::{
     AUTOMATIC_BACKEND_ORDER, DeviceRequest, DeviceRequestParseError, SelectionError, select,
     unusable_reason,
 };
-
-/// The space a download may take on the volume holding `path`: each call
-/// reads what the OS lets this process still write there, and takes fit's
-/// volume ceiling of it ([`MemoryReserves::volume_thresholds`], the
-/// thresholds [`Fit::store`] holds every volume to).
-pub fn volume_space(
-    path: std::path::PathBuf,
-    reserves: MemoryReserves,
-) -> impl Fn() -> Result<u64, seismic::ObservationError> + Send + Sync + 'static {
-    move || {
-        let available = seismic::volume_available(&path)?.value;
-        Ok(reserves.volume_thresholds().ceiling(available))
-    }
-}
 
 /// Relaxes the macOS GPU watchdog for this process. M1 and M2 GPUs cannot
 /// preempt a long prefill attention launch, so while the window server waits

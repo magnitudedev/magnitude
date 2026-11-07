@@ -1356,7 +1356,7 @@ mod tests {
             &catalog,
             magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
             None,
-            magnitude_executor::platform::MemoryReserves::standard(),
+            magnitude_executor::platform::MemoryReserves::of_machine(None),
             environment::serving_policy(),
             magnitude_engine::options::standard_service_limits(),
         )

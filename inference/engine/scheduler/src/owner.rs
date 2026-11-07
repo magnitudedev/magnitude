@@ -639,11 +639,13 @@ pub struct Ran {
 /// observations may fail continuously, before the model unloads.
 const MEMORY_ESCALATION_NS: u64 = 1_000_000_000;
 
-/// How often the owner observes memory without another reason to run.
-const OBSERVATION_INTERVAL_NS: u64 = 100_000_000;
+/// How often the owner observes memory without another reason to run: the
+/// interval a load's reserves hold the host's motion over
+/// ([`magnitude_executor::platform::READING_INTERVAL`]).
+const OBSERVATION_INTERVAL: std::time::Duration = magnitude_executor::platform::READING_INTERVAL;
 
-/// [`OBSERVATION_INTERVAL_NS`], as the domain's memory probes take it.
-const OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(OBSERVATION_INTERVAL_NS);
+/// [`OBSERVATION_INTERVAL`] in nanoseconds.
+const OBSERVATION_INTERVAL_NS: u64 = OBSERVATION_INTERVAL.as_nanos() as u64;
 
 /// One probe of every domain the loaded model uses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

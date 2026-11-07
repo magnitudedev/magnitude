@@ -63,7 +63,7 @@ fn plain_owner(
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -181,7 +181,7 @@ impl Drop for AddressSpaceLimit {
 fn press_to_reclaim(host: &Host) -> AddressSpaceLimit {
     use magnitude_executor::platform::{self, MemoryBand};
     let catalog = seismic::Devices::discover(&[]).unwrap();
-    let reserves = MemoryReserves::standard();
+    let reserves = MemoryReserves::of_machine(None);
     let band = || {
         host.owner()
             .inspect_domain(|domain| {
@@ -381,7 +381,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -508,7 +508,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -597,7 +597,7 @@ fn admission_reclaims_under_a_real_process_limit() {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -605,7 +605,7 @@ fn admission_reclaims_under_a_real_process_limit() {
     let package = resolved.host.shared_package();
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let catalog = Devices::discover(&[]).unwrap();
-    let reserves = MemoryReserves::standard();
+    let reserves = MemoryReserves::of_machine(None);
     let allocation = |device: &seismic::Device| -> Result<DomainReading, String> {
         let readings = platform::observe_domains(&catalog, device, &reserves, platform::HostRoom::Allocatable)
             .map_err(|error| error.to_string())?;
@@ -845,7 +845,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap();
@@ -853,7 +853,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
     let package = resolved.host.shared_package();
     let (domain, bindings, _) = build_native_domain(&resolved.manifest, package).unwrap();
     let catalog = Devices::discover(&[]).unwrap();
-    let reserves = MemoryReserves::standard();
+    let reserves = MemoryReserves::of_machine(None);
     let planning = platform::observe_domains(&catalog, domain.resources().device(), &reserves, platform::HostRoom::Allocatable)
         .unwrap()[0]
         .thresholds
@@ -1112,7 +1112,7 @@ fn reclaim_releases_retained_sessions_and_replays_them() {
     assert_eq!(before.unattributed, 0);
 
     let catalog = Devices::discover(&[]).unwrap();
-    let reserves = MemoryReserves::standard();
+    let reserves = MemoryReserves::of_machine(None);
     let band = |host: &Host| {
         host.owner()
             .inspect_domain(|domain| {

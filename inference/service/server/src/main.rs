@@ -164,7 +164,6 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .context("invalid ICN installation")?;
             let release_catalog = Arc::new(open_installation_catalog(&installation)?);
             let worker_launcher = WorkerLauncher::current()?;
-            let reserves = MemoryReserves::standard();
             let inventory_root = match model_store {
                 Some(root) => root,
                 None => InventoryConfig::default_root()
@@ -186,9 +185,12 @@ async fn run(command: Command) -> anyhow::Result<()> {
             let ServedStore {
                 store: inventory,
                 devices: catalog,
-            } = open_served_store(inventory_config, reserves).await?;
+                volumes,
+            } = open_served_store(inventory_config).await?;
             let kernels = inventory.derived_cache().kernel_directory();
             let storage = inventory.root().to_owned();
+            // The machine's motion, its page-fill rate kept with its figures in the kernel cache.
+            let reserves = MemoryReserves::of_machine(Some((kernels.as_path(), &*catalog.topology())));
             // The serving device is decided once over the discovered topology. Every model is
             // assessed on it, from that topology and a status sample, under what the
             // measurement job has stored of this machine; every load and the hardware report
@@ -320,6 +322,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 .with_hardware(Arc::new(HardwareInventory::new(
                     Arc::clone(catalog.inventory()),
                     reserves,
+                    volumes,
                     serving,
                     Arc::new(instances.clone()),
                 )))

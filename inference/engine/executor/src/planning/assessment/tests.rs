@@ -1978,6 +1978,7 @@ fn unopened(topology: &DeviceTopology, by: seismic::ReportedBy) -> Status {
                 limit_visibility: seismic::LimitVisibility::Complete,
                 displacement: None,
                 kernel_pressure: None,
+                free_target: None,
                 held: None,
                 displaced_bytes: None,
             }),
@@ -2027,7 +2028,7 @@ fn domain(fit: &AssessmentFit, store: StoreId) -> DomainFit {
 /// host tables and sealed graph plans to host RAM.
 #[test]
 fn fit_is_decided_per_domain_against_capacity_less_reserve() {
-    let reserves = crate::platform::MemoryReserves::standard();
+    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let m4_pro = recorded::m4_pro();
     let status = unopened(&m4_pro, seismic::ReportedBy::MachMovablePages);
     let cpu = executor(&m4_pro, BackendName::Cpu);
@@ -2135,7 +2136,7 @@ fn fit_is_decided_per_domain_against_capacity_less_reserve() {
 /// staged upload, and the device's own memory holds none of them.
 #[test]
 fn worker_host_bytes_are_charged_to_host_ram() {
-    let reserves = crate::platform::MemoryReserves::standard();
+    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let mut worker = AssessmentMemoryCharge {
         host_table_bytes: 50,
         ..fixture_charge(800, 300)
@@ -2275,7 +2276,7 @@ fn worker_host_bytes_price_the_plans_vocabulary_and_kernels() {
 /// the allocation in its own memory.
 #[test]
 fn staging_is_charged_to_host_ram_once() {
-    let reserves = crate::platform::MemoryReserves::standard();
+    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let (allocation, staged, tables) = (8 * GIB, 2 * GIB, 30);
     let assess = |topology: &DeviceTopology, executor: &Executor, status: &Status, staging| {
         AssessmentMemoryCharge {
@@ -2329,7 +2330,7 @@ fn staging_is_charged_to_host_ram_once() {
 /// working set's room.
 #[test]
 fn host_demand_sits_beside_the_metal_working_set() {
-    let reserves = crate::platform::MemoryReserves::standard();
+    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let m4_pro = recorded::m4_pro();
     let status = unopened(&m4_pro, seismic::ReportedBy::MachMovablePages);
     let metal = executor(&m4_pro, BackendName::Metal);
@@ -2375,7 +2376,7 @@ fn host_demand_sits_beside_the_metal_working_set() {
 /// memory (ReBAR), where the same load fits.
 #[test]
 fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
-    let reserves = crate::platform::MemoryReserves::standard();
+    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let topology = recorded::rtx3090();
     let status = unopened(&topology, seismic::ReportedBy::LinuxMemAvailable);
     let (gpu, host_ram) = (device_memory(&topology), topology.host_ram().id());
@@ -2429,7 +2430,7 @@ fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
 fn reserved_host_weights_stay_in_host_ram_beside_rebar_upload() {
     let topology = recorded::rtx3090();
     let status = unopened(&topology, seismic::ReportedBy::LinuxMemAvailable);
-    let reserves = crate::platform::MemoryReserves::standard();
+    let reserves = crate::platform::MemoryReserves::of_machine(None);
     let vulkan = executor(&topology, BackendName::Vulkan);
     let charge = AssessmentMemoryCharge {
         weight_demand: ClaimDemand { upload: GIB, host: 2 * GIB, reserved: GIB,

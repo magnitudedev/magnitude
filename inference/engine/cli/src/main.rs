@@ -342,6 +342,12 @@ fn run() -> Result<(), String> {
     log_to_stderr()?;
     let mut service = standard_service_limits();
     service.prefill_tokens = options.prefill_tokens;
+    // The machine's figures live in the kernel cache, keyed by its host.
+    let topology = match &options.kernel_cache {
+        Some(_) => Some(seismic::Devices::discover(&[]).map_err(|error| error.to_string())?.topology()),
+        None => None,
+    };
+    let reserves = MemoryReserves::of_machine(options.kernel_cache.as_deref().zip(topology.as_deref()));
     let mut resolved = EngineConfiguration {
         package: PackageOptions {
             target: options.target,
@@ -363,7 +369,7 @@ fn run() -> Result<(), String> {
         path: ExecutionPath::Native,
         device: options.device,
         kernel_cache: options.kernel_cache,
-        reserves: MemoryReserves::standard(),
+        reserves,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

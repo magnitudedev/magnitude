@@ -43,7 +43,7 @@ pub struct EngineConfiguration {
     /// nothing: no tuning record reaches a load, which forms every entry
     /// at its canonical default.
     pub kernel_cache: Option<PathBuf>,
-    /// The host's threshold policy (`MemoryReserves::standard()` for the
+    /// The host's threshold policy (`MemoryReserves::of_machine(None)` for the
     /// service and CLI). The engine never defaults it.
     pub reserves: MemoryReserves,
 }

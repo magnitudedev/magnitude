@@ -85,7 +85,7 @@ fn resolved() -> ResolvedEngineConfiguration {
         path: ExecutionPath::Native,
         device: DeviceRequest::Automatic,
         kernel_cache: std::env::var_os("MAGNITUDE_TEST_KERNEL_CACHE").map(PathBuf::from),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap()
@@ -370,7 +370,7 @@ fn header_only_assessment_charges_what_a_load_commits() {
         &catalog,
         DeviceRequest::Automatic,
         None,
-        MemoryReserves::standard(),
+        MemoryReserves::of_machine(None),
         policy(),
         standard_service_limits(),
     )

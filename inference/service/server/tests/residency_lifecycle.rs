@@ -72,6 +72,14 @@ impl HostMemoryObserver for ScriptedHostMemory {
             },
         })
     }
+
+    fn observed_load(&self, at: std::time::Instant, available: u64, charged: u64) {
+        self.seismic.observed_load(at, available, charged);
+    }
+
+    fn motion(&self) -> magnitude_executor::platform::StoreMotion {
+        self.seismic.motion()
+    }
 }
 
 fn flag(arguments: &[String], name: &str) -> String {
@@ -115,11 +123,12 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     config.add_hugging_face_caches([PathBuf::from(flag(&arguments, "--hf-cache"))]);
     config.catalog_models = release.catalog().models.clone();
     config.architectures = magnitude_service_server::assessment::candidates::engine_architectures();
-    let reserves = MemoryReserves::standard();
+    let reserves = MemoryReserves::of_machine(None);
     let ServedStore {
         store: inventory,
         devices: catalog,
-    } = open_served_store(config, reserves).await?;
+        volumes,
+    } = open_served_store(config).await?;
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
     let downloads = Arc::new(ManagedModelDownloads::open(inventory.clone()).await?);
     let host_memory = Arc::new(ScriptedHostMemory {
@@ -289,6 +298,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
     let hardware = HardwareInventory::new(
         catalog.inventory().clone(),
         reserves,
+        volumes,
         serving,
         Arc::new(main.instances.clone()),
     );

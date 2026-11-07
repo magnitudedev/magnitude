@@ -375,7 +375,7 @@ mod tests {
         let resolved = engine_configuration(
             material(ModelMethod::DSpark),
             kernels.clone(),
-            MemoryReserves::standard(),
+            MemoryReserves::of_machine(None),
             serving,
             LoadBounds::default(),
         )
@@ -397,7 +397,7 @@ mod tests {
             let Err(error) = engine_configuration(
                 material(method),
                 kernels.clone(),
-                MemoryReserves::standard(),
+                MemoryReserves::of_machine(None),
                 serving,
                 LoadBounds::default(),
             )
@@ -425,7 +425,7 @@ mod tests {
                 method: ModelMethod::Plain,
             },
             std::env::temp_dir(),
-            MemoryReserves::standard(),
+            MemoryReserves::of_machine(None),
             serving,
             LoadBounds::default(),
         );

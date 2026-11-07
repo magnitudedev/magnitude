@@ -308,7 +308,7 @@ fn run() -> Result<bool, String> {
         &catalog,
         options.device,
         Some(options.kernels.as_path()),
-        MemoryReserves::standard(),
+        MemoryReserves::of_machine(Some((options.kernels.as_path(), &*catalog.topology()))),
         ModelPolicy::default(),
         standard_service_limits(),
     )

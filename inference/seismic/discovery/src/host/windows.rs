@@ -362,6 +362,8 @@ pub(super) fn sample() -> Result<HostSample, ObservationError> {
         limits: job_limits()?,
         limit_visibility: LimitVisibility::Complete,
         kernel_pressure: None,
+        // Windows reports no free target of its memory manager.
+        free_target: None,
         held: None,
         displaced_bytes: None,
     })

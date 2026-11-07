@@ -62,6 +62,7 @@ fn recorded_setup(
                 limit_visibility: seismic::LimitVisibility::Complete,
                 displacement: None,
                 kernel_pressure: None,
+                free_target: None,
                 held: None,
                 displaced_bytes: None,
             }),

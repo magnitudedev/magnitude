@@ -218,13 +218,13 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
         ),
     };
     let displacing = serving.and_then(|serving| serving.baseline).is_some_and(|baseline| displacing(host, &baseline));
-    let thresholds = reserves.for_domain(store.kind(), capacity_bytes);
+    let thresholds = reserves.host_thresholds(store.kind(), host);
     let fit = match serving.and_then(|serving| serving.lent) {
         // Allocatable counts as free the RAM the OS made by displacing other
         // programs' data since, which is free only while that data stays out.
         None => store_fit(
             store,
-            reserves,
+            thresholds,
             capacity_bytes,
             host.allocatable_bytes().saturating_sub(displaced),
             host_distress(host),
@@ -239,7 +239,7 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
         // the OS can obtain, and displacement now is the hold.
         Some(lent) => store_fit(
             store,
-            reserves,
+            thresholds,
             capacity_bytes,
             host.obtainable_bytes().min(thresholds.planning_bytes.saturating_add(lent)),
             host_distress(host),
@@ -258,19 +258,17 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
 /// free headroom, and its host's distress: each less its planning reserve,
 /// in the Reclaim band at or below the reserve, while the host is in
 /// distress, or where `displacing` (a hold on room borrowed beyond the
-/// hold line, [`Serving::lent`]). The reserves are fractions of the capacity within limits, not
-/// of the whole store: a container limited to a few GiB of a large host
-/// keeps a reserve of those.
+/// hold line, [`Serving::lent`]), its thresholds `thresholds`
+/// ([`MemoryReserves::thresholds`]).
 fn store_fit(
     store: &Store,
-    reserves: &MemoryReserves,
+    thresholds: DomainThresholds,
     capacity_bytes: u64,
     headroom_bytes: u64,
     distress: Option<HostDistress>,
     displacing: bool,
     constraint: MemoryConstraint,
 ) -> StoreFit {
-    let thresholds = reserves.for_domain(store.kind(), capacity_bytes);
     StoreFit {
         store: store.id(),
         capacity_bytes,
@@ -290,40 +288,361 @@ fn store_fit(
     }
 }
 
-const GIB: u64 = 1024 * 1024 * 1024;
-const MIB: u64 = 1024 * 1024;
+/// The interval a load reads memory at: the engine's probe, and what the
+/// rest of the host may take between two readings, before a release can be
+/// decided.
+pub const READING_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The threshold policy, keyed by store kind: how much of each memory
-/// domain a loaded model may not use, and how much of each volume a
-/// download may not use. The host (service or CLI) chooses it and passes it
-/// to the engine; the engine never defaults it. `standard` is the only place
-/// the values live.
+/// The bytes of fresh memory the page-fill probe takes ([`StoreMotion::of_machine`]).
+const PAGE_FILL_PROBE_BYTES: usize = 256 << 20;
+
+/// How other programs move a store's available bytes, as measured: the
+/// steady fluctuation (the largest fall between consecutive readings with
+/// nothing of ours written or asked) and the fastest rate another program
+/// takes it at. Its margin ([`Self::margin`]) is what a planning line keeps
+/// above the store's own line: a load's on host RAM or device memory, a
+/// download's on a volume ([`super::VolumeReserve`]).
+///
+/// The take rate is a measured, positive rate: before any program was seen
+/// taking the store, the fastest one program can take it at, measured of
+/// the machine (host RAM's page-fill rate, [`Self::of_machine`]; a volume's
+/// sequential write rate, [`super::VolumeReserve`]). So no margin is zero.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "MotionFigures")]
+pub struct StoreMotion {
+    fluctuation: u64,
+    take_rate: f64,
+}
+
+/// A take rate is finite by construction ([`StoreMotion::new`]).
+impl Eq for StoreMotion {}
+
+/// [`StoreMotion`]'s figures as serialized, checked as [`StoreMotion::new`]
+/// checks them.
+#[derive(serde::Deserialize)]
+struct MotionFigures {
+    fluctuation: u64,
+    take_rate: f64,
+}
+
+impl TryFrom<MotionFigures> for StoreMotion {
+    type Error = String;
+
+    fn try_from(figures: MotionFigures) -> Result<Self, String> {
+        match figures.take_rate.is_finite() && figures.take_rate > 0.0 {
+            true => Ok(Self { fluctuation: figures.fluctuation, take_rate: figures.take_rate }),
+            false => Err(format!("a take rate is measured and positive, not {}", figures.take_rate)),
+        }
+    }
+}
+
+impl StoreMotion {
+    /// # Panics
+    /// Where `take_rate` (bytes a second) is not a positive finite rate:
+    /// what bounds a take is measured, never zero.
+    pub fn new(fluctuation: u64, take_rate: f64) -> Self {
+        assert!(take_rate.is_finite() && take_rate > 0.0, "a take rate is measured and positive, not {take_rate}");
+        Self { fluctuation, take_rate }
+    }
+
+    /// The machine's own motion before any reading of it: no measured
+    /// fluctuation, and the rate the machine fills fresh pages at (a byte
+    /// written to every page of [`PAGE_FILL_PROBE_BYTES`] of new memory,
+    /// timed, then freed). No program on one thread takes memory from the OS
+    /// faster than the machine fills its pages, so a load whose line holds
+    /// that rate over a release's latency is not crossed by one program's
+    /// ask before the release lands.
+    ///
+    /// A generic figure of the machine, measured once: where `machine`
+    /// names a kernel cache and the topology of the machine it serves, the
+    /// rate that cache keeps for the host's identity
+    /// (`KernelCache::machine_figures`, keyed by
+    /// `PhysicalIdentity::Host`), measured and stored there when it keeps
+    /// none; elsewhere, measured once per process.
+    pub fn of_machine(machine: Option<(&std::path::Path, &DeviceTopology)>) -> Self {
+        Self::new(0, page_rate(machine, "page-fill", |probe| probe.fill))
+    }
+
+    /// The margin a planning line holds above its store's own line, for a
+    /// load that notices a take within a reading `interval` and whose
+    /// first release lands `latency` after it decides one, then releases
+    /// `releasing`'s bytes at its rate (none of a store nothing of ours
+    /// releases in, a volume's):
+    ///
+    /// `fluctuation + t·(interval + latency) + max(0, t − r)·B / r`
+    ///
+    /// for the take rate `t`, release rate `r` and releasable bytes `B`:
+    /// the rest of the host takes `t·(interval + latency)` before the first
+    /// release lands, and while it takes faster than the load releases, the
+    /// deficit grows at `t − r` for the `B / r` releasing runs.
+    pub fn margin(&self, interval: Duration, latency: Duration, releasing: Option<Releasing>) -> u64 {
+        let shortfall = releasing.map_or(0, |releasing| (self.shortfall_ratio(releasing.rate) * releasing.bytes as f64) as u64);
+        self.lead(interval, latency).saturating_add(shortfall)
+    }
+
+    /// The fluctuation and what the host takes before a first release
+    /// lands: `fluctuation + t·(interval + latency)`.
+    fn lead(&self, interval: Duration, latency: Duration) -> u64 {
+        self.fluctuation.saturating_add((self.take_rate * (interval + latency).as_secs_f64()) as u64)
+    }
+
+    /// `g = max(0, t − r) / r`: what the deficit grows by per byte released.
+    fn shortfall_ratio(&self, release: ReleaseRate) -> f64 {
+        (self.take_rate - release.0).max(0.0) / release.0
+    }
+
+    pub fn fluctuation(&self) -> u64 {
+        self.fluctuation
+    }
+
+    pub fn take_rate(&self) -> f64 {
+        self.take_rate
+    }
+
+    /// The larger of each figure: what a later measurement adds to an
+    /// earlier one, which it never lowers.
+    pub fn with(self, other: Self) -> Self {
+        Self::new(self.fluctuation.max(other.fluctuation), self.take_rate.max(other.take_rate))
+    }
+}
+
+/// The rate a load releases memory at, measured and positive: a finished
+/// release's bytes over its span from decision to effect, the slowest
+/// measured; before any, the machine's page-release rate
+/// ([`Self::of_machine`]).
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct ReleaseRate(f64);
+
+/// A release rate is finite by construction ([`ReleaseRate::new`]).
+impl Eq for ReleaseRate {}
+
+impl TryFrom<f64> for ReleaseRate {
+    type Error = String;
+
+    fn try_from(rate: f64) -> Result<Self, String> {
+        match rate.is_finite() && rate > 0.0 {
+            true => Ok(Self(rate)),
+            false => Err(format!("a release rate is measured and positive, not {rate}")),
+        }
+    }
+}
+
+impl From<ReleaseRate> for f64 {
+    fn from(rate: ReleaseRate) -> f64 {
+        rate.0
+    }
+}
+
+impl ReleaseRate {
+    /// # Panics
+    /// Where `bytes_per_second` is not a positive finite rate.
+    pub fn new(bytes_per_second: f64) -> Self {
+        Self::try_from(bytes_per_second).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    /// The rate the machine returns fresh pages to the OS at (the
+    /// page-fill probe's memory freed, timed), the fastest any release
+    /// returns memory: a generic figure of the machine, kept and measured
+    /// as [`StoreMotion::of_machine`]'s page-fill rate is.
+    pub fn of_machine(machine: Option<(&std::path::Path, &DeviceTopology)>) -> Self {
+        Self::new(page_rate(machine, "page-release", |probe| probe.release))
+    }
+
+    /// The slower of two rates: what a later measurement adds, which never
+    /// makes a margin smaller.
+    pub fn with(self, other: Self) -> Self {
+        Self(self.0.min(other.0))
+    }
+
+    pub fn bytes_per_second(&self) -> f64 {
+        self.0
+    }
+}
+
+/// What a load releases in a store: `bytes`, at `rate`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Releasing {
+    pub rate: ReleaseRate,
+    pub bytes: u64,
+}
+
+/// The bytes a serving load can release in host RAM and in its device's own
+/// memory: its bank's beyond the bank's floor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Releasable {
+    pub host: u64,
+    pub device: u64,
+}
+
+/// A rate the machine's figures keep: host RAM's page-fill and page-release
+/// rates, a volume's sequential write rate.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MachineRate {
+    bytes_per_second: f64,
+}
+
+impl seismic::measure::Stored for MachineRate {
+    const SCHEMA: &'static str = "machine-rate-v1";
+}
+
+/// The most bytes a stored [`MachineRate`] is read as.
+const MACHINE_RATE_RECORD_BYTES: u64 = 4096;
+
+/// A generic figure of the machine, measured once: where `figure` names a
+/// kernel cache and the figure's key there, the rate its machine figures
+/// (`KernelCache::machine_figures`) keep under that key, `measure`d and
+/// stored there when they keep none; elsewhere, `measure`d.
+pub(super) fn machine_rate<E>(
+    figure: Option<(&std::path::Path, String)>,
+    measure: impl FnOnce() -> Result<f64, E>,
+) -> Result<f64, E> {
+    let Some((cache, key)) = figure else { return measure() };
+    let figures = crate::kernel_cache::KernelCache::machine_figures(cache);
+    match figures.load::<MachineRate>(&key, MACHINE_RATE_RECORD_BYTES) {
+        Ok(Some(MachineRate { bytes_per_second })) if bytes_per_second.is_finite() && bytes_per_second > 0.0 => {
+            return Ok(bytes_per_second);
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!("machine figures: the {key} rate stored is unreadable: {error}"),
+    }
+    let bytes_per_second = measure()?;
+    if let Err(error) = figures.store(&key, &MachineRate { bytes_per_second }, MACHINE_RATE_RECORD_BYTES) {
+        tracing::warn!("machine figures: the {key} rate could not be stored: {error}");
+    }
+    Ok(bytes_per_second)
+}
+
+/// The host's identity in `topology` (`PhysicalIdentity::Host`): its CPU
+/// as the OS reports it and its RAM, what a machine's figures are keyed by.
+fn host_identity(topology: &DeviceTopology) -> Option<String> {
+    topology.physical_devices().iter().find_map(|device| match device.identity() {
+        seismic::PhysicalIdentity::Host { machine } => Some(machine.clone()),
+        _ => None,
+    })
+}
+
+/// The machine's page probe: the rates it fills fresh pages at and returns
+/// them to the OS at, in bytes a second.
+#[derive(Clone, Copy)]
+struct PageProbe {
+    fill: f64,
+    release: f64,
+}
+
+/// The page probe's `figure` of the machine (`page-fill`, `page-release`),
+/// kept under `{figure}:{host}` ([`machine_rate`]); the probe runs at most
+/// once per process.
+fn page_rate(machine: Option<(&std::path::Path, &DeviceTopology)>, figure: &str, rate: fn(PageProbe) -> f64) -> f64 {
+    static PROBED: std::sync::OnceLock<PageProbe> = std::sync::OnceLock::new();
+    let key = machine.and_then(|(cache, topology)| Some((cache, format!("{figure}:{}", host_identity(topology)?))));
+    machine_rate(key, || Ok::<_, std::convert::Infallible>(rate(*PROBED.get_or_init(page_probe)))).unwrap_or_else(|never| match never {})
+}
+
+/// The page probe, run: a byte written to every page of
+/// [`PAGE_FILL_PROBE_BYTES`] of new memory, timed, then the memory freed,
+/// timed.
+fn page_probe() -> PageProbe {
+    let page = 4096;
+    let layout = std::alloc::Layout::from_size_align(PAGE_FILL_PROBE_BYTES, page).expect("the probe's layout");
+    // SAFETY: a non-zero layout; every write lies within it, and it is
+    // freed with the same layout.
+    unsafe {
+        let memory = std::alloc::alloc(layout);
+        assert!(!memory.is_null(), "the page-fill probe could not take {PAGE_FILL_PROBE_BYTES} bytes");
+        let started = Instant::now();
+        for offset in (0..PAGE_FILL_PROBE_BYTES).step_by(page) {
+            std::ptr::write_volatile(memory.add(offset), 1);
+        }
+        let filled = started.elapsed().as_secs_f64();
+        let started = Instant::now();
+        std::alloc::dealloc(memory, layout);
+        let released = started.elapsed().as_secs_f64();
+        let rate = |seconds: f64| PAGE_FILL_PROBE_BYTES as f64 / seconds.max(f64::MIN_POSITIVE);
+        PageProbe { fill: rate(filled), release: rate(released) }
+    }
+}
+
+/// A store's motion as a reader that observes it continuously measures it
+/// (the service's memory guard, a volume's writer): readings folded in as
+/// they come, beside the prior (the machine's page-fill rate, a volume's
+/// write rate), which bounds a take until a faster one is seen.
+///
+/// What other programs took is judged on available bytes plus what the
+/// reading counts as our own outside them (`own`: what this host's loads
+/// hold, what a writer wrote): our import, allocation or write lowers the
+/// one and raises the other by the same bytes, so only another program's
+/// take lowers the sum. A reading
+/// that counts no such holding (`None`) measures nothing, nor is it
+/// measured against.
+#[derive(Clone, Copy, Debug)]
+pub struct MotionMeter {
+    prior: StoreMotion,
+    /// The latest reading's time, and the available memory plus own holding
+    /// it counted, if it counted one.
+    last: Option<(Instant, Option<u64>)>,
+    fluctuation: u64,
+    fastest: f64,
+}
+
+impl MotionMeter {
+    pub fn new(prior: StoreMotion) -> Self {
+        Self { prior, last: None, fluctuation: 0, fastest: 0.0 }
+    }
+
+    /// Fold in a reading at `at` of `available` bytes, beside `own` bytes
+    /// this host's own loads hold outside them, where the reading counts
+    /// them. A fall of the sum within a reading interval is steady
+    /// fluctuation; over a longer span, a take at its rate where it exceeds
+    /// the fluctuation.
+    pub fn read(&mut self, at: Instant, available: u64, own: Option<u64>) {
+        let judged = own.map(|own| available.saturating_add(own));
+        if let (Some((then, Some(was))), Some(now)) = (self.last, judged) {
+            let fall = was.saturating_sub(now);
+            let span = at.duration_since(then);
+            if span <= READING_INTERVAL {
+                self.fluctuation = self.fluctuation.max(fall);
+            } else if fall > self.fluctuation {
+                self.fastest = self.fastest.max(fall as f64 / span.as_secs_f64());
+            }
+        }
+        self.last = Some((at, judged));
+    }
+
+    /// The motion measured so far, never below the prior.
+    pub fn motion(&self) -> StoreMotion {
+        let measured = (self.fastest > 0.0).then(|| StoreMotion::new(self.fluctuation, self.fastest));
+        measured.map_or(StoreMotion { fluctuation: self.fluctuation, ..self.prior }, |measured| self.prior.with(measured))
+    }
+}
+
+/// What each memory domain keeps free beyond what a load holds, derived and
+/// never a fraction of capacity. A store's planning line is its own line
+/// plus a margin; its emergency line is its own line alone:
+/// - host RAM's own line is the kernel's free target
+///   ([`HostStatus::free_target`]): below it, taking memory makes the kernel
+///   reclaim for it, compressing or swapping other programs' data once
+///   nothing cheap is left;
+/// - a device's own memory has none: its driver keeps its own reserve
+///   outside what it grants or reports free;
+/// - host RAM's margin is its motion's ([`StoreMotion::margin`]) over a
+///   reading interval and a release's latency: none before a plan
+///   estimates one, the plan's decode step (a bank shrink installs between
+///   steps), then what the load measured;
+/// - a device's own memory's margin is its motion's once a load measured
+///   it; before that, none: the driver reports what other processes hold of
+///   it at every reading.
+///
+/// A volume's reserve is not these: it belongs to the volume's writer
+/// ([`super::VolumeReserve`]), which reads the volume's motion as it writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryReserves {
-    host: KindReserves,
-    device: KindReserves,
-    /// The bytes every volume keeps free.
-    volume_bytes: u64,
-}
-
-/// The planning and emergency reserves of one kind of memory domain.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct KindReserves {
-    planning: Reserve,
-    emergency: Reserve,
-}
-
-/// `max(capacity / fraction_divisor, floor_bytes)`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct Reserve {
-    fraction_divisor: u64,
-    floor_bytes: u64,
-}
-
-impl Reserve {
-    fn of(&self, capacity_bytes: u64) -> u64 {
-        (capacity_bytes / self.fraction_divisor).max(self.floor_bytes)
-    }
+    host: StoreMotion,
+    device: Option<StoreMotion>,
+    interval: Duration,
+    latency: Duration,
+    release: ReleaseRate,
+    releasable: Releasable,
 }
 
 /// One domain's thresholds. Stable fit and every engine claim keep headroom
@@ -344,74 +663,86 @@ impl DomainThresholds {
 }
 
 impl MemoryReserves {
-    /// Host RAM, unified memory included: planning reserve
-    /// `max(capacity / 10, 2 GiB)` and emergency reserve
-    /// `max(capacity / 20, 1 GiB)`. A dedicated device's own memory, whose
-    /// capacity is already what its driver grants this process: planning
-    /// reserve `max(capacity / 20, 512 MiB)` and emergency reserve
-    /// `max(capacity / 40, 256 MiB)`. A volume: planning reserve 2 GiB.
-    pub fn standard() -> Self {
-        Self {
-            host: KindReserves {
-                planning: Reserve {
-                    fraction_divisor: 10,
-                    floor_bytes: 2 * GIB,
-                },
-                emergency: Reserve {
-                    fraction_divisor: 20,
-                    floor_bytes: GIB,
-                },
-            },
-            device: KindReserves {
-                planning: Reserve {
-                    fraction_divisor: 20,
-                    floor_bytes: 512 * MIB,
-                },
-                emergency: Reserve {
-                    fraction_divisor: 40,
-                    floor_bytes: 256 * MIB,
-                },
-            },
-            volume_bytes: 2 * GIB,
-        }
+    /// The reserves of a host moving as `host` measures, a load releasing
+    /// at `release`: read every [`READING_INTERVAL`], no release latency
+    /// estimated yet, nothing releasable known.
+    pub fn new(host: StoreMotion, release: ReleaseRate) -> Self {
+        Self { host, device: None, interval: READING_INTERVAL, latency: Duration::ZERO, release, releasable: Releasable::default() }
     }
 
-    /// The thresholds of a store of `kind` with `capacity_bytes`. A volume
-    /// has no emergency reserve: no worker grows on one, so none is killed
-    /// for its space.
-    pub fn for_domain(&self, kind: &StoreKind, capacity_bytes: u64) -> DomainThresholds {
-        let reserves = match kind {
-            StoreKind::HostRam => self.host,
-            StoreKind::DeviceMemory(_) => self.device,
-            StoreKind::Volume(_) => return self.volume_thresholds(),
+    /// The reserves of this machine before any reading of its motion or a
+    /// load's release ([`StoreMotion::of_machine`],
+    /// [`ReleaseRate::of_machine`]).
+    pub fn of_machine(machine: Option<(&std::path::Path, &DeviceTopology)>) -> Self {
+        Self::new(StoreMotion::of_machine(machine), ReleaseRate::of_machine(machine))
+    }
+
+    /// These reserves, a release taking `latency`: the plan's estimated
+    /// decode step, or a load's measured release.
+    pub fn with_latency(self, latency: Duration) -> Self {
+        Self { latency, ..self }
+    }
+
+    /// These reserves with what a serving load measured: host RAM's motion
+    /// and a device's own memory's, each never below what was known.
+    pub fn measured(self, host: Option<StoreMotion>, device: Option<StoreMotion>) -> Self {
+        let device = match (self.device, device) {
+            (Some(known), Some(measured)) => Some(known.with(measured)),
+            (known, measured) => known.or(measured),
         };
-        DomainThresholds {
-            planning_bytes: reserves.planning.of(capacity_bytes),
-            emergency_bytes: reserves.emergency.of(capacity_bytes),
-        }
+        Self { host: host.map_or(self.host, |measured| self.host.with(measured)), device, ..self }
     }
 
-    /// Every volume's thresholds: it keeps `volume_bytes` free, which neither
-    /// a download nor any other demand on it may take.
-    pub fn volume_thresholds(&self) -> DomainThresholds {
-        DomainThresholds {
-            planning_bytes: self.volume_bytes,
-            emergency_bytes: 0,
-        }
+    /// These reserves with what a serving load measured of its releases:
+    /// their rate, never above what was known, and the bytes it can
+    /// release now.
+    pub fn releasing(self, release: Option<ReleaseRate>, releasable: Releasable) -> Self {
+        Self { release: release.map_or(self.release, |measured| self.release.with(measured)), releasable, ..self }
     }
 
-    /// Stable identity of the reserves assessments read, the host and device
-    /// memory reserves, for assessment cache keys.
+    /// Host RAM's motion.
+    pub fn host_motion(&self) -> StoreMotion {
+        self.host
+    }
+
+    /// The rate a load releases at.
+    pub fn release_rate(&self) -> ReleaseRate {
+        self.release
+    }
+
+    /// Host RAM's margin over its line ([`StoreMotion::margin`]).
+    pub fn host_margin(&self) -> u64 {
+        self.host.margin(self.interval, self.latency, Some(Releasing { rate: self.release, bytes: self.releasable.host }))
+    }
+
+    /// The thresholds of a store of `kind` whose own line is `line` bytes:
+    /// for host RAM, the kernel's free target ([`HostStatus::free_target`],
+    /// none where the OS reports none); for a device's own memory, none.
+    ///
+    /// # Panics
+    /// For a volume, whose reserve is its writer's
+    /// ([`super::VolumeReserves`]).
+    pub fn thresholds(&self, kind: &StoreKind, line: u64) -> DomainThresholds {
+        let margin = match kind {
+            StoreKind::HostRam => self.host_margin(),
+            StoreKind::DeviceMemory(_) => self.device.map_or(0, |device| {
+                device.margin(self.interval, self.latency, Some(Releasing { rate: self.release, bytes: self.releasable.device }))
+            }),
+            StoreKind::Volume(_) => panic!("a volume's reserve is its writer's (`VolumeReserves`), never a load's"),
+        };
+        DomainThresholds { planning_bytes: line.saturating_add(margin), emergency_bytes: line }
+    }
+
+    /// Host RAM's thresholds as `host` reads its line.
+    pub fn host_thresholds(&self, kind: &StoreKind, host: &HostStatus) -> DomainThresholds {
+        self.thresholds(kind, host.free_target.unwrap_or(0))
+    }
+
+    /// Stable identity of the reserves assessments read, for assessment
+    /// cache keys: the rule, not its measured motion, which moves with the
+    /// host from reading to reading and which a load reads live.
     pub fn identity(&self) -> String {
-        let reserve =
-            |reserve: Reserve| format!("{}:{}", reserve.fraction_divisor, reserve.floor_bytes);
-        format!(
-            "reserves-v2:{}:{}:{}:{}",
-            reserve(self.host.planning),
-            reserve(self.host.emergency),
-            reserve(self.device.planning),
-            reserve(self.device.emergency)
-        )
+        "reserves-v4".to_owned()
     }
 }
 
@@ -797,6 +1128,8 @@ pub struct Fit<'a> {
     status: &'a Status,
     reserves: &'a MemoryReserves,
     room: HostRoom,
+    /// The reserves of the volumes this process writes, where it reads them.
+    volumes: Option<&'a super::VolumeReserves>,
 }
 
 impl<'a> Fit<'a> {
@@ -813,7 +1146,14 @@ impl<'a> Fit<'a> {
             status,
             reserves,
             room,
+            volumes: None,
         }
+    }
+
+    /// This fit, reading volumes against `volumes`' reserves: a volume
+    /// this process does not write keeps nothing free for it.
+    pub fn with_volumes(self, volumes: &'a super::VolumeReserves) -> Self {
+        Self { volumes: Some(volumes), ..self }
     }
 
     /// Store `id`'s fit: its capacity within process limits (host RAM's)
@@ -825,7 +1165,7 @@ impl<'a> Fit<'a> {
             .topology
             .store(id)
             .ok_or(MemoryPolicyError::ForeignIdentifier)?;
-        let constraint = match store.kind() {
+        let (constraint, thresholds) = match store.kind() {
             StoreKind::HostRam => {
                 let host = self
                     .status
@@ -835,8 +1175,15 @@ impl<'a> Fit<'a> {
                     .map_err(|error| MemoryPolicyError::Observation(error.clone()))?;
                 return Ok(host_ram_fit(store, host, self.reserves, self.room));
             }
-            StoreKind::DeviceMemory(_) => MemoryConstraint::DeviceLocal,
-            StoreKind::Volume(_) => MemoryConstraint::Volume,
+            // A device's own memory has no line of its own: the driver keeps
+            // its reserve outside what it reports free.
+            kind @ StoreKind::DeviceMemory(_) => (MemoryConstraint::DeviceLocal, self.reserves.thresholds(kind, 0)),
+            // Nor has a volume (`super::volume`): it keeps the margin its
+            // writes need, and none where this process writes nothing.
+            StoreKind::Volume(volume) => {
+                let margin = self.volumes.and_then(|volumes| volumes.margin(volume)).unwrap_or(0);
+                (MemoryConstraint::Volume, DomainThresholds { planning_bytes: margin, emergency_bytes: 0 })
+            }
         };
         let headroom_bytes = self
             .status
@@ -856,7 +1203,7 @@ impl<'a> Fit<'a> {
             })?;
         Ok(store_fit(
             store,
-            self.reserves,
+            thresholds,
             store.capacity().value,
             headroom_bytes,
             None,
@@ -889,8 +1236,7 @@ impl<'a> Fit<'a> {
             Some(KernelPressure::Critical) => Some(HostEmergency::KernelCritical),
             Some(KernelPressure::Normal | KernelPressure::Warning) => None,
             None => {
-                let store = topology.host_ram();
-                let thresholds = reserves.for_domain(store.kind(), store.capacity().value);
+                let thresholds = reserves.host_thresholds(topology.host_ram().kind(), host);
                 (host.obtainable_bytes() <= thresholds.emergency_bytes)
                     .then_some(HostEmergency::EmergencyReserve)
             }
@@ -1280,6 +1626,9 @@ mod tests {
     };
     use std::time::SystemTime;
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+
     const LINUX: ReportedBy = ReportedBy::LinuxMemAvailable;
     const MACOS: ReportedBy = ReportedBy::MachMovablePages;
 
@@ -1308,9 +1657,22 @@ mod tests {
             limit_visibility: LimitVisibility::Complete,
             displacement: None,
             kernel_pressure: None,
+            free_target: None,
             held: None,
             displaced_bytes: None,
         }
+    }
+
+    /// Reserves whose host motion holds exactly `margin` bytes over a
+    /// reading interval: one byte taken an interval, the rest fluctuation.
+    fn holding(margin: u64) -> MemoryReserves {
+        MemoryReserves::new(StoreMotion::new(margin - 1, 10.0), crate::platform::ReleaseRate::new(1e9))
+    }
+
+    /// The reserves these tests read where no figure depends on them: a
+    /// host whose motion holds 2 GiB.
+    fn reserves() -> MemoryReserves {
+        holding(2 * GIB)
     }
 
     /// Status of an unopened machine: `host` alone, no grant read and no
@@ -1376,9 +1738,7 @@ mod tests {
             .access_path(executor.paths(seismic::Placing::Fixed(kind))[index])
             .unwrap();
         let store = topology.store(path.store()).unwrap();
-        let reserve = MemoryReserves::standard()
-            .for_domain(store.kind(), store.capacity().value)
-            .planning_bytes;
+        let reserve = reserves().thresholds(store.kind(), 0).planning_bytes;
         path.grant().unwrap().value - reserve
     }
 
@@ -1591,18 +1951,17 @@ mod tests {
 
     /// Where the OS reports its pressure level, only critical pressure is an
     /// emergency, whatever the headroom; where it reports none, obtainable
-    /// headroom at or below the emergency reserve is.
+    /// headroom at or below the emergency reserve, the kernel's own line,
+    /// is.
     #[test]
     fn host_emergency_is_critical_pressure_where_reported_and_the_emergency_reserve_elsewhere() {
         let topology = recorded::rtx3090();
-        let reserves = MemoryReserves::standard();
-        let store = topology.host_ram();
-        let emergency_bytes = reserves
-            .for_domain(store.kind(), store.capacity().value)
-            .emergency_bytes;
+        let reserves = holding(2 * GIB);
+        let emergency_bytes = GIB;
         let emergency = |headroom, kernel_pressure| {
             let host = HostStatus {
                 kernel_pressure,
+                free_target: Some(emergency_bytes),
                 ..host(LINUX, headroom)
             };
             Fit::host_emergency(&topology, &host, &reserves)
@@ -1625,7 +1984,7 @@ mod tests {
     /// process's own charges cannot show.
     #[test]
     fn a_stores_headroom_follows_what_is_left_of_its_grants() {
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let rtx3090 = recorded::rtx3090();
         let cuda = executor(&rtx3090, BackendName::Cuda);
         let path = rtx3090.access_path(cuda.paths(seismic::Placing::Fixed(Contract::DeviceOnly))[0]).unwrap();
@@ -1643,7 +2002,7 @@ mod tests {
     /// device memory store never carries it.
     #[test]
     fn host_distress_puts_host_domains_in_reclaim_whatever_their_headroom() {
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let swapping = status(displaced(lasting(window(500, 0, 0, 1), DISPLACEMENT_SPAN)));
         let m4_pro = recorded::m4_pro();
         let host_ram = Fit::new(&m4_pro, &swapping, &reserves, HostRoom::Allocatable)
@@ -1682,7 +2041,7 @@ mod tests {
     /// while it loads its own displacement is accepted.
     #[test]
     fn a_loads_growth_reads_no_room_made_by_displacing_another_program() {
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let m4_pro = recorded::m4_pro();
         let fit = |displaced_bytes, room| {
             let host = HostStatus { displaced_bytes, ..host(ReportedBy::MachAllocatablePages, 32 * GIB) };
@@ -1707,7 +2066,7 @@ mod tests {
         let m4_pro = recorded::m4_pro();
         let host = HostStatus { displaced_bytes: None, ..host(ReportedBy::MachAllocatablePages, 32 * GIB) };
         let served = HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 4 * GIB, baseline: None, borrows: false, lent: None }));
-        Fit::new(&m4_pro, &status(host), &MemoryReserves::standard(), served).store(m4_pro.host_ram().id()).unwrap();
+        Fit::new(&m4_pro, &status(host), &reserves(), served).store(m4_pro.host_ram().id()).unwrap();
     }
 
     /// The host of a load that compressed other programs' data to fit, as
@@ -1721,19 +2080,22 @@ mod tests {
     #[test]
     fn a_load_holds_at_what_the_os_gives_without_compressing_anyone() {
         const GB: u64 = 1_000_000_000;
-        let reserves = MemoryReserves::standard();
+        // The kernel's free target, and a margin the load measured.
+        let target = 4_000 * 16_384;
+        let reserves = holding(6_870_000_000 - target);
         let mut m4_max = seismic::fixtures::m4_pro();
         m4_max.host.value = 64 * GIB;
         let m4_max = seismic::fixtures::topology(&m4_max);
         let host_ram = m4_max.host_ram();
-        let planning = reserves.for_domain(host_ram.kind(), host_ram.capacity().value).planning_bytes;
-        assert_eq!(planning / (GB / 100), 687, "6.87 GB");
         let host = |allocatable: u64| HostStatus {
             allocatable: Reported::new(allocatable, ReportedBy::MachAllocatablePages),
             obtainable: Reported::new(10 * GB, ReportedBy::MachMovablePages),
             displaced_bytes: Some(9 * GB),
+            free_target: Some(target),
             ..host(MACOS, 0)
         };
+        let planning = reserves.host_thresholds(host_ram.kind(), &host(0)).planning_bytes;
+        assert_eq!(planning, 6_870_000_000);
         let served = HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 9 * GB, baseline: None, borrows: false, lent: None }));
         let reading = |host: HostStatus| host_ram_fit(host_ram, &host, &reserves, served);
 
@@ -1763,12 +2125,12 @@ mod tests {
     #[test]
     fn a_bank_holding_borrowed_room_is_held_on_displacement_now_not_the_level() {
         const GB: u64 = 1_000_000_000;
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let mut m4_max = seismic::fixtures::m4_pro();
         m4_max.host.value = 64 * GIB;
         let m4_max = seismic::fixtures::topology(&m4_max);
         let host_ram = m4_max.host_ram();
-        let planning = reserves.for_domain(host_ram.kind(), host_ram.capacity().value).planning_bytes;
+        let planning = reserves.thresholds(host_ram.kind(), 0).planning_bytes;
         let grown = epoch();
         let second = |seconds: u64| grown + Duration::from_secs(seconds);
         let at = |ended: Instant, swapped: u64| DisplacementWindow { ended, ..window(1_000, 0, 0, swapped) };
@@ -1833,74 +2195,148 @@ mod tests {
         assert_eq!(baseline.swapped, Some(500), "faster than every one since: displacement now");
     }
 
-    /// Each reserve is the larger of its fraction of the store's capacity
-    /// and its floor: host RAM a tenth (2 GiB floor) to plan and a
-    /// twentieth (1 GiB) for emergency, device memory a twentieth (512 MiB)
-    /// and a fortieth (256 MiB).
+    /// Each store's planning line is its own line plus its motion's margin,
+    /// its emergency line its own line alone, and neither a fraction of
+    /// capacity: host RAM's own line is the kernel's free target (none where
+    /// the OS leaves it out of what it reports allocatable, as Linux's
+    /// `MemAvailable` does), a device's own memory has none and no margin
+    /// until a load measured its motion; a volume's is its writer's. The
+    /// margin is the fluctuation plus what the host takes at its take rate
+    /// over a reading interval and a release's latency, so a positive take
+    /// rate leaves no reserve without one; and a measurement only raises it.
     #[test]
-    fn standard_reserves_use_the_larger_of_fraction_and_floor() {
-        let reserves = MemoryReserves::standard();
-        let thresholds = |topology: &DeviceTopology, store: StoreId| {
-            let store = topology.store(store).unwrap();
-            reserves.for_domain(store.kind(), store.capacity().value)
-        };
-        // Lunar Lake's 14.8 GB: both floors.
-        let lunar_lake = recorded::lunar_lake();
-        assert_eq!(
-            thresholds(&lunar_lake, lunar_lake.host_ram().id()),
-            DomainThresholds {
-                planning_bytes: 2 * GIB,
-                emergency_bytes: GIB,
-            }
-        );
-        // The M4 Pro's 48 GiB: both fractions.
+    fn reserves_are_the_stores_own_line_plus_the_motions_margin() {
+        let target = 4_000 * 16_384;
+        let macos = HostStatus { free_target: Some(target), ..host(MACOS, 0) };
+        let linux = HostStatus { free_target: Some(0), ..host(LINUX, 0) };
+        // 10 GB a second, over 0.1 s, then over 0.1 s and a 0.4 s release.
+        let motion = StoreMotion::new(GIB, 10e9);
+        let unplanned = MemoryReserves::new(motion, crate::platform::ReleaseRate::new(1e9));
+        let planned = unplanned.with_latency(Duration::from_millis(400));
+        assert_eq!(unplanned.host_margin(), GIB + 1_000_000_000);
+        assert_eq!(planned.host_margin(), GIB + 5_000_000_000);
         let m4_pro = recorded::m4_pro();
-        let capacity = m4_pro.host_ram().capacity().value;
+        let host_ram = m4_pro.host_ram().kind();
         assert_eq!(
-            thresholds(&m4_pro, m4_pro.host_ram().id()),
-            DomainThresholds {
-                planning_bytes: capacity / 10,
-                emergency_bytes: capacity / 20,
-            }
+            planned.host_thresholds(host_ram, &macos),
+            DomainThresholds { planning_bytes: target + planned.host_margin(), emergency_bytes: target }
         );
-        // The A10-8Q slice's 7.6 GB: the device floors.
-        let a10 = recorded::a10_8q();
         assert_eq!(
-            thresholds(&a10, device_memory(&a10)),
-            DomainThresholds {
-                planning_bytes: 512 * MIB,
-                emergency_bytes: 256 * MIB,
-            }
+            planned.host_thresholds(host_ram, &linux),
+            DomainThresholds { planning_bytes: planned.host_margin(), emergency_bytes: 0 }
         );
-        // The RTX 3090's 25.3 GB: the device fractions.
+        // A host of another size keeps the same line.
+        let lunar_lake = recorded::lunar_lake();
+        assert_eq!(planned.host_thresholds(lunar_lake.host_ram().kind(), &macos), planned.host_thresholds(host_ram, &macos));
+        // A slower measurement lowers nothing; a faster one raises the margin.
+        let slower = planned.measured(Some(StoreMotion::new(0, 1e9)), None);
+        assert_eq!(slower.host_margin(), planned.host_margin());
+        let faster = planned.measured(Some(StoreMotion::new(0, 20e9)), None);
+        assert_eq!(faster.host_margin(), GIB + 10_000_000_000);
         let rtx3090 = recorded::rtx3090();
-        let capacity = rtx3090
-            .store(device_memory(&rtx3090))
-            .unwrap()
-            .capacity()
-            .value;
-        assert_eq!(
-            thresholds(&rtx3090, device_memory(&rtx3090)),
-            DomainThresholds {
-                planning_bytes: capacity / 20,
-                emergency_bytes: capacity / 40,
-            }
-        );
-        // Every volume keeps 2 GiB free, whatever its size, and has no
-        // emergency reserve.
-        let volume = StoreKind::Volume(seismic::VolumeId {
-            device: 1,
-            uuid: None,
-        });
-        for capacity in [64 * GIB, 4096 * GIB] {
-            assert_eq!(
-                reserves.for_domain(&volume, capacity),
-                DomainThresholds {
-                    planning_bytes: 2 * GIB,
-                    emergency_bytes: 0,
-                }
-            );
+        let device = rtx3090.store(device_memory(&rtx3090)).unwrap();
+        assert_eq!(planned.thresholds(device.kind(), 0), DomainThresholds { planning_bytes: 0, emergency_bytes: 0 });
+        let measured = planned.measured(None, Some(StoreMotion::new(0, 1e9)));
+        assert_eq!(measured.thresholds(device.kind(), 0), DomainThresholds { planning_bytes: 500_000_000, emergency_bytes: 0 });
+    }
+
+    /// The margin over the take before a first release lands, and while
+    /// the host takes faster than the load releases, the deficit's growth
+    /// over the releasing: none where the load releases as fast, growing
+    /// with the bytes released where it does not, and smaller the faster
+    /// the release.
+    #[test]
+    fn the_margin_covers_a_take_outrunning_the_release() {
+        let interval = Duration::from_millis(100);
+        let latency = Duration::from_millis(100);
+        let motion = StoreMotion::new(MIB, 4e9);
+        let lead = MIB + 800_000_000;
+        let releasing = |rate: f64, bytes: u64| Some(Releasing { rate: ReleaseRate::new(rate), bytes });
+        assert_eq!(motion.margin(interval, latency, None), lead);
+        for bytes in [0, GIB, 10 * GIB] {
+            assert_eq!(motion.margin(interval, latency, releasing(4e9, bytes)), lead, "t ≤ r: no shortfall");
+            assert_eq!(motion.margin(interval, latency, releasing(8e9, bytes)), lead);
         }
+        // t = 2r: the deficit grows by a byte per byte released.
+        assert_eq!(motion.margin(interval, latency, releasing(2e9, GIB)), lead + GIB);
+        assert_eq!(motion.margin(interval, latency, releasing(2e9, 4 * GIB)), lead + 4 * GIB);
+        assert!(motion.margin(interval, latency, releasing(3e9, 4 * GIB)) < motion.margin(interval, latency, releasing(2e9, 4 * GIB)));
+        // A measured release only ever slows the rate the reserves hold.
+        let reserves = MemoryReserves::new(motion, ReleaseRate::new(8e9)).with_latency(latency);
+        let serving = reserves.releasing(None, Releasable { host: 4 * GIB, device: 0 });
+        assert_eq!(serving.host_margin(), lead);
+        assert_eq!(serving.releasing(Some(ReleaseRate::new(2e9)), Releasable { host: 4 * GIB, device: 0 }).host_margin(), lead + 4 * GIB);
+        assert_eq!(serving.releasing(Some(ReleaseRate::new(16e9)), Releasable { host: 4 * GIB, device: 0 }).release_rate(), ReleaseRate::new(8e9));
+    }
+
+    /// A take rate is measured and positive: no motion without one is
+    /// constructible, and a serialized one is refused.
+    #[test]
+    fn no_motion_without_a_take_rate() {
+        assert!(std::panic::catch_unwind(|| StoreMotion::new(GIB, 0.0)).is_err());
+        assert!(std::panic::catch_unwind(|| StoreMotion::new(GIB, f64::NAN)).is_err());
+        assert!(serde_json::from_value::<StoreMotion>(serde_json::json!({ "fluctuation": 0, "take_rate": 0.0 })).is_err());
+        assert!(MemoryReserves::new(StoreMotion::new(0, 1e9), crate::platform::ReleaseRate::new(1e9)).host_margin() > 0);
+    }
+
+    /// The machine's page-fill rate is a positive rate, measured once: per
+    /// process without a cache, once per machine with one.
+    #[test]
+    fn the_machine_fills_pages_at_a_measured_rate() {
+        let machine = StoreMotion::of_machine(None);
+        assert!(machine.take_rate() > 0.0 && machine.take_rate().is_finite());
+        assert_eq!(StoreMotion::of_machine(None), machine);
+        assert_eq!(machine.fluctuation(), 0);
+        // A cache keeps the machine's rate, which a later reader reads
+        // rather than measuring again.
+        let cache = std::env::temp_dir().join(format!("page-fill-{}", std::process::id()));
+        let topology = recorded::m4_pro();
+        let stored = StoreMotion::of_machine(Some((&cache, &topology)));
+        crate::kernel_cache::KernelCache::machine_figures(&cache)
+            .store(&format!("page-fill:{}", host_identity(&topology).unwrap()), &MachineRate { bytes_per_second: 7e9 }, MACHINE_RATE_RECORD_BYTES)
+            .unwrap();
+        assert!(stored.take_rate() > 0.0);
+        assert_eq!(StoreMotion::of_machine(Some((&cache, &topology))).take_rate(), 7e9);
+        std::fs::remove_dir_all(&cache).unwrap();
+    }
+
+    /// The meter folds a continuous observer's readings, judged on available
+    /// memory plus what the host's own loads hold: a fall within a reading
+    /// interval is fluctuation, a fall over a longer span a take at its
+    /// rate; a reading that counts no own holding measures nothing; and the
+    /// motion is never below the prior.
+    #[test]
+    fn the_meter_measures_fluctuation_and_takes() {
+        let start = epoch();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut meter = MotionMeter::new(StoreMotion::new(0, 5e9));
+        meter.read(at(0), 20 * GIB, Some(0));
+        meter.read(at(100), 20 * GIB - MIB, Some(0));
+        assert_eq!(meter.motion(), StoreMotion::new(MIB, 5e9));
+        // 4 GiB over a second, slower than the prior; then a reading that
+        // counts no own holding, and one after it.
+        meter.read(at(1_100), 16 * GIB - MIB, Some(0));
+        meter.read(at(2_100), 4 * GIB, None);
+        meter.read(at(3_100), 0, Some(0));
+        assert_eq!(meter.motion(), StoreMotion::new(MIB, 5e9));
+        // 10 GiB over a second, faster than the prior.
+        let mut fast = MotionMeter::new(StoreMotion::new(0, GIB as f64));
+        fast.read(at(0), 20 * GIB, Some(0));
+        fast.read(at(1_000), 10 * GIB, Some(0));
+        assert_eq!(fast.motion(), StoreMotion::new(0, 10.0 * GIB as f64));
+    }
+
+    /// The host's own load taking memory is no other program's take: its
+    /// holding rises by what available memory falls, over any span.
+    #[test]
+    fn the_meter_measures_no_take_of_the_hosts_own_loads() {
+        let start = epoch();
+        let at = |millis: u64| start + Duration::from_millis(millis);
+        let mut meter = MotionMeter::new(StoreMotion::new(0, GIB as f64));
+        for (step, held) in [0, 4, 12, 20].into_iter().enumerate() {
+            meter.read(at(step as u64 * 1_000), 30 * GIB - held * GIB, Some(held * GIB));
+        }
+        assert_eq!(meter.motion(), StoreMotion::new(0, GIB as f64));
     }
 
     /// Host RAM's stable fit is its capacity less the planning reserve, its
@@ -1911,20 +2347,22 @@ mod tests {
         let topology = recorded::rtx3090();
         let id = topology.host_ram().id();
         let capacity = topology.host_ram().capacity().value;
-        let reserves = MemoryReserves::standard();
+        let line = 2 * GIB;
+        let reserves = holding(line - GIB);
         let reading = |headroom| {
-            Fit::new(&topology, &status(host(LINUX, headroom)), &reserves, HostRoom::Allocatable)
+            let host = HostStatus { free_target: Some(GIB), ..host(LINUX, headroom) };
+            Fit::new(&topology, &status(host), &reserves, HostRoom::Allocatable)
                 .store(id)
                 .unwrap()
         };
         let normal = reading(16 * GIB);
-        assert_eq!(normal.thresholds.planning_bytes, capacity / 10);
-        assert_eq!(normal.stable_bytes, capacity - capacity / 10);
-        assert_eq!(normal.ceiling_bytes, 16 * GIB - capacity / 10);
+        assert_eq!(normal.thresholds.planning_bytes, line);
+        assert_eq!(normal.stable_bytes, capacity - line);
+        assert_eq!(normal.ceiling_bytes, 16 * GIB - line);
         assert_eq!(normal.constraint, MemoryConstraint::HostRam);
         assert_eq!(normal.band, MemoryBand::Normal);
         // Exactly at the planning reserve is already Reclaim.
-        let at_line = reading(capacity / 10);
+        let at_line = reading(line);
         assert_eq!(at_line.band, MemoryBand::Reclaim);
         assert_eq!(at_line.ceiling_bytes, 0);
         // Below the emergency reserve the engine still reports Reclaim; the
@@ -1943,7 +2381,7 @@ mod tests {
         let mut unobserved = status(host(LINUX, 16 * GIB));
         let error = ObservationError::Failed("sample failed".into());
         unobserved.sample.host_ram = Err(error.clone());
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let fit = Fit::new(&topology, &unobserved, &reserves, HostRoom::Allocatable);
         assert_eq!(
             fit.store(topology.host_ram().id()),
@@ -2004,7 +2442,7 @@ mod tests {
     #[test]
     fn metal_fit_respects_the_recommended_working_set() {
         let topology = recorded::m4_pro();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let metal = executor(&topology, BackendName::Metal);
         let working_set = grant_room(&topology, metal, Contract::DeviceOnly, 0);
         let unlimited = sampled(&topology, host(MACOS, 16 * GIB));
@@ -2052,7 +2490,7 @@ mod tests {
     #[test]
     fn metal_working_set_bounds_the_ceiling_not_the_band() {
         let topology = recorded::m4_pro();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let metal = executor(&topology, BackendName::Metal);
         let path = metal.paths(seismic::Placing::Fixed(Contract::DeviceOnly))[0];
         let host_ram = topology.host_ram().id();
@@ -2128,7 +2566,7 @@ mod tests {
     /// fit, and a demand beyond it is refused by whichever is smaller.
     #[test]
     fn an_integrated_gpu_is_bounded_by_the_smaller_of_its_grant_and_host_ram() {
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         for (topology, backend) in [
             (recorded::gb10(), BackendName::Cuda),
             (recorded::gb10(), BackendName::Vulkan),
@@ -2164,7 +2602,7 @@ mod tests {
     #[test]
     fn gb10_executors_and_host_work_share_host_ram() {
         let topology = recorded::gb10();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let unopened = status(host(LINUX, 8 * GIB));
         let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         let host_ram = topology.host_ram().id();
@@ -2200,7 +2638,7 @@ mod tests {
     #[test]
     fn integrated_cuda_is_bounded_by_host_ram_and_what_it_holds() {
         let topology = recorded::gb10();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let cuda = executor(&topology, BackendName::Cuda);
         let path = cuda.paths(seismic::Placing::Fixed(Contract::DeviceOnly))[0];
         let total = topology.access_path(path).unwrap().grant().unwrap().value;
@@ -2245,7 +2683,7 @@ mod tests {
     #[test]
     fn cuda_and_vulkan_on_one_device_share_its_fit() {
         let topology = recorded::rtx3090();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let gpu = device_memory(&topology);
         let capacity = topology.store(gpu).unwrap().capacity().value;
         let mut sampled = sampled(&topology, host(LINUX, 16 * GIB));
@@ -2298,20 +2736,21 @@ mod tests {
         }
     }
 
-    /// The A10-8Q slice keeps the 512 MiB device floor above its claims, not
-    /// the 2 GiB host floor: its stable fit is its capacity less 512 MiB,
-    /// and a charge leaving headroom at the reserve is Reclaim.
+    /// The A10-8Q slice keeps no host reserve above its claims: before a
+    /// load measured its motion its driver's own reserve is all it keeps,
+    /// so its stable fit is its capacity, and a charge leaving no headroom
+    /// is Reclaim.
     #[test]
-    fn a_small_dedicated_device_keeps_512_mib_above_its_claims() {
+    fn a_small_dedicated_device_keeps_no_host_reserve_above_its_claims() {
         let topology = recorded::a10_8q();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let slice = device_memory(&topology);
         let capacity = topology.store(slice).unwrap().capacity().value;
         let mut sampled = sampled(&topology, host(LINUX, 16 * GIB));
         let fit = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable);
         let own = fit.store(slice).unwrap();
-        assert_eq!(own.thresholds.planning_bytes, 512 * MIB);
-        assert_eq!(own.stable_bytes, capacity - 512 * MIB);
+        assert_eq!(own.thresholds.planning_bytes, 0);
+        assert_eq!(own.stable_bytes, capacity);
         // CUDA's usable memory is below the slice's fit; Vulkan's heap, the
         // slice's capacity, is above it.
         let cuda = executor(&topology, BackendName::Cuda);
@@ -2334,9 +2773,9 @@ mod tests {
         let charged = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable)
             .store(slice)
             .unwrap();
-        assert_eq!(charged.ceiling_bytes, 2 * GIB - 512 * MIB);
+        assert_eq!(charged.ceiling_bytes, 2 * GIB);
         assert_eq!(charged.band, MemoryBand::Normal);
-        sampled.runtime.charges = vec![(slice, capacity - 512 * MIB)];
+        sampled.runtime.charges = vec![(slice, capacity)];
         let at_line = Fit::new(&topology, &sampled, &reserves, HostRoom::Allocatable)
             .store(slice)
             .unwrap();
@@ -2350,7 +2789,7 @@ mod tests {
     #[test]
     fn remaining_path_grant_is_shared_by_device_and_upload() {
         let topology = recorded::rtx3090();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let vulkan = executor(&topology, BackendName::Vulkan);
         let path = vulkan.paths(seismic::Placing::Fixed(Contract::DeviceOnly))[0];
         assert_eq!(vulkan.paths(seismic::Placing::Fixed(Contract::Upload)), [path]);
@@ -2399,7 +2838,7 @@ mod tests {
     #[test]
     fn a_placement_over_two_paths_continues_onto_host_ram() {
         let topology = recorded::strix_halo_windows();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let unopened = sampled(&topology, host(WINDOWS, 16 * GIB));
         let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         let (radeon, host_ram) = (device_memory(&topology), topology.host_ram().id());
@@ -2465,18 +2904,17 @@ mod tests {
         );
     }
 
-    /// Process limits are grants on host RAM that every path into it
-    /// shares: a cgroup limit bounds host RAM's stable fit by its limit and
-    /// A container limited to a few GiB of a large host keeps reserves of
-    /// what it may use: a fraction of the whole host's RAM would exceed the
-    /// limit and leave nothing to fit.
+    /// A container limited to a few GiB of a large host keeps its line and
+    /// measured margin within what it may use, never a fraction of the
+    /// whole host's RAM, which would exceed the limit and leave nothing to
+    /// fit.
     #[test]
-    fn host_reserves_are_fractions_of_the_capacity_within_limits() {
+    fn a_limited_container_keeps_its_line_within_its_limit() {
         let topology = recorded::rtx3090();
-        let reserves = MemoryReserves::standard();
+        let reserves = holding(GIB);
         let host_ram = topology.host_ram();
-        assert!(host_ram.capacity().value / 10 > 4 * GIB);
         let mut limited = host(LINUX, 3 * GIB);
+        limited.free_target = Some(0);
         limited.limits = vec![ProcessMemoryLimit {
             kind: ProcessLimitKind::CgroupV2 {
                 cgroup: "/container".into(),
@@ -2488,20 +2926,22 @@ mod tests {
         let limited = status(limited);
         let reading = Fit::new(&topology, &limited, &reserves, HostRoom::Allocatable).store(host_ram.id()).unwrap();
         assert_eq!(reading.capacity_bytes, 4 * GIB);
-        assert_eq!(reading.thresholds, reserves.for_domain(host_ram.kind(), 4 * GIB));
-        assert_eq!(reading.stable_bytes, 2 * GIB);
+        assert_eq!(reading.thresholds, reserves.thresholds(host_ram.kind(), 0));
+        assert_eq!(reading.stable_bytes, 3 * GIB);
         assert_eq!(
             Fit::host_ram(&topology, &limited.sample.host_ram.clone().unwrap(), &reserves, HostRoom::Allocatable).thresholds,
             reading.thresholds
         );
     }
 
+    /// Process limits are grants on host RAM that every path into it
+    /// shares: a cgroup limit bounds host RAM's stable fit by its limit and
     /// its headroom by what the limit leaves, for the CPU and for CUDA's
     /// pinned upload alike, though the cgroup's ancestors are hidden.
     #[test]
     fn process_limits_bound_host_headroom() {
         let topology = recorded::rtx3090();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let host_ram = topology.host_ram().id();
         let mut limited = host(LINUX, 40 * GIB);
         limited.limits = vec![ProcessMemoryLimit {
@@ -2545,7 +2985,7 @@ mod tests {
     #[test]
     fn cgroup_file_cache_is_available_but_anonymous_usage_and_reserves_still_bound_claims() {
         let topology = recorded::rtx3090();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let host_ram = topology.host_ram().id();
         let reading = |reclaimable_bytes| {
             let mut sampled = host(LINUX, 40 * GIB);
@@ -2576,7 +3016,7 @@ mod tests {
     #[test]
     fn storage_kinds_and_direct_work_spend_one_host_budget() {
         let topology = recorded::m4_pro();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let unopened = status(host(MACOS, 16 * GIB));
         let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         let host_ram = topology.host_ram().id();
@@ -2610,7 +3050,7 @@ mod tests {
     #[test]
     fn demand_on_an_unavailable_executor_is_unplaced() {
         let topology = recorded::m4_pro_without_unified_memory();
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let unopened = status(host(MACOS, 16 * GIB));
         let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         let metal = executor(&topology, BackendName::Metal);
@@ -2633,7 +3073,7 @@ mod tests {
     #[test]
     fn a_subject_of_another_revision_is_refused() {
         let (topology, other) = (recorded::m4_pro(), recorded::m4_pro());
-        let reserves = MemoryReserves::standard();
+        let reserves = reserves();
         let unopened = status(host(MACOS, 16 * GIB));
         let fit = Fit::new(&topology, &unopened, &reserves, HostRoom::Allocatable);
         assert_eq!(

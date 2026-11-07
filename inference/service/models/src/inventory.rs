@@ -421,7 +421,7 @@ fn hub_client(config: &InventoryConfig, token: Option<String>) -> Result<HFClien
 
 pub struct ManagedModelStore {
     pub(crate) config: InventoryConfig,
-    pub(crate) download_space: Arc<dyn DownloadSpace>,
+    pub(crate) volume: Arc<crate::download::VolumeWrites>,
     pub(crate) client: HFClient,
     hub_credential: Arc<RwLock<Option<HubCredential>>>,
     pub(crate) http: reqwest::Client,
@@ -449,22 +449,23 @@ pub struct ManagedModelStore {
     ollama_hub_resolution: Arc<AtomicBool>,
 }
 
-/// The space a download may take on the model store's volume, above the
-/// volume's reserve. The composition root supplies it from the engine's fit
-/// owner (`magnitude_executor::platform::volume_space`), which owns the
-/// reserve.
+/// The space the model store's downloads may take on its volume, above the
+/// volume's reserve. The composition root supplies it from the volume's
+/// reserve owner (`magnitude_executor::platform::volume_space`).
 pub trait DownloadSpace: Send + Sync {
-    /// The bytes a download may still write to the volume now.
-    fn available_bytes(&self) -> Result<u64, InventoryError>;
+    /// The bytes the store's downloads may still write to the volume now,
+    /// having written `written` bytes there so far, which the reserve tells
+    /// from other programs' writes.
+    fn available_bytes(&self, written: u64) -> Result<u64, InventoryError>;
 }
 
 impl<F, E> DownloadSpace for F
 where
-    F: Fn() -> Result<u64, E> + Send + Sync,
+    F: Fn(u64) -> Result<u64, E> + Send + Sync,
     E: std::fmt::Display,
 {
-    fn available_bytes(&self) -> Result<u64, InventoryError> {
-        self().map_err(|error| InventoryError::Internal(error.to_string()))
+    fn available_bytes(&self, written: u64) -> Result<u64, InventoryError> {
+        self(written).map_err(|error| InventoryError::Internal(error.to_string()))
     }
 }
 
@@ -473,7 +474,7 @@ impl ManagedModelStore {
     /// [`Self::open`] with download space without bound, for tests that
     /// download nothing.
     pub(crate) async fn open_unbounded(config: InventoryConfig) -> Result<Self, InventoryError> {
-        Self::open(config, Arc::new(|| Ok::<_, InventoryError>(u64::MAX))).await
+        Self::open(config, Arc::new(|_| Ok::<_, InventoryError>(u64::MAX))).await
     }
 }
 
@@ -493,7 +494,7 @@ impl Clone for ManagedModelStore {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            download_space: Arc::clone(&self.download_space),
+            volume: Arc::clone(&self.volume),
             client: self.client.clone(),
             hub_credential: Arc::clone(&self.hub_credential),
             http: self.http.clone(),
@@ -708,7 +709,7 @@ impl ManagedModelStore {
         let catalog_affiliations = CatalogAffiliations::load(&config.root);
         let local_models = Arc::new(RwLock::new(config.local_models.clone()));
         let manager = Self {
-            download_space,
+            volume: Arc::new(crate::download::VolumeWrites::new(download_space)),
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
             client,

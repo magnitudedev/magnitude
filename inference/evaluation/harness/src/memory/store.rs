@@ -39,7 +39,7 @@ pub struct Target {
 impl Target {
     pub fn open(backend: BackendName, selected: PressureStore) -> Result<Self, String> {
         let devices = Devices::discover(&[]).map_err(|error| error.to_string())?;
-        let chosen = select_device(&devices, ExecutionPath::Native, DeviceRequest::Backend(backend), &MemoryReserves::standard())
+        let chosen = select_device(&devices, ExecutionPath::Native, DeviceRequest::Backend(backend), &MemoryReserves::of_machine(None))
             .map_err(|error| error.to_string())?;
         let id = devices.resolve(chosen.info.selector()).map_err(|error| error.to_string())?;
         let device = devices.open(id).map_err(|error| error.to_string())?;
@@ -55,7 +55,7 @@ impl Target {
     }
 
     pub fn reading(&self) -> Result<magnitude_executor::platform::DomainReading, String> {
-        observe_domains(&self.devices, &self.device, &MemoryReserves::standard(), self.room)
+        observe_domains(&self.devices, &self.device, &MemoryReserves::of_machine(None), self.room)
             .map_err(|error| error.to_string())?.into_iter().find(|reading| reading.domain == self.store)
             .ok_or_else(|| "selected pressure store has no admission observation".into())
     }

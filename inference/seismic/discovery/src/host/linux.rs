@@ -203,6 +203,11 @@ pub(super) fn sample() -> Result<HostSample, ObservationError> {
         limits,
         limit_visibility,
         kernel_pressure: None,
+        // `MemAvailable` already leaves out the kernel's own reserve
+        // (`totalreserve_pages`: each zone's high watermark and lowmem
+        // reserve), which kswapd reclaims toward; counting the zones'
+        // watermarks again would hold the line twice.
+        free_target: Some(0),
         held: None,
         displaced_bytes: Some(displaced_bytes(&meminfo)?),
     })

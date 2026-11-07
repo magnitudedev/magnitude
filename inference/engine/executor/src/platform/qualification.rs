@@ -337,7 +337,7 @@ mod tests {
                     path: ExecutionPath::Native,
                     artifacts: None,
                     graph_cost: None,
-                    reserves: MemoryReserves::standard(),
+                    reserves: MemoryReserves::of_machine(None),
                 },
             ),
             Err(PlatformError::Resolve(ResolveError::Missing(selector))) if selector == missing

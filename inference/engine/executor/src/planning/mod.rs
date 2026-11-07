@@ -235,7 +235,7 @@ pub(crate) mod tests {
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
-            &crate::platform::MemoryReserves::standard(),
+            &crate::platform::MemoryReserves::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = catalog
@@ -336,7 +336,7 @@ pub(crate) mod tests {
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
-            &crate::platform::MemoryReserves::standard(),
+            &crate::platform::MemoryReserves::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = catalog
@@ -409,7 +409,7 @@ pub(crate) mod tests {
             &catalog,
             crate::ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
-            &crate::platform::MemoryReserves::standard(),
+            &crate::platform::MemoryReserves::of_machine(None),
         )
         .unwrap_or_else(|error| panic!("the host's device is selected: {error}"));
         let device = catalog
@@ -734,7 +734,7 @@ pub(crate) mod tests {
                 catalog,
                 crate::ExecutionPath::Native,
                 crate::platform::DeviceRequest::Backend(backend),
-                &crate::platform::MemoryReserves::standard(),
+                &crate::platform::MemoryReserves::of_machine(None),
             )
             .unwrap_or_else(|error| panic!("an available {backend:?} device is selected: {error}"));
             let device = catalog

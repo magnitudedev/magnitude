@@ -92,6 +92,12 @@ pub fn configuration(
     } else {
         None
     };
+    // The machine's figures live in the kernel cache, keyed by its host.
+    let topology = match &options.cache_dir {
+        Some(_) => Some(seismic::Devices::discover(&[]).map_err(|error| error.to_string())?.topology()),
+        None => None,
+    };
+    let reserves = MemoryReserves::of_machine(options.cache_dir.as_deref().zip(topology.as_deref()));
     let mut resolved = EngineConfiguration {
         package: PackageOptions {
             target: artifacts.target.clone(),
@@ -123,7 +129,7 @@ pub fn configuration(
         path: ExecutionPath::Native,
         device: options.device,
         kernel_cache: options.cache_dir.clone(),
-        reserves: MemoryReserves::standard(),
+        reserves,
     }
     .resolve()
     .map_err(|error| error.to_string())?;

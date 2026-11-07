@@ -2324,6 +2324,7 @@ dependencies = [
  "magnitude-executor",
  "magnitude-serving",
  "magnitude-state",
+ "seismic",
  "serde_json",
  "tokio",
 ]

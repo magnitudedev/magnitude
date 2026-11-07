@@ -1122,7 +1122,7 @@ pub(crate) mod tests {
             "metal:00000001000004a5".parse().unwrap(),
             kernel_cache,
             Some(PathBuf::from("/models")),
-            MemoryReserves::standard(),
+            MemoryReserves::of_machine(None),
         )
         .unwrap()
     }

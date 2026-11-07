@@ -503,7 +503,7 @@ mod tests {
         config.local_models.roots.clear();
         config.hub_endpoint = Some(endpoint);
         let store = std::sync::Arc::new(
-            magnitude_service_models::ManagedModelStore::open(config, std::sync::Arc::new(|| Ok::<u64, std::convert::Infallible>(u64::MAX)))
+            magnitude_service_models::ManagedModelStore::open(config, std::sync::Arc::new(|_| Ok::<u64, std::convert::Infallible>(u64::MAX)))
                 .await
                 .unwrap(),
         );

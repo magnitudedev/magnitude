@@ -3760,7 +3760,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         &catalog,
         crate::ExecutionPath::Native,
         crate::platform::DeviceRequest::Automatic,
-        &crate::platform::MemoryReserves::standard(),
+        &crate::platform::MemoryReserves::of_machine(None),
     )
     .unwrap();
     let device = catalog.open(catalog.resolve(selected.info.selector()).unwrap()).unwrap();

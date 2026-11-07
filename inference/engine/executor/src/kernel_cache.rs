@@ -105,9 +105,10 @@ const PREPARED: &str = "prepared";
 const RECORDS: &str = "records";
 const MEASUREMENT_ATTEMPTS: &str = "measurement-attempts";
 const MEASUREMENT_REQUESTS: &str = "measurement-requests";
+const MACHINE_FIGURES: &str = "machine-figures";
 /// The directories under the root that hold no entry: eviction never walks
 /// them.
-const KEPT: [&str; 3] = [RECORDS, MEASUREMENT_ATTEMPTS, MEASUREMENT_REQUESTS];
+const KEPT: [&str; 4] = [RECORDS, MEASUREMENT_ATTEMPTS, MEASUREMENT_REQUESTS, MACHINE_FIGURES];
 
 /// The bytes at `path`, refreshing its use time; `None` on any failure.
 fn read_entry(path: &Path) -> Option<Vec<u8>> {
@@ -236,6 +237,14 @@ impl KernelCache {
     /// next, beside the records it stores. Eviction leaves them alone.
     pub fn measurement_requests(root: &Path) -> JsonFileStore {
         JsonFileStore::new(&root.join(MEASUREMENT_REQUESTS))
+    }
+
+    /// The machine's own generic figures kept in the kernel cache at `root`,
+    /// measured once per machine and keyed by its identity (the host's page
+    /// fill rate, `platform::StoreMotion::of_machine`). Eviction leaves them
+    /// alone.
+    pub fn machine_figures(root: &Path) -> JsonFileStore {
+        JsonFileStore::new(&root.join(MACHINE_FIGURES))
     }
 
     fn entry(&self, directory: &str, key: &str, extension: &str) -> PathBuf {

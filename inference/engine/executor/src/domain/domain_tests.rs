@@ -396,6 +396,7 @@ fn places_grow_only_beyond_what_the_bank_can_grow_into() {
                 rate: 0.0,
                 fastest: 0.0,
                 fluctuation: Fluctuation::default(),
+                host: false,
             });
             let request = RequestId(80);
             open(&mut domain, &mut bindings, request);
@@ -961,6 +962,7 @@ fn a_full_device_leaves_the_host_stores_room() {
         rate: 0.0,
         fastest: 0.0,
         fluctuation: Fluctuation::default(),
+        host: false,
     };
     let mut pace = MemoryPace::new();
     pace.domains.insert(device, domain(DomainRole::Allocation, 0));
@@ -1533,6 +1535,7 @@ fn each_domains_deficit_is_the_shrink_of_what_it_charges() {
         rate: 0.0,
         fastest: 0.0,
         fluctuation: Fluctuation::default(),
+        host: false,
     };
     let mut pace = MemoryPace::new();
     pace.domains.insert(short, domain(7 * GB));
@@ -1572,14 +1575,19 @@ fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
         installed: at(released),
         released: at(released),
     };
+    const GB: u64 = 1_000_000_000;
     let ms = std::time::Duration::from_millis;
     let mut pace = MemoryPace::new();
     pace.reading_interval = ms(100);
     assert_eq!(pace.horizon(), ms(100));
-    pace.released(&times(0, 120));
+    pace.released(GB, &times(0, 120));
     assert_eq!(pace.horizon(), ms(340));
-    pace.released(&times(130, 280));
+    pace.released(GB, &times(130, 280));
     assert_eq!(pace.horizon(), ms(400));
+    // The release rate kept is the slowest: a gigabyte over 150 ms.
+    assert_eq!(pace.motions().release, Some(crate::platform::ReleaseRate::new(GB as f64 / 0.15)));
+    pace.released(GB, &times(300, 400));
+    assert_eq!(pace.motions().release, Some(crate::platform::ReleaseRate::new(GB as f64 / 0.15)));
 }
 
 /// A chain's encoding reads memory between its submissions at most every
@@ -1618,11 +1626,60 @@ fn the_wait_bound_is_the_reserve_between_the_lines_at_the_fastest_taking() {
         rate: 0.0,
         fastest,
         fluctuation: Fluctuation::default(),
+        host: false,
     };
     assert_eq!(domain(DomainRole::Allocation, 1e9).wait_bound(), Some(8.0));
     assert_eq!(domain(DomainRole::Allocation, 0.0).wait_bound(), None);
     assert_eq!(domain(DomainRole::Staging, 1e9).wait_bound(), None);
     assert_eq!(MemoryPace::new().wait_bound(), None);
+}
+
+/// What a serving load measured of the rest of the host's motion, which
+/// its reserves then hold their margin at: nothing on a quiet host (the
+/// reserves keep the machine's page-fill rate), and once the host took
+/// memory, the steady fluctuation and the fastest take, host RAM's and a
+/// device's own memory's each their own; and the last release's latency
+/// once one finished.
+#[test]
+fn a_serving_load_measures_the_hosts_motion_and_its_release_latency() {
+    const GB: u64 = 1_000_000_000;
+    let [host, device] = [(); 2].map(|()| seismic::Devices::discover(&[]).unwrap().topology().host_ram().id());
+    let domain = |host: bool, fastest: f64, fluctuation: u64| DomainPace {
+        role: DomainRole::Allocation,
+        headroom: 0,
+        thresholds: crate::platform::DomainThresholds { planning_bytes: 0, emergency_bytes: 0 },
+        charged: 0,
+        band: MemoryBand::Normal,
+        unseen: 0,
+        witness: None,
+        available: 0,
+        base: (Instant::now(), 0),
+        rate: 0.0,
+        fastest,
+        fluctuation: Fluctuation { settled: None, largest: fluctuation },
+        host,
+    };
+    let none = PaceMotions { host: None, device: None, latency: None, release: None };
+    let mut pace = MemoryPace::new();
+    assert_eq!(pace.motions(), none, "nothing measured before a probe");
+    pace.domains.insert(host, domain(true, 0.0, GB / 10));
+    pace.domains.insert(device, domain(false, 0.0, 0));
+    assert_eq!(pace.motions(), none, "a quiet host took nothing");
+    pace.domains.insert(host, domain(true, 5.0 * GB as f64, GB / 10));
+    pace.latency = Duration::from_millis(200);
+    assert_eq!(
+        pace.motions(),
+        PaceMotions {
+            host: Some(crate::platform::StoreMotion::new(GB / 10, 5.0 * GB as f64)),
+            latency: Some(Duration::from_millis(200)),
+            ..none
+        }
+    );
+    // The reserves hold the margin over a reading interval and that latency.
+    let reserves = crate::platform::MemoryReserves::new(crate::platform::StoreMotion::new(0, GB as f64), crate::platform::ReleaseRate::new(1e9))
+        .measured(pace.motions().host, pace.motions().device)
+        .with_latency(Duration::from_millis(200));
+    assert_eq!(reserves.host_margin(), GB / 10 + 3 * GB / 2);
 }
 
 /// The fluctuation is the largest fall between consecutive readings while

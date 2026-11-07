@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -24,7 +24,10 @@ use tokio::sync::watch;
 
 use crate::hugging_face::{HubCredential, require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, inventory_entry_id};
-use crate::inventory::{ManagedModelStore, build_model, hf_repo_dir, now, repository_lock_path};
+use crate::inventory::{
+    DownloadSpace, ManagedModelStore, build_model, hf_repo_dir, now,
+    repository_lock_path,
+};
 use crate::store_fs::{
     acquire_exclusive_lock, ensure_owned_directory as ensure_store_directory,
     quarantine_owned_path_sync,
@@ -37,6 +40,136 @@ const MAX_INTEGRITY_RECORD_BYTES: u64 = 4 * 1024;
 /// Longest a source request may go without delivering bytes before the attempt is abandoned as a
 /// retryable network interruption.
 const SOURCE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The store's writes to its volume, their one owner: the space the
+/// volume's reserve leaves them ([`DownloadSpace`]), every byte the store's
+/// downloads wrote there (beside which that space judges what other
+/// programs write), and what every live download has left to write.
+pub(crate) struct VolumeWrites {
+    space: Arc<dyn DownloadSpace>,
+    ledger: std::sync::Mutex<WriteLedger>,
+}
+
+#[derive(Default)]
+struct WriteLedger {
+    written: u64,
+    /// The bytes every live download has left to write.
+    committed: u64,
+}
+
+impl VolumeWrites {
+    pub(crate) fn new(space: Arc<dyn DownloadSpace>) -> Self {
+        Self {
+            space,
+            ledger: std::sync::Mutex::new(WriteLedger::default()),
+        }
+    }
+
+    fn ledger(&self) -> std::sync::MutexGuard<'_, WriteLedger> {
+        self.ledger
+            .lock()
+            .expect("a volume's write ledger is never left mid-update")
+    }
+
+    /// The bytes the volume lets the store's downloads still write.
+    fn space(&self, ledger: &WriteLedger) -> Result<u64, DownloadError> {
+        self.space
+            .available_bytes(ledger.written)
+            .map_err(|error| DownloadError {
+                kind: DownloadErrorKind::FileSystem,
+                message: error.to_string(),
+                retryable: true,
+                resumable: true,
+            })
+    }
+
+    /// A download of `required_bytes`, beside the bytes the volume leaves
+    /// it after every live download's: admitted, its bytes then reserved
+    /// until it writes them or ends, where they fit; refused otherwise.
+    fn admit(
+        self: &Arc<Self>,
+        required_bytes: u64,
+    ) -> Result<(u64, Result<DownloadWrites, DownloadError>), DownloadError> {
+        let mut ledger = self.ledger();
+        let available_bytes = self.space(&ledger)?.saturating_sub(ledger.committed);
+        if required_bytes > available_bytes {
+            return Ok((
+                available_bytes,
+                Err(insufficient_space(required_bytes, available_bytes)),
+            ));
+        }
+        ledger.committed += required_bytes;
+        Ok((
+            available_bytes,
+            Ok(DownloadWrites {
+                volume: Arc::clone(self),
+                remaining: AtomicU64::new(required_bytes),
+            }),
+        ))
+    }
+}
+
+fn insufficient_space(required_bytes: u64, available_bytes: u64) -> DownloadError {
+    DownloadError {
+        kind: DownloadErrorKind::InsufficientDiskSpace {
+            required_bytes,
+            available_bytes,
+        },
+        message: "insufficient disk space".to_owned(),
+        retryable: false,
+        resumable: true,
+    }
+}
+
+/// One admitted download's writes to the store's volume
+/// ([`VolumeWrites::admit`]). Before each write, the space the volume leaves
+/// must still hold what every live download has left to write; a download
+/// refused writes nothing more, its partial files kept to resume.
+struct DownloadWrites {
+    volume: Arc<VolumeWrites>,
+    /// Changed only under the volume's ledger.
+    remaining: AtomicU64,
+}
+
+impl DownloadWrites {
+    /// Writes to a volume without bound, for tests of what a download
+    /// fetches.
+    #[cfg(test)]
+    fn unbounded() -> Self {
+        let space: Arc<dyn DownloadSpace> = Arc::new(|_| Ok::<_, std::convert::Infallible>(u64::MAX));
+        let (_, writes) = Arc::new(VolumeWrites::new(space)).admit(0).expect("unbounded space");
+        writes.expect("unbounded space")
+    }
+
+    /// Refused where the volume no longer holds what every live download
+    /// has left to write.
+    fn admit(&self) -> Result<(), DownloadError> {
+        let ledger = self.volume.ledger();
+        let space = self.volume.space(&ledger)?;
+        if ledger.committed > space {
+            let remaining = self.remaining.load(Ordering::Acquire);
+            let others = ledger.committed - remaining;
+            return Err(insufficient_space(remaining, space.saturating_sub(others)));
+        }
+        Ok(())
+    }
+
+    fn wrote(&self, bytes: u64) {
+        let mut ledger = self.volume.ledger();
+        let remaining = self.remaining.load(Ordering::Acquire);
+        let settled = bytes.min(remaining);
+        self.remaining.store(remaining - settled, Ordering::Release);
+        ledger.written += bytes;
+        ledger.committed -= settled;
+    }
+}
+
+impl Drop for DownloadWrites {
+    fn drop(&mut self) {
+        let mut ledger = self.volume.ledger();
+        ledger.committed -= *self.remaining.get_mut();
+    }
+}
 
 pub(crate) struct DownloadOperation {
     sender: watch::Sender<ModelDownloadEvent>,
@@ -730,16 +863,8 @@ impl ManagedModelStore {
         let completed_bytes = resumable_bytes(&repo_root, &components).await;
         let missing_bytes = total_bytes.saturating_sub(completed_bytes);
         let required_bytes = missing_bytes.saturating_add(companion_bytes);
-        // What the volume has above its reserve, which fit owns.
-        let available_bytes =
-            self.download_space
-                .available_bytes()
-                .map_err(|error| DownloadError {
-                    kind: DownloadErrorKind::FileSystem,
-                    message: error.to_string(),
-                    retryable: true,
-                    resumable: true,
-                })?;
+        // What the volume has above its reserve, which its writer's space owns.
+        let (available_bytes, admitted) = self.volume.admit(required_bytes)?;
         operation
             .sender
             .send_replace(ModelDownloadEvent::CheckingSpace {
@@ -750,17 +875,7 @@ impl ManagedModelStore {
                 completed_bytes,
                 total_bytes,
             });
-        if required_bytes > available_bytes {
-            return Err(DownloadError {
-                kind: DownloadErrorKind::InsufficientDiskSpace {
-                    required_bytes,
-                    available_bytes,
-                },
-                message: "insufficient disk space".to_owned(),
-                retryable: false,
-                resumable: true,
-            });
-        }
+        let writes = admitted?;
 
         let started_at = now();
         let planned = InventoryModel {
@@ -909,6 +1024,7 @@ impl ManagedModelStore {
                     }
                 },
                 &operation.control,
+                &writes,
             )
             .await
             .map_err(|error| error.presented_credential(credentialed))?;
@@ -1046,6 +1162,7 @@ async fn download_component_with_retry(
     local_source: Option<&Path>,
     mut progress: impl FnMut(u64, DownloadStage),
     control: &TransferControl,
+    writes: &DownloadWrites,
 ) -> Result<(), DownloadError> {
     let blobs = root
         .join("hub")
@@ -1057,7 +1174,7 @@ async fn download_component_with_retry(
         return Ok(());
     }
     if let Some(source) = local_source {
-        match copy_local_component(source, component, &paths, &mut progress, control).await {
+        match copy_local_component(source, component, &paths, &mut progress, control, writes).await {
             Ok(()) => return Ok(()),
             Err(error) if matches!(error.kind, DownloadErrorKind::Cancelled) => return Err(error),
             Err(error) => tracing::warn!(
@@ -1085,6 +1202,7 @@ async fn download_component_with_retry(
             &mut integrity,
             &mut progress,
             control,
+            writes,
         )
         .await
         {
@@ -1115,6 +1233,7 @@ async fn download_component_once(
     integrity: &mut DownloadIntegrity,
     progress: &mut impl FnMut(u64, DownloadStage),
     control: &TransferControl,
+    writes: &DownloadWrites,
 ) -> Result<(), DownloadError> {
     let mut offset = integrity.bytes;
     if offset == component.size_bytes {
@@ -1173,7 +1292,12 @@ async fn download_component_once(
                 resumable: true,
             });
         }
+        if let Err(error) = writes.admit() {
+            persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
+            return Err(error);
+        }
         file.write_all(&chunk).await.map_err(download_io)?;
+        writes.wrote(chunk_len);
         integrity.update(&chunk)?;
         offset += chunk_len;
         progress(offset, DownloadStage::Downloading);
@@ -1216,6 +1340,7 @@ async fn copy_local_component(
     paths: &DownloadComponentPaths,
     progress: &mut impl FnMut(u64, DownloadStage),
     control: &TransferControl,
+    writes: &DownloadWrites,
 ) -> Result<(), DownloadError> {
     if !matches!(component.content, ContentIdentity::Sha256 { .. }) {
         return Err(DownloadError {
@@ -1237,7 +1362,7 @@ async fn copy_local_component(
         let integrity = if cloned {
             verified_integrity(&paths.partial, component, progress, control).await?
         } else {
-            streamed_copy(&source, &paths.partial, component, progress, control).await?
+            streamed_copy(&source, &paths.partial, component, progress, control, writes).await?
         };
         atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
         publish_verified_blob(paths).await
@@ -1313,6 +1438,7 @@ async fn streamed_copy(
     component: &ModelComponent,
     progress: &mut impl FnMut(u64, DownloadStage),
     control: &TransferControl,
+    writes: &DownloadWrites,
 ) -> Result<DownloadIntegrity, DownloadError> {
     use tokio::io::AsyncReadExt as _;
     let mut input = tokio::fs::File::open(source).await.map_err(download_io)?;
@@ -1327,10 +1453,12 @@ async fn streamed_copy(
         if read == 0 {
             break;
         }
+        writes.admit()?;
         output
             .write_all(&buffer[..read])
             .await
             .map_err(download_io)?;
+        writes.wrote(read as u64);
         integrity.update(&buffer[..read])?;
         if integrity.bytes > component.size_bytes {
             return Err(DownloadError {
@@ -3054,6 +3182,7 @@ mod tests {
             &mut integrity,
             &mut |_, _| {},
             &control,
+            &DownloadWrites::unbounded(),
         )
         .await
         .expect_err("stalled source");
@@ -3080,6 +3209,7 @@ mod tests {
             None,
             |_, _| {},
             &control,
+            &DownloadWrites::unbounded(),
         )
         .await
         .expect("resumed download");
@@ -3119,6 +3249,7 @@ mod tests {
             Some(&found),
             |_, _| {},
             &control,
+            &DownloadWrites::unbounded(),
         )
         .await
         .expect("copied component");
@@ -3202,6 +3333,7 @@ mod tests {
             Some(&changed),
             |_, _| {},
             &control,
+            &DownloadWrites::unbounded(),
         )
         .await
         .expect("downloaded component");
@@ -3256,6 +3388,7 @@ mod tests {
             Some(&snapshot_entry),
             |_, _| {},
             &control,
+            &DownloadWrites::unbounded(),
         )
         .await
         .expect("component from the local copy");
@@ -3323,6 +3456,7 @@ mod tests {
             &component,
             &mut |bytes, _| reported = bytes,
             &control,
+            &DownloadWrites::unbounded(),
         )
         .await
         .expect("streamed copy");
@@ -3340,7 +3474,7 @@ mod tests {
         tokio::fs::write(&other, &changed)
             .await
             .expect("other file");
-        let error = copy_local_component(&other, &component, &paths, &mut |_, _| {}, &control)
+        let error = copy_local_component(&other, &component, &paths, &mut |_, _| {}, &control, &DownloadWrites::unbounded())
             .await
             .expect_err("mismatched source");
         assert!(matches!(error.kind, DownloadErrorKind::Integrity));
@@ -3373,6 +3507,7 @@ mod tests {
             None,
             |_, _| {},
             &control,
+            &DownloadWrites::unbounded(),
         )
         .await
         .expect_err("cancelled download");
@@ -3511,6 +3646,35 @@ mod tests {
         assert!(matches!(error.kind, DownloadErrorKind::Integrity));
         assert!(!error.retryable());
         assert!(!error.resumable());
+    }
+
+    #[test]
+    fn concurrent_downloads_are_admitted_only_together_within_the_volume() {
+        let volume = Arc::new(VolumeWrites::new(Arc::new(|written: u64| {
+            Ok::<_, std::convert::Infallible>(100_u64.saturating_sub(written))
+        })));
+        let refused = |admitted: Result<DownloadWrites, DownloadError>| match admitted {
+            Err(DownloadError {
+                kind:
+                    DownloadErrorKind::InsufficientDiskSpace {
+                        required_bytes,
+                        available_bytes,
+                    },
+                ..
+            }) => (required_bytes, available_bytes),
+            _ => panic!("admitted beyond the volume"),
+        };
+        let (_, first) = volume.admit(60).expect("space");
+        let first = first.expect("the first fits");
+        let (available, second) = volume.admit(60).expect("space");
+        assert_eq!(available, 40);
+        assert_eq!(refused(second), (60, 40));
+        // Written bytes leave what the first has left reserved.
+        first.wrote(30);
+        assert_eq!(refused(volume.admit(60).expect("space").1), (60, 40));
+        // Its end releases the rest.
+        drop(first);
+        assert!(volume.admit(60).expect("space").1.is_ok());
     }
 
     #[test]

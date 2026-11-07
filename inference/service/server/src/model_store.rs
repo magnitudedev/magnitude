@@ -5,24 +5,27 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use magnitude_executor::platform::{MemoryReserves, volume_space};
-use magnitude_service_models::{InventoryConfig, ManagedModelStore};
+use magnitude_executor::platform::VolumeReserves;
+use magnitude_service_models::{InventoryConfig, ManagedModelStore, ModelCache};
 use seismic::Devices;
 
 /// An open model store and the devices discovered with the paths it serves.
 pub struct ServedStore {
     pub store: Arc<ManagedModelStore>,
     pub devices: Arc<Devices>,
+    /// The reserves of the volumes the store writes: its downloads' space and the hardware
+    /// report read the one reserve of each.
+    pub volumes: Arc<VolumeReserves>,
 }
 
-/// Open the store of `config`, its downloads held to the space its volume fits above `reserves`
-/// (the engine's fit owner, [`volume_space`]), then discover the devices with the paths it
-/// serves ([`ManagedModelStore::served_paths`]).
-pub async fn open_served_store(
-    config: InventoryConfig,
-    reserves: MemoryReserves,
-) -> anyhow::Result<ServedStore> {
-    let space = Arc::new(volume_space(config.root.clone(), reserves));
+/// Open the store of `config`, its downloads held to the space its volume leaves above its
+/// reserve ([`VolumeReserves::space`], its prior the volume's write rate as the kernel cache
+/// keeps it),
+/// then discover the devices with the paths it serves ([`ManagedModelStore::served_paths`]).
+pub async fn open_served_store(config: InventoryConfig) -> anyhow::Result<ServedStore> {
+    let kernels = ModelCache::new(&config.cache_root).kernel_directory();
+    let volumes = Arc::new(VolumeReserves::new(Some(kernels)));
+    let space = Arc::new(Arc::clone(&volumes).space(config.root.clone()));
     let store = Arc::new(
         ManagedModelStore::open(config, space)
             .await
@@ -35,5 +38,6 @@ pub async fn open_served_store(
     Ok(ServedStore {
         store,
         devices: Arc::new(devices),
+        volumes,
     })
 }

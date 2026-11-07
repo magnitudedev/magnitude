@@ -148,6 +148,21 @@ fn kernel_pressure() -> Result<KernelPressure, ObservationError> {
     }
 }
 
+/// The pageout daemon's free-page target (`vm.vm_page_free_target`,
+/// XNU's `vm_page_free_target`, set at boot from RAM): the free pages the
+/// kernel reclaims toward, file pages first and then by compressing
+/// anonymous ones. `allocatable` counts free pages, so taking memory below
+/// this many free makes the kernel reclaim for it.
+fn free_target(reading: &VmReading) -> Result<u64, ObservationError> {
+    let name = "vm.vm_page_free_target";
+    let pages = sysctl_u64(name)
+        .map_err(ObservationError::Failed)?
+        .ok_or_else(|| ObservationError::Failed(format!("sysctl {name} reported no value")))?;
+    pages
+        .checked_mul(reading.page_size)
+        .ok_or_else(|| ObservationError::Failed(format!("{name} bytes overflow")))
+}
+
 /// Every page of programs' data the compressor holds, in RAM or swapped out
 /// (`vm.compressor_segment_pages_compressed`). Mach's
 /// `total_uncompressed_pages_in_compressor` is no such count: macOS 15
@@ -249,6 +264,7 @@ pub(super) fn sample_of(reading: &VmReading) -> Result<HostSample, ObservationEr
         limits: Vec::new(),
         limit_visibility: LimitVisibility::Complete,
         kernel_pressure: Some(kernel_pressure()?),
+        free_target: Some(free_target(reading)?),
         held: Some(HostHeld {
             wired_bytes: pages_bytes(reading, statistics.wire_count, "wired")?,
             compressed_bytes: pages_bytes(reading, statistics.compressor_page_count, "compressor")?,

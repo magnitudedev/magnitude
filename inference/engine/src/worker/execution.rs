@@ -254,7 +254,7 @@ mod tests {
         // The pricing: the streamed fixture model planned on this device,
         // its bank and resident plan, its costs kept in an empty cache.
         let catalog = seismic::Devices::discover(&[]).unwrap();
-        let reserves = platform::MemoryReserves::standard();
+        let reserves = platform::MemoryReserves::of_machine(None);
         let selected =
             platform::select_device(&catalog, ExecutionPath::Native, platform::DeviceRequest::Backend(backend), &reserves)
                 .unwrap();

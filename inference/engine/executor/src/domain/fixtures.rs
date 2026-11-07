@@ -269,7 +269,7 @@ pub fn fixture_of(
     device_request: platform::DeviceRequest,
 ) -> Fixture {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    let reserves = platform::MemoryReserves::standard();
+    let reserves = platform::MemoryReserves::of_machine(None);
     let selected = platform::select_device(&catalog, ExecutionPath::Native, device_request, &reserves)
         .unwrap_or_else(|error| panic!("{device_request} selects a device: {error}"));
     let device = Rc::new(

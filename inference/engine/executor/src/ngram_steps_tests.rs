@@ -1294,7 +1294,7 @@ fn load(
     // A hung step reports every owner and every thread's stack on SIGUSR1,
     // as the rig asks a job past its estimate.
     crate::diagnostics::install();
-    let reserves = platform::MemoryReserves::standard();
+    let reserves = platform::MemoryReserves::of_machine(None);
     let selected = platform::select_device(
         catalog,
         ExecutionPath::Native,

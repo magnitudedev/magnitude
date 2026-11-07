@@ -6,7 +6,7 @@ use crate::memory::{
 };
 use super::borrowing::{BankRoom, Room};
 use crate::platform::{
-    DomainReading, DomainRole, Fit, FitMode, HostRoom, LoadStage, MemoryBand, MemoryConstraint,
+    DomainReading, DomainRole, Fit, FitMode, StoreMotion, HostRoom, LoadStage, MemoryBand, MemoryConstraint,
     MemoryPolicyError, MemoryReserves, Serving, StorageDemand,
 };
 use crate::memory::CLAIMED;
@@ -213,6 +213,21 @@ pub struct DeviceHeap {
 }
 
 impl DeviceHeap {
+    /// Hold every fit from the next reading on at what the load measured:
+    /// host RAM's motion and a device's own memory's, and its release
+    /// latency once one finished (`platform::MemoryReserves::measured`).
+    pub(crate) fn measure(
+        &mut self,
+        host: Option<StoreMotion>,
+        device: Option<StoreMotion>,
+        latency: Option<std::time::Duration>,
+        release: Option<crate::platform::ReleaseRate>,
+        releasable: crate::platform::Releasable,
+    ) {
+        let measured = self.reserves.measured(host, device).releasing(release, releasable);
+        self.reserves = latency.map_or(measured, |latency| measured.with_latency(latency));
+    }
+
     /// The heap of `device`, observed once, for a load
     /// ([`HostRoom::Load`], accepting its own displacement). Its
     /// capacity, the stable fit of the device's storage
@@ -681,6 +696,7 @@ mod tests {
                     limit_visibility: seismic::LimitVisibility::Complete,
                     displacement: None,
                     kernel_pressure: None,
+                    free_target: Some(0),
                     held: None,
                     displaced_bytes: None,
                 }),
@@ -692,7 +708,7 @@ mod tests {
         };
         // The device's blocks leave 4 GiB of its memory as headroom.
         status.runtime.charges = vec![(gpu.id(), gpu.capacity().value - 4 * GIB)];
-        let reserves = MemoryReserves::standard();
+        let reserves = MemoryReserves::of_machine(None);
         let fit = Fit::new(&topology, &status, &reserves, HostRoom::Allocatable);
         let ceiling = fit.store(gpu.id()).unwrap().ceiling_bytes;
         let allocated = ClaimDemand {
@@ -762,7 +778,7 @@ mod tests {
     fn cpu_heap() -> DeviceHeap {
         let catalog = Rc::new(Devices::discover(&[]).unwrap());
         let device = Rc::new(catalog.open_backend(BackendName::Cpu).unwrap());
-        DeviceHeap::open(catalog, MemoryReserves::standard(), device).unwrap()
+        DeviceHeap::open(catalog, MemoryReserves::of_machine(None), device).unwrap()
     }
 
     #[test]
@@ -770,7 +786,7 @@ mod tests {
         let catalog = Devices::discover(&[]).unwrap();
         let device = catalog.open_backend(BackendName::Cpu).unwrap();
         assert_eq!(
-            require_normal(&catalog, &device, &MemoryReserves::standard(), HostRoom::Load(LoadStage::Loading)),
+            require_normal(&catalog, &device, &MemoryReserves::of_machine(None), HostRoom::Load(LoadStage::Loading)),
             Ok(())
         );
     }

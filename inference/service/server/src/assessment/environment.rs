@@ -68,7 +68,7 @@ pub fn assessment_structure(
         devices,
         serving.request(),
         kernels,
-        MemoryReserves::standard(),
+        MemoryReserves::of_machine(kernels.zip(Some(&*devices.topology()))),
         serving_policy(),
         standard_service_limits(),
     )?;

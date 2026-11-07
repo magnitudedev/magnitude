@@ -643,7 +643,7 @@ pub(crate) mod tests {
             &catalog,
             ExecutionPath::Native,
             crate::platform::DeviceRequest::Automatic,
-            &MemoryReserves::standard(),
+            &MemoryReserves::of_machine(None),
         )
         .unwrap();
         selected.assessment_capacity_bytes = selected.assessment_capacity_bytes.min(capacity_bytes);
@@ -677,7 +677,7 @@ pub(crate) mod tests {
             context_limit,
             performance_depths: depths.to_vec(),
             sequences: 1,
-            reserves: MemoryReserves::standard(),
+            reserves: MemoryReserves::of_machine(None),
         }
     }
 

@@ -31,7 +31,7 @@ fn model() -> ResolvedEngineConfiguration {
         path: ExecutionPath::Native,
         device: DeviceRequest::Backend(BackendName::Cpu),
         kernel_cache: None,
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     }
     .resolve()
     .unwrap()
@@ -64,11 +64,9 @@ impl Window {
             *byte = 1;
         }
         let catalog = Devices::discover(&[]).unwrap();
-        let reserve = MemoryReserves::standard()
-            .for_domain(
-                &StoreKind::HostRam,
-                catalog.topology().host_ram().capacity().value,
-            )
+        let host = catalog.inventory().host_status().unwrap();
+        let reserve = MemoryReserves::of_machine(None)
+            .host_thresholds(&StoreKind::HostRam, &host)
             .planning_bytes;
         let used = std::fs::read_to_string(group.join("memory.current"))
             .unwrap()

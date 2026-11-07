@@ -772,7 +772,7 @@ pub fn kernel_inventory(
         policy,
         service,
         device: DeviceRequest::Backend(backend),
-        reserves: MemoryReserves::standard(),
+        reserves: MemoryReserves::of_machine(None),
     };
     let plain = environment
         .plain(&admitted)

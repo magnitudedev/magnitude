@@ -7,7 +7,7 @@ use crate::batching::{
     ValidatedTargetBatch,
 };
 use crate::memory::{ClaimId, HoldingClass, MemoryHeap};
-use crate::platform::{DomainReading, DomainRole, DomainThresholds, MemoryBand};
+use crate::platform::{DomainReading, DomainRole, DomainThresholds, MemoryBand, ReleaseRate, Releasable, StoreMotion};
 use crate::programs::{Chain, ProgramSubmission};
 use crate::programs::graph::readout;
 use crate::{
@@ -958,6 +958,11 @@ impl<'d> MemoryProbe<'d> {
         let readings = self.observe(bank)?;
         let host = self.host_witness(&readings);
         self.pace.borrow_mut().observe(&readings, &self.domain.device().ledgers().own_claims(), host, !self.resizing, reading_interval);
+        // Every fit from the next reading on holds the line at the motion
+        // and release latency measured now.
+        let motions = self.pace.borrow().motions();
+        let releasable = bank.map(releasable).transpose()?.unwrap_or_default();
+        self.memory.borrow_mut().measure(motions.host, motions.device, motions.latency, motions.release, releasable);
         match readings.into_iter().find(|reading| reading.band == MemoryBand::Reclaim) {
             Some(reading) => Err(DomainError::Reclaim(reading)),
             None => Ok(()),
@@ -1239,6 +1244,19 @@ struct MemoryPace {
     read: Option<Instant>,
     /// The last finished release's latency; zero before the first.
     latency: Duration,
+    /// The slowest finished release's rate: its bytes over its span from
+    /// decision to effect; none before one released any.
+    release: Option<ReleaseRate>,
+}
+
+/// What a load measured of the rest of the host and of its own releases
+/// ([`MemoryPace::motions`]).
+#[derive(Debug, PartialEq)]
+struct PaceMotions {
+    host: Option<StoreMotion>,
+    device: Option<StoreMotion>,
+    latency: Option<Duration>,
+    release: Option<ReleaseRate>,
 }
 
 /// One domain's pace, as of its latest probe.
@@ -1270,6 +1288,9 @@ struct DomainPace {
     /// Available memory's fluctuation over its readings since the domain
     /// last left Reclaim.
     fluctuation: Fluctuation,
+    /// Whether the domain is host RAM: its margin is host RAM's
+    /// ([`MemoryPace::margins`]).
+    host: bool,
 }
 
 /// Available memory's fluctuation in steady state: the largest fall between
@@ -1340,6 +1361,7 @@ impl MemoryPace {
             reading_interval: Duration::ZERO,
             read: None,
             latency: Duration::ZERO,
+            release: None,
         }
     }
 
@@ -1430,6 +1452,7 @@ impl MemoryPace {
                     rate,
                     fastest,
                     fluctuation,
+                    host: reading.identity == seismic::StoreIdentity::HostRam,
                 },
             );
         }
@@ -1462,13 +1485,42 @@ impl MemoryPace {
     }
 
     /// What a growth step in `store` must stay below at the latest probe,
-    /// and the margin it leaves: its domain's ceiling less the reading's
+    /// and the margin it leaves: its domain's ceiling, whose planning line
+    /// holds the reading's fluctuation ([`Self::margin`]), and that
     /// fluctuation; `None` before a probe of it. Each store's room is its
     /// own: a step in host memory takes nothing of a device's.
     fn growth_room(&self, store: seismic::StoreId) -> Option<(u64, u64)> {
         self.domains
             .get(&store)
-            .map(|pace| (pace.thresholds.ceiling(pace.headroom).saturating_sub(pace.fluctuation.largest), pace.fluctuation.largest))
+            .map(|pace| (pace.thresholds.ceiling(pace.headroom), pace.fluctuation.largest))
+    }
+
+    /// What the load measured of the rest of the host's motion
+    /// (`platform::StoreMotion`), which its reserves hold their margin at:
+    /// host RAM's, a device's own memory's (the largest of its allocation
+    /// domains'), each the steady fluctuation of available memory and the
+    /// fastest rate the rest of the host took it at, none where no domain
+    /// of it measured a take; and the last finished release's latency, none
+    /// before one. A measured motion only ever raises what was known
+    /// (`platform::MemoryReserves::measured`), whose take rate starts at
+    /// the machine's page-fill rate; and the slowest finished release's
+    /// rate, none before one, which only ever lowers what was known (the
+    /// machine's page-release rate).
+    fn motions(&self) -> PaceMotions {
+        let motion = |host: bool| {
+            self.domains
+                .values()
+                .filter(|pace| pace.host == host && (host || pace.role == DomainRole::Allocation))
+                .filter(|pace| pace.fastest > 0.0)
+                .map(|pace| StoreMotion::new(pace.fluctuation.largest, pace.fastest))
+                .reduce(StoreMotion::with)
+        };
+        PaceMotions {
+            host: motion(true),
+            device: motion(false),
+            latency: (self.latency > Duration::ZERO).then_some(self.latency),
+            release: self.release,
+        }
     }
 
     /// `store`'s available memory's fluctuation at the latest probe, which a
@@ -1503,10 +1555,30 @@ impl MemoryPace {
         self.reading_interval + 2 * self.latency
     }
 
-    /// A release finished, as `times` say.
-    fn released(&mut self, times: &ResizeTimes) {
+    /// A release of `bytes` finished, as `times` say: its latency, and its
+    /// rate where it released any.
+    fn released(&mut self, bytes: u64, times: &ResizeTimes) {
         self.latency = times.released - times.decided;
+        let seconds = self.latency.as_secs_f64();
+        if bytes > 0 && seconds > 0.0 {
+            let rate = ReleaseRate::new(bytes as f64 / seconds);
+            self.release = Some(self.release.map_or(rate, |slowest| slowest.with(rate)));
+        }
     }
+}
+
+/// What `bank` can release now: its slots beyond its floor, each an equal
+/// share of its records' charge in every store, host RAM's apart from the
+/// device's own memory's.
+fn releasable(bank: &dyn ElasticBank) -> Result<Releasable, DomainError> {
+    let residency = bank.residency()?;
+    let above = u128::from(residency.slots.saturating_sub(residency.floor));
+    let slots = u128::from(residency.slots.max(1));
+    let share = |bytes: u64| u64::try_from(u128::from(bytes) * above / slots).expect("a share of a charge fits its charge");
+    Ok(residency.stores.iter().fold(Releasable::default(), |releasable, (store, bytes)| match store {
+        seismic::StoreIdentity::HostRam => Releasable { host: releasable.host + share(*bytes), ..releasable },
+        _ => Releasable { device: releasable.device + share(*bytes), ..releasable },
+    }))
 }
 
 /// `deficit` bytes now, and what the host takes at `rate` bytes a second
