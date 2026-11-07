@@ -2638,7 +2638,15 @@ pub(super) trait ComposedContender<'a> {
     /// devices.
     fn pin_identity(&self) -> String;
     fn label(&self) -> &'static str;
-    fn cached(&self) -> Option<bool>;
+    /// The stored choice, when the record of the recipe's comparison
+    /// against its prerequisites' choices (`chosen`) as they stand is
+    /// known. None while a prerequisite is still searched: the
+    /// qualification looks the record up once it is final.
+    fn cached(
+        &mut self,
+        device: &Device,
+        chosen: &HashMap<TuningKey, NativeSpecialization>,
+    ) -> Result<Option<bool>, CatalogFailure>;
     /// Weigh the recipe's point by the launches the load's graph supplied
     /// for it ([`apply_invocation_counts`]).
     fn set_invocations(
@@ -3724,10 +3732,6 @@ impl Drop for Staff<'_> {
 }
 
 impl<'a> Tuner<'a> {
-    pub(super) fn choice(&self, key: &TuningKey) -> Option<&NativeSpecialization> {
-        self.chosen.get(key)
-    }
-
     /// `fixed` with each arithmetic parameter of `implementation`
     /// (`NativeParameter::arithmetic`) at its value in the choice of the
     /// unit `prerequisite` as it stands: a dependant whose results carry its
@@ -4712,7 +4716,7 @@ impl<'a> Tuner<'a> {
             self.composed_choices.insert(key, selected);
             return Ok(Some(selected));
         }
-        if let Some(selected) = contender.cached() {
+        if let Some(selected) = contender.cached(self.device, &self.chosen)? {
             if serving {
                 pinned::record_recipe(label, &identity, selected);
             }

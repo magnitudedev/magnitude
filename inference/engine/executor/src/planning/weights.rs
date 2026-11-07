@@ -405,12 +405,24 @@ pub struct ScalableWeight {
     pub scale: u64,
 }
 
-/// Physical resident storage identity. Multiple semantic roles may name one
-/// tensor, while distinct resident representations, and distinct import
-/// transforms of one stored tensor, require distinct storage.
+/// Physical resident storage identity: the opened component that holds the
+/// weight and the weight's identity within any open of its package. Multiple
+/// semantic roles may name one tensor, while distinct resident
+/// representations, and distinct import transforms of one stored tensor,
+/// require distinct storage.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WeightStorageIdentity {
-    pub component: ArtifactComponent,
+    pub artifact: ArtifactIdentity,
+    pub stored: PersistentWeightIdentity,
+}
+
+/// A stored weight's identity at every open of its package: its component's
+/// role, its tensor, the import transforms and the resident form. It holds
+/// no per-open `ArtifactIdentity`, so what persistent records key on it is
+/// the same at every open.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct PersistentWeightIdentity {
+    pub kind: ArtifactComponentKind,
     pub tensor_name: String,
     pub transforms: Vec<ImportTransform>,
     pub resident: Element,
@@ -419,7 +431,14 @@ pub struct WeightStorageIdentity {
 impl WeightPlan {
     pub fn storage_identity(&self) -> WeightStorageIdentity {
         WeightStorageIdentity {
-            component: self.component,
+            artifact: self.component.identity,
+            stored: self.persistent_identity(),
+        }
+    }
+
+    pub fn persistent_identity(&self) -> PersistentWeightIdentity {
+        PersistentWeightIdentity {
+            kind: self.component.kind,
             tensor_name: self.descriptor.name.clone(),
             transforms: self.descriptor.transforms.clone(),
             resident: self.resident,

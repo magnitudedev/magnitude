@@ -193,12 +193,6 @@ impl<'a> Tuning<'a> {
         }
     }
 
-    pub fn choice(&self, key: &super::tuning::TuningKey) -> Option<&NativeSpecialization> {
-        match self {
-            Self::Tuner(tuner) => tuner.choice(key),
-            Self::Listing(_) | Self::Demand { .. } => None,
-        }
-    }
     pub fn cache(&self) -> Option<&'a crate::kernel_cache::KernelCache> {
         match self {
             Self::Tuner(tuner) => tuner.cache(),

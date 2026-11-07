@@ -65,7 +65,7 @@ pub use weights::{
     HostTablePlan, ModelLoadPlan,
     NGramBinding, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
     ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoutedBinding, ScalableWeight,
-    SelectionBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlan, WeightScalePlan, WeightStorageIdentity,
+    SelectionBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlan, WeightScalePlan, WeightStorageIdentity, PersistentWeightIdentity,
     held_storage, resident_element, resident_elements, resident_layout, scaled_source_element,
     source_element, stored_weights,
 };

@@ -663,7 +663,7 @@ fn constraint_parts(condition: &NativeCondition, parts: &mut Vec<Vec<String>>) {
 /// Launch-selection coordinates are boundaries even when selecting a form
 /// changes scratch or constrains that form's local code parameters. Those
 /// restrictions are conditioned on the boundary, not Cartesian group edges.
-fn boundary_parameters(implementation: &NativeImplementation) -> Vec<ParameterAddress> {
+pub(super) fn boundary_parameters(implementation: &NativeImplementation) -> Vec<ParameterAddress> {
     let mut conditions = Vec::new();
     let mut geometry = Vec::new();
     for launch in &implementation.launches {

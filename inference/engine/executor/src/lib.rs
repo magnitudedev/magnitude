@@ -137,6 +137,7 @@ pub use planning::{
     SharedHeadProgramPlan, StartupSlots, StateCapacityPlan, StateProgramPlan, StateResourcePlan,
     StateStorePlan, SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
     TensorOperations, VisionProgramPlan, WeightPlan, WeightScalePlan, WeightStorageIdentity,
+    PersistentWeightIdentity,
     draft_ladder, held_storage, image_cell_limit, max_image_cells, resident_element, resident_elements, resident_layout, source_element,
     scaled_source_element, stored_weights,
 };

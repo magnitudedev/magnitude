@@ -1761,8 +1761,12 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
         fn label(&self) -> &'static str {
             "test_recipe"
         }
-        fn cached(&self) -> Option<bool> {
-            None
+        fn cached(
+            &mut self,
+            _: &Device,
+            _: &HashMap<TuningKey, NativeSpecialization>,
+        ) -> Result<Option<bool>, CatalogFailure> {
+            Ok(None)
         }
         fn set_invocations(
             &mut self,
@@ -1894,8 +1898,12 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
         fn label(&self) -> &'static str {
             "test_recipe"
         }
-        fn cached(&self) -> Option<bool> {
-            None
+        fn cached(
+            &mut self,
+            _: &Device,
+            _: &HashMap<TuningKey, NativeSpecialization>,
+        ) -> Result<Option<bool>, CatalogFailure> {
+            Ok(None)
         }
         fn set_invocations(
             &mut self,
@@ -1995,7 +2003,7 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
     assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
     // The pinned unit serves its choice from the count on, and forms and
     // searches nothing.
-    assert_eq!(tuner.choice(&dependency), Some(&defaults));
+    assert_eq!(tuner.chosen.get(&dependency), Some(&defaults));
     let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     assert_eq!(case.formations.get(), 0);
     tuner.tune(&case, &implementation, &statics).unwrap();
