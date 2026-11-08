@@ -34,7 +34,7 @@ use crate::census::AllocationCensus;
 use crate::execution::LoadAttempt;
 use magnitude_executor::UnpreparedUnits;
 use crate::error::{ArtifactError, LoadError, UnloadCause};
-use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResourcePlanSummary};
+use crate::options::{ExecutionManifest, InputModalities, ReadyInfo, ResolvedModelPolicy, ResourcePlanSummary};
 use execution::ExecutionOwner;
 use magnitude_artifacts::Package;
 use magnitude_chat::{
@@ -286,6 +286,9 @@ fn serve(
 
 /// Readiness facts of the constructed execution domain.
 struct ExecutionReady {
+    /// The model policy the load serves: the manifest's, within what its
+    /// verifies read once ([`ResolvedModelPolicy::verifying_within`]).
+    model: ResolvedModelPolicy,
     resources: ResourcePlanSummary,
     device: seismic::ExecutorSelector,
     backend: seismic::BackendName,
@@ -332,7 +335,6 @@ fn load(
     let definition = manifest.definition.clone();
     let session_definition = manifest.definition.clone();
     let manifest_identity = manifest.package.identity;
-    let ready_model = manifest.model.clone();
     let ready_service = manifest.service.clone();
     let ready_path = manifest.path;
     let host_package = package.clone();
@@ -360,8 +362,8 @@ fn load(
             LoadAttempt::Loaded(built) => built,
             LoadAttempt::Unprepared => return Err(Stopped::Unprepared),
         };
-        let method = manifest
-            .model
+        let model = manifest.model.clone().verifying_within(built.domain.streamed_verify_rows());
+        let method = model
             .factory(&manifest.package.identity.to_string())
             .map_err(internal)?;
         if built.domain.execution_path() != manifest.path {
@@ -385,6 +387,7 @@ fn load(
             .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes, owner.serving_census()?))
             .map_err(internal)?;
         let ready = ExecutionReady {
+            model,
             resources,
             device: built.device,
             backend,
@@ -448,7 +451,7 @@ fn load(
         package: manifest_identity,
         template_fingerprint: chat.template_fingerprint,
         modalities: chat.modalities,
-        model: ready_model,
+        model: execution_ready.model,
         service: ready_service,
         resources: execution_ready.resources,
         path: ready_path,

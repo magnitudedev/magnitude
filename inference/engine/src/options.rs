@@ -281,6 +281,31 @@ impl ResolvedModelPolicy {
         }
     }
 
+    /// This policy as a load serves it whose verifies read each streamed
+    /// expert once for all their rows up to `verify_rows` rows (a streaming
+    /// load's decode form; none where every expert is resident). Its
+    /// adaptive MTP rounds draft at most one proposal fewer, so the widest
+    /// verify, the proposals and their anchor, fits: a wider one runs the
+    /// prompt path's scratch protocol instead. An explicit width or budget
+    /// keeps what it asks for, and a separate draft's width is its block's.
+    pub fn verifying_within(self, verify_rows: Option<usize>) -> Self {
+        let ResolvedMethod::Mtp { greedy_proposals, sampled_proposals, history } = self.method else {
+            return self;
+        };
+        let (Some(rows), Some(DraftPolicy::Adaptive)) = (verify_rows, self.draft_policy) else {
+            return self;
+        };
+        let widest = u8::try_from(rows - 1).expect("a verify's rows past its anchor are a draft width");
+        Self {
+            method: ResolvedMethod::Mtp {
+                greedy_proposals: greedy_proposals.min(widest),
+                sampled_proposals: sampled_proposals.min(widest),
+                history,
+            },
+            ..self
+        }
+    }
+
     pub fn factory(&self, artifact_identity: &str) -> Result<Arc<dyn Method>, String> {
         match (self.method, self.draft_policy) {
             (ResolvedMethod::Mtp { history, .. }, Some(policy)) => {
@@ -929,6 +954,31 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(mtp.draft_policy, Some(DraftPolicy::Adaptive));
+    }
+
+    /// An adaptive load whose verifies read each streamed expert once up to
+    /// the decode form's rows drafts at most one proposal fewer, so its
+    /// widest verify fits; a load with every expert resident, an explicit
+    /// width and an explicit fixed budget keep theirs.
+    #[test]
+    fn a_streaming_load_drafts_within_its_single_landing_verify() {
+        let mtp = |policy: Option<DraftPolicy>, proposals: Option<u8>| ModelPolicy {
+            mtp_proposals: proposals,
+            draft_policy: policy,
+            ..ModelPolicy::default()
+        }
+        .resolve(&definition(true))
+        .unwrap();
+        let widths = |policy: ResolvedModelPolicy| match policy.method {
+            ResolvedMethod::Mtp { greedy_proposals, sampled_proposals, .. } => (greedy_proposals, sampled_proposals),
+            other => panic!("not MTP: {other:?}"),
+        };
+        let widest = MAX_DRAFT_PROPOSALS;
+        assert_eq!(widths(mtp(None, None).verifying_within(Some(8))), (7, 7));
+        assert_eq!(widths(mtp(None, None).verifying_within(None)), (widest, widest));
+        assert_eq!(widths(mtp(None, Some(widest)).verifying_within(Some(8))), (widest, widest));
+        let fixed = DraftPolicy::Fixed(DraftBudget { generated: 8, verified: 8 });
+        assert_eq!(widths(mtp(Some(fixed), None).verifying_within(Some(8))), (widest, widest));
     }
 
     #[test]

@@ -1395,6 +1395,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.family.expert_bank().map(|bank| bank.slots())
     }
 
+    /// The most rows a verify carries while each streamed expert it misses
+    /// is read once for all of them: the decode form's; none without an
+    /// elastic bank, where every expert is resident.
+    pub fn streamed_verify_rows(&self) -> Option<usize> {
+        self.family
+            .expert_bank()
+            .map(|_| crate::operators::routed::fused_graph::DECODE_ROWS as usize)
+    }
+
     /// Where the load's routed experts are now (`ElasticBank::residency`);
     /// none without an elastic bank.
     pub fn expert_residency(&self) -> Result<Option<super::ExpertResidency>, DomainError> {
