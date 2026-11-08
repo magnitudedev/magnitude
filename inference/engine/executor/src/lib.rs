@@ -84,7 +84,7 @@ pub use native::{
     ZeroTuningWeights, attention_points, row_points,
 };
 pub use operation::{
-    CommittedClass, DraftForm, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey,
+    CommittedClass, DraftForm, DraftShape, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey,
     HeadPhase, Operation, OperationError, Outcome, Priming, ProgramIdentity, RequestId,
     ResourceDomainId, RowResult, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };

@@ -252,7 +252,7 @@ mod tests {
             program_identity: ProgramIdentity::new("target").unwrap(),
             executable: ExecutableKind::Target,
             commitment: CommittedClass::AllCommitted,
-            draft_width: None,
+            draft: None,
         };
         let operation = |id| Operation::Forward {
             request: RequestId(id),
