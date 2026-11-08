@@ -72,7 +72,12 @@ pub enum TimedLaunch {
 /// A round that changes between drafting and not: one that drafts after a
 /// round that did not discards the decode queued behind that round and
 /// first enters the pairs held since, and one that does not draft after a
-/// round that did starts the decode pipeline again.
+/// round that did starts the decode pipeline again. Where a round drafting
+/// nothing publishes no feature (a drafter whose feature costs the step),
+/// a round cannot draft after one that did not: the round choosing to
+/// draft drafts nothing and has its queued decode publish its feature; that
+/// decode is the next round, which prepares, discarding nothing, and the
+/// round after drafts from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Switch {
     Enter,
@@ -461,10 +466,10 @@ impl RoundCosts {
             .reduce(f64::max)
     }
 
-    /// The switch a round generating `generated` makes from the request's
-    /// previous round.
-    fn switching(&self, generated: usize) -> Option<Switch> {
-        match (self.after_drafting, generated > 0) {
+    /// The switch a round drafting (or preparing to) or not makes from the
+    /// request's previous round.
+    fn switching(&self, drafting: bool) -> Option<Switch> {
+        match (self.after_drafting, drafting) {
             (Some(false), true) => Some(Switch::Enter),
             (Some(true), false) => Some(Switch::Leave),
             _ => None,
@@ -481,7 +486,7 @@ impl RoundCosts {
     /// first round is its widest.
     fn round(&self, generated: usize, verified: usize) -> f64 {
         let switch = self
-            .switching(generated)
+            .switching(generated > 0)
             .and_then(|switch| self.switch(switch))
             .map_or(0.0, |switch| self.switch_weight * switch);
         (self.draft(generated) + self.verify(self.sequences * (verified + 1)) + switch).max(1e-9)
@@ -491,7 +496,7 @@ impl RoundCosts {
     /// switches beyond its share: a look after a round that drafted nothing
     /// drafts for that round alone, so it enters and leaves again whole.
     fn excursion(&self, generated: usize) -> f64 {
-        if self.switching(generated) != Some(Switch::Enter) {
+        if self.switching(generated > 0) != Some(Switch::Enter) {
             return 0.0;
         }
         let enter = self.switch(Switch::Enter).unwrap_or(0.0);
@@ -629,6 +634,13 @@ pub struct RoundChoice {
     pub look: bool,
 }
 
+impl RoundChoice {
+    /// Whether the round drafts, or prepares to (see [`Switch`]).
+    fn drafting(self, preparing: bool) -> bool {
+        self.generated > 0 || preparing
+    }
+}
+
 /// One request's draft width controller.
 #[derive(Clone, Debug)]
 pub struct DraftController {
@@ -669,6 +681,22 @@ pub struct DraftController {
     context_class: usize,
     sequences: usize,
     choice: RoundChoice,
+    /// This round prepares to draft (see [`Switch`]): it publishes its
+    /// feature, and the next round drafts what `deferred` holds.
+    preparing: bool,
+    deferred: Option<Deferred>,
+}
+
+/// A choice to draft taken by a round whose drafter lacked its anchor's
+/// feature (see [`Switch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deferred {
+    /// Chosen by this round, which drafts nothing and whose queued decode
+    /// publishes its feature: the next round prepares, as that decode.
+    Behind(RoundChoice),
+    /// Prepared by this round, which publishes its feature: the next round
+    /// drafts it.
+    Prepared(RoundChoice),
 }
 
 impl DraftController {
@@ -711,11 +739,25 @@ impl DraftController {
             context_class: 1,
             sequences: 1,
             choice: RoundChoice::default(),
+            preparing: false,
+            deferred: None,
         }
     }
 
     pub fn choice(&self) -> RoundChoice {
         self.choice
+    }
+
+    /// Whether this round prepares to draft: its target step publishes its
+    /// feature for the next round's draft (see [`Switch`]).
+    pub fn preparing(&self) -> bool {
+        self.preparing
+    }
+
+    /// Whether the decode queued behind this round, which drafts nothing,
+    /// publishes its feature: the next round prepares (see [`Switch`]).
+    pub fn publishes_behind(&self) -> bool {
+        matches!(self.deferred, Some(Deferred::Behind(_)))
     }
 
     /// How often a block is expected to be right through each depth, from
@@ -794,12 +836,39 @@ impl DraftController {
     }
 
     /// The proposals this round generates, of at most `limit`, for a round
-    /// anchored at target position `position`.
-    pub fn generate(&mut self, limit: usize, position: usize) -> usize {
+    /// anchored at target position `position`. A drafter without its
+    /// anchor's feature (`anchored` false: the round before published none)
+    /// cannot draft: a round choosing to drafts nothing, the decode queued
+    /// behind it publishes its feature as the next round, which prepares,
+    /// and the round after drafts the choice (see [`Switch`]).
+    pub fn generate(&mut self, limit: usize, position: usize, anchored: bool) -> usize {
         self.context_class = position.max(1).next_power_of_two();
         // Entries before a round chooses are no round's: the prompt's, or
         // pairs held past their bound by rounds that drafted nothing.
         self.entered = Some(0.0);
+        self.preparing = false;
+        match self.deferred.take() {
+            // The round after the choice prepares: it is the decode queued
+            // publishing its feature, and drafts nothing.
+            Some(Deferred::Behind(choice)) if !anchored => {
+                self.preparing = true;
+                self.deferred = Some(Deferred::Prepared(choice));
+                self.choice = RoundChoice { generated: 0, verified: 0, look: choice.look };
+                self.timing_draft = None;
+                self.timing_target = true;
+                return 0;
+            }
+            // The round after the one that prepared drafts the choice, where
+            // the request still has room for it.
+            Some(Deferred::Prepared(choice)) if anchored && choice.generated <= limit => {
+                self.chosen = Some(true);
+                self.choice = choice;
+                self.timing_draft = Some(choice.generated);
+                self.timing_target = false;
+                return choice.generated;
+            }
+            _ => {}
+        }
         let costs = self.costs();
         let right = self.right();
         // The fastest pair. Of equal rates the narrowest.
@@ -914,11 +983,16 @@ impl DraftController {
             self.chosen = Some(generated > 0);
         }
         *self.load.look_seconds.lock().expect("draft load look time") = self.look_seconds;
-        self.choice = RoundChoice {
+        let choice = RoundChoice {
             generated,
             verified: 0,
             look: generated != kept,
         };
+        // Without its anchor's feature the round drafts nothing; the decode
+        // queued behind it prepares, and the round after drafts this choice.
+        let generated = if anchored { generated } else { 0 };
+        self.deferred = (choice.generated > generated).then_some(Deferred::Behind(choice));
+        self.choice = RoundChoice { generated, ..choice };
         self.timing_draft = (generated > 0).then_some(generated);
         self.timing_target = generated == 0;
         generated
@@ -996,6 +1070,8 @@ impl DraftController {
     /// Score every open block against the tokens just committed, which end
     /// the round: a depth no block scored in it goes unscored for a round.
     pub fn committed(&mut self, tokens: &[TokenId]) {
+        // The round ended: a round that does not choose prepares nothing.
+        self.preparing = false;
         // A round that verified proposals and committed them all extends
         // the run; any other ends it.
         if self.choice.verified > 0 && tokens.len() == self.choice.verified + 1 {
@@ -1046,15 +1122,18 @@ impl DraftController {
     /// a round are part of its proposing launch, or of the target's when the
     /// round proposed nothing. A switch between drafting and not (see
     /// [`Switch`]) is paid in the launch that follows it: the discarded
-    /// decode and the catch-up before the drafter proposes, the decode
-    /// started again in the target's launch. That launch is measured without
-    /// the switch's price, and the switch by what its round took beyond the
-    /// price of its launches. A launch that recorded its graph (`duration`
-    /// `None`) measured that recording, not itself: it carries its round on
-    /// and prices nothing. A launch the expert bank's fill ran beside prices
-    /// its round until a launch measured with no fill beside it shows the
-    /// fill finished: then every duration measured beside it is dropped
-    /// ([`LaunchCosts::settle`]), and the rounds measure their launches anew.
+    /// decode and the catch-up before the drafter proposes, or in a
+    /// preparing round's target launch the taps it publishes beyond a plain
+    /// decode; the decode started again in the target's launch. That
+    /// launch is measured without the switch's price, and the switch by what
+    /// its round took beyond the price of its launches; a preparing round's
+    /// launch is its switch alone. A launch that recorded its graph
+    /// (`duration` `None`) measured that recording, not itself: it carries
+    /// its round on and prices nothing. A launch the expert bank's fill ran
+    /// beside prices its round until a launch measured with no fill beside
+    /// it shows the fill finished: then every duration measured beside it is
+    /// dropped ([`LaunchCosts::settle`]), and the rounds measure their
+    /// launches anew.
     pub fn timed(
         &mut self,
         launch: TimedLaunch,
@@ -1089,7 +1168,8 @@ impl DraftController {
             self.sequences,
             self.after_drafting,
         );
-        let switch = costs.switching(self.choice.generated);
+        let drafting = self.choice.drafting(self.preparing);
+        let switch = costs.switching(drafting);
         // The switch's price, when this launch paid one. While the switch is
         // unmeasured, a drafter launch that paid it is not measured: its
         // duration would carry the discarded decode, a switch measured
@@ -1129,7 +1209,7 @@ impl DraftController {
             return;
         }
         let drafter = self.drafter.take();
-        self.after_drafting = Some(self.choice.generated > 0);
+        self.after_drafting = Some(drafting);
         let generated = if drafter.is_some() {
             self.choice.generated
         } else {
@@ -1146,6 +1226,9 @@ impl DraftController {
             launches
                 .switch_mut(switch)
                 .record(round, (took + drafter_took - steady).max(0.0), filling);
+        }
+        if self.preparing {
+            return;
         }
         let Some(paid) = paid(Switch::Leave, launches, size) else {
             return;

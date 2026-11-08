@@ -2857,6 +2857,9 @@ impl<F: ProgramFamily> Service<F> {
         }
         Ok(match generation.start_round(id, allowance) {
             Ok(RoundStart::Target(round)) => {
+                // Where the next round prepares to draft, the decode queued
+                // behind this one publishes its feature as that round.
+                self.domain.publish_behind(id, round.publishes_behind());
                 match lower_round(&round, id, round.generation().resident_position(), None) {
                     Ok(operation) => Start::Joined(
                         Member {

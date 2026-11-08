@@ -161,6 +161,16 @@ impl Drafter {
         }
     }
 
+    /// Whether publishing a round's feature costs its target step: a
+    /// separate draft's fused taps do (the fusion and the tapped blocks'
+    /// writes); an MTP head's feature is the step's own output row.
+    fn fuses_taps(self) -> bool {
+        match self {
+            Self::DFlash => true,
+            Self::Mtp | Self::TargetReadingMtp => false,
+        }
+    }
+
     /// Whether the drafter enters every committed row into its own history.
     fn keeps_history(self) -> bool {
         match self {
@@ -208,6 +218,15 @@ pub(crate) struct DrafterState {
     /// started again proposes what it proposed before.
     generated: Option<usize>,
     verified: Option<usize>,
+    /// Whether the drafter holds its next anchor's pair: the round before
+    /// published its feature (or a prompt chunk closed). Under the
+    /// controller a round that drafts nothing publishes none, so the next
+    /// one cannot draft.
+    anchored: bool,
+    /// Target rows whose pairs an own-history drafter never entered: rows of
+    /// rounds that published no feature. Its history goes on from the next
+    /// pair it is given, so its positions trail the target's by these.
+    skipped: usize,
 }
 
 impl DrafterState {
@@ -223,6 +242,7 @@ impl DrafterState {
                 position: 0,
                 pending: None,
                 open: None,
+                skipped: 0,
             },
             Some(checkpoint) => drafter.restored(checkpoint).cloned().ok_or_else(|| {
                 format!(
@@ -248,6 +268,9 @@ impl DrafterState {
             control: adaptive.map(|load| DraftController::new(proposals, load)),
             generated: None,
             verified: None,
+            // The next prompt chunk anchors it.
+            anchored: false,
+            skipped: checkpoint.skipped,
         })
     }
 
@@ -312,6 +335,7 @@ impl DrafterState {
         self.pending = None;
         self.open = None;
         self.advance(tokens.len())?;
+        self.anchored = next.is_some();
         if let Some(next) = next {
             let features =
                 features.ok_or("the chunk closing the prompt requires its final target feature")?;
@@ -419,7 +443,10 @@ impl MethodState for DrafterState {
 
     fn priming_position(&self) -> Option<usize> {
         // A drafter without history has no entry to draft behind a chunk.
+        // Its history's positions trail the target's past a gap, and a
+        // device entry anchors at the target's (`Priming::draft_from`).
         (self.drafter.keeps_history()
+            && self.skipped == 0
             && self.pending.is_none()
             && !matches!(self.open, Some(OpenFeature::Host(_)))
             && self.head.is_none()
@@ -447,6 +474,9 @@ impl MethodState for DrafterState {
                 self.drafter.name()
             )
         })?;
+        self.anchored = true;
+        // The first draft's anchor in the drafter's positions.
+        let draft_from = draft_from.saturating_sub(self.skipped);
         if let Some(primed) = primed {
             // The device entered complete causal pairs. MTP leaves the
             // final feature open; a feature-only drafter may enter it now.
@@ -527,21 +557,29 @@ impl MethodState for DrafterState {
             self.verified = Some(count);
             return Propose::Tokens(proposal[..count].to_vec());
         }
-        let (Some(_), None, None, false) =
-            (&self.pending, &self.head, &self.open, selects.is_empty())
-        else {
+        let (None, None, false) = (&self.head, &self.open, selects.is_empty()) else {
             return Propose::Tokens(Vec::new());
         };
         // A round drafts a prepared width that fits what the request can
-        // still produce, or nothing. Launch costs depend on the history the
-        // round reads, the target's position.
+        // still produce, or nothing; only from its anchor's pair. A
+        // fused-taps drafter under the controller that a round publishing no
+        // feature left without it asks the controller still, which prepares
+        // the next round's draft (`DraftController::generate`); any other
+        // drafter without its anchor's pair drafts nothing. Launch costs
+        // depend on the history the round reads, the target's position.
+        let anchored = self.anchored && self.pending.is_some();
+        let prepares = !self.anchored && self.drafter.fuses_taps() && self.control.is_some();
+        if !anchored && !prepares {
+            return Propose::Tokens(Vec::new());
+        }
         let position = self
             .round_state()
             .target_position()
-            .expect("drafter state preserves its method boundary");
+            .expect("drafter state preserves its method boundary")
+            + self.skipped;
         let generated = match (&mut self.control, self.generated) {
             (_, Some(generated)) => generated,
-            (Some(control), None) => control.generate(selects.len(), position),
+            (Some(control), None) => control.generate(selects.len(), position, anchored),
             (None, None) => self.budget.generated_within(selects.len()),
         };
         self.generated = Some(generated);
@@ -595,14 +633,13 @@ impl MethodState for DrafterState {
             ));
         }
         self.proposal = None;
-        let features = verification
-            .features
-            .ok_or_else(|| format!("{name} verification requires target features"))?;
         let accepted = verification.accepted;
         if verification.inputs.is_empty() || accepted == 0 || accepted > verification.inputs.len() {
             return Err(format!("{name} verification prefix is invalid"));
         }
-        let transition = self.round_state().observed(accepted)?;
+        if verification.features.is_none() && self.control.is_none() {
+            return Err(format!("{name} verification requires target features"));
+        }
         self.generated = None;
         self.verified = None;
         if let Some(control) = &mut self.control {
@@ -625,17 +662,36 @@ impl MethodState for DrafterState {
         // After a replay the last replayed row's feature selected the anchor.
         if let Some(open) = self.open.take() {
             self.append(vec![verification.inputs[0]], Self::open_rows(reader, open)?)?;
+            self.anchored = true;
         }
-        if self
-            .pending
-            .as_ref()
-            .and_then(|pending| pending.tokens.last())
-            .is_some_and(|anchor| *anchor != verification.inputs[0])
+        if self.anchored
+            && self
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.tokens.last())
+                .is_some_and(|anchor| *anchor != verification.inputs[0])
         {
             return Err(format!(
                 "{name} pending anchor differs from the verified anchor"
             ));
         }
+        // A round that published no feature (one drafting nothing under the
+        // controller) leaves the drafter without the pairs of its rows'
+        // successors: the next round cannot draft, and an own history goes
+        // on past them from the next pair it is given.
+        let Some(features) = verification.features else {
+            self.anchored = false;
+            match self.drafter.keeps_history() {
+                true => self.skipped += accepted,
+                false => {
+                    self.pending = None;
+                    self.advance(accepted)?;
+                }
+            }
+            return Ok(MethodEffects::default());
+        };
+        self.anchored = true;
+        let transition = self.round_state().observed(accepted)?;
         if !self.drafter.keeps_history() {
             // The accepted rows moved the target; the last one's feature
             // selected the next anchor.
@@ -657,6 +713,24 @@ impl MethodState for DrafterState {
             return self.flush(request, 1, HeadPhase::Generation);
         }
         Ok(MethodEffects::default())
+    }
+
+    /// A drafter whose feature costs the step nothing, or one without the
+    /// controller, takes every round's. Under the controller a fused-taps
+    /// drafter takes one only for the next round's draft: from a round that
+    /// drafted (its rows' successors are the next draft's pairs) or one
+    /// preparing to draft, so a round drafting nothing costs a plain step.
+    fn taps(&self) -> bool {
+        match &self.control {
+            Some(control) if self.drafter.fuses_taps() => {
+                self.generated.is_some_and(|generated| generated > 0) || control.preparing()
+            }
+            _ => true,
+        }
+    }
+
+    fn publishes_behind(&self) -> bool {
+        self.drafter.fuses_taps() && self.control.as_ref().is_some_and(DraftController::publishes_behind)
     }
 
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String> {
@@ -743,14 +817,17 @@ impl MethodState for DrafterState {
                 position: self.position,
                 pending: None,
                 open: None,
+                skipped: 0,
             }));
         }
         let mut pending = self.pending.clone();
         let mut open = self.open.clone();
         // The final pending token is the sampled successor, outside the
         // retained target prefix. Export its feature without that token;
-        // each restored request supplies its own successor.
-        if open.is_none() {
+        // each restored request supplies its own successor. A drafter
+        // without its anchor's pair holds no successor: its pairs are all
+        // inside the prefix.
+        if open.is_none() && self.anchored {
             if let Some(rows) = pending.take() {
                 let last = rows.tokens.len() - 1;
                 open = Some(OpenFeature::Host(
@@ -768,6 +845,7 @@ impl MethodState for DrafterState {
             position: self.position,
             pending,
             open,
+            skipped: self.skipped,
         }))
     }
 
@@ -775,6 +853,8 @@ impl MethodState for DrafterState {
         self.position = 0;
         self.pending = None;
         self.open = None;
+        self.anchored = false;
+        self.skipped = 0;
         self.head = None;
         self.proposal = None;
         self.generated = None;

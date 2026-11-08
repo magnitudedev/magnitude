@@ -363,11 +363,7 @@ impl<'p> FeatureSource<'p> {
         if let Some(width) = load.residual_conditioning() {
             return Self::Residual { width };
         }
-        let role = WeightRole {
-            scope: WeightScope::Draft,
-            kind: WeightKind::DraftFusion,
-        };
-        match load.target().iter().find(|weight| weight.role == role) {
+        match load.draft_fusion() {
             Some(fusion) => Self::Taps { fusion },
             None => Self::Output,
         }

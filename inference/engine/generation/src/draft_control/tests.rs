@@ -242,7 +242,7 @@ fn adaptive_on(
     while position < stream.len() {
         let slowdown = slowdown(context + position);
         let limit = (stream.len() - position - 1).min(WIDEST);
-        let generated = controller.generate(limit, context + position);
+        let generated = controller.generate(limit, context + position, true);
         let mut verified = 0;
         if generated > 0 {
             let seconds = (costs.draft)(generated) / 1000.0;
@@ -645,7 +645,7 @@ fn a_launch_not_measured_here_costs_no_more_than_a_larger_one_proven_here() {
 fn a_launch_that_recorded_its_graph_prices_nothing() {
     let drafted = |duration: Option<Duration>| {
         let mut controller = DraftController::new(7, Arc::new(DraftLoad::default()));
-        let generated = controller.generate(7, CONTEXT);
+        let generated = controller.generate(7, CONTEXT, true);
         assert!(generated > 0);
         controller.timed(TimedLaunch::Draft, duration.map(LaunchDuration::settled), 1, generated + 1);
         controller.measured().draft.contains_key(&generated)
@@ -666,7 +666,7 @@ fn a_launch_that_recorded_its_graph_prices_nothing() {
 fn launches_measured_beside_a_fill_price_only_until_it_finishes() {
     let filling = |milliseconds| Some(LaunchDuration { duration: Duration::from_millis(milliseconds), filling: true });
     let mut controller = DraftController::new(7, Arc::new(DraftLoad::default()));
-    let generated = controller.generate(7, CONTEXT);
+    let generated = controller.generate(7, CONTEXT, true);
     assert!(generated > 0);
     controller.timed(TimedLaunch::Draft, filling(40), 1, generated + 1);
     controller.drafted(generated, &vec![TokenId(1); generated], None);
@@ -676,7 +676,7 @@ fn launches_measured_beside_a_fill_price_only_until_it_finishes() {
     let measured = controller.measured();
     assert!(measured.draft.contains_key(&generated) && measured.verify.contains_key(&(verified + 1)), "the fill's round prices while it runs");
     // A plain decode with no fill beside it: the fill finished.
-    assert_eq!(controller.generate(0, CONTEXT), 0);
+    assert_eq!(controller.generate(0, CONTEXT, true), 0);
     controller.timed(TimedLaunch::Target, settled(Duration::from_millis(60)), 1, 1);
     let measured = controller.measured();
     assert!(!measured.draft.contains_key(&generated), "the drafter's launch is unmeasured again");
@@ -691,7 +691,7 @@ fn requests_sharing_a_launch_give_its_rows_to_the_proposals_most_often_right() {
     // The launches two requests share, as rounds measured them.
     let mut measuring = DraftController::new(7, load.clone());
     for rows in [2, 4, 8, 16] {
-        assert_eq!(measuring.generate(0, CONTEXT), 0);
+        assert_eq!(measuring.generate(0, CONTEXT, true), 0);
         let seconds = (LONG.verify)(rows) / 1000.0;
         measuring.timed(
             TimedLaunch::Target,
@@ -715,7 +715,7 @@ fn requests_sharing_a_launch_give_its_rows_to_the_proposals_most_often_right() {
             load: load.clone(),
             ..controller
         };
-        controller.generate(0, CONTEXT);
+        controller.generate(0, CONTEXT, true);
         controller.drafted(7, &stream.block(position + 32, 7), None);
         controller.outlook().unwrap()
     };
@@ -984,6 +984,12 @@ struct Pipelined {
     resume: f64,
     discard: f64,
     catch_up: fn(usize) -> f64,
+    /// What publishing a target launch's feature adds to it, where it costs
+    /// the step (a separate draft's fused taps): there a round drafting
+    /// nothing publishes none, so drafting begins with a preparing round,
+    /// the decode queued behind the choosing round, and no pairs are held to
+    /// catch up.
+    fused: Option<f64>,
 }
 
 /// How the controller sees a round that changes between drafting and not:
@@ -1017,10 +1023,13 @@ fn pipelined(
     let mut position = 0;
     let mut drafted_before = None;
     let mut held = 0;
+    // The prompt's last feature anchors the first round.
+    let mut anchored = true;
     let ms = |milliseconds: f64| Duration::from_secs_f64(milliseconds / 1000.0);
     while position < stream.len() {
         let limit = (stream.len() - position - 1).min(widest);
-        let generated = controller.generate(limit, CONTEXT + position);
+        let generated = controller.generate(limit, CONTEXT + position, anchored);
+        let preparing = controller.preparing();
         let mut verified = 0;
         if generated > 0 {
             let mut draft = (machine.costs.draft)(generated);
@@ -1046,19 +1055,22 @@ fn pipelined(
             let block = stream.block(position, generated);
             controller.drafted(generated, &block, None);
             verified = controller.verify(limit);
-        } else {
+        } else if machine.fused.is_none() {
             held = (held + 1).min(64);
         }
-        let mut target = (machine.costs.verify)(verified + 1);
-        if generated == 0 && drafted_before == Some(true) {
+        let publishes = machine.fused.is_none() || generated > 0 || preparing;
+        let launch = (machine.costs.verify)(verified + 1) + if publishes { machine.fused.unwrap_or(0.0) } else { 0.0 };
+        let mut target = launch;
+        if generated == 0 && !preparing && drafted_before == Some(true) {
             target += machine.resume;
         }
         run.milliseconds += target;
         if reported == Reported::WithoutSwitch {
-            target = (machine.costs.verify)(verified + 1);
+            target = launch;
         }
         controller.timed(TimedLaunch::Target, settled(ms(target)), 1, verified + 1);
-        drafted_before = Some(generated > 0);
+        drafted_before = Some(generated > 0 || preparing);
+        anchored = machine.fused.is_none() || generated > 0 || preparing;
         let accepted = stream.right(position).min(verified);
         let committed = (position + 1..=position + accepted + 1)
             .map(Stream::token)
@@ -1079,7 +1091,8 @@ fn pipelined_fixed(stream: &Stream, machine: Pipelined, width: usize) -> f64 {
     while position < stream.len() {
         let limit = stream.len() - position - 1;
         let width = if width <= limit { width } else { 0 };
-        milliseconds += (machine.costs.draft)(width) + (machine.costs.verify)(width + 1);
+        let publishes = if width > 0 { machine.fused.unwrap_or(0.0) } else { 0.0 };
+        milliseconds += (machine.costs.draft)(width) + (machine.costs.verify)(width + 1) + publishes;
         position += stream.right(position).min(width) + 1;
     }
     milliseconds
@@ -1108,6 +1121,7 @@ const V710_HEADS: Pipelined = Pipelined {
     },
     resume: 1.7,
     discard: 4.5,
+    fused: None,
     catch_up: |held| {
         if held > 1 {
             0.6 + 0.02 * held as f64
@@ -1290,6 +1304,7 @@ const M4_HEADS: Pipelined = Pipelined {
     resume: 0.8,
     discard: 13.5,
     catch_up: V710_HEADS.catch_up,
+    fused: None,
 };
 
 /// A stretch the heads get wrong: a quoted table of numbers, say.
@@ -1340,4 +1355,65 @@ fn runs_of_wrong_blocks_on_steady_text_do_not_stop_drafting() {
         eprintln!("{report}");
         assert!(adaptive <= best * 1.03, "{report}");
     }
+}
+
+/// Qwen3.6-35B-A3B q4 with its DFlash drafter on an M4 Pro, as measured:
+/// a block draft of about 3.8 ms at any width, a verification of two rows
+/// 2 ms over the 13.7 ms plain decode, and the fused taps 0.19 ms on any
+/// launch publishing its feature. A preparing round is the decode queued
+/// behind the round before, so entering drafting discards none (`discard`
+/// goes unused).
+const M4_DFLASH: Pipelined = Pipelined {
+    costs: Costs {
+        draft: |generated| if generated == 0 { 0.0 } else { 3.8 },
+        verify: |rows| match rows {
+            1 => 13.7,
+            2 => 15.7,
+            3..=4 => 17.5,
+            5..=8 => 18.9,
+            _ => 27.0,
+        },
+    },
+    resume: 0.6,
+    discard: 13.7,
+    catch_up: |_| 0.0,
+    fused: Some(0.19),
+};
+
+/// The DFlash drafter's acceptance on prose it cannot predict
+/// (prose-continue, against a float32 reference: 14 of 32 at the first
+/// depth).
+const DFLASH_PROSE: [f64; WIDEST] = [
+    0.44, 0.15, 0.05, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+];
+
+/// A drafter whose feature costs the step publishes none from a round
+/// drafting nothing, so on prose it barely predicts a load serves no slower
+/// than plain decoding beyond its looks' share, and within the margin of
+/// its best fixed width; one whose drafting pays prepares, drafts, and
+/// goes on drafting. A preparing round pays the switch, measured as the
+/// taps it publishes: it is the decode queued behind the round that chose
+/// to draft, and discards nothing.
+#[test]
+fn a_fused_drafter_declining_decodes_at_the_plain_pace() {
+    let prose = texts(&[(400, DFLASH_PROSE)]);
+    let (width, best) = fastest_served(&prose, M4_DFLASH);
+    let plain = served(&prose, M4_DFLASH, None, 0);
+    let adaptive = served(&prose, M4_DFLASH, Some(Reported::Whole), HEADS);
+    let report = format!(
+        "plain {plain:.0} ms, fixed {width} {best:.0} ms, adaptive {adaptive:.0} ms ({:+.1}% on plain)",
+        (adaptive / plain - 1.0) * 100.0
+    );
+    eprintln!("{report}");
+    assert!(adaptive <= plain * (1.0 + 1.5 * super::LOOK_SHARE) && adaptive <= best * 1.05, "{report}");
+    let code = texts(&[(400, HEADS_CODE)]);
+    let (width, best) = fastest_served(&code, M4_DFLASH);
+    assert!(width > 0, "drafting pays on code");
+    let adaptive = served(&code, M4_DFLASH, Some(Reported::Whole), HEADS);
+    assert!(adaptive <= best * 1.05, "adaptive {adaptive:.0} ms, fixed {width} {best:.0} ms");
+    let load = Arc::new(DraftLoad::default());
+    pipelined(&Stream::of(&[(150, HEADS_CODE), (150, DFLASH_PROSE), (150, HEADS_CODE)]), M4_DFLASH, HEADS, &load, Reported::Whole);
+    let costs = load.costs.lock().unwrap();
+    let enter = costs[&((CONTEXT + 1).next_power_of_two(), 1)].enter.cost() * 1000.0;
+    assert!((enter - 0.19).abs() < 0.01, "entering costs the taps alone: {enter} ms");
 }

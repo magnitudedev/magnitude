@@ -290,19 +290,28 @@ fn fitting<T>(result: Result<T, magnitude_state::Error>) -> Result<Option<T>, Do
 /// drafter proposed (a request in `proposed`) has none whatever its rows, as
 /// a verification of several rows has none: a decode queued behind a
 /// one-row verification that declined every proposal is what the next
-/// round's drafter waits for and discards.
+/// round's drafter waits for and discards. On a load whose features are a
+/// separate draft's fused taps (`ModelLoadPlan::draft_fusion`) a round
+/// drafting nothing publishes no feature: a decode that publishes one
+/// prepares the next round's draft, and has none either; and a decode whose
+/// next round prepares (a request in `publishing`) has one that publishes
+/// its feature, so that round is the queued decode, discarding nothing.
 pub(super) fn continuations(
     operations: &[Operation],
     proposed: &BTreeSet<RequestId>,
+    publishing: &BTreeSet<RequestId>,
+    fuses_draft_taps: bool,
     context: usize,
 ) -> Option<Vec<Operation>> {
     operations
         .iter()
         .map(|operation| {
-            if proposed.contains(&operation.request()) {
-                None
-            } else {
-                continuation_of(operation, context)
+            let request = operation.request();
+            let drafts_next = proposed.contains(&request)
+                || (fuses_draft_taps && operation.demand().contains(crate::batching::Demand::FEATURES));
+            match drafts_next {
+                true => None,
+                false => continuation_of(operation, publishing.contains(&request), context),
             }
         })
         .collect()
@@ -315,8 +324,10 @@ pub(super) fn continuations(
 /// finishes. `None` when the next step depends on the host (grammar masks,
 /// penalty histories, logits demanded, conditioned rows, more than one row),
 /// or when `operation` fills the last of the `context` rows a sequence
-/// holds: its request ends there, and no step follows it.
-pub(super) fn continuation_of(operation: &Operation, context: usize) -> Option<Operation> {
+/// holds: its request ends there, and no step follows it. The decode
+/// continuing `operation` selects its next row as its own was, publishing
+/// its feature where `publishes`.
+pub(super) fn continuation_of(operation: &Operation, publishes: bool, context: usize) -> Option<Operation> {
     let Operation::Forward {
         request,
         kind: WorkKind::Decode,
@@ -354,7 +365,10 @@ pub(super) fn continuation_of(operation: &Operation, context: usize) -> Option<O
         tokens: vec![crate::TokenId(0)],
         position: following,
         conditioning: None,
-        demand: *demand,
+        demand: match publishes {
+            true => *demand | crate::batching::Demand::FEATURES,
+            false => *demand,
+        },
         select: vec![next],
         committed: 1,
         prime: None,
@@ -558,7 +572,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // continuation). A planned chunk of a load that chains opens the next
         // chain rather than queueing alone behind this one.
         let context = self.execution.resources().target_state().context_rows;
-        if let Some(operations) = continuations(operations, &self.proposed, context) {
+        let fuses_draft_taps = self.execution.load().draft_fusion().is_some();
+        if let Some(operations) = continuations(operations, &self.proposed, &self.publishing, fuses_draft_taps, context) {
             return Behind::Continuation { operations };
         }
         if self.chain_capacity() > std::num::NonZeroUsize::MIN {
@@ -1188,7 +1203,7 @@ mod tests {
     #[test]
     fn a_decode_feeding_a_drafter_continues_like_a_plain_decode() {
         for demand in [Demand::SELECT, Demand::SELECT | Demand::FEATURES] {
-            let next = continuation_of(&decode(demand, vec![TokenId(5)]), 9)
+            let next = continuation_of(&decode(demand, vec![TokenId(5)]), false, 9)
                 .unwrap_or_else(|| panic!("{demand:?} decode has a continuation"));
             let Operation::Forward {
                 position,
@@ -1202,9 +1217,10 @@ mod tests {
             assert_eq!((*position, *next_demand, select[0].position), (8, demand, 5));
         }
         // Logits go to the host, and a verification's rows are the method's.
-        assert!(continuation_of(&decode(Demand::SELECT | Demand::LOGITS, vec![TokenId(5)]), 9).is_none());
+        assert!(continuation_of(&decode(Demand::SELECT | Demand::LOGITS, vec![TokenId(5)]), false, 9).is_none());
         assert!(continuation_of(
             &decode(Demand::SELECT | Demand::FEATURES, vec![TokenId(5), TokenId(6)]),
+            false,
             9
         )
         .is_none());
@@ -1219,8 +1235,27 @@ mod tests {
     fn a_round_whose_drafter_proposed_queues_no_decode_behind_it() {
         let declined = decode(Demand::SELECT | Demand::FEATURES, vec![TokenId(5)]);
         let plain = std::collections::BTreeSet::new();
-        assert!(continuations(std::slice::from_ref(&declined), &plain, 9).is_some());
+        let none = std::collections::BTreeSet::new();
+        assert!(continuations(std::slice::from_ref(&declined), &plain, &none, false, 9).is_some());
         let proposed = std::collections::BTreeSet::from([RequestId(3)]);
-        assert!(continuations(std::slice::from_ref(&declined), &proposed, 9).is_none());
+        assert!(continuations(std::slice::from_ref(&declined), &proposed, &none, false, 9).is_none());
+    }
+
+    /// On a load whose features are a separate draft's fused taps, a round
+    /// drafting nothing publishes no feature: a decode publishing one
+    /// prepares the next round's draft, and queues no decode behind it; a
+    /// plain decode queues one as anywhere, which publishes its feature
+    /// where the next round prepares.
+    #[test]
+    fn a_decode_preparing_a_fused_draft_queues_no_decode_behind_it() {
+        let none = std::collections::BTreeSet::new();
+        let preparing = decode(Demand::SELECT | Demand::FEATURES, vec![TokenId(5)]);
+        assert!(continuations(std::slice::from_ref(&preparing), &none, &none, true, 9).is_none());
+        let plain = decode(Demand::SELECT, vec![TokenId(5)]);
+        let queued = continuations(std::slice::from_ref(&plain), &none, &none, true, 9).unwrap();
+        assert_eq!(queued[0].demand(), Demand::SELECT);
+        let publishing = std::collections::BTreeSet::from([plain.request()]);
+        let queued = continuations(std::slice::from_ref(&plain), &none, &publishing, true, 9).unwrap();
+        assert_eq!(queued[0].demand(), Demand::SELECT | Demand::FEATURES);
     }
 }

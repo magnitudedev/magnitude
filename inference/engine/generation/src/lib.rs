@@ -654,7 +654,13 @@ impl Generation {
                     .iter()
                     .take_while(|token| !self.options.stop_tokens.contains(token))
                     .copied()
-                    .collect();
+                    .collect::<Vec<_>>();
+                // A round that verifies nothing publishes its feature only
+                // where its method reads it.
+                let verify_demand = match proposal.is_empty() && !self.method.taps() {
+                    true => Demand::NONE,
+                    false => requirements.verify_demand,
+                };
                 RoundState::verification(
                     *self.generated.last().unwrap(),
                     proposal,
@@ -665,7 +671,7 @@ impl Generation {
                     self.options.sampling,
                     self.options.shaping,
                     self.options.seed,
-                    requirements,
+                    verify_demand,
                 )?
             }
         };
@@ -1245,6 +1251,12 @@ impl StartedRound {
 
     pub fn round_forward(&self) -> &RoundForward {
         self.round.forward()
+    }
+
+    /// Whether the decode queued behind this round's target step publishes
+    /// its feature (`MethodState::publishes_behind`).
+    pub fn publishes_behind(&self) -> bool {
+        self.generation.method.publishes_behind()
     }
 
     pub fn round_publication_bound(&self) -> usize {

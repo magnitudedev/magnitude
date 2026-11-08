@@ -106,11 +106,25 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.queue_successor(&work, operations)
             .map_err(SubmitFailure::Failed)?;
         // This launch was the round's verification: the next round's
-        // drafter, if it proposes, marks its request again.
+        // drafter, if it proposes, marks its request again, as the next
+        // round's method does a request whose round after prepares.
         for operation in operations {
             self.proposed.remove(&operation.request());
+            self.publishing.remove(&operation.request());
         }
         Ok(TargetFlight { work, bindings })
+    }
+
+    /// Whether `request`'s next target launch is a round drafting nothing
+    /// whose next round prepares to draft from a separate draft's fused
+    /// taps: its decode continuation then publishes its feature, so the
+    /// preparing round is that queued decode, discarding nothing
+    /// (`queue::continuations`). Set before each round's launch.
+    pub fn publish_behind(&mut self, request: RequestId, publishes: bool) {
+        match publishes {
+            true => self.publishing.insert(request),
+            false => self.publishing.remove(&request),
+        };
     }
 
     /// Launch the group's target step as the first of a chain: alone, or with

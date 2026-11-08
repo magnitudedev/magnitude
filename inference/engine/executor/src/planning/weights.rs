@@ -1117,6 +1117,16 @@ impl ModelLoadPlan {
         self.vision.as_deref()
     }
 
+    /// The separate draft's fusion, where the target's features are its
+    /// fused taps (the fusion planned with the target, and no residual
+    /// conditioning): publishing them costs a step the fusion and the
+    /// tapped blocks' writes, where an MTP head's feature is the step's own
+    /// output row.
+    pub(crate) fn draft_fusion(&self) -> Option<&WeightPlan> {
+        let role = WeightRole { scope: WeightScope::Draft, kind: WeightKind::DraftFusion };
+        self.residual_conditioning.is_none().then(|| self.target.iter().find(|weight| weight.role == role)).flatten()
+    }
+
     /// Resolve the ordered checked-entry topology from the same weight facts
     /// used for import and residency.
     pub(crate) fn program_plan(

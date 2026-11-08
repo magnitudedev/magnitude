@@ -669,6 +669,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// launch is their round's verification, however many proposals it
     /// verifies, and queues no decode behind it (`queue::continuations`).
     proposed: BTreeSet<RequestId>,
+    /// Requests whose next round prepares to draft from a separate draft's
+    /// fused taps: their next target launch's decode continuation publishes
+    /// its feature (`queue::continuations`, `Self::publish_behind`).
+    publishing: BTreeSet<RequestId>,
     /// Sequences a step of which could not read its weights: every later
     /// outcome of theirs fails (`Outcome::WeightReadFailed`) until they
     /// close.
@@ -2901,6 +2905,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             next_flight: 0,
             host_turn: None,
             proposed: BTreeSet::new(),
+            publishing: BTreeSet::new(),
             poisoned: BTreeMap::new(),
             measures: None,
             bank_claim: None,

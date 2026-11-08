@@ -74,6 +74,8 @@ pub struct DraftCheckpoint {
     pub(crate) position: usize,
     pub(crate) pending: Option<PendingRows>,
     pub(crate) open: Option<OpenFeature>,
+    /// Target rows the drafter's history omits (`DrafterState::skipped`).
+    pub(crate) skipped: usize,
 }
 
 /// One target feature awaiting its successor token. Device rows are owned by
@@ -107,11 +109,12 @@ impl DraftCheckpoint {
     }
 
     /// Target rows this state accounts for: every entered head row, every
-    /// pending pair, and the open feature.
+    /// pending pair, the open feature, and the rows whose pairs it omits.
     pub fn target_rows(&self) -> usize {
         self.position
             + self.pending.as_ref().map_or(0, |rows| rows.tokens.len())
             + usize::from(self.open.is_some())
+            + self.skipped
     }
 
     pub fn retained_bytes(&self) -> u64 {
@@ -211,6 +214,19 @@ pub trait MethodState {
         verification: Verification<'_>,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String>;
+    /// Whether this round's target step, once it verifies no proposal,
+    /// publishes its rows' features (`MethodRequirements::verify_demand`):
+    /// a method reading them only to draft takes them only for a round it
+    /// drafts from next. Asked after `propose`.
+    fn taps(&self) -> bool {
+        true
+    }
+    /// Whether the decode queued behind this round's target step, which
+    /// publishes no feature, publishes its own: the next round prepares to
+    /// draft as that decode. Asked after `propose`.
+    fn publishes_behind(&self) -> bool {
+        false
+    }
     /// Consume the outcome of the exact operation `propose` returned.
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String>;
     /// A launch carrying this request's work finished: `rows` rows of

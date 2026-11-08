@@ -149,6 +149,8 @@ impl RoundState {
             .saturating_sub(1)
     }
 
+    /// A decode or verification of `proposal` behind `anchor`, publishing
+    /// its rows' features where `verify_demand` demands them.
     #[allow(clippy::too_many_arguments)]
     pub fn verification(
         anchor: TokenId,
@@ -160,7 +162,7 @@ impl RoundState {
         sampling: Sampling,
         shaping: Shaping,
         seed: u64,
-        requirements: MethodRequirements,
+        verify_demand: Demand,
     ) -> Result<Self, String> {
         if proposal.len() > proposal_limit {
             return Err("method proposal exceeds the round width limit".into());
@@ -185,7 +187,7 @@ impl RoundState {
                     WorkKind::Verify
                 },
                 tokens,
-                demand: Demand::SELECT | requirements.verify_demand,
+                demand: Demand::SELECT | verify_demand,
                 selects,
                 committed: 1,
                 prime: None,
@@ -324,7 +326,7 @@ mod tests {
                 ..Default::default()
             },
             4,
-            requirements(),
+            Demand::NONE,
         )
         .unwrap()
     }
