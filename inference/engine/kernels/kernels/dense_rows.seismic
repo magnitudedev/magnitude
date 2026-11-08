@@ -22,8 +22,10 @@
 # launch it three times, `gemv` for one row, `gemv_pair` for two and
 # `gemv_rows` for three rows up to BATCH_FROM, each with its own mapping and
 # each instantiating only the row bounds it runs: the fastest mapping of one row is not
-# that of several (the GEMV rule below), and a row's result is the same in
-# both only under the same LANES (and TILED);
+# that of several (on the M4 Pro 8 simdgroups of 8 lanes a group, a group
+# owning two weight rows, or one in the paired `dense_expand` and in
+# `attention_project`), and a row's result is the same in both only under the
+# same LANES (and TILED);
 # BATCH_FROM..16 rows the batched launch on the matrix units (SIMDGROUPS x ROWS
 # blocks of 8 weight rows, F32 operands, a different summation order, so
 # BATCH_FROM is arithmetic too; with MATRIX = 1, which a declaration admits
@@ -47,35 +49,6 @@
 # admitted it is the default, with the same results as the tiles above.
 # `activation` is the gate's function code (`functions.seismic`: 0 SiLU,
 # 1 GELU-tanh); the product is the `glu` of gate and up.
-#
-# The GEMV rule: the defaults of every Metal declaration that launches the
-# projection library's GEMV (`metal/lib/projection/gemv.h`), one rule over
-# each declaration's own shape, its terms `GEMV_WEIGHT_ROWS` (the weight rows
-# its GEMV grid covers) and `GEMV_WIDTH` (their columns). A module declares
-# nothing shared between entries, so each declaration states the rule itself,
-# alike. From every recorded open on M4 Pro (2026-11-07: Qwen3.6 35B and a
-# 2560-wide model), each mapping against the next one tried:
-# - One row (`gemv`, and the one GEMV launch of an entry that runs every row
-#   class below BATCH_FROM through it): 16 simdgroups of 16-lane groups, a
-#   weight row each, with 8-lane groups where a row holds fewer than 16
-#   packets (GEMV_WIDTH < 512), whose other lanes would idle: 0.90x the time
-#   at a width of 320 (46 opens), 0.66x and 0.68x at 2 and 4 rows.
-# - Two rows (`gemv_pair`) and three up to BATCH_FROM (`gemv_rows`): 8
-#   simdgroups of 8-lane groups, each owning two weight rows where
-#   1024 < GEMV_WEIGHT_ROWS <= 4096 or GEMV_WEIGHT_ROWS > 65536, else one. Two
-#   rows a group halve the activation unpacks a weight and the grid: they took
-#   0.93-0.95x the time of one at 2048 weight rows and 0.95x at 248320 (4
-#   rows); one row a group took 0.65-0.68x at 640 and 0.67-0.98x at 6144 to
-#   16480 (one open 1.003).
-# - BATCH_FROM: 3 where the batched launch decodes a weight once for all its
-#   rows more cheaply than the GEMV does per row, that is where every weight
-#   takes the matrix form, the weights are a bit-plane view, or a row holds
-#   fewer than 16 packets; 5 elsewhere. At 4 rows the matrix form took
-#   0.82-0.95x the GEMV's time, the plane views 0.63-0.87x and the batched
-#   rows at a width of 320 0.45x (one open); the batched rows over decoded
-#   packets at widths of 2048 and 2560 took 1.00-13x, and
-#   `gated_delta_project_convolved` (matrix qkv and z, batched-row alpha and
-#   beta) 1.19-1.57x.
 #
 # Second-level weight scales (every entry reading packed weights): one
 # `<weight>_scale` port per weight, after every other argument, in weight
@@ -122,12 +95,13 @@ fn dense_expand[M, O, H, F, GS, US, GB, UB](residual: &tensor[M, H] f32, norm: &
     glu(gate, up, product, activation)
     return product
 
+# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
+# 0.91x the time batched that they took on the GEMV (24 opens, at most
+# 0.94x). Fewer than 3 rows and more than 4 launch alike either way.
 native dense_expand for metal from "metal/dense_expand.metal":
     static (H, F, GS, US, GB, UB)
-    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default least where BATCH_FROM >= 5 or (BATCH_FROM >= 3 and (GEMV_WIDTH < 512 or (H % 256 == 0 and form(GW, MATRIX) == 1 and form(UW, MATRIX) == 1))), form TALL in [1, 0] default 1, arithmetic form INT8 in [0, 1] default 0,
+    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default 3, form TALL in [1, 0] default 1, arithmetic form INT8 in [0, 1] default 0,
         arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
-    let GEMV_WEIGHT_ROWS = F
-    let GEMV_WIDTH = H
     where GS <= 1 and US <= 1 and (TALL == 0 or H % 128 == 0) and (INT8 == 0 or (TALL == 1 and H % 512 == 0 and F % 32 == 0 and form(GW, INT8) == 1 and form(UW, INT8) == 1 and form(GW, INT8_INTERLEAVED) == form(UW, INT8_INTERLEAVED))) and (PACK == 0 or (TALL == 1 and INT8 == 0 and H % 256 == 0 and H < 1048576 and F % 32 == 0 and form(GW, PACK) == 1 and form(UW, PACK) == 1 and form(GW, PACK_FOLDS) == form(UW, PACK_FOLDS) and form(GW, PACK_RESIDUE) == form(UW, PACK_RESIDUE))) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and ((GB > 0 and form(GW, PACK_RESIDUE) == 1) or (UB > 0 and form(UW, PACK_RESIDUE) == 1)))) and (MATRIX == 0 or (H % 256 == 0 and form(GW, MATRIX) == 1 and form(UW, MATRIX) == 1))
     scratch normalized bytes ((O + TALL * (ceil_div(O, 64) * 64 - O)) * H * 2) when O >= BATCH_FROM
     scratch packed bytes (ceil_div(O, 64) * 64 * H * 2 + 1024) when O > 64 and PACK == 1
@@ -148,7 +122,7 @@ native dense_expand for metal from "metal/dense_expand.metal":
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_expand_gemv when O < 2:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2] default 1, arithmetic LANES in [16, 32, 8] default least where LANES >= 16 or GEMV_WIDTH < 512,
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2] default 1, arithmetic LANES in [16, 32, 8] default 16,
             arithmetic form TILED in [0, 1, 2] default 0)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
@@ -183,13 +157,13 @@ native dense_expand for metal from "metal/dense_expand.metal":
         threadgroups (ceil_div(F, 32), ceil_div(O, 64), 1)
         threads_per_threadgroup (128, 1, 1)
     launch dense_expand_gemv_rows when O >= 3 and O < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2] default least where ROWS >= 2 or GEMV_WEIGHT_ROWS <= 1024 or (GEMV_WEIGHT_ROWS > 4096 and GEMV_WEIGHT_ROWS <= 65536), arithmetic LANES in [8, 16, 32] default 8,
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2] default 1, arithmetic LANES in [8, 16, 32] default 8,
             arithmetic form TILED in [0, 1] default 0)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(min(ceil_div(H, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64, TILED * SIMDGROUPS * 256))
     launch dense_expand_gemv_pair when O == 2 and O < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2] default least where ROWS >= 2 or GEMV_WEIGHT_ROWS <= 1024 or (GEMV_WEIGHT_ROWS > 4096 and GEMV_WEIGHT_ROWS <= 65536), arithmetic LANES in [8, 16, 32] default 8,
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [1, 2] default 1, arithmetic LANES in [8, 16, 32] default 8,
             arithmetic form TILED in [0, 1, 2] default 0)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
@@ -299,12 +273,13 @@ fn dense_output[M, O, H, F, DS, DB](residual: &tensor[M, H] f32,
 # that the F16 fold cannot overflow. `dense_expand` packs its normalized rows
 # alike, with one such pair of tables per weight (`gate_factors`,
 # `up_factors`, `gate_scales`, `up_scales`).
+# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
+# 0.94x the time batched that they took on the GEMV (23 opens, at most
+# 0.94x). Fewer than 3 rows and more than 4 launch alike either way.
 native dense_output for metal from "metal/dense_output.metal":
     static (H, F, DS, DB)
-    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default least where BATCH_FROM >= 5 or (BATCH_FROM >= 3 and (GEMV_WIDTH < 512 or (form(DW, MATRIX) == 1))), arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
+    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default 3, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
         arithmetic form INT8 in [0, 1] default 0, arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
-    let GEMV_WEIGHT_ROWS = H
-    let GEMV_WIDTH = F
     where DS <= 1 and (TALL == 0 or (SPLIT == 1 and F % 128 == 0)) and (INT8 == 0 or (TALL == 1 and F % 512 == 0 and H % 64 == 0 and form(DW, INT8) == 1)) and (INT8 == 1 or INT8_TILE == 128) and (PACK == 0 or (TALL == 1 and INT8 == 0 and F % 256 == 0 and F < 1048576 and H % 64 == 0 and form(DW, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and DB > 0 and form(DW, PACK_RESIDUE) == 1)) and (MATRIX == 0 or form(DW, MATRIX) == 1)
     scratch partials bytes (SPLIT * O * H * 4) when O > 64 and SPLIT > 1
     scratch small_partials bytes (4 * O * H * 4) when O > 16 and O <= 64
@@ -321,7 +296,7 @@ native dense_output for metal from "metal/dense_output.metal":
     scratch biases bytes (ceil_div(H, 32) * 32 * ceil_div(F, 1024) * 32 * 2) when O > 64 and INT8 == 1
     scratch staged bytes (O * F * 2) when O >= BATCH_FROM and operands(DW) == 1
     launch dense_output_gemv when O < 2:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2] default 1, arithmetic LANES in [16, 32, 8] default least where LANES >= 16 or GEMV_WIDTH < 512,
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2] default 1, arithmetic LANES in [16, 32, 8] default 16,
             arithmetic form TILED in [0, 1, 2] default 0)
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
@@ -366,13 +341,13 @@ native dense_output for metal from "metal/dense_output.metal":
         threadgroups (ceil_div(O, INT8_TILE), (INT8_TILE / 128) * ceil_div(H, 32) + (1 - INT8_TILE / 128) * ceil_div(H, 64), 1)
         threads_per_threadgroup (128, 1, 1)
     launch dense_output_gemv_rows when O >= 3 and O < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1] default least where ROWS >= 2 or GEMV_WEIGHT_ROWS <= 1024 or (GEMV_WEIGHT_ROWS > 4096 and GEMV_WEIGHT_ROWS <= 65536), arithmetic LANES in [8, 16, 32] default 8,
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1] default 2, arithmetic LANES in [8, 16, 32] default 8,
             arithmetic form TILED in [0, 1] default 0)
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (max(min(ceil_div(F, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64, TILED * SIMDGROUPS * 128))
     launch dense_output_gemv_pair when O == 2 and O < BATCH_FROM:
-        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1] default least where ROWS >= 2 or GEMV_WEIGHT_ROWS <= 1024 or (GEMV_WEIGHT_ROWS > 4096 and GEMV_WEIGHT_ROWS <= 65536), arithmetic LANES in [8, 16, 32] default 8,
+        params (SIMDGROUPS in [8, 16, 4, 2, 32] default 8, ROWS in [2, 1] default 2, arithmetic LANES in [8, 16, 32] default 8,
             arithmetic form TILED in [0, 1, 2] default 0)
         threadgroups (ceil_div(H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
@@ -515,15 +490,14 @@ fn per_layer_gate[M, D, L, P, GS](hidden: &tensor[M, D] f32, gate_weight: &tenso
 # span TILE_N features instead of TILE_N / 2 pairs).
 native dense_up for metal from "metal/dense_up.metal":
     static (H, F, US)
-    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default least where BATCH_FROM >= 5 or (BATCH_FROM >= 3 and GEMV_WIDTH < 512))
-    let GEMV_WIDTH = H
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5)
     where US <= 1
     scratch normalized bytes (O * H * 2) when O > 16
     launch dense_up_normalize when O > 16:
         threadgroups (O, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch dense_up_gemv when O < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default least where LANES >= 16 or GEMV_WIDTH < 512)
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
         threadgroups (ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(O, 2) + 2 * min(O / 3, 1) + 4 * min(O / 5, 1)), 448) * 64)
@@ -594,15 +568,14 @@ native dense_up for cpu from "cpu/dense_up.rs":
 # items the same way.
 native short_conv_project for metal from "metal/short_conv_project.metal":
     static (H, CH, BS, CS, XS)
-    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default least where BATCH_FROM >= 5 or (BATCH_FROM >= 3 and GEMV_WIDTH < 512))
-    let GEMV_WIDTH = H
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5)
     where H > 0 and BS <= 1 and CS <= 1 and XS <= 1
     scratch normalized bytes (M * H * 2) when M > 16
     launch short_conv_project_normalize when M > 16:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch short_conv_project_gemv when M < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default least where LANES >= 16 or GEMV_WIDTH < 512)
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
         threadgroups (2 * ceil_div(CH, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
@@ -672,15 +645,14 @@ native short_conv_project for cpu from "cpu/short_conv_project.rs":
 # (the multiplier row is `inputs[m, layer]`).
 native per_layer_gate for metal from "metal/per_layer_gate.metal":
     static (D, L, P, GS)
-    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default least where BATCH_FROM >= 5 or (BATCH_FROM >= 3 and GEMV_WIDTH < 512))
-    let GEMV_WIDTH = D
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5)
     where GS <= 1
     scratch rounded bytes (M * D * 2)
     launch per_layer_gate_stage:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch per_layer_gate_gemv when M < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default least where LANES >= 16 or GEMV_WIDTH < 512)
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
         threadgroups (ceil_div(P, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
@@ -771,11 +743,14 @@ fn project_rows[M, K, N, WS, WB](source: &tensor[M, K] A, weight: &tensor[N, K] 
 # source rows into `fragments`; the PACK form's launches, error class and
 # transient scratch are `dense_output`'s, the weights' factors per 32-row
 # weight tile).
+# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
+# 0.81x the time batched that they took on the GEMV (22 opens, at most
+# 0.84x), and 0.91x for a 2560-wide model. Fewer than 3 rows and more than 4
+# launch alike either way.
 native project_rows for metal from "metal/project_rows.metal":
     static (K, N, WS, WB)
-    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default least where BATCH_FROM >= 5 or (BATCH_FROM >= 3 and (GEMV_WIDTH < 512 or (form(W, MATRIX_SYMMETRIC) == 1))), arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
+    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default 3, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
         arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
-    let GEMV_WIDTH = K
     where WS <= 1 and (TALL == 0 or (SPLIT == 1 and K % 128 == 0)) and (PACK == 0 or (TALL == 1 and K % 256 == 0 and K < 1048576 and N % 64 == 0 and form(W, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and WB > 0 and form(W, PACK_RESIDUE) == 1)) and (MATRIX == 0 or form(W, MATRIX_SYMMETRIC) == 1)
     scratch partials bytes (SPLIT * M * N * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * M * N * 4) when M > 16 and M <= 64
@@ -787,7 +762,7 @@ native project_rows for metal from "metal/project_rows.metal":
     scratch weight_scales bytes (N * 4) when M > 64 and PACK == 1
     scratch staged bytes (M * K * 2) when M >= BATCH_FROM and operands(W) == 1
     launch project_rows_gemv when M < BATCH_FROM:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default least where LANES >= 16 or GEMV_WIDTH < 512)
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
         threadgroups (ceil_div(N, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(K, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)

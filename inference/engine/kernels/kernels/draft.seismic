@@ -138,12 +138,10 @@ fn readout_project_rows[O, V, D, S, I, WS](features: &tensor[O, D] A,
                 logits[row, col] = cap_logit(value, softcap)
     return logits
 
-# Defaults: the GEMV rule (`dense_rows.seismic`).
 native readout_project_rows for metal from "metal/readout_project_rows.metal":
     static (V, D, S, I, WS)
-    let GEMV_WIDTH = D
     launch readout_project_rows_gemv:
-        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default least where LANES >= 16 or GEMV_WIDTH < 512)
+        params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16)
         threadgroups (S * I + (1 - I) * ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES), O, 1)
         threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
         shared_bytes (min(ceil_div(D, 32), 448) * 64)
