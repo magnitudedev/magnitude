@@ -162,7 +162,14 @@ reading settles the serving heap only where it moved the settle's inputs: its
 holdings, a request's arrival or end, the load's measures, and each store's room by
 a step the settle could take (`SettleStands`). The serving rates' and the decode
 price's drift between them moves no step. A settle prices the bank's steps on the
-decode model, which is no step's work, so none runs where nothing moved. Every host-RAM question reads one
+decode model, which is no step's work, so none runs where nothing moved. What a
+settle reads is computed once per change of its own inputs: a decode launch once
+per rows and depth, a prompt group's seconds once per size it reads and change of
+their source, the bank's releases only as far as offers in their own store reach,
+and a growth's room on the last reading while the process's own charge stands as it
+read it (its claim still reads the machine afresh). It reads the ranking's live
+decode and group-read curve as the residency thread's last feed published them,
+never feeding the stack itself. Every host-RAM question reads one
 measure, what the OS gives without compressing or swapping another program's data
 (free, file-backed and purgeable pages): a load's admission, its band, its deficits and
 its claims (`HostRoom::Load`). So another program's ask that takes it to the planning line
