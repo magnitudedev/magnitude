@@ -4218,13 +4218,7 @@ mod tests {
             package_ids: Vec<ModelPackageId>,
         ) -> futures_util::future::BoxFuture<'_, Result<u64, InventoryError>> {
             use magnitude_service_contracts::models::InstalledModelPackages as _;
-            Box::pin(async move {
-                let mut freed = 0_u64;
-                for package_id in package_ids {
-                    freed += self.0.remove_installed(&package_id).await?.freed_bytes;
-                }
-                Ok(freed)
-            })
+            Box::pin(async move { self.0.remove_installed_packages(&package_ids).await })
         }
     }
 
@@ -5465,6 +5459,99 @@ mod tests {
         );
         fixture.inventory().ensure_installed_model_inventory().await.unwrap();
         assert!(fixture.inventory().list_installed().await.unwrap().packages.is_empty());
+    }
+
+    /// QA linux-vulkan: removing one variant of a catalog model deleted the projector file the
+    /// other installed variant of the same snapshot is served with, so that variant silently lost
+    /// image input. Remove deletes only the removed variant's own weights.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_variant_keeps_the_projector_its_installed_sibling_shares() {
+        use magnitude_service_contracts::models::{
+            CatalogInstallationRemoval, InstalledModelPackages as _,
+        };
+
+        let fixture = Fixture::new().await;
+        let projector = gguf_bytes(
+            &[
+                ("general.architecture", Meta::Str("clip")),
+                ("general.name", Meta::Str("projector")),
+            ],
+            &["v.patch_embd.weight"],
+        );
+        let removed_weights = model_bytes("q8");
+        let removed_bytes = removed_weights.len() as u64;
+        publish_managed(
+            &fixture.store,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[
+                ("Model-Q4_K_M.gguf", model_bytes("q4")),
+                ("Model-Q8_0.gguf", removed_weights),
+                ("mmproj-F16.gguf", projector),
+            ],
+        );
+        fixture.apply(LocalModelsConfiguration::default()).await;
+        let targets = fixture
+            .inventory()
+            .list_installed()
+            .await
+            .unwrap()
+            .packages
+            .into_iter()
+            .map(|installed| installed.package)
+            .filter(|package| crate::inventory::catalog_projector_package(package).is_some())
+            .collect::<Vec<_>>();
+        let target = |name: &str| {
+            targets
+                .iter()
+                .find(|package| package.files.iter().any(|file| file.path.ends_with(name)))
+                .unwrap_or_else(|| panic!("a target for {name}"))
+                .clone()
+        };
+        let kept = catalog_definition(target("Model-Q4_K_M.gguf"));
+        let mut removed = catalog_definition(target("Model-Q8_0.gguf"));
+        removed.variant_id =
+            magnitude_service_contracts::models::CatalogVariantId::new("gguf:q8").unwrap();
+        let removed_id = catalog_id(&removed);
+        let kept_target = target("Model-Q4_K_M.gguf");
+        let fixture = fixture.restart(vec![kept, removed]).await;
+        fixture.apply(LocalModelsConfiguration::default()).await;
+
+        let installations = crate::catalog_installations::ManagedCatalogInstallations::new(
+            fixture.resolver.clone(),
+            Arc::new(
+                crate::ManagedModelDownloads::open(fixture.resolver.inventory.clone())
+                    .await
+                    .unwrap(),
+            ),
+            Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
+            Arc::new(NoOptimizer),
+        );
+        let removal = installations.remove(&removed_id).await.unwrap();
+
+        assert_eq!(
+            removal,
+            CatalogInstallationRemoval::Removed {
+                reclaimed_bytes: removed_bytes,
+                kept_components: Vec::new(),
+            }
+        );
+        fixture.inventory().ensure_installed_model_inventory().await.unwrap();
+        let installed = fixture.inventory().list_installed().await.unwrap().packages;
+        assert!(
+            installed.iter().any(|entry| entry.package.id == kept_target.id),
+            "the kept variant is still installed with its projector: {:?}",
+            installed.iter().map(|entry| &entry.package.id).collect::<Vec<_>>()
+        );
+        let snapshot = fixture
+            .store
+            .join("hub")
+            .join(crate::inventory::hf_repo_dir("owner/Model-GGUF"))
+            .join("snapshots")
+            .join("a".repeat(40));
+        assert!(snapshot.join("mmproj-F16.gguf").is_file(), "the shared projector file stays");
+        assert!(snapshot.join("Model-Q4_K_M.gguf").is_file());
+        assert!(snapshot.join("Model-Q8_0.gguf").symlink_metadata().is_err());
     }
 
     /// Hiding changes only what is shown: installing a catalog model whose target is exactly a

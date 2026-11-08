@@ -186,38 +186,6 @@ impl InstalledPackageSnapshot {
             .flat_map(occurrence_entries)
             .any(|entry| removed.contains(&entry))
     }
-
-    /// `removing` without the packages whose every snapshot file the others in it hold (the
-    /// projector package of a target stored with its projector, say): deleting those deletes the
-    /// files, so such a package goes with them rather than separately.
-    pub(crate) fn without_contained_managed_packages(
-        &self,
-        removing: &[ModelPackageId],
-    ) -> Vec<ModelPackageId> {
-        let mut largest_first = removing
-            .iter()
-            .map(|package_id| (package_id, self.managed_entries(package_id)))
-            .collect::<Vec<_>>();
-        largest_first.sort_by(|(left_id, left), (right_id, right)| {
-            right
-                .len()
-                .cmp(&left.len())
-                .then_with(|| left_id.cmp(right_id))
-        });
-        let mut deleted = BTreeSet::new();
-        let mut kept = BTreeSet::new();
-        for (package_id, entries) in largest_first {
-            if entries.is_empty() || !entries.is_subset(&deleted) {
-                deleted.extend(entries);
-                kept.insert(package_id);
-            }
-        }
-        removing
-            .iter()
-            .filter(|package_id| kept.contains(package_id))
-            .cloned()
-            .collect()
-    }
 }
 
 /// The snapshot files of a Magnitude occurrence, each by repository, commit and path; none for an

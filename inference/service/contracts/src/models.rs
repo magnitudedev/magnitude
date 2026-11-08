@@ -2672,6 +2672,12 @@ pub trait InstalledModelPackages: Send + Sync + 'static {
         &self,
         package_id: &ModelPackageId,
     ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>>;
+    /// Removes Magnitude's copies of `package_ids` as one removal, returning the bytes freed: a
+    /// file another installed package is served from stays.
+    fn remove_installed_packages(
+        &self,
+        package_ids: &[ModelPackageId],
+    ) -> BoxFuture<'_, Result<u64, InventoryError>>;
 }
 
 pub trait RecommendableModelCatalogProvider: Send + Sync + 'static {

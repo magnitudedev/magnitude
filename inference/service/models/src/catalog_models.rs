@@ -550,10 +550,6 @@ impl ModelDomainResolver {
             .map(|(component, _)| component)
             .collect();
         }
-        // The store lists a target held with its projector and, from the same snapshot file, that
-        // projector as a package of its own: deleting the target deletes the file, so the projector
-        // package goes with it rather than unlinking the target's file before the target's turn.
-        plan.package_ids = occurrences.without_contained_managed_packages(&plan.package_ids);
         drop(occurrences);
         Ok(plan)
     }
