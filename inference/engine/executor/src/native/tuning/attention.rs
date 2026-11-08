@@ -1689,24 +1689,19 @@ mod tests {
                     .iter()
                     .filter(|choice| choice.get("MATRIX") == Some(&0))
                     .collect::<Vec<_>>();
-                // The start is the least legal split above the default's,
-                // or none where no larger split is legal (the default may
-                // already take the most slices the group or the simdgroups
-                // allow).
+                // The start is the next split above the default's: the
+                // affine entry already defaults to two slices of an even
+                // group.
                 let default_slices = defaults.param("SLICES").unwrap();
-                let split = [2, 4, 8]
-                    .into_iter()
-                    .filter(|slices| *slices > default_slices && group % slices == 0)
-                    .find(|slices| {
-                        implementation
-                            .validate(&defaults.clone().with_param("SLICES", *slices))
-                            .is_ok()
-                    });
-                assert_eq!(scalar.len(), usize::from(split.is_some()));
+                let split = 2 * default_slices;
+                assert_eq!(scalar.len(), usize::from(group % split == 0));
                 for values in scalar {
                     let mut expected = defaults.params().clone();
-                    expected.insert("SLICES".into(), split.unwrap());
+                    expected.insert("SLICES".into(), split);
                     assert_eq!(*values, expected);
+                    implementation
+                        .validate(&defaults.clone().with_param("SLICES", split))
+                        .unwrap();
                 }
                 mix.decode_rows = Some(1..2);
                 assert!(
