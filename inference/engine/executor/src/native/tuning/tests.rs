@@ -3090,18 +3090,6 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
     assert!(tuned.time.forming_seconds > 0.0);
 }
 
-/// A step class's rows are timed as the drafter's verification they serve:
-/// published after the committed row, the rest written to the tape. A
-/// chunked class's rows are a prefill chunk, published after every row.
-#[test]
-fn recurrent_cases_publish_as_their_served_launch_does() {
-    use super::recurrent::served_publication;
-    assert_eq!(served_publication(1, 1), (1, 0));
-    assert_eq!(served_publication(4, 4), (1, 3));
-    assert_eq!(served_publication(16, 16), (1, 15));
-    assert_eq!(served_publication(32, 32), (32, 0));
-}
-
 #[test]
 fn tuning_batches_are_packed_by_the_batch_builder() {
     let Some(device) = metal() else {

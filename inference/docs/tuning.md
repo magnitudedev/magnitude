@@ -289,12 +289,6 @@ inside the load's wall-clock allowance. Cold formation, first-use effects and wa
 steady-state speed evidence. Confirmation compares contenders under matched conditions and must
 establish a gain beyond measurement noise before replacing the default.
 
-A timed case does the work its served launch does. Its control tables take the form the served
-launch's row class takes: a recurrent step class's rows of one sequence are a drafter's
-verification, which publishes its state after the committed row and writes the rest to the
-rollback tape, while a chunked class's rows are a prefill chunk, published after every row. A
-case that skips served writes ranks configurations by a cost the step does not pay.
-
 Numerical comparison observes every returned subject and affected writable-state region from
 identical initialized inputs. Reused outputs start cleared so a missing write cannot inherit a
 previous candidate's correct value. Private tuning state never aliases live serving state.
