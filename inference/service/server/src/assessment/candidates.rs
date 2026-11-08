@@ -2302,7 +2302,7 @@ impl ManagedModelCandidates {
             (!embedded_catalog && !matches!(verdict, DrafterVerdict::None)).then(|| {
                 decide(DrafterCandidate {
                     category: DrafterCategory::BuiltIn,
-                    automatic: is_bound(&verdict) && fits(&own.profile),
+                    automatic: is_bound(&verdict) && serves_as_much(&own.profile, &bare.profile),
                     reference: DrafterReference::Embedded,
                     name: embedded_drafter_name(bound_method(&verdict).as_ref()),
                     label: "Built into this model".to_owned(),
@@ -2484,8 +2484,9 @@ impl ManagedModelCandidates {
             verdict,
             on_this_computer,
         };
-        candidate.automatic =
-            known_to_work(&candidate) && is_bound(&candidate.verdict) && fits(&assessed.profile);
+        candidate.automatic = known_to_work(&candidate)
+            && is_bound(&candidate.verdict)
+            && self.serves_as_much_as_plain(target, &assessed.profile).await;
         Some(candidate)
     }
 
@@ -2689,17 +2690,32 @@ impl ManagedModelCandidates {
         })
     }
 
-    /// The engine's verdict on a drafter for the target, and whether the model fits with it.
+    /// The engine's verdict on a drafter for the target, and whether the model with it serves as
+    /// much context as without one.
     async fn drafter_verdict(
         &self,
         target: &DrafterTarget,
         drafter: &DrafterMaterial,
     ) -> Option<(DrafterVerdict, bool)> {
-        self.assess(&target.material, Some(drafter), ModelMethod::Auto)
+        let assessed = self
+            .assess(&target.material, Some(drafter), ModelMethod::Auto)
             .await
-            .map(|assessed| (verdict_of(&assessed.profile), fits(&assessed.profile)))
             .map_err(|error| tracing::warn!(%error, "drafter assessment failed"))
-            .ok()
+            .ok()?;
+        let fits = self.serves_as_much_as_plain(target, &assessed.profile).await;
+        Some((verdict_of(&assessed.profile), fits))
+    }
+
+    /// Whether the target with a drafter, `assessed`, serves as much context as it does without
+    /// one: a drafter never costs the model context it would otherwise have.
+    async fn serves_as_much_as_plain(&self, target: &DrafterTarget, assessed: &ModelAssessment) -> bool {
+        match self.assess(&target.material, None, ModelMethod::Plain).await {
+            Ok(plain) => serves_as_much(assessed, &plain.profile),
+            Err(error) => {
+                tracing::warn!(%error, "plain assessment failed");
+                fits(assessed)
+            }
+        }
     }
 
     // Candidate assessment and bundles --------------------------------------------------------
@@ -3212,6 +3228,16 @@ fn known_to_work(candidate: &DrafterCandidate) -> bool {
 
 fn fits(assessment: &ModelAssessment) -> bool {
     matches!(assessment, ModelAssessment::Fits { .. })
+}
+
+/// Whether `with` fits and serves at least the context `without` does.
+fn serves_as_much(with: &ModelAssessment, without: &ModelAssessment) -> bool {
+    match (with, without) {
+        (ModelAssessment::Fits { served, .. }, ModelAssessment::Fits { served: plain, .. }) => {
+            served.context_length >= plain.context_length
+        }
+        (with, _) => fits(with),
+    }
 }
 
 /// Candidates in automatic-choice order: by category (`DrafterCategory`'s order), then by method

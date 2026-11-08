@@ -4888,8 +4888,7 @@ struct Requirements {
 
 impl Requirements {
     /// What the model needs served plain, with its heads and with the catalog DFlash, each at the
-    /// smallest served context: whether a drafter keeps a model fitting is judged there, since
-    /// above it the model is served at a smaller context instead.
+    /// smallest served context.
     async fn of(file: &str) -> Self {
         let standard = fixture_from(
             Vec::new(),
@@ -5102,6 +5101,62 @@ async fn a_model_that_fits_only_served_plain_gets_no_automatic_drafter_even_with
             built_in_heads: false,
         },
         "served plain, never with heads that would stop it fitting"
+    );
+}
+
+/// Release QA (RTX 4090, 2026-11-07): Nemotron 3.5 Lightning fit at its trained 1M context plain,
+/// yet kept its catalog DFlash and was served at 32K, because a drafter only had to keep the model
+/// fitting at the 32K floor. A drafter never costs the model context it would otherwise have:
+/// one that would serve it at a smaller context than plain is withheld.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catalog_drafter_that_would_lower_the_served_context_is_withheld() {
+    let requirements = Requirements::of(QWEN_FILE).await;
+    let fixture = fixture_from(
+        Vec::new(),
+        LocalModelsConfiguration::default(),
+        false,
+        BTreeMap::new(),
+        true,
+        requirements.with_budget(requirements.dflash),
+    )
+    .await;
+    let served = |drafter: Option<CandidateDrafter>| {
+        let candidates = Arc::clone(&fixture.candidates);
+        async move {
+            match candidates
+                .assess_candidate(ModelCandidate {
+                    drafter,
+                    ..hugging_face_candidate(QWEN_COMMUNITY, '3', QWEN_FILE)
+                })
+                .await
+                .expect("assessment")
+            {
+                ModelAssessment::Fits { served, .. } => served.context_length,
+                other => panic!("it fits within the budget: {other:?}"),
+            }
+        }
+    };
+    let plain = served(None).await;
+    let with_drafter = served(Some(CandidateDrafter {
+        reference: DrafterReference::Catalog {
+            model_id: qwen_catalog_id(),
+        },
+        method: SpeculativeMethod::DFlash,
+    }))
+    .await;
+    assert!(
+        with_drafter == magnitude_engine::assessment::SERVED_CONTEXT_FLOOR && plain > with_drafter,
+        "the budget serves the model plain above the floor and with the drafter at it: {plain} vs {with_drafter}"
+    );
+
+    assert!(
+        fixture
+            .candidates
+            .catalog_drafter_fit(&qwen_catalog_id())
+            .await
+            .expect("catalog drafter fit")
+            .withheld,
+        "the catalog model is served plain at {plain}, not with its drafter at {with_drafter}"
     );
 }
 
