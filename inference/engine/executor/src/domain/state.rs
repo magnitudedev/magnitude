@@ -1246,24 +1246,27 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The most bytes a growth step of the expert bank in `kind` storage may
-    /// back now in `room`, and the unborn state its claim leaves beside it:
-    /// what the heap's claim of them admits there
-    /// (`DeviceHeap::reserved_room`, the one test the claim then passes,
+    /// back now in each of `rooms`, from one reading of the machine: what
+    /// the heap's claim of them admits there
+    /// (`DeviceHeap::reserved_rooms`, the one test the claim then passes,
     /// beside the workload's unborn state and the plan's class reserve,
     /// [`Self::bank_unborn`]), less its store's fluctuation
     /// (`MemoryPace::fluctuation`) and, in device storage's store, the
     /// measurement job's claim. Refused in the Reclaim band, or blind.
-    pub(super) fn growth_room(&self, kind: crate::planning::BankTier, room: Room) -> Result<(u64, u64), ClaimRefusal> {
+    pub(super) fn growth_room(&self, kind: crate::planning::BankTier, rooms: &[Room]) -> Result<Vec<u64>, ClaimRefusal> {
         let unborn = self.bank_unborn(kind.storage());
-        let mode = match room {
-            Room::Committed => crate::platform::FitMode::Live,
-            Room::Borrowed => crate::platform::FitMode::Borrow,
-        };
+        let modes = rooms
+            .iter()
+            .map(|room| match room {
+                Room::Committed => crate::platform::FitMode::Live,
+                Room::Borrowed => crate::platform::FitMode::Borrow,
+            })
+            .collect::<Vec<_>>();
         let planned = self.planned_unheld();
-        let bytes = self.memory.borrow_mut().reserved_room(kind, unborn, mode, planned)?;
+        let bytes = self.memory.borrow_mut().reserved_rooms(kind, unborn, &modes, planned)?;
         let fluctuation = self.store_of(kind.storage()).map_or(0, |store| self.pace.borrow().fluctuation(store));
         let claimed = self.measurement_beside(kind.storage());
-        Ok((bytes.saturating_sub(fluctuation).saturating_sub(claimed), unborn))
+        Ok(bytes.into_iter().map(|bytes| bytes.saturating_sub(fluctuation).saturating_sub(claimed)).collect())
     }
 
     /// The rooms a growth step of the expert bank in `kind` storage may take

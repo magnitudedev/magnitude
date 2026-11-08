@@ -545,16 +545,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             false => tiers[0],
         };
         let rooms = self.growth_rooms(tier);
-        let room = |room: Room| match rooms.contains(&room) {
-            false => Ok(0),
-            true => match self.growth_room(tier, room) {
-                Ok((bytes, _)) => Ok(bytes),
-                Err(super::ClaimRefusal::Reclaim(_) | super::ClaimRefusal::Blind(_)) => Ok(0),
-                Err(refusal) => Err(DomainError::from(refusal)),
-            },
+        let bytes = match self.growth_room(tier, &rooms) {
+            Ok(bytes) => bytes,
+            Err(super::ClaimRefusal::Reclaim(_) | super::ClaimRefusal::Blind(_)) => vec![0; rooms.len()],
+            Err(refusal) => return Err(DomainError::from(refusal)),
         };
-        let committed = room(Room::Committed)?.min(supply.free);
-        supply.borrowable = room(Room::Borrowed)?.saturating_sub(committed).min(supply.borrowable);
+        let room = |room: Room| rooms.iter().position(|&of| of == room).map_or(0, |at| bytes[at]);
+        let committed = room(Room::Committed).min(supply.free);
+        supply.borrowable = room(Room::Borrowed).saturating_sub(committed).min(supply.borrowable);
         supply.free = committed;
         Ok(Some(supply))
     }

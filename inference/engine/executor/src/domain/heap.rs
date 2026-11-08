@@ -568,7 +568,7 @@ impl DeviceHeap {
     /// Why `claim` and `table` new bytes of host tables do not fit beside
     /// every outstanding claim and the held host tables at `status`, whose
     /// domains `readings` observed; none where they fit. The one test of a
-    /// claim: [`Self::check_storage`] applies it, and [`Self::reserved_room`]
+    /// claim: [`Self::check_storage`] applies it, and [`Self::reserved_rooms`]
     /// finds the most it admits.
     fn refusal(
         &self,
@@ -623,38 +623,43 @@ impl DeviceHeap {
     }
 
     /// The most bytes [`Self::claim_reserved`] of `kind` storage beside
-    /// `beside` device bytes admits now in `mode`'s room, from one fresh
-    /// status sample: by halving over [`Self::refusal`], the one test of a
-    /// claim, which never admits more bytes where it refuses fewer, at the
-    /// sample's one fit. Refused while a domain is in the Reclaim band, or
-    /// blind.
-    pub fn reserved_room(&mut self, kind: BankTier, beside: u64, mode: FitMode, planned: u64) -> Result<u64, ClaimRefusal> {
+    /// `beside` device bytes admits now in each of `modes`' rooms, from one
+    /// fresh status sample: by halving over [`Self::refusal`], the one test
+    /// of a claim, which never admits more bytes where it refuses fewer, at
+    /// the sample's one fit. Refused while a domain is in the Reclaim band,
+    /// or blind.
+    pub fn reserved_rooms(&mut self, kind: BankTier, beside: u64, modes: &[FitMode], planned: u64) -> Result<Vec<u64>, ClaimRefusal> {
         let (status, readings) = self.sample(planned)?;
         let fit = Fit::new(self.device.topology(), &status, &self.reserves, self.room());
-        let fits = |bytes: u64| -> Result<bool, ClaimRefusal> {
-            let claim = besides(reserved(kind, bytes), beside)?;
-            Ok(self.refusal_in(&fit, &readings, claim, 0, mode)?.is_none())
-        };
-        if !fits(0)? {
-            return Ok(0);
-        }
-        // The most known to fit, and the least known not to.
-        let (mut fitting, mut over) = (0u64, 1u64);
-        while fits(over)? {
-            fitting = over;
-            match over.checked_mul(2) {
-                Some(next) => over = next,
-                None => return Ok(u64::MAX),
-            }
-        }
-        while over - fitting > 1 {
-            let middle = fitting + (over - fitting) / 2;
-            match fits(middle)? {
-                true => fitting = middle,
-                false => over = middle,
-            }
-        }
-        Ok(fitting)
+        modes
+            .iter()
+            .map(|&mode| {
+                let fits = |bytes: u64| -> Result<bool, ClaimRefusal> {
+                    let claim = besides(reserved(kind, bytes), beside)?;
+                    Ok(self.refusal_in(&fit, &readings, claim, 0, mode)?.is_none())
+                };
+                if !fits(0)? {
+                    return Ok(0);
+                }
+                // The most known to fit, and the least known not to.
+                let (mut fitting, mut over) = (0u64, 1u64);
+                while fits(over)? {
+                    fitting = over;
+                    match over.checked_mul(2) {
+                        Some(next) => over = next,
+                        None => return Ok(u64::MAX),
+                    }
+                }
+                while over - fitting > 1 {
+                    let middle = fitting + (over - fitting) / 2;
+                    match fits(middle)? {
+                        true => fitting = middle,
+                        false => over = middle,
+                    }
+                }
+                Ok(fitting)
+            })
+            .collect()
     }
 
     /// Hold a host-resident table's `bytes` in host RAM for the model's

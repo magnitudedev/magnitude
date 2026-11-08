@@ -894,7 +894,7 @@ fn a_growth_step_reaches_the_room_or_the_saturation_and_never_past_either() {
 }
 
 /// A growth step is sized within what the heap's claim of it admits
-/// (`DeviceHeap::reserved_room`), which admits exactly its room: that many
+/// (`DeviceHeap::reserved_rooms`), which admits exactly its room: that many
 /// bytes and not one more. With a claim the heap holds leaving room for two
 /// of the three slots the record's misses would use, the step takes the two
 /// and lands; sized past the heap's room, as by a room the claim does not
@@ -911,9 +911,9 @@ fn a_growth_step_is_sized_within_what_the_heap_admits() {
         let device = crate::planning::BankTier::Bank;
         // What a growth may take: the free headroom's room, which a growth's
         // claim reads.
-        let available = domain.memory.borrow_mut().reserved_room(device, 0, crate::platform::FitMode::Live, 0).unwrap();
+        let available = domain.memory.borrow_mut().reserved_rooms(device, 0, &[crate::platform::FitMode::Live], 0).unwrap()[0];
         let held = domain.memory.borrow_mut().claim_reserved(device, available - 5 * row / 2, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0).unwrap();
-        let room = domain.memory.borrow_mut().reserved_room(device, 0, crate::platform::FitMode::Live, 0).unwrap();
+        let room = domain.memory.borrow_mut().reserved_rooms(device, 0, &[crate::platform::FitMode::Live], 0).unwrap()[0];
         assert!(
             matches!(
                 domain.memory.borrow_mut().claim_reserved(device, room + 1, 0, HoldingClass::Live, crate::platform::FitMode::Live, 0),
@@ -993,7 +993,7 @@ fn a_bank_grown_before_the_first_group_leaves_its_places_room() {
         domain.probe_memory().unwrap();
         let row = bank_row(&domain);
         let room = |domain: &ExecutorDomain<TestFamily>| {
-            domain.growth_room(crate::planning::BankTier::Bank, super::borrowing::Room::Committed).unwrap().0
+            domain.growth_room(crate::planning::BankTier::Bank, &[super::borrowing::Room::Committed]).unwrap()[0]
         };
         assert!(room(&domain) > 4 * row, "{backend:?}: the device has room for the bank");
         // The plan's class keeps all but a row and a half of the room: the
@@ -1496,7 +1496,7 @@ fn a_paying_growth_stops_at_the_line() {
         assert_eq!(near[0].held[..], whole[0].held[..near[0].held.len()]);
         // What the heap grants a growth now, by whichever constraint binds:
         // the free headroom's room, which a growth's claim reads.
-        let available = domain.memory.borrow_mut().reserved_room(kind, 0, crate::platform::FitMode::Live, 0).unwrap();
+        let available = domain.memory.borrow_mut().reserved_rooms(kind, 0, &[crate::platform::FitMode::Live], 0).unwrap()[0];
         // Claimed as a reservation's, the bytes take the store's room itself,
         // which `available` reads: the free space of the device's blocks serves
         // none of them.
