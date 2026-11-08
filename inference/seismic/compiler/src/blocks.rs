@@ -2,7 +2,7 @@
 //! (CUDA, Vulkan). Device memory is taken from the driver in blocks, and an
 //! allocation is a range of a block, so a model's many small tensors cost
 //! no per-allocation driver rounding. Blocks grow from 64 MiB to the cap; a
-//! request beyond the cap gets a dedicated block. A block's unallocated
+//! request of more than half the first block gets a block of its own. A block's unallocated
 //! space is device usage no allocation charges, so a new block never exceeds
 //! the room the caller grants, and the backend reports its blocks' free
 //! space as held memory.
@@ -68,18 +68,150 @@ impl FreeRanges {
     }
 }
 
+/// A block as the packing rule sees it: its size, whether it is an
+/// allocation's own (`takes_own_block`), and its free ranges. The backends'
+/// blocks and a replay's (`Packing`) are placed by the same rule.
+pub trait PackedBlock {
+    fn bytes(&self) -> u64;
+    fn own(&self) -> bool;
+    /// The offset of a range taken from the block's free ranges, first fit.
+    fn take(&self, bytes: u64, alignment: u64) -> Option<u64>;
+}
+
+impl<B: PackedBlock> PackedBlock for std::sync::Arc<B> {
+    fn bytes(&self) -> u64 {
+        (**self).bytes()
+    }
+    fn own(&self) -> bool {
+        (**self).own()
+    }
+    fn take(&self, bytes: u64, alignment: u64) -> Option<u64> {
+        (**self).take(bytes, alignment)
+    }
+}
+
+/// Where an allocation goes among `blocks`, in order: the first shared block
+/// with a free range that fits it, and the range's offset.
+pub fn first_fit<B: PackedBlock>(blocks: &[B], bytes: u64, alignment: u64) -> Option<(usize, u64)> {
+    blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| !block.own())
+        .find_map(|(index, block)| block.take(bytes, alignment).map(|offset| (index, offset)))
+}
+
+/// The largest shared block, the one a new shared block doubles.
+pub fn largest_shared<B: PackedBlock>(blocks: &[B]) -> Option<u64> {
+    blocks
+        .iter()
+        .filter(|block| !block.own())
+        .map(PackedBlock::bytes)
+        .max()
+}
+
+/// A replay of the packing rule over a sequence of allocations, holding
+/// only the blocks' sizes and free ranges: the device memory a backend's
+/// blocks hold for those allocations, and what of it no allocation uses,
+/// without a device. No room is granted, so every new shared block is the
+/// doubled one: the most free space the sequence leaves.
+pub struct Packing {
+    cap: u64,
+    granularity: u64,
+    minimum_alignment: u64,
+    blocks: Vec<ReplayedBlock>,
+}
+
+struct ReplayedBlock {
+    bytes: u64,
+    own: bool,
+    free: std::cell::RefCell<FreeRanges>,
+}
+
+impl PackedBlock for ReplayedBlock {
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    fn own(&self) -> bool {
+        self.own
+    }
+    fn take(&self, bytes: u64, alignment: u64) -> Option<u64> {
+        self.free.borrow_mut().take(bytes, alignment)
+    }
+}
+
+impl Packing {
+    /// The blocks of a backend whose blocks are at most `cap`, in whole
+    /// `granularity` units, with ranges at least `minimum_alignment` aligned.
+    pub fn new(cap: u64, granularity: u64, minimum_alignment: u64) -> Self {
+        Self {
+            cap,
+            granularity,
+            minimum_alignment,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Place an allocation of `bytes` aligned to `alignment`, as the
+    /// backend's blocks would.
+    pub fn allocate(&mut self, bytes: u64, alignment: u64) -> Result<(), ExecutionError> {
+        let bytes = bytes.max(1);
+        let alignment = alignment.max(self.minimum_alignment);
+        if first_fit(&self.blocks, bytes, alignment).is_some() {
+            return Ok(());
+        }
+        let size = block_bytes(
+            largest_shared(&self.blocks),
+            self.cap,
+            bytes,
+            None,
+            self.granularity,
+        )?;
+        let mut free = FreeRanges::new(size);
+        free.take(bytes, alignment)
+            .expect("a new block holds its first allocation");
+        self.blocks.push(ReplayedBlock {
+            bytes: size,
+            own: takes_own_block(bytes, self.cap),
+            free: std::cell::RefCell::new(free),
+        });
+        Ok(())
+    }
+
+    /// The device memory the blocks hold.
+    pub fn held_bytes(&self) -> u64 {
+        self.blocks.iter().map(|block| block.bytes).sum()
+    }
+
+    /// What of the blocks no allocation uses.
+    pub fn free_bytes(&self) -> u64 {
+        self.blocks
+            .iter()
+            .map(|block| block.free.borrow().free_bytes())
+            .sum()
+    }
+}
+
+/// Whether an allocation of `bytes` takes a block of its own, which nothing
+/// else shares and no later block doubles: one of more than half the first
+/// block (or of the cap). Sharing doubled blocks, a run of such allocations
+/// (a model's expert stacks) would hold a tail of each block that fits none
+/// of them and that the model's few smaller tensors never fill: 343 MiB
+/// stacks two to a 1 GiB block held 5.0 GB free beside Nemotron 3.5
+/// Lightning's 20.5 GB, and 450 MiB stacks 5.4 GB beside Qwen3.8 Flash
+/// Next's 73.5 GB, against a one-block allowance.
+pub fn takes_own_block(bytes: u64, cap: u64) -> bool {
+    bytes > FIRST_BLOCK_BYTES.min(cap) / 2
+}
+
 /// The size of a new block for an allocation of `bytes`: double the largest
-/// block (64 MiB first) up to `cap`, in whole `granularity` units. An
-/// allocation of more than half that block gets a block of its own size
-/// rounded up to the granularity: a block shares its space so many smaller
-/// allocations cost one driver allocation, and what such an allocation
-/// would leave free fits no allocation its size, so a run of them (a
-/// model's expert stacks) would hold most of a block each in tails nothing
-/// takes. When `room` is given and the doubled block does not fit it, the
-/// block is the allocation's own size: a device near its limit holds no
-/// free block space it was not asked for, so its usage stays with its
-/// claims and clear of the planning reserve. An allocation that needs more
-/// than the room is a capacity shortfall.
+/// shared block (64 MiB first) up to `cap`, in whole `granularity` units,
+/// so many smaller allocations cost one driver allocation. An allocation
+/// that takes its own block (`takes_own_block`) gets its own size rounded up
+/// to the granularity. When `room` is given and the doubled block does not
+/// fit it, the block is the allocation's own size: a device near its limit
+/// holds no free block space it was not asked for, so its usage stays with
+/// its claims and clear of the planning reserve. An allocation that needs
+/// more than the room is a capacity shortfall.
 pub fn block_bytes(
     largest: Option<u64>,
     cap: u64,
@@ -91,7 +223,11 @@ pub fn block_bytes(
     let doubled = largest
         .map_or(FIRST_BLOCK_BYTES, |largest| largest * 2)
         .min(cap);
-    let size = if needed > doubled / 2 { needed } else { doubled };
+    let size = if takes_own_block(bytes, cap) || needed > doubled / 2 {
+        needed
+    } else {
+        doubled
+    };
     match room {
         Some(room) if needed > room => Err(ExecutionError::AllocationCapacity {
             required: needed.into(),
@@ -162,11 +298,33 @@ mod tests {
         ));
     }
 
-    /// An allocation of more than half the block it would open takes a
-    /// block of its own size: its tail would fit nothing its size. Half or
-    /// less shares the doubled block.
+    /// A replay holds what the backends' blocks would: a run of expert stacks
+    /// each in a block of its own, the granule beyond each its only free
+    /// space, and small tensors sharing a doubled block.
     #[test]
-    fn an_allocation_beyond_half_a_new_block_takes_its_own_size() {
+    fn a_replay_holds_each_stack_in_its_own_block_and_shares_the_small() {
+        let g = 2 * MIB;
+        let mut packing = Packing::new(BLOCK_CAP_BYTES, g, 256);
+        for _ in 0..46 {
+            packing.allocate(343 * MIB + MIB / 2, 256).unwrap();
+        }
+        assert_eq!(packing.held_bytes(), 46 * 344 * MIB);
+        assert_eq!(packing.free_bytes(), 46 * (MIB / 2));
+        for _ in 0..100 {
+            packing.allocate(MIB / 4, 256).unwrap();
+        }
+        assert_eq!(packing.held_bytes(), 46 * 344 * MIB + FIRST_BLOCK_BYTES);
+        assert_eq!(
+            packing.free_bytes(),
+            46 * (MIB / 2) + FIRST_BLOCK_BYTES - 25 * MIB
+        );
+    }
+
+    /// An allocation of more than half the first block takes a block of its
+    /// own size, however large the shared blocks have grown: its tail would
+    /// fit nothing its size. Half or less shares the doubled block.
+    #[test]
+    fn an_allocation_beyond_half_the_first_block_takes_its_own_size() {
         let cap = 1024 * MIB;
         let g = 2 * MIB;
         assert_eq!(
@@ -174,12 +332,16 @@ mod tests {
             758 * MIB
         );
         assert_eq!(
-            block_bytes(Some(512 * MIB), cap, 512 * MIB, None, g).unwrap(),
-            cap
+            block_bytes(Some(512 * MIB), cap, 343 * MIB + 1, None, g).unwrap(),
+            344 * MIB
         );
         assert_eq!(
-            block_bytes(None, cap, 40 * MIB, None, g).unwrap(),
-            40 * MIB
+            block_bytes(Some(512 * MIB), cap, 32 * MIB, None, g).unwrap(),
+            cap
         );
+        assert_eq!(block_bytes(None, cap, 40 * MIB, None, g).unwrap(), 40 * MIB);
+        assert!(takes_own_block(32 * MIB + 1, cap));
+        assert!(!takes_own_block(32 * MIB, cap));
+        assert!(takes_own_block(9 * MIB, 16 * MIB));
     }
 }

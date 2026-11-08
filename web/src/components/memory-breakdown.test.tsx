@@ -19,7 +19,7 @@ const allocation = Schema.decodeUnknownSync(ModelInstanceAllocationSchema)({
 it("sums the three native allocation categories across memory domains", () => {
   const html = renderToStaticMarkup(<MemoryFigures allocation={Option.some(allocation)} hardware={hardware} />)
   expect(html).toContain(`data-memory-bytes="${6 * GiB}"`)
-  for (const [label, bytes] of [["Weights", 3.5 * GiB], ["KV cache", 2 * GiB], ["Runtime", GiB / 2]]) {
+  for (const [label, bytes] of [["Weights", 3.5 * GiB], ["Context", 2 * GiB], ["Overhead", GiB / 2]]) {
     expect(html).toContain(`data-memory-category="${label}" data-bytes="${bytes}"`)
   }
   expect(html.match(/data-memory-category=/g)).toHaveLength(3)

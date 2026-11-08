@@ -952,13 +952,13 @@ pub fn on_device(
 
 /// `implementation`'s declared defaults as `device` offers them at
 /// `bindings`. On a CPU whose tier forms quantized dots from vector integer
-/// products (AVX2, AVX-512 or VNNI, `Tier::quantized_dots`, a fact of the
-/// device), a projection over a packed weight the quantized dot takes
-/// (`form(W, INT8)`) defaults to its `INT8` form: it quantizes the staged
-/// rows to Q8 blocks and runs the representation's integer dot, and the F32
-/// form is the challenger; where `where` refuses it, the walk from the
-/// defaults takes the F32 form. Elsewhere (x86-64-v2, NEON, dense weights,
-/// GPUs) the declaration's defaults stand.
+/// products (AVX2, AVX-512, VNNI or NEON `sdot`, `Tier::quantized_dots`, a
+/// fact of the device), a projection over a packed weight the quantized dot
+/// takes (`form(W, INT8)`) defaults to its `INT8` form: it quantizes the
+/// staged rows to Q8 blocks and runs the representation's integer dot, and
+/// the F32 form is the challenger; where `where` refuses it, the walk from
+/// the defaults takes the F32 form. Elsewhere (x86-64-v2, NEON without
+/// `dotprod`, dense weights, GPUs) the declaration's defaults stand.
 pub(crate) fn device_defaults(
     device: &DeviceInner,
     mut implementation: NativeImplementation,
@@ -3411,8 +3411,8 @@ fn encode(first: &NativePrepared, work: &Encoding<'_, impl DispatchList>) -> Res
     );
     match &first.route {
         NativeRoute::Cpu(route) => {
-            let (outcome, interval) = cpu::run(&route.opened, list, repetitions);
-            Ok(Committed::Cpu { outcome, interval })
+            let (outcome, interval, launches) = cpu::run(&route.opened, list, repetitions, timed.is_some());
+            Ok(Committed::Cpu { outcome, interval, launches })
         }
         #[cfg(target_os = "macos")]
         NativeRoute::Metal { opened, .. } => {
@@ -4106,20 +4106,12 @@ mod issue_lifecycle_tests {
     use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 
     fn cpu_noop() -> Arc<NativePrepared> {
-        use seismic_native_cpu::Tier;
-        unsafe fn unused(_: &CpuInvocation<'_>, _: [u64; 3], _: &mut [u8]) {}
-        const fn variant(tier: Tier) -> CpuVariant {
-            CpuVariant { tier, elements: &[], function: unused }
-        }
         static KERNELS: CpuNativeKernels = CpuNativeKernels {
             digest: "issue-lifecycle-unwind",
             elements: &[],
             launches: &[CpuLaunchVariants {
                 kernel: "entry",
-                variants: &[
-                    variant(Tier::X86V2), variant(Tier::X86V3), variant(Tier::X86V4),
-                    variant(Tier::X86V4Vnni), variant(Tier::Neon),
-                ],
+                variants: &crate::native::cpu::UNRUN_VARIANTS,
             }],
         };
         let module = check_source(SourceSet::new(vec![SourceFile {
@@ -4138,7 +4130,7 @@ mod issue_lifecycle_tests {
         for outcome in [Ok(()), Err(ExecutionError::SubmissionFailed("retire failed".into()))] {
             let route = EncodeFailure {
                 error: issue.clone(),
-                committed: Some(Committed::Cpu { outcome: outcome.clone(), interval: (1., 2.) }),
+                committed: Some(Committed::Cpu { outcome: outcome.clone(), interval: (1., 2.), launches: None }),
             }
             .completion()
             .ok()

@@ -684,6 +684,22 @@ impl ManagedModelAssessments {
                 work: None,
             };
         }
+        // A configuration that depends on a drafter fit not worked out yet is a placeholder: it
+        // is assessed once the fit is known, and meanwhile reported as assessing, never as a
+        // verdict that refuses its download or its load.
+        if self.assessor.awaits_catalog_drafter_fit(&subject) {
+            return AssessmentTarget {
+                key: AssessmentWorkKey(
+                    serde_json::to_string(&(&subject, &profile, "awaiting catalog drafter fit"))
+                        .expect("assessment target identity is serializable"),
+                ),
+                entry: ModelAssessmentEntry {
+                    subject,
+                    state: ModelAssessmentEntryState::Assessing,
+                },
+                work: None,
+            };
+        }
         let environment = self.assessor.environment();
         let work = self
             .assessor
@@ -1243,11 +1259,17 @@ mod tests {
             template_fingerprint: String::new(),
             fingerprint: None,
             profile: ModelAssessment::Fits {
+                served: profile.clone(),
                 profile,
                 assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
                     "assessment".to_owned(),
                 ),
                 memory: Vec::new(),
+                memory_breakdown: magnitude_service_contracts::models::MemoryBreakdown {
+                    weights_bytes: 0,
+                    context_bytes: 0,
+                    overhead_bytes: 0,
+                },
                 residency: magnitude_service_contracts::models::ModelResidency::Resident {
                     performance,
                 },

@@ -4,13 +4,9 @@ import {
   formatLocalInferenceBackend,
   formatMemorySize,
 } from "@magnitudedev/client-common"
-import type { LocalInferenceHardware } from "@magnitudedev/sdk"
 
-export const formatContext = (tokens: number): string => tokens < 1_000
-  ? String(tokens)
-  : tokens % 1_024 === 0
-    ? `${tokens / 1_024}K`
-    : `${Math.round(tokens / 1_000)}K`
+export { formatContext } from "@magnitudedev/client-common"
+import type { LocalInferenceHardware } from "@magnitudedev/sdk"
 
 export interface LocalHardwarePresentation {
   readonly system: { readonly name: string; readonly details: readonly string[] }

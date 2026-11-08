@@ -37,7 +37,7 @@ use magnitude_executor::{
         assess_execution_fit, decode_pricing, decode_step, estimate_execution, performance_depths,
         prepare_execution_assessment, undrafted_memory_charge, AssessmentError,
         AssessmentRequest,
-        DomainFit, ExecutionAssessment, ExecutionShortfall,
+        ExecutionAssessment, ExecutionFit, ExecutionShortfall,
         ExecutorCosts, ExpertShares, PerformanceEstimate, PreparedExecutionAssessment,
         PointRequests, Priced, Residency as FitResidency, StoredCosts, StreamedFigures, StreamedLayers,
     },
@@ -81,9 +81,10 @@ pub struct AssessmentStructure {
     pub reserves: MemoryReserves,
     pub policy: ModelPolicy,
     pub service: ServiceLimits,
-    /// The context every model is planned at, as a load serving it at that
-    /// context holds it (`host::resolve_served_context`): its declared
-    /// limit when none.
+    /// The one context every model is planned at, as a load serving it at
+    /// that context holds it (`host::resolve_served_context`): when none,
+    /// each is planned at its served tiers ([`served_contexts`]) from its
+    /// declared limit down.
     pub served_context: Option<usize>,
 }
 
@@ -338,7 +339,9 @@ pub struct ModelFacts {
     /// [`magnitude_chat::TemplateInspection::fingerprint`] of the package's
     /// chat templates and reasoning profile.
     pub template_fingerprint: String,
-    /// The model's supported context, which assessment serves.
+    /// The model's supported context, or the one the structure fixes
+    /// ([`AssessmentStructure::served_context`]): the largest it is served
+    /// at ([`served_contexts`]).
     pub context_limit: u32,
     pub fingerprint: Option<ModelFingerprint>,
     pub projector: ProjectorVerdict,
@@ -368,14 +371,14 @@ pub enum ModelAssessment {
 /// expert bank among them, or why it does not fit.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelExecution {
+    /// It fits at the served context `fit.fit_context_tokens`, the largest
+    /// of its served tiers ([`served_contexts`]) that fits, with what it
+    /// requires there and its plan's expert bank, whole or streamed.
     Fits {
-        domains: Vec<DomainFit>,
+        fit: ExecutionFit,
         residency: ModelResidency,
-        /// The plan's expert bank, whole or streamed: its slots, ceiling,
-        /// host slots, prompt places and pass. None for a plan that banks
-        /// no experts.
-        bank: Option<magnitude_executor::ExpertBankPlan>,
     },
+    /// It fits at none of its served tiers: the shortfall at the smallest.
     DoesNotFit(ExecutionShortfall),
 }
 
@@ -447,25 +450,119 @@ pub enum PreparedModelAssessment {
         unsupported: UnsupportedModel,
         fingerprint: Option<ModelFingerprint>,
     },
+    /// The package planned at its largest served tier, `facts.context_limit`
+    /// (`definition`, `draft` and `execution`, its drafter verdict in
+    /// `facts`), and its smaller tiers, each planned when assessment first
+    /// reaches it (`below`).
     Planned {
         facts: ModelFacts,
         /// The definition `draft` plans.
         definition: ModelDefinition,
         draft: ExecutionPlanDraft,
         execution: PreparedExecutionAssessment,
+        below: LowerTiers,
     },
 }
 
-/// Complete a prepared model against stable capacity and, when it fits,
-/// estimate its decode speed with `sequences` conversations decoding at
-/// once from the setup's measurements: arithmetic over the prepared demand.
+/// The plan of a package served at one of its tiers below the largest: the
+/// drafter verdict, definition, plan and prepared assessment a load serving
+/// it at that context has.
+struct TierPlan {
+    drafter: DrafterVerdict,
+    definition: ModelDefinition,
+    draft: ExecutionPlanDraft,
+    execution: PreparedExecutionAssessment,
+}
+
+/// A package's served tiers below its largest, largest first, each planned
+/// once, when assessment first reaches it ([`finish_model_assessment`]):
+/// a fit decided at the largest tier, as a streamed model's always is where
+/// its bank's floor fits, plans no other. A tier is planned as a load
+/// serving it is, so its charge and bank are exactly that load's.
+pub struct LowerTiers {
+    admitted: Box<AdmittedPackage>,
+    tiers: Vec<(u32, std::sync::Mutex<Option<Arc<TierPlan>>>)>,
+}
+
+impl LowerTiers {
+    /// The tiers below `admitted`'s served context: none where the
+    /// structure fixes the context ([`AssessmentStructure::served_context`]),
+    /// else the rest of [`served_contexts`].
+    fn of(admitted: Box<AdmittedPackage>, structure: &AssessmentStructure) -> Self {
+        let tiers = match structure.served_context {
+            Some(_) => Vec::new(),
+            None => served_contexts(admitted.context_limit).split_off(1),
+        };
+        Self {
+            tiers: tiers.into_iter().map(|tier| (tier, std::sync::Mutex::new(None))).collect(),
+            admitted,
+        }
+    }
+
+    /// The `index`th tier below the largest and its plan, planned on
+    /// `structure` (the one the package was prepared on) the first time it
+    /// is asked for. A package planned at its largest tier and refused at a
+    /// smaller one is a planning defect, reported as an error.
+    fn plan(&self, index: usize, structure: &AssessmentStructure) -> Result<(u32, Arc<TierPlan>), ModelAssessmentError> {
+        let (tier, plan) = &self.tiers[index];
+        let mut plan = plan.lock().expect("a tier's plan is never left poisoned");
+        if let Some(plan) = plan.as_ref() {
+            return Ok((*tier, Arc::clone(plan)));
+        }
+        let planned = match plan_tier(&self.admitted, *tier, structure)? {
+            Ok(planned) => Arc::new(planned),
+            Err(unsupported) => {
+                return Err(ModelAssessmentError::Planning(format!(
+                    "the package plans at {} tokens of context but is refused at {tier}: {}",
+                    self.admitted.context_limit, unsupported.detail
+                )));
+            }
+        };
+        *plan = Some(Arc::clone(&planned));
+        Ok((*tier, planned))
+    }
+}
+
+/// The smallest context a model is served at when its trained limit allows
+/// more: a coding harness's prompt and tools alone fill much of 16K.
+pub const SERVED_CONTEXT_FLOOR: u32 = 32_768;
+
+/// The contexts a model trained for `context_limit` tokens may be served at,
+/// largest first: the limit, then every power of two below it down to
+/// [`SERVED_CONTEXT_FLOOR`]. A model trained for less than the floor is
+/// served only at its limit. Tiers rather than the exact largest context
+/// keep the served context stable when a build's footprint shifts slightly.
+pub fn served_contexts(context_limit: u32) -> Vec<u32> {
+    let mut contexts = vec![context_limit];
+    let mut tier = SERVED_CONTEXT_FLOOR;
+    let mut below = Vec::new();
+    while tier < context_limit {
+        below.push(tier);
+        match tier.checked_mul(2) {
+            Some(next) => tier = next,
+            None => break,
+        }
+    }
+    contexts.extend(below.into_iter().rev());
+    contexts
+}
+
+/// Complete a prepared model against stable capacity at the largest of its
+/// served tiers it fits ([`served_contexts`], [`served_tier`]), each planned
+/// as a load serving it there plans it, and, when it fits, estimate its
+/// decode speed at the requested depths within that context with
+/// `sequences` conversations decoding at once from the setup's
+/// measurements: arithmetic over the prepared demand. A streamed model's
+/// tier does not trade its bank for context: the bank is planned against
+/// the room the tier's state leaves, and while it serves it borrows the
+/// state no request has committed.
 pub fn finish_model_assessment(
     prepared: &PreparedModelAssessment,
     setup: &AssessmentSetup,
     performance_depths: &[u32],
     sequences: u32,
 ) -> Result<ModelAssessment, ModelAssessmentError> {
-    let (facts, definition, draft, preparation) = match prepared {
+    let (facts, largest, below) = match prepared {
         PreparedModelAssessment::Unsupported {
             unsupported,
             fingerprint,
@@ -480,55 +577,114 @@ pub fn finish_model_assessment(
             definition,
             draft,
             execution,
-        } => (facts, definition, draft, execution),
+            below,
+        } => (facts, (definition, draft, execution), below),
     };
     let structure = &setup.structure;
-    let request = AssessmentRequest {
-        context_limit: facts.context_limit,
+    let request_at = |context_limit| AssessmentRequest {
+        context_limit,
         performance_depths: performance_depths.to_vec(),
         reserves: structure.reserves,
         sequences,
     };
-    let fit = assess_execution_fit(
-        definition,
-        preparation,
-        draft,
-        &structure.topology,
-        &structure.status,
-        &request,
-        &plan_prices(&setup.measurements, draft),
-    )
-    .map_err(ModelAssessmentError::Assessment)?;
-    let execution = match fit {
-        ExecutionAssessment::DoesNotFit(shortfall) => ModelExecution::DoesNotFit(shortfall),
-        ExecutionAssessment::Fits(fit) => ModelExecution::Fits {
-            residency: match fit.residency() {
-                FitResidency::Streamed(bank) => {
-                    let shares = ExpertShares::of(&bank);
-                    let at = |held| streamed_performance(&setup.measurements, preparation, draft, &bank, &request, held);
-                    ModelResidency::Streamed {
-                        performance: at(shares.held(shares.slots()))?,
-                        floor_performance: at(shares.held(shares.floor()))?,
-                        shares,
-                    }
-                }
-                FitResidency::Resident => ModelResidency::Resident {
-                    performance: resident_performance(
-                        &setup.measurements,
-                        preparation,
-                        draft,
-                        &request,
-                    )?,
-                },
+    // The `index`th tier, largest first: its context and, below the
+    // largest, its plan.
+    let tier = |index: usize| match index {
+        0 => Ok((facts.context_limit, None)),
+        _ => below.plan(index - 1, structure).map(|(context, plan)| (context, Some(plan))),
+    };
+    let served = served_tier(1 + below.tiers.len(), |index| {
+        let (context, plan) = tier(index)?;
+        let (definition, draft, execution) = match &plan {
+            None => largest,
+            Some(plan) => (&plan.definition, &plan.draft, &plan.execution),
+        };
+        let fit = assess_execution_fit(
+            definition,
+            execution,
+            draft,
+            &structure.topology,
+            &structure.status,
+            &request_at(context),
+            &plan_prices(&setup.measurements, draft),
+        )
+        .map_err(ModelAssessmentError::Assessment)?;
+        Ok::<_, ModelAssessmentError>(match fit {
+            ExecutionAssessment::Fits(fit) => Ok((plan, fit)),
+            ExecutionAssessment::DoesNotFit(shortfall) => Err(shortfall),
+        })
+    })?;
+    let (plan, fit) = match served {
+        Ok(served) => served,
+        Err(shortfall) => {
+            return Ok(ModelAssessment::Assessed {
+                facts: facts.clone(),
+                execution: ModelExecution::DoesNotFit(shortfall),
+            });
+        }
+    };
+    let (draft, preparation, facts) = match &plan {
+        None => (largest.1, largest.2, facts.clone()),
+        Some(plan) => (
+            &plan.draft,
+            &plan.execution,
+            ModelFacts {
+                drafter: plan.drafter.clone(),
+                ..facts.clone()
             },
-            domains: fit.domains,
-            bank: fit.bank,
+        ),
+    };
+    let request = request_at(fit.fit_context_tokens);
+    let residency = match fit.residency() {
+        FitResidency::Streamed(bank) => {
+            let shares = ExpertShares::of(&bank);
+            let at = |held| streamed_performance(&setup.measurements, preparation, draft, &bank, &request, held);
+            ModelResidency::Streamed {
+                performance: at(shares.held(shares.slots()))?,
+                floor_performance: at(shares.held(shares.floor()))?,
+                shares,
+            }
+        }
+        FitResidency::Resident => ModelResidency::Resident {
+            performance: resident_performance(&setup.measurements, preparation, draft, &request)?,
         },
     };
     Ok(ModelAssessment::Assessed {
-        facts: facts.clone(),
-        execution,
+        facts,
+        execution: ModelExecution::Fits { fit, residency },
     })
+}
+
+/// The largest of `count` served tiers, largest first, at which `assess`
+/// finds a fit, or the shortfall at the smallest: the largest is assessed
+/// first, then the smallest, then the tiers between by bisection, a smaller
+/// context holding less. A fit at the largest assesses no other tier, and
+/// a shortfall at both ends none between.
+fn served_tier<F, S, E>(
+    count: usize,
+    mut assess: impl FnMut(usize) -> Result<Result<F, S>, E>,
+) -> Result<Result<F, S>, E> {
+    assert!(count > 0, "a package is served at one tier at least");
+    let shortfall = match assess(0)? {
+        Ok(fit) => return Ok(Ok(fit)),
+        Err(shortfall) => shortfall,
+    };
+    if count == 1 {
+        return Ok(Err(shortfall));
+    }
+    let mut fit = match assess(count - 1)? {
+        Ok(fit) => fit,
+        Err(shortfall) => return Ok(Err(shortfall)),
+    };
+    let (mut short, mut fits) = (0, count - 1);
+    while fits - short > 1 {
+        let middle = short + (fits - short) / 2;
+        match assess(middle)? {
+            Ok(found) => (fit, fits) = (found, middle),
+            Err(_) => short = middle,
+        }
+    }
+    Ok(Ok(fit))
 }
 
 /// A resident fit's decode speed from the setup's measurements.
@@ -669,7 +825,38 @@ pub fn prepare_model_assessment_from(
                 fingerprint,
             });
         }
-        Admission::Admitted(admitted) => admitted.served_at(structure.served_context)?,
+        Admission::Admitted(admitted) => Box::new(admitted.served_at(structure.served_context)?),
+    };
+    let largest = match plan_tier(&admitted, admitted.context_limit, structure)? {
+        Ok(plan) => plan,
+        Err(unsupported) => {
+            return Ok(PreparedModelAssessment::Unsupported {
+                unsupported,
+                fingerprint: admitted.fingerprint.clone(),
+            });
+        }
+    };
+    Ok(PreparedModelAssessment::Planned {
+        facts: admitted.facts(largest.drafter),
+        definition: largest.definition,
+        draft: largest.draft,
+        execution: largest.execution,
+        below: LowerTiers::of(admitted, structure),
+    })
+}
+
+/// `admitted` planned at `context_limit` tokens of context, as a load
+/// serving it at that context plans it: the drafted plan when its drafter
+/// plans, the target's alone otherwise; or the target's refusal.
+fn plan_tier(
+    admitted: &AdmittedPackage,
+    context_limit: u32,
+    structure: &AssessmentStructure,
+) -> Result<Result<TierPlan, UnsupportedModel>, ModelAssessmentError> {
+    let served = |definition: &ModelDefinition| {
+        let mut definition = definition.clone();
+        definition.decoder.context_limit = u64::from(context_limit);
+        definition
     };
     let environment = Environment {
         policy: &structure.policy,
@@ -678,7 +865,7 @@ pub fn prepare_model_assessment_from(
         reserves: structure.reserves,
     };
     let plain = environment
-        .plain(&admitted)
+        .plain(admitted, served(&admitted.definition))
         .map_err(ModelAssessmentError::Configuration)?;
     let drafted = match &admitted.drafter {
         DrafterAdmission::None => Err(DrafterVerdict::None),
@@ -686,9 +873,9 @@ pub fn prepare_model_assessment_from(
             Err(DrafterVerdict::Rejected(unsupported.clone()))
         }
         DrafterAdmission::Candidate { definition, method } => environment
-            .drafted(&admitted, definition, *method)
+            .drafted(admitted, &served(definition), *method)
             .and_then(|(manifest, method)| {
-                match prepare_plan::<DraftedCharge>(manifest, &structure.selected, admitted.context_limit) {
+                match prepare_plan::<DraftedCharge>(manifest, &structure.selected, context_limit) {
                     Ok(planned) => Ok((method, planned)),
                     Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
                     Err(Refusal::Failed(error)) => {
@@ -701,10 +888,7 @@ pub fn prepare_model_assessment_from(
     // The target's plan alone is a package's refusal: a drafter's own is
     // the drafter's.
     let refused = |refusal| match refusal {
-        Refusal::Unsupported(unsupported) => Ok(PreparedModelAssessment::Unsupported {
-            unsupported,
-            fingerprint: admitted.fingerprint.clone(),
-        }),
+        Refusal::Unsupported(unsupported) => Ok(Err(unsupported)),
         Refusal::Failed(error) => Err(error),
     };
     let (drafter, definition, draft, execution) = match drafted {
@@ -717,18 +901,13 @@ pub fn prepare_model_assessment_from(
             }
         }
         Err(verdict) => {
-            match prepare_plan::<AssessmentMemoryCharge>(plain, &structure.selected, admitted.context_limit) {
+            match prepare_plan::<AssessmentMemoryCharge>(plain, &structure.selected, context_limit) {
                 Ok((definition, planned, execution)) => (verdict, definition, planned.into_draft(), execution),
                 Err(refusal) => return refused(refusal),
             }
         }
     };
-    Ok(PreparedModelAssessment::Planned {
-        facts: admitted.facts(drafter),
-        definition,
-        draft,
-        execution,
-    })
+    Ok(Ok(TierPlan { drafter, definition, draft, execution }))
 }
 
 /// What a drafter adds to the target's plan alone (`plain`) at the drafted
@@ -799,7 +978,7 @@ pub fn kernel_inventory(
         reserves: MemoryReserves::of_machine(None),
     };
     let plain = environment
-        .plain(&admitted)
+        .plain(&admitted, admitted.definition.clone())
         .map_err(ModelAssessmentError::Configuration)?;
     let requests = match inventory(&plain, backend)? {
         Ok(requests) => requests,
@@ -914,19 +1093,19 @@ struct Environment<'a> {
 impl Environment<'_> {
     /// The target served alone: plain generation, without the drafter's
     /// component.
-    fn plain(&self, admitted: &AdmittedPackage) -> Result<ExecutionManifest, String> {
+    fn plain(&self, admitted: &AdmittedPackage, definition: ModelDefinition) -> Result<ExecutionManifest, String> {
         let policy = ModelPolicy {
             method: ModelMethod::Plain,
             draft_policy: None,
             mtp_proposals: None,
             ..self.policy.clone()
         };
-        let model = policy.resolve(&admitted.definition)?;
+        let model = policy.resolve(&definition)?;
         let package = PackageManifest {
             draft: None,
             ..admitted.headers.manifest()
         };
-        self.manifest(package, admitted.definition.clone(), model)
+        self.manifest(package, definition, model)
     }
 
     /// The target with its admitted drafter, under the method that drafts
@@ -1026,7 +1205,7 @@ impl AdmittedPackage {
         Ok(*self)
     }
 
-    fn facts(self, drafter: DrafterVerdict) -> ModelFacts {
+    fn facts(&self, drafter: DrafterVerdict) -> ModelFacts {
         ModelFacts {
             capabilities: ModelCapabilities {
                 vision: self.definition.vision.is_some(),
@@ -1043,10 +1222,10 @@ impl AdmittedPackage {
                     default_effort: self.chat.reasoning.default_effort.clone(),
                 },
             },
-            template_fingerprint: self.chat.fingerprint,
+            template_fingerprint: self.chat.fingerprint.clone(),
             context_limit: self.context_limit,
-            fingerprint: self.fingerprint,
-            projector: self.projector,
+            fingerprint: self.fingerprint.clone(),
+            projector: self.projector.clone(),
             drafter,
         }
     }
@@ -1394,6 +1573,55 @@ mod tests {
             let layout = backend.resident_layout();
             let refused = unsupported_weights(&tensors, Residency::Packed, layout);
             assert!(refused.is_none(), "{backend:?} {refused:?}");
+        }
+    }
+
+    #[test]
+    fn served_contexts_are_the_limit_then_powers_of_two_to_the_floor() {
+        assert_eq!(
+            served_contexts(262_144),
+            vec![262_144, 131_072, 65_536, 32_768]
+        );
+        assert_eq!(
+            served_contexts(1_048_576),
+            vec![1_048_576, 524_288, 262_144, 131_072, 65_536, 32_768]
+        );
+        assert_eq!(served_contexts(40_960), vec![40_960, 32_768]);
+        assert_eq!(served_contexts(131_000), vec![131_000, 65_536, 32_768]);
+        assert_eq!(served_contexts(SERVED_CONTEXT_FLOOR), vec![SERVED_CONTEXT_FLOOR]);
+        assert_eq!(served_contexts(8_192), vec![8_192]);
+        assert_eq!(served_contexts(u32::MAX).last(), Some(&SERVED_CONTEXT_FLOOR));
+        assert!(served_contexts(u32::MAX).windows(2).all(|pair| pair[0] > pair[1]));
+    }
+
+    /// The served tier is the largest that fits, found with the largest
+    /// assessed first, then the smallest, then by bisection; a shortfall is
+    /// the smallest tier's.
+    #[test]
+    fn the_served_tier_is_the_largest_that_fits() {
+        for count in 1..=7usize {
+            for first_fit in 0..=count {
+                let mut assessed = Vec::new();
+                let served = served_tier(count, |index| {
+                    assessed.push(index);
+                    Ok::<_, ()>(if index >= first_fit { Ok(index) } else { Err(index) })
+                })
+                .unwrap();
+                match first_fit {
+                    _ if first_fit == count => assert_eq!(served, Err(count - 1)),
+                    _ => assert_eq!(served, Ok(first_fit)),
+                }
+                let mut once = assessed.clone();
+                once.sort();
+                once.dedup();
+                assert_eq!(once.len(), assessed.len(), "no tier is assessed twice: {assessed:?}");
+                assert!(assessed.len() <= 2 + count.next_power_of_two().trailing_zeros() as usize);
+                match first_fit {
+                    0 => assert_eq!(assessed, vec![0]),
+                    _ if first_fit == count => assert_eq!(assessed, (0..count).filter(|i| *i == 0 || *i == count - 1).collect::<Vec<_>>()),
+                    _ => {}
+                }
+            }
         }
     }
 }

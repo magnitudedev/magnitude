@@ -18,6 +18,7 @@ use magnitude_engine::{
     fingerprint::ModelFingerprint,
     options::{standard_service_limits, ModelMethod, ModelPolicy, PROFILE_SEQUENCES},
 };
+use magnitude_executor::assessment::ExecutionFit;
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use seismic::BackendName;
 use std::path::{Path, PathBuf};
@@ -951,7 +952,7 @@ fn widened_weights_are_charged_as_resident() {
         let target = gguf.write(&scratch.file(name));
         let ModelAssessment::Assessed {
             execution:
-                ModelExecution::Fits { domains, .. },
+                ModelExecution::Fits { fit: ExecutionFit { domains, .. }, .. },
             ..
         } = assess_model(&package(target), &cpu_setup(), &[], PROFILE_SEQUENCES)
             .unwrap_or_else(|error| panic!("operational failure: {error}"))

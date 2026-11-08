@@ -6,6 +6,7 @@ import {
   canonicalLocalModelId,
   HarnessConnectionFailed,
   localModelProviderModelId,
+  localModelServingProfile,
   type HarnessConnectOutcome,
   type HarnessConnectRequest,
   type HarnessConnectionsSnapshot,
@@ -54,14 +55,17 @@ const aliasKey = ({ models }: LocalModelsState): string => models
   .join("\n")
 
 /**
- * What moving selections depends on: the catalog's aliases, and the models a harness can be synced to,
- * which are the models the service offers for inference (installed and assessed to fit). Empty while
- * either is empty, so nothing runs: just after an upgrade the aliases and the installed models are known
- * before the new engine has assessed any model, and the service offers none until it has.
+ * What syncing stale connections depends on: the catalog's aliases, and the models a harness can be
+ * synced to, which are the models the service offers for inference (installed and assessed to fit),
+ * each with the context it is served at. Empty while either is empty, so nothing runs: just after an
+ * upgrade the aliases and the installed models are known before the new engine has assessed any
+ * model, and the service offers none until it has.
  */
-const renameKey = (state: LocalModelsState): string => {
+const staleKey = (state: LocalModelsState): string => {
   const aliases = aliasKey(state)
-  const offered = state.models.flatMap((model) => Option.toArray(localModelProviderModelId(model))).sort()
+  const offered = state.models.flatMap((model) => Option.toArray(localModelProviderModelId(model)).map((id) =>
+    `${id}\0${Option.match(localModelServingProfile(model), { onNone: () => "", onSome: ({ contextLength }) => contextLength })}`))
+    .sort()
   if (aliases.length === 0 || offered.length === 0) return ""
   return `${aliases}\n\n${offered.join("\n")}`
 }
@@ -77,20 +81,22 @@ export const isolatedHarnessHome = (dataDir: string, home: string, platform: Nod
 }
 
 /**
- * Moves every connected harness whose selection names an alias to the catalog ID, through the same
- * reconciliation `connections sync` uses, once the aliases and the offered models are both known, and
- * again whenever either changes, in whichever order they arrive. It changes nothing for harnesses
- * already moved. `states` is the current state followed by every change, so none is missed at start.
+ * Syncs every stale connected harness, through the same reconciliation `connections sync` uses: one
+ * whose selection names an alias moves to the catalog ID, and one written with a context window a model
+ * is no longer served at gets the context it is served at. It runs once the aliases and the offered
+ * models are both known, and again whenever either changes or a model's served context does, in
+ * whichever order they arrive. It changes nothing for harnesses already current. `states` is the current
+ * state followed by every change, so none is missed at start.
  */
-export const moveHarnessSelectionsOnAliasChanges = <E>(
+export const syncStaleHarnessConnections = <E>(
   states: Stream.Stream<LocalModelsState>,
-  syncRenamedSelections: Effect.Effect<ReadonlyArray<HarnessId>, E>,
+  syncStaleConnections: Effect.Effect<ReadonlyArray<HarnessId>, E>,
 ): Effect.Effect<void, E> =>
   states.pipe(
-    Stream.map(renameKey),
+    Stream.map(staleKey),
     Stream.changes,
     Stream.filter((key) => key.length > 0),
-    Stream.runForEach(() => syncRenamedSelections),
+    Stream.runForEach(() => syncStaleConnections),
   )
 
 export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Effect.gen(function* () {
@@ -130,10 +136,10 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
     : Effect.void
 
   if (!serverService) {
-    yield* moveHarnessSelectionsOnAliasChanges(localModels.states, service.pipe(
-      Effect.flatMap((connections) => connections.syncRenamedSelections),
-      Effect.tap((renamed) => renamed.length > 0 ? changed : Effect.void),
-      Effect.catchAll((error) => Effect.logWarning(`Moving harness selections to renamed models failed: ${error.message}`).pipe(Effect.as([]))),
+    yield* syncStaleHarnessConnections(localModels.states, service.pipe(
+      Effect.flatMap((connections) => connections.syncStaleConnections),
+      Effect.tap((synced) => synced.length > 0 ? changed : Effect.void),
+      Effect.catchAll((error) => Effect.logWarning(`Syncing stale harness connections failed: ${error.message}`).pipe(Effect.as([]))),
     )).pipe(Effect.forkScoped)
   }
 

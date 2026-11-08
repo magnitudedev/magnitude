@@ -53,6 +53,7 @@ pub struct Device {
     /// The word a graph's word nodes name as it is recorded, before a
     /// replay binds its run's own ([`Self::placeholder_word`]).
     placeholder: Arc<crate::direct::HostWord>,
+    stack_growth: Arc<crate::driver::StackGrowth>,
 }
 
 /// One `cuMemGetInfo` sample.
@@ -106,6 +107,7 @@ impl Device {
         }
         let placeholder = Arc::new(crate::direct::HostWord::on(&context, &accounts.upload)?);
         let graphs = Arc::new(crate::graph_cost::GraphPool::new(accounts.device.clone(), context.clone()));
+        context.charge_stack_to(accounts.device.clone());
         Ok(Self {
             context,
             accounts,
@@ -114,6 +116,7 @@ impl Device {
             blocks,
             graphs,
             placeholder,
+            stack_growth: crate::driver::stack_growth(ordinal),
         })
     }
 
@@ -158,11 +161,12 @@ impl Device {
             .map(Buffer::device)
     }
 
-    /// Device memory held beyond the live ranges: the blocks' free space
-    /// and the instantiated graphs' driver memory. Held by this process,
+    /// Device memory held beyond the live ranges: the blocks' free space,
+    /// the instantiated graphs' driver memory and the stack the driver
+    /// reserved beyond what every context reserves. Held by this process,
     /// charged to no allocation.
     pub fn held_beyond_ranges(&self) -> u64 {
-        self.blocks.unallocated_bytes() + self.graphs.bytes()
+        self.blocks.unallocated_bytes() + self.graphs.bytes() + self.stack_growth.bytes()
     }
 
     /// The word every graph's word nodes name as it is recorded, held from

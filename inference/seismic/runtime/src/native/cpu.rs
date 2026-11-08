@@ -34,6 +34,25 @@ pub struct CpuVariant {
     pub function: CpuKernelFn,
 }
 
+/// A variant of every tier ([`Tier::EVERY`]) whose function never runs:
+/// the launches of a test kernel that is formed, never run.
+#[cfg(test)]
+pub(crate) static UNRUN_VARIANTS: [CpuVariant; Tier::EVERY.len()] = {
+    unsafe fn unused(_: &CpuInvocation<'_>, _: [u64; 3], _: &mut [u8]) {}
+    const UNRUN: CpuVariant = CpuVariant {
+        tier: Tier::X86V2,
+        elements: &[],
+        function: unused,
+    };
+    let mut variants = [UNRUN; Tier::EVERY.len()];
+    let mut index = 0;
+    while index < variants.len() {
+        variants[index].tier = Tier::EVERY[index];
+        index += 1;
+    }
+    variants
+};
+
 /// The compiled forms of one launch.
 pub struct CpuLaunchVariants {
     pub kernel: &'static str,
@@ -214,14 +233,19 @@ impl NativeSteps for Steps<'_> {
     }
 }
 
-/// Runs `repetitions` passes over `list` as one pool job: one wake of the
-/// pool, a barrier between consecutive launches. Returns the outcome and the
-/// interval the job ran, on the [`host_seconds`] clock.
+/// Runs `repetitions` passes over `list`: as one pool job (one wake of the
+/// pool, a barrier between consecutive launches), split into a job at each
+/// timeline boundary where it has any, and at launch detail (`per_launch`)
+/// into a job per launch, so a launch's interval is the device time of that
+/// launch alone. Returns the outcome, the interval the run took and, at
+/// launch detail, each launch's interval in encode order (`None` for an
+/// inactive launch), on the [`host_seconds`] clock.
 pub(super) fn run(
     opened: &Arc<CpuOpened>,
     list: &impl DispatchList,
     repetitions: usize,
-) -> (Result<(), ExecutionError>, (f64, f64)) {
+    per_launch: bool,
+) -> (Result<(), ExecutionError>, (f64, f64), Option<Vec<Option<(f64, f64)>>>) {
     let executor = opened.executor();
     let mut pointers = Vec::new();
     let mut storages = Vec::new();
@@ -233,41 +257,66 @@ pub(super) fn run(
         weights: &weights,
     };
     let now = host_seconds();
-    if !list.has_timelines() {
-        return match steps(&calls, tables, executor.workers()) {
+    if !per_launch && !list.has_timelines() {
+        let (outcome, interval) = match steps(&calls, tables, executor.workers()) {
             Ok(steps) if steps.is_empty() => (Ok(()), (now, now)),
             Ok(steps) => executor.run_native(&Steps { steps, repetitions }, host_seconds),
             Err(error) => (Err(error), (now, now)),
         };
+        return (outcome, interval, None);
     }
-    // The calls between timeline boundaries run as pool jobs of their own;
-    // at a boundary this thread waits for, or signals, its timelines.
+    let job = |steps| {
+        executor.run_native(
+            &Steps {
+                steps,
+                repetitions: 1,
+            },
+            host_seconds,
+        )
+    };
+    // The calls between job boundaries run as pool jobs of their own; at a
+    // timeline boundary this thread waits for, or signals, its timelines.
+    let mut launches = per_launch.then(Vec::new);
     let mut end = now;
     for _ in 0..repetitions {
         let mut first = 0;
         for boundary in 0..=calls.len() {
             let operations = list.timelines(boundary);
-            if operations.is_empty() && boundary < calls.len() {
+            if operations.is_empty() && boundary < calls.len() && !per_launch {
                 continue;
             }
-            match steps(&calls[first..boundary], tables, executor.workers()) {
-                Ok(steps) if steps.is_empty() => {}
-                Ok(steps) => {
-                    let (outcome, (_, finished)) = executor.run_native(
-                        &Steps {
-                            steps,
-                            repetitions: 1,
-                        },
-                        host_seconds,
-                    );
+            let run = &calls[first..boundary];
+            first = boundary;
+            let steps = match steps(run, tables, executor.workers()) {
+                Ok(steps) => steps,
+                Err(error) => return (Err(error), (now, end), launches),
+            };
+            match &mut launches {
+                None if steps.is_empty() => {}
+                None => {
+                    let (outcome, (_, finished)) = job(steps);
                     end = finished;
                     if outcome.is_err() {
-                        return (outcome, (now, end));
+                        return (outcome, (now, end), None);
                     }
                 }
-                Err(error) => return (Err(error), (now, end)),
+                Some(intervals) => {
+                    let mut steps = steps.into_iter();
+                    for launch in run.iter().flat_map(|call| call.0.launches) {
+                        if launch.is_none() {
+                            intervals.push(None);
+                            continue;
+                        }
+                        let step = steps.next().expect("every active launch forms a step");
+                        let (outcome, interval) = job(vec![step]);
+                        intervals.push(Some(interval));
+                        end = interval.1;
+                        if outcome.is_err() {
+                            return (outcome, (now, end), launches);
+                        }
+                    }
+                }
             }
-            first = boundary;
             for operation in operations {
                 let TimelineKind::Cpu(timeline) = operation.timeline.kind() else {
                     unreachable!("a run binds timelines of its own device");
@@ -279,7 +328,7 @@ pub(super) fn run(
             }
         }
     }
-    (Ok(()), (now, end))
+    (Ok(()), (now, end), launches)
 }
 
 /// One call of a submission: its dispatch, the range of its buffers in the

@@ -235,7 +235,8 @@ def main(argv=None) -> int:
     command = commands.add_parser("gate")
     command.add_argument("--log", required=True)
     for field in fields(gate.GateSettings):
-        command.add_argument(f"--{field.name.replace('_', '-')}", type=float, default=field.default)
+        parse = (lambda value: value == "True") if field.type in (bool, "bool") else float
+        command.add_argument(f"--{field.name.replace('_', '-')}", type=parse, default=field.default)
     command.set_defaults(handler=_gate)
     command = commands.add_parser("record")
     command.add_argument("--run-dir", required=True)

@@ -105,7 +105,7 @@ describe("Response status", () => {
       { type: "failed", error: { type: "inference", code: "context_length_exceeded", message: "Prompt too long" } },
       "failed",
       Option.some("Failed"),
-      Option.some("The inference service failed: Prompt too long"),
+      Option.some("This chat is longer than the context this computer serves this model at. Start a new chat to continue."),
     ],
     [{ type: "stopped", by: "user" }, "stopped", Option.some("Stopped"), Option.none()],
     [

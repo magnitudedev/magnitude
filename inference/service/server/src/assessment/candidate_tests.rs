@@ -4892,6 +4892,9 @@ struct Requirements {
 }
 
 impl Requirements {
+    /// What the model needs served plain, with its heads and with the catalog DFlash, each at the
+    /// smallest served context: whether a drafter keeps a model fitting is judged there, since
+    /// above it the model is served at a smaller context instead.
     async fn of(file: &str) -> Self {
         let standard = fixture_from(
             Vec::new(),
@@ -4902,31 +4905,52 @@ impl Requirements {
             cpu_environment(),
         )
         .await;
-        let assess = |drafter: Option<CandidateDrafter>| {
-            let candidate = ModelCandidate {
-                drafter,
-                ..hugging_face_candidate(QWEN_COMMUNITY, '3', file)
-            };
-            let candidates = Arc::clone(&standard.candidates);
-            async move {
-                let assessment = candidates
-                    .assess_candidate(candidate)
+        let ModelAssessment::Fits { memory, .. } = standard
+            .candidates
+            .assess_candidate(hugging_face_candidate(QWEN_COMMUNITY, '3', file))
+            .await
+            .expect("assessment")
+        else {
+            panic!("everything fits the standard host");
+        };
+        let capacity = memory.first().expect("a memory domain").capacity_bytes;
+        let at_floor = |drafter: Option<CandidateDrafter>| async move {
+            let mut budget = capacity;
+            loop {
+                let fixture = fixture_from(
+                    Vec::new(),
+                    LocalModelsConfiguration::default(),
+                    false,
+                    BTreeMap::new(),
+                    true,
+                    budget_environment(capacity, budget),
+                )
+                .await;
+                let assessment = fixture
+                    .candidates
+                    .assess_candidate(ModelCandidate {
+                        drafter: drafter.clone(),
+                        ..hugging_face_candidate(QWEN_COMMUNITY, '3', file)
+                    })
                     .await
                     .expect("assessment");
-                let ModelAssessment::Fits { memory, .. } = &assessment else {
-                    panic!("everything fits the standard host: {assessment:?}");
+                let ModelAssessment::Fits { served, memory, .. } = &assessment else {
+                    panic!("it fits within the budget of its last context: {assessment:?}");
                 };
-                let host = memory.first().expect("a memory domain");
-                (host.capacity_bytes, host.required_bytes)
+                let required = memory.first().expect("a memory domain").required_bytes;
+                if served.context_length == magnitude_engine::assessment::SERVED_CONTEXT_FLOOR {
+                    return required;
+                }
+                budget = required - 1;
             }
         };
-        let (capacity, plain) = assess(None).await;
-        let (_, heads) = assess(Some(CandidateDrafter {
+        let plain = at_floor(None).await;
+        let heads = at_floor(Some(CandidateDrafter {
             reference: DrafterReference::Embedded,
             method: SpeculativeMethod::Mtp,
         }))
         .await;
-        let (_, dflash) = assess(Some(CandidateDrafter {
+        let dflash = at_floor(Some(CandidateDrafter {
             reference: DrafterReference::Catalog {
                 model_id: qwen_catalog_id(),
             },
@@ -4946,7 +4970,8 @@ impl Requirements {
     }
 
     /// A CPU environment whose host may use halfway between serving plain and serving with the
-    /// cheaper drafter: the model fits plain and with neither its heads nor the DFlash.
+    /// cheaper drafter at the smallest context: the model fits plain and with neither its heads
+    /// nor the DFlash.
     fn between(&self) -> Arc<AssessmentEnvironment> {
         self.with_budget((self.plain + self.heads.min(self.dflash)) / 2)
     }
@@ -4958,33 +4983,38 @@ impl Requirements {
     }
 
     fn with_budget(&self, budget: u64) -> Arc<AssessmentEnvironment> {
-        let catalog = seismic::Devices::discover(&[]).expect("device catalog");
-        // The planning line is the host's own (the kernel's free target) plus the margin: the
-        // margin is what of `capacity - budget` that line leaves.
-        let line = catalog.inventory().host_status().expect("host status").free_target.unwrap_or(0);
-        let reserves =
-            magnitude_executor::platform::MemoryReserves::new(magnitude_executor::platform::StoreMotion::new(
-                (self.capacity - budget).saturating_sub(line).saturating_sub(1),
-                10.0,
-            ), magnitude_executor::platform::ReleaseRate::new(1e9));
-        let structure = magnitude_engine::assessment::AssessmentStructure::discover(
-            &catalog,
-            magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
-            None,
-            reserves,
-            crate::assessment::environment::serving_policy(),
-            magnitude_engine::options::standard_service_limits(),
-        )
-        .expect("the CPU backend is selectable");
-        // The reserves enter the environment's identity, so each budget is its own.
-        Arc::new(
-            AssessmentEnvironment::new(
-                Arc::new(structure),
-                magnitude_engine::assessment::Measurements::Pending,
-            )
-            .expect("the CPU environment"),
-        )
+        budget_environment(self.capacity, budget)
     }
+}
+
+/// A CPU environment whose host of `capacity` may use `budget`.
+fn budget_environment(capacity: u64, budget: u64) -> Arc<AssessmentEnvironment> {
+    let catalog = seismic::Devices::discover(&[]).expect("device catalog");
+    // The planning line is the host's own (the kernel's free target) plus the margin: the
+    // margin is what of `capacity - budget` that line leaves.
+    let line = catalog.inventory().host_status().expect("host status").free_target.unwrap_or(0);
+    let reserves =
+        magnitude_executor::platform::MemoryReserves::new(magnitude_executor::platform::StoreMotion::new(
+            (capacity - budget).saturating_sub(line).saturating_sub(1),
+            10.0,
+        ), magnitude_executor::platform::ReleaseRate::new(1e9));
+    let structure = magnitude_engine::assessment::AssessmentStructure::discover(
+        &catalog,
+        magnitude_executor::platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+        None,
+        reserves,
+        crate::assessment::environment::serving_policy(),
+        magnitude_engine::options::standard_service_limits(),
+    )
+    .expect("the CPU backend is selectable");
+    // The reserves enter the environment's identity, so each budget is its own.
+    Arc::new(
+        AssessmentEnvironment::new(
+            Arc::new(structure),
+            magnitude_engine::assessment::Measurements::Pending,
+        )
+        .expect("the CPU environment"),
+    )
 }
 
 /// QA (Windows CUDA 8 GB, round 3b): a found Qwen3.5 4B with built-in MTP heads fit served plain,
@@ -6095,4 +6125,33 @@ async fn a_model_refused_at_the_graph_bound_is_offered_once_its_graph_cost_lands
         matches!(offered.as_slice(), [ModelAssessment::Fits { .. }]),
         "{offered:?}"
     );
+}
+
+/// How a catalog model serves without its drafter is news to the catalog when it first becomes
+/// known, even when it keeps the drafter, so a model waiting for it is assessed; and when the fits
+/// may not be worked out soon, every model still waiting is released to serve as before.
+#[test]
+fn a_catalog_drafter_fit_is_news_once_known_or_unreachable() {
+    use magnitude_service_models::CustomModelEnrichment;
+    let knows = |enrichment: &super::CandidateEnrichment, model: &ModelId| {
+        CustomModelEnrichment::knows_catalog_drafter_fit(enrichment, model)
+    };
+    let enrichment = super::CandidateEnrichment::default();
+    let model = qwen_catalog_id();
+    assert!(!knows(&enrichment, &model));
+    assert!(enrichment.record_catalog_drafter_fit(model.clone(), CatalogDrafterFit::default()));
+    assert!(knows(&enrichment, &model));
+    assert!(!enrichment.record_catalog_drafter_fit(model.clone(), CatalogDrafterFit::default()));
+    let withheld = CatalogDrafterFit {
+        withheld: true,
+        built_in_heads: false,
+    };
+    assert!(enrichment.record_catalog_drafter_fit(model, withheld));
+
+    let unreachable = super::CandidateEnrichment::default();
+    let other = qwen_catalog_id();
+    assert!(!knows(&unreachable, &other));
+    assert!(unreachable.record_catalog_drafter_fits_unreachable());
+    assert!(!unreachable.record_catalog_drafter_fits_unreachable());
+    assert!(knows(&unreachable, &other));
 }

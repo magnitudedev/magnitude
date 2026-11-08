@@ -37,6 +37,7 @@ import {
   type ChatDefaultsKey,
   type ChatRequestSettings,
   localModelProviderModelId,
+  localModelContextLimit,
   localModelServingProfile,
   localModelResidency,
   useLocalModels,
@@ -168,6 +169,14 @@ function ChatView({
         )
       : m.context_length
   }
+  /** The model's own context when this computer serves it at less, which the picker names beside it. */
+  const contextLimitFor = (m: (typeof models)[number]) => {
+    const local = localFor(m.id)
+    const limit = local
+      ? Option.getOrUndefined(localModelContextLimit(local))?.contextLength
+      : undefined
+    return limit !== undefined && limit > contextFor(m) ? limit : undefined
+  }
   const effort = reasoningEffortFor(model, settings.reasoningEffort)
   const effectiveSettings: ChatRequestSettings = {
     ...settings,
@@ -223,6 +232,17 @@ function ChatView({
   )
   const input = useRef<HTMLTextAreaElement>(null)
   const scroller = useRef<HTMLDivElement>(null)
+  const startNewChat = () => {
+    clearError()
+    select(null)
+    // The new chat keeps this model and starts from its defaults.
+    setNewDraft({
+      text: "",
+      settings: { model: effectiveSettings.model },
+      submitted: null,
+    })
+    input.current?.focus()
+  }
   const follow = useRef(true)
   const lastScrollTop = useRef(0)
   // Following the bottom ends the moment the reader scrolls up and resumes once they return to it;
@@ -337,6 +357,7 @@ function ChatView({
           settings={effectiveSettings}
           patch={patch}
           context={model ? contextFor(model) : undefined}
+          contextLimit={model ? contextLimitFor(model) : undefined}
           defaults={defaults}
         />
       ) : (
@@ -360,17 +381,7 @@ function ChatView({
           <Button
             variant="ghost"
             disabled={pending}
-            onClick={() => {
-              clearError()
-              select(null)
-              // The new chat keeps this model and starts from its defaults.
-              setNewDraft({
-                text: "",
-                settings: { model: effectiveSettings.model },
-                submitted: null,
-              })
-              input.current?.focus()
-            }}
+            onClick={startNewChat}
           >
             <PlusIcon />
             New chat
@@ -439,6 +450,7 @@ function ChatView({
                           ? () => void submit(message.id)
                           : undefined
                       }
+                      newChat={pending ? undefined : startNewChat}
                       notify={setNotice}
                     />
                   )
@@ -596,7 +608,9 @@ function ChatView({
                             </span>
                             <span className="pl-[18px] text-xs font-normal text-slate-500">
                               {[
-                                `${number(contextFor(m))} context`,
+                                contextLimitFor(m) === undefined
+                                  ? `${number(contextFor(m))} context`
+                                  : `${number(contextFor(m))} of ${number(contextLimitFor(m)!)} context`,
                                 localFor(m.id) &&
                                 Option.exists(
                                   localModelResidency(localFor(m.id)!),

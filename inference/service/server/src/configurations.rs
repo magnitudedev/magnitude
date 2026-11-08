@@ -89,10 +89,11 @@ impl ResolvedConfigurations {
         }
     }
 
-    /// The configuration's resolution, resolving it once for concurrent callers. A resolution is
-    /// kept by its bundle and the files its packages are at now: a package is named by its
-    /// content, which may be in several places or move, so a file moved, or the copy that served
-    /// it gone, resolves afresh from where the package is, never from where it was.
+    /// The configuration's resolution at its profile's context, resolving it once for concurrent
+    /// callers. A resolution is kept by its bundle, its context and the files its packages are at
+    /// now: a package is named by its content, which may be in several places or move, so a file
+    /// moved, or the copy that served it gone, resolves afresh from where the package is, never
+    /// from where it was.
     pub async fn resolve(
         &self,
         configuration: &ModelServingConfiguration,
@@ -100,15 +101,19 @@ impl ResolvedConfigurations {
         let (input, package_ids) = installed_bundle(&configuration.bundle);
         let material = self.models.resolve_bundle(input).await?;
         let paths = engine_material(&material)?;
+        let context_tokens = configuration.profile.context_length;
         let key = ResolutionKey {
             bundle: servable_model_bundle_key_for_bundle(&configuration.bundle),
+            context_tokens,
             files: std::iter::once(paths.target.clone())
                 .chain(paths.projector.clone())
                 .chain(paths.draft.clone())
                 .collect(),
         };
         self.cache
-            .resolve(key, || self.resolve_material(material, paths, package_ids))
+            .resolve(key, || {
+                self.resolve_material(material, paths, package_ids, context_tokens)
+            })
             .await
     }
 
@@ -128,6 +133,7 @@ impl ResolvedConfigurations {
         material: ResolvedServableModelBundle,
         paths: ModelPackagePaths,
         package_ids: Vec<ModelPackageId>,
+        context_tokens: u32,
     ) -> Result<Arc<ResolvedConfiguration>, InventoryError> {
         let configuration = engine_configuration(
             paths,
@@ -135,6 +141,7 @@ impl ResolvedConfigurations {
             self.reserves,
             self.serving,
             self.bounds,
+            context_tokens,
         );
         let resolved = magnitude_service_utils::blocking::run(move || configuration.resolve())
             .await
@@ -150,13 +157,15 @@ impl ResolvedConfigurations {
 
 /// The engine configuration serving a bundle's material: its components, its declared method
 /// (a separate draft's method is the bundle's, never `Auto`), the standard service limits, on
-/// the serving device.
+/// the serving device, at `served` tokens of context, the profile's (the tier assessment serves
+/// it at; 0, a package not read yet, the artifact's), unless the bounds fix every load's.
 fn engine_configuration(
     package: ModelPackagePaths,
     kernel_directory: PathBuf,
     reserves: MemoryReserves,
     serving: ServingDevice,
     bounds: LoadBounds,
+    served: u32,
 ) -> EngineConfiguration {
     EngineConfiguration {
         package: PackageOptions {
@@ -172,7 +181,9 @@ fn engine_configuration(
             weight_bound: bounds.weight_bound,
             ..serving_policy()
         },
-        context_tokens: bounds.context_tokens,
+        context_tokens: bounds
+            .context_tokens
+            .or((served > 0).then_some(served as usize)),
         service: standard_service_limits(),
         path: ExecutionPath::Native,
         device: serving.request(),
@@ -239,6 +250,7 @@ pub fn resolve_failure(error: ResolveError) -> InventoryError {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ResolutionKey {
     bundle: ServableModelBundleKey,
+    context_tokens: u32,
     files: Vec<PathBuf>,
 }
 
@@ -378,6 +390,7 @@ mod tests {
             MemoryReserves::of_machine(None),
             serving,
             LoadBounds::default(),
+            0,
         )
         .resolve()
         .unwrap();
@@ -400,6 +413,7 @@ mod tests {
                 MemoryReserves::of_machine(None),
                 serving,
                 LoadBounds::default(),
+                0,
             )
             .resolve() else {
                 panic!("{method:?} resolved over a DSpark draft")
@@ -428,6 +442,7 @@ mod tests {
             MemoryReserves::of_machine(None),
             serving,
             LoadBounds::default(),
+            0,
         );
         assert_eq!(configuration.device, serving.request());
     }

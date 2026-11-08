@@ -193,8 +193,10 @@ export const projectAssessment = (
     return decodeLocalModelAssessment({
       _tag: "Fits", assessmentId: assessment.assessmentId, environmentId,
       profile: assessment.profile,
+      served: assessment.served,
       memory: {
         domains: assessment.memory, totalRequiredBytes, requiredSystemMemoryBytes,
+        breakdown: assessment.memoryBreakdown,
       },
       residency: projectFitResidency(assessment.residency, snapshot.measurement),
     })
@@ -203,6 +205,7 @@ export const projectAssessment = (
     return decodeLocalModelAssessment({
       _tag: "DoesNotFit", assessmentId: assessment.assessmentId, environmentId,
       profile: assessment.profile,
+      shortfall: assessment.shortfall,
       memoryDomains: assessment.memory,
       totalRequiredBytes: assessment.memory.reduce((total, item) => total + item.requiredBytes, 0),
       deficitBytes: assessment.deficitBytes, limitingResource: assessment.limitingResource,
@@ -346,7 +349,7 @@ export const availableCatalogModelServingState = (
 ): AvailableCatalogServingState => catalogServingState(ready, assessment, unavailableFailure, (fits) => ({
   rankingScores: modelRankingScores({
     ...catalogScores,
-    profile: fits.profile,
+    profile: fits.served,
     performance: fits.residency.performance,
   }),
 }))

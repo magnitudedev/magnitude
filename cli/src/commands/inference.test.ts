@@ -16,6 +16,7 @@ import {
   ADDED_MODEL_ID,
   catalogState,
   doesNotFitAssessment,
+  fitsAssessment,
   FOUND_MODEL_ID,
   makeAcquiringModel,
   makeAddedModel,
@@ -308,6 +309,28 @@ describe("catalog renderers", () => {
       { name: "Test GPU", details: "25.8 GB VRAM · CUDA acceleration · in use" },
       { name: "Integrated graphics", details: "shares system memory · available" },
     ])
+  })
+
+  it("breaks a fitting model's memory into weights, context and overhead in catalog and model details", () => {
+    const GB = 1_000_000_000
+    const fitting = (served: number) => {
+      const model = makeCatalogModel()
+      if (model.servingState._tag !== "Assessed" || !("rankingScores" in model.servingState)) {
+        throw new Error("the fixture model fits")
+      }
+      return makeCatalogModel({ servingState: { ...model.servingState, assessment: {
+        ...fitsAssessment(),
+        profile: { contextLength: 1_048_576 },
+        served: { contextLength: served },
+        memory: { domains: [], totalRequiredBytes: 45.4 * GB, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 36 * GB, contextBytes: 7.1 * GB, overheadBytes: 2.3 * GB } },
+      } } })
+    }
+    const full = fitting(1_048_576)
+    const line = /Breakdown +Weights 36 GB · 1M context 7\.1 GB · Overhead 2\.3 GB\n/
+    expect(renderCatalogDetail({ model: full, models: [full] })).toMatch(line)
+    expect(renderModelDetail({ model: full, models: [full], hardware: Option.none(), drafters: { _tag: "NotApplicable" }, hidden: false })).toMatch(line)
+    const reduced = fitting(262_144)
+    expect(renderCatalogDetail({ model: reduced, models: [reduced] })).toContain("256K context 7.1 GB · Overhead 2.3 GB (full 1M doesn’t fit)")
   })
 
   it("prints the search command for other versions in catalog details", () => {
@@ -1112,7 +1135,7 @@ describe("--json internal identities", () => {
   it("keeps the product facts of each assessment", () => {
     const status = encode(modelsStatusJson, statusView({ models: [makeFoundModel()] }))
     expect((status.models as { servingState: { assessment: Record<string, unknown> } }[])[0]!.servingState.assessment)
-      .toMatchObject({ _tag: "Fits", profile: { contextLength: expect.any(Number) }, memory: { totalRequiredBytes: expect.any(Number) } })
+      .toMatchObject({ _tag: "Fits", profile: { contextLength: expect.any(Number) }, served: { contextLength: expect.any(Number) }, memory: { totalRequiredBytes: expect.any(Number) } })
     const hardware = encode(hardwareJson, { hardware: makeHardware(), models: [loading(makeFoundModel())] })
     expect(hardware.currentModel).toMatchObject({ _tag: "Custom", modelId: FOUND_MODEL_ID, servingState: { _tag: "Assessed" } })
     const inspection = encode(inspectionJson, { inspection: makeInspection(), drafters: [], models: [] })

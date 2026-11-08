@@ -1773,7 +1773,7 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
     )
     .unwrap();
     let device_process =
-        DeviceProcessBytes::derive(BackendName::Cpu, host_process.kernels).unwrap();
+        DeviceProcessBytes::derive(BackendName::Cpu, host_process.kernels, load.device_allocations().unwrap()).unwrap();
     // The CPU records no graphs: its startup graphs hold nothing.
     let bounds = header
         .with_graph_resource_bound(&graph, seismic::GraphCost::None, host_process, device_process)
@@ -1815,7 +1815,7 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
     );
     assert_eq!(charge.staging_bytes, header.staging_upload_bytes);
 
-    // The fit depth is the context limit capped at 100,000 tokens.
+    // The fit depth is the served context limit, uncapped.
     definition.decoder.context_limit = 262_144;
     let long = AssessmentMemoryTerms::derive(
         &definition,
@@ -1826,10 +1826,10 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
         limits,
     )
     .unwrap();
-    assert_eq!(long.fit_depth, 100_000);
+    assert_eq!(long.fit_depth, definition.decoder.context_limit);
     assert_eq!(
         long.history_at_fit_depth().unwrap(),
-        100_000 * terms.history_per_token
+        definition.decoder.context_limit * terms.history_per_token
     );
 }
 
@@ -2192,6 +2192,30 @@ fn worker_host_bytes_are_charged_to_host_ram() {
     );
 }
 
+/// The blocks' free space is charged at the measured allowance unless
+/// the weights, replayed through the backend's block rule, leave more:
+/// expert stacks each in a block of their own leave a granule's tail
+/// each, well within it, but a run of allocations just past a granule
+/// would leave nearly a granule each, beyond it.
+#[test]
+fn block_free_space_is_the_allowance_or_the_replayed_layout_whichever_is_more() {
+    let mib = 1u64 << 20;
+    let stacks = std::iter::repeat_n(343 * mib + mib / 2, 46);
+    let replayed = replayed_block_free_bytes(BackendName::Cuda, stacks).unwrap();
+    assert_eq!(replayed, 46 * (mib / 2));
+    assert!(replayed < CUDA_BLOCK_SLACK);
+    let stranded = std::iter::repeat_n(33 * mib + 1, 2_000);
+    let replayed = replayed_block_free_bytes(BackendName::Cuda, stranded).unwrap();
+    assert_eq!(replayed, 2_000 * (mib - 1));
+    assert!(replayed > CUDA_BLOCK_SLACK);
+    for unified in [BackendName::Cpu, BackendName::Metal] {
+        assert_eq!(
+            replayed_block_free_bytes(unified, std::iter::repeat_n(33 * mib + 1, 2_000)).unwrap(),
+            0
+        );
+    }
+}
+
 /// The worker's device bytes are the backend's context and a cost per
 /// kernel the load prepares; a unified device's are in its host bytes,
 /// and a CUDA context is already outside the device's usable capacity.
@@ -2204,7 +2228,7 @@ fn worker_device_bytes_price_the_context_and_kernels() {
         BackendName::Cuda,
     ] {
         let costs = DeviceProcessCosts::of(backend);
-        let device = DeviceProcessBytes::derive(backend, 40).unwrap();
+        let device = DeviceProcessBytes::derive(backend, 40, []).unwrap();
         assert_eq!(
             device,
             DeviceProcessBytes {
@@ -2219,17 +2243,17 @@ fn worker_device_bytes_price_the_context_and_kernels() {
         );
     }
     for unified in [BackendName::Cpu, BackendName::Metal] {
-        let device = DeviceProcessBytes::derive(unified, 40).unwrap();
+        let device = DeviceProcessBytes::derive(unified, 40, []).unwrap();
         assert_eq!(device.bytes().unwrap(), 0);
     }
     // A CUDA context is outside the usable capacity; a dedicated
     // device's block allocator holds free space whatever the model.
-    let cuda = DeviceProcessBytes::derive(BackendName::Cuda, 40).unwrap();
+    let cuda = DeviceProcessBytes::derive(BackendName::Cuda, 40, []).unwrap();
     assert_eq!(cuda.context, 0);
     assert!(cuda.slack > 0);
-    let vulkan = DeviceProcessBytes::derive(BackendName::Vulkan, 40).unwrap();
+    let vulkan = DeviceProcessBytes::derive(BackendName::Vulkan, 40, []).unwrap();
     assert!(vulkan.context > 0 && vulkan.programs > 0 && vulkan.slack > 0);
-    assert!(DeviceProcessBytes::derive(BackendName::Vulkan, u64::MAX).is_err());
+    assert!(DeviceProcessBytes::derive(BackendName::Vulkan, u64::MAX, []).is_err());
 }
 
 /// The worker's host bytes are counts the plan fixes times the costs

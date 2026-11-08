@@ -2708,6 +2708,17 @@ pub struct MemoryAssessment {
     pub remaining_bytes: i64,
 }
 
+/// What a fitting model's required memory holds across every domain: its weights, the
+/// conversation's state at the served context, and everything else the load holds.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryBreakdown {
+    pub weights_bytes: u64,
+    pub context_bytes: u64,
+    pub overhead_bytes: u64,
+}
+
 /// An estimated decode speed at one context depth, in tokens per second per conversation, from
 /// the costs measured of this machine's selected executor: what the engine's own kernels achieve
 /// on it.
@@ -2905,19 +2916,26 @@ pub enum MeasurementState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase")]
 pub enum ModelAssessment {
-    /// A fitting model, how it holds its weights, and its decode-speed estimates held that way.
+    /// A fitting model at `served`, the largest context tier within `profile` at which its
+    /// standard workload fits this computer, how it holds its weights, and its decode-speed
+    /// estimates held that way up to `served`.
     #[serde(rename_all = "camelCase")]
     Fits {
         profile: ServingProfile,
+        served: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
+        memory_breakdown: MemoryBreakdown,
         residency: ModelResidency,
         projector: ProjectorVerdict,
         drafter: DrafterVerdict,
     },
+    /// A model that fits at no context tier: `deficit_bytes` is its shortfall at the smallest,
+    /// `shortfall`.
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
         profile: ServingProfile,
+        shortfall: ServingProfile,
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         limiting_resource: String,

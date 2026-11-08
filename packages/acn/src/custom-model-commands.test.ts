@@ -734,6 +734,7 @@ describe("adding models", () => {
           _tag: "DoesNotFit",
           assessmentId: "assessment",
           profile: { contextLength: 4096 },
+          shortfall: { contextLength: 32_768 },
           memory: [{ memoryDomainId: "system", capacityBytes: 8, compatibilityReserveBytes: 0, remainingBytes: -4, requiredBytes: 12 }],
           limitingResource: "system",
           deficitBytes: 4,

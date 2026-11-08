@@ -51,6 +51,7 @@ describe("catalog component offers", () => {
         assessment: {
           _tag: "DoesNotFit" as const,
           profile,
+          shortfall: { contextLength: 32_768 },
           assessmentId,
           environmentId,
           memoryDomains: [],

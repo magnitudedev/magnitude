@@ -21,10 +21,10 @@ use magnitude_artifacts::gguf::Directory;
 use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
 use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::{ModelMethod, PROFILE_SEQUENCES};
-use magnitude_executor::assessment::{DomainFit, ExecutionShortfall, PerformanceEstimate};
+use magnitude_executor::assessment::{DomainFit, ExecutionFit, ExecutionShortfall, PerformanceEstimate};
 use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, DrafterVerdict, InstalledModelPackages as _, KernelStatic,
-    KnownUnsupportedReason, MemoryAssessment, ModelAssessment, ModelAssessmentId,
+    KnownUnsupportedReason, MemoryAssessment, MemoryBreakdown, ModelAssessment, ModelAssessmentId,
     ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure, ModelFingerprint,
     ModelPackageOperand, ModelPerformance, ModelReasoningCapabilities, ModelResidency,
     ModelServingConfiguration, PerformanceEvidence, ProjectorVerdict, ResolvedServableModelBundle, ServableModelBundle,
@@ -41,7 +41,9 @@ use sha2::{Digest, Sha256};
 use super::environment::AssessmentEnvironment;
 
 /// The service's performance depths: 25K, 50K and 75K where the context admits them, then the
-/// full context. ACN ranking reads `min(50_000, context)`, which this set contains.
+/// full context. ACN ranking reads `min(50_000, context)`, which this set contains. A profile
+/// asks for the depths of its ceiling; a model is estimated at those of the context it is served
+/// at.
 pub fn performance_depths(context_length: u32) -> Vec<u32> {
     let mut depths = [25_000, 50_000, 75_000]
         .into_iter()
@@ -171,6 +173,14 @@ impl ModelAssessor {
     ) -> Result<ResolvedServableModelBundle, InventoryError> {
         let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
         self.resolve(&bundle_key, bundle).await
+    }
+
+    /// Whether `subject`'s configuration still waits on its catalog drafter's fit.
+    pub fn awaits_catalog_drafter_fit(
+        &self,
+        subject: &magnitude_service_contracts::models::ModelAssessmentSubject,
+    ) -> bool {
+        self.model_domains.awaits_catalog_drafter_fit(subject)
     }
 
     pub fn configuration_for(
@@ -473,26 +483,43 @@ pub(crate) fn model_assessment(
     let projector = projector_verdict(facts.projector);
     let drafter = drafter_verdict(facts.drafter);
     let assessment_id = assessment_id(bundle_key, &requested, &environment.id);
-    let ModelAssessmentProfile {
-        profile,
-        performance_context_tokens,
-    } = requested;
+    let profile = requested.profile;
     let assessment = match execution {
-        ModelExecution::Fits { domains, residency, .. } => ModelAssessment::Fits {
+        ModelExecution::Fits {
+            fit:
+                ExecutionFit {
+                    fit_context_tokens,
+                    domains,
+                    breakdown,
+                    ..
+                },
+            residency,
+        } => ModelAssessment::Fits {
             profile,
+            served: magnitude_service_contracts::models::ServingProfile {
+                context_length: fit_context_tokens,
+            },
             assessment_id,
             memory: memory_assessments(&domains, environment),
-            residency: model_residency(residency, &performance_context_tokens)?,
+            memory_breakdown: MemoryBreakdown {
+                weights_bytes: breakdown.weights_bytes,
+                context_bytes: breakdown.context_bytes,
+                overhead_bytes: breakdown.overhead_bytes,
+            },
+            residency: model_residency(residency, &performance_depths(fit_context_tokens))?,
             projector,
             drafter,
         },
         ModelExecution::DoesNotFit(ExecutionShortfall {
+            fit_context_tokens,
             domains,
             limiting,
             deficit_bytes,
-            ..
         }) => ModelAssessment::DoesNotFit {
             profile,
+            shortfall: magnitude_service_contracts::models::ServingProfile {
+                context_length: fit_context_tokens,
+            },
             assessment_id,
             memory: memory_assessments(&domains, environment),
             limiting_resource: domain_id(limiting, environment).as_str().to_owned(),

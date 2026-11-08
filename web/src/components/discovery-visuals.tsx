@@ -7,6 +7,7 @@ import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { InfoIcon } from "@phosphor-icons/react"
 import { useAgentClient, localModelQuantizationAware, localModelRadarAxes, localModelSpeedTooltip, quantizationAwareTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
 import { ActionTooltip } from "./ui/tooltip"
+import { MemoryBreakdownInfo } from "./memory-breakdown-info"
 import { type HardwarePhoto } from "./hardware-photos"
 import { HardwareSummary } from "./machine-summary"
 import { useSession } from "../session"
@@ -28,6 +29,7 @@ export function QuantizationAwareInfo({ model, className = "" }: { model: LocalM
 /** The five-axis capability profile for any model; a custom model's intelligence is never rated, so that axis stays empty. */
 export function ModelRadar({ model }: { model: LocalModel }) {
   const axes = localModelRadarAxes(model)
+  const fits = model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" ? model.servingState.assessment : null
   if (Option.isNone(axes)) return <p className="py-12 text-center text-sm text-slate-500">{model.servingState._tag === "Assessing" ? "Waiting for model assessment" : "No performance profile is available for this configuration."}</p>
   const point = (index: number, radius: number) => {
     const angle = -Math.PI / 2 + index * Math.PI * 2 / 5
@@ -43,12 +45,15 @@ export function ModelRadar({ model }: { model: LocalModel }) {
       {axes.value.map((axis,index) => {
         const [x,y] = [[180,20],[290,83],[258,238],[102,238],[70,83]][index]!
         const label = axis.label.charAt(0)+axis.label.slice(1).toLowerCase()
-        // Speed's label carries its estimate marker and info icon: an HTML row centered on the
-        // axis, occupying the label line's box above the detail's baseline.
+        const info = axis.label === "SPEED" ? <>{label} (est.)<SpeedInfo /></>
+          : axis.label === "FIT" && fits ? <>{label}<MemoryBreakdownInfo assessment={fits} /></>
+          : null
+        // Speed's and fit's labels carry an info icon: an HTML row centered on the axis,
+        // occupying the label line's box above the detail's baseline.
         return <g key={axis.label}>
-          {axis.label === "SPEED"
+          {info
             ? <foreignObject x={x - 70} y={y - 11} width="140" height="14">
-                <div className="flex h-full items-center justify-center gap-1 text-[11px] leading-none text-slate-500 dark:text-slate-400">{label} (est.)<SpeedInfo /></div>
+                <div className="flex h-full items-center justify-center gap-1 text-[11px] leading-none text-slate-500 dark:text-slate-400">{info}</div>
               </foreignObject>
             : <text x={x} y={y} textAnchor="middle" className="fill-slate-500 dark:fill-slate-400" fontSize="11">{label}</text>}
           <text x={x} y={y + 18} textAnchor="middle" className="fill-slate-800 dark:fill-slate-200" fontSize="13" fontWeight="500">{axis.detail}</text>

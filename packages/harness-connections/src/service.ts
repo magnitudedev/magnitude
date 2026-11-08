@@ -414,32 +414,41 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     : failure("sync", String(error), harness))))
 
   /**
-   * Syncs only the managed connections whose selection names an ID that now means another model, and
-   * returns them. Connections without such a selection, and configuration Magnitude doesn't manage,
-   * are not touched, so running it again changes nothing.
+   * Syncs only the managed connections that are stale, and returns them: those whose selection names an
+   * ID that now means another model, and those written with a context window a model is no longer served
+   * at (this computer serves it at another context tier). Connections that are current, and configuration
+   * Magnitude doesn't manage, are not touched, so running it again changes nothing.
    */
-  const syncRenamedSelections: HarnessConnection["syncRenamedSelections"] = provide(Effect.gen(function* () {
+  const syncStaleConnections: HarnessConnection["syncStaleConnections"] = provide(Effect.gen(function* () {
     const manifest = yield* readManifest
-    const renamed = yield* Effect.filter(manifest.connections, (entry) => registry.get(entry.harness).selectedModel.pipe(
-      Effect.flatMap(Option.match({
-        onNone: () => Effect.succeed(false),
-        onSome: (selected) => canonicalModel(selected).pipe(Effect.map((canonical) => canonical !== selected)),
-      })),
-      Effect.orElseSucceed(() => false),
-    ))
-    if (renamed.length === 0) return []
+    if (manifest.connections.length === 0) return []
     const models = uniqueModels(yield* resolveModels)
+    const windows = new Map(models.map((model) => [model.id, model.contextWindow]))
+    const resized = (entry: ManifestEntry) => entry.models.some((written) => {
+      const served = windows.get(written.id)
+      return served !== undefined && served !== written.contextWindow
+    })
+    const stale = yield* Effect.filter(manifest.connections, (entry) => resized(entry)
+      ? Effect.succeed(true)
+      : registry.get(entry.harness).selectedModel.pipe(
+        Effect.flatMap(Option.match({
+          onNone: () => Effect.succeed(false),
+          onSome: (selected) => canonicalModel(selected).pipe(Effect.map((canonical) => canonical !== selected)),
+        })),
+        Effect.orElseSucceed(() => false),
+      ))
+    if (stale.length === 0) return []
     if (models.length === 0) return yield* failure("sync", "No installed Magnitude models are available")
-    // Each connection moves on its own: one harness that can't be synced never keeps the others on an alias.
-    const outcomes = yield* Effect.forEach(renamed, (entry) => syncEntries([entry], models).pipe(
+    // Each connection syncs on its own: one harness that can't be synced never keeps the others stale.
+    const outcomes = yield* Effect.forEach(stale, (entry) => syncEntries([entry], models).pipe(
       Effect.as(entry.harness),
       Effect.either,
     ))
-    const moved = outcomes.flatMap((outcome) => outcome._tag === "Right" ? [outcome.right] : [])
+    const synced = outcomes.flatMap((outcome) => outcome._tag === "Right" ? [outcome.right] : [])
     const failures = outcomes.flatMap((outcome) => outcome._tag === "Left" ? [outcome.left] : [])
-    if (moved.length === 0 && failures.length > 0) return yield* Effect.fail(failures[0]!)
-    yield* Effect.forEach(failures, (error) => Effect.logWarning(`Moving a harness selection to a renamed model failed: ${String(error)}`), { discard: true })
-    return moved
+    if (synced.length === 0 && failures.length > 0) return yield* Effect.fail(failures[0]!)
+    yield* Effect.forEach(failures, (error) => Effect.logWarning(`Syncing a stale harness connection failed: ${String(error)}`), { discard: true })
+    return synced
   })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("sync", String(error))))
 
   const disconnect = (harness: HarnessId) => provide(connectionTransaction(Effect.gen(function* () {
@@ -494,7 +503,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     list: mutationLock.withPermits(1)(list),
     connect: (harness, options) => withMutationLock("connect", connect(harness, options)),
     sync: (harness?: HarnessId) => withMutationLock("sync", sync(harness)),
-    syncRenamedSelections: withMutationLock("sync", syncRenamedSelections),
+    syncStaleConnections: withMutationLock("sync", syncStaleConnections),
     disconnect: (harness) => withMutationLock("disconnect", disconnect(harness)),
     installSkill,
     installStartup,

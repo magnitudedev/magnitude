@@ -171,6 +171,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                 [
                     ModelAssessment::Fits {
                         profile,
+                        served,
                         memory,
                         residency,
                         ..
@@ -178,6 +179,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                 ] => json!({
                     "result": "Fits",
                     "context": profile.context_length,
+                    "served": served.context_length,
                     "requiredBytes": memory.iter().map(|domain| domain.required_bytes).collect::<Vec<_>>(),
                     "tokensPerSecond": match residency {
                         ModelResidency::Resident { performance } => tokens_per_second(performance),
@@ -187,6 +189,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                 [
                     ModelAssessment::DoesNotFit {
                         profile,
+                        shortfall,
                         limiting_resource,
                         deficit_bytes,
                         ..
@@ -194,6 +197,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                 ] => json!({
                     "result": "DoesNotFit",
                     "context": profile.context_length,
+                    "shortfall": shortfall.context_length,
                     "limitingResource": limiting_resource,
                     "deficitBytes": deficit_bytes,
                 }),

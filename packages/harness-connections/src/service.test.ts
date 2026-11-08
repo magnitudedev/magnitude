@@ -12,9 +12,9 @@ import { describe, expect, it, vi } from "vitest"
 import { fixturePackageFiles, piPackageFiles } from "./pi-package-fixture"
 import { inspectPluginContent } from "@magnitudedev/release/plugin-content"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
-import { HarnessModelSchema, type HarnessCompanionPackage } from "./contract"
+import { HarnessModelSchema, type HarnessCompanionPackage, type HarnessModel } from "./contract"
 import { skillText } from "./inspection"
-import { jsonObject } from "./shared"
+import { jsonObject, valueAt } from "./shared"
 import { PiPackageSourceSchema } from "./connectors/pi-package-state"
 import { PiPackageEntrySchema } from "./connectors/pi-settings"
 import {
@@ -1902,6 +1902,7 @@ describe("HarnessConnection model-set behavior", () => {
           ANTHROPIC_AUTH_TOKEN: CLAUDE_AUTH_TOKEN_PLACEHOLDER,
           ANTHROPIC_API_KEY: "",
           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000",
         },
       })
       expect(yield* claudeInspection(service)).toBe("Connected")
@@ -1935,7 +1936,7 @@ describe("HarnessConnection model-set behavior", () => {
         expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
           theme: "dark",
           model: anthropicLocalModelId(model),
-          env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY },
+          env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" },
         })
         expect(yield* claudeInspection(service)).toBe("Connected")
 
@@ -1980,7 +1981,7 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
         theme: "dark",
         model: anthropicLocalModelId(model),
-        env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY },
+        env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" },
       })
       expect(yield* claudeInspection(service)).toBe("Connected")
 
@@ -2360,6 +2361,75 @@ describe("selections after an upgrade", () => {
   )
 })
 
+describe("stale context windows", () => {
+  it("rewrites a connection written with a context window its model is no longer served at, once", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-context-resync-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = (served: ReadonlyArray<HarnessModel>) => makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel: Effect.succeed,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(served),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const opencode = HarnessIdSchema.make("opencode")
+      const before = yield* service(models)
+      yield* before.connect(opencode, { model: Option.some(model) })
+      expect(yield* before.syncStaleConnections).toEqual([])
+      const limit = () => fs.readFileString(paths.opencode).pipe(Effect.map((text) =>
+        (jsonObject(text) as { provider: { magnitude: { models: Record<string, { limit: { context: number } }> } } })
+          .provider.magnitude.models[model]!.limit.context))
+      expect(yield* limit()).toBe(50_000)
+      const resized = yield* service([{ ...models[0], contextWindow: 131_072 }, models[1]])
+      expect(yield* resized.syncStaleConnections).toEqual([opencode])
+      expect(yield* limit()).toBe(131_072)
+      expect(yield* resized.syncStaleConnections).toEqual([])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("declares the selected model's served context to Claude Code, follows it, and removes it on disconnect", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-claude-window-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = (served: ReadonlyArray<HarnessModel>) => makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel: Effect.succeed,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(served),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const claude = HarnessIdSchema.make("claude-code")
+      const window = () => fs.readFileString(paths.claude).pipe(Effect.map((text) =>
+        valueAt(jsonObject(text), ["env", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"])))
+      const before = yield* service(models)
+      yield* before.connect(claude, { model: Option.some(secondModel) })
+      expect(yield* window()).toBe("32768")
+      const resized = yield* service([models[0], { ...models[1], contextWindow: 65_536 }])
+      expect(yield* resized.syncStaleConnections).toEqual([claude])
+      expect(yield* window()).toBe("65536")
+      yield* resized.disconnect(claude)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initialFiles(paths)[paths.claude]!))
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+})
+
 describe("automatic alias reconciliation", () => {
   it("moves a Claude Code selection naming an alias in a Windows-written settings file", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -2386,7 +2456,7 @@ describe("automatic alias reconciliation", () => {
       yield* fs.writeFileString(paths.claude, `\uFEFF${written.replace(/\n/g, "\r\n")}`)
       expect(yield* registry.get(claude).selectedModel).toEqual(Option.some(secondModel))
       const upgraded = yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected))
-      expect(yield* upgraded.syncRenamedSelections).toEqual([claude])
+      expect(yield* upgraded.syncStaleConnections).toEqual([claude])
       expect(yield* registry.get(claude).selectedModel).toEqual(Option.some(model))
       expect(jsonObject(yield* fs.readFileString(paths.claude)).model).toBe(`anthropic-local/${model}`)
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
@@ -2422,7 +2492,7 @@ describe("automatic alias reconciliation", () => {
       yield* before.connect(codex, { model: Option.some(secondModel) })
       yield* before.connect(claude, { model: Option.some(secondModel) })
       const upgraded = yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected), (id) => id !== "codex")
-      expect(yield* upgraded.syncRenamedSelections).toEqual([claude])
+      expect(yield* upgraded.syncStaleConnections).toEqual([claude])
       expect(yield* registry.get(claude).selectedModel).toEqual(Option.some(model))
       expect(yield* registry.get(codex).selectedModel).toEqual(Option.some(secondModel))
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
@@ -2458,11 +2528,11 @@ describe("automatic alias reconciliation", () => {
       const hermesBefore = yield* fs.readFileString(paths.hermes)
       const claudeBefore = yield* fs.readFileString(paths.claude)
       const upgraded = yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected))
-      expect(yield* upgraded.syncRenamedSelections).toEqual([opencode])
+      expect(yield* upgraded.syncStaleConnections).toEqual([opencode])
       expect(yield* registry.get(opencode).selectedModel).toEqual(Option.some(model))
       expect(yield* fs.readFileString(paths.hermes)).toBe(hermesBefore)
       expect(yield* fs.readFileString(paths.claude)).toBe(claudeBefore)
-      expect(yield* upgraded.syncRenamedSelections).toEqual([])
+      expect(yield* upgraded.syncStaleConnections).toEqual([])
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
 })

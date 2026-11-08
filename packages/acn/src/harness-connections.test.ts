@@ -1,19 +1,31 @@
 import { Effect, Fiber, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import { HarnessIdSchema, type LocalModelsState } from "@magnitudedev/acn-protocol"
-import { isolatedHarnessHome, moveHarnessSelectionsOnAliasChanges } from "./harness-connections"
+import { isolatedHarnessHome, syncStaleHarnessConnections } from "./harness-connections"
 
 const alias = "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 const installation = { _tag: "Resolved", installedBytes: 1, primaryPath: "/m.gguf", ownership: "External" }
-/** `offered` models are installed and assessed to fit; `assessing` ones are installed and not assessed yet. */
-const state = (aliases: readonly string[], offered: readonly string[] = [], assessing: readonly string[] = []) => ({
+/**
+ * `offered` models are installed and assessed to fit, each served at `served`'s context or 32K;
+ * `assessing` ones are installed and not assessed yet.
+ */
+const state = (
+  aliases: readonly string[],
+  offered: readonly string[] = [],
+  assessing: readonly string[] = [],
+  served: Readonly<Record<string, number>> = {},
+) => ({
   models: [
     { _tag: "Catalog", modelId: "qwen3.5-4b:gguf:q4", catalogData: { aliases, support: { _tag: "Supported" } }, acquisitionState: { _tag: "NotInstalled" }, servingState: { _tag: "Assessing" } },
     ...offered.map((modelId) => ({
       _tag: "Custom",
       modelId,
       acquisitionState: { _tag: "External", installation, residencyState: { _tag: "Unloaded" } },
-      servingState: { _tag: "Assessed", assessment: { _tag: "Fits" } },
+      servingState: { _tag: "Assessed", assessment: {
+        _tag: "Fits",
+        profile: { contextLength: 262_144 },
+        served: { contextLength: served[modelId] ?? 32_768 },
+      } },
     })),
     ...assessing.map((modelId) => ({
       _tag: "Custom",
@@ -29,7 +41,7 @@ const state = (aliases: readonly string[], offered: readonly string[] = [], asse
 const syncsAfter = (initial: LocalModelsState, steps: readonly LocalModelsState[]) => Effect.runPromise(Effect.gen(function* () {
   const models = yield* SubscriptionRef.make(initial)
   let calls = 0
-  const fiber = yield* moveHarnessSelectionsOnAliasChanges(
+  const fiber = yield* syncStaleHarnessConnections(
     models.changes,
     Effect.sync(() => { calls += 1; return [HarnessIdSchema.make("opencode")] }),
   ).pipe(Effect.fork)
@@ -44,7 +56,7 @@ const syncsAfter = (initial: LocalModelsState, steps: readonly LocalModelsState[
   return counts
 }))
 
-describe("harness selections after an upgrade", () => {
+describe("stale harness connections", () => {
   it("reconciles at start when aliases and offered models are known, and again only when the aliases change", async () => {
     expect(await syncsAfter(state([alias], ["local:abc"]), [
       state([alias], ["local:abc"]),
@@ -72,11 +84,18 @@ describe("harness selections after an upgrade", () => {
     expect(await syncsAfter(state([alias], ["local:abc"]), [state([alias], ["local:abc", "qwen3.5-4b:gguf:q4"])])).toEqual([1, 2])
   })
 
+  it("syncs again when an offered model's served context changes, so harnesses size conversations to it", async () => {
+    expect(await syncsAfter(state([alias], ["local:abc"], [], { "local:abc": 131_072 }), [
+      state([alias], ["local:abc"], [], { "local:abc": 131_072 }),
+      state([alias], ["local:abc"], [], { "local:abc": 65_536 }),
+    ])).toEqual([1, 1, 2])
+  })
+
   it("misses no change made while it starts", async () => {
     const calls = await Effect.runPromise(Effect.gen(function* () {
       const models = yield* SubscriptionRef.make(state([alias]))
       let calls = 0
-      const fiber = yield* moveHarnessSelectionsOnAliasChanges(
+      const fiber = yield* syncStaleHarnessConnections(
         models.changes,
         Effect.sync(() => { calls += 1; return [] }),
       ).pipe(Effect.fork)

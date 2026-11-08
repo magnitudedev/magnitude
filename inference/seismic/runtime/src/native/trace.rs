@@ -2,7 +2,7 @@
 //! every native submission on that device is recorded with its host encode
 //! interval and, once complete, its device interval on the same host clock.
 //! At launch detail each launch runs in its own timed unit (Metal encoder,
-//! CUDA event pair, Vulkan timestamp pair), so device time is attributed to
+//! CUDA event pair, Vulkan timestamp pair, CPU pool job), so device time is attributed to
 //! entries; that changes the device work and is for attribution runs only.
 
 use super::RouteSubmission;
@@ -257,9 +257,9 @@ impl SubmissionTrace {
             RouteSubmission::Failed(failure) => return Err(TraceError::Issue(failure.outcome())),
         };
         let (device, intervals, queue) = match (committed, &self.sink.timeline) {
-            (Committed::Cpu { outcome, interval }, _) => {
+            (Committed::Cpu { outcome, interval, launches }, _) => {
                 outcome.clone().map_err(execution)?;
-                (*interval, None, Vec::new())
+                (*interval, launches.clone(), Vec::new())
             }
             #[cfg(target_os = "macos")]
             (Committed::Metal(submission), _) => {

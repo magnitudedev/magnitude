@@ -1786,21 +1786,20 @@ fn a_graph_submission_encodes_every_node_into_one_encoder() {
             );
             assert_eq!(trace[0].launches.len(), nodes);
         }
-        if device.backend() != BackendName::Cpu {
-            // Only the per-launch form has a timed unit (encoder) per launch.
-            assert!(
-                serial_trace[0]
-                    .launches
-                    .iter()
-                    .all(|launch| launch.device.is_none())
-            );
-            assert!(
-                separate_trace[0]
-                    .launches
-                    .iter()
-                    .all(|launch| launch.device.is_some())
-            );
-        }
+        // Only the per-launch form has a timed unit (encoder, pool job) per
+        // launch.
+        assert!(
+            serial_trace[0]
+                .launches
+                .iter()
+                .all(|launch| launch.device.is_none())
+        );
+        assert!(
+            separate_trace[0]
+                .launches
+                .iter()
+                .all(|launch| launch.device.is_some())
+        );
     }
 }
 
@@ -2413,10 +2412,8 @@ fn conditional_launches_run_only_the_active_launch() {
                 [0, 1],
                 "{case}: inactive launches keep their ordinal"
             );
-            if device.backend() != BackendName::Cpu {
-                assert!(launches[active].device.is_some(), "{case}");
-                assert!(launches[1 - active].device.is_none(), "{case}");
-            }
+            assert!(launches[active].device.is_some(), "{case}");
+            assert!(launches[1 - active].device.is_none(), "{case}");
 
             let mut graph = device.native_graph();
             let input = graph.input_for(&kernel, "x", &[("N", n)]).unwrap();

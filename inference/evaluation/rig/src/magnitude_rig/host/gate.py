@@ -17,6 +17,8 @@ A window passes when, over its whole span:
 - no judged utilization probe failed.
 Missing readings never pass, nor does a run with nothing of its own to judge: an unverifiable
 host fails explicitly. Every wait is bounded by `timeout_seconds` and fails with its reasons.
+A host declared to have no temperature sensors (`temperatures` false, a cloud VM) is judged on
+idleness alone; any sensors of the run's own it does report are still judged.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ class GateSettings:
     max_cpu_pct: float = 15.0
     max_gpu_pct: float = 5.0
     timeout_seconds: float = 900.0
+    temperatures: bool = True
 
 
 @dataclass(frozen=True)
@@ -78,7 +81,7 @@ def judge(samples: List[Sample], settings: GateSettings, cpu_own: bool) -> Verdi
     channels: Dict[str, dict] = {"cpu_own": {"own": cpu_own}}
     judged = GROUPS if cpu_own else ("gpu",)
     groups = [g for g in judged if covered[-1].reading.group_values(g)]
-    if not groups:
+    if not groups and settings.temperatures:
         latest_errors = covered[-1].reading.errors
         reasons.append(f"no temperature sensors of the run's own (judged: {', '.join(judged)}; "
                        f"errors: {latest_errors})")
@@ -117,6 +120,8 @@ def judge(samples: List[Sample], settings: GateSettings, cpu_own: bool) -> Verdi
         channels[f"{key}_pct"] = {"mean": mean, "limit": limit}
         if mean > limit:
             reasons.append(f"{key} busy {mean:.1f}% > {limit}%")
+    if not groups and not keys:
+        reasons.append("nothing of the run's own to judge: no temperature or utilization reading")
     failed = sorted(
         {f"{k}: {v}" for s in covered for k, v in s.reading.errors.items()
          if k.startswith("utilization") and (cpu_own or k != "utilization:cpu")}

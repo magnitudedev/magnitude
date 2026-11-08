@@ -212,6 +212,7 @@ struct CandidateEnrichment {
         std::sync::RwLock<BTreeMap<(ModelId, String), (u64, Reach, CustomModelEnrichmentResult)>>,
     drafter_contents: std::sync::RwLock<BTreeMap<String, DrafterContent>>,
     catalog_drafter_fits: std::sync::RwLock<BTreeMap<ModelId, CatalogDrafterFit>>,
+    catalog_drafter_fits_unreachable: std::sync::atomic::AtomicBool,
 }
 
 impl CandidateEnrichment {
@@ -277,18 +278,30 @@ impl CandidateEnrichment {
         previous.map(|(_, previous)| previous).unwrap_or_default() != result
     }
 
-    fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
+    /// Whether how a catalog model serves without its drafter is worked out.
+    fn has_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
         self.catalog_drafter_fits
             .read()
             .is_ok_and(|fits| fits.contains_key(model_id))
     }
 
-    /// Record how a catalog model serves without its drafter; whether that changed what it serves.
+    /// Record how a catalog model serves without its drafter; whether that is new: it was not
+    /// known before, or it changed what the model serves.
     fn record_catalog_drafter_fit(&self, model_id: ModelId, fit: CatalogDrafterFit) -> bool {
         let Ok(mut known) = self.catalog_drafter_fits.write() else {
             return false;
         };
-        known.insert(model_id, fit).unwrap_or_default() != fit
+        known.insert(model_id, fit) != Some(fit)
+    }
+
+    /// Record that the fits not worked out yet may not be soon: a fit failed, as every one does
+    /// while the Hub is out of reach. Those models then serve as if their drafter fits, as before
+    /// the fit was known, so none waits for it; whether this is new. The local pass, which never
+    /// works fits out, says nothing about them.
+    fn record_catalog_drafter_fits_unreachable(&self) -> bool {
+        !self
+            .catalog_drafter_fits_unreachable
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Record a drafter reference's bytes; whether they are new.
@@ -344,6 +357,13 @@ impl CustomModelEnrichment for CandidateEnrichment {
             .ok()
             .and_then(|fits| fits.get(model_id).copied())
             .unwrap_or_default()
+    }
+
+    fn knows_catalog_drafter_fit(&self, model_id: &ModelId) -> bool {
+        self.has_catalog_drafter_fit(model_id)
+            || self
+                .catalog_drafter_fits_unreachable
+                .load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -647,6 +667,10 @@ impl ManagedModelCandidates {
                     }
                 }
             }
+            // Catalog drafter fits come before the custom models: every catalog model with a
+            // drafter is held assessing until its fit is known.
+            let catalog_failed =
+                reach == Reach::Hub && !self.fit_catalog_drafters(resolver, revision).await;
             // Models with no result yet come first, so a model just added or installed is
             // never kept waiting behind recomputing the others; each result is published as
             // soon as it is known, and a pass restarts as soon as the inputs move again.
@@ -692,8 +716,6 @@ impl ManagedModelCandidates {
                     }
                 }
             }
-            let catalog_failed =
-                reach == Reach::Hub && !self.fit_catalog_drafters(resolver, revision).await;
             tokio::select! {
                 change = changes.next() => if change.is_none() { return },
                 () = tokio::time::sleep(ENRICHMENT_RETRY_DELAY), if !failed.is_empty() || catalog_failed => {}
@@ -716,7 +738,7 @@ impl ManagedModelCandidates {
                 break;
             }
             if model.desired.speculative_method.is_none()
-                || self.enrichment.knows_catalog_drafter_fit(&model.id)
+                || self.enrichment.has_catalog_drafter_fit(&model.id)
             {
                 continue;
             }
@@ -729,6 +751,9 @@ impl ManagedModelCandidates {
                 Err(error) => {
                     tracing::warn!(model.id = %model.id.as_str(), %error, "catalog drafter fit failed");
                     complete = false;
+                    if self.enrichment.record_catalog_drafter_fits_unreachable() {
+                        resolver.catalog_drafter_fit_changed();
+                    }
                 }
             }
         }
@@ -3854,25 +3879,38 @@ fn candidate_versions(
         .collect()
 }
 
-/// The recommended version: the largest fitting Q4_K-class version, else the largest fitting one.
+/// The recommended version: among the fitting versions, those served at a working context first
+/// (see [`WORKING_CONTEXT`]), then Q4_K-class ones, then the largest. A Q8 served at 32K is a
+/// worse coding model than a Q6 served at 128K.
 fn recommended_version<'a>(
     versions: impl Iterator<Item = (&'a ClassifiedGroup, Option<&'a CachedModelAssessment>)>,
 ) -> Option<usize> {
     versions
         .enumerate()
-        .filter(|(_, (_, assessment))| {
-            matches!(
-                assessment.map(|assessment| &assessment.profile),
-                Some(ModelAssessment::Fits { .. })
-            )
+        .filter_map(|(index, (group, assessment))| {
+            match assessment.map(|assessment| &assessment.profile) {
+                Some(ModelAssessment::Fits {
+                    profile, served, ..
+                }) => Some((index, group, working_context(profile, served))),
+                _ => None,
+            }
         })
-        .max_by_key(|(_, (group, _))| {
+        .max_by_key(|(_, group, working)| {
             (
+                *working,
                 group.quantization.as_deref().is_some_and(is_q4_k_class),
                 group.group.size_bytes(),
             )
         })
-        .map(|(index, _)| index)
+        .map(|(index, _, _)| index)
+}
+
+/// The context a version should be served at to be recommended over one that fits only a smaller
+/// context: 64K, or the model's whole context when it is trained for less.
+const WORKING_CONTEXT: u32 = 65_536;
+
+fn working_context(profile: &ServingProfile, served: &ServingProfile) -> bool {
+    served.context_length >= profile.context_length.min(WORKING_CONTEXT)
 }
 
 /// Each version's label, distinct among its candidate's: its quantization label (see
@@ -4000,6 +4038,86 @@ mod hub_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_recommended_version_is_served_at_a_working_context_first() {
+        let group = |name: &str, quantization: &str, size_bytes: u64| ClassifiedGroup {
+            group: GgufGroup {
+                files: vec![CandidateGguf {
+                    path: PathBuf::from(name),
+                    size_bytes,
+                }],
+            },
+            role: CandidateFileRole::Target { architecture: None },
+            header_digest: String::new(),
+            local_digest: None,
+            local_id: None,
+            quantization: Some(quantization.to_owned()),
+            embedded_mtp: false,
+            unreadable: None,
+        };
+        let fits = |ceiling: u32, served: u32| CachedModelAssessment {
+            capabilities: serde_json::from_value(serde_json::json!({
+                "vision": false, "tools": false, "structuredOutput": false,
+                "reasoning": { "supported": false, "efforts": [] },
+            }))
+            .unwrap(),
+            template_fingerprint: String::new(),
+            fingerprint: None,
+            profile: ModelAssessment::Fits {
+                profile: ServingProfile {
+                    context_length: ceiling,
+                },
+                served: ServingProfile {
+                    context_length: served,
+                },
+                assessment_id: magnitude_service_contracts::models::ModelAssessmentId(String::new()),
+                memory: Vec::new(),
+                memory_breakdown: magnitude_service_contracts::models::MemoryBreakdown {
+                    weights_bytes: 0,
+                    context_bytes: 0,
+                    overhead_bytes: 0,
+                },
+                residency: magnitude_service_contracts::models::ModelResidency::Resident {
+                    performance: magnitude_service_contracts::models::ModelPerformance::Pending,
+                },
+                projector: magnitude_service_contracts::models::ProjectorVerdict::None,
+                drafter: magnitude_service_contracts::models::DrafterVerdict::None,
+            },
+        };
+        let versions = [
+            group("q8.gguf", "Q8_0", 30),
+            group("q6.gguf", "Q6_K", 22),
+            group("q4.gguf", "Q4_K_M", 16),
+        ];
+        let pick = |assessments: [CachedModelAssessment; 3]| {
+            recommended_version(versions.iter().zip(assessments.iter().map(Some)))
+        };
+        // Every version at 256K: the Q4_K-class one.
+        assert_eq!(
+            pick([fits(262_144, 262_144), fits(262_144, 262_144), fits(262_144, 262_144)]),
+            Some(2)
+        );
+        // The Q4 and Q6 reach 64K, the Q8 only 32K: the largest at 64K or more.
+        assert_eq!(
+            pick([fits(262_144, 32_768), fits(262_144, 65_536), fits(262_144, 131_072)]),
+            Some(2)
+        );
+        assert_eq!(
+            pick([fits(262_144, 32_768), fits(262_144, 65_536), fits(262_144, 32_768)]),
+            Some(1)
+        );
+        // None reaches 64K: the Q4_K-class one at 32K.
+        assert_eq!(
+            pick([fits(262_144, 32_768), fits(262_144, 32_768), fits(262_144, 32_768)]),
+            Some(2)
+        );
+        // A model trained for 40K works at its whole context.
+        assert_eq!(
+            pick([fits(40_960, 40_960), fits(40_960, 32_768), fits(40_960, 32_768)]),
+            Some(0)
+        );
+    }
 
     fn minimal_gguf() -> Vec<u8> {
         let string = |bytes: &mut Vec<u8>, value: &str| {

@@ -18,7 +18,7 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, HeldBound, HeldCharges, PlanError, PlanPrices, PlanRoom, StableRoom, WeightBound,
-    assessment::{AssessmentError, ColdSource, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
+    assessment::{AssessmentError, ColdSource, ExecutionFit, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
     platform::{DeviceRequest, DomainRole, MemoryReserves, StoreMotion},
 };
 use magnitude_scheduler::ServiceLimits;
@@ -843,11 +843,12 @@ fn a_bank_shrunk_to_fit_keeps_its_host_tier() {
 /// A 4-bit MoE on a 24 GB device holds as much of its bank as the room
 /// holds and merges its prompt passes, the plan's settle pricing each
 /// holding by what it saves: Qwen3.6 35B on the recorded RTX 3090,
-/// uncapped, planned on synthetic prices into the device's stable room.
-/// The 17.35 GB that room leaves beside the 7.67 GB mandatory part holds
-/// 248 of its 256 slots, and the 248th saves nothing on these prices, so
-/// the bank holds 247, and grows to no more than the room's 248; a prompt
-/// pass covers at least 512 rows.
+/// uncapped, planned on synthetic prices into the device's stable room
+/// beside its mandatory part, which holds one conversation's state at the
+/// model's whole 262,144-token context: 227 of its 256 slots, the most that
+/// room admits that save anything on these prices (a load lends them the
+/// state no request has committed), and grows to no more than the room's
+/// 228; a prompt pass covers at least 512 rows.
 #[test]
 fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     let scratch = Scratch::new("qwen36-3090-settle");
@@ -875,8 +876,8 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
         .unwrap()
         .unwrap_or_else(|no| panic!("Qwen3.6 35B streams on the RTX 3090: {no:?}"));
     let bank = planned.draft().load().expert_bank().expect("a routed load banks its experts");
-    assert_eq!(bank.slots, 247, "the bank holds the slots its room admits that save anything");
-    assert!((247..=248).contains(&bank.ceiling), "a ceiling of {} slots beyond the room's 248", bank.ceiling);
+    assert_eq!(bank.slots, 227, "the bank holds the slots its room admits that save anything");
+    assert!((227..=228).contains(&bank.ceiling), "a ceiling of {} slots beyond the room's 228", bank.ceiling);
     let limits = planned.draft().policy().limits();
     let region = *magnitude_executor::batching::row_classes(limits.max_launch_rows).last().unwrap() as u64;
     assert!(bank.pass.get() as u64 * region >= 512, "{:?} of {region} rows", bank.pass);
@@ -894,7 +895,7 @@ fn a_streamed_fit_is_priced_on_the_bank_it_was_held_in() {
     let scratch = Scratch::new("streamed-own-bank");
     let package = qwen36_35b(&scratch);
     let (_, _, resident) = assess_qwen36_35b(&package, MemoryReserves::of_machine(None));
-    let ModelExecution::Fits { domains, .. } = resident else {
+    let ModelExecution::Fits { fit: ExecutionFit { domains, .. }, .. } = resident else {
         panic!("Qwen3.6 35B fits the M4 Pro resident: {resident:?}");
     };
     let allocation = domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
@@ -973,12 +974,11 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
 
     let (_, _, resident) = assess_qwen36_35b(&package, MemoryReserves::of_machine(None));
     let ModelExecution::Fits {
-        domains,
+        fit: ExecutionFit { domains, .. },
         residency:
             ModelResidency::Resident {
                 performance: Performance::Estimated(_),
             },
-        ..
     } = resident
     else {
         panic!("Qwen3.6 35B fits the M4 Pro resident: {resident:?}");
@@ -993,7 +993,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     // holdings the fit's settle grants on the machine's prices.
     let reserves = host_room(capacity, resident_bytes - 4_000_000_000);
     let (setup, prepared, streamed) = assess_qwen36_35b(&package, reserves);
-    let ModelExecution::Fits { domains, residency: ModelResidency::Streamed { shares, .. }, .. } = streamed else {
+    let ModelExecution::Fits { fit: ExecutionFit { domains, .. }, residency: ModelResidency::Streamed { shares, .. } } = streamed else {
         panic!("Qwen3.6 35B fits streamed: {streamed:?}");
     };
     assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));

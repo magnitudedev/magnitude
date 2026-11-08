@@ -861,10 +861,19 @@ export const LocalModelRankingScoresSchema = Schema.Struct({
 })
 export type LocalModelRankingScores = typeof LocalModelRankingScoresSchema.Type
 
+/** What a fitting model's required memory holds: its weights, the conversation at the served context, and the rest. */
+export const MemoryBreakdownSchema = Schema.Struct({
+  weightsBytes: NonNegativeSafeInteger,
+  contextBytes: NonNegativeSafeInteger,
+  overheadBytes: NonNegativeSafeInteger,
+})
+export type MemoryBreakdown = typeof MemoryBreakdownSchema.Type
+
 export const LocalModelMemorySchema = Schema.Struct({
   domains: Schema.Array(MemoryAssessmentSchema),
   totalRequiredBytes: NonNegativeSafeInteger,
   requiredSystemMemoryBytes: NonNegativeSafeInteger,
+  breakdown: MemoryBreakdownSchema,
 }).pipe(Schema.filter((memory) => {
   const uniqueDomains = new Set(memory.domains.map(({ memoryDomainId }) => memoryDomainId)).size
     === memory.domains.length
@@ -872,10 +881,12 @@ export const LocalModelMemorySchema = Schema.Struct({
   const requiredSystemMemoryBytes = memory.domains
     .filter(({ memoryDomainId }) => memoryDomainId === "system")
     .reduce((total, domain) => total + domain.requiredBytes, 0)
+  const { weightsBytes, contextBytes, overheadBytes } = memory.breakdown
   return uniqueDomains
     && memory.totalRequiredBytes === totalRequiredBytes
     && memory.requiredSystemMemoryBytes === requiredSystemMemoryBytes
-}, { message: () => "local model memory totals and domains must agree with their evidence" }))
+    && weightsBytes + contextBytes + overheadBytes === totalRequiredBytes
+}, { message: () => "local model memory totals, domains and breakdown must agree with their evidence" }))
 export type LocalModelMemory = typeof LocalModelMemorySchema.Type
 
 /**
@@ -914,20 +925,26 @@ export const LocalModelFitResidencySchema = Schema.Union(
 )
 export type LocalModelFitResidency = typeof LocalModelFitResidencySchema.Type
 
-/** A fitting model, how it holds its weights, and its decode speed held that way. */
+/**
+ * A fitting model served at `served`, the largest context tier within its own `profile` that fits
+ * this computer, how it holds its weights, and its decode speed held that way up to it.
+ */
 export const LocalModelFitsAssessmentSchema = Schema.TaggedStruct("Fits", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
+  served: ServingProfileSchema,
   memory: LocalModelMemorySchema,
   residency: LocalModelFitResidencySchema,
 })
 export type LocalModelFitsAssessment = typeof LocalModelFitsAssessmentSchema.Type
 
+/** A model that fits at no context tier: `deficitBytes` is its shortfall at the smallest, `shortfall`. */
 export const LocalModelDoesNotFitAssessmentSchema = Schema.TaggedStruct("DoesNotFit", {
   assessmentId: ModelAssessmentIdSchema,
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
+  shortfall: ServingProfileSchema,
   memoryDomains: Schema.Array(MemoryAssessmentSchema),
   totalRequiredBytes: NonNegativeSafeInteger,
   deficitBytes: NonNegativeSafeInteger,

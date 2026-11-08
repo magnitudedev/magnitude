@@ -37,6 +37,7 @@ describe("local model serving projection", () => {
       assessment: {
         _tag: "Fits",
         profile: { contextLength: 32_768 },
+        served: { contextLength: 32_768 },
         residency: { _tag: "Resident", performance: { _tag: "Pending", measurement: { _tag: "Measuring" } } },
       },
       capabilities: {
@@ -92,7 +93,9 @@ describe("local model serving projection", () => {
               _tag: "Fits",
               assessmentId: "assessment",
               profile: { contextLength: 4096 },
+              served: { contextLength: 4096 },
               memory: [],
+              memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
               residency: {
                 _tag: "Resident",
                 performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
@@ -190,7 +193,9 @@ describe("automatic assessment projection", () => {
           _tag: "Fits",
           assessmentId: "assessment",
           profile: { contextLength: 4096 },
+          served: { contextLength: 4096 },
           memory: [],
+          memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
           residency: {
             _tag: "Resident",
             performance: { _tag: "Estimated", samples: [{ contextTokens: 4096, estimatedTokensPerSecond: 2 }] },
@@ -239,8 +244,10 @@ describe("automatic assessment projection", () => {
             profiles: [{
               _tag: "Fits",
               profile: { contextLength: 32_768 },
+              served: { contextLength: 32_768 },
               assessmentId: "assessment",
               memory: [],
+              memoryBreakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
               residency: {
                 _tag: "Streamed",
                 bank: { experts: 100, slots: 60, floorSlots: 10, coldExperts: "disk" },

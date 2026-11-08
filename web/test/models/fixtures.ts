@@ -16,15 +16,15 @@ const capabilities = { vision: false, tools: true, structuredOutput: true, reaso
 const metadata = { format: "gguf" as const, quantization: "Q4_K", quantizationName: "Q4_K_P", architecture: "qwen35moe", maximumContextLength: Option.some(32_768), storageBytes: 23 * GB }
 
 export const fits: Extract<LocalModelAssessment, { readonly _tag: "Fits" }> = {
-  _tag: "Fits", assessmentId, environmentId, profile: { contextLength: 32_768 },
-  memory: { domains: [], totalRequiredBytes: 24 * GB, requiredSystemMemoryBytes: 0 },
+  _tag: "Fits", assessmentId, environmentId, profile: { contextLength: 32_768 }, served: { contextLength: 32_768 },
+  memory: { domains: [], totalRequiredBytes: 24 * GB, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 18 * GB, contextBytes: 4 * GB, overheadBytes: 2 * GB } },
   residency: {
     _tag: "Resident",
     performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }] },
   },
 }
 export const doesNotFit: Extract<LocalModelAssessment, { readonly _tag: "DoesNotFit" }> = {
-  _tag: "DoesNotFit", assessmentId, environmentId, profile: { contextLength: 32_768 }, memoryDomains: [], totalRequiredBytes: 0, deficitBytes: 4 * GB, limitingResource: "system",
+  _tag: "DoesNotFit", assessmentId, environmentId, profile: { contextLength: 32_768 }, shortfall: { contextLength: 32_768 }, memoryDomains: [], totalRequiredBytes: 0, deficitBytes: 4 * GB, limitingResource: "system",
 }
 export const unsupported = (...reasons: [UnsupportedReason, ...UnsupportedReason[]]): LocalModelAssessment => ({
   _tag: "Unsupported", environmentId, profile: Option.some({ contextLength: 32_768 }), reasons, detail: "engine detail",

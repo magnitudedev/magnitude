@@ -3716,7 +3716,7 @@ impl<F: ProgramFamily> Service<F> {
         {
             return Ok(());
         }
-        let end = PrefixPath::of(generation).len();
+        let end = generation.reconciled_position();
         if generation.resident_position() != end {
             if generation.pending_reconciliation().is_some() {
                 return Ok(());

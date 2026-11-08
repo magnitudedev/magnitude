@@ -2,6 +2,7 @@ import { Command } from "@effect/platform"
 import { Effect, Option } from "effect"
 import { isDeepStrictEqual } from "node:util"
 import { MAGNITUDE_CLAUDE_CODE_PLACEHOLDER_CREDENTIAL } from "@magnitudedev/sdk"
+import type { HarnessModel } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
 import {
   ANTHROPIC_BASE_URL,
@@ -74,6 +75,24 @@ const noLoginEnv: ReadonlyArray<readonly [ReadonlyArray<string>, string]> = [
   [["env", "ANTHROPIC_API_KEY"], ""],
 ]
 
+/**
+ * Claude Code assumes 200K tokens for a model ID it doesn't recognize, so it would run a local model
+ * served at a smaller context past that context before compacting. For an ID outside its own
+ * `claude-` names this variable declares the window instead; the connection writes the served
+ * context of the Magnitude model Claude Code is set to.
+ */
+const CONTEXT_WINDOW_ENV = ["env", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"] as const
+
+const contextWindowValue = (window: number) => String(window)
+
+const ownedContextWindows = (models: ReadonlyArray<HarnessModel>) =>
+  models.map((model) => [CONTEXT_WINDOW_ENV, contextWindowValue(model.contextWindow)] as const)
+
+const selectedContextWindow = (models: ReadonlyArray<HarnessModel>, selected: Option.Option<string>) =>
+  Option.flatMap(selected, (id) => Option.fromNullable(models.find((model) => model.id === id))).pipe(
+    Option.map((model) => contextWindowValue(model.contextWindow)),
+  )
+
 export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl = ANTHROPIC_BASE_URL) => defineConnector({
   id: "claude-code",
   name: "Claude Code",
@@ -93,7 +112,15 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl =
     ]
     if (!loggedIn) changes.push(...noLoginEnv)
     if (Option.isSome(spec.model)) changes.push([["model"], anthropicLocalModelId(spec.model.value)])
-    const base = loggedIn ? removeOwnedJsonc(source, noLoginEnv) : source
+    const window = selectedContextWindow(spec.models, Option.orElse(
+      spec.model,
+      () => magnitudeSelection(previous, LOCAL_ANTHROPIC_MODEL_PREFIX),
+    ))
+    if (Option.isSome(window)) changes.push([CONTEXT_WINDOW_ENV, window.value])
+    const withoutLogin = loggedIn ? removeOwnedJsonc(source, noLoginEnv) : source
+    const base = Option.isSome(window)
+      ? withoutLogin
+      : removeOwnedJsonc(withoutLogin, ownedContextWindows([...spec.models, ...(spec.previousModels ?? [])]))
     yield* writeIfChanged(paths.claude, source, updateJsonc(base, changes))
     return Option.map(spec.model, () => ({
       model: typeof previous === "string" ? Option.some(previous) : Option.none(),
@@ -108,6 +135,7 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl =
       [["env", "ANTHROPIC_BASE_URL"], baseUrl],
       [["env", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], CLAUDE_GATEWAY_DISCOVERY],
       ...noLoginEnv,
+      ...ownedContextWindows(spec.models),
     ])
     const withoutGateway = isDeepStrictEqual(valueAt(jsonObject(withoutGatewayEnv), ["env"]), {})
       ? removeJsoncPaths(withoutGatewayEnv, [["env"]])

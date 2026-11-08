@@ -50,7 +50,7 @@ describe("connection model choices", () => {
       reasons: [{ _tag: "Unreadable" }], detail: "Unsupported model",
     } } })
     const tooLarge = makeFoundModel({ servingState: { ...serving, assessment: {
-      _tag: "DoesNotFit", profile: { contextLength: 32_768 }, memoryDomains: [],
+      _tag: "DoesNotFit", profile: { contextLength: 32_768 }, shortfall: { contextLength: 32_768 }, memoryDomains: [],
       assessmentId: assessment.assessmentId, environmentId: assessment.environmentId,
       totalRequiredBytes: 0, limitingResource: "memory", deficitBytes: 1,
     } } })

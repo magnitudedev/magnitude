@@ -45,6 +45,13 @@ use utoipa::{OpenApi, PartialSchema, ToSchema};
 
 const CONNECTOR_MAX_OUTPUT_TOKENS: u32 = 32_768;
 
+/// The output a listed model offers harnesses: a quarter of its served context, at most
+/// [`CONNECTOR_MAX_OUTPUT_TOKENS`]. Harnesses keep this much of the window free for the reply, so
+/// a model served at 32K leaves 24K for the conversation rather than none.
+fn connector_max_output_tokens(context_length: u32) -> u32 {
+    (context_length / 4).min(CONNECTOR_MAX_OUTPUT_TOKENS)
+}
+
 use magnitude_serving::chat::{
     AllowedToolRequest, AllowedToolsChoiceRequest, AllowedToolsModeRequest, AllowedToolsRequest,
     AllowedToolsType, ApplyTemplateRequest, ApplyTemplateResponse, ChatCompletionChoice,
@@ -1671,15 +1678,15 @@ async fn standard_models(
         .snapshot()
         .await
         .map_err(ApiError::from_inventory)?;
-    let offered_capabilities = offered_capabilities(&assessment_snapshot);
+    let offered = offered_models(&assessment_snapshot);
     let catalog_models = catalog.models.into_iter().filter_map(|model| {
         let CatalogModelState::Installed { effective, .. } = model.local_state else {
             return None;
         };
-        let EffectiveModel::Ready { model: target } = effective else {
+        let EffectiveModel::Ready { .. } = effective else {
             return None;
         };
-        let capabilities = offered_capabilities.get(&ModelAssessmentSubject::Catalog {
+        let offered = offered.get(&ModelAssessmentSubject::Catalog {
             model_id: model.id.clone(),
             selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
         })?;
@@ -1690,15 +1697,15 @@ async fn standard_models(
             "magnitude",
             name,
             model.description,
-            target.profile.context_length,
-            capabilities.clone(),
+            offered.served.context_length,
+            offered.capabilities.clone(),
         )
     });
     let custom_models = local.models.into_iter().filter_map(|model| {
-        let CustomModelState::Ready { model: target, .. } = &model.state else {
+        let CustomModelState::Ready { .. } = &model.state else {
             return None;
         };
-        let capabilities = offered_capabilities.get(&ModelAssessmentSubject::Custom {
+        let offered = offered.get(&ModelAssessmentSubject::Custom {
             model_id: model.model_id.clone(),
         })?;
         let (owned_by, description) = custom_model_source(&model);
@@ -1707,8 +1714,8 @@ async fn standard_models(
             owned_by,
             model.display_name,
             description,
-            target.profile.context_length,
-            capabilities.clone(),
+            offered.served.context_length,
+            offered.capabilities.clone(),
         )
     });
     let data = catalog_models.chain(custom_models).collect();
@@ -1745,11 +1752,15 @@ fn custom_model_source(model: &CustomModel) -> (&'static str, String) {
     }
 }
 
-/// The capabilities of every offered model: one whose assessment is `Fits`. A model that does not
-/// fit or that the engine cannot run is never offered for inference.
-fn offered_capabilities(
-    snapshot: &ModelAssessmentsSnapshot,
-) -> BTreeMap<ModelAssessmentSubject, ModelCapabilities> {
+/// What an offered model serves: its capabilities, at the context it is served at.
+struct OfferedModel {
+    capabilities: ModelCapabilities,
+    served: magnitude_service_contracts::models::ServingProfile,
+}
+
+/// Every offered model: one whose assessment is `Fits`. A model that does not fit or that the
+/// engine cannot run is never offered for inference.
+fn offered_models(snapshot: &ModelAssessmentsSnapshot) -> BTreeMap<ModelAssessmentSubject, OfferedModel> {
     [&snapshot.catalog, &snapshot.custom]
         .into_iter()
         .filter_map(|domain| match domain {
@@ -1762,9 +1773,16 @@ fn offered_capabilities(
                 capabilities,
                 profiles,
                 ..
-            } if matches!(profiles.first(), Some(ModelAssessment::Fits { .. })) => {
-                Some((entry.subject.clone(), capabilities.clone()))
-            }
+            } => match profiles.first() {
+                Some(ModelAssessment::Fits { served, .. }) => Some((
+                    entry.subject.clone(),
+                    OfferedModel {
+                        capabilities: capabilities.clone(),
+                        served: served.clone(),
+                    },
+                )),
+                _ => None,
+            },
             ModelAssessmentEntryState::Assessed { .. }
             | ModelAssessmentEntryState::Assessing
             | ModelAssessmentEntryState::Dropped => None,
@@ -1830,7 +1848,7 @@ fn open_ai_model(
         reasoning,
         top_provider: OpenAiTopProvider {
             context_length,
-            max_completion_tokens: context_length.min(CONNECTOR_MAX_OUTPUT_TOKENS),
+            max_completion_tokens: connector_max_output_tokens(context_length),
         },
     })
 }
@@ -2341,7 +2359,7 @@ mod tests {
 
         let value = serde_json::to_value(model).expect("serializable model");
         assert_eq!(value["context_length"], 65_536);
-        assert_eq!(value["top_provider"]["max_completion_tokens"], 32_768);
+        assert_eq!(value["top_provider"]["max_completion_tokens"], 16_384);
         assert_eq!(
             value["architecture"]["input_modalities"],
             json!(["text", "image"])
@@ -3093,10 +3111,18 @@ mod tests {
             profile: ServingProfile {
                 context_length: 8192,
             },
+            served: ServingProfile {
+                context_length: 8192,
+            },
             assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
                 "assessment".to_owned(),
             ),
             memory: Vec::new(),
+            memory_breakdown: magnitude_service_contracts::models::MemoryBreakdown {
+                weights_bytes: 0,
+                context_bytes: 0,
+                overhead_bytes: 0,
+            },
             residency: magnitude_service_contracts::models::ModelResidency::Resident {
                 performance: magnitude_service_contracts::models::ModelPerformance::Pending,
             },
@@ -3788,6 +3814,9 @@ mod tests {
             profile: ServingProfile {
                 context_length: 8192,
             },
+            shortfall: ServingProfile {
+                context_length: 8192,
+            },
             assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
                 "assessment".to_owned(),
             ),
@@ -3882,6 +3911,42 @@ mod tests {
         assert_eq!(body["data"][0]["context_length"], 8192);
     }
 
+    #[test]
+    fn listed_output_leaves_three_quarters_of_the_served_context_for_the_conversation() {
+        assert_eq!(connector_max_output_tokens(32_768), 8_192);
+        assert_eq!(connector_max_output_tokens(65_536), 16_384);
+        assert_eq!(connector_max_output_tokens(131_072), 32_768);
+        assert_eq!(connector_max_output_tokens(1_048_576), 32_768);
+        assert_eq!(connector_max_output_tokens(8_192), 2_048);
+    }
+
+    /// A model served at a smaller context than its own lists the context it is served at, which
+    /// is what harnesses size their conversations to.
+    #[tokio::test]
+    async fn standard_models_list_the_served_context() {
+        let ModelAssessment::Fits {
+            profile, served: _, assessment_id, memory, memory_breakdown, residency, projector,
+            drafter,
+        } = fits_assessment()
+        else {
+            unreachable!()
+        };
+        let body = standard_models_with_custom_assessment(ModelAssessment::Fits {
+            profile,
+            served: ServingProfile {
+                context_length: 4096,
+            },
+            assessment_id,
+            memory,
+            memory_breakdown,
+            residency,
+            projector,
+            drafter,
+        })
+        .await;
+        assert_eq!(body["data"][0]["context_length"], 4096);
+    }
+
     #[tokio::test]
     async fn standard_models_omit_a_reasoning_model_without_a_default_effort() {
         let mut entry = assessed_entry(
@@ -3947,7 +4012,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            offered_capabilities(&snapshot)
+            offered_models(&snapshot)
                 .into_keys()
                 .collect::<Vec<_>>(),
             {

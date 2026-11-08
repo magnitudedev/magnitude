@@ -15,8 +15,8 @@ export function MemoryFigures({ allocation, hardware, reading = false, pendingLa
   const domains = allocation === null ? [] : Option.match(allocation, { onNone: () => [], onSome: value => value.memoryDomains })
   const segments = [
     { label: "Weights", bytes: domains.reduce((sum, domain) => sum + domain.modelBytes + domain.auxiliaryBytes, 0), color: "weights" },
-    { label: "KV cache", bytes: domains.reduce((sum, domain) => sum + domain.contextBytes, 0), color: "cache" },
-    { label: "Runtime", bytes: domains.reduce((sum, domain) => sum + domain.computeBytes, 0), color: "runtime" },
+    { label: "Context", bytes: domains.reduce((sum, domain) => sum + domain.contextBytes, 0), color: "cache" },
+    { label: "Overhead", bytes: domains.reduce((sum, domain) => sum + domain.computeBytes, 0), color: "runtime" },
   ]
   const total = segments.reduce((sum, segment) => sum + segment.bytes, 0)
   const serving = allocation === null ? null : Option.getOrNull(allocation)
