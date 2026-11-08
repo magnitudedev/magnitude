@@ -2420,14 +2420,18 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     );
     assert_eq!(inactive.formations.get(), 1);
     assert!(inactive.stages.borrow().is_empty());
-    // Its record weighed no point, as no launch ran it: a later load that
-    // runs it searches it for its own workload, and that record replaces
-    // the canonical one.
     let mut activated = FakeCase::new(&implementation, &statics, "implementation inactive");
     activated.launches = 7;
-    let (searched, started, _) = load_once(&activated, limits);
-    assert_eq!(searched.origin, TuningOrigin::Searched);
-    assert!(started && !activated.seen.borrow().is_empty());
+    let (reused, started, progressed) = load_once(&activated, limits);
+    assert_eq!(reused.overall, canonical.overall);
+    assert_eq!(reused.origin, TuningOrigin::Stored);
+    assert!(!started && !progressed);
+    assert!(activated.seen.borrow().is_empty() && activated.stages.borrow().is_empty());
+    assert_eq!(
+        activated.formations.get(),
+        0,
+        "a later load is metadata only"
+    );
 
     assert_eq!(stored_results(), 5);
     // A fresh load searches a unit whose result is stored, and replaces it.
@@ -3297,16 +3301,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         tuning_identity: device.tuning_identity(),
         entry: "attention_prefill_k8v4".into(),
         backend: "metal".into(),
-        // The record names the points this load weighs, so it is a hit,
-        // and its choice is held to its served contract.
-        points: points
-            .iter()
-            .map(|point| seismic::PointRecord {
-                label: point.label.clone(),
-                weight: point.weight,
-                class: point.class.clone(),
-            })
-            .collect(),
+        points: Vec::new(),
         requirement: context.numerical_profile.requirement(&case.entry()),
         observations: Vec::new(),
         served: vec![configuration(&defaults)],
@@ -3873,93 +3868,4 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         let every = (0..crate::native::LEADS as u64).map(Some).collect::<BTreeSet<_>>();
         assert_eq!(leads, every, "{streamed}: every lead's unit is searched: {finished:?}");
     }
-}
-
-/// A record names the points its search weighed. A load that weighs a point
-/// the search did not (a drafting load's verify rows over a record a plain
-/// load stored) reads it as missing, so the unit is searched for that
-/// load's workload; a load weighing fewer reads it. A record stored before
-/// choices named the points is stated once from its evidence.
-#[test]
-fn a_record_serves_only_loads_whose_weighed_points_its_search_weighed() {
-    let weighed = |weights: &[(u64, f64)]| {
-        weights
-            .iter()
-            .map(|&(rows, weight)| row_point(rows, weight))
-            .collect::<Vec<_>>()
-    };
-    let configuration = Configuration {
-        statics: BTreeMap::new(),
-        params: BTreeMap::new(),
-        launches: Vec::new(),
-    };
-    let plain = TuningResult {
-        disposition: seismic::TuningDisposition::QualifiedCandidate,
-        tuning_identity: String::new(),
-        entry: "gated_delta_project_convolved".into(),
-        backend: "metal".into(),
-        points: weighed(&[(1, 1.), (2, 0.), (4, 0.)])
-            .into_iter()
-            .map(|point| seismic::PointRecord {
-                label: point.label,
-                weight: point.weight,
-                class: None,
-            })
-            .collect(),
-        requirement: super::precision::ResolvedNumericalProfile::standard()
-            .requirement_of(Some(seismic::DType::BF16)),
-        observations: Vec::new(),
-        served: vec![configuration.clone()],
-        reselection: None,
-        implementation_identity: String::new(),
-        parameters: Vec::new(),
-        configurations: Vec::new(),
-        overall: configuration,
-        method: TuningMethod::Census,
-        time: TuningTime::default(),
-        coverage: None,
-        default_launches: Vec::new(),
-    };
-    let choice = StoredChoice::of(&plain);
-    let drafting = weighed(&[(1, 1.), (2, 0.5), (4, 0.25)]);
-    assert!(!choice.covers(&drafting), "the verify rows were never weighed");
-    assert!(choice.covers(&weighed(&[(1, 2.), (2, 0.), (4, 0.)])));
-    // A covered record stays final however its search stood: coverage
-    // reads only the points weighed.
-    let ended = StoredChoice {
-        disposition: seismic::TuningDisposition::CanonicalFallback {
-            artifact: String::new(),
-        },
-        stop: Some(SearchStop::Expired),
-        ..choice.clone()
-    };
-    assert!(ended.covers(&weighed(&[(1, 2.), (2, 0.), (4, 0.)])));
-    assert!(!ended.covers(&drafting));
-    let mut verify = plain.clone();
-    verify.points.iter_mut().for_each(|point| point.weight = 1.);
-    assert!(
-        StoredChoice::of(&verify).covers(&weighed(&[(1, 1.), (2, 0.), (4, 0.)])),
-        "a choice weighed at more points serves a plain load"
-    );
-
-    let root = std::env::temp_dir().join(format!("magnitude-weighed-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
-    let key = TuningCacheKey::of("weighed");
-    let legacy = StoredChoice {
-        weighed: None,
-        ..choice.clone()
-    };
-    cache.store_tuning(&key, &legacy, &plain);
-    let (read, evidence) = cache.tuning::<StoredChoice>(&key).unwrap();
-    assert_eq!(read.weighed, None, "a record stored before the field parses");
-    let (stated, evidence) = stating_weighed(&cache, &key, read, evidence).unwrap();
-    assert_eq!(stated, choice, "the evidence states what its search weighed");
-    assert_eq!(evidence.read().unwrap(), plain);
-    assert_eq!(
-        cache.tuning::<StoredChoice>(&key).unwrap().0,
-        choice,
-        "and the record is stored stating it"
-    );
-    std::fs::remove_dir_all(root).unwrap();
 }
