@@ -1008,10 +1008,8 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
     std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
 }
 
-/// The drafter's graph families on CUDA, where a graph is replayed again
-/// only once its last run completed (`choose` takes an idle instance), so
-/// two drafter launches of one shape in flight take a graph each: a load of
-/// an MTP head seals each family within what the planner charged for it
+/// The drafter's graph families on CUDA: a load of an MTP head seals each
+/// family within what the planner charged for it
 /// (`programs::graph::serial_family` asserts it as the head, readout and
 /// state families seal), and its priming and drafting steps record no graph
 /// beyond those charges. Two passes run the same work, each over two fresh
