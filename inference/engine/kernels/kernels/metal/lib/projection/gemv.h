@@ -30,12 +30,22 @@ namespace projection {
 constant constexpr uint gemv_stage_packet_rows = 448;
 constant constexpr uint gemv_packet_row_bytes = 4 * 16;
 
+// The staged word of chunk-local packet p, step s (columns 32p + 8s ..) and
+// activation row m, in a chunk of `count` packets: rows, then steps, with the
+// packets innermost. The lanes of a group own consecutive packets and read
+// the same step and row together, so their words are consecutive. Packets
+// outermost (the rows of a step adjacent) would put those lanes 64 * MAXM
+// bytes apart, in a few banks of the threadgroup memory, so every row a GEMV
+// adds would cost a conflicted read per step.
+inline uint gemv_word(uint p, uint s, uint m, uint count) {
+    return (m * 4u + s) * count + p;
+}
+
 // Stage packets first .. first + count of MAXM activation rows (rows at or
 // past m_rows are zero); all threads of the threadgroup (whole simdgroups)
 // take part, one thread per eight columns. The eight activation values of
-// chunk-local packet p, step s (columns 32p + 8s ..) and row m are one uint4
-// in A storage at words[(p * 4 + s) * MAXM + m], so a lane reads the rows of
-// its step consecutively.
+// chunk-local packet p, step s and row m are one uint4 in A storage at
+// words[gemv_word(p, s, m, count)].
 template <uint MAXM, typename In>
 inline void gemv_stage(thread const In &in, uint m_rows, uint first, uint count, threadgroup uint4 *words,
     uint thread_index, uint threads) {
@@ -46,7 +56,7 @@ inline void gemv_stage(thread const In &in, uint m_rows, uint first, uint count,
         float4 even = float4(0.0f), odd = float4(0.0f);
         if (m < m_rows)
             in.load8(m, 32u * (first + local) + 8u * step, 0.0f, even, odd);
-        words[(local * 4u + step) * MAXM + m] = A::pack8(even, odd);
+        words[gemv_word(local, step, m, count)] = A::pack8(even, odd);
     }
 }
 
@@ -155,11 +165,11 @@ inline float gemv_step_add(float acc, thread const typename W::packet &k, float4
         return gemv_step_dot(acc, we, wo, xe, xo);
 }
 
-// Accumulate one loaded packet (chunk-local `local`) into the accumulators of
-// all MAXM staged rows.
+// Accumulate one loaded packet (chunk-local `local` of a chunk of `count`)
+// into the accumulators of all MAXM staged rows.
 template <typename W, typename U, bool PAIRED, uint R, uint MAXM, typename A>
 inline void gemv_accumulate(thread float (&acc)[R][MAXM], thread float (&acc2)[R][MAXM],
-    thread const gemv_packets<W, U, PAIRED, R> &packets, uint local, threadgroup const uint4 *words) {
+    thread const gemv_packets<W, U, PAIRED, R> &packets, uint local, uint count, threadgroup const uint4 *words) {
     PROJECTION_UNROLL
     for (uint step = 0; step < 4; ++step) {
         float4 ae[R], ao[R], be[R], bo[R];
@@ -169,11 +179,10 @@ inline void gemv_accumulate(thread float (&acc)[R][MAXM], thread float (&acc2)[R
             if (PAIRED)
                 gemv_step_weights<U>(packets.b[r], step, be[r], bo[r]);
         }
-        threadgroup const uint4 *x = words + (local * 4u + step) * MAXM;
         PROJECTION_UNROLL
         for (uint m = 0; m < MAXM; ++m) {
             float4 xe, xo;
-            A::split8(x[m], xe, xo);
+            A::split8(words[gemv_word(local, step, m, count)], xe, xo);
             PROJECTION_UNROLL
             for (uint r = 0; r < R; ++r) {
                 acc[r][m] = gemv_step_add<W>(acc[r][m], packets.a[r], ae[r], ao[r], xe, xo);
@@ -319,7 +328,7 @@ inline void gemv_body(thread const In &in, thread const Out &out, thread const W
             for (uint local = sub; local < count; local += LANES) {
                 if (first + local + LANES < packets)
                     next.load(w, u, at, first_packet + first + local + LANES);
-                gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, words);
+                gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, count, words);
                 current = next;
             }
         }
@@ -434,7 +443,7 @@ inline void gemv_classes(thread const In &in, thread const Out &out, thread cons
             for (uint local = sub; local < count; local += LANES) {
                 if (first + local + LANES < packets)
                     next.load(w, u, at, first + local + LANES);
-                gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, words);
+                gemv_accumulate<W, U, PAIRED, R, MAXM, A>(acc, acc2, current, local, count, words);
                 current = next;
             }
         }
@@ -595,7 +604,7 @@ inline gemv_chunk gemv_chunk_at(gemv_split split, uint offset, uint window) {
 }
 
 // Stage a chunk of MAXM activation rows as `gemv_stage` does, slot q of the
-// chunk at words[(q * 4 + s) * MAXM + m].
+// chunk at words[gemv_word(q, s, m, chunk.slots())].
 template <uint MAXM, typename In>
 inline void gemv_stage_chunk(thread const In &in, uint m_rows, gemv_chunk chunk, threadgroup uint4 *words,
     uint thread_index, uint threads) {
@@ -607,7 +616,7 @@ inline void gemv_stage_chunk(thread const In &in, uint m_rows, gemv_chunk chunk,
         float4 even = float4(0.0f), odd = float4(0.0f);
         if (m < m_rows)
             in.load8(m, 32u * chunk.packet(slot) + 8u * step, 0.0f, even, odd);
-        words[(slot * 4u + step) * MAXM + m] = A::pack8(even, odd);
+        words[gemv_word(slot, step, m, count)] = A::pack8(even, odd);
     }
 }
 
@@ -695,6 +704,7 @@ inline void gemv_tile_row(thread const In &in, thread const Out &out, thread con
         threadgroup_barrier(mem_flags::mem_threadgroup);
         gemv_stage_chunk<MAXM>(in, m_rows, chunk, words, thread_index, threads);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint slots = chunk.slots();
         for (uint at = 0; at < (split.extra == 0u ? chunk.shorter : chunk.longer); ++at) {
             PROJECTION_UNROLL
             for (uint j = 0; j < R; ++j) {
@@ -706,7 +716,6 @@ inline void gemv_tile_row(thread const In &in, thread const Out &out, thread con
                         b[j].current = b[j].ahead;
                         gemv_walk_load(b[j], u, b_at, false);
                     }
-                    threadgroup const uint4 *x = words + (chunk.slot(range) + at) * 4u * MAXM;
                     PROJECTION_UNROLL
                     for (uint step = 0; step < 4; ++step) {
                         float4 ae, ao, be, bo;
@@ -716,7 +725,7 @@ inline void gemv_tile_row(thread const In &in, thread const Out &out, thread con
                         PROJECTION_UNROLL
                         for (uint m = 0; m < MAXM; ++m) {
                             float4 xe, xo;
-                            A::split8(x[step * MAXM + m], xe, xo);
+                            A::split8(words[gemv_word(chunk.slot(range) + at, step, m, slots)], xe, xo);
                             acc[j][m] = gemv_step_add<W>(acc[j][m], a[j].current, ae, ao, xe, xo);
                             if (PAIRED)
                                 acc2[j][m] = gemv_step_add<U>(acc2[j][m], b[j].current, be, bo, xe, xo);
