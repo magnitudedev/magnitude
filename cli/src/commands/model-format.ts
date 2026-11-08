@@ -50,8 +50,16 @@ export const isCatalogModel = (model: LocalModel): model is CatalogLocalModel =>
 
 export const residencyState = (model: LocalModel) => Option.getOrUndefined(localModelResidency(model))
 
+/** Why this computer serves a model at no context: what it lacks at the smallest one. */
+export const doesNotFitLabel = (model: LocalModel): Option.Option<string> => {
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  return serving?._tag === "Assessed" && serving.assessment._tag === "DoesNotFit"
+    ? Option.some(`Doesn't fit - needs ${formatMemorySize(serving.assessment.deficitBytes, { rounding: "up" })} more, even at ${formatContext(serving.assessment.shortfall.contextLength)}`)
+    : Option.none()
+}
+
 /** The context a model is served at, with its own when this computer serves it at less. */
-export const modelContext = (model: LocalModel): string => Option.match(localModelServingProfile(model), {
+export const modelContext = (model: LocalModel): string => Option.isSome(doesNotFitLabel(model)) ? "—" : Option.match(localModelServingProfile(model), {
   onNone: () => "—",
   onSome: ({ contextLength }) => Option.match(localModelContextLimit(model), {
     onNone: () => formatContext(contextLength),
@@ -71,7 +79,11 @@ export const modelMemoryBytes = (model: LocalModel): number | undefined => {
 
 export const modelMemory = (model: LocalModel): string => {
   const bytes = modelMemoryBytes(model)
-  return bytes === undefined ? "—" : formatMemorySize(bytes)
+  if (bytes === undefined) return "—"
+  const serving = Option.getOrUndefined(localModelServingState(model))
+  return serving?._tag === "Assessed" && serving.assessment._tag === "DoesNotFit"
+    ? `${formatMemorySize(bytes)} at ${formatContext(serving.assessment.shortfall.contextLength)}`
+    : formatMemorySize(bytes)
 }
 
 /** What a fitting model's memory holds, as the desktop shows it: "Weights 36 GB · 1M context 7.1 GB · Overhead 2.3 GB". */
