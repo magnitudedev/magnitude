@@ -28,12 +28,12 @@ export const attachDesktopDmg = (image: string, mount: string, mode: "-readonly"
   return device["dev-entry"]
 })
 
-// Finder and Spotlight can retain a newly mounted image briefly after its window closes.
-// Retry only a busy volume; never force-detach an image that may still be writing.
+// Finder can retain a newly mounted image briefly after its window closes, for longer than 20 s
+// on the Intel runners. Retry only a busy volume; never force-detach an image that may still be writing.
 export const detachDesktopDmg = (device: string) => appleCommand("/usr/bin/hdiutil", "detach", device).pipe(
   Effect.retry({
     schedule: Schedule.spaced("2 seconds"),
-    times: 10,
+    times: 30,
     while: error => error.message.includes("hdiutil exited 16:") && error.message.includes("Resource busy"),
   }),
 )
@@ -46,6 +46,8 @@ export const packageDesktopDmg = (app: string, output: string) => Effect.scoped(
   yield* fs.makeDirectory(join(contents, ".background"), { recursive: true })
   yield* appleCommand("/usr/bin/ditto", app, join(contents, "Magnitude.app"))
   yield* fs.symlink("/Applications", join(contents, "Applications"))
+  // Spotlight indexing the mounted writable image holds it busy at detach.
+  yield* fs.writeFileString(join(contents, ".metadata_never_index"), "")
   yield* appleCommand("/usr/bin/tiffutil", "-cathidpicheck", join(resources, "dmg-background.png"), join(resources, "dmg-background@2x.png"), "-out", join(contents, ".background/background.tiff"))
   const writable = join(stage, "installer.dmg")
   const mount = join(stage, "mounted")
