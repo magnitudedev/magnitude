@@ -523,6 +523,7 @@ impl ManagedModelStore {
                 self.release_operation(&operation_key, &operation).await;
                 return;
             };
+            tracing::warn!(%operation_id, kind = ?failure.kind, error = %failure.message, "model download failed");
             let resumable = failure.resumable();
             if let Some(model_id) = model_id.as_ref()
                 && let Ok(mut models) = self.models.write()
