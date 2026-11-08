@@ -168,6 +168,34 @@ fn a_launch_is_charged_its_requests_host_turn_but_not_idle_time() {
     assert!(idle <= within, "after the owner idled: {idle:?}, its step {within:?}");
 }
 
+/// The owner's own work between flights (memory observation, and what it
+/// releases or grows) serves no request: a launch is charged its request's
+/// host turn without it. The owner's span is long against the request's
+/// own host work, so a charge that kept it would exceed both together.
+#[test]
+fn a_launch_is_not_charged_the_owners_work_in_its_requests_host_turn() {
+    let (mut domain, mut bindings) = fixture(None);
+    let request = RequestId(72);
+    open(&mut domain, &mut bindings, request);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    let own = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let own = own.elapsed();
+    let owner = std::time::Instant::now();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let owner = owner.elapsed();
+    domain.owner_worked(owner);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 1)]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    let charged = pending.physical_duration();
+    assert!(charged >= own, "the request's own host work: {charged:?}");
+    assert!(charged < own + owner, "the owner's work is no launch's: {charged:?}, owner {owner:?}");
+}
+
 /// A request that stops continuing its queued step discards it, and waiting
 /// for that step is part of its next launch: the switch away from plain
 /// decoding costs the round that makes it.

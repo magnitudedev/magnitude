@@ -285,6 +285,24 @@ fn fitting<T>(result: Result<T, magnitude_state::Error>) -> Result<Option<T>, Do
     }
 }
 
+/// Every slot's decode continuation (`continuation_of`), or `None` when a
+/// slot has none. A round whose drafter proposed (a request in `proposed`)
+/// has none whatever its rows, as a verification of several rows has none:
+/// a decode queued behind a one-row verification that declined every
+/// proposal is what the next round's drafter waits for and discards.
+pub(super) fn continuations(operations: &[Operation], proposed: &BTreeSet<RequestId>) -> Option<Vec<Operation>> {
+    operations
+        .iter()
+        .map(|operation| {
+            if proposed.contains(&operation.request()) {
+                None
+            } else {
+                continuation_of(operation)
+            }
+        })
+        .collect()
+}
+
 /// The operation continuing `operation` by one decode row: the same request,
 /// selection and output demand, one position later. A decode that also
 /// publishes its row's feature for a drafter continues like a plain one: the
@@ -517,7 +535,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // all planned chunks (a decode has no planned chunk, a prefill no
         // continuation). A planned chunk of a load that chains opens the next
         // chain rather than queueing alone behind this one.
-        if let Some(operations) = operations.iter().map(continuation_of).collect::<Option<Vec<_>>>() {
+        if let Some(operations) = continuations(operations, &self.proposed) {
             return Behind::Continuation { operations };
         }
         if self.chain_capacity() > std::num::NonZeroUsize::MIN {
@@ -1101,7 +1119,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::{continuation_of, fitting};
+    use super::{continuation_of, continuations, fitting};
 
     /// A queued step's state that does not fit until it provisions runs it
     /// unpipelined; any other refusal of the store is a fault.
@@ -1167,5 +1185,19 @@ mod tests {
             vec![TokenId(5), TokenId(6)]
         ))
         .is_none());
+    }
+
+    /// A round whose drafter proposed verifies them in its target launch,
+    /// and one that declined every proposal verifies none in a one-row
+    /// decode: neither queues a decode behind it, which the next round's
+    /// drafter would wait for and discard (13.6 ms on an M4 Pro serving
+    /// Qwen3.6-35B-A3B q4 with its MTP head, charged to that drafter).
+    #[test]
+    fn a_round_whose_drafter_proposed_queues_no_decode_behind_it() {
+        let declined = decode(Demand::SELECT | Demand::FEATURES, vec![TokenId(5)]);
+        let plain = std::collections::BTreeSet::new();
+        assert!(continuations(std::slice::from_ref(&declined), &plain).is_some());
+        let proposed = std::collections::BTreeSet::from([RequestId(3)]);
+        assert!(continuations(std::slice::from_ref(&declined), &proposed).is_none());
     }
 }

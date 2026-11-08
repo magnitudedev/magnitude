@@ -224,6 +224,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         self.release_prefetches(&[request])?;
         self.head.remove(&request);
+        self.proposed.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
         self.poisoned.remove(&request);

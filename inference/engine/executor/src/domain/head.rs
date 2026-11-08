@@ -876,6 +876,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             item.physical_duration = duration;
             item.timed = timed;
         }
+        // A request whose drafter proposed verifies its round next: no
+        // decode queues behind that launch (`queue::continuations`).
+        self.proposed.extend(
+            pending
+                .iter()
+                .filter(|item| matches!(&item.outcome, Outcome::Head { proposals, .. } if !proposals.is_empty()))
+                .map(|item| item.request),
+        );
         self.begin_host_turn(pending.iter().map(|item| item.request));
         Ok((pending, bindings))
     }

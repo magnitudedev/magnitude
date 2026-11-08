@@ -105,6 +105,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map_err(|error| SubmitFailure::Failed(DomainError::invariant(error)))?;
         self.queue_successor(&work, operations)
             .map_err(SubmitFailure::Failed)?;
+        // This launch was the round's verification: the next round's
+        // drafter, if it proposes, marks its request again.
+        for operation in operations {
+            self.proposed.remove(&operation.request());
+        }
         Ok(TargetFlight { work, bindings })
     }
 

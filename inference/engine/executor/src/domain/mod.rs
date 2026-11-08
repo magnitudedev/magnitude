@@ -605,6 +605,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// Identity of the next target flight.
     next_flight: u64,
     host_turn: Option<in_flight::HostTurn>,
+    /// Requests whose drafter proposed since their last target launch: that
+    /// launch is their round's verification, however many proposals it
+    /// verifies, and queues no decode behind it (`queue::continuations`).
+    proposed: BTreeSet<RequestId>,
     /// Sequences a step of which could not read its weights: every later
     /// outcome of theirs fails (`Outcome::WeightReadFailed`) until they
     /// close.
@@ -2808,6 +2812,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             class_reserve: 0,
             next_flight: 0,
             host_turn: None,
+            proposed: BTreeSet::new(),
             poisoned: BTreeMap::new(),
             measures: None,
             bank_claim: None,

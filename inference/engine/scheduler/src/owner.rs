@@ -1753,7 +1753,16 @@ trait MemoryStep: MemoryHost + Sized {
     /// Observe memory when due. Reclaim releases need the bindings; while a
     /// flight holds them they are owed until it completes. Returns whether
     /// memory escalation decided to unload, after terminating every request.
+    /// This is the owner's own work, which serves no request: no launch is
+    /// charged the time it takes (`ExecutorDomain::owner_worked`).
     fn observe(&mut self, bindings: Option<&mut StateBindings>) -> Result<bool, RequestError> {
+        let began = std::time::Instant::now();
+        let observed = self.observe_memory(bindings);
+        self.domain().owner_worked(began.elapsed());
+        observed
+    }
+
+    fn observe_memory(&mut self, bindings: Option<&mut StateBindings>) -> Result<bool, RequestError> {
         let memory = |error: String| invariant("memory observation")(error);
         let now = self.now();
         if now >= self.memory().next_observation {
