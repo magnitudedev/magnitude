@@ -215,20 +215,20 @@ impl Link {
     fn map(&mut self, want: &Want) -> &mut BTreeMap<(Want, u64), Queued> {
         match want.deadline() {
             Deadline::Streamed(_) => &mut self.streamed,
-            Deadline::Parked(_) | Deadline::None => &mut self.requests,
+            Deadline::Parked(_) | Deadline::Expected(_) | Deadline::None => &mut self.requests,
         }
     }
 
-    /// The request whose next piece may start at `now`, and how it stands:
+    /// The request whose next piece may start now, and how it stands:
     /// the more urgent of the two maps' due heads, where the due bytes in
     /// flight leave it room; else, where no parked piece is queued, the
     /// head read ahead, where the bytes in flight it is counted against
     /// leave it room ([`admits`]). A due head held back at the due depth
     /// holds back the due pieces behind it, a parked one everything read
     /// ahead too; a streamed one holds back nothing read ahead.
-    fn next(&self, now: Instant) -> Option<((Want, u64), Standing)> {
-        let head = self.requests.first_key_value().map(|(key, request)| (*key, request, key.0.standing(now)));
-        let streamed = self.streamed.first_key_value().map(|(key, request)| (*key, request, key.0.standing(now)));
+    fn next(&self) -> Option<((Want, u64), Standing)> {
+        let head = self.requests.first_key_value().map(|(key, request)| (*key, request, key.0.standing()));
+        let streamed = self.streamed.first_key_value().map(|(key, request)| (*key, request, key.0.standing()));
         let due = [head, streamed].into_iter().flatten().filter(|(_, _, standing)| standing.due()).min_by_key(|(key, ..)| *key);
         if let Some((key, request, standing)) = due {
             if self.admits(request, standing) {
@@ -246,16 +246,16 @@ impl Link {
         admits(self.flight, &request.volume.shape, piece.end - piece.start, standing)
     }
 
-    /// Whether a piece of it may start at `now`.
-    fn ready(&self, now: Instant) -> bool {
-        self.next(now).is_some()
+    /// Whether a piece of it may start now.
+    fn ready(&self) -> bool {
+        self.next().is_some()
     }
 
     /// How many pieces, in order, of the request [`Self::next`] names, then
-    /// of the head read ahead where nothing parked is queued, may start at
-    /// `now` beside what is in flight: the workers to wake for them.
-    fn room(&self, now: Instant) -> usize {
-        let Some((key, standing)) = self.next(now) else {
+    /// of the head read ahead where nothing parked is queued, may start
+    /// now beside what is in flight: the workers to wake for them.
+    fn room(&self) -> usize {
+        let Some((key, standing)) = self.next() else {
             return 0;
         };
         let mut flight = self.flight;
@@ -273,7 +273,7 @@ impl Link {
         let request = self.requests.get(&key).or_else(|| self.streamed.get(&key)).expect("the request named");
         count(request, standing);
         if standing == Standing::Streamed {
-            if let Some((_, ahead)) = self.requests.first_key_value().filter(|(key, _)| key.0.standing(now) == Standing::Ahead) {
+            if let Some((_, ahead)) = self.requests.first_key_value().filter(|(key, _)| key.0.standing() == Standing::Ahead) {
                 count(ahead, Standing::Ahead);
             }
         }
@@ -325,14 +325,14 @@ impl Queue {
         let now = Instant::now();
         let volume = request.volume.id;
         let link = self.links.entry(volume).or_insert_with(|| Link::new(now));
-        self.waits.insert(id, Wait::new(request.pieces.len(), want.due(now), &mut link.book, now));
+        self.waits.insert(id, Wait::new(request.pieces.len(), want.due(), &mut link.book, now));
         if crate::timeline::recording() {
             let bytes = request.pieces.iter().map(|piece| piece.end - piece.start).sum::<u64>();
-            crate::timeline::note(crate::timeline::Kind::Submit, id, (i64::from(!want.due(now)), request.pieces.len() as i64, bytes as i64));
+            crate::timeline::note(crate::timeline::Kind::Submit, id, (i64::from(!want.due()), request.pieces.len() as i64, bytes as i64));
         }
         self.wants.insert(id, (volume, want));
         link.map(&want).insert((want, id), request);
-        (id, link.room(now))
+        (id, link.room())
     }
 
     /// The most urgent piece of every link's that its link may start now
@@ -346,7 +346,7 @@ impl Queue {
         let (volume, key, standing) = self
             .links
             .iter()
-            .filter_map(|(volume, link)| link.next(now).map(|(key, standing)| (*volume, key, standing)))
+            .filter_map(|(volume, link)| link.next().map(|(key, standing)| (*volume, key, standing)))
             .min_by_key(|(_, key, _)| *key)?;
         let link = self.links.get_mut(&volume).expect("a ready link");
         let flight = link.flight.total();
@@ -371,8 +371,7 @@ impl Queue {
     /// took one wakes another for, so a link's depth fills one piece after
     /// another however many its last change freed.
     pub(crate) fn ready(&self) -> bool {
-        let now = Instant::now();
-        self.links.values().any(|link| link.ready(now))
+        self.links.values().any(Link::ready)
     }
 
     /// `returned`'s piece ended as its read returned, counted in its link's
@@ -396,9 +395,9 @@ impl Queue {
         let link = self.links.get_mut(volume).expect("a queued request's link");
         let request = link.map(current).remove(&(*current, id)).expect("a queued request");
         *current = want;
-        crate::timeline::note(crate::timeline::Kind::Reprice, id, (i64::from(!want.due(Instant::now())), request.pieces.len() as i64, 0));
+        crate::timeline::note(crate::timeline::Kind::Reprice, id, (i64::from(!want.due()), request.pieces.len() as i64, 0));
         link.map(&want).insert((want, id), request);
-        link.room(Instant::now())
+        link.room()
     }
 
     /// Cancel request `id`: its pieces no worker took, none where every one

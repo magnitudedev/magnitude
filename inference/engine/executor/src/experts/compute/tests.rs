@@ -281,7 +281,7 @@ fn the_most_urgent_job_runs_first_in_submission_order() {
     // The worker holds the gate's one piece.
     until(|| handle.inner.jobs.lock().unwrap().iter().all(|job| job.next.load(Ordering::Acquire) == 1));
     let order = Arc::new(AtomicUsize::new(0));
-    let ahead = Some(Want::at(std::time::Instant::now() + std::time::Duration::from_secs(3600), 0.));
+    let ahead = Some(Want::expected(std::time::Instant::now() + std::time::Duration::from_secs(3600), 0.));
     let kinds = [ahead, None, ahead, ahead, None];
     let jobs = kinds.map(|ahead| Counted::ordered(2, ahead, order.clone()));
     for job in &jobs {

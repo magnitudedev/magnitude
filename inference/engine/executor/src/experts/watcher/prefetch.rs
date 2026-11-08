@@ -475,8 +475,8 @@ impl Prefetch {
             return None;
         }
         noted(if matches!(reading, Reading::Hint(_)) { 1 } else { 2 });
-        // Due from now, or from its own deadline where that came first: a
-        // hastened read is never ordered later than it was.
+        // Parked from now, or since a step first waited on it: a hastened
+        // read orders before every read ahead, and never later than it was.
         inbound.ticket().reprice(inbound.urgency.get().min(Want::now()));
         inbound.urgency.hasten();
         Some(reading)

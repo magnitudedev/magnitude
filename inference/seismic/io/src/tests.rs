@@ -25,9 +25,9 @@ fn temporary_volume() -> std::sync::MutexGuard<'static, ()> {
     TEMPORARY_VOLUME.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Wanted an hour from now: not due while a test runs.
+/// Expected an hour from now: read ahead.
 fn ahead() -> Want {
-    Want::at(Instant::now() + Duration::from_secs(3600), 0.)
+    Want::expected(Instant::now() + Duration::from_secs(3600), 0.)
 }
 
 fn temporary(name: &str, bytes: &[u8]) -> PathBuf {
@@ -515,7 +515,7 @@ fn pieces_are_taken_most_urgent_first() {
         queue.push(request, want).0
     };
     let later = Instant::now() + Duration::from_secs(3600);
-    let at = |seconds: u64, value: f64| Want::at(later + Duration::from_secs(seconds), value);
+    let at = |seconds: u64, value: f64| Want::expected(later + Duration::from_secs(seconds), value);
     // A load's request, though submitted first, is read behind every dated one.
     push(&mut queue, &mut states, Want::undated(0.), 1);
     push(&mut queue, &mut states, at(2, 0.), 1);
@@ -541,6 +541,22 @@ fn pieces_are_taken_most_urgent_first() {
     assert_eq!(take(&mut queue, &states), (0, 0));
     assert_eq!(take(&mut queue, &states), (6, 0), "repriced undated: behind the earlier undated one");
     assert!(queue.take().is_none());
+}
+
+/// A prediction whose instant has passed stays read ahead ("Order and
+/// depth"): a step parked on a read submitted after it reads first, and the
+/// prediction is then taken as a read ahead, counted against the knee, not
+/// the due depth.
+#[test]
+fn a_passed_expectation_stays_read_ahead() {
+    let mut queue = Queue::default();
+    let (expected, _) = queued(1);
+    queue.push(expected, Want::expected(Instant::now(), 1.));
+    let (parked, parked_state) = queued(1);
+    queue.push(parked, Want::now());
+    let first = queue.take().unwrap();
+    assert!(Arc::ptr_eq(&first.state, &parked_state) && first.standing.due(), "the parked read first");
+    assert!(!queue.take().unwrap().standing.due(), "a passed expectation parks nothing");
 }
 
 /// A cancelled request gives up the pieces no worker took, a started one

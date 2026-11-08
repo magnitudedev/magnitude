@@ -56,13 +56,16 @@
 //!
 //! # Order and depth
 //!
-//! A link orders its requests by want: the earlier deadline, then the
-//! greater value, then submission. A request is due once its deadline has
-//! come, so the due ones lead. A due request is waited on in one of two
-//! ways: a step **parks** on it (a decode step's miss, a hint it comes to
-//! wait on), or a **stream** consumes it at the link's rate (a prompt
-//! group's conveyor, which keeps the link at its due depth and parks on no
-//! single read). Its depths come from the volume's curve ("A volume's
+//! A link orders its requests by want: due before read ahead, the earlier
+//! deadline, then the greater value, then submission. A request is due
+//! while a consumer waits on it, in one of two ways: a step **parks** on it
+//! (a decode step's miss, a hint it comes to wait on, repriced so), or a
+//! **stream** consumes it at the link's rate (a prompt group's conveyor,
+//! which keeps the link at its due depth and parks on no single read). A
+//! request read ahead orders by the instant a step is expected to park on
+//! it (a hint's), before those wanted at none (a load, a fill); that
+//! instant passing makes it due no more than a wrong prediction would: a
+//! parked read never queues behind a prediction. Its depths come from the volume's curve ("A volume's
 //! curve"), in bytes in flight:
 //!
 //! 1. A due piece, parked or streamed, starts whenever the due bytes in

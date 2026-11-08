@@ -511,15 +511,16 @@ impl HintPrice {
 
     /// What a hint at rank `rank` of `bytes` is wanted as on its read's link
     /// (`seismic_io::Want`), its layer `ahead` streamed layers past the
-    /// device's at `now`: from that layer's estimated start, `ahead` layer
-    /// times after `now`, worth the step time it is expected to save, its
+    /// device's at `now`: expected from that layer's estimated start,
+    /// `ahead` layer times after `now` (read ahead until a step waits on it,
+    /// `Prefetch::hasten`), worth the step time it is expected to save, its
     /// bytes' time at the volume's rate if right, `p · b/R` (nothing before
     /// the volume's line is measured); undated before a decode step is
     /// timed.
     pub(super) fn want(&self, rank: usize, ahead: usize, bytes: u64, now: std::time::Instant) -> seismic_io::Want {
         let value = self.line.map_or(0., |line| self.precision[rank] * line.transfer_seconds(bytes as f64));
         match self.layer {
-            Some(layer) => seismic_io::Want::at(now + std::time::Duration::from_secs_f64(layer * ahead as f64), value),
+            Some(layer) => seismic_io::Want::expected(now + std::time::Duration::from_secs_f64(layer * ahead as f64), value),
             None => seismic_io::Want::undated(value),
         }
     }

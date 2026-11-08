@@ -30,39 +30,40 @@ use engine::engine;
 /// while `λ · D` (≈ 790 KB) exceeds the gap read.
 const COALESCE_GAP: u64 = 128 * 1024;
 
-/// When a request's consumer would wait from, and how: an instant a step
-/// waits on it parked, an instant from which a stream consumes it at the
-/// link's rate (a prompt group's conveyor, which keeps the link at its due
-/// depth and parks on no single read), or none (a load or a fill, which no
-/// consumer waits on at any instant), after every dated one. Of one
-/// instant, a parked wait orders first.
+/// How a request's consumer waits on it: a step parked on it since an
+/// instant; a stream consuming it at the link's rate since an instant (a
+/// prompt group's conveyor, which keeps the link at its due depth and parks
+/// on no single read); none yet, a step expected to park on it from an
+/// instant (a hint, whose instant is a prediction: passing it parks
+/// nothing, and a step that comes to wait on it reprices it parked); or
+/// none at any instant (a load, a fill). The first two are due and order
+/// before every request read ahead, of one instant a parked one first; of
+/// those read ahead, an expected one orders by its instant, before every
+/// undated one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Deadline {
     Parked(Instant),
     Streamed(Instant),
+    Expected(Instant),
     None,
 }
 
 impl Deadline {
-    /// Its instant, and whether a stream rather than a parked step waits:
-    /// what it orders by, `None` after every instant.
-    fn key(&self) -> Option<(Instant, bool)> {
+    /// What it orders by: due before an expected instant before none, then
+    /// its instant, then a parked wait before a stream's.
+    fn key(&self) -> (u8, Option<Instant>, bool) {
         match *self {
-            Self::Parked(at) => Some((at, false)),
-            Self::Streamed(at) => Some((at, true)),
-            Self::None => None,
+            Self::Parked(at) => (0, Some(at), false),
+            Self::Streamed(at) => (0, Some(at), true),
+            Self::Expected(at) => (1, Some(at), false),
+            Self::None => (2, None, false),
         }
     }
 }
 
 impl Ord for Deadline {
     fn cmp(&self, other: &Self) -> Ordering {
-        match (self.key(), other.key()) {
-            (Some(left), Some(right)) => left.cmp(&right),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        }
+        self.key().cmp(&other.key())
     }
 }
 
@@ -72,9 +73,9 @@ impl PartialOrd for Deadline {
     }
 }
 
-/// How a request stands with its consumer at an instant ("Order and
-/// depth"): a step waits on it parked, a stream consumes it at the link's
-/// rate, or none waits yet (read ahead).
+/// How a request stands with its consumer ("Order and depth"): a step
+/// waits on it parked, a stream consumes it at the link's rate, or none
+/// waits yet (read ahead).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Standing {
     Parked,
@@ -93,9 +94,11 @@ impl Standing {
 /// deadline, and its value, the step time it is expected to save, in
 /// seconds (a read ahead right with probability `p` saves its bytes' time
 /// at the volume's rate, `p · b/R`), which only orders requests of one
-/// deadline. A request is **due** once its deadline has come: a consumer
-/// waits on it now, a step parked or a stream at the link's rate. More
-/// urgent orders first: the earlier deadline, then the greater value.
+/// deadline. A request is **due** while a consumer waits on it, a step
+/// parked or a stream at the link's rate; an expected deadline's passing
+/// makes none due, since only a step's own wait says one waits. More
+/// urgent orders first: due before read ahead, the earlier deadline, then
+/// the greater value.
 #[derive(Clone, Copy, Debug)]
 pub struct Want {
     deadline: Deadline,
@@ -105,12 +108,13 @@ pub struct Want {
 impl Want {
     /// Due now, a step parked on it.
     pub fn now() -> Self {
-        Self::at(Instant::now(), 0.)
+        Self::new(Deadline::Parked(Instant::now()), 0.)
     }
 
-    /// A step parks on it from `deadline`; worth `value`.
-    pub fn at(deadline: Instant, value: f64) -> Self {
-        Self::new(Deadline::Parked(deadline), value)
+    /// Read ahead, a step expected to park on it from `deadline`; worth
+    /// `value`.
+    pub fn expected(deadline: Instant, value: f64) -> Self {
+        Self::new(Deadline::Expected(deadline), value)
     }
 
     /// Due now, consumed by a stream at the link's rate: a prompt group's
@@ -137,17 +141,17 @@ impl Want {
         self.value
     }
 
-    /// Whether a consumer waits on it at `now`: its deadline has come.
-    pub fn due(&self, now: Instant) -> bool {
-        self.standing(now).due()
+    /// Whether a consumer waits on it.
+    pub fn due(&self) -> bool {
+        self.standing().due()
     }
 
-    /// How it stands at `now`.
-    pub(crate) fn standing(&self, now: Instant) -> Standing {
+    /// How it stands.
+    pub(crate) fn standing(&self) -> Standing {
         match self.deadline {
-            Deadline::Parked(at) if at <= now => Standing::Parked,
-            Deadline::Streamed(at) if at <= now => Standing::Streamed,
-            _ => Standing::Ahead,
+            Deadline::Parked(_) => Standing::Parked,
+            Deadline::Streamed(_) => Standing::Streamed,
+            Deadline::Expected(_) | Deadline::None => Standing::Ahead,
         }
     }
 }
@@ -265,7 +269,7 @@ pub(crate) unsafe fn request(file: &Arc<SourceFile>, volume: &VolumeReads, outst
         }
     }
     order.sort_by_key(|(_, span)| span.offset);
-    let read = volume.shape.read(want.due(Instant::now()));
+    let read = volume.shape.read(want.due());
     let pieces = pieces(&order, file.size, read);
     outstanding.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let state = RequestState::new(pieces.len(), failed, outstanding.clone(), ranges);
