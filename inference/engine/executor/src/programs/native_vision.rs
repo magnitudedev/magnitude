@@ -1306,7 +1306,8 @@ impl PreparedVisionGraphs {
         // `layouts`.
         let planned = |layouts: &mut dyn Iterator<Item = &NativeGraphLayout>| {
             seismic::LaunchGraphs::of(
-                layouts.map(|layout| seismic::LaunchedGraph { graph: layout.storage_bytes().recorded, decode_runs: 0, runs: 1 }),
+                layouts.map(|layout| seismic::LaunchedGraph { graph: layout.storage_bytes().recorded, pinned_runs: 0, runs: 1 }),
+                seismic::Beside::AnyRun,
                 Vec::new(),
             )
             .ok_or_else(|| invalid("vision graph census overflows"))
@@ -1331,7 +1332,7 @@ impl PreparedVisionGraphs {
             let plan = graph.seal().map_err(device)?;
             variants.push(PreparedVisionGraph {
                 patch_rows: rows,
-                outputs: super::graph::serial_family([(false, plan.clone())], &planned(&mut std::iter::once(layout))?).map_err(device)?,
+                outputs: super::graph::serial_family("vision output", [(false, plan.clone())], &planned(&mut std::iter::once(layout))?).map_err(device)?,
                 plan,
                 ports,
             });
@@ -1340,7 +1341,7 @@ impl PreparedVisionGraphs {
             return Err(invalid("vision graph family has no patch class"));
         }
         let plans = variants.iter().map(|variant| (false, variant.plan.clone()));
-        let family = super::graph::serial_family(plans, &family_graphs).map_err(device)?;
+        let family = super::graph::serial_family("vision", plans, &family_graphs).map_err(device)?;
         Ok(Self {
             device: target_device.clone(),
             variants,

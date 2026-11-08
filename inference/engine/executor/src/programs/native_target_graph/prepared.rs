@@ -808,16 +808,15 @@ impl PreparedTargetGraphs {
         let bytes = |census| device.graph_cost().bytes(census).map_or(0, |bytes| bytes.device + bytes.upload);
         tracing::info!(
             "target graphs: a decode launch holds {} bytes, the union of every launch's {} bytes; the plan bounded them at {} and {}",
-            bytes(sealed.decode),
+            bytes(sealed.flight),
             bytes(sealed.union),
-            bytes(bound.decode),
+            bytes(bound.flight),
             bytes(bound.union),
         );
-        if !sealed.within(&bound) {
-            return Err(format!(
-                "the sealed target graphs, {sealed:?}, exceed the plan's bound on them, {bound:?}"
-            ));
-        }
+        assert!(
+            sealed.within(&bound),
+            "invariant violated: the target family's sealed graphs, {sealed:?}, exceed what the planner charged, {bound:?}"
+        );
         let seal = SealReport {
             classes: launch_classes.len(),
             sealed_graphs,

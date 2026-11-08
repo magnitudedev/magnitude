@@ -130,9 +130,9 @@ struct Replay<G> {
 
 /// Graphs of a shape kept whatever the budget for one family: `per_flight`
 /// for each of `flights`, its live slots, each a launch in flight. The
-/// family's hold counts them (`LaunchGraphs::held`: a decode launch's
-/// graphs for each launch beside one, and within the union for that one),
-/// so a release never needs them.
+/// family's hold counts them (`LaunchGraphs::held`: its pinned graphs
+/// within what each launch beside one replays, and within the union for
+/// that one), so a release never needs them.
 struct Pinned {
     per_flight: usize,
     flights: Arc<std::sync::atomic::AtomicUsize>,

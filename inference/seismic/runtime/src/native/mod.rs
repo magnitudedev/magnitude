@@ -416,9 +416,9 @@ impl LayoutForms {
 pub struct FamilyGraphs {
     device: Arc<DeviceInner>,
     layouts: LayoutForms,
-    /// What its decode launch replays, which each launch in flight beside
-    /// another may hold, and the union of every launch's, which any one may
-    /// (`LaunchGraphs::held`).
+    /// What it pins for each launch in flight, what each launch in flight
+    /// beside another replays, and the union of every launch's, which any
+    /// one may (`LaunchGraphs::held`).
     launches: LaunchGraphs,
     /// Its live slots, and the hold of their census, none while no slot
     /// lives.
@@ -439,7 +439,8 @@ impl FamilyGraphs {
         Arc::new(Self { device: device.clone(), layouts, launches, held: Mutex::new((0, None)), flights: Arc::default() })
     }
 
-    /// What its decode launch and the union of its launches replay.
+    /// What it pins, each further launch in flight replays, and the union
+    /// of its launches' graphs.
     pub(crate) fn launches(&self) -> LaunchGraphs {
         self.launches.clone()
     }

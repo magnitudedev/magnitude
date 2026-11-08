@@ -194,7 +194,7 @@ pub mod native_cpu {
 }
 
 /// What recorded graphs are made of and what a device's hold for it.
-pub use seismic_compiler::graph_cost::{GraphBytes, GraphCensus, GraphCost, LaunchGraphs, LaunchedGraph};
+pub use seismic_compiler::graph_cost::{Beside, GraphBytes, GraphCensus, GraphCost, LaunchGraphs, LaunchedGraph};
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
@@ -3888,17 +3888,18 @@ pub struct NativeGraphFamily {
 
 impl NativeGraphFamily {
     /// A family of `plans` whose launch is one run of one of them, the
-    /// first `decodes` those a decode step may make.
+    /// first `decodes` those a decode step may make, kept live for each
+    /// launch in flight; a launch in flight beside another may be any of
+    /// them ([`Beside::AnyRun`]).
     pub fn new(plans: &[NativeGraphPlan], decodes: usize) -> Result<Self, WorkflowError> {
-        let launches = plans
-            .iter()
-            .map(|plan| vec![plan.clone()])
-            .collect::<Vec<_>>();
-        Self::with_launches(plans, &launches, decodes, &[])
+        let plans = plans.iter().map(|plan| plan.inner.clone()).collect::<Vec<_>>();
+        seismic_runtime::native::graph::NativeGraphFamily::new(&plans, decodes)
+            .map(|inner| Self { inner: Arc::new(inner) })
     }
     /// A family of `plans` whose launches each make the runs of one of
     /// `launches`, a plan once for each of its runs, the first `decodes`
-    /// those a decode step may make: its plans of one layout
+    /// those a decode step may make, a launch in flight beside another one
+    /// of them ([`Beside::Decode`]): its plans of one layout
     /// share one graph, recorded as a run
     /// first needs it, within what its live slots hold ([`Self::graphs`]).
     /// A chain of `k + 2` launches in one submission further runs
@@ -3925,8 +3926,9 @@ impl NativeGraphFamily {
                 inner: Arc::new(inner),
             })
     }
-    /// What its decode and largest launches replay, which its live slots,
-    /// each a launch in flight, hold of its device's graph budget
+    /// What it pins, what each launch in flight beside another replays and
+    /// the union of its launches' graphs, which its live slots, each a
+    /// launch in flight, hold of its device's graph budget
     /// ([`LaunchGraphs::held`]).
     pub fn graphs(&self) -> LaunchGraphs {
         self.inner.graphs()

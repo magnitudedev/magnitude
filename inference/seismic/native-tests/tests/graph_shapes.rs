@@ -376,8 +376,8 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
             // One graph of the layout, both launches its nodes, recorded at
             // its first use and serving every class, slot and round after.
             assert_eq!(created.recorded, 0, "{backend:?}: a slot records nothing");
-            assert_eq!(family.graphs().decode.graphs, 1, "{backend:?}: a launch holds the layout's one graph");
-            assert_eq!(family.graphs().decode.launches, 2, "{backend:?}: the graph's nodes are both classes' launches");
+            assert_eq!(family.graphs().pinned.graphs, 1, "{backend:?}: a launch holds the layout's one graph");
+            assert_eq!(family.graphs().pinned.launches, 2, "{backend:?}: the graph's nodes are both classes' launches");
             assert_eq!(served.recorded, 1, "{backend:?}: one graph serves every class, slot and round");
         }
     }

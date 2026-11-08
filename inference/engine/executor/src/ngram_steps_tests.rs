@@ -856,17 +856,20 @@ fn no_decode_step_records_a_graph() {
     decode_steps_record_no_graph(&catalog, cuda);
 }
 
-/// [`no_decode_step_records_a_graph`] on Metal, whose graphs are recorded
-/// at their shape's first use, never for a decode step's run after it, over
-/// the same release and shrink paths.
+/// [`no_decode_step_records_a_graph`]'s release and shrink paths on Metal:
+/// Reclaim's surplus rung releases a prompt group's class and a whole bank
+/// shrinks, with decode steps of every class around them. A Metal schedule
+/// holds no device memory and records nothing the replays count
+/// (`GraphCost::None`), so its recordings are none by construction; what it
+/// asserts is that both paths are driven, never skipped.
 #[test]
+#[ignore = "needs a Metal device: run with --ignored on one"]
 fn no_decode_step_records_a_graph_on_metal() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let metal = seismic::BackendName::Metal;
-    if available(&catalog, metal) {
-        decode_steps_record_no_graph(&catalog, metal);
-    }
+    assert!(available(&catalog, metal), "the test runs on a host with a Metal device");
+    decode_steps_record_no_graph(&catalog, metal);
 }
 
 /// Decode steps' recordings, by family, of open requests at their positions.

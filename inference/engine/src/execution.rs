@@ -598,7 +598,7 @@ pub(crate) fn build(
     );
     // What the target's graphs are made of, beside what they cost on this
     // device: what its decode launch's runs replay, as the family is
-    // charged for it (`LaunchGraphs::decode`), and its largest launch
+    // charged for it (`LaunchGraphs::flight`), and its largest launch
     // class's, which the family's live slots hold of its device's graph
     // budget.
     let family = target_graphs.family();
@@ -609,7 +609,7 @@ pub(crate) fn build(
         let bytes = graph_cost.bytes(graphs).expect("a charged family's graphs price at its device's cost");
         bytes.device + bytes.upload
     };
-    let decode = family.graphs().decode;
+    let decode = family.graphs().flight;
     // Every plan of a family runs in one of its launches, so it has one.
     let largest = census.launches.iter().copied().max_by_key(|graphs| cost(*graphs)).expect("a target family has a launch class");
     tracing::info!(

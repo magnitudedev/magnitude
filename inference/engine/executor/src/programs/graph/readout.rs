@@ -617,9 +617,9 @@ impl PreparedTargetReadoutGraphs {
         for &class in &qualified {
             add(class)?;
         }
-        let family = super::serial_family(plans, &readout_graphs(&regimes, &qualified, limits, false).map_err(error)?)
+        let family = super::serial_family("readout", plans, &readout_graphs(&regimes, &qualified, limits, false).map_err(error)?)
             .map_err(|error| error.to_string())?;
-        let chunk_family = super::serial_family(chunk_plans, &readout_graphs(&regimes, &qualified, limits, true).map_err(error)?)
+        let chunk_family = super::serial_family("chunk readout", chunk_plans, &readout_graphs(&regimes, &qualified, limits, true).map_err(error)?)
             .map_err(|error| error.to_string())?;
         Ok(Self {
             residual_width: load.residual_conditioning(),
@@ -1910,10 +1910,10 @@ fn readout_graphs(
         .into_iter()
         .map(|(regime, decodes)| {
             let layout = regimes.get(&regime).ok_or("readout class has no resource regime")?;
-            Ok(LaunchedGraph { graph: layout.storage_bytes().recorded, decode_runs: u64::from(decodes), runs: 1 })
+            Ok(LaunchedGraph { graph: layout.storage_bytes().recorded, pinned_runs: u64::from(decodes), runs: 1 })
         })
         .collect::<Result<Vec<_>, GraphError>>()?;
-    Ok(LaunchGraphs::of(graphs, Vec::new()).ok_or("readout graph census overflows")?)
+    Ok(LaunchGraphs::of(graphs, seismic::Beside::AnyRun, Vec::new()).ok_or("readout graph census overflows")?)
 }
 
 fn readout_regime(class: ReadoutClass) -> ReadoutRegime {

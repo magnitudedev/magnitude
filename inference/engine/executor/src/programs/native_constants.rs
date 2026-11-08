@@ -525,9 +525,9 @@ impl CheckedGraphFamilyResources {
     /// Count one graph of a family whose launch is one run of one of its
     /// graphs (`seismic::NativeGraphFamily::new`): a layout's, or a plan's
     /// sealed alone, recording `recorded`, which a decode step's launch
-    /// replays where `decodes`.
+    /// replays where `decodes`, kept live for each launch in flight.
     pub(crate) fn include_graph(&mut self, recorded: GraphCensus, decodes: bool) {
-        self.graphs.push(LaunchedGraph { graph: recorded, decode_runs: u64::from(decodes), runs: 1 });
+        self.graphs.push(LaunchedGraph { graph: recorded, pinned_runs: u64::from(decodes), runs: 1 });
     }
 
     /// Count the host heap of one sealed plan of the family
@@ -597,7 +597,7 @@ impl CheckedGraphFamilyResources {
                 .ok_or("checked graph host heap overflows")?,
             storage: self.storage.ok_or("checked graph family has no class")?,
             binding_constant_bytes: distinct_storage_bytes(self.constants.iter())?,
-            graphs: LaunchGraphs::of(self.graphs, Vec::new()).ok_or("checked graph family census overflows")?,
+            graphs: LaunchGraphs::of(self.graphs, seismic::Beside::AnyRun, Vec::new()).ok_or("checked graph family census overflows")?,
         })
     }
 }

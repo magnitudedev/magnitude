@@ -115,14 +115,16 @@ impl GraphCensus {
     }
 }
 
-/// What a family's graphs hold with launches in flight: a decode launch's
-/// graphs, each layout's graph for the most runs of it any one of its
-/// decode launches makes; the union of every launch's, each layout's for
-/// the most runs of it any one launch makes; and what a chain of launches
-/// replays beyond each launch's own ([`Self::held`]).
+/// What a family's graphs hold with launches in flight ([`Self::held`]):
+/// the graphs it keeps live for each launch in flight (`pinned`); what each
+/// launch in flight beside another replays (`flight`), the pinned graphs
+/// among it; the union of every launch's, each layout's for the most runs
+/// of it any one launch makes; and what a chain of launches replays beyond
+/// each launch's own.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaunchGraphs {
-    pub decode: GraphCensus,
+    pub pinned: GraphCensus,
+    pub flight: GraphCensus,
     pub union: GraphCensus,
     /// A chain of `k + 2` launches' graphs beyond each launch's own, at
     /// `k`: the further runs of the graphs it runs once a group, where one
@@ -131,47 +133,72 @@ pub struct LaunchGraphs {
 }
 
 /// One graph a family's launches replay (a layout's, or a plan's sealed
-/// alone): what recording it takes, and the most runs of it any one of the
-/// family's decode launches makes, and any one of its launches.
+/// alone): what recording it takes, the runs of it the family keeps live
+/// for each launch in flight (the most any one of its decode launches
+/// makes, where it pins them), and the most runs of it any one of its
+/// launches makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LaunchedGraph {
     pub graph: GraphCensus,
-    pub decode_runs: u64,
+    pub pinned_runs: u64,
     pub runs: u64,
 }
 
+/// What a family's launch in flight beside another replays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Beside {
+    /// One of its decode launches, whose graphs it keeps live for each
+    /// launch in flight: the pinned graphs (the target's launches).
+    Decode,
+    /// Any one of its launches, each one run of one graph: its pinned
+    /// graphs, kept for it whatever it runs, and the largest graph, an
+    /// instance of its own, as a CUDA graph in flight is never replayed
+    /// again until it completes (the readout's, head's, drafter's, state
+    /// copies' and vision's launches).
+    AnyRun,
+}
+
 impl LaunchGraphs {
-    /// What a family of `graphs` holds, with `chained` its chains' further
-    /// graphs: its decode launch's, each graph for the most runs any one
-    /// decode launch makes of it, which a family keeps live for each launch
-    /// in flight, all of them resident at once (`record_decode`), so their
-    /// sum; and its union, each graph for the most runs any one launch
-    /// makes. The one computation of a family's census, from the graphs its
-    /// plans are sealed into, for the planner's charge and the sealed
-    /// family's alike. None on overflow.
-    pub fn of(graphs: impl IntoIterator<Item = LaunchedGraph>, chained: Vec<GraphCensus>) -> Option<Self> {
-        let (mut decode, mut union) = (GraphCensus::default(), GraphCensus::default());
-        for LaunchedGraph { graph, decode_runs, runs } in graphs {
-            assert!(decode_runs <= runs, "a decode launch is one of the family's launches");
-            decode = decode.plus(graph.times(decode_runs)?)?;
+    /// What a family of `graphs` holds, with `beside` what a launch in
+    /// flight beside another replays and `chained` its chains' further
+    /// graphs: the pinned graphs, each graph for its pinned runs, all of
+    /// them resident at once for each launch in flight (`record_decode`),
+    /// so their sum; each further launch's (`beside`); and its union, each
+    /// graph for the most runs any one launch makes. The one computation of
+    /// a family's census, from the graphs its plans are sealed into, for the
+    /// planner's charge and the sealed family's alike. None on overflow.
+    pub fn of(graphs: impl IntoIterator<Item = LaunchedGraph>, beside: Beside, chained: Vec<GraphCensus>) -> Option<Self> {
+        let (mut pinned, mut largest, mut union) = (GraphCensus::default(), GraphCensus::default(), GraphCensus::default());
+        for LaunchedGraph { graph, pinned_runs, runs } in graphs {
+            assert!(pinned_runs <= runs, "a pinned graph is one the family's launches run");
+            assert!(beside == Beside::Decode || runs <= 1, "a launch of one run runs a graph once");
+            pinned = pinned.plus(graph.times(pinned_runs)?)?;
+            if runs > 0 {
+                largest = largest.most(graph);
+            }
             union = union.plus(graph.times(runs)?)?;
         }
-        Some(Self { decode, union, chained })
+        let flight = match beside {
+            Beside::Decode => pinned,
+            Beside::AnyRun => pinned.plus(largest)?,
+        };
+        Some(Self { pinned, flight, union, chained })
     }
 
     /// What the family holds with `launches` launches in flight: the
     /// union, within which any one launch's graphs are whatever its class,
-    /// so every submission fits; beside it each other launch's, a decode
-    /// launch's, so one prompt launch in flight with decode launches
-    /// records no graph it once recorded; and what a chain of them replays
-    /// beyond each launch's own (`chained`), the longest chain's past it.
-    /// Each layout's graphs kept for its decode launches, `decode`'s runs
-    /// of it for every launch, are within this, as a layout's union runs
-    /// are no fewer than its decode runs, so no release ever takes them. A
-    /// second prompt launch in flight (a chunk's pipelined successor, where
-    /// prompt chunks do not chain) still fits, releasing graphs only the
-    /// first prompt launch replays, which then record again. None without
-    /// a launch, none on overflow.
+    /// so every submission fits; beside it each other launch's (`flight`),
+    /// so a launch in flight with others records no graph it once recorded,
+    /// and each of its graphs in flight is an instance of its own; and what
+    /// a chain of them replays beyond each launch's own (`chained`), the
+    /// longest chain's past it. The pinned graphs, kept for every launch in
+    /// flight, are within this, as each is within `flight` and a graph's
+    /// union runs are no fewer than its pinned runs, so no release ever
+    /// takes them. A family whose beside launch is a decode launch
+    /// ([`Beside::Decode`], the target's) fits a second prompt launch in flight (a
+    /// chunk's pipelined successor, where prompt chunks do not chain) too,
+    /// releasing graphs only the first prompt launch replays, which then
+    /// record again. None without a launch, none on overflow.
     pub fn held(&self, launches: u64) -> Option<GraphCensus> {
         let chained = match launches {
             0 => return Some(GraphCensus::default()),
@@ -182,13 +209,14 @@ impl LaunchGraphs {
                 .copied()
                 .unwrap_or_default(),
         };
-        self.decode.times(launches - 1)?.plus(self.union)?.plus(chained)
+        self.flight.times(launches - 1)?.plus(self.union)?.plus(chained)
     }
 
     /// Whether every term is within `bound`'s: what it holds at any count
-    /// of launches is then within what `bound` holds.
+    /// of launches, and what it pins, is then within what `bound` does.
     pub fn within(&self, bound: &Self) -> bool {
-        self.decode.within(bound.decode)
+        self.pinned.within(bound.pinned)
+            && self.flight.within(bound.flight)
             && self.union.within(bound.union)
             && self.chained.len() == bound.chained.len()
             && self.chained.iter().zip(&bound.chained).all(|(chained, bound)| chained.within(*bound))
@@ -272,6 +300,27 @@ mod tests {
 
     /// A census adds its parts' terms and takes the larger largest launch;
     /// removing a part leaves the rest, and a set is within itself.
+    #[test]
+    fn a_launch_beside_another_holds_its_own_instance_of_what_it_runs() {
+        let (small, large) = (census(1, 3, 0, 0), census(1, 10, 0, 0));
+        let graph = |graph, pinned_runs| LaunchedGraph { graph, pinned_runs, runs: 1 };
+        // Single-run launches, none pinned (a head's): a second launch in
+        // flight holds an instance of the largest graph beside the union.
+        let unpinned = LaunchGraphs::of([graph(small, 0), graph(large, 0)], Beside::AnyRun, Vec::new()).unwrap();
+        assert_eq!(unpinned.pinned, GraphCensus::default());
+        assert_eq!(unpinned.held(1), Some(census(2, 13, 0, 0)));
+        assert_eq!(unpinned.held(3), Some(census(4, 33, 0, 0)));
+        // Single-run launches with a pinned decode graph (the readout's):
+        // each further launch holds its pins and the largest graph.
+        let pinned = LaunchGraphs::of([graph(small, 1), graph(large, 0)], Beside::AnyRun, Vec::new()).unwrap();
+        assert_eq!(pinned.pinned, small);
+        assert_eq!(pinned.held(2), Some(census(4, 26, 0, 0)));
+        // Decode launches beside one another (the target's): their pins.
+        let decode = LaunchGraphs::of([graph(small, 1), graph(large, 0)], Beside::Decode, Vec::new()).unwrap();
+        assert_eq!(decode.held(2), Some(census(3, 16, 0, 0)));
+        assert!(decode.within(&pinned) && !pinned.within(&decode));
+    }
+
     #[test]
     fn a_census_adds_its_parts() {
         let first = GraphCensus::graph(GraphCensus::launch(40)).unwrap();

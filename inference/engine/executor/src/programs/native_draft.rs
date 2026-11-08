@@ -3150,7 +3150,7 @@ impl PreparedDraftGraphs {
             );
         }
         let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
-        let family = super::graph::serial_family(plans, &resources.graphs).map_err(device)?;
+        let family = super::graph::serial_family("drafter", plans, &resources.graphs).map_err(device)?;
         Ok(Self {
             classes: prepared,
             family,

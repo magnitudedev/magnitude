@@ -752,10 +752,10 @@ impl FamilyLayouts {
         let graphs = most
             .iter()
             .map(|(&graphed, &runs)| {
-                Ok(LaunchedGraph { graph: recorded(graphed)?, decode_runs: decode.get(&graphed).copied().unwrap_or(0), runs })
+                Ok(LaunchedGraph { graph: recorded(graphed)?, pinned_runs: decode.get(&graphed).copied().unwrap_or(0), runs })
             })
             .collect::<Result<Vec<_>, GraphError>>()?;
-        let graphs = LaunchGraphs::of(graphs, chained).ok_or_else(overflow)?;
+        let graphs = LaunchGraphs::of(graphs, seismic::Beside::Decode, chained).ok_or_else(overflow)?;
         Ok(TargetFamilyCertificate {
             outline,
             served,

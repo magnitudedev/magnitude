@@ -1448,7 +1448,7 @@ impl PreparedHeadGraphs {
             return Err(invalid("head graph family has no classes"));
         }
         let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
-        let family = super::graph::serial_family(plans, &resources.graphs).map_err(device)?;
+        let family = super::graph::serial_family("head", plans, &resources.graphs).map_err(device)?;
         Ok(Self {
             conditioning_bytes: load.residual_conditioning().map_or(
                 geometry.hidden as usize * geometry.activation_dtype.bytes(),

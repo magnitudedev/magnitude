@@ -34,7 +34,7 @@ use crate::api::{CallError, TensorError, WorkflowError};
 use crate::driver::Allocation;
 use crate::layout;
 use seismic_compiler::errors::{ExecutionError, InvocationError};
-use seismic_compiler::graph_cost::{argument_bytes, GraphCensus, LaunchGraphs, LaunchedGraph};
+use seismic_compiler::graph_cost::{argument_bytes, Beside, GraphCensus, LaunchGraphs, LaunchedGraph};
 use seismic_compiler::prepared::{ArgumentValue, DeviceIdentity, TensorDescriptor};
 use seismic_lang::checked::NativeImplementation;
 use seismic_lang::entry::{AliasRule, CallSchema, ParameterKind, TensorAccess};
@@ -2795,7 +2795,8 @@ impl NativeGraphPlan {
         let census = self.run_graphs(&form);
         let layout = super::LayoutGraph { form, plans: vec![self.clone()] };
         let layouts = super::LayoutForms::new([(self.shape.layout, layout)]);
-        let graphs = LaunchGraphs { decode: census, union: census, chained: Vec::new() };
+        let graphs = LaunchGraphs::of([LaunchedGraph { graph: census, pinned_runs: 0, runs: 1 }], Beside::AnyRun, Vec::new())
+            .expect("a plan's graph census fits u64");
         super::FamilyGraphs::new(&self.device, layouts, graphs).slot().map_err(TensorError::Execution)
     }
 
@@ -3023,10 +3024,12 @@ pub struct GraphFamilyCensus {
 
 impl NativeGraphFamily {
     /// A family of `plans` whose launch is one run of one of them, the
-    /// first `decodes` those a decode step may make.
+    /// first `decodes` those a decode step may make, kept live for each
+    /// launch in flight ([`Self::record_decode`]); a launch in flight beside
+    /// another may be any of them ([`Beside::AnyRun`]).
     pub fn new(plans: &[Arc<NativeGraphPlan>], decodes: usize) -> Result<Self, WorkflowError> {
         let launches = plans.iter().map(|plan| vec![plan.clone()]).collect::<Vec<_>>();
-        Self::with_launches(plans, &launches, decodes, &[])
+        Self::of_launches(plans, &launches, decodes, Beside::AnyRun, &[])
     }
 
     /// A family of `plans` whose launches each make the runs of one of
@@ -3047,6 +3050,19 @@ impl NativeGraphFamily {
         plans: &[Arc<NativeGraphPlan>],
         launches: &[Vec<Arc<NativeGraphPlan>>],
         decodes: usize,
+        chains: &[Vec<(Arc<NativeGraphPlan>, u64)>],
+    ) -> Result<Self, WorkflowError> {
+        Self::of_launches(plans, launches, decodes, Beside::Decode, chains)
+    }
+
+    /// A family of `plans` whose launches make `launches`' runs, the first
+    /// `decodes` decode launches, a launch in flight beside another as
+    /// `beside` says.
+    fn of_launches(
+        plans: &[Arc<NativeGraphPlan>],
+        launches: &[Vec<Arc<NativeGraphPlan>>],
+        decodes: usize,
+        beside: Beside,
         chains: &[Vec<(Arc<NativeGraphPlan>, u64)>],
     ) -> Result<Self, WorkflowError> {
         let first = plans.first().ok_or(WorkflowError::Empty)?;
@@ -3103,7 +3119,7 @@ impl NativeGraphFamily {
         // Of each layout, its largest plan's graph (every plan of a layout
         // runs in some launch), and the most runs of it any one decode
         // launch, and any one launch, makes.
-        let mut graphed = vec![LaunchedGraph { graph: GraphCensus::default(), decode_runs: 0, runs: 0 }; layouts.len()];
+        let mut graphed = vec![LaunchedGraph { graph: GraphCensus::default(), pinned_runs: 0, runs: 0 }; layouts.len()];
         for (index, runs) in launches.iter().enumerate() {
             let mut counts = vec![0u64; layouts.len()];
             for plan in runs.iter().filter(|plan| plan.graphed()) {
@@ -3114,7 +3130,7 @@ impl NativeGraphFamily {
             for (graphed, count) in graphed.iter_mut().zip(counts) {
                 graphed.runs = graphed.runs.max(count);
                 if index < decodes {
-                    graphed.decode_runs = graphed.decode_runs.max(count);
+                    graphed.pinned_runs = graphed.pinned_runs.max(count);
                 }
             }
         }
@@ -3129,10 +3145,10 @@ impl NativeGraphFamily {
         let decode_layouts = layouts
             .iter()
             .zip(&graphed)
-            .filter(|(_, graphed)| graphed.decode_runs > 0)
-            .map(|(graphs, graphed)| (graphs.plans[0].shape.layout, graphed.decode_runs as usize))
+            .filter(|(_, graphed)| graphed.pinned_runs > 0)
+            .map(|(graphs, graphed)| (graphs.plans[0].shape.layout, graphed.pinned_runs as usize))
             .collect::<Vec<_>>();
-        let graphs = LaunchGraphs::of(graphed, chained).expect("a family's graph census fits u64");
+        let graphs = LaunchGraphs::of(graphed, beside, chained).expect("a family's graph census fits u64");
         let count = layouts.len();
         let layouts = super::LayoutForms::new(layouts.into_iter().map(|graph| (graph.plans[0].shape.layout, graph)));
         Ok(Self {
@@ -3197,9 +3213,10 @@ impl NativeGraphFamily {
         })
     }
 
-    /// What its decode launch and the union of its launches replay, which
-    /// its live slots, each a launch in flight, hold of its device's graph
-    /// budget (`LaunchGraphs::held`).
+    /// What it pins, what each launch in flight beside another replays and
+    /// the union of its launches' graphs, which its live slots, each a
+    /// launch in flight, hold of its device's graph budget
+    /// (`LaunchGraphs::held`).
     pub fn graphs(&self) -> LaunchGraphs {
         self.graphs.launches()
     }

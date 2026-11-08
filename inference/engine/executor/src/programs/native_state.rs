@@ -265,7 +265,7 @@ impl PreparedStateCopyGraphs {
         }
         // A state copy runs on its own lane, never in a decode step's launch.
         let plans = variants.iter().map(|variant| (false, variant.plan.clone()));
-        let family = super::graph::serial_family(plans, &graphs).map_err(device)?;
+        let family = super::graph::serial_family("state copy", plans, &graphs).map_err(device)?;
         let graphs = Self {
             variants,
             family,
@@ -489,7 +489,7 @@ fn certify_copy_family(
                 .dimension("N", group.iter().map(|&index| classes[index].map_rows))])
         })?;
         let storage = layout.storage_bytes();
-        graphs.push(LaunchedGraph { graph: storage.recorded, decode_runs: 0, runs: 1 });
+        graphs.push(LaunchedGraph { graph: storage.recorded, pinned_runs: 0, runs: 1 });
         match &mut family {
             Some(maximum) => {
                 maximum.workspace = maximum.workspace.max(storage.workspace);
@@ -504,7 +504,7 @@ fn certify_copy_family(
     }
     Ok((
         family.ok_or("state copy graph family has no classes")?,
-        LaunchGraphs::of(graphs, Vec::new()).ok_or("state copy graph census overflows")?,
+        LaunchGraphs::of(graphs, seismic::Beside::AnyRun, Vec::new()).ok_or("state copy graph census overflows")?,
         layouts.into_iter().map(Option::unwrap).collect(),
     ))
 }

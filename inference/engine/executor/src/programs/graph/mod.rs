@@ -63,11 +63,12 @@ impl From<&str> for GraphError {
     }
 }
 
-/// The family of `graphs`' plans, each launch one run of one of them, those
-/// a decode step's launch runs (`decodes`) leading: its census is within
-/// what the planner charged for it (`planned`, of the same graphs through
-/// `seismic::LaunchGraphs::of`), which an exceeding one violates.
+/// The `name`d family of `graphs`' plans, each launch one run of one of
+/// them, those a decode step's launch runs (`decodes`) leading: its census
+/// is within what the planner charged for it (`planned`, of the same graphs
+/// through `seismic::LaunchGraphs::of`), which an exceeding one violates.
 pub(crate) fn serial_family(
+    name: &str,
     graphs: impl IntoIterator<Item = (bool, seismic::NativeGraphPlan)>,
     planned: &seismic::LaunchGraphs,
 ) -> Result<seismic::NativeGraphFamily, seismic::WorkflowError> {
@@ -77,7 +78,7 @@ pub(crate) fn serial_family(
     let family = seismic::NativeGraphFamily::new(&plans, decodes)?;
     assert!(
         family.graphs().within(planned),
-        "invariant violated: a family's sealed graphs, {:?}, exceed what the planner charged, {planned:?}",
+        "invariant violated: the {name} family's sealed graphs, {:?}, exceed what the planner charged, {planned:?}",
         family.graphs()
     );
     Ok(family)
