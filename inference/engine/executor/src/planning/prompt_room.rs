@@ -123,13 +123,13 @@ pub(crate) fn routed_prompt_seconds(
 
 /// The seconds `chunks` prompt chunks take in groups of `places`, a group
 /// of `steps` chunks taking `group(steps)`: the whole groups and the one
-/// left over.
-pub(crate) fn grouped(chunks: usize, places: usize, group: impl Fn(usize) -> f64) -> f64 {
+/// left over; the first error `group` meets.
+pub(crate) fn grouped<E>(chunks: usize, places: usize, mut group: impl FnMut(usize) -> Result<f64, E>) -> Result<f64, E> {
     let rest = match chunks % places {
         0 => 0.0,
-        rest => group(rest),
+        rest => group(rest)?,
     };
-    (chunks / places) as f64 * group(places) + rest
+    Ok((chunks / places) as f64 * group(places)? + rest)
 }
 
 /// The routed seconds one group of `steps` prompt chunks of a launch region

@@ -529,7 +529,7 @@ mod tests {
     fn places_are_worth_the_group_reads_they_save() {
         let slots = BankSlots { now: 8, floor: 2, bytes: 20_000_000, host: 0 };
         let cold = reads(&[8; 7]);
-        let seconds = |reads: &GroupReads, places| crate::planning::grouped(8, places, |steps| reads.group_seconds(slots, steps, None));
+        let seconds = |reads: &GroupReads, places| crate::planning::grouped(8, places, |steps| Ok::<_, std::convert::Infallible>(reads.group_seconds(slots, steps, None))).unwrap_or_else(|never| match never {});
         assert!(seconds(&cold, 1) > seconds(&cold, 2) && seconds(&cold, 2) > seconds(&cold, 8));
         let held = reads(&[0, 1, 2, 3, 4, 5, 6]);
         assert!((seconds(&held, 1) - seconds(&held, 8)).abs() < 1e-12);

@@ -119,12 +119,12 @@ pub(super) enum GroupSource {
     Modelled { submission: f64, held: Option<crate::assessment::HeldSlots> },
 }
 
-/// One prompt group's seconds at each size up to the chain's capacity, as
-/// `source` last priced them ([`ExecutorDomain::group_sizes`]); none where
-/// it prices no group.
+/// One prompt group's seconds at each size a settle read since `source`
+/// last changed, by size ([`ExecutorDomain::places_seconds`]); a size not
+/// read yet is none.
 pub(super) struct PlacesPrompt {
     source: GroupSource,
-    groups: Option<std::rc::Rc<[f64]>>,
+    groups: Vec<Option<f64>>,
 }
 
 /// What a settle of the serving heap read that moves its outcome
@@ -339,36 +339,60 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// The prompt's seconds at each place count from `held` to the most
     /// whose group runs within the wait bound, `chunks` chunks in groups of
-    /// that many ([`Self::group_sizes`], `planning::grouped`).
+    /// that many (`planning::grouped`); none priced where no group is
+    /// ([`Self::group_seconds`]).
+    ///
+    /// A group's seconds change only with its source ([`GroupSource`]),
+    /// never with a reading's wait bound or request rate, which apply to
+    /// them as they are read: each size is priced once per change of its
+    /// source, and only the sizes a settle reads (a priced group's seconds
+    /// take each layer's union and merge).
     fn places_seconds(&self, held: usize, chunks: usize) -> Result<Vec<f64>, DomainError> {
-        let groups = self.group_sizes()?;
-        let seconds = |chunks: usize, places: usize| groups.as_ref().map(|groups| crate::planning::grouped(chunks, places, |steps| groups[steps]));
-        let wait = self.pace.borrow().wait_bound();
-        let most = (held + 1..=chunks)
-            .take_while(|&places| !wait.zip(seconds(places, places)).is_some_and(|(wait, group)| group > wait))
-            .last()
-            .unwrap_or(held);
-        Ok((held..=most).map(|places| seconds(chunks, places).unwrap_or(0.)).collect())
-    }
-
-    /// One prompt group's seconds at each size up to the chain's capacity,
-    /// the most chunks a group holds ([`Self::group_seconds`]); none where
-    /// no group is priced. They change only with the group's source and the
-    /// load's measures, never with a reading's wait bound or request rate,
-    /// which apply to them as they are read: a settle at every reading
-    /// prices each size once per change of its source, not once per
-    /// reading (a priced group's seconds take each layer's union and merge).
-    fn group_sizes(&self) -> Result<Option<std::rc::Rc<[f64]>>, DomainError> {
         let source = self.group_source()?;
-        if let Some(memo) = self.places_prompt.borrow().as_ref().filter(|memo| memo.source == source) {
-            return Ok(memo.groups.clone());
+        let mut memo = self.places_prompt.borrow_mut();
+        if memo.as_ref().is_none_or(|memo| memo.source != source) {
+            *memo = Some(PlacesPrompt { source, groups: Vec::new() });
         }
-        let capacity = self.chain_capacity().get();
-        let groups = self
-            .group_seconds(&source)?
-            .map(|group| (0..=capacity).map(|steps| if steps == 0 { 0. } else { group(steps) }).collect::<std::rc::Rc<[f64]>>());
-        *self.places_prompt.borrow_mut() = Some(PlacesPrompt { source, groups: groups.clone() });
-        Ok(groups)
+        let PlacesPrompt { source, groups } = memo.as_mut().expect("the prompt's memo is its source's");
+        // The group's pricing, built at the first size not priced yet.
+        let mut pricing = None;
+        let mut group = |steps: usize| -> Result<Option<f64>, DomainError> {
+            if let Some(&Some(seconds)) = groups.get(steps) {
+                return Ok(Some(seconds));
+            }
+            if pricing.is_none() {
+                pricing = Some(self.group_seconds(source)?);
+            }
+            let Some(price) = pricing.as_ref().and_then(Option::as_ref) else {
+                return Ok(None);
+            };
+            let seconds = price(steps);
+            if groups.len() <= steps {
+                groups.resize(steps + 1, None);
+            }
+            groups[steps] = Some(seconds);
+            Ok(Some(seconds))
+        };
+        let mut seconds = |chunks: usize, places: usize| {
+            match crate::planning::grouped(chunks, places, |steps| -> Result<f64, Option<DomainError>> { group(steps).map_err(Some)?.ok_or(None) }) {
+                Ok(seconds) => Ok(Some(seconds)),
+                Err(None) => Ok(None),
+                Err(Some(error)) => Err(error),
+            }
+        };
+        let wait = self.pace.borrow().wait_bound();
+        let mut most = held;
+        for places in held + 1..=chunks {
+            let over = match wait {
+                Some(wait) => seconds(places, places)?.is_some_and(|group| group > wait),
+                None => false,
+            };
+            if over {
+                break;
+            }
+            most = places;
+        }
+        (held..=most).map(|places| Ok(seconds(chunks, places)?.unwrap_or(0.))).collect()
     }
 
     /// What prices a prompt group's seconds now ([`GroupSource`]).

@@ -620,7 +620,9 @@ pub fn assess_execution_fit(
 /// layers decode in their streamed form ([`decode_demand`]), each on
 /// `costs` under `resident`'s lookahead, which the two share; a decode step
 /// within the decode row classes, a prefill launch beyond
-/// ([`launch_seconds`]).
+/// ([`launch_seconds`]). Each launch is priced once: the step is a function
+/// of its rows and depth alone, so a launch priced again reads what it
+/// priced the first time.
 pub fn decode_step(
     definition: &ModelDefinition,
     resident: &ExecutionPlanDraft,
@@ -629,10 +631,16 @@ pub fn decode_step(
 ) -> Result<Box<crate::DecodeStep>, AssessmentError> {
     let (whole, streamed) = (decode_demand(definition, resident)?, decode_demand(definition, banked)?);
     let lookahead = decode_pricing(resident, &costs).lookahead;
+    let priced = std::cell::RefCell::new(std::collections::HashMap::new());
     Ok(Box::new(move |rows, depth| {
+        if let Some(&seconds) = priced.borrow().get(&(rows, depth)) {
+            return Ok(seconds);
+        }
         let pricing = Pricing { costs: &costs, lookahead };
         let launch = |demand| launch_seconds(demand, &pricing, u64::from(rows), depth).map(|launch| launch.total());
-        Ok(super::FormSeconds { resident: launch(&whole)?, streamed: launch(&streamed)? })
+        let seconds = super::FormSeconds { resident: launch(&whole)?, streamed: launch(&streamed)? };
+        priced.borrow_mut().insert((rows, depth), seconds);
+        Ok(seconds)
     }))
 }
 
