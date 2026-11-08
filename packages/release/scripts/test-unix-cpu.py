@@ -93,8 +93,9 @@ with (root / 'server.log').open('w') as log:
         record('health', health)
         hardware = request('/api/v1/hardware')
         assert hardware['native_build'] == metadata['nativeBuild']
-        devices = [device for domain in hardware['memory_domains'] for device in domain['devices']]
-        assert any(device['backend'] == 'cpu' and 'unavailable_reason' not in device for device in devices), hardware
+        executors = [executor for device in hardware['physical_devices'] for executor in device['executors']]
+        assert any(executor['backend'] == 'cpu' and executor['availability']['type'] == 'available'
+                   for executor in executors), hardware
         record('hardware-identity', hardware)
         catalog_model = request(catalog_path)
         assert catalog_model['id'] == model
@@ -127,7 +128,7 @@ with (root / 'server.log').open('w') as log:
         record('catalog-installed', installed)
         # Independently check the content-addressed bytes fetched by the product downloader.
         blobs = sorted(blob for blob in (root / 'models' / 'hub').glob('models--*/blobs/lfs-sha256-*') if blob.suffix != '.integrity')
-        assert len(blobs) == 2, 'Catalog target and its required draft or projector must both be installed'
+        assert len(blobs) >= 2, 'Catalog target and its required drafter or projector must all be installed'
         integrity = []
         for blob in blobs:
             assert not blob.name.endswith('.incomplete'), blob
@@ -198,6 +199,7 @@ with (root / 'server.log').open('w') as log:
         # The fixture owns this entire group, including any workers left after parent exit.
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # macOS refuses with EPERM, not ESRCH, once only exited members remain.
             pass
         (root / 'cleanup.json').write_text(json.dumps({'parentPid': process.pid, 'returncode': process.returncode}))

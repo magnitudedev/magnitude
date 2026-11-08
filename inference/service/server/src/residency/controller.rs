@@ -388,16 +388,11 @@ impl CatalogPackageRemover for ModelInstances {
                 .acquire_package_removal(package_ids.clone())
                 .await?;
             self.environment.configurations.evict_packages(&package_ids);
-            let mut reclaimed_bytes = 0_u64;
-            for package_id in package_ids {
-                reclaimed_bytes = reclaimed_bytes.saturating_add(
-                    self.environment
-                        .models
-                        .remove_installed(&package_id)
-                        .await?
-                        .freed_bytes,
-                );
-            }
+            let reclaimed_bytes = self
+                .environment
+                .models
+                .remove_installed_packages(&package_ids)
+                .await?;
             drop(permit);
             Ok(reclaimed_bytes)
         })

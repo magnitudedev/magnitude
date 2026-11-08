@@ -16,19 +16,6 @@ export const fitNotice = (model: AssessedModel): string | null => {
   return null
 }
 
-/**
- * The context a fitting model is served at, when this computer has memory for less than the
- * model's own: "64K of 256K context".
- */
-export const servedContextNote = (model: AssessedModel): string | null => {
-  const serving = model.servingState
-  if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") return null
-  const { served, profile } = serving.assessment
-  return served.contextLength < profile.contextLength
-    ? `${formatContext(served.contextLength)} of ${formatContext(profile.contextLength)} context`
-    : null
-}
-
 /** Why the model cannot be loaded at all: an assessment that it does not fit this computer, or can't run. */
 export const loadRefusal = (model: AssessedModel): string | null =>
   model.servingState._tag === "Assessed" && model.servingState.assessment._tag !== "Fits" ? fitNotice(model) : null

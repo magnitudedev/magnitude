@@ -79,7 +79,8 @@ const noLoginEnv: ReadonlyArray<readonly [ReadonlyArray<string>, string]> = [
  * Claude Code assumes 200K tokens for a model ID it doesn't recognize, so it would run a local model
  * served at a smaller context past that context before compacting. For an ID outside its own
  * `claude-` names this variable declares the window instead; the connection writes the served
- * context of the Magnitude model Claude Code is set to.
+ * context of the Magnitude model Claude Code is set to, or with none set, the smallest any Magnitude
+ * model is served at, since `--model` may pick any of them.
  */
 const CONTEXT_WINDOW_ENV = ["env", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"] as const
 
@@ -88,10 +89,16 @@ const contextWindowValue = (window: number) => String(window)
 const ownedContextWindows = (models: ReadonlyArray<HarnessModel>) =>
   models.map((model) => [CONTEXT_WINDOW_ENV, contextWindowValue(model.contextWindow)] as const)
 
-const selectedContextWindow = (models: ReadonlyArray<HarnessModel>, selected: Option.Option<string>) =>
-  Option.flatMap(selected, (id) => Option.fromNullable(models.find((model) => model.id === id))).pipe(
-    Option.map((model) => contextWindowValue(model.contextWindow)),
-  )
+const declaredContextWindow = (models: ReadonlyArray<HarnessModel>, selected: Option.Option<string>) =>
+  Option.match(selected, {
+    onNone: () => models.length === 0
+      ? Option.none<number>()
+      : Option.some(Math.min(...models.map((model) => model.contextWindow))),
+    onSome: (id) => Option.map(
+      Option.fromNullable(models.find((model) => model.id === id)),
+      (model) => model.contextWindow,
+    ),
+  }).pipe(Option.map(contextWindowValue))
 
 export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl = ANTHROPIC_BASE_URL) => defineConnector({
   id: "claude-code",
@@ -112,7 +119,7 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl =
     ]
     if (!loggedIn) changes.push(...noLoginEnv)
     if (Option.isSome(spec.model)) changes.push([["model"], anthropicLocalModelId(spec.model.value)])
-    const window = selectedContextWindow(spec.models, Option.orElse(
+    const window = declaredContextWindow(spec.models, Option.orElse(
       spec.model,
       () => magnitudeSelection(previous, LOCAL_ANTHROPIC_MODEL_PREFIX),
     ))

@@ -69,6 +69,7 @@ import {
   plural,
   findModel,
   modelContext,
+  doesNotFitLabel,
   memoryBreakdownFields,
   modelMemoryBytes,
   modelMemory,
@@ -180,7 +181,7 @@ export const drafterUpdateAvailable = (model: LocalModel): boolean =>
 
 const readyStatus = (model: LocalModel): string => Option.getOrElse(
   Option.orElse(unsupportedAssessmentReason(model).pipe(Option.map((reason) => `Can't run - ${reason}`)),
-    () => drafterTransferStatus(model)),
+    () => Option.orElse(doesNotFitLabel(model), () => drafterTransferStatus(model))),
   () => residencyLabel(model))
 
 const withUpdate = (model: LocalModel): string => {
@@ -451,6 +452,7 @@ export const renderModelDetail = (view: ModelDetailView): string => {
       ...catalogComponentFields(model),
       ...(localModelIsInstalled(model) ? [["Runtime", residencyLabel(model)]] as const : []),
       ...Option.match(localModelAllocation(model), { onNone: () => [], onSome: (allocation) => [promptGroupPlacesFact(allocation)] }),
+      ...Option.match(doesNotFitLabel(model), { onNone: () => [], onSome: (label) => [["Fit", label]] as const }),
       ...(modelMemoryBytes(model) === undefined ? [] : [["Memory", modelMemory(model)]] as const),
       ...localModelExpertFacts(model, view.hardware),
       ...memoryBreakdownFields(model),

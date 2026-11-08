@@ -123,13 +123,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Operation::Head { form, .. } => *form,
             _ => unreachable!("validated head group"),
         };
+        let shape = operations[0].draft_shape();
         if operations.iter().any(|operation| {
-            !matches!(operation, Operation::Head { form: other, proposals, .. }
-                if *other == form && (form != DraftForm::Block || proposals.len() == steps))
+            !matches!(operation, Operation::Head { form: other, .. } if *other == form)
+                || operation.draft_shape() != shape
         }) {
             self.restore_head_advances(&metadata, advances);
             return Err(SubmitFailure::Refused(
-                "head group mixes draft forms or physical block widths".into(),
+                "head group mixes draft forms or draft shapes".into(),
                 bindings,
             ));
         }

@@ -104,11 +104,12 @@ impl AssessmentMemoryBounds {
 /// allocation: the driver objects its device's creation makes where the
 /// usable capacity does not already exclude them, the driver objects of the
 /// native kernels it prepares (Vulkan pipelines; CUDA modules measure
-/// none), and the free space of the blocks its allocations are carved from.
-/// Each is a cost measured on the backend, the kernels' times a count the
-/// plan fixes (`DeviceProcessCosts::of`). A unified device's are part of
-/// its worker's host bytes, which are measured with them, so they are zero
-/// there.
+/// none), and the free space of the blocks its allocations are carved from
+/// that no other allocation can use. Each is a cost measured on the backend,
+/// the kernels' times a count the plan fixes (`DeviceProcessCosts::of`), or
+/// the weights' layout under the backend's block rule. A unified device's
+/// are part of its worker's host bytes, which are measured with them, so
+/// they are zero there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceProcessBytes {
     pub context: u64,
@@ -142,18 +143,24 @@ impl DeviceProcessCosts {
     /// objects beyond the charge grow with the kernels (at most 7.5 MB each
     /// on Windows, 3.5 MB on Linux).
     ///
-    /// The block allocator holds free space beside the charge at every
-    /// moment, the fit depth included; it depends on the order of
-    /// allocations, not on a count the plan fixes. On CUDA, where every
-    /// allocation of more than half the first block takes a block of its own
-    /// (`seismic_compiler::blocks::takes_own_block`), it stays within one
-    /// block cap, which is its cost: replaying the tensors of Nemotron 3.5
-    /// Lightning, Qwen3.8 Flash Next, Qwen3.8 27B and Gemma 4 31B gives
-    /// 0.05–0.78 GB, where doubled blocks shared by expert stacks held up to
-    /// 5.4 GB (measured). On Vulkan,
-    /// whose upload storage has blocks of its own, it reached 1.151 GB on
-    /// both systems, the most measured. Metal and the CPU are unified: their
-    /// kernels and runtime are measured in the worker's host bytes.
+    /// The block allocator holds free space beside the charge; it depends on
+    /// the order of allocations, not on a count the plan fixes. On CUDA every
+    /// block is sized within the room the device account has left, less the
+    /// free space the blocks already hold (`seismic_cuda`'s
+    /// `allocate_within`), and a doubled block that does not fit it holds
+    /// only its allocation, so a shared block's free space is taken only
+    /// from room no charge needs, and the next allocation that fits it goes
+    /// there. The 0.28–1.04 GB measured on roomy devices was such free
+    /// space, not demand: an A10-8Q serving MiniCPM5 2B Q8 at 32K held
+    /// 3.6 GiB at load and 4.5 GiB after a 31K-token request, its context
+    /// and the desktop included, against 5.1 GiB charged with one block cap
+    /// of it. What no allocation can use is the tail of a block an
+    /// allocation holds as its own (`takes_own_block`), which the weights'
+    /// replay gives (`DeviceProcessBytes::derive`), so CUDA's measured cost
+    /// is none. On Vulkan, whose upload storage has blocks the room does not
+    /// bound, it reached 1.151 GB on both systems, the most measured. Metal
+    /// and the CPU are unified: their kernels and runtime are measured in
+    /// the worker's host bytes.
     fn of(backend: BackendName) -> Self {
         match backend {
             BackendName::Metal | BackendName::Cpu => Self {
@@ -164,7 +171,7 @@ impl DeviceProcessCosts {
             BackendName::Cuda => Self {
                 context: 0,
                 per_kernel: 0,
-                slack: CUDA_BLOCK_SLACK,
+                slack: 0,
             },
             BackendName::Vulkan => Self {
                 context: VULKAN_CONTEXT,
@@ -175,7 +182,6 @@ impl DeviceProcessCosts {
     }
 }
 
-const CUDA_BLOCK_SLACK: u64 = seismic::DEVICE_BLOCK_CAP_BYTES;
 const VULKAN_CONTEXT: u64 = 74_000_000;
 const VULKAN_PER_KERNEL: u64 = 7_500_000;
 const VULKAN_BLOCK_SLACK: u64 = 1_151_000_000;
@@ -185,24 +191,25 @@ impl DeviceProcessBytes {
     /// native kernels (`HostProcessBytes::kernels`) and whose weights
     /// allocate `allocations` of the device's memory in order
     /// (`ModelLoadPlan::device_allocations`). The blocks' free space is the
-    /// measured allowance, or what those allocations leave free when
-    /// replayed through the backend's own block rule
-    /// (`seismic::device_block_packing`), whichever is more: a layout whose
-    /// blocks hold more free space than was measured is charged it.
+    /// measured allowance, or what those allocations strand when replayed
+    /// through the backend's own block rule
+    /// (`seismic::device_block_packing`), whichever is more: the tails of
+    /// the blocks an allocation holds as its own, which no later allocation
+    /// can use.
     pub fn derive(
         backend: BackendName,
         kernels: u64,
         allocations: impl IntoIterator<Item = u64>,
     ) -> Result<Self, String> {
         let costs = DeviceProcessCosts::of(backend);
-        let replayed = replayed_block_free_bytes(backend, allocations)?;
+        let stranded = replayed_stranded_bytes(backend, allocations)?;
         Ok(Self {
             context: costs.context,
             programs: costs
                 .per_kernel
                 .checked_mul(kernels)
                 .ok_or("prepared program device bytes overflow")?,
-            slack: costs.slack.max(replayed),
+            slack: costs.slack.max(stranded),
         })
     }
 
@@ -214,9 +221,11 @@ impl DeviceProcessBytes {
     }
 }
 
-/// What `backend`'s blocks leave free holding `allocations`, in order,
-/// placed by its own block rule; 0 where the device's memory is the host's.
-fn replayed_block_free_bytes(
+/// What `backend`'s blocks holding `allocations`, in order, placed by its own
+/// block rule, leave free where no later allocation can use it
+/// (`seismic::DeviceBlockPacking::stranded_bytes`); 0 where the device's
+/// memory is the host's.
+fn replayed_stranded_bytes(
     backend: BackendName,
     allocations: impl IntoIterator<Item = u64>,
 ) -> Result<u64, String> {
@@ -228,7 +237,7 @@ fn replayed_block_free_bytes(
             .allocate(bytes, 1)
             .map_err(|error| error.to_string())?;
     }
-    Ok(packing.free_bytes())
+    Ok(packing.stranded_bytes())
 }
 
 /// What a load's worker holds in host RAM that no planned holding names:

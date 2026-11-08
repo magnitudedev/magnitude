@@ -1342,6 +1342,7 @@ describe("HarnessConnection model-set behavior", () => {
           ANTHROPIC_AUTH_TOKEN: CLAUDE_AUTH_TOKEN_PLACEHOLDER,
           ANTHROPIC_API_KEY: "",
           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "32768",
         },
       })
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toMatchObject({
@@ -2425,6 +2426,36 @@ describe("stale context windows", () => {
       expect(yield* resized.syncStaleConnections).toEqual([claude])
       expect(yield* window()).toBe("65536")
       yield* resized.disconnect(claude)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initialFiles(paths)[paths.claude]!))
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+})
+
+describe("Claude Code without a selected model", () => {
+  it("declares the smallest served context, since --model may pick any Magnitude model", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-claude-smallest-window-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel: Effect.succeed,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(models),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const claude = HarnessIdSchema.make("claude-code")
+      yield* (yield* service).connect(claude, { model: Option.none() })
+      const settings = jsonObject(yield* fs.readFileString(paths.claude))
+      expect(valueAt(settings, ["env", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"])).toBe("32768")
+      yield* (yield* service).disconnect(claude)
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initialFiles(paths)[paths.claude]!))
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })

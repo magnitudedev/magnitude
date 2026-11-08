@@ -3516,3 +3516,34 @@ fn the_supply_reads_the_latest_probe() {
     assert_eq!((short.free, short.owed), (0, GB / 2));
     assert!((short.borrow_price - 2.0 / (10.0 * 4.0 * GB as f64)).abs() < 1e-24);
 }
+
+/// A causal head (entry rows, no proposals) has no selection to pad a
+/// drafting slot with, so it never shares a launch with a drafting head;
+/// chained drafts of unequal widths pad together and do. (Regression: a
+/// concurrent request's catch-up entry joined a peer's draft and failed both
+/// with "a causal head in a drafting batch has no selection".)
+#[test]
+fn causal_heads_launch_apart_from_chained_drafts() {
+    let (domain, _bindings) = fixture_with(None, false, true);
+    let select = SelectSpec {
+        sampling: crate::Sampling::Greedy,
+        seed: 0,
+        position: 0,
+        domain: 0,
+        mask: None,
+        shaping: crate::Shaping::default(),
+        history: None,
+    };
+    let head = |request: u64, proposals: usize| Operation::Head {
+        request: RequestId(request),
+        phase: crate::HeadPhase::Generation,
+        tokens: vec![crate::TokenId(1)],
+        conditioning: crate::FeatureRows::new(vec![0u8; 4].into(), 1).unwrap(),
+        position: 1,
+        proposals: vec![select.clone(); proposals],
+        form: crate::DraftForm::Chained,
+    };
+    assert_ne!(domain.group_key(&head(1, 0)), domain.group_key(&head(2, 2)));
+    assert_eq!(domain.group_key(&head(1, 0)), domain.group_key(&head(2, 0)));
+    assert_eq!(domain.group_key(&head(1, 1)), domain.group_key(&head(2, 3)));
+}

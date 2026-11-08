@@ -82,50 +82,10 @@ impl ModelInventory for ManagedModelStore {
     fn delete(&self, id: &InventoryEntryId) -> BoxFuture<'_, Result<DeletedModel, InventoryError>> {
         let id = id.clone();
         Box::pin(async move {
-            self.ensure_installed_model_inventory().await?;
-            let observed = self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            let lock_path = match (&observed.location, &observed.source) {
-                (
-                    ModelLocation::MagnitudeCache { .. },
-                    ModelSource::HuggingFace { repository, .. },
-                ) => repository_lock_path(&self.config.root, repository),
-                _ => self
-                    .config
-                    .root
-                    .join("locks")
-                    .join(format!("{}.lock", id.0)),
-            };
-            let lock = acquire_delete_lock(&lock_path)?;
-            let model = self
-                .models
-                .read()
-                .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
-            ensure_deletable_status(&model)?;
-            // Magnitude deletes only from its own store. Every other location belongs to the
-            // user or another tool, whatever the request.
-            let ModelLocation::MagnitudeCache { components, .. } = &model.location else {
-                return Err(InventoryError::Unsupported(EXTERNAL_READ_ONLY.to_owned()));
-            };
-            let plan = plan_managed_delete(&self.config.root, &model, components)?;
-            let freed_bytes = delete_managed(&self.config.root, &model, components)?;
-            drop(lock);
-            self.remove_published_model(&id).await?;
-            Ok(DeletedModel {
-                id: id.clone(),
-                deleted: true,
-                freed_bytes,
-                retained_shared_bytes: plan.retained_shared_bytes,
-                plan,
-            })
+            self.delete_entries(std::slice::from_ref(&id))
+                .await?
+                .pop()
+                .ok_or_else(|| InventoryError::NotFound(id.0.clone()))
         })
     }
 
@@ -317,6 +277,115 @@ fn invalid_split_layout(role: &magnitude_service_contracts::ComponentRole) -> In
         code: "invalid_split_layout".to_owned(),
         message: format!("the {role:?} GGUF shard layout is invalid").to_ascii_lowercase(),
         retryable: false,
+    }
+}
+
+/// A file of a Magnitude snapshot: its repository, commit and path within the snapshot.
+type SnapshotFile = (String, String, PathBuf);
+
+impl ManagedModelStore {
+    /// Deletes Magnitude's copies of `ids` as one removal. A snapshot file stays while a model
+    /// outside `ids` is served from it (a variant's target holding the projector its sibling
+    /// variant shares); a file several of `ids` hold goes with the first of them.
+    pub(crate) async fn delete_entries(
+        &self,
+        ids: &[InventoryEntryId],
+    ) -> Result<Vec<DeletedModel>, InventoryError> {
+        self.ensure_installed_model_inventory().await?;
+        let removing = ids.iter().collect::<BTreeSet<_>>();
+        let in_use = self
+            .models
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .values()
+            .filter(|model| !removing.contains(&model.id))
+            .flat_map(|model| snapshot_files(model).into_iter().map(|(file, _)| file))
+            .collect::<BTreeSet<_>>();
+        let mut deleted_files = BTreeSet::new();
+        let mut deleted = Vec::new();
+        for id in ids {
+            deleted.push(self.delete_entry(id, &in_use, &mut deleted_files).await?);
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_entry(
+        &self,
+        id: &InventoryEntryId,
+        in_use: &BTreeSet<SnapshotFile>,
+        deleted_files: &mut BTreeSet<SnapshotFile>,
+    ) -> Result<DeletedModel, InventoryError> {
+        let observed = self
+            .models
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+        let lock_path = match (&observed.location, &observed.source) {
+            (
+                ModelLocation::MagnitudeCache { .. },
+                ModelSource::HuggingFace { repository, .. },
+            ) => repository_lock_path(&self.config.root, repository),
+            _ => self
+                .config
+                .root
+                .join("locks")
+                .join(format!("{}.lock", id.0)),
+        };
+        let lock = acquire_delete_lock(&lock_path)?;
+        let model = self
+            .models
+            .read()
+            .map_err(|_| InventoryError::Internal("inventory lock poisoned".to_owned()))?
+            .get(id)
+            .cloned()
+            .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
+        ensure_deletable_status(&model)?;
+        // Magnitude deletes only from its own store. Every other location belongs to the
+        // user or another tool, whatever the request.
+        if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
+            return Err(InventoryError::Unsupported(EXTERNAL_READ_ONLY.to_owned()));
+        }
+        let mut shared = Vec::new();
+        let mut owned = Vec::new();
+        for (file, component) in snapshot_files(&model) {
+            if in_use.contains(&file) {
+                shared.push(component.clone());
+            } else if deleted_files.insert(file) {
+                owned.push(component.clone());
+            }
+        }
+        let mut plan = plan_managed_delete(&self.config.root, &model, &owned)?;
+        plan.retained_shared_bytes = shared.iter().fold(plan.retained_shared_bytes, |total, component| {
+            total.saturating_add(component.size_bytes)
+        });
+        let freed_bytes = delete_managed(&self.config.root, &model, &owned)?;
+        drop(lock);
+        self.remove_published_model(id).await?;
+        Ok(DeletedModel {
+            id: id.clone(),
+            deleted: true,
+            freed_bytes,
+            retained_shared_bytes: plan.retained_shared_bytes,
+            plan,
+        })
+    }
+}
+
+/// The snapshot files a Magnitude-stored model is served from, with their components.
+fn snapshot_files(model: &InventoryModel) -> Vec<(SnapshotFile, &magnitude_service_contracts::ModelComponent)> {
+    match (&model.location, &model.source) {
+        (
+            ModelLocation::MagnitudeCache { components, .. },
+            ModelSource::HuggingFace {
+                repository, commit, ..
+            },
+        ) => components
+            .iter()
+            .map(|component| ((repository.clone(), commit.clone(), component.path.clone()), component))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

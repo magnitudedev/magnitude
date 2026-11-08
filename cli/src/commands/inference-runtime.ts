@@ -435,8 +435,9 @@ export const renderHardware = ({ hardware, models }: HardwareView): string => {
       ...(domain.usedBytes === null || domain.freeBytes === null ? [`  ${domain.notice ?? "Current memory usage is unavailable."}`] : [
         `  ${formatMemorySize(domain.usedBytes)} / ${formatMemorySize(domain.totalBytes)} used`,
         ...(Option.isSome(allocation) ? [
-          `  Weights       ${formatMemorySize(domain.fixedBytes ?? 0)}`,
+          `  Weights       ${formatMemorySize(domain.weightsBytes ?? 0)}`,
           `  Context       ${formatMemorySize(domain.kvCacheBytes ?? 0)}`,
+          `  Overhead      ${formatMemorySize(domain.overheadBytes ?? 0)}`,
           `  System & apps ${formatMemorySize(domain.systemAndAppsBytes ?? 0)}`,
         ] : []),
         `  Free          ${formatMemorySize(domain.freeBytes)}`,

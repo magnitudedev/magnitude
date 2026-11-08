@@ -15,7 +15,7 @@ use magnitude_service_contracts::models::{
 use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, HubCacheOwner,
     InventoryError, InventoryModel, InventoryProperties, ModelAvailability, ModelComponent,
-    ModelInventory, ModelLocation, ModelPreviewComponentSource, ModelPreviewSource, ModelSource,
+    ModelLocation, ModelPreviewComponentSource, ModelPreviewSource, ModelSource,
     ResolvedModel,
 };
 use sha2::{Digest, Sha256};
@@ -1480,43 +1480,70 @@ impl InstalledModelPackages for ManagedModelStore {
     ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
         let package_id = package_id.clone();
         Box::pin(async move {
-            // Occurrence ids must come from the same observation that `delete` validates against.
-            self.ensure_installed_model_inventory().await?;
-            let managed_occurrences = self
-                .installed_packages
-                .read()
-                .map_err(|_| {
-                    InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-                })?
-                .records
-                .values()
-                .filter(|record| {
-                    record.installed.package.id == package_id
-                        && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
-                })
-                .map(|record| record.model.id.clone())
-                .collect::<Vec<_>>();
-            if managed_occurrences.is_empty() {
-                return Err(InventoryError::NotFound(package_id.0));
-            }
-            let mut removed = false;
-            let mut freed_bytes = 0_u64;
-            for inventory_entry_id in managed_occurrences {
-                let deleted = <Self as ModelInventory>::delete(self, &inventory_entry_id)
-                    .await
-                    .inspect_err(|error| {
-                        tracing::warn!(package_id = %package_id.0, model_id = %inventory_entry_id.0, %error, "installed model package removal failed");
-                    })?;
-                removed |= deleted.deleted;
-                freed_bytes = freed_bytes.saturating_add(deleted.freed_bytes);
-            }
-            tracing::info!(package_id = %package_id.0, removed, freed_bytes, "removed installed model package");
+            let (removed, freed_bytes) = self
+                .remove_managed_packages(std::slice::from_ref(&package_id))
+                .await?;
             Ok(RemoveInstalledModelPackageResponse {
                 package_id,
                 removed,
                 freed_bytes,
             })
         })
+    }
+
+    fn remove_installed_packages(
+        &self,
+        package_ids: &[ModelPackageId],
+    ) -> BoxFuture<'_, Result<u64, InventoryError>> {
+        let package_ids = package_ids.to_vec();
+        Box::pin(async move {
+            Ok(self.remove_managed_packages(&package_ids).await?.1)
+        })
+    }
+}
+
+impl ManagedModelStore {
+    /// Deletes every Magnitude occurrence of `package_ids` as one removal: whether any was
+    /// deleted, and the bytes freed.
+    async fn remove_managed_packages(
+        &self,
+        package_ids: &[ModelPackageId],
+    ) -> Result<(bool, u64), InventoryError> {
+        // Occurrence ids must come from the same observation that `delete` validates against.
+        self.ensure_installed_model_inventory().await?;
+        let occurrences = {
+            let installed = self.installed_packages.read().map_err(|_| {
+                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
+            })?;
+            let mut occurrences = Vec::new();
+            for package_id in package_ids {
+                let managed = installed
+                    .records
+                    .values()
+                    .filter(|record| {
+                        &record.installed.package.id == package_id
+                            && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
+                    })
+                    .map(|record| record.model.id.clone())
+                    .collect::<Vec<_>>();
+                if managed.is_empty() {
+                    return Err(InventoryError::NotFound(package_id.0.clone()));
+                }
+                occurrences.extend(managed);
+            }
+            occurrences.sort();
+            occurrences.dedup();
+            occurrences
+        };
+        let deleted = self.delete_entries(&occurrences).await.inspect_err(|error| {
+            tracing::warn!(?package_ids, %error, "installed model package removal failed");
+        })?;
+        let removed = deleted.iter().any(|model| model.deleted);
+        let freed_bytes = deleted
+            .iter()
+            .fold(0_u64, |total, model| total.saturating_add(model.freed_bytes));
+        tracing::info!(?package_ids, removed, freed_bytes, "removed installed model packages");
+        Ok((removed, freed_bytes))
     }
 }
 

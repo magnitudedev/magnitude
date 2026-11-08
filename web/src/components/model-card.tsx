@@ -20,7 +20,7 @@ import { ModelFacts } from "./model-facts"
 import { DrafterPickerDialog } from "./drafter-list"
 import { customModelSource } from "./custom-model-details"
 import { removalConfirmation } from "./model-remove-action"
-import { fitNotice, loadRefusal, servedContextNote } from "./model-fit"
+import { fitNotice, loadRefusal } from "./model-fit"
 import { downloadNotice, modelCommandNotice, modelRemovalNotice, ModelLoadNotice } from "./model-error"
 import { acquiring } from "./models-page"
 import { addedModelAwaitingFiles, catalogDrafterOnlyUpdate, modelCanDownload, modelCardDrafter, modelCardStatus, modelSubtitle, modelTransferEstimate, modelUpdateDescription, type StatusTone } from "./model-card-state"
@@ -184,10 +184,9 @@ export function ModelCard({ model, models, page, replacing, hardware, onFindOthe
 
   const memoryUse = localModelMemoryUse(model)
   const memory = model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
-    ? <span className="flex min-w-0 items-center gap-2"><span className="whitespace-nowrap tabular-nums">{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)}</span>
-      {servedContextNote(model) !== null && <span className="whitespace-nowrap text-slate-500" title="This computer has memory for this much of the model's context">{servedContextNote(model)}</span>}
-      {Option.isSome(memoryUse) && <span aria-hidden="true" className="h-1 w-10 shrink-0 xl:w-14 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700"><span className={`block h-full rounded-full ${memoryUse.value > 0.8 ? "bg-orange-500 dark:bg-orange-400" : "bg-slate-400"}`} style={{ width: `${Math.max(4, memoryUse.value * 100)}%` }} /></span>}
+    ? <span className="flex min-w-0 items-center gap-2"><span className="flex shrink-0 items-center gap-1"><span className="whitespace-nowrap tabular-nums">{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)}</span>
       <MemoryBreakdownInfo assessment={model.servingState.assessment} /></span>
+      {Option.isSome(memoryUse) && <span aria-hidden="true" className="h-1 w-10 shrink-0 xl:w-14 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-700"><span className={`block h-full rounded-full ${memoryUse.value > 0.8 ? "bg-orange-500 dark:bg-orange-400" : "bg-slate-400"}`} style={{ width: `${Math.max(4, memoryUse.value * 100)}%` }} /></span>}</span>
     : model.servingState._tag === "Assessed" ? <span className="text-slate-500" title={refusal ?? undefined}>{model.servingState.assessment._tag === "DoesNotFit" ? "Doesn’t fit this machine" : "Unsupported"}</span>
     : model.servingState._tag === "Assessing" && !awaitingFiles ? <span className="text-slate-500">Checking…</span>
     : <span className="text-slate-500">{model.servingState._tag === "Failed" ? "Assessment failed" : "—"}</span>

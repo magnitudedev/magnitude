@@ -2947,14 +2947,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             program_identity: self.lane_identities[lane].clone(),
             executable,
             commitment: operation.commitment(),
-            draft_width: match operation {
-                Operation::Head {
-                    form: crate::DraftForm::Block,
-                    proposals,
-                    ..
-                } => Some(proposals.len()),
-                _ => None,
-            },
+            draft: operation.draft_shape(),
         }
     }
 

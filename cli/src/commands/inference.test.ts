@@ -687,6 +687,18 @@ describe("model status", () => {
     expect(output).toContain(downloading.modelId)
   })
 
+  it("says a downloaded model doesn't fit, with what it lacks at the smallest context, instead of pairing that context's memory with its own", () => {
+    const installed = makeInstalledCatalogModel()
+    if (installed.servingState._tag !== "Assessed") throw new Error("Expected an assessed fixture")
+    const tooLarge = { ...installed, servingState: { ...installed.servingState, assessment: { ...doesNotFitAssessment(), totalRequiredBytes: 11.8e9 } } } as typeof installed
+    const row = renderModelsStatus(statusView({ models: [tooLarge] })).split("\n").find((line) => line.includes(tooLarge.modelId))
+    expect(row).toMatch(/11\.8 GB at 32K\s+—\s+Doesn't fit - needs 8\.6 GB more, even at 32K/)
+    const detail = renderModelDetail({ model: tooLarge, models: [tooLarge], drafters: { _tag: "NotApplicable" }, hidden: false })
+    expect(detail).toMatch(/Fit\s+Doesn't fit - needs 8\.6 GB more, even at 32K/)
+    expect(detail).toMatch(/Memory\s+11\.8 GB at 32K/)
+    expect(detail).not.toMatch(/Context\s/)
+  })
+
   it("lists every visible custom model with its source and a footer for what can't run", () => {
     const output = renderModelsStatus(statusView({
       models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), makeFolderModel()],

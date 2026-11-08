@@ -2193,24 +2193,35 @@ fn worker_host_bytes_are_charged_to_host_ram() {
 }
 
 /// The blocks' free space is charged at the measured allowance unless
-/// the weights, replayed through the backend's block rule, leave more:
-/// expert stacks each in a block of their own leave a granule's tail
-/// each, well within it, but a run of allocations just past a granule
-/// would leave nearly a granule each, beyond it.
+/// the weights, replayed through the backend's block rule, strand more:
+/// expert stacks each in a block of their own strand a granule's tail
+/// each, and a run of allocations just past a granule nearly a granule
+/// each. A small model's tensors sharing doubled blocks strand nothing:
+/// the tail of its last block is where its state and workspace go, so
+/// CUDA charges none of it.
 #[test]
-fn block_free_space_is_the_allowance_or_the_replayed_layout_whichever_is_more() {
+fn block_free_space_is_the_allowance_or_the_stranded_tails_whichever_is_more() {
     let mib = 1u64 << 20;
     let stacks = std::iter::repeat_n(343 * mib + mib / 2, 46);
-    let replayed = replayed_block_free_bytes(BackendName::Cuda, stacks).unwrap();
-    assert_eq!(replayed, 46 * (mib / 2));
-    assert!(replayed < CUDA_BLOCK_SLACK);
-    let stranded = std::iter::repeat_n(33 * mib + 1, 2_000);
-    let replayed = replayed_block_free_bytes(BackendName::Cuda, stranded).unwrap();
-    assert_eq!(replayed, 2_000 * (mib - 1));
-    assert!(replayed > CUDA_BLOCK_SLACK);
+    let stranded = replayed_stranded_bytes(BackendName::Cuda, stacks).unwrap();
+    assert_eq!(stranded, 46 * (mib / 2));
+    let granules = std::iter::repeat_n(33 * mib + 1, 2_000);
+    let stranded = replayed_stranded_bytes(BackendName::Cuda, granules).unwrap();
+    assert_eq!(stranded, 2_000 * (mib - 1));
+    // 1.2 GB of 14 MiB matrices fill 64, 128, 256 and 512 MiB blocks
+    // and leave most of a fifth, 1 GiB, block free.
+    let small = std::iter::repeat_n(14 * mib, 80);
+    let mut packing = seismic::device_block_packing(BackendName::Cuda).unwrap();
+    for bytes in small.clone() {
+        packing.allocate(bytes, 1).unwrap();
+    }
+    assert!(packing.free_bytes() > 800 * mib);
+    assert_eq!(replayed_stranded_bytes(BackendName::Cuda, small).unwrap(), 0);
+    let weights = DeviceProcessBytes::derive(BackendName::Cuda, 40, []).unwrap();
+    assert_eq!(weights.bytes().unwrap(), 0);
     for unified in [BackendName::Cpu, BackendName::Metal] {
         assert_eq!(
-            replayed_block_free_bytes(unified, std::iter::repeat_n(33 * mib + 1, 2_000)).unwrap(),
+            replayed_stranded_bytes(unified, std::iter::repeat_n(33 * mib + 1, 2_000)).unwrap(),
             0
         );
     }
@@ -2246,11 +2257,11 @@ fn worker_device_bytes_price_the_context_and_kernels() {
         let device = DeviceProcessBytes::derive(unified, 40, []).unwrap();
         assert_eq!(device.bytes().unwrap(), 0);
     }
-    // A CUDA context is outside the usable capacity; a dedicated
-    // device's block allocator holds free space whatever the model.
+    // A CUDA context is outside the usable capacity, and its blocks'
+    // free space beyond the weights' stranded tails is taken from room
+    // no charge needs.
     let cuda = DeviceProcessBytes::derive(BackendName::Cuda, 40, []).unwrap();
-    assert_eq!(cuda.context, 0);
-    assert!(cuda.slack > 0);
+    assert_eq!(cuda.bytes().unwrap(), 0);
     let vulkan = DeviceProcessBytes::derive(BackendName::Vulkan, 40, []).unwrap();
     assert!(vulkan.context > 0 && vulkan.programs > 0 && vulkan.slack > 0);
     assert!(DeviceProcessBytes::derive(BackendName::Vulkan, u64::MAX, []).is_err());

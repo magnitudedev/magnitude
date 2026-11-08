@@ -331,6 +331,17 @@ pub enum DraftForm {
     Block,
 }
 
+/// The draft passes every slot of one head launch shares. A causal head
+/// drafts nothing, so it has no selection to pad a drafting slot with;
+/// chained drafts pad to the longest; a block's width is physical, so
+/// unequal blocks cannot be padded together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DraftShape {
+    Causal,
+    Chained,
+    Block(usize),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExecutableKind {
     Target,
@@ -349,8 +360,7 @@ pub struct GroupKey {
     pub program_identity: ProgramIdentity,
     pub executable: ExecutableKind,
     pub commitment: CommittedClass,
-    /// Physical block width; unequal noncausal blocks cannot be padded together.
-    pub draft_width: Option<usize>,
+    pub draft: Option<DraftShape>,
 }
 
 impl Operation {
@@ -407,6 +417,22 @@ impl Operation {
             Self::Forward { committed, .. } => *committed,
             Self::Head { tokens, .. } => tokens.len(),
             Self::Encode { .. } => self.row_count(),
+        }
+    }
+
+    pub fn draft_shape(&self) -> Option<DraftShape> {
+        match self {
+            Self::Head { proposals, .. } if proposals.is_empty() => Some(DraftShape::Causal),
+            Self::Head {
+                form: DraftForm::Chained,
+                ..
+            } => Some(DraftShape::Chained),
+            Self::Head {
+                form: DraftForm::Block,
+                proposals,
+                ..
+            } => Some(DraftShape::Block(proposals.len())),
+            Self::Forward { .. } | Self::Encode { .. } => None,
         }
     }
 
