@@ -232,17 +232,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// one was timed, the bank's slots in what their shrink's moves take
     /// the device, a step moving at most a record of each group
     /// (`MoveLines`). None without a bank.
-    fn bank_heap(&self, decode_steps_per_s: f64, reach: Reaches) -> Result<Vec<(BankCurve, Curve<Holding>)>, DomainError> {
+    fn bank_heap(&self, price: Option<&crate::assessment::DecodePrice>, decode_steps_per_s: f64, reach: Reaches) -> Result<Vec<(BankCurve, Curve<Holding>)>, DomainError> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(Vec::new());
         };
-        let price = self.decode_price()?;
         let held = &self.resize_held.last;
         let measures = self.expert_measures();
         let moves = measures.and_then(|measures| measures.moves.measured());
-        let returns = self.slot_returns(price.as_ref())?;
+        let returns = self.slot_returns(price)?;
         Ok(bank
-            .curves(price.as_ref(), reach)?
+            .curves(price, reach)?
             .into_iter()
             .map(|curve| {
                 let slots = curve.holding == BankHolding::Experts && curve.kind == BankTier::Bank;
@@ -278,6 +277,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             _ => 0.,
         }))
+    }
+
+    /// What the process charges `store` now: its own claims there, read
+    /// from the device's ledgers alone (`MemoryProbe::charged_in` without
+    /// the probe's planned holdings, which a settle's room reads apart).
+    fn store_charge(&self, store: seismic::StoreId) -> u64 {
+        self.domain.device().ledgers().own_claims().into_iter().filter(|(of, _)| *of == store).map(|(_, bytes)| bytes).sum()
     }
 
     /// Whether the bank's tiers' storage lies in one store ([`Reaches::shared`]).
@@ -444,7 +450,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// is unpriced: its worth is unknown, not its import seconds. None while
     /// a request is resident: the components are released only idle
     /// (`release_idle_optional_components`).
-    fn optional_holdings(&self, rates: Option<&WorkloadRates>) -> Result<Vec<OptionalHolding>, DomainError> {
+    fn optional_holdings(&self, rates: Option<&WorkloadRates>, price: Option<&crate::assessment::DecodePrice>) -> Result<Vec<OptionalHolding>, DomainError> {
         if !self.optional_idle() {
             return Ok(Vec::new());
         }
@@ -455,7 +461,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let depth = u32::from(self.execution.policy().method().widest());
             let accepted = super::holdings::prior_accepted(depth);
             let step = self.load_costs().map(|costs| &costs.step);
-            let price = self.decode_price()?;
             let held = self.held_slots()?;
             holdings.push(match (rates, read, step, price, held) {
                 (Some(rates), Some(read), Some(step), Some(price), Some(held)) => {
@@ -495,7 +500,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// (`holdings::cheapest`); none with none bound and idle.
     pub fn lowest_optional(&mut self) -> Result<Option<(OptionalComponent, Option<f64>)>, DomainError> {
         let rates = self.serving_rates()?;
-        Ok(super::holdings::cheapest(&self.optional_holdings(rates.as_ref())?))
+        let price = self.decode_price()?;
+        Ok(super::holdings::cheapest(&self.optional_holdings(rates.as_ref(), price.as_ref())?))
     }
 
     /// The room a settle grows into in `store`, which `tiers` lie in
@@ -507,7 +513,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// the Reclaim band, or blind, nothing is free. None before a probe of
     /// the store.
     fn growth_supply(&self, store: seismic::StoreId, tiers: &[BankTier], horizon: Duration) -> Result<Option<Supply>, DomainError> {
-        let Some(mut supply) = self.pace.borrow().supply(store, self.memory_probe().charged_in(store), horizon) else {
+        let Some(mut supply) = self.pace.borrow().supply(store, self.store_charge(store), horizon) else {
             return Ok(None);
         };
         let tier = match tiers.contains(&BankTier::Bank) {
@@ -571,7 +577,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .map(|(store, _)| store)
             .chain(self.store_of(seismic::Contract::DeviceOnly))
             .filter_map(|store| {
-                pace.supply(store, self.memory_probe().charged_in(store), WORKLOAD_SPAN)
+                pace.supply(store, self.store_charge(store), WORKLOAD_SPAN)
                     .map(|supply| (store, supply.free.saturating_add(supply.borrowable), supply.owed))
             })
             .collect::<Vec<_>>();
@@ -625,7 +631,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let device = self.store_of(seismic::Contract::DeviceOnly);
         let mut device_curves = vec![places, super::holdings::prefixes(owner.prefixes.iter().copied())];
         // A settle moves only the components whose worth is known.
-        device_curves.extend(self.optional_holdings(Some(&rates))?.into_iter().filter_map(OptionalHolding::curve));
+        // The decode's price once a settle: every holding's worth is read on it.
+        let price = self.decode_price()?;
+        device_curves.extend(self.optional_holdings(Some(&rates), price.as_ref())?.into_iter().filter_map(OptionalHolding::curve));
         let mut stores = self.bank_stores();
         if let Some(device) = device.filter(|device| !stores.iter().any(|(store, _)| store == device)) {
             stores.push((device, Vec::new()));
@@ -659,7 +667,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         };
         let reach = Reaches { tiers: BankTier::ALL.map(reach), shared: self.tiers_shared() };
-        let bank = self.bank_heap(rates.decode_steps_per_s, reach)?;
+        let bank = self.bank_heap(price.as_ref(), rates.decode_steps_per_s, reach)?;
         let mut settlement = ServingSettlement { places: held, ..ServingSettlement::default() };
         let mut moves = Vec::new();
         for (store, tiers, supply) in supplies {
@@ -731,7 +739,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(None);
         };
         Ok(self
-            .bank_heap(rates.decode_steps_per_s, Reaches { shared: self.tiers_shared(), ..Reaches::every(Reach { held: 1, offered: 0 }) })?
+            .bank_heap(self.decode_price()?.as_ref(), rates.decode_steps_per_s, Reaches { shared: self.tiers_shared(), ..Reaches::every(Reach { held: 1, offered: 0 }) })?
             .iter()
             .filter_map(|(_, heap)| heap.held.first().map(Step::per_byte))
             .min_by(f64::total_cmp))
@@ -855,7 +863,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let (running, free): (Vec<BankTier>, Vec<BankTier>) = asked.into_iter().partition(|&kind| self.resize_held.runs_in(kind));
         let owed = short.iter().map(|&kind| deficit(kind)).max().unwrap_or(1);
-        let bank = self.bank_heap(1., Reaches { shared: self.tiers_shared(), ..Reaches::every(Reach { held: owed, offered: 0 }) })?;
+        let bank = self.bank_heap(self.decode_price()?.as_ref(), 1., Reaches { shared: self.tiers_shared(), ..Reaches::every(Reach { held: owed, offered: 0 }) })?;
         let settles: Vec<(Vec<&(BankCurve, Curve<Holding>)>, u64)> = match short.is_empty() {
             true => vec![(bank.iter().filter(|(curve, _)| free.contains(&curve.kind)).collect(), 1)],
             false => free
