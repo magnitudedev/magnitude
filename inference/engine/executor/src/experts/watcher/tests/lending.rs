@@ -45,7 +45,10 @@ fn a_later_steps_experts_borrow_no_slot_an_earlier_step_converts() {
     harness.publish(&steps[0], 0, &[0, 1, 2]);
     harness.publish(&steps[1], 0, &[3, 4, 5]);
     let first = harness.rounds_checked(&steps[0], 0).concat();
-    assert_eq!(Harness::from_slots(&first), [(0, 3), (1, 4), (2, 5)]);
+    // Each expert's round follows its read's landing, in no set order.
+    let mut lent = Harness::from_slots(&first);
+    lent.sort_unstable();
+    assert_eq!(lent, [(0, 3), (1, 4), (2, 5)]);
     let second = harness.rounds_checked(&steps[1], 0).concat();
     assert_eq!(Harness::experts(&second), [3, 4, 5]);
     // Step 1 converts each of 3 to 5 into its own slot once step 0's
