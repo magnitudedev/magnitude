@@ -856,19 +856,19 @@ fn no_decode_step_records_a_graph() {
     decode_steps_record_no_graph(&catalog, cuda);
 }
 
-/// [`no_decode_step_records_a_graph`]'s release and shrink paths on Metal:
-/// Reclaim's surplus rung releases a prompt group's class and a whole bank
-/// shrinks, with decode steps of every class around them. A Metal schedule
-/// holds no device memory and records nothing the replays count
-/// (`GraphCost::None`), so its recordings are none by construction; what it
-/// asserts is that both paths are driven, never skipped.
+/// [`no_decode_step_records_a_graph`] on Metal, run by default on every
+/// Mac: a Metal schedule holds no device memory (`GraphCost::None`), so
+/// every family's graph charge is none, and `record_decode` pins nothing
+/// there, so no decode step may record a graph either: of one request,
+/// eight and four, across Reclaim's surplus release and a bank shrink's
+/// step. It fails once Metal charges or records graphs without the pins.
+#[cfg(target_os = "macos")]
 #[test]
-#[ignore = "needs a Metal device: run with --ignored on one"]
 fn no_decode_step_records_a_graph_on_metal() {
     let _placement = crate::test_support::process_placement();
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let metal = seismic::BackendName::Metal;
-    assert!(available(&catalog, metal), "the test runs on a host with a Metal device");
+    assert!(available(&catalog, metal), "a Mac has a Metal device");
     decode_steps_record_no_graph(&catalog, metal);
 }
 
@@ -959,6 +959,9 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
     // places, which Reclaim's surplus rung releases to one.
     {
         let (mut domain, bindings, _, _) = load(catalog, &definition, &package, backend, DecodeSteps::limits(2), Banked::Resident);
+        if backend == seismic::BackendName::Metal {
+            assert_eq!(domain.device().graph_cost(), seismic::GraphCost::None, "Metal charges no family for its graphs");
+        }
         let (mut steps, mut bindings) = DecodeSteps::open(&mut domain, bindings, 2, backend);
         assert_eq!(domain.group_places().get(), 2, "{backend:?}: the chain grew the prompt group's class");
         bindings = steps.step(&mut domain, bindings, 1, "the first of one request", backend);
