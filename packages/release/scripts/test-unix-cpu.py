@@ -199,6 +199,7 @@ with (root / 'server.log').open('w') as log:
         # The fixture owns this entire group, including any workers left after parent exit.
         try:
             os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
+            # macOS refuses with EPERM, not ESRCH, once only exited members remain.
             pass
         (root / 'cleanup.json').write_text(json.dumps({'parentPid': process.pid, 'returncode': process.returncode}))
