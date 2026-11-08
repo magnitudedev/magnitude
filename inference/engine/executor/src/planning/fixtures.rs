@@ -136,6 +136,76 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
     }
 }
 
+/// `definition` with an MTP head of its own history, stored in the target
+/// component: its first block (attention, dense) under head names, between
+/// the head's own norms and combine, reading out through the target's
+/// vocabulary projection and chaining its output.
+#[cfg(test)]
+pub(crate) fn with_mtp_head(mut definition: ModelDefinition) -> ModelDefinition {
+    use magnitude_family_contracts::{
+        Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout,
+        VocabularyProjection,
+    };
+    let hidden = definition.decoder.hidden;
+    let named = |name: &str, shape: &[u64]| descriptor(&format!("head_{name}"), shape);
+    let rms = |name: &str| RmsNorm {
+        weight: named(name, &[hidden]),
+        epsilon: 1e-6,
+    };
+    let mut head_layer = definition.decoder.blocks[0].clone();
+    let rename = |weight: &mut WeightDescriptor| weight.name = format!("head_{}", weight.name);
+    for sublayer in &mut head_layer.sublayers {
+        if let InputNorm::Rms(norm) = &mut sublayer.input {
+            rename(&mut norm.weight);
+        }
+        match &mut sublayer.op {
+            Operator::Attention(attention) => {
+                rename(&mut attention.query);
+                rename(&mut attention.output);
+                if let HeadNorm::Rms(norm) = &mut attention.query_norm {
+                    rename(&mut norm.weight);
+                }
+                if let KeyValue::Owned {
+                    key,
+                    value: ValueSource::Projected(value),
+                    key_norm: HeadNorm::Rms(key_norm),
+                    ..
+                } = &mut attention.key_value
+                {
+                    rename(key);
+                    rename(value);
+                    rename(&mut key_norm.weight);
+                }
+            }
+            Operator::DenseFfn(dense) => {
+                if let FeedForwardUp::Gated { gate, up, .. } = &mut dense.up {
+                    rename(gate);
+                    rename(up);
+                }
+                rename(&mut dense.down);
+            }
+            _ => unreachable!("the fixture's first block is attention then dense"),
+        }
+    }
+    definition.head = Some(Head {
+        blocks: vec![HeadBlock {
+            residual: ResidualForm::Single,
+            input: HeadInput::Combine {
+                embedding_norm: rms("embedding_norm"),
+                hidden_norm: rms("hidden_norm"),
+                combine: named("combine", &[hidden, 2 * hidden]),
+            },
+            blocks: vec![head_layer],
+            output_norm: ExitNorm::Rms(rms("output_norm")),
+            readout: HeadReadout::full(VocabularyProjection::Target),
+            chain: HeadChain::Output,
+        }],
+        history: HeadHistory::Own,
+        component: HeadComponent::Target,
+    });
+    definition
+}
+
 pub(crate) fn fixture_manifest(definition: &ModelDefinition) -> PackageManifest {
     let decoder = &definition.decoder;
     let head = definition.head.as_ref().map_or_else(Vec::new, |head| {

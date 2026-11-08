@@ -263,77 +263,16 @@ fn checked_decoder_family_bounds_every_prepared_class_axis() {
 fn checked_head_family_includes_chained_and_shaped_classes() {
     use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
     use magnitude_family_contracts::{
-        ActivationFunction, ExitNorm, ExpertSelection, FeedForwardUp, Head, HeadBlock,
-        HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, InputNorm, Operator,
-        RmsNorm, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
-        SharedExpert, SharedExpertGate, VocabularyProjection, WeightDescriptor,
+        ActivationFunction, ExitNorm, ExpertSelection, FeedForwardUp, HeadChain, HeadInput,
+        InputNorm, Operator, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
+        SharedExpert, SharedExpertGate, WeightDescriptor,
     };
 
     // At the width every backend's mix sites admit: the test later puts
     // the hyper-connection fixture's decoder under the same head.
     let hidden = crate::planning::fixtures::mix_site_hidden();
-    let mut definition = crate::planning::fixtures::fixture_definition_of(hidden);
-    let descriptor =
-        |name: &str, shape: &[u64]| WeightDescriptor::stored(format!("head_{name}"), shape);
-    let rms = |name: &str| RmsNorm {
-        weight: descriptor(name, &[hidden]),
-        epsilon: 1e-6,
-    };
-    // The head block is the target block (attention, dense) under head
-    // names, between its own norms and combine.
-    let mut head_layer = definition.decoder.blocks[0].clone();
-    let rename = |weight: &mut WeightDescriptor| weight.name = format!("head_{}", weight.name);
-    for sublayer in &mut head_layer.sublayers {
-        if let InputNorm::Rms(norm) = &mut sublayer.input {
-            rename(&mut norm.weight);
-        }
-        match &mut sublayer.op {
-            Operator::Attention(attention) => {
-                rename(&mut attention.query);
-                rename(&mut attention.output);
-                if let magnitude_family_contracts::HeadNorm::Rms(norm) =
-                    &mut attention.query_norm
-                {
-                    rename(&mut norm.weight);
-                }
-                if let magnitude_family_contracts::KeyValue::Owned {
-                    key,
-                    value: magnitude_family_contracts::ValueSource::Projected(value),
-                    key_norm: magnitude_family_contracts::HeadNorm::Rms(key_norm),
-                    ..
-                } = &mut attention.key_value
-                {
-                    rename(key);
-                    rename(value);
-                    rename(&mut key_norm.weight);
-                }
-            }
-            Operator::DenseFfn(dense) => {
-                if let FeedForwardUp::Gated { gate, up, .. } = &mut dense.up {
-                    rename(gate);
-                    rename(up);
-                }
-                rename(&mut dense.down);
-            }
-            _ => unreachable!(),
-        }
-    }
-    definition.head = Some(Head {
-        blocks: vec![HeadBlock {
-            residual: magnitude_family_contracts::ResidualForm::Single,
-            input: HeadInput::Combine {
-                embedding_norm: rms("embedding_norm"),
-                hidden_norm: rms("hidden_norm"),
-                combine: descriptor("combine", &[hidden, 2 * hidden]),
-            },
-            blocks: vec![head_layer],
-            output_norm: ExitNorm::Rms(rms("output_norm")),
-            readout: HeadReadout::full(VocabularyProjection::Target),
-            chain: HeadChain::Output,
-        }],
-        history: HeadHistory::Own,
-        component: HeadComponent::Target,
-    });
+    let mut definition =
+        crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition_of(hidden));
     let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
     let mut offset = manifest.target.files[0].size;
     let load = ModelLoadPlan::derive(

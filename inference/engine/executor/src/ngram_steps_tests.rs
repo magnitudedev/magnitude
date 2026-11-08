@@ -21,6 +21,7 @@ use magnitude_artifacts::{Package, gguf::Encoding};
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::KvCodec;
 use std::rc::Rc;
+use std::sync::Arc;
 
 /// A GGUF of every tensor `manifest` names (its n-gram tables IQ4_NL
 /// blocks, a streamed load's expert stacks Q8_0 or Q4_0 blocks, everything else
@@ -519,7 +520,7 @@ fn site_answers(
 fn scores(
     catalog: &seismic::Devices,
     definition: &Rc<ModelDefinition>,
-    package: &Package,
+    package: &Arc<Package>,
     backend: seismic::BackendName,
     banked: Banked,
     filled: Filled,
@@ -932,14 +933,7 @@ impl DecodeSteps {
         for position in &mut self.positions[..count] {
             *position += 1;
         }
-        let recorded = domain
-            .family_graph_replays()
-            .into_iter()
-            .zip(before)
-            .map(|((family, after), (_, before))| (family, after.since(before).recorded))
-            .filter(|&(_, graphs)| graphs > 0)
-            .collect();
-        self.recorded.push((step, recorded));
+        self.recorded.push((step, recorded_since(domain, before)));
         bindings
     }
 
@@ -948,6 +942,18 @@ impl DecodeSteps {
         eprintln!("{backend:?}, {context}: graphs recorded by decode steps (step, graphs by family): {:?}", self.recorded);
         assert!(self.recorded.iter().all(|(_, graphs)| graphs.is_empty()), "{backend:?}, {context}: a decode step recorded graphs: {:?}", self.recorded);
     }
+}
+
+/// The graphs each of `domain`'s families recorded since `before`, its
+/// replays then: the families that recorded any.
+fn recorded_since(domain: &ExecutorDomain, before: Vec<(&'static str, seismic::GraphReplays)>) -> Vec<(&'static str, u64)> {
+    domain
+        .family_graph_replays()
+        .into_iter()
+        .zip(before)
+        .map(|((family, after), (_, before))| (family, after.since(before).recorded))
+        .filter(|&(_, graphs)| graphs > 0)
+        .collect()
 }
 
 fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::BackendName) {
@@ -1000,6 +1006,202 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
         drop(bindings);
     }
     std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+}
+
+/// The drafter's graph families on CUDA, where a graph is replayed again
+/// only once its last run completed (`choose` takes an idle instance), so
+/// two drafter launches of one shape in flight take a graph each: a load of
+/// an MTP head seals each family within what the planner charged for it
+/// (`programs::graph::serial_family` asserts it as the head, readout and
+/// state families seal), and its priming and drafting steps record no graph
+/// beyond those charges. Two passes run the same work, each over two fresh
+/// requests: each request primes its head through a prompt chunk and the
+/// chunk's pipelined successor, two primings in flight, then drafts one
+/// and two proposals, alone and beside the other request. Every graph a
+/// drafter or state-copy step replays is recorded at its shape's first use
+/// and kept within its family's charge, so the second pass records none: a
+/// graph beyond its charge would be released and recorded again. Each
+/// step's recordings, by family, are reported before the verdict.
+#[test]
+#[ignore = "needs a CUDA device: run with --ignored on one"]
+fn drafter_steps_record_no_graph_beyond_their_charge() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let cuda = seismic::BackendName::Cuda;
+    assert!(available(&catalog, cuda), "the test runs on a host with a CUDA device");
+    let mtp = crate::planning::fixtures::with_mtp_head(crate::planning::fixtures::fixture_definition());
+    let (directory, definition, package) = fixture_with("drafter-graphs", mtp, crate::planning::fixtures::fixture_manifest);
+    let method = PlannedMethod::Mtp {
+        greedy_proposals: DrafterSteps::PROPOSALS as u8,
+        sampled_proposals: DrafterSteps::PROPOSALS as u8,
+        widths: crate::DraftWidths::Adaptive,
+    };
+    // Lookahead: a prompt chunk's successor runs behind it, its own drafter
+    // entry behind it.
+    let limits = limits(DrafterSteps::ROWS, true, 1, 0);
+    let (mut domain, mut bindings, _, _) = load_with(&catalog, &definition, &package, cuda, limits, Banked::Resident, method);
+    let row_bytes = definition.decoder.hidden as usize * definition.decoder.activation_dtype.bytes();
+    let mut steps = DrafterSteps { row_bytes, recorded: Vec::new() };
+    for pass in [1, 2] {
+        let first = steps.recorded.len();
+        let requests = [RequestId(2 * pass - 1), RequestId(2 * pass)];
+        let mut positions = Vec::new();
+        for request in requests {
+            let (position, returned) = steps.prime(&mut domain, bindings, request);
+            bindings = returned;
+            positions.push(position);
+        }
+        // Drafts of one and two proposals, of one request and of both.
+        for (count, proposals) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
+            let drafting = requests[..count].iter().copied().zip(positions.iter_mut());
+            bindings = steps.draft(&mut domain, bindings, drafting, proposals);
+        }
+        for request in requests {
+            domain.close(request).unwrap_or_else(|error| panic!("{error}"));
+        }
+        if pass == 2 {
+            steps.assert_none_since(first);
+        }
+    }
+    drop(bindings);
+    drop(domain);
+    std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+}
+
+/// Drafter steps on CUDA, each step's recordings kept by family.
+struct DrafterSteps {
+    /// Bytes of a drafter entry row's conditioning feature.
+    row_bytes: usize,
+    recorded: Vec<(String, Vec<(&'static str, u64)>)>,
+}
+
+impl DrafterSteps {
+    /// Rows of a prompt chunk, the launch row bound.
+    const ROWS: usize = 4;
+    /// The most proposals a draft makes.
+    const PROPOSALS: usize = 2;
+    /// The families a drafter step runs graphs of.
+    const DRAFTING: [&'static str; 2] = ["drafter", "state"];
+
+    /// Keep `step`'s recordings, each family's since `before`.
+    fn keep(&mut self, domain: &ExecutorDomain, before: Vec<(&'static str, seismic::GraphReplays)>, step: String) {
+        self.recorded.push((step, recorded_since(domain, before)));
+    }
+
+    /// Open `request` and prompt it with two chunks, each entering its rows
+    /// to the head behind it: the second is the first's pipelined
+    /// successor, so both entries are in flight at once. Returns the head's
+    /// position after them.
+    fn prime(&mut self, domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, request: RequestId) -> (usize, crate::StateBindings) {
+        let cuda = seismic::BackendName::Cuda;
+        domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+        domain.open_state(&mut bindings, request, None).unwrap();
+        let before = domain.family_graph_replays();
+        domain.plan_successors(vec![Self::primed_chunk(request, 1)]);
+        for chunk in 0..2 {
+            let (_, returned) = run(domain, bindings, Self::primed_chunk(request, chunk), chunk > 0, cuda);
+            bindings = returned;
+        }
+        self.keep(domain, before, format!("{request:?}'s two primed chunks"));
+        // An embedded head's entry pairs each token with the feature of the
+        // row before it, so it trails the target by a row.
+        (2 * Self::ROWS - 1, bindings)
+    }
+
+    /// Prompt chunk `chunk` of two of `request`'s prompt, its features
+    /// demanded and its rows entered to the head behind it as an embedded
+    /// head enters them (`Priming::boundary`); the last selects the first
+    /// token.
+    fn primed_chunk(request: RequestId, chunk: usize) -> Operation {
+        let position = chunk * Self::ROWS;
+        let last = chunk == 1;
+        let tokens = (position..position + Self::ROWS)
+            .map(|row| TokenId((row * 37 + 11 + request.0 as usize * 5) as u32 % 256))
+            .collect::<Vec<_>>();
+        let demand = crate::batching::Demand::FEATURES;
+        Operation::Forward {
+            request,
+            kind: WorkKind::Prefill,
+            prime: Some(crate::Priming {
+                boundary: true,
+                tokens: if position == 0 { tokens[1..].to_vec() } else { tokens.clone() },
+                position: position.saturating_sub(1),
+                draft_from: 2 * Self::ROWS,
+            }),
+            tokens,
+            position,
+            conditioning: None,
+            demand: if last { demand | crate::batching::Demand::SELECT } else { demand },
+            select: last.then(|| Self::greedy(position + Self::ROWS - 1)).into_iter().collect(),
+            committed: Self::ROWS,
+        }
+    }
+
+    fn greedy(position: usize) -> SelectSpec {
+        SelectSpec {
+            sampling: Sampling::Greedy,
+            seed: 0,
+            position,
+            domain: 0,
+            mask: None,
+            shaping: Shaping::default(),
+            history: None,
+        }
+    }
+
+    /// A draft of `proposals` proposals by each of `drafting`, its request
+    /// and its head's position, which the draft's entry row advances.
+    fn draft<'p>(
+        &mut self,
+        domain: &mut ExecutorDomain,
+        mut bindings: crate::StateBindings,
+        drafting: impl Iterator<Item = (RequestId, &'p mut usize)>,
+        proposals: usize,
+    ) -> crate::StateBindings {
+        assert!(proposals <= Self::PROPOSALS, "a draft makes at most the method's proposals");
+        let mut drafted = Vec::new();
+        let operations = drafting
+            .map(|(request, position)| {
+                let at = *position;
+                *position += 1;
+                drafted.push(request);
+                Operation::Head {
+                    request,
+                    phase: crate::HeadPhase::Generation,
+                    tokens: vec![TokenId((at * 13 % 256) as u32)],
+                    conditioning: crate::FeatureRows::new(vec![0; self.row_bytes].into(), 1).unwrap(),
+                    position: at,
+                    proposals: (1..=proposals).map(|step| Self::greedy(at + step)).collect(),
+                    form: crate::DraftForm::Chained,
+                }
+            })
+            .collect::<Vec<_>>();
+        let before = domain.family_graph_replays();
+        let reserved = domain.reserve(&mut bindings, &operations).unwrap_or_else(|error| panic!("{error}")).into_resources();
+        let ReservedResources::Head(workspace, output, advances) = reserved else {
+            panic!("a draft reserves the head lane");
+        };
+        let flight = domain
+            .submit_head(bindings, &operations, workspace, output, advances)
+            .unwrap_or_else(|failure| panic!("{}", failure.error()));
+        let (pendings, bindings) = domain.finish_head(flight).unwrap_or_else(|error| panic!("{error}"));
+        for pending in pendings {
+            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap_or_else(|error| panic!("{error}"));
+        }
+        self.keep(domain, before, format!("a draft of {proposals} proposals by {drafted:?}"));
+        bindings
+    }
+
+    /// The verdict: no drafting family recorded a graph in the steps from
+    /// `first` on.
+    fn assert_none_since(&self, first: usize) {
+        eprintln!("graphs recorded by drafter steps (step, graphs by family): {:?}", self.recorded);
+        let beyond = self.recorded[first..]
+            .iter()
+            .filter(|(_, graphs)| graphs.iter().any(|(family, _)| Self::DRAFTING.contains(family)))
+            .collect::<Vec<_>>();
+        assert!(beyond.is_empty(), "drafter steps recorded graphs again, beyond their families' charges: {beyond:?}");
+    }
 }
 
 /// The last routed layer's expert stacks stored as Q4_0, the rest as
@@ -1094,7 +1296,7 @@ fn shrunk_bank_scores_as_resident(
 
 /// The fixture decoder written as a GGUF in a fresh directory named for
 /// `test`, and its definition naming the written artifact.
-fn fixture(test: &str) -> (std::path::PathBuf, Rc<ModelDefinition>, Package) {
+fn fixture(test: &str) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
     fixture_of(test, stored_table_manifest)
 }
 
@@ -1102,7 +1304,7 @@ fn fixture(test: &str) -> (std::path::PathBuf, Rc<ModelDefinition>, Package) {
 fn fixture_of(
     test: &str,
     manifest: fn(&ModelDefinition) -> magnitude_artifacts::PackageManifest,
-) -> (std::path::PathBuf, Rc<ModelDefinition>, Package) {
+) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
     fixture_with(test, qwen4exp_fixture_definition(), manifest)
 }
 
@@ -1111,7 +1313,7 @@ fn fixture_with(
     test: &str,
     mut definition: ModelDefinition,
     manifest: fn(&ModelDefinition) -> magnitude_artifacts::PackageManifest,
-) -> (std::path::PathBuf, Rc<ModelDefinition>, Package) {
+) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
     let directory = std::env::temp_dir().join(format!(
         "magnitude-{test}-{}-{}",
         std::process::id(),
@@ -1125,7 +1327,7 @@ fn fixture_with(
     write_gguf(&manifest(&definition), &path);
     let package = Package::open_without_projector(&path).unwrap();
     definition.artifact_identity = package.manifest().identity;
-    (directory, Rc::new(definition), package)
+    (directory, Rc::new(definition), Arc::new(package))
 }
 
 /// Rows of one prompt chunk, the launch row bound of the chain test: a
@@ -1212,7 +1414,7 @@ struct Prompts {
 fn chained_prompts(
     catalog: &seismic::Devices,
     definition: &Rc<ModelDefinition>,
-    package: &Package,
+    package: &Arc<Package>,
     backend: seismic::BackendName,
     Prompts { requests, chunks, rows }: Prompts,
     chain_capacity: usize,
@@ -1489,10 +1691,25 @@ enum Banked {
 fn load(
     catalog: &seismic::Devices,
     definition: &Rc<ModelDefinition>,
-    package: &Package,
+    package: &Arc<Package>,
     backend: seismic::BackendName,
     limits: ResourceLimits,
     banked: Banked,
+) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
+    load_with(catalog, definition, package, backend, limits, banked, PlannedMethod::Plain)
+}
+
+/// [`load`] serving `method`: one that drafts binds the definition's drafter
+/// as the engine's load does, its graphs sealed beside the target's and its
+/// state allocated.
+fn load_with(
+    catalog: &seismic::Devices,
+    definition: &Rc<ModelDefinition>,
+    package: &Arc<Package>,
+    backend: seismic::BackendName,
+    limits: ResourceLimits,
+    banked: Banked,
+    method: PlannedMethod,
 ) -> (ExecutorDomain, crate::StateBindings, u64, Pricing) {
     // A hung step reports every owner and every thread's stack on SIGUSR1,
     // as the rig asks a job past its estimate.
@@ -1518,11 +1735,11 @@ fn load(
         &package.manifest(),
         definition,
         ComponentSelection {
-            head: false,
+            head: method.drafts(),
             vision: false,
         },
         ExecutionPath::Native,
-        PlannedMethod::Plain,
+        method,
         KvCodec::Dense,
         limits,
     )
@@ -1596,14 +1813,14 @@ fn load(
             draft.programs(),
             &state,
             limits,
-            PlannedMethod::Plain,
+            method,
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     let resources_plan = ResourcePlanner::plan_with_state(
         state,
         &target_graphs,
         &target_readout_graphs,
-        None,
+        programs.drafter_graphs(),
         None,
         programs.state_graphs().unwrap(),
     )
@@ -1621,7 +1838,7 @@ fn load(
         identity.clone(),
         programs.target_graphs().unwrap(),
         programs.target_readout_graphs().unwrap(),
-        None,
+        programs.drafter_graphs(),
         None,
         programs.state_graphs().unwrap(),
     )
@@ -1637,8 +1854,18 @@ fn load(
     let target = residency
         .load_target(definition, package, Box::new(|_, _| Ok(())))
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+    // As the engine's load does: the drafter is imported from the store that
+    // imported the target, when its first work binds it.
+    let head_loader = match method.drafts() {
+        true => Some(
+            crate::ComponentLoader::head(residency, definition.clone(), package.clone())
+                .unwrap_or_else(|error| panic!("{backend:?}: {error}")),
+        ),
+        false => None,
+    };
     let plan = execution.resources().clone();
     let target_state = plan.allocate_target_state(device.clone()).unwrap();
+    let head_state = plan.head_state().map(|state| state.allocate(device.clone()).unwrap());
     let heap = crate::DeviceHeap::open(
         Rc::new(seismic::Devices::discover(&[]).unwrap()),
         reserves,
@@ -1651,11 +1878,11 @@ fn load(
         heap,
         programs,
         resources,
-        None,
+        head_loader,
         None,
         target,
         target_state,
-        None,
+        head_state,
     )
     .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
     // As a load ends: priced on the costs it waited for, then serving, its
