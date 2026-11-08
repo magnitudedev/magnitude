@@ -1901,7 +1901,43 @@ impl ManagedModelStore {
     }
 }
 
+/// `resolve_package_once`, retried like a component's transfer while its failure is retryable: a
+/// connection dropped while the Hub resolves the revision would otherwise fail the download at once.
 async fn resolve_package(
+    client: &hf_hub::HFClient,
+    token: Option<&str>,
+    owner: &str,
+    name: &str,
+    repository: &str,
+    revision: &str,
+    components: &[ModelComponent],
+    control: &TransferControl,
+) -> Result<(hf_hub::HFRepository<hf_hub::RepoTypeModel>, String), DownloadError> {
+    for attempt in 0..MAX_ATTEMPTS {
+        match resolve_package_once(
+            client, token, owner, name, repository, revision, components, control,
+        )
+        .await
+        {
+            Err(error) if error.retryable() && attempt + 1 < MAX_ATTEMPTS => {
+                tracing::warn!(
+                    repository,
+                    revision,
+                    attempt = attempt + 1,
+                    error = %error,
+                    "resolving the model's revision failed; retrying"
+                );
+                control
+                    .backoff(Duration::from_secs(1_u64 << attempt.min(4)))
+                    .await?;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop returns on its final attempt")
+}
+
+async fn resolve_package_once(
     client: &hf_hub::HFClient,
     token: Option<&str>,
     owner: &str,
@@ -2215,10 +2251,22 @@ async fn resolve_remote_metadata(
     }
 }
 
+/// An error with every cause beneath it, so a log names what failed under a transport's summary.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
     DownloadError {
         kind: DownloadErrorKind::Network,
-        message: error.to_string(),
+        message: error_chain(&error),
         retryable: error.is_timeout() || error.is_connect() || error.is_request(),
         resumable: false,
     }
@@ -2256,7 +2304,7 @@ fn map_hf_error(error: HFError) -> DownloadError {
     };
     DownloadError {
         kind,
-        message: error.to_string(),
+        message: error_chain(&error),
         retryable,
         resumable: retryable,
     }
@@ -2947,6 +2995,30 @@ mod tests {
             &downloading("download_old"),
             "download_old"
         ));
+    }
+
+    #[test]
+    fn an_error_message_names_every_cause_beneath_it() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|cause| cause as &(dyn std::error::Error + 'static))
+            }
+        }
+        let error = Layer(
+            "error sending request",
+            Some(Box::new(Layer("client error (Connect)", Some(Box::new(Layer("connection reset by peer", None)))))),
+        );
+        assert_eq!(
+            error_chain(&error),
+            "error sending request: client error (Connect): connection reset by peer"
+        );
     }
 
     /// Serves one file over HTTP the way the Hub resolve endpoint does. The first `stalled_gets`
