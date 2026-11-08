@@ -318,24 +318,61 @@ pub struct PendingOperationOutcome {
     kind: WorkKind,
     physical_duration: Duration,
     /// Whether its duration is its launches' alone ([`LaunchEpoch`]): no
-    /// graph was recorded, nor any expert bank resize ran, within it.
-    timed: bool,
+    /// graph was recorded, nor any expert bank resize ran or fill began or
+    /// ended, within it; and whether the bank's fill ran beside it.
+    timed: Timed,
     image: Option<ImageRef>,
 }
 
 /// What a launch's duration is its own across: the graphs recorded on the
 /// device, by any load (a recording is paid on the host within the
 /// duration), read from the device's own count at each submission and
-/// finish, and the expert bank's resizes begun (a resize holds the thread
-/// at the boundaries it runs across, and a growth's new slots or a
-/// shrink's evictions change what the launch misses). A launch is timed
-/// only where the epoch at its finish is the one at its submission, none
-/// while a resize runs: a resize changes no launch cost the draft width is
-/// chosen by.
+/// finish, the expert bank's resizes begun (a resize holds the thread at
+/// the boundaries it runs across, and a growth's new slots or a shrink's
+/// evictions change what the launch misses), and its fill's starts and
+/// finishes (`ElasticBank::fill_epoch`). A launch is timed only where the
+/// epoch at its finish is the one at its submission, none while a resize
+/// runs: a resize changes no launch cost the draft width is chosen by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LaunchEpoch {
     graphs: u64,
     resizes: u64,
+    /// None without an elastic bank.
+    fills: Option<u64>,
+}
+
+impl LaunchEpoch {
+    /// Whether the bank's fill ran beside a launch timed across this epoch:
+    /// its count is even while the fill lands experts.
+    fn filling(self) -> bool {
+        self.fills.is_some_and(|fills| fills % 2 == 0)
+    }
+}
+
+/// Whether a launch's duration was its own ([`LaunchEpoch`]), and whether
+/// the expert bank's fill ran beside it then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Timed {
+    Untimed,
+    Settled,
+    Filling,
+}
+
+/// A launch's duration where it was its own ([`LaunchEpoch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaunchDuration {
+    pub duration: Duration,
+    /// Whether the expert bank's fill landed experts beside the launch: it
+    /// missed and read what the fill left, not what the bank settles to, so
+    /// its duration prices the load only until the fill finishes.
+    pub filling: bool,
+}
+
+impl LaunchDuration {
+    /// `duration`, measured with no fill beside it.
+    pub fn settled(duration: Duration) -> Self {
+        Self { duration, filling: false }
+    }
 }
 
 /// The state an outcome publishes when reconciled.
@@ -367,8 +404,13 @@ impl PendingOperationOutcome {
     }
     /// What the launches took, where the duration is theirs alone
     /// ([`LaunchEpoch`]).
-    pub fn launch_duration(&self) -> Option<Duration> {
-        self.timed.then_some(self.physical_duration)
+    pub fn launch_duration(&self) -> Option<LaunchDuration> {
+        let filling = match self.timed {
+            Timed::Untimed => return None,
+            Timed::Settled => false,
+            Timed::Filling => true,
+        };
+        Some(LaunchDuration { duration: self.physical_duration, filling })
     }
 }
 
@@ -947,12 +989,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         (!self.resize_held.runs()).then(|| LaunchEpoch {
             graphs: self.domain.device().graph_replays().recorded,
             resizes: self.resize_held.begun,
+            fills: self.family.expert_bank().map(|bank| bank.fill_epoch()),
         })
     }
 
-    /// Whether a launch submitted at `epoch` finishing now was timed alone.
-    fn timed(&self, epoch: Option<LaunchEpoch>) -> bool {
-        epoch.is_some() && self.launch_epoch() == epoch
+    /// Whether a launch submitted at `epoch` finishing now was timed alone,
+    /// and whether the bank's fill ran beside it.
+    fn timed(&self, epoch: Option<LaunchEpoch>) -> Timed {
+        match epoch {
+            Some(epoch) if self.launch_epoch() == Some(epoch) && epoch.filling() => Timed::Filling,
+            Some(epoch) if self.launch_epoch() == Some(epoch) => Timed::Settled,
+            _ => Timed::Untimed,
+        }
     }
 }
 

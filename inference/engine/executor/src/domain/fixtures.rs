@@ -858,6 +858,9 @@ pub struct FakeBank {
     /// The tier copy costs it last took: its grid's blocks and its copies'
     /// price.
     pub(crate) tier_copy: std::sync::Mutex<Option<crate::assessment::TierCopyCosts>>,
+    /// Its fill's starts and finishes ([`ElasticBank::fill_epoch`]): one,
+    /// filled as it opens, until a test fills it ([`Self::fill`]).
+    fills: std::sync::atomic::AtomicU64,
 }
 
 enum FakeResize {
@@ -891,7 +894,16 @@ impl FakeBank {
             rises: std::sync::Mutex::new(()),
             refuse_tier_copy: false,
             tier_copy: std::sync::Mutex::new(None),
+            fills: std::sync::atomic::AtomicU64::new(1),
         }
+    }
+
+    /// Start a fill (`true`) or finish it (`false`), as the bank's
+    /// residency publishes one.
+    pub fn fill(&self, filling: bool) {
+        let fills = self.fills.load(std::sync::atomic::Ordering::Acquire);
+        assert_eq!(fills % 2 == 0, !filling, "the fill is already {}", if filling { "running" } else { "finished" });
+        self.fills.store(fills + 1, std::sync::atomic::Ordering::Release);
     }
 
     /// `steps` of the bank's run from now.
@@ -955,6 +967,10 @@ impl ElasticBank for FakeBank {
     /// The fake's tier is filled as it opens.
     fn wait_tier_filled(&self) -> Result<(), DomainError> {
         Ok(())
+    }
+
+    fn fill_epoch(&self) -> u64 {
+        self.fills.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The fake streams no layer.

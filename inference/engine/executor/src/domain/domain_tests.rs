@@ -1256,6 +1256,41 @@ fn a_launch_a_bank_resize_ran_across_is_not_timed() {
     }
 }
 
+/// A launch's duration says whether the expert bank's fill ran beside it:
+/// one with the fill running at its submission and finish is timed as
+/// filling, one a fill began or finished across is not timed, and one with
+/// no fill beside it is settled.
+#[test]
+fn a_launch_says_whether_the_banks_fill_ran_beside_it() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 2);
+        let request = RequestId(91);
+        open(&mut domain, &mut bindings, request);
+        let step = |domain: &mut ExecutorDomain<TestFamily>, bindings, position, during: &dyn Fn(&ExecutorDomain<TestFamily>)| {
+            let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
+            during(domain);
+            let (pending, bindings) = finish_one(domain, flight);
+            let duration = pending.launch_duration();
+            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+            (duration.map(|duration| duration.filling), bindings)
+        };
+        let quiet = |_: &ExecutorDomain<TestFamily>| {};
+        let fill = |filling: bool| move |domain: &ExecutorDomain<TestFamily>| domain.family.bank.as_ref().unwrap().fill(filling);
+        // The first launch records its graphs.
+        let (_, bindings) = step(&mut domain, bindings, 0, &quiet);
+        let (timed, bindings) = step(&mut domain, bindings, 1, &quiet);
+        assert_eq!(timed, Some(false), "{backend:?}: no fill beside it");
+        let (timed, bindings) = step(&mut domain, bindings, 2, &fill(true));
+        assert_eq!(timed, None, "{backend:?}: a fill began across it");
+        let (timed, bindings) = step(&mut domain, bindings, 3, &quiet);
+        assert_eq!(timed, Some(true), "{backend:?}: the fill ran beside it");
+        let (timed, bindings) = step(&mut domain, bindings, 4, &fill(false));
+        assert_eq!(timed, None, "{backend:?}: the fill finished across it");
+        let (timed, _) = step(&mut domain, bindings, 5, &quiet);
+        assert_eq!(timed, Some(false), "{backend:?}: settled again");
+    }
+}
+
 /// A growth decided while a step runs waits for no gap: its slots join at a
 /// boundary steps still run at, and it finishes there.
 #[test]
@@ -2020,7 +2055,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             committed_rows: 0,
             kind: WorkKind::Decode,
             physical_duration: Duration::ZERO,
-            timed: true,
+            timed: Timed::Settled,
             image: None,
         })
         .unwrap();
@@ -2048,7 +2083,7 @@ fn completed_head_and_vision_request_cancellation_restores_or_drops() {
             committed_rows: 0,
             kind: WorkKind::Prefill,
             physical_duration: Duration::ZERO,
-            timed: true,
+            timed: Timed::Settled,
             image: Some(image),
         })
         .unwrap();
@@ -2268,7 +2303,7 @@ fn reconcile_encode<F: ProgramFamily>(
                 committed_rows: 0,
                 kind: WorkKind::Prefill,
                 physical_duration: Duration::ZERO,
-                timed: true,
+                timed: Timed::Settled,
                 image: Some(image),
             },
             PhysicalDecision { accepted_rows: 0 },

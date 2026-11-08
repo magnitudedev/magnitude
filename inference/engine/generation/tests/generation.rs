@@ -1,5 +1,5 @@
 use magnitude_executor::{
-    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, Operation, Outcome, ResourceDomainId,
+    FeatureReader, FeatureRef, FeatureRows, FeatureSpan, LaunchDuration, Operation, Outcome, ResourceDomainId,
     Selected,
 };
 use magnitude_generation::{
@@ -1948,14 +1948,14 @@ fn adaptive_drafting_stops_where_no_draft_is_accepted() {
     use std::time::Duration;
     let (mut generation, first) = drafting(adaptive_generation(16));
     assert_eq!(head_parts(&first).3.len(), 3);
-    generation.timed(TimedLaunch::Draft, Some(Duration::from_millis(20)), 1, 5);
+    generation.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(Duration::from_millis(20))), 1, 5);
     reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
     let mut verify = start(generation, 4);
     assert_eq!(
         verify.round_forward().tokens,
         [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
     );
-    verify.timed(TimedLaunch::Target, Some(Duration::from_millis(40)), 1, 4);
+    verify.timed(TimedLaunch::Target, Some(LaunchDuration::settled(Duration::from_millis(40))), 1, 4);
     // The target rejects the first draft.
     let (mut generation, effects) = resolve(verify, &[21, 30, 31, 32], Some(feature(2)));
     assert!(effects.is_empty());
@@ -1972,13 +1972,13 @@ fn adaptive_drafting_stops_where_no_draft_is_accepted() {
                 break;
             }
             Ok(RoundStart::Method(mut generation, operations)) => {
-                generation.timed(TimedLaunch::Draft, Some(Duration::from_millis(20)), 1, 5);
+                generation.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(Duration::from_millis(20))), 1, 5);
                 let proposals = head_parts(&operations[0]).3.len();
                 let block = (0..proposals as u32).map(|slot| (50 + slot, 0)).collect::<Vec<_>>();
                 reconcile_head(&mut generation, &operations[0], &block);
                 let mut verify = start(generation, 4);
                 assert_eq!(verify.round_forward().tokens, [TokenId(last)]);
-                verify.timed(TimedLaunch::Target, Some(Duration::from_millis(30)), 1, 1);
+                verify.timed(TimedLaunch::Target, Some(LaunchDuration::settled(Duration::from_millis(30))), 1, 1);
                 last += 1;
                 let (mut generation, _) = resolve(verify, &[last], Some(feature(3)));
                 generation.take(8).unwrap();
@@ -2058,7 +2058,7 @@ fn every_draft_policy_commits_the_targets_own_tokens() {
                     .collect::<Vec<_>>();
                 let confidence =
                     confident.then(|| slots.map(|slot| confidence(from + slot)).collect());
-                generation.timed(TimedLaunch::Draft, Some(Duration::from_millis(2)), 1, 4);
+                generation.timed(TimedLaunch::Draft, Some(LaunchDuration::settled(Duration::from_millis(2))), 1, 4);
                 reconcile_confident_head(generation, operation, &proposals, confidence);
             }
         };
@@ -2083,7 +2083,7 @@ fn every_draft_policy_commits_the_targets_own_tokens() {
                     // drafting pays.
                     round.timed(
                         TimedLaunch::Target,
-                        Some(Duration::from_millis(7 + 3 * rows as u64)),
+                        Some(LaunchDuration::settled(Duration::from_millis(7 + 3 * rows as u64))),
                         1,
                         rows,
                     );

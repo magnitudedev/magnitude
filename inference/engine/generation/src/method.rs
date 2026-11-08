@@ -1,9 +1,8 @@
 use crate::{DraftOutlook, TimedLaunch};
 use magnitude_executor::{
-    Demand, FeatureReader, FeatureRef, FeatureRows, Operation, Outcome, RequestId, SelectSpec,
+    Demand, FeatureReader, FeatureRef, FeatureRows, LaunchDuration, Operation, Outcome, RequestId, SelectSpec,
     TokenId, WeakFeatureRef,
 };
-use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MethodChoice {
@@ -219,7 +218,7 @@ pub trait MethodState {
     fn timed(
         &mut self,
         _launch: TimedLaunch,
-        _duration: Option<Duration>,
+        _duration: Option<LaunchDuration>,
         _sequences: usize,
         _rows: usize,
     ) {

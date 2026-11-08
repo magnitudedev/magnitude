@@ -66,7 +66,7 @@ pub use device_resources::{
 pub use domain::{
     MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, ClaimRefusal, BankCurve, Reach, BankGrant, BankRelease, OwnerHoldings, ServingSettlement, SizeStep, TableResidency, DeviceHeap, DomainError, Reclaimed, DomainRequirements, DomainReservation, ExecutorDomain,
     ExpertMeasures, LoadCosts, LoadMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, ShrinkCause, TierFill, DecodeStep,
-    HeadFlight, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
+    HeadFlight, LaunchDuration, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
     ReservedResources, ResumeState, RunningBegun, RunningPressure, StateBindings, SlotRelease, StateShrink, StoreAllocation, SubmitFailure,
     TargetContinuation, TargetFlight, TargetHostTiming, TrafficHold, VisionFlight, require_normal,

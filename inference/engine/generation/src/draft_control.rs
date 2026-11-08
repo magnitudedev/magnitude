@@ -23,11 +23,10 @@
 //!
 //! Requests verified in one launch share its rows ([`share_rows`]).
 
-use magnitude_executor::{draft_ladder, TokenId};
+use magnitude_executor::{draft_ladder, LaunchDuration, TokenId};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 /// The weight of a new block in a depth's mean over the current text once
@@ -80,19 +79,29 @@ enum Switch {
     Leave,
 }
 
-/// A launch's latest durations in seconds, oldest first, each with the
-/// load's round it was measured in.
+/// A launch's latest durations, oldest first.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct Durations(Vec<(u64, f64)>);
+struct Durations(Vec<Measured>);
+
+/// One duration of a launch: its seconds, the load's round it was measured
+/// in, and whether the expert bank's fill ran beside it
+/// (`LaunchDuration::filling`), which prices the launch only until the
+/// fill finishes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Measured {
+    round: u64,
+    seconds: f64,
+    filling: bool,
+}
 
 impl Durations {
-    fn record(&mut self, round: u64, seconds: f64) {
+    fn record(&mut self, round: u64, seconds: f64, filling: bool) {
         self.0
-            .retain(|(measured, _)| round.saturating_sub(*measured) < STALE_ROUNDS);
+            .retain(|measured| round.saturating_sub(measured.round) < STALE_ROUNDS);
         if self.0.len() == COST_SAMPLES {
             self.0.remove(0);
         }
-        self.0.push((round, seconds));
+        self.0.push(Measured { round, seconds, filling });
     }
 
     /// The launch's cost: the median of its durations, the lower of two.
@@ -100,10 +109,21 @@ impl Durations {
         let mut sorted = self
             .0
             .iter()
-            .map(|(_, seconds)| *seconds)
+            .map(|measured| measured.seconds)
             .collect::<Vec<_>>();
         sorted.sort_by(f64::total_cmp);
         sorted[(sorted.len() - 1) / 2]
+    }
+
+    /// `(round, seconds)` durations measured with no fill beside them.
+    #[cfg(test)]
+    fn settled(durations: &[(u64, f64)]) -> Self {
+        Self(durations.iter().map(|&(round, seconds)| Measured { round, seconds, filling: false }).collect())
+    }
+
+    /// Drop the durations measured beside a fill, which has finished.
+    fn settle(&mut self) {
+        self.0.retain(|measured| !measured.filling);
     }
 
     fn measured(&self) -> bool {
@@ -116,12 +136,12 @@ impl Durations {
     }
 
     fn latest(&self) -> u64 {
-        self.0.last().map_or(0, |(round, _)| *round)
+        self.0.last().map_or(0, |measured| measured.round)
     }
 
     fn scale(&mut self, factor: f64) {
-        for (_, seconds) in &mut self.0 {
-            *seconds *= factor;
+        for measured in &mut self.0 {
+            measured.seconds *= factor;
         }
     }
 }
@@ -255,8 +275,23 @@ pub struct LaunchCosts {
 }
 
 impl LaunchCosts {
-    fn record(costs: &mut BTreeMap<usize, Durations>, round: u64, size: usize, seconds: f64) {
-        costs.entry(size).or_default().record(round, seconds);
+    fn record(costs: &mut BTreeMap<usize, Durations>, round: u64, size: usize, seconds: f64, filling: bool) {
+        costs.entry(size).or_default().record(round, seconds, filling);
+    }
+
+    /// Drop every duration measured beside the expert bank's fill, which
+    /// has finished: what a launch missed and read then was what the fill
+    /// left, not what the bank settled to. A launch left with none is
+    /// unmeasured again, so the rounds measure it anew.
+    fn settle(&mut self) {
+        for costs in [&mut self.draft, &mut self.verify] {
+            costs.retain(|_, durations| {
+                durations.settle();
+                durations.measured()
+            });
+        }
+        self.enter.settle();
+        self.leave.settle();
     }
 
     /// A plain launch (one target row) took `seconds`. The machine's speed
@@ -265,9 +300,9 @@ impl LaunchCosts {
     /// a launch no longer taken keeps its cost relative to a plain decode
     /// rather than the seconds it took on a machine that was busier or
     /// freer, until it is measured again.
-    fn record_plain(&mut self, round: u64, seconds: f64) {
+    fn record_plain(&mut self, round: u64, seconds: f64, filling: bool) {
         let before = self.verify.get(&1).map(Durations::cost);
-        Self::record(&mut self.verify, round, 1, seconds);
+        Self::record(&mut self.verify, round, 1, seconds, filling);
         let Some(before) = before.filter(|before| *before > 0.0) else {
             return;
         };
@@ -555,6 +590,22 @@ pub struct DraftLoad {
     /// The run of accepted rounds that earned its latest request a look.
     look_run: Mutex<Option<u32>>,
     look_seconds: Mutex<f64>,
+    /// Whether `costs` holds a duration measured beside the expert bank's
+    /// fill ([`Self::settle`]).
+    beside_fill: Mutex<bool>,
+}
+
+impl DraftLoad {
+    /// Drop every duration measured beside the bank's fill, which a launch
+    /// measured with none beside it shows finished ([`LaunchCosts::settle`]).
+    fn settle(&self) {
+        let mut beside_fill = self.beside_fill.lock().expect("draft load fill");
+        if std::mem::take(&mut *beside_fill) {
+            for costs in self.costs.lock().expect("draft load costs").values_mut() {
+                costs.settle();
+            }
+        }
+    }
 }
 
 /// A drafted block being scored against the tokens committed after it.
@@ -1000,15 +1051,26 @@ impl DraftController {
     /// the switch's price, and the switch by what its round took beyond the
     /// price of its launches. A launch that recorded its graph (`duration`
     /// `None`) measured that recording, not itself: it carries its round on
-    /// and prices nothing.
+    /// and prices nothing. A launch the expert bank's fill ran beside prices
+    /// its round until a launch measured with no fill beside it shows the
+    /// fill finished: then every duration measured beside it is dropped
+    /// ([`LaunchCosts::settle`]), and the rounds measure their launches anew.
     pub fn timed(
         &mut self,
         launch: TimedLaunch,
-        duration: Option<Duration>,
+        duration: Option<LaunchDuration>,
         sequences: usize,
         rows: usize,
     ) {
-        let seconds = duration.map(|duration| duration.as_secs_f64());
+        let filling = duration.is_some_and(|duration| duration.filling);
+        match duration {
+            Some(LaunchDuration { filling: true, .. }) => {
+                *self.load.beside_fill.lock().expect("draft load fill") = true
+            }
+            Some(_) => self.load.settle(),
+            None => {}
+        }
+        let seconds = duration.map(|duration| duration.duration.as_secs_f64());
         let size = match launch {
             TimedLaunch::Entry => {
                 self.entered = self.entered.zip(seconds).map(|(entered, seconds)| entered + seconds);
@@ -1062,7 +1124,7 @@ impl DraftController {
         if launch == TimedLaunch::Draft {
             self.drafter = Some(took);
             if let (Some(took), Some(paid)) = (took, paid(Switch::Enter, launches, size)) {
-                LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0));
+                LaunchCosts::record(&mut launches.draft, round, size, (took - paid).max(0.0), filling);
             }
             return;
         }
@@ -1083,18 +1145,18 @@ impl DraftController {
         {
             launches
                 .switch_mut(switch)
-                .record(round, (took + drafter_took - steady).max(0.0));
+                .record(round, (took + drafter_took - steady).max(0.0), filling);
         }
         let Some(paid) = paid(Switch::Leave, launches, size) else {
             return;
         };
         let seconds = (took - paid).max(0.0);
         match (size, self.choice.generated) {
-            (1, 0) => launches.record_plain(round, seconds),
+            (1, 0) => launches.record_plain(round, seconds, filling),
             // A drafting round that verified nothing decoded one row behind
             // its drafter's launch, not in a decode pipeline.
             (1, _) => {}
-            (rows, _) => LaunchCosts::record(&mut launches.verify, round, rows, seconds),
+            (rows, _) => LaunchCosts::record(&mut launches.verify, round, rows, seconds, filling),
         }
     }
 }

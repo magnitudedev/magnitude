@@ -6,8 +6,13 @@
 //! same stream, so their total times compare directly.
 
 use super::{DraftController, DraftLoad, RoundChoice, TimedLaunch};
-use magnitude_executor::TokenId;
+use magnitude_executor::{LaunchDuration, TokenId};
 use std::{sync::Arc, time::Duration};
+
+/// `duration`, measured with no fill beside it.
+fn settled(duration: Duration) -> Option<LaunchDuration> {
+    Some(LaunchDuration::settled(duration))
+}
 
 const WIDEST: usize = 15;
 
@@ -244,7 +249,7 @@ fn adaptive_on(
             run.milliseconds += seconds * 1000.0;
             controller.timed(
                 TimedLaunch::Draft,
-                Some(Duration::from_secs_f64(seconds * slowdown)),
+                settled(Duration::from_secs_f64(seconds * slowdown)),
                 1,
                 generated + 1,
             );
@@ -257,7 +262,7 @@ fn adaptive_on(
         run.milliseconds += seconds * 1000.0;
         controller.timed(
             TimedLaunch::Target,
-            Some(Duration::from_secs_f64(seconds * slowdown)),
+            settled(Duration::from_secs_f64(seconds * slowdown)),
             1,
             verified + 1,
         );
@@ -624,12 +629,12 @@ fn a_launch_not_measured_here_costs_no_more_than_a_larger_one_proven_here() {
         let mut costs = load.costs.lock().unwrap();
         // A held-up first duration of width 3 at a short context.
         let mut short = LaunchCosts::default();
-        short.draft.insert(3, Durations(vec![(1, 0.0795)]));
+        short.draft.insert(3, Durations::settled(&[(1, 0.0795)]));
         costs.insert((512, 1), short);
         // Width 7 proven at the request's context.
         let mut long = LaunchCosts::default();
         long.draft
-            .insert(7, Durations(vec![(2, 0.0099), (3, 0.0099), (4, 0.0099)]));
+            .insert(7, Durations::settled(&[(2, 0.0099), (3, 0.0099), (4, 0.0099)]));
         costs.insert((4096, 1), long);
     }
     let costs = RoundCosts::of(&load, 4096, 1, None);
@@ -642,13 +647,41 @@ fn a_launch_that_recorded_its_graph_prices_nothing() {
         let mut controller = DraftController::new(7, Arc::new(DraftLoad::default()));
         let generated = controller.generate(7, CONTEXT);
         assert!(generated > 0);
-        controller.timed(TimedLaunch::Draft, duration, 1, generated + 1);
+        controller.timed(TimedLaunch::Draft, duration.map(LaunchDuration::settled), 1, generated + 1);
         controller.measured().draft.contains_key(&generated)
     };
     // A drafter launch that recorded its graph measured that recording; one
     // that replayed it measured itself.
     assert!(!drafted(None));
     assert!(drafted(Some(Duration::from_millis(9))));
+}
+
+/// A round the expert bank's fill ran beside prices its launches until a
+/// launch with no fill beside it shows the fill finished: then they are
+/// unmeasured again, and the rounds measure them anew. (Regression: a
+/// streamed load's first verifies, beside its bank's first fill, cost 1-2 s
+/// against 60 ms settled, and the controller drafted nothing for the rest
+/// of the answer.)
+#[test]
+fn launches_measured_beside_a_fill_price_only_until_it_finishes() {
+    let filling = |milliseconds| Some(LaunchDuration { duration: Duration::from_millis(milliseconds), filling: true });
+    let mut controller = DraftController::new(7, Arc::new(DraftLoad::default()));
+    let generated = controller.generate(7, CONTEXT);
+    assert!(generated > 0);
+    controller.timed(TimedLaunch::Draft, filling(40), 1, generated + 1);
+    controller.drafted(generated, &vec![TokenId(1); generated], None);
+    let verified = controller.verify(7);
+    assert!(verified > 0, "an unscored load verifies what it drafts");
+    controller.timed(TimedLaunch::Target, filling(2_000), 1, verified + 1);
+    let measured = controller.measured();
+    assert!(measured.draft.contains_key(&generated) && measured.verify.contains_key(&(verified + 1)), "the fill's round prices while it runs");
+    // A plain decode with no fill beside it: the fill finished.
+    assert_eq!(controller.generate(0, CONTEXT), 0);
+    controller.timed(TimedLaunch::Target, settled(Duration::from_millis(60)), 1, 1);
+    let measured = controller.measured();
+    assert!(!measured.draft.contains_key(&generated), "the drafter's launch is unmeasured again");
+    assert!(!measured.verify.contains_key(&(verified + 1)), "the verify is unmeasured again");
+    assert!(measured.verify.contains_key(&1), "the settled decode prices");
 }
 
 #[test]
@@ -662,7 +695,7 @@ fn requests_sharing_a_launch_give_its_rows_to_the_proposals_most_often_right() {
         let seconds = (LONG.verify)(rows) / 1000.0;
         measuring.timed(
             TimedLaunch::Target,
-            Some(Duration::from_secs_f64(seconds)),
+            settled(Duration::from_secs_f64(seconds)),
             2,
             rows,
         );
@@ -928,6 +961,7 @@ fn a_width_held_up_on_its_first_launch_is_taken_again() {
             calibration: std::sync::Mutex::new(warm.calibration.lock().unwrap().clone()),
             look_run: std::sync::Mutex::new(*warm.look_run.lock().unwrap()),
             look_seconds: std::sync::Mutex::new(*warm.look_seconds.lock().unwrap()),
+            beside_fill: std::sync::Mutex::new(*warm.beside_fill.lock().unwrap()),
         });
         let round = std::cell::Cell::new(0usize);
         let run = adaptive_on(&stream, SHORT, &load, class - 50, |position| {
@@ -999,13 +1033,13 @@ fn pipelined(
             match reported {
                 Reported::Whole => {
                     if entry > 0.0 {
-                        controller.timed(TimedLaunch::Entry, Some(ms(entry)), 1, held);
+                        controller.timed(TimedLaunch::Entry, settled(ms(entry)), 1, held);
                     }
-                    controller.timed(TimedLaunch::Draft, Some(ms(draft)), 1, generated + 1);
+                    controller.timed(TimedLaunch::Draft, settled(ms(draft)), 1, generated + 1);
                 }
                 Reported::WithoutSwitch => {
                     let launch = (machine.costs.draft)(generated);
-                    controller.timed(TimedLaunch::Draft, Some(ms(launch)), 1, generated + 1);
+                    controller.timed(TimedLaunch::Draft, settled(ms(launch)), 1, generated + 1);
                 }
             }
             held = 0;
@@ -1023,7 +1057,7 @@ fn pipelined(
         if reported == Reported::WithoutSwitch {
             target = (machine.costs.verify)(verified + 1);
         }
-        controller.timed(TimedLaunch::Target, Some(ms(target)), 1, verified + 1);
+        controller.timed(TimedLaunch::Target, settled(ms(target)), 1, verified + 1);
         drafted_before = Some(generated > 0);
         let accepted = stream.right(position).min(verified);
         let committed = (position + 1..=position + accepted + 1)

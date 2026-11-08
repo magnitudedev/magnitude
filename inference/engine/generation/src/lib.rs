@@ -23,7 +23,7 @@ pub use draft_transition::{
 };
 pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
 pub use magnitude_executor::{
-    Demand, FeatureReader, FeatureRef, Operation, Priming, RequestId, Sampling, SelectSpec,
+    Demand, FeatureReader, FeatureRef, LaunchDuration, Operation, Priming, RequestId, Sampling, SelectSpec,
     Shaping, TokenId, WorkKind,
 };
 pub use method::{
@@ -930,7 +930,7 @@ impl Generation {
     pub fn timed(
         &mut self,
         launch: TimedLaunch,
-        duration: Option<std::time::Duration>,
+        duration: Option<LaunchDuration>,
         sequences: usize,
         rows: usize,
     ) {
@@ -1232,7 +1232,7 @@ impl StartedRound {
     pub fn timed(
         &mut self,
         launch: TimedLaunch,
-        duration: Option<std::time::Duration>,
+        duration: Option<LaunchDuration>,
         sequences: usize,
         rows: usize,
     ) {

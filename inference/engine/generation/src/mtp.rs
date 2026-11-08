@@ -33,10 +33,10 @@ use crate::{
 };
 use crate::{DraftHistory, DraftRoundState};
 use magnitude_executor::{
-    Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, Operation,
-    Outcome, RequestId, SelectSpec, TokenId,
+    Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, LaunchDuration,
+    Operation, Outcome, RequestId, SelectSpec, TokenId,
 };
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct Mtp {
@@ -716,7 +716,7 @@ impl MethodState for DrafterState {
     fn timed(
         &mut self,
         launch: TimedLaunch,
-        duration: Option<Duration>,
+        duration: Option<LaunchDuration>,
         sequences: usize,
         rows: usize,
     ) {

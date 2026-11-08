@@ -1055,7 +1055,7 @@ impl ExpertStep {
                 false,
             ),
             lent: super::lent::LentRecords::new(),
-            filled: std::sync::atomic::AtomicBool::new(false),
+            fills: std::sync::atomic::AtomicU64::new(0),
             resizing: ResizeHandoff::new(),
             traffic_held: Default::default(),
             traffic_quiet: Default::default(),

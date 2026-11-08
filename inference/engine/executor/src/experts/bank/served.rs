@@ -527,6 +527,10 @@ impl ElasticBank for ServedBank {
         self.bank.watcher.shared().in_gap()
     }
 
+    fn fill_epoch(&self) -> u64 {
+        self.bank.watcher.shared().fill_epoch()
+    }
+
     fn wait_tier_filled(&self) -> Result<(), DomainError> {
         match self.bank.host_tier() {
             Some(_) => self.bank.watcher.shared().wait_filled().map_err(DomainError::invariant),

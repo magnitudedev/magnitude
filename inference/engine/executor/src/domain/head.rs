@@ -863,7 +863,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     committed_rows: rows,
                     kind: WorkKind::Decode,
                     physical_duration: Duration::ZERO,
-                    timed: false,
+                    timed: Timed::Untimed,
                     image: None,
                 },
             )

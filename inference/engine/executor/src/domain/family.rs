@@ -205,6 +205,12 @@ pub trait ElasticBank {
     /// Wait until the host tier is filled ([`TierFill::Filled`]), as its
     /// fill publishes it; at once without a tier.
     fn wait_tier_filled(&self) -> Result<(), super::DomainError>;
+
+    /// How many times the bank's fill started or finished
+    /// (`Shared::fill_epoch`): odd once it finished, even while it lands
+    /// experts beside the steps, which then miss and read what the fill
+    /// leaves, not what the bank settles to.
+    fn fill_epoch(&self) -> u64;
 }
 
 /// Where a load's routed experts are now: the slots its directory serves

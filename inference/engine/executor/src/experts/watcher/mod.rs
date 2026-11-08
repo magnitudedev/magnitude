@@ -192,9 +192,11 @@ pub(super) struct Shared {
     /// The lender's lent bank records' reservation, beside a host tier
     /// (`lent`).
     lent: lent::LentRecords,
-    /// Whether the host tier's fill has finished, as residency last
-    /// published it (`Residency::read_ahead`).
-    filled: std::sync::atomic::AtomicBool,
+    /// The fill's changes as residency published them
+    /// (`Residency::read_ahead`): each start and each finish counts one, from
+    /// filling as the bank opens, so the fill has finished when the count
+    /// is odd ([`Self::fill_epoch`]).
+    fills: std::sync::atomic::AtomicU64,
     /// What a routed pass over each streamed layer's experts costs, once
     /// priced (`Self::price`): what a scratch-served group's merge sets are
     /// chosen by (`Shared::begin`).
@@ -350,17 +352,29 @@ impl Shared {
     /// the bank's open until its first turn finds it filled
     /// (`Prefetch::filling`).
     pub fn tier_fill(&self) -> crate::TierFill {
-        match self.filled.load(std::sync::atomic::Ordering::Acquire) {
-            true => crate::TierFill::Filled,
-            false => crate::TierFill::Filling,
+        match self.fill_epoch() % 2 {
+            1 => crate::TierFill::Filled,
+            _ => crate::TierFill::Filling,
         }
+    }
+
+    /// How many times the fill started or finished so far: odd once it
+    /// finished, even while it lands experts. Two equal readings with the
+    /// fill finished at both saw no fill between them.
+    pub fn fill_epoch(&self) -> u64 {
+        self.fills.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Publish the host tier's fill, `fill`; a change is an event, which
     /// wakes [`Self::wait_filled`]. Whether it changed.
     pub(super) fn publish_fill(&self, fill: crate::TierFill) -> bool {
-        let filled = fill == crate::TierFill::Filled;
-        let changed = self.filled.swap(filled, std::sync::atomic::Ordering::AcqRel) != filled;
+        let filled = u64::from(fill == crate::TierFill::Filled);
+        let changed = self
+            .fills
+            .fetch_update(std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire, |fills| {
+                (fills % 2 != filled).then_some(fills + 1)
+            })
+            .is_ok();
         if changed {
             self.events().notify();
         }
@@ -673,7 +687,7 @@ impl Watcher {
             promoted: Default::default(),
             copy: Mutex::new(None),
             lent: lent::LentRecords::new(),
-            filled: std::sync::atomic::AtomicBool::new(false),
+            fills: std::sync::atomic::AtomicU64::new(0),
             passes: Mutex::new(None),
             settled: Default::default(),
         });
