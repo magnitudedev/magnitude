@@ -121,8 +121,8 @@ pub(crate) enum HeadPlans<'p> {
     Packed(&'p crate::WeightPlan),
     /// Its progressive planes, in `ProgressivePlane::ALL` order.
     Progressive([&'p crate::WeightPlan; 5]),
-    /// The planes of a scope stored as them alone
-    /// (`ModelLoadPlan::finalize_readout`). `rows` are the classes of
+    /// The planes of a scope a reader selected, which is stored as them
+    /// alone (`ModelLoadPlan::finalize_readout`). `rows` are the classes of
     /// the reader in question that run the certified levels; its other
     /// classes read the planes' full pass.
     Qualified {
@@ -133,7 +133,7 @@ pub(crate) enum HeadPlans<'p> {
 
 impl<'p> HeadPlans<'p> {
     /// The stored form of `scope`'s projection. A scope has one: its planes
-    /// when a choice names it, the output projection otherwise.
+    /// when a reader selected a class, the output projection otherwise.
     pub(crate) fn of(load: &'p ModelLoadPlan, scope: WeightScope) -> Result<Self, String> {
         let weight = |kind| {
             load.weights()

@@ -778,11 +778,10 @@ pub struct HeadBinding {
     pub activation: Element,
 }
 
-/// Completed first-load physical choice of one reader of a projection scope
-/// stored as its views. Preparation names every reader of such a scope,
-/// whose form it chose over all its readers' classes by their weighed
-/// costs. The reader's listed selected-row classes use bounded readout and
-/// its other classes the views' full pass; it may list none.
+/// Completed first-load physical choice of one reader of a projection scope.
+/// The scope is stored as its views; the reader's listed selected-row classes
+/// use bounded readout, and its other classes, and the scope's other
+/// readers, the views' full pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadoutClassChoice {
     pub scope: WeightScope,
@@ -1566,10 +1565,10 @@ impl ModelLoadPlan {
     }
 
     /// Commit completed physical choices before resource admission. A scope
-    /// a choice names is stored as its views: they are placed, and its
-    /// packed projection is planned and not placed (`unplaced_output`), so
-    /// every reader of the scope reads the views. Unselected transient views
-    /// are discarded.
+    /// in which any reader selected a class is stored as its views: they are
+    /// placed, and its packed projection is planned and not placed
+    /// (`unplaced_output`), so every reader of the scope reads the views.
+    /// Unselected transient views are discarded.
     pub fn finalize_readout(mut self, choices: &[ReadoutClassChoice]) -> Result<Self, String> {
         if !self.readout_choices.is_empty() && self.readout_choices == choices {
             return Ok(self);
@@ -1577,8 +1576,8 @@ impl ModelLoadPlan {
         let mut scopes = HashSet::new();
         let mut recipes = HashSet::new();
         for choice in choices {
-            if choice.rows.iter().any(|&rows| rows == 0) {
-                return Err("a readout choice's selected-row classes are nonzero".into());
+            if choice.rows.is_empty() || choice.rows.iter().any(|&rows| rows == 0) {
+                return Err("a retained readout view needs nonzero selected-row classes".into());
             }
             if !recipes.insert((choice.scope, choice.norm_scope, choice.prepared)) {
                 return Err("readout choices duplicate a semantic recipe".into());
@@ -2362,8 +2361,11 @@ pub(super) fn planned_readout_recipe(
 ) -> Result<ReadoutHead, crate::PlanError> {
     let packed = planned_readout(weights, scope)?;
     // Every reader of a scope stored as views reads them, whichever of the
-    // scope's readers certified a class.
-    if !choices.iter().any(|choice| choice.scope == scope) {
+    // scope's readers selected a class.
+    if !choices
+        .iter()
+        .any(|choice| choice.scope == scope && !choice.rows.is_empty())
+    {
         return Ok(packed);
     }
     if !ProgressivePlane::ALL.into_iter().all(|plane| {

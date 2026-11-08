@@ -381,27 +381,12 @@ impl KernelCache {
     /// The exact finalized canonical specialization against which a selected
     /// optional recipe completed its paired comparison.
     pub(crate) fn readout_canonical_choice(&self, key: &TuningCacheKey) -> Option<String> {
-        self.readout_field(key, "canonical_specification")
-    }
-
-    /// The costs a stored recipe choice measured its class at, in each form
-    /// its scope can be stored in.
-    pub(crate) fn readout_costs(
-        &self,
-        key: &TuningCacheKey,
-    ) -> Option<crate::native::RecipeCosts> {
-        self.readout_field(key, "costs")
-    }
-
-    /// One field of a stored recipe choice; none when it is absent or null.
-    fn readout_field<T: serde::de::DeserializeOwned>(
-        &self,
-        key: &TuningCacheKey,
-        field: &str,
-    ) -> Option<T> {
         let bytes = self.read(&self.entry(READOUT, key.as_str(), "json"))?;
-        let mut choice = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
-        serde_json::from_value(choice.get_mut(field)?.take()).ok()
+        serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()?
+            .get("canonical_specification")?
+            .as_str()
+            .map(str::to_owned)
     }
 
     pub(crate) fn store_readout_choice(

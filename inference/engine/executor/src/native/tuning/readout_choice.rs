@@ -26,14 +26,6 @@
 //!     (run 20261010T124501Z-a3b.diag-96f42c)
 //! In whole decode steps three of the four cases are faster with the bounded
 //! recipe and the worst (Nemotron, prose-continue) is break-even.
-//!
-//! A class's choice is not its scope's stored form. A scope is stored in one
-//! form, and every reader's every class reads it: its certified classes
-//! through the bounded levels, every other class through the planes' full
-//! pass, or all of them through the packed projection. So each class's
-//! qualification also times the full pass beside the two recipes
-//! ([`RecipeCosts`]), and the scope stores whichever form its readers' classes,
-//! weighed by the load's demand, cost less in all ([`stores_planes`]).
 
 use super::{ComposedCensus, ComposedContender, PointShape, TuningInputs, TuningKey};
 use crate::native::specialization::{entry_statics, prepare_program};
@@ -74,57 +66,9 @@ pub(crate) struct ReadoutRecipe {
 
 #[derive(Default)]
 pub(crate) struct QualifiedRecipe {
+    pub selected: bool,
     pub progressive: Option<ProgressiveReadoutKernels>,
     pub canonical_specification: Option<String>,
-    /// The class's measured costs, from its census on and its qualification
-    /// once timed; kept whatever the class's choice.
-    pub costs: Option<RecipeCosts>,
-    /// The class's weight in the load's objective: the launches its graphs
-    /// demand of it ([`super::apply_invocation_counts`]).
-    pub weight: f64,
-}
-
-/// One class's measured cost of a whole readout invocation in each form its
-/// scope's projection can be read through, in seconds: the packed
-/// projection, the bounded levels over the planes, and the planes' full
-/// pass. All three are timed on the same rows in the same comparison.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RecipeCosts {
-    pub packed: f64,
-    pub bounded: f64,
-    pub planes: f64,
-}
-
-/// What one reader's class of a scope weighs in its stored form: its
-/// weight in the load's objective, whether its bounded levels are certified
-/// (it reads them when the scope is stored as planes), and its measured
-/// costs, if any were measured.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ClassCost {
-    pub weight: f64,
-    pub certified: bool,
-    pub costs: Option<RecipeCosts>,
-}
-
-/// Whether a scope is stored as its planes: when every class its readers
-/// demand was measured, and the planes cost the load less over all of them
-/// than the packed projection does. Packed is canonical: a demanded class
-/// without measured costs, a tie, and a scope nothing demands keep it.
-pub(crate) fn stores_planes(classes: impl IntoIterator<Item = ClassCost>) -> bool {
-    let (mut packed, mut planes) = (0., 0.);
-    for class in classes {
-        if class.weight <= 0. {
-            continue;
-        }
-        let Some(costs) = class.costs else {
-            return false;
-        };
-        // Stored as planes, a class reads its bounded levels where they are
-        // certified and the full pass where not.
-        packed += class.weight * costs.packed;
-        planes += class.weight * if class.certified { costs.bounded } else { costs.planes };
-    }
-    planes < packed
 }
 
 pub(crate) type RecipeState = Rc<RefCell<QualifiedRecipe>>;
@@ -154,8 +98,6 @@ struct ReadoutChoiceReceipt {
     canonical_specification: Option<String>,
     // Every pair is the complete submitted recipe, including dependent levels.
     pairs: Vec<(f64, f64)>,
-    /// The class's costs as its scope's stored form weighs them.
-    costs: Option<RecipeCosts>,
     settled: bool,
 }
 
@@ -412,8 +354,6 @@ struct RecipeCase {
     fine: Tensor,
     floor1: Tensor,
     exact: Tensor,
-    /// The planes' full pass's logits.
-    full: Tensor,
     token_rows: Tensor,
 }
 
@@ -473,7 +413,6 @@ impl RecipeCase {
             coarse: zeros(Element::f32(), &[rows, recipe.vocabulary])?,
             fine: zeros(Element::f32(), &[rows, recipe.vocabulary])?,
             exact: zeros(Element::f32(), &[rows, recipe.vocabulary])?,
-            full: zeros(Element::f32(), &[rows, recipe.vocabulary])?,
             floor0: zeros(Element::f32(), &[rows])?,
             floor1: zeros(Element::f32(), &[rows])?,
             features: zeros(recipe.activation, &[rows, recipe.hidden])?,
@@ -706,46 +645,6 @@ impl RecipeCase {
         Ok(start.elapsed().as_secs_f64())
     }
 
-    /// Run the planes' full pass once, the readout of every class a scope
-    /// stored as planes does not certify; the seconds it took.
-    fn planes(
-        &mut self,
-        device: &seismic::Device,
-        recipe: ReadoutRecipe,
-        kernels: &ProgressiveReadoutKernels,
-    ) -> Result<f64, CatalogFailure> {
-        let [top, bit3, rest, scales, _] = &self.planes;
-        // The entry reads the rows as their `[M, PT, D]` parts.
-        let rows = self.hidden.extents()[0];
-        let partials = self
-            .hidden
-            .reshape(&[rows, recipe.parts, recipe.hidden])
-            .map_err(fail)?;
-        let mut batch = NativeTensorBatch::new(device);
-        batch
-            .push(
-                &kernels.planes,
-                readout_planes_rows::Args {
-                    hidden: &partials,
-                    norm: &self.norm,
-                    top,
-                    bit3,
-                    rest,
-                    scales,
-                    out_rows: &self.out_rows,
-                    epsilon: recipe.epsilon,
-                    softcap: recipe.softcap,
-                },
-                readout_planes_rows::OutputArgs {
-                    value: &mut self.full,
-                },
-            )
-            .map_err(fail)?;
-        let start = Instant::now();
-        batch.submit().map_err(fail)?.wait().map_err(fail)?;
-        Ok(start.elapsed().as_secs_f64())
-    }
-
     fn same_winners(&self, rows: u64, vocabulary: u64) -> Result<bool, CatalogFailure> {
         let read = |t: &Tensor| {
             t.read_to_host()
@@ -827,7 +726,6 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             invocations,
             objective,
         );
-        self.state.borrow_mut().weight = self.point.weight;
     }
     fn key(&self) -> String {
         self.key.as_str().to_owned()
@@ -882,28 +780,18 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         let preparation = preparation.elapsed();
         self.receipt.preparation_seconds = preparation.as_secs_f64();
         let measured = Instant::now();
-        let progressive = formed.progressive.as_ref().unwrap();
         self.canonical_seconds = case.packed(inputs.device, self.recipe, &packed)?;
-        self.candidate_seconds = case.bounded(inputs.device, self.recipe, progressive)?;
-        let planes = case.planes(inputs.device, self.recipe, progressive)?;
+        self.candidate_seconds = case.bounded(
+            inputs.device,
+            self.recipe,
+            formed.progressive.as_ref().unwrap(),
+        )?;
         self.receipt
             .pairs
             .push((self.canonical_seconds, self.candidate_seconds));
-        // Until a qualification times the class, its census prices it: the
-        // packed and full passes read every row alike, and the bounded
-        // levels only serve a class its qualification certifies.
-        self.receipt.costs = Some(RecipeCosts {
-            packed: self.canonical_seconds,
-            bounded: self.candidate_seconds,
-            planes,
-        });
         self.receipt.reason =
             "censused; qualification not admitted within first-load allocation".into();
-        {
-            let mut state = self.state.borrow_mut();
-            state.progressive = formed.progressive;
-            state.costs = self.receipt.costs;
-        }
+        *self.state.borrow_mut() = formed;
         let rounds = Tally::default().fewest(super::SEARCH_SETTINGS.error_rate);
         // The comparison's clock is established by its first raise: twice
         // over, readings of the packed run in doubling lengths from a
@@ -920,10 +808,9 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             measured: vec![self.point.clone()],
             seconds: vec![self.canonical_seconds],
             // The qualification prepares as the census did, establishes its
-            // clock, and runs what the census ran, for each seed: twice for
-            // agreement (noise rows, then the timed rows; the two recipes
-            // alone, so this bounds it), and a lead and a sample in each
-            // round it is admitted.
+            // clock, and runs the pair the census ran, for each seed: twice
+            // for agreement (noise rows, then the timed rows), and a lead and
+            // a sample in each round it is admitted.
             qualification: preparation
                 + std::time::Duration::from_secs_f64(establishment)
                 + measured.elapsed() * (QUALIFICATION_SEEDS.len() as u32 * (2 + 2 * rounds)),
@@ -1009,13 +896,11 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         }
         // The search's comparison (`seismic::measure::Tally`), on whole
         // recipe runs: a round raises the device to a sustained clock, then
-        // runs both recipes and the planes' full pass at every seed in random
-        // order, each behind a lead of its own work, and is ahead when the
-        // bounded recipe cost less over the seeds. The full pass is not in
-        // the comparison: every round's samples of all three price the class
-        // for its scope's stored form. The comparison is admitted the fewest
-        // rounds in which it can resolve as a lead at the search's error
-        // rate, and ends with its first round that is not ahead.
+        // runs both recipes at every seed in random order, each behind a lead
+        // of its own work, and is ahead when the
+        // bounded recipe cost less over the seeds. The comparison is admitted
+        // the fewest rounds in which it can resolve as a lead at the search's
+        // error rate, and ends with its first round that is not ahead.
         let rate = super::SEARCH_SETTINGS.error_rate;
         let mut tally = Tally::default();
         let mut shuffle = Shuffle::default();
@@ -1023,9 +908,6 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         // compares: back-to-back packed runs at the first seed, read as the
         // rounds read their samples.
         let mut clock = SustainedClock::new(super::MIN_SAMPLE_SECONDS, tally.fewest(rate));
-        // Each form's summed samples, and their count.
-        let mut sums = [0.; 3];
-        let mut samples = 0u32;
         for _ in 0..tally.fewest(rate) {
             check_deadline!();
             let raised = clock.raise(|passes| {
@@ -1049,45 +931,26 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 }
             }
             let mut difference = 0.;
-            let mut round = [0.; 3];
             for case in &mut cases {
                 check_deadline!();
-                let mut order = [0, 1, 2];
+                let mut order = [0, 1];
                 shuffle.shuffle(&mut order);
-                let mut seconds = [0.; 3];
-                for form in order {
+                let mut seconds = [0.; 2];
+                for recipe in order {
                     check_deadline!();
-                    seconds[form] = match form {
-                        0 => {
-                            case.packed(inputs.device, self.recipe, &packed)?;
-                            check_deadline!();
-                            case.packed(inputs.device, self.recipe, &packed)?
-                        }
-                        1 => {
-                            case.bounded(inputs.device, self.recipe, progressive)?;
-                            check_deadline!();
-                            case.bounded(inputs.device, self.recipe, progressive)?
-                        }
-                        _ => {
-                            case.planes(inputs.device, self.recipe, progressive)?;
-                            check_deadline!();
-                            case.planes(inputs.device, self.recipe, progressive)?
-                        }
+                    seconds[recipe] = if recipe == 0 {
+                        case.packed(inputs.device, self.recipe, &packed)?;
+                        check_deadline!();
+                        case.packed(inputs.device, self.recipe, &packed)?
+                    } else {
+                        case.bounded(inputs.device, self.recipe, progressive)?;
+                        check_deadline!();
+                        case.bounded(inputs.device, self.recipe, progressive)?
                     };
                 }
                 self.receipt.pairs.push((seconds[0], seconds[1]));
                 difference += seconds[1] / seconds[0] - 1.;
-                for (sum, seconds) in round.iter_mut().zip(seconds) {
-                    *sum += seconds;
-                }
             }
-            // A whole round prices the class, in place of its census.
-            for (sum, seconds) in sums.iter_mut().zip(round) {
-                *sum += seconds;
-            }
-            samples += cases.len() as u32;
-            let [packed, bounded, planes] = sums.map(|sum| sum / f64::from(samples));
-            self.receipt.costs = Some(RecipeCosts { packed, bounded, planes });
             tally.observe(difference);
             if difference >= 0. {
                 break;
@@ -1109,13 +972,9 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
     fn conclude(&mut self, selected: bool, settled: bool) -> Result<(), CatalogFailure> {
         self.receipt.selected = selected;
         self.receipt.settled = settled;
-        {
-            let mut state = self.state.borrow_mut();
-            state.costs = self.receipt.costs;
-            if !selected {
-                state.progressive = None;
-                state.canonical_specification = None;
-            }
+        self.state.borrow_mut().selected = selected;
+        if !selected {
+            *self.state.borrow_mut() = QualifiedRecipe::default();
         }
         if let Some(cache) = self.cache {
             cache.store_readout_choice(&self.key, &self.receipt);
@@ -1128,88 +987,6 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
 mod tests {
     use super::*;
     use crate::{ExecutionPath, resident_layout};
-
-    fn class(weight: f64, certified: bool, [packed, bounded, planes]: [f64; 3]) -> ClassCost {
-        ClassCost {
-            weight,
-            certified,
-            costs: Some(RecipeCosts {
-                packed,
-                bounded,
-                planes,
-            }),
-        }
-    }
-
-    /// A drafting round of an MTP load as measured on an M4 Pro (ms): one
-    /// plain step's 1-row class certified (bounded 1.62, packed 2.05), and
-    /// the draft's 3 rows and the verification's 4, whose classes are not
-    /// certified, reading the full pass at 2.91 against packed's 2.04.
-    fn drafting_round(planes: f64) -> [ClassCost; 3] {
-        [
-            class(1., true, [2.05, 1.62, 2.91]),
-            class(1., false, [2.04, 3.9, planes]),
-            class(1., false, [2.04, 3.9, planes]),
-        ]
-    }
-
-    /// The scope stores the form its readers' classes, weighed, cost less
-    /// in all: not the form one reader's certified class prefers.
-    #[test]
-    fn a_scope_stores_the_form_its_classes_weigh_cheaper() {
-        // 1.62 + 2 x 2.91 = 7.44 through the planes, 6.13 packed.
-        assert!(!stores_planes(drafting_round(2.91)));
-        // A full pass at packed's pace: 1.62 + 2 x 2.04 = 5.70.
-        assert!(stores_planes(drafting_round(2.04)));
-        // Weight decides: plain steps outnumbering the round's other reads
-        // by enough (past 1.74 / 0.43, about 4 to 1) make the planes the
-        // cheaper form even at 2.91.
-        let mut weighed = drafting_round(2.91);
-        weighed[0].weight = 5.;
-        assert!(stores_planes(weighed));
-        // A certified class alone, as on a load that does not draft.
-        assert!(stores_planes([class(1., true, [2.05, 1.62, 2.91])]));
-        // A full pass cheaper than packed stores the planes with nothing
-        // certified.
-        assert!(stores_planes([class(1., false, [2., 3., 1.5])]));
-    }
-
-    /// Equal totals keep the canonical packed projection, and the choice
-    /// does not depend on the order the classes are met in.
-    #[test]
-    fn a_tie_keeps_the_packed_projection_in_any_order() {
-        let tied = [class(1., true, [2., 1., 4.]), class(1., false, [2., 4., 3.])];
-        assert!(!stores_planes(tied));
-        assert!(!stores_planes(tied.into_iter().rev()));
-        let mut round = drafting_round(2.04);
-        assert!(stores_planes(round));
-        round.reverse();
-        assert!(stores_planes(round));
-    }
-
-    /// A demanded class without measured costs keeps the packed
-    /// projection; a class nothing demands weighs nothing, measured or not,
-    /// and a scope nothing demands keeps it too.
-    #[test]
-    fn missing_evidence_keeps_the_packed_projection() {
-        let unmeasured = ClassCost {
-            weight: 1.,
-            certified: false,
-            costs: None,
-        };
-        let certified = class(1., true, [2.05, 1.62, 2.91]);
-        assert!(!stores_planes([certified, unmeasured]));
-        assert!(stores_planes([
-            certified,
-            ClassCost {
-                weight: 0.,
-                ..unmeasured
-            },
-            class(0., false, [1., 9., 9.]),
-        ]));
-        assert!(!stores_planes([class(0., true, [2., 1., 1.])]));
-        assert!(!stores_planes(std::iter::empty()));
-    }
 
     /// Every program of the recipe digests and forms on each backend with
     /// its kernels, in both input forms: a normed exit's one row, and a

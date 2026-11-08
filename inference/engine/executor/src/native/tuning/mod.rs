@@ -4664,42 +4664,6 @@ impl<'a> Tuner<'a> {
         Ok(self)
     }
 
-    /// A composed choice the installed pin decides, when this walk serves a
-    /// load: none when no pin decides it.
-    fn pinned_composed(&mut self, label: &'static str, identity: &str) -> Option<bool> {
-        if !matches!(self.phase, Phase::Serve(_)) {
-            return None;
-        }
-        let (selected, choice) = pinned::recipe(label, identity)?;
-        self.context.observer.event(&TuningEvent::Pinned {
-            entry: label,
-            bindings: identity.to_owned(),
-            statics: BTreeMap::new(),
-            choice,
-            configuration: Configuration::of(&pinned::recipe_configuration(selected)),
-        });
-        Some(selected)
-    }
-
-    /// A choice derived from completed composed choices and their evidence
-    /// (`derived`), as a pin decides it: the pin's when it replays one, and
-    /// recorded when it records, so that a replay serves what the recorded
-    /// load served.
-    pub(super) fn derived_composed(
-        &mut self,
-        label: &'static str,
-        identity: &str,
-        derived: bool,
-    ) -> bool {
-        if let Some(selected) = self.pinned_composed(label, identity) {
-            return selected;
-        }
-        if matches!(self.phase, Phase::Serve(_)) {
-            pinned::record_recipe(label, identity, derived);
-        }
-        derived
-    }
-
     /// Register the same contender in each walk. Cache hits never census or
     /// qualify; misses join ordinary allocation and conclude once this load.
     pub(super) fn register_composed(
@@ -4715,13 +4679,20 @@ impl<'a> Tuner<'a> {
             .get(&(unit.0, unit.1.clone(), BTreeMap::new()))
             .ok_or_else(|| unit_failure(&unit, "graph invocation demand is missing"))?;
         contender.set_invocations(demand, &self.invocations.objective);
-        let demanded = demand.launches().any(|(_, count)| count > 0.);
         if let Some(selected) = self.composed_choices.get(&key).copied() {
             return Ok(Some(selected));
         }
         let serving = matches!(self.phase, Phase::Serve(_));
         let (label, identity) = (contender.label(), contender.pin_identity());
-        if let Some(selected) = self.pinned_composed(label, &identity) {
+        let decided = serving.then(|| pinned::recipe(label, &identity)).flatten();
+        if let Some((selected, choice)) = decided {
+            self.context.observer.event(&TuningEvent::Pinned {
+                entry: label,
+                bindings: identity,
+                statics: BTreeMap::new(),
+                choice,
+                configuration: Configuration::of(&pinned::recipe_configuration(selected)),
+            });
             self.composed_choices.insert(key, selected);
             return Ok(Some(selected));
         }
@@ -4732,6 +4703,7 @@ impl<'a> Tuner<'a> {
             self.composed_choices.insert(key, selected);
             return Ok(Some(selected));
         }
+        let demanded = demand.launches().any(|(_, count)| count > 0.);
         match &self.phase {
             Phase::Count { .. } => {
                 self.composed_counted.insert(key);

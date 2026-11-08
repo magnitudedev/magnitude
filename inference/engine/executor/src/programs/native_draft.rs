@@ -1442,8 +1442,9 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let readout_vocabulary = vocabulary;
     let mut leading = Vec::new();
     // Full draft logits read the projection's vocabulary prefix as it is
-    // stored: the packed projection, or the planes of a scope stored as them
-    // (`ModelLoadPlan::finalize_readout`), through their full pass.
+    // stored: the packed projection, or the planes of a scope another reader
+    // selected a class of (`ModelLoadPlan::finalize_readout`), through their
+    // full pass.
     let plans = readout::HeadPlans::of(load, projection_scope)?.selected();
     let mut prefix = |plan: &crate::WeightPlan| -> Result<NativePort, GraphError> {
         let mut shape = plan.shape.clone();
