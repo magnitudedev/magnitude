@@ -63,12 +63,6 @@
 //!
 //! A unit composed of other units' choices reads them as they stand when
 //! its own work starts; from then they are sealed and receive no more work.
-//! Sealing ends a prerequisite's search, so a dependant's work starts only
-//! once its prerequisites have no work left that fits: until then the
-//! dependant waits, and its next piece, with what it then owes, is held
-//! back from every other start ([`Waiting`]), so it still fits when they
-//! stop. Neither is starved: the prerequisite searches to the budget less
-//! what its dependants take, and they take it whole.
 //!
 //! # Compiles overlap the device
 //!
@@ -698,51 +692,6 @@ impl Report {
     }
 }
 
-/// The dependants whose next work waits for their prerequisites' search
-/// to end, each with what that work takes: its price and what its unit then
-/// owes. Sealing a prerequisite ends its search, so a dependant runs after
-/// its prerequisites, and what it will take is held back from every other
-/// unit's start, so that it still fits when they stop.
-struct Waiting(Vec<(usize, Duration)>);
-
-impl Waiting {
-    fn of<U: Unit>(
-        units: &[U],
-        offers: &[(usize, Work)],
-        sealed: &[bool],
-        flying: impl Fn(usize) -> bool,
-        longest: Duration,
-    ) -> Self {
-        Self(
-            offers
-                .iter()
-                .filter(|(unit, work)| {
-                    work.stage != Stage::Discovery
-                        && units[*unit].prerequisites().iter().any(|prerequisite| {
-                            !sealed[*prerequisite]
-                                && (flying(*prerequisite)
-                                    || offers.iter().any(|(offering, _)| offering == prerequisite))
-                        })
-                })
-                .map(|(unit, work)| {
-                    let takes = forecast(&work.quote, longest)
-                        .saturating_add(forecast(&units[*unit].owed(true), longest));
-                    (*unit, takes)
-                })
-                .collect(),
-        )
-    }
-
-    /// What `unit`'s work must leave the waiting dependants other than
-    /// itself.
-    fn held(&self, unit: usize) -> Duration {
-        self.0
-            .iter()
-            .filter(|(dependant, _)| *dependant != unit)
-            .fold(Duration::ZERO, |sum, (_, takes)| sum.saturating_add(*takes))
-    }
-}
-
 /// What work is taken to last: its price, with each unpriced operation at
 /// the longest operation completed, as in its admission.
 fn forecast(quote: &Quote, longest: Duration) -> Duration {
@@ -914,12 +863,6 @@ pub(crate) fn allocate<U: Unit>(
                     })
             })
             .collect::<Vec<_>>();
-        // Dependants that wait for their prerequisites, and what each
-        // other unit's work leaves them.
-        let dependants = Waiting::of(units, &offers, &sealed, flying, longest);
-        let reserved = (0..units.len())
-            .map(|unit| owed[unit].saturating_add(dependants.held(unit)))
-            .collect::<Vec<_>>();
         // The ending begins at the earliest cutoff of the pieces in flight
         // ([`Unit::perform`]): from then what they would measure and what
         // is owed after it no longer fit, whatever their compiles do.
@@ -957,7 +900,7 @@ pub(crate) fn allocate<U: Unit>(
                         *offering == unit
                             && work
                                 .quote
-                                .fits(remaining.saturating_sub(reserved[unit]), longest)
+                                .fits(remaining.saturating_sub(owed[unit]), longest)
                     })
             })
             .collect::<Vec<_>>();
@@ -986,6 +929,20 @@ pub(crate) fn allocate<U: Unit>(
                     .forecast(units[flight.unit].largest_footprint()),
             )
         });
+        // A dependant's discovery reads nothing of its prerequisites. Its
+        // other work reads their choices, once their defaults are measured,
+        // no lead of theirs awaits conversion and no work of theirs is in
+        // flight.
+        let settled = |unit: usize| {
+            units[unit].prerequisites().iter().all(|prerequisite| {
+                sealed[*prerequisite]
+                    || !(flying(*prerequisite)
+                        || offers.iter().any(|(offering, work)| {
+                            offering == prerequisite
+                                && matches!(work.stage, Stage::Discovery | Stage::Promote)
+                        }))
+            })
+        };
         // The device's queue: each piece in flight, when it is ready for
         // the device (now, once its compile has ended) and the device time
         // admitted with it.
@@ -1022,26 +979,9 @@ pub(crate) fn allocate<U: Unit>(
         let fits = |unit: usize, work: &Work| {
             let mut jobs = queue.clone();
             jobs.push(job(work));
-            device_ends(now, jobs).saturating_add(reserved[unit]) <= total
+            device_ends(now, jobs).saturating_add(owed[unit]) <= total
                 && (!ahead(work)
                     || now.saturating_add(forecast(&work.forming, longest).max(compiled)) <= total)
-        };
-        // A dependant's discovery reads nothing of its prerequisites. Its
-        // other work reads their choices and seals them: it starts once no
-        // work of theirs is in flight and none they offer can start, a
-        // lead's conversion included.
-        let settled = |unit: usize| {
-            units[unit].prerequisites().iter().all(|prerequisite| {
-                sealed[*prerequisite]
-                    || !(flying(*prerequisite)
-                        || offers.iter().any(|(offering, work)| {
-                            offering == prerequisite
-                                && (work.stage == Stage::Discovery
-                                    || (!starved[*offering]
-                                        && !barred[*offering]
-                                        && fits(*offering, work)))
-                        }))
-            })
         };
         let objective_ready = U::objective_ready(units);
         let discovering = offers.iter().any(|(unit, work)| {
@@ -1328,7 +1268,7 @@ pub(crate) fn allocate<U: Unit>(
                     let began = clock.now();
                     if began
                         .saturating_add(own.narrow(longest))
-                        .saturating_add(reserved[unit])
+                        .saturating_add(owed[unit])
                         > total
                     {
                         continue;
@@ -1405,7 +1345,7 @@ pub(crate) fn allocate<U: Unit>(
         let performing = clock.now();
         // Preserve the original cutoff and terminal obligations even when
         // admitted work waits behind an underestimated piece.
-        let performed = units[unit].perform(context, total.saturating_sub(reserved[unit]));
+        let performed = units[unit].perform(context, total.saturating_sub(owed[unit]));
         starved.fill(false);
         alone.fill(false);
         published[unit] = false;
@@ -3065,38 +3005,6 @@ mod tests {
             report.ended,
             report.admitted.iter().map(|admitted| admitted.actual).sum()
         );
-    }
-
-    /// A cheap dependant does not freeze a prerequisite of real weight: it
-    /// runs once the prerequisite has no work left that fits, and what it
-    /// takes was held back for it, so the prerequisite searches to the
-    /// budget less the dependant's piece and the dependant still runs.
-    /// Before, the dependant started once its piece ranked first and
-    /// sealed the prerequisite a few challengers in.
-    #[test]
-    fn a_dependant_runs_after_its_prerequisites_search_within_what_was_held_for_it() {
-        let clock = Fake::default();
-        let mut units = [
-            Synthetic::new(0, &clock, 0.9, &[1.; 200]),
-            Synthetic {
-                prerequisites: vec![0],
-                ..Synthetic::new(1, &clock, 0.1, &[1.])
-            },
-        ];
-        let (log, report) = run(&mut units, &clock, 60);
-        let log = stages(&log);
-        let dependant = log
-            .iter()
-            .position(|step| *step == (1, Stage::Measure))
-            .expect("the dependant's piece runs within the budget");
-        assert!(
-            log[dependant..].iter().all(|(unit, _)| *unit != 0),
-            "{log:?}"
-        );
-        // Two discoveries and the dependant's piece leave the prerequisite
-        // the rest of the minute, a second a challenger.
-        assert!(units[0].measured.len() >= 55, "{}", units[0].measured.len());
-        assert!(report.ended <= SECOND * 60, "{:?}", report.ended);
     }
 
     /// Work of a class never observed has no price. It is ranked and
