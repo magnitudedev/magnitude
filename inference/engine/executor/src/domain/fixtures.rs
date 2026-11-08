@@ -1281,9 +1281,6 @@ impl ProgramFamily for TestFamily {
     fn family_graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)> {
         Vec::new()
     }
-    fn family_kept_graphs(&self) -> Vec<(&'static str, seismic::KeptGraphs)> {
-        Vec::new()
-    }
     fn vision_is_bound(&self) -> bool {
         false
     }

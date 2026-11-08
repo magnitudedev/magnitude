@@ -839,12 +839,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.family.family_graph_replays()
     }
 
-    /// The graphs each of the load's graph families keeps on the device,
-    /// beside what its live slots hold for them.
-    pub fn family_kept_graphs(&self) -> Vec<(&'static str, seismic::KeptGraphs)> {
-        self.family.family_kept_graphs()
-    }
-
     /// The expert bank's resizes so far ([`ExpertResizes`]).
     pub fn expert_resizes(&self) -> ExpertResizes {
         ExpertResizes { begun: self.resize_held.begun, running: self.resize_held.runs() }

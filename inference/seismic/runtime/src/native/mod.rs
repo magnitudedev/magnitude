@@ -70,7 +70,7 @@ use crate::driver::{collect_native_access, typed_buffer, write_zeros, Allocation
 pub(crate) use crate::formation::FormationClass;
 use crate::formation::{Compile, Keyed, ProgramFormer};
 pub use budget::{Footprint, Linear, Observed, Quote};
-pub use graph_replays::{GraphReplays, KeptGraphs};
+pub use graph_replays::GraphReplays;
 pub use point::{GraphPending, GraphPoint, GraphTiming, KernelPoint, Point, PointPending};
 pub use spans::NativeSpans;
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};
@@ -264,20 +264,6 @@ impl NativeState {
         #[cfg(not(target_os = "macos"))]
         let counts = counts.plus(self.vulkan_replays.plan_counts(plan));
         counts
-    }
-
-    /// The graphs the device keeps of the shapes of `plans`' runs, of
-    /// every kind [`Self::plan_graph_replays`] counts: every one, and one
-    /// of each shape.
-    pub(crate) fn kept_graphs_of(&self, plans: &std::collections::HashSet<u64>) -> (GraphCensus, GraphCensus) {
-        let kept = self.cuda_replays.kept_of(plans);
-        #[cfg(not(target_os = "macos"))]
-        let kept = {
-            let (graphs, shapes) = self.vulkan_replays.kept_of(plans);
-            let plus = |census: GraphCensus, other| census.plus(other).expect("kept graphs' census fits u64");
-            (plus(kept.0, graphs), plus(kept.1, shapes))
-        };
-        kept
     }
 
     /// What the graphs the device keeps may be made of: what every live

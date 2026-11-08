@@ -151,7 +151,7 @@ pub use seismic_runtime::native::tune::{
     Violation, Work, Workers, WorkloadRotation, WrittenRows, COMPARISON_VERSION, GOVERNING_STEP,
 };
 pub use seismic_runtime::native::{
-    Footprint, GraphReplays, KeptGraphs, NativeArtifactIdentity, NativeQueue, Observed, Quote,
+    Footprint, GraphReplays, NativeArtifactIdentity, NativeQueue, Observed, Quote,
 };
 
 /// Result of checking one native entry's element bindings without device
@@ -3950,11 +3950,6 @@ impl NativeGraphFamily {
     /// counts ([`Device::graph_replays`]).
     pub fn graph_replays(&self) -> GraphReplays {
         self.inner.graph_replays()
-    }
-    /// The graphs its plans' runs keep on its device, beside what its live
-    /// slots hold of the device's graph budget for them.
-    pub fn kept_graphs(&self) -> KeptGraphs {
-        self.inner.kept_graphs()
     }
     pub fn workspace_bytes(&self) -> u64 {
         self.inner.workspace_bytes()
