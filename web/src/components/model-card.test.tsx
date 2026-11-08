@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { CatalogLocalModel } from "@magnitudedev/sdk"
 import { Option } from "effect"
 import { ModelCard } from "./model-card"
-import { catalogModel, doesNotFit } from "../../test/models/fixtures"
+import { catalogModel, doesNotFit, fits } from "../../test/models/fixtures"
 
 vi.mock("@magnitudedev/client-common", async importOriginal => ({
   ...await importOriginal<typeof import("@magnitudedev/client-common")>(),
@@ -38,6 +38,13 @@ describe("unified catalog rows", () => {
     expect(html).toContain("more memory than this computer")
     expect(html).toMatch(/<button[^>]*disabled=""/)
     expect(html).not.toContain('role="alert"')
+  })
+  it("leaves the served context to the memory breakdown instead of the card", () => {
+    if (model.servingState._tag !== "Assessed") throw new Error("Expected an assessed fixture")
+    const assessment: typeof fits = { ...fits, profile: { contextLength: 262_144 }, served: { contextLength: 131_072 } }
+    const html = render({ ...model, servingState: { ...model.servingState, assessment } as CatalogLocalModel["servingState"] })
+    expect(html).toContain('aria-label="Memory breakdown"')
+    expect(html).not.toContain("of 256K")
   })
   it("uses the same dash as unavailable speed when the drafter does not fit", () => {
     const html = render({ ...model, drafterWithheld: true })
