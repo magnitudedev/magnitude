@@ -706,12 +706,10 @@ fn metal() -> Option<Device> {
 
 /// A dependant (a streamed layer's route of its resident route) is fixed at
 /// its prerequisite's arithmetic and free in the rest. A round that
-/// searches the prerequisite defers it, registering none of it, and opens
-/// it at every arithmetic it could follow, so its canonical programs are
-/// formed before that round's deadline: the load's mandatory work is all
-/// known once the deadline is set. The next round registers it once, at
-/// the prerequisite's final arithmetic, takes the program formed there,
-/// and forms nothing an earlier round decided.
+/// searches the prerequisite defers it, counting, forming and searching
+/// none of it; the next round registers it once, at the prerequisite's
+/// final arithmetic, forms it there, and forms nothing an earlier round
+/// decided.
 #[test]
 fn a_search_registers_each_dependant_once_at_its_prerequisites_final_arithmetic() {
     let Some(device) = metal() else {
@@ -763,24 +761,11 @@ fn a_search_registers_each_dependant_once_at_its_prerequisites_final_arithmetic(
         let fixed = tuner
             .following(&key, ("dense_output", "dependant"), &implementation, statics.clone())
             .unwrap();
-        match &fixed {
-            Some(fixed) => {
-                tuner.tune(&dependant, &implementation, fixed).unwrap();
-            }
-            None => tuner
-                .anticipate(&dependant, &implementation, &statics, &implementation)
-                .unwrap(),
+        if let Some(fixed) = &fixed {
+            tuner.tune(&dependant, &implementation, fixed).unwrap();
         }
         fixed
     };
-    // Every combination of the dependant's declared arithmetic values, of
-    // which the declaration and the device admit some.
-    let arithmetic = implementation
-        .params
-        .iter()
-        .filter(|parameter| parameter.arithmetic)
-        .map(|parameter| parameter.values.len())
-        .product::<usize>();
     // The round that searches the prerequisite registers no dependant.
     assert_eq!(walk(&mut tuner), None);
     let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
@@ -791,20 +776,12 @@ fn a_search_registers_each_dependant_once_at_its_prerequisites_final_arithmetic(
     assert_eq!(walk(&mut tuner), None);
     let tuner = tuner.search().unwrap();
     assert!(tuner.deferred());
-    // Its programs at every admitted arithmetic, more than the one it
-    // would follow now, are formed by the deadline.
-    assert!(tuner.anticipating.is_empty());
-    assert!((2..=arithmetic).contains(&tuner.anticipated.len()));
-    // The next registers it once, at the promoted arithmetic, whose
-    // program was formed.
+    // The next registers it once, at the promoted arithmetic.
     let mut tuner = tuner.recount();
     let recounted = walk(&mut tuner).expect("the prerequisite is decided");
     assert_eq!(recounted.param("BATCH_FROM"), Some(3));
     assert_eq!(recounted.param("TALL"), None);
-    let formed = unit_key("dense_output", "dependant".into(), &recounted);
-    assert!(tuner.anticipated.contains_key(&formed));
     let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
-    assert!(!tuner.anticipated.contains_key(&formed), "the next round took the formed program");
     assert_eq!(
         (prerequisite.formations.get(), dependant.formations.get()),
         (1, 1)
@@ -812,7 +789,6 @@ fn a_search_registers_each_dependant_once_at_its_prerequisites_final_arithmetic(
     walk(&mut tuner);
     let tuner = tuner.search().unwrap();
     assert!(!tuner.deferred());
-    assert!(tuner.anticipated.is_empty(), "the last round keeps no program it did not take");
 }
 
 fn fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {

@@ -263,15 +263,8 @@ first. Its comparison and retained identity use the finalized prerequisites, not
 census defaults that may subsequently change. Dependency ordering shares the same allowance.
 A unit that follows another's arithmetic (a streamed layer's route keeps its resident route's
 bits) is the same: a round that searches the prerequisite registers no part of it, and the next
-round registers it once, at the prerequisite's final choice. Its canonical program is formed
-before then: the round that defers it opens it at every choice its prerequisite can end at,
-followed as the next round follows it, and their compiles are that round's spare work. A spare
-compile starts only on a worker no priced compile is waiting for, while the device measures, and
-only where a compile thread's host bytes fit; the allocator ends its priced work early enough for
-the spare compiles left to end inside the allowance. The next round takes the program formed at
-the final choice and compiles nothing, so every compile a first load owes is known once its
-deadline is set; the first round's work ends early enough for that round's walks to finish inside
-the allowance.
+round registers it once, at the prerequisite's final choice. The first round's work ends early
+enough for that round's walks and canonical compiles to finish inside the allowance.
 
 The canonical default is a distinguished legal outcome when optional search or coverage cannot
 finish. It is recorded as a default, with any unmeasured scope still explicit. A nondefault

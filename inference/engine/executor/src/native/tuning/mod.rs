@@ -2586,22 +2586,6 @@ pub(super) fn arithmetic_of(
         .collect()
 }
 
-/// A follower of `implementation` at `fixed`, following its prerequisite's
-/// `choice`: each of its arithmetic parameters at the choice's value. The
-/// one construction of a follower's statics, for the round that follows a
-/// prerequisite's choice and the one that anticipates it
-/// ([`Tuner::following`], [`Tuner::anticipate`]). Fails with the name of a
-/// parameter the choice lacks.
-pub(super) fn followed(
-    implementation: &NativeImplementation,
-    fixed: NativeSpecialization,
-    choice: &NativeSpecialization,
-) -> Result<NativeSpecialization, String> {
-    Ok(arithmetic_of(implementation, choice)?
-        .into_iter()
-        .fold(fixed, |fixed, (name, value)| fixed.with_param(name, value)))
-}
-
 /// Where a preparation's tuning is. One [`Tuner`] walks the program once per
 /// phase.
 enum Phase<'a> {
@@ -3615,27 +3599,13 @@ pub(crate) struct Tuner<'a> {
     /// at its prerequisite's final choice ([`Self::deferred`]).
     deferred: std::collections::HashSet<TuningKey>,
     /// When this round's count began, on the tuning clock, and what its
-    /// count walk and mandatory phase took: they price the walks of the
-    /// round that registers its deferred dependants
-    /// ([`Self::deferred_round`]).
+    /// count walk and mandatory phase took, with the longest canonical
+    /// compile it ran: they price the round that forms its deferred
+    /// dependants ([`Self::deferred_round`]).
     round_began: Duration,
     round_counted: Duration,
     round_mandatory: Duration,
-    /// The longest canonical compile this round's mandatory phase ran:
-    /// what each anticipated compile is taken to take before one has ended
-    /// ([`Self::search`]).
     round_compile: Duration,
-    /// Each deferred dependant at every arithmetic its prerequisite could
-    /// end at, opened by this round's count ([`Self::anticipate`]): their
-    /// canonical compiles run beside this round's search.
-    anticipating: Vec<(TuningKey, Box<dyn CanonicalUnit>)>,
-    /// What those compiles formed, by unit (none for a unit whose program
-    /// forms where it is grounded): the next round's mandatory phase takes
-    /// its dependants' from here and compiles nothing.
-    anticipated: HashMap<TuningKey, Option<seismic::Grounded>>,
-    /// This round follows one that deferred dependants: everything its
-    /// mandatory phase forms was formed before the last round's deadline.
-    recounted: bool,
     /// The mandatory compiles this load has run: a wave runs no more at
     /// once than have been observed ([`Self::census`]).
     compiled: usize,
@@ -3688,18 +3658,7 @@ struct Staff<'a> {
 /// the search prepares.
 enum Mandatory<'a> {
     Canonical(Option<seismic::Grounding>),
-    /// A follower's canonical program, formed while an earlier round's
-    /// search ran ([`Tuner::anticipate`]).
-    Anticipated(Option<seismic::Grounded>),
     Untuned(UntunedFormation<'a>),
-}
-
-/// The anticipated compiles a search queued as spare work
-/// ([`Tuner::form_anticipated`]): what they report their ends on, and how
-/// many there are.
-struct Anticipated {
-    receiver: std::sync::mpsc::Receiver<(TuningKey, seismic::Grounded)>,
-    forming: usize,
 }
 
 /// What one compile of the mandatory phase formed: a unit's canonical
@@ -3757,9 +3716,13 @@ impl<'a> Tuner<'a> {
                 prerequisite.0, prerequisite.1
             )
         })?;
-        followed(implementation, fixed, choice)
-            .map(Some)
-            .map_err(|name| format!("its prerequisite {} has no parameter `{name}`", prerequisite.0))
+        let arithmetic = arithmetic_of(implementation, choice)
+            .map_err(|name| format!("its prerequisite {} has no parameter `{name}`", prerequisite.0))?;
+        Ok(Some(
+            arithmetic
+                .into_iter()
+                .fold(fixed, |fixed, (name, value)| fixed.with_param(name, value)),
+        ))
     }
 
     /// Whether this round deferred a dependant ([`Self::following`]): the
@@ -3770,10 +3733,10 @@ impl<'a> Tuner<'a> {
     }
 
     /// What the round after this one takes before its search, priced from
-    /// this round's: its count, a walk of the same plan, and its census,
-    /// this round's census per unit it measured, for each deferred
-    /// dependant. Its mandatory phase compiles nothing: every dependant's
-    /// program forms beside this round's search ([`Self::anticipate`]).
+    /// this round's: its count, a walk of the same plan; its census, this
+    /// round's census per unit it measured, for each deferred dependant;
+    /// and its mandatory phase, their canonical compiles in the waves the
+    /// compile threads afford, each as long as this round's longest.
     /// Nothing while no dependant was deferred.
     fn deferred_round(&self) -> Duration {
         let deferred = self.deferred.len() as u32;
@@ -3785,132 +3748,11 @@ impl<'a> Tuner<'a> {
             .elapsed()
             .saturating_sub(self.round_began + self.round_counted + self.round_mandatory);
         let measured = self.opened.len().max(1) as u32;
-        self.round_counted + census * deferred / measured
-    }
-
-    /// Open `case`'s unit, a dependant this round deferred at `fixed` (its
-    /// static values), at every choice its prerequisite (of
-    /// `prerequisite`) can end at: each combination of the prerequisite's
-    /// declared values of the dependant's arithmetic parameters, followed
-    /// as the next round follows it ([`followed`]). Whichever it ends at,
-    /// the next round finds the dependant's canonical program formed. Their
-    /// compiles run as spare work beside this round's search
-    /// ([`Self::search`]). Each unit is opened once.
-    pub(super) fn anticipate<T: EntryTuning>(
-        &mut self,
-        case: &T,
-        implementation: &NativeImplementation,
-        fixed: &NativeSpecialization,
-        prerequisite: &NativeImplementation,
-    ) -> Result<(), CatalogFailure> {
-        if !matches!(self.phase, Phase::Count { .. }) {
-            return Ok(());
-        }
-        let entry = <T::Entry as seismic::Entry>::NAME;
-        let bindings = case.bindings();
-        let failure = |outcome: String| CatalogFailure::Tuning {
-            entry,
-            bindings: bindings.clone(),
-            outcome,
-        };
-        // A prerequisite without one of the parameters is no prerequisite
-        // the next round can follow: it fails there, as it would unseen.
-        let Some(choices) = implementation
-            .params
-            .iter()
-            .filter(|parameter| parameter.arithmetic)
-            .try_fold(vec![NativeSpecialization::new()], |choices, parameter| {
-                let values = &prerequisite
-                    .params
-                    .iter()
-                    .find(|declared| declared.name == parameter.name)?
-                    .values;
-                Some(
-                    choices
-                        .iter()
-                        .flat_map(|choice| {
-                            values
-                                .iter()
-                                .map(|value| choice.clone().with_param(parameter.name.clone(), *value))
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            })
-        else {
-            return Ok(());
-        };
-        let offered = offered(case, self.device).map_err(failure)?;
-        let requirement = self.context.numerical_profile.requirement(&case.entry());
-        for choice in choices {
-            let statics = followed(implementation, fixed.clone(), &choice)
-                .expect("a choice of every arithmetic parameter is followed");
-            let key = unit_key(entry, bindings.clone(), &statics);
-            // An arithmetic the declaration or the device rules out is no
-            // choice a prerequisite can end at here.
-            if implementation.admits(&statics).is_err()
-                || offered.default_specialization(&statics).is_err()
-                || self.anticipated.contains_key(&key)
-                || self.anticipating.iter().any(|(anticipating, _)| *anticipating == key)
-            {
-                continue;
-            }
-            let shapes = self.shapes(case, &key, &statics)?;
-            let search = case
-                .open(self.device, &statics, requirement.clone())
-                .map_err(|error| failure(error.to_string()))?;
-            let cases: UnitCases<T::Case> = UnitCases {
-                points: shapes.iter().map(|_| None).collect(),
-                guard: None,
-            };
-            self.anticipating.push((
-                key,
-                Box::new(PreparedUnit {
-                    case: case.clone(),
-                    shapes,
-                    search,
-                    cases,
-                    mandatory: Duration::ZERO,
-                }),
-            ));
-        }
-        Ok(())
-    }
-
-    /// The canonical compiles of the units [`Self::anticipate`] opened, as
-    /// spare work for the search's workers, and what reports their ends
-    /// ([`Self::anticipated_formed`]). A unit whose program forms where it
-    /// is grounded has none, and is formed already.
-    fn form_anticipated(
-        &mut self,
-    ) -> Result<(Vec<Box<dyn FnOnce() + Send>>, Anticipated), CatalogFailure> {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let mut jobs = Vec::<Box<dyn FnOnce() + Send>>::new();
-        for (key, mut unit) in std::mem::take(&mut self.anticipating) {
-            match unit.grounding().map_err(|error| unit_failure(&key, error))? {
-                Some(grounding) => {
-                    let sender = sender.clone();
-                    jobs.push(Box::new(move || {
-                        // The search reads every compile it queued.
-                        let _ = sender.send((key, grounding.run()));
-                    }));
-                }
-                None => {
-                    self.anticipated.insert(key, None);
-                }
-            }
-        }
-        let forming = jobs.len();
-        Ok((jobs, Anticipated { receiver, forming }))
-    }
-
-    /// The anticipated compiles' ends, each kept for the next round: the
-    /// allocator ran every one to its end before it ended.
-    fn anticipated_formed(&mut self, Anticipated { receiver, forming }: Anticipated) {
-        let formed = receiver
-            .try_iter()
-            .map(|(key, formed)| self.anticipated.insert(key, Some(formed)))
-            .count();
-        assert_eq!(formed, forming, "every anticipated compile ended within the search");
+        let threads = self
+            .memory
+            .compile_threads(self.device)
+            .map_or(deferred, |threads| threads.max(1) as u32);
+        self.round_counted + census * deferred / measured + self.round_compile * deferred.div_ceil(threads)
     }
 
     /// Another round of the search, after a search that deferred a
@@ -3928,7 +3770,6 @@ impl<'a> Tuner<'a> {
         self.opened.clear();
         self.deferred.clear();
         self.round_began = self.started.elapsed();
-        self.recounted = true;
         self.staff = Some(Staff::of(self.device));
         self
     }
@@ -4117,9 +3958,6 @@ impl<'a> Tuner<'a> {
             round_counted: Duration::ZERO,
             round_mandatory: Duration::ZERO,
             round_compile: Duration::ZERO,
-            anticipating: Vec::new(),
-            anticipated: HashMap::new(),
-            recounted: false,
             compiled: 0,
             digests: std::cell::RefCell::new(HashMap::new()),
             composed_counted: std::collections::HashSet::new(),
@@ -4246,29 +4084,17 @@ impl<'a> Tuner<'a> {
         let began = self.started.elapsed();
         self.round_counted = began.saturating_sub(self.round_began);
         let untuned_programs = untuned.len();
-        // A round after a deferral compiles nothing: each of its units, a
-        // dependant, was formed beside the last round's search at whatever
-        // arithmetic its prerequisite could end at.
-        let mut canonical = Vec::with_capacity(searching.len());
-        for key in &searching {
-            let grounding = self
-                .prepared
-                .get_mut(key)
-                .expect("counted unit has its opened search")
-                .grounding()
-                .map_err(|error| unit_failure(key, error))?;
-            canonical.push(match self.anticipated.remove(key) {
-                Some(formed) => Mandatory::Anticipated(formed),
-                None if self.recounted && grounding.is_some() => panic!(
-                    "{} [{}]: a round after a deferral would compile a program no earlier round formed",
-                    key.0, key.1
-                ),
-                None => Mandatory::Canonical(grounding),
-            });
-        }
-        let groundings = canonical
-            .into_iter()
-            .map(|mandatory| Ok::<_, CatalogFailure>(std::sync::Mutex::new(Some(mandatory))))
+        let mut compile = Duration::ZERO;
+        let groundings = searching
+            .iter()
+            .map(|key| {
+                self.prepared
+                    .get_mut(key)
+                    .expect("counted unit has its opened search")
+                    .grounding()
+                    .map(|grounding| std::sync::Mutex::new(Some(Mandatory::Canonical(grounding))))
+                    .map_err(|error| unit_failure(key, error))
+            })
             .chain(
                 untuned.into_formations().into_iter().map(|formation| {
                     Ok(std::sync::Mutex::new(Some(Mandatory::Untuned(formation))))
@@ -4285,7 +4111,6 @@ impl<'a> Tuner<'a> {
             Mandatory::Canonical(grounding) => {
                 MandatoryFormed::Canonical(grounding.map(seismic::Grounding::run))
             }
-            Mandatory::Anticipated(grounded) => MandatoryFormed::Canonical(grounded),
             Mandatory::Untuned(formation) => {
                 let began = Instant::now();
                 let formed = formation();
@@ -4372,7 +4197,6 @@ impl<'a> Tuner<'a> {
                 forming_seconds: untuned_forming.as_secs_f64(),
             });
         }
-        let mut compile = Duration::ZERO;
         for (key, grounded) in searching.iter().zip(grounded) {
             let MandatoryFormed::Canonical(grounded) = grounded else {
                 unreachable!("the canonical compiles come first");
@@ -4510,13 +4334,6 @@ impl<'a> Tuner<'a> {
             ));
         }
         let longest = self.longest;
-        // The deferred dependants' canonical compiles are the search's
-        // spare work: they run on threads no piece's compile takes while
-        // the device measures, held to a compile thread's host bytes, and
-        // end within the budget, so the next round forms nothing. Each is
-        // taken to take this round's longest canonical compile until one
-        // has ended.
-        let (spare, anticipated) = self.form_anticipated()?;
         // The pieces' compiles run on the load's worker threads while the
         // device measures; each started runs to its end.
         let mut threads = allocation::Threads::new(
@@ -4525,15 +4342,8 @@ impl<'a> Tuner<'a> {
             seismic::Forming::threads,
             self.memory.compile_host_bytes,
         );
-        threads.spare(spare, self.round_compile);
         let (report, outcome) =
             allocation::allocate(&mut units, &mut self, &clock, &mut threads, budget, longest);
-        self.anticipated_formed(anticipated);
-        // A round that deferred nothing is the last: what it did not take
-        // serves no arithmetic any prerequisite ended at.
-        if self.deferred.is_empty() {
-            self.anticipated.clear();
-        }
         self.memory.compile_host_bytes = self
             .memory
             .compile_host_bytes
