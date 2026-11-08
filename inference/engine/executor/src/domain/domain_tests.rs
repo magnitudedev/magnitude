@@ -1961,6 +1961,42 @@ fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
     assert_eq!(pace.motions().release, Some(crate::platform::ReleaseRate::new(GB as f64 / 0.15)));
 }
 
+/// A shrink's wait for the steps queued on the device is latency, never
+/// release time: an M4 Pro's 18.9 MB table release waited 164.3 ms of its
+/// 165.4 ms for a gap. Read over the whole span, its 114 MB/s rate made the
+/// device deficit of a Flash Next bank 1.82 TB on a 48 GB machine, and the
+/// bank shrank from 185 slots to its floor; at a 10 GB/s take, a 20 GB
+/// bank's margin would be 1.7 TB.
+#[test]
+fn a_release_rate_excludes_its_wait_for_queued_steps() {
+    let start = Instant::now();
+    let us = std::time::Duration::from_micros;
+    let released = start + us(165_410);
+    let times = crate::domain::ResizeTimes {
+        decided: start,
+        queued: us(164_272),
+        planned: Default::default(),
+        trips: Default::default(),
+        moves: Default::default(),
+        prepared: released,
+        installed: released,
+        released,
+    };
+    const TABLE: u64 = 18_874_368;
+    let mut pace = MemoryPace::new();
+    pace.released(TABLE, &times);
+    assert_eq!(pace.horizon(), std::time::Duration::from_millis(100) + 2 * us(165_410), "the wait is latency");
+    let rate = pace.motions().release.expect("a release was measured");
+    assert_eq!(rate, crate::platform::ReleaseRate::new(TABLE as f64 / us(1_138).as_secs_f64()));
+    let bank = 20_000_000_000;
+    let margin = crate::platform::StoreMotion::new(0, 10e9).margin(
+        READING_INTERVAL,
+        times.latency(),
+        Some(crate::platform::Releasing { rate, bytes: bank, store_bytes: 48_000_000_000 }),
+    );
+    assert!(margin < bank, "a margin of {margin} bytes for a {bank}-byte bank");
+}
+
 /// The wait bound is what the host may take from the planning line to the
 /// emergency reserve at the rate it sustains taking now: 8 GB at 1 GB/s is
 /// 8 s. None in a domain taking nothing now, nor in one that grows nothing;
@@ -2038,7 +2074,8 @@ fn a_serving_load_measures_the_hosts_motion_and_its_release_latency() {
     let reserves = crate::platform::MemoryReserves::new(crate::platform::StoreMotion::new(0, GB as f64), crate::platform::ReleaseRate::new(1e9))
         .measured(pace.motions().host, pace.motions().device)
         .with_latency(Duration::from_millis(200));
-    assert_eq!(reserves.host_margin(), GB / 10 + 3 * GB / 2);
+    let m4_pro = seismic::fixtures::recorded::m4_pro();
+    assert_eq!(reserves.host_margin(m4_pro.host_ram()), GB / 10 + 3 * GB / 2);
 }
 
 /// The fluctuation is the largest fall between consecutive readings while

@@ -13,7 +13,7 @@ use magnitude_executor::{
     ExecutionPath,
     platform::{DeviceRequest, MemoryReserves},
 };
-use seismic::{BackendName, Devices, StoreKind};
+use seismic::{BackendName, Devices};
 use std::path::PathBuf;
 
 fn model() -> ResolvedEngineConfiguration {
@@ -66,7 +66,7 @@ impl Window {
         let catalog = Devices::discover(&[]).unwrap();
         let host = catalog.inventory().host_status().unwrap();
         let reserve = MemoryReserves::of_machine(None)
-            .host_thresholds(&StoreKind::HostRam, &host)
+            .host_thresholds(catalog.topology().host_ram(), &host)
             .planning_bytes;
         let used = std::fs::read_to_string(group.join("memory.current"))
             .unwrap()

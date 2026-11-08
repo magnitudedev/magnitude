@@ -1874,10 +1874,14 @@ impl MemoryPace {
     }
 
     /// A release of `bytes` finished, as `times` say: its latency, and its
-    /// rate where it released any.
+    /// rate over the span its bytes took (`ResizeTimes::releasing`) where it
+    /// released any. The margin grows its deficit for the `B / r` runs a
+    /// release of all `B` releasable bytes takes; a rate read over a wait
+    /// any release takes alike would multiply that wait by every byte of
+    /// the bank (a 20 GB bank's margin past a terabyte).
     fn released(&mut self, bytes: u64, times: &ResizeTimes) {
-        self.latency = times.released - times.decided;
-        let seconds = self.latency.as_secs_f64();
+        self.latency = times.latency();
+        let seconds = times.releasing().as_secs_f64();
         if bytes > 0 && seconds > 0.0 {
             let rate = ReleaseRate::new(bytes as f64 / seconds);
             self.release = Some(self.release.map_or(rate, |slowest| slowest.with(rate)));

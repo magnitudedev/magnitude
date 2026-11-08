@@ -131,7 +131,7 @@ impl ModelInstances {
         let topology = environment.catalog.topology();
         let thresholds = match environment.catalog.inventory().host_status() {
             Ok(host) => Fit::host_ram(&topology, &host, &environment.reserves, HostRoom::Allocatable).thresholds,
-            Err(_) => environment.reserves.thresholds(&seismic::StoreKind::HostRam, 0),
+            Err(_) => environment.reserves.thresholds(topology.host_ram(), 0),
         };
         let supervisor = MemorySupervisor::start(
             Arc::clone(&environment.host_memory),

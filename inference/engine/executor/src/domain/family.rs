@@ -465,6 +465,28 @@ pub struct ResizeTimes {
     pub released: std::time::Instant,
 }
 
+impl ResizeTimes {
+    /// The span from its decision to its effect: what the next shrink
+    /// waits before it takes effect.
+    pub fn latency(&self) -> std::time::Duration {
+        self.released - self.decided
+    }
+
+    /// The span its bytes took to release: its latency less its wait for
+    /// the steps queued on the device, which a release of any size waits
+    /// alike and the latency already holds. A shrink of one 18 MB table
+    /// waited 164 ms of its 165 ms for a gap; read over the whole span, that
+    /// is a rate of 114 MB/s where the release itself ran at 17 GB/s.
+    ///
+    /// # Panics
+    /// Where the wait outlasts the span it lies in.
+    pub fn releasing(&self) -> std::time::Duration {
+        self.latency()
+            .checked_sub(self.queued)
+            .expect("invariant violated: a resize's wait for queued steps outlasted its decision-to-effect span")
+    }
+}
+
 /// An ask's trip through the expert watcher, as the submitting thread waits
 /// it out: until the watcher took it up, and its serving.
 #[derive(Clone, Copy, Debug, Default)]

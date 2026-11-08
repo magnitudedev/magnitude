@@ -218,7 +218,7 @@ fn host_ram_fit(store: &Store, host: &HostStatus, reserves: &MemoryReserves, roo
         ),
     };
     let displacing = serving.and_then(|serving| serving.baseline).is_some_and(|baseline| displacing(host, &baseline));
-    let thresholds = reserves.host_thresholds(store.kind(), host);
+    let thresholds = reserves.host_thresholds(store, host);
     let fit = match serving.and_then(|serving| serving.lent) {
         // Allocatable counts as free the RAM the OS made by displacing other
         // programs' data since, which is free only while that data stays out.
@@ -375,9 +375,44 @@ impl StoreMotion {
     /// the rest of the host takes `t·(interval + latency)` before the first
     /// release lands, and while it takes faster than the load releases, the
     /// deficit grows at `t − r` for the `B / r` releasing runs.
+    ///
+    /// The rest of the host never takes more of a store than it holds, so
+    /// the margin of a store a load releases in is at most the store's
+    /// bytes. Its terms are measured rates, of other programs and of the
+    /// load's releases: a margin past the store is a measurement that
+    /// cannot be, reported as an invariant violation with every input
+    /// (a panic in debug and test builds). A release build then holds the
+    /// take before the first release lands, never a line past the store
+    /// that would read every reading as Reclaim and drive the bank to its
+    /// floor.
     pub fn margin(&self, interval: Duration, latency: Duration, releasing: Option<Releasing>) -> u64 {
-        let shortfall = releasing.map_or(0, |releasing| (self.shortfall_ratio(releasing.rate) * releasing.bytes as f64) as u64);
-        self.lead(interval, latency).saturating_add(shortfall)
+        let lead = self.lead(interval, latency);
+        let Some(releasing) = releasing else {
+            return lead;
+        };
+        let shortfall = (self.shortfall_ratio(releasing.rate) * releasing.bytes as f64) as u64;
+        let margin = lead.saturating_add(shortfall);
+        if margin <= releasing.store_bytes {
+            return margin;
+        }
+        tracing::error!(
+            margin,
+            store_bytes = releasing.store_bytes,
+            fluctuation = self.fluctuation,
+            take_rate = self.take_rate,
+            release_rate = releasing.rate.bytes_per_second(),
+            releasable = releasing.bytes,
+            interval = ?interval,
+            latency = ?latency,
+            "invariant violated: a memory margin exceeds the store it is held in"
+        );
+        if cfg!(any(debug_assertions, test)) {
+            panic!(
+                "invariant violated: a margin of {margin} bytes in a store of {} ({self:?}, {releasing:?}, interval {interval:?}, latency {latency:?})",
+                releasing.store_bytes
+            );
+        }
+        lead.min(releasing.store_bytes)
     }
 
     /// The fluctuation and what the host takes before a first release
@@ -460,11 +495,12 @@ impl ReleaseRate {
     }
 }
 
-/// What a load releases in a store: `bytes`, at `rate`.
+/// What a load releases in a store of `store_bytes`: `bytes`, at `rate`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Releasing {
     pub rate: ReleaseRate,
     pub bytes: u64,
+    pub store_bytes: u64,
 }
 
 /// The bytes a serving load can release in host RAM and in its device's own
@@ -710,9 +746,10 @@ impl MemoryReserves {
         self.release
     }
 
-    /// Host RAM's margin over its line ([`StoreMotion::margin`]).
-    pub fn host_margin(&self) -> u64 {
-        self.host.margin(self.interval, self.latency, Some(Releasing { rate: self.release, bytes: self.releasable.host }))
+    /// The margin over `host_ram`'s line ([`StoreMotion::margin`]).
+    pub fn host_margin(&self, host_ram: &Store) -> u64 {
+        let releasing = Releasing { rate: self.release, bytes: self.releasable.host, store_bytes: host_ram.capacity().value };
+        self.host.margin(self.interval, self.latency, Some(releasing))
     }
 
     /// The thresholds of a store of `kind` whose own line is `line` bytes:
@@ -722,11 +759,13 @@ impl MemoryReserves {
     /// # Panics
     /// For a volume, whose reserve is its writer's
     /// ([`super::VolumeReserves`]).
-    pub fn thresholds(&self, kind: &StoreKind, line: u64) -> DomainThresholds {
-        let margin = match kind {
-            StoreKind::HostRam => self.host_margin(),
+    pub fn thresholds(&self, store: &Store, line: u64) -> DomainThresholds {
+        let margin = match store.kind() {
+            StoreKind::HostRam => self.host_margin(store),
             StoreKind::DeviceMemory(_) => self.device.map_or(0, |device| {
-                device.margin(self.interval, self.latency, Some(Releasing { rate: self.release, bytes: self.releasable.device }))
+                let releasing =
+                    Releasing { rate: self.release, bytes: self.releasable.device, store_bytes: store.capacity().value };
+                device.margin(self.interval, self.latency, Some(releasing))
             }),
             StoreKind::Volume(_) => panic!("a volume's reserve is its writer's (`VolumeReserves`), never a load's"),
         };
@@ -734,8 +773,8 @@ impl MemoryReserves {
     }
 
     /// Host RAM's thresholds as `host` reads its line.
-    pub fn host_thresholds(&self, kind: &StoreKind, host: &HostStatus) -> DomainThresholds {
-        self.thresholds(kind, host.free_target.unwrap_or(0))
+    pub fn host_thresholds(&self, host_ram: &Store, host: &HostStatus) -> DomainThresholds {
+        self.thresholds(host_ram, host.free_target.unwrap_or(0))
     }
 
     /// Stable identity of the reserves assessments read, for assessment
@@ -1177,7 +1216,7 @@ impl<'a> Fit<'a> {
             }
             // A device's own memory has no line of its own: the driver keeps
             // its reserve outside what it reports free.
-            kind @ StoreKind::DeviceMemory(_) => (MemoryConstraint::DeviceLocal, self.reserves.thresholds(kind, 0)),
+            StoreKind::DeviceMemory(_) => (MemoryConstraint::DeviceLocal, self.reserves.thresholds(store, 0)),
             // Nor has a volume (`super::volume`): it keeps the margin its
             // writes need, and none where this process writes nothing.
             StoreKind::Volume(volume) => {
@@ -1236,7 +1275,7 @@ impl<'a> Fit<'a> {
             Some(KernelPressure::Critical) => Some(HostEmergency::KernelCritical),
             Some(KernelPressure::Normal | KernelPressure::Warning) => None,
             None => {
-                let thresholds = reserves.host_thresholds(topology.host_ram().kind(), host);
+                let thresholds = reserves.host_thresholds(topology.host_ram(), host);
                 (host.obtainable_bytes() <= thresholds.emergency_bytes)
                     .then_some(HostEmergency::EmergencyReserve)
             }
@@ -1759,7 +1798,7 @@ mod tests {
             .access_path(executor.paths(seismic::Placing::Fixed(kind))[index])
             .unwrap();
         let store = topology.store(path.store()).unwrap();
-        let reserve = reserves().thresholds(store.kind(), 0).planning_bytes;
+        let reserve = reserves().thresholds(store, 0).planning_bytes;
         path.grant().unwrap().value - reserve
     }
 
@@ -2150,7 +2189,7 @@ mod tests {
             free_target: Some(target),
             ..host(MACOS, 0)
         };
-        let planning = reserves.host_thresholds(host_ram.kind(), &host(0)).planning_bytes;
+        let planning = reserves.host_thresholds(host_ram, &host(0)).planning_bytes;
         assert_eq!(planning, 6_870_000_000);
         let served = HostRoom::Load(LoadStage::Serving(Serving { displaced_bytes: 9 * GB, baseline: None, borrows: false, lent: None }));
         let reading = |host: HostStatus| host_ram_fit(host_ram, &host, &reserves, served);
@@ -2186,7 +2225,7 @@ mod tests {
         m4_max.host.value = 64 * GIB;
         let m4_max = seismic::fixtures::topology(&m4_max);
         let host_ram = m4_max.host_ram();
-        let planning = reserves.thresholds(host_ram.kind(), 0).planning_bytes;
+        let planning = reserves.thresholds(host_ram, 0).planning_bytes;
         let grown = epoch();
         let second = |seconds: u64| grown + Duration::from_secs(seconds);
         let at = |ended: Instant, swapped: u64| DisplacementWindow { ended, ..window(1_000, 0, 0, swapped) };
@@ -2269,31 +2308,31 @@ mod tests {
         let motion = StoreMotion::new(GIB, 10e9);
         let unplanned = MemoryReserves::new(motion, crate::platform::ReleaseRate::new(1e9));
         let planned = unplanned.with_latency(Duration::from_millis(400));
-        assert_eq!(unplanned.host_margin(), GIB + 1_000_000_000);
-        assert_eq!(planned.host_margin(), GIB + 5_000_000_000);
         let m4_pro = recorded::m4_pro();
-        let host_ram = m4_pro.host_ram().kind();
+        let host_ram = m4_pro.host_ram();
+        assert_eq!(unplanned.host_margin(host_ram), GIB + 1_000_000_000);
+        assert_eq!(planned.host_margin(host_ram), GIB + 5_000_000_000);
         assert_eq!(
             planned.host_thresholds(host_ram, &macos),
-            DomainThresholds { planning_bytes: target + planned.host_margin(), emergency_bytes: target }
+            DomainThresholds { planning_bytes: target + planned.host_margin(host_ram), emergency_bytes: target }
         );
         assert_eq!(
             planned.host_thresholds(host_ram, &linux),
-            DomainThresholds { planning_bytes: planned.host_margin(), emergency_bytes: 0 }
+            DomainThresholds { planning_bytes: planned.host_margin(host_ram), emergency_bytes: 0 }
         );
         // A host of another size keeps the same line.
         let lunar_lake = recorded::lunar_lake();
-        assert_eq!(planned.host_thresholds(lunar_lake.host_ram().kind(), &macos), planned.host_thresholds(host_ram, &macos));
+        assert_eq!(planned.host_thresholds(lunar_lake.host_ram(), &macos), planned.host_thresholds(host_ram, &macos));
         // A slower measurement lowers nothing; a faster one raises the margin.
         let slower = planned.measured(Some(StoreMotion::new(0, 1e9)), None);
-        assert_eq!(slower.host_margin(), planned.host_margin());
+        assert_eq!(slower.host_margin(host_ram), planned.host_margin(host_ram));
         let faster = planned.measured(Some(StoreMotion::new(0, 20e9)), None);
-        assert_eq!(faster.host_margin(), GIB + 10_000_000_000);
+        assert_eq!(faster.host_margin(host_ram), GIB + 10_000_000_000);
         let rtx3090 = recorded::rtx3090();
         let device = rtx3090.store(device_memory(&rtx3090)).unwrap();
-        assert_eq!(planned.thresholds(device.kind(), 0), DomainThresholds { planning_bytes: 0, emergency_bytes: 0 });
+        assert_eq!(planned.thresholds(device, 0), DomainThresholds { planning_bytes: 0, emergency_bytes: 0 });
         let measured = planned.measured(None, Some(StoreMotion::new(0, 1e9)));
-        assert_eq!(measured.thresholds(device.kind(), 0), DomainThresholds { planning_bytes: 500_000_000, emergency_bytes: 0 });
+        assert_eq!(measured.thresholds(device, 0), DomainThresholds { planning_bytes: 500_000_000, emergency_bytes: 0 });
     }
 
     /// The margin over the take before a first release lands, and while
@@ -2307,7 +2346,7 @@ mod tests {
         let latency = Duration::from_millis(100);
         let motion = StoreMotion::new(MIB, 4e9);
         let lead = MIB + 800_000_000;
-        let releasing = |rate: f64, bytes: u64| Some(Releasing { rate: ReleaseRate::new(rate), bytes });
+        let releasing = |rate: f64, bytes: u64| Some(Releasing { rate: ReleaseRate::new(rate), bytes, store_bytes: 64 * GIB });
         assert_eq!(motion.margin(interval, latency, None), lead);
         for bytes in [0, GIB, 10 * GIB] {
             assert_eq!(motion.margin(interval, latency, releasing(4e9, bytes)), lead, "t ≤ r: no shortfall");
@@ -2320,9 +2359,31 @@ mod tests {
         // A measured release only ever slows the rate the reserves hold.
         let reserves = MemoryReserves::new(motion, ReleaseRate::new(8e9)).with_latency(latency);
         let serving = reserves.releasing(None, Releasable { host: 4 * GIB, device: 0 });
-        assert_eq!(serving.host_margin(), lead);
-        assert_eq!(serving.releasing(Some(ReleaseRate::new(2e9)), Releasable { host: 4 * GIB, device: 0 }).host_margin(), lead + 4 * GIB);
+        let m4_pro = recorded::m4_pro();
+        let host_ram = m4_pro.host_ram();
+        assert_eq!(serving.host_margin(host_ram), lead);
+        assert_eq!(serving.releasing(Some(ReleaseRate::new(2e9)), Releasable { host: 4 * GIB, device: 0 }).host_margin(host_ram), lead + 4 * GIB);
         assert_eq!(serving.releasing(Some(ReleaseRate::new(16e9)), Releasable { host: 4 * GIB, device: 0 }).release_rate(), ReleaseRate::new(8e9));
+    }
+
+    /// The rest of the host never takes more of a store than it holds: a
+    /// margin past it is a measurement that cannot be, an invariant
+    /// violation (a panic in test builds), never a line that would hold the
+    /// whole store. A 114 MB/s release of a 20 GB bank against a 10 GB/s
+    /// take, as a release rate read over its wait for queued steps made it,
+    /// is a 1.7 TB margin in a 48 GB store.
+    #[test]
+    fn a_margin_past_its_store_is_an_invariant_violation() {
+        let motion = StoreMotion::new(0, 10e9);
+        let interval = Duration::from_millis(100);
+        let latency = Duration::from_millis(165);
+        let store_bytes = 48 * GIB;
+        let releasing = |rate: f64| Some(Releasing { rate: ReleaseRate::new(rate), bytes: 20_000_000_000, store_bytes });
+        assert!(motion.margin(interval, latency, releasing(17e9)) < store_bytes, "a release at its work's rate");
+        let impossible = std::panic::catch_unwind(|| motion.margin(interval, latency, releasing(114e6)));
+        let message = impossible.expect_err("a margin past its store panics in test builds");
+        let message = message.downcast_ref::<String>().expect("a formatted invariant message");
+        assert!(message.starts_with("invariant violated: a margin of"), "{message}");
     }
 
     /// A take rate is measured and positive: no motion without one is
@@ -2332,7 +2393,8 @@ mod tests {
         assert!(std::panic::catch_unwind(|| StoreMotion::new(GIB, 0.0)).is_err());
         assert!(std::panic::catch_unwind(|| StoreMotion::new(GIB, f64::NAN)).is_err());
         assert!(serde_json::from_value::<StoreMotion>(serde_json::json!({ "fluctuation": 0, "take_rate": 0.0 })).is_err());
-        assert!(MemoryReserves::new(StoreMotion::new(0, 1e9), crate::platform::ReleaseRate::new(1e9)).host_margin() > 0);
+        let m4_pro = recorded::m4_pro();
+        assert!(MemoryReserves::new(StoreMotion::new(0, 1e9), crate::platform::ReleaseRate::new(1e9)).host_margin(m4_pro.host_ram()) > 0);
     }
 
     /// The machine's page-fill rate is a positive rate, measured once: per
@@ -2982,7 +3044,7 @@ mod tests {
         let limited = status(limited);
         let reading = Fit::new(&topology, &limited, &reserves, HostRoom::Allocatable).store(host_ram.id()).unwrap();
         assert_eq!(reading.capacity_bytes, 4 * GIB);
-        assert_eq!(reading.thresholds, reserves.thresholds(host_ram.kind(), 0));
+        assert_eq!(reading.thresholds, reserves.thresholds(host_ram, 0));
         assert_eq!(reading.stable_bytes, 3 * GIB);
         assert_eq!(
             Fit::host_ram(&topology, &limited.sample.host_ram.clone().unwrap(), &reserves, HostRoom::Allocatable).thresholds,
