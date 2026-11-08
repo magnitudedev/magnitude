@@ -313,6 +313,11 @@ pub struct DeviceHeap {
     /// when it serves; none without one, or where it lies across a link
     /// (a host tier's), whose slots borrow nothing.
     bank: Option<BankRoom>,
+    /// The last reading observed, fresh or published: its status, its
+    /// domains' readings and the process's own charge it read
+    /// ([`Self::charged`]), on which a growth's room is sized while that
+    /// charge stands ([`Self::reserved_rooms`]); none where it failed.
+    observed: Option<(seismic::Status, Vec<DomainReading>, Vec<(seismic::StoreId, u64)>)>,
 }
 
 impl DeviceHeap {
@@ -364,6 +369,7 @@ impl DeviceHeap {
             host_table_bytes: 0,
             room,
             bank: None,
+            observed: None,
         };
         // Nothing the load plans is held yet, nor admitted.
         heap.observe(&status, 0)?;
@@ -492,6 +498,8 @@ impl DeviceHeap {
         let readings =
             crate::platform::refresh_device_ceiling(&self.device, status, &self.reserves, self.room(), planned);
         self.account();
+        let charged = self.charged();
+        self.observed = readings.as_ref().ok().map(|readings| (status.clone(), readings.clone(), charged));
         if let (Ok(readings), Some(bank)) = (&readings, self.bank.as_mut()) {
             let now = std::time::Instant::now();
             for reading in readings.iter().filter(|reading| reading.constraint == MemoryConstraint::HostRam) {
@@ -501,11 +509,17 @@ impl DeviceHeap {
         readings
     }
 
+    /// What the process's own allocations charge each of Seismic's stores
+    /// now.
+    fn charged(&self) -> Vec<(seismic::StoreId, u64)> {
+        self.device.ledgers().own.iter().map(|(store, ledger)| (*store, ledger.charged)).collect()
+    }
+
     /// Refresh the heap's view of Seismic's charge alone, reading no store:
     /// what the process's own claims and releases changed since. The stores
     /// and Seismic's ceiling stand as the last [`Self::refresh`] read them.
     pub fn account(&mut self) {
-        let charged_bytes = self.device.ledgers().own.iter().map(|(_, ledger)| ledger.charged).sum();
+        let charged_bytes = self.charged().into_iter().map(|(_, charged)| charged).sum();
         self.heap
             .observe(MemoryObservation {
                 capacity_bytes: self.capacity_bytes,
@@ -623,20 +637,32 @@ impl DeviceHeap {
     }
 
     /// The most bytes [`Self::claim_reserved`] of `kind` storage beside
-    /// `beside` device bytes admits now in each of `modes`' rooms, from one
-    /// fresh status sample: by halving over [`Self::refusal`], the one test
-    /// of a claim, which never admits more bytes where it refuses fewer, at
-    /// the sample's one fit. Refused while a domain is in the Reclaim band,
-    /// or blind.
+    /// `beside` device bytes admits in each of `modes`' rooms on the last
+    /// reading ([`Self::observe`]) while the process's own charge stands as
+    /// it read it, a fresh one otherwise (a status reads the process's
+    /// allocations with every other program's, so one read before an
+    /// allocation is no status beside it): by halving
+    /// over [`Self::refusal`], the one test of a claim, which never admits
+    /// more bytes where it refuses fewer, at the reading's one fit. The
+    /// claim of what it sized reads the machine afresh, so a size is never
+    /// held on a reading the machine has since left. Refused while a domain
+    /// is in the Reclaim band, or blind.
     pub fn reserved_rooms(&mut self, kind: BankTier, beside: u64, modes: &[FitMode], planned: u64) -> Result<Vec<u64>, ClaimRefusal> {
-        let (status, readings) = self.sample(planned)?;
-        let fit = Fit::new(self.device.topology(), &status, &self.reserves, self.room());
+        let charged = self.charged();
+        if self.observed.as_ref().is_none_or(|(_, _, read)| *read != charged) {
+            self.sample(planned)?;
+        }
+        let (status, readings, _) = self.observed.as_ref().expect("a sample that succeeds is observed");
+        if let Some(refusal) = reclaiming(readings) {
+            return Err(refusal);
+        }
+        let fit = Fit::new(self.device.topology(), status, &self.reserves, self.room());
         modes
             .iter()
             .map(|&mode| {
                 let fits = |bytes: u64| -> Result<bool, ClaimRefusal> {
                     let claim = besides(reserved(kind, bytes), beside)?;
-                    Ok(self.refusal_in(&fit, &readings, claim, 0, mode)?.is_none())
+                    Ok(self.refusal_in(&fit, readings, claim, 0, mode)?.is_none())
                 };
                 if !fits(0)? {
                     return Ok(0);
