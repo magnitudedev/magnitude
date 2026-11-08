@@ -189,6 +189,18 @@ impl Packing {
             .map(|block| block.free.borrow().free_bytes())
             .sum()
     }
+
+    /// What of the blocks no later allocation can use: the free space of
+    /// the blocks allocations hold as their own, which `first_fit` never
+    /// offers again. A shared block's free space is where the next
+    /// allocation that fits it goes.
+    pub fn stranded_bytes(&self) -> u64 {
+        self.blocks
+            .iter()
+            .filter(|block| block.own)
+            .map(|block| block.free.borrow().free_bytes())
+            .sum()
+    }
 }
 
 /// Whether an allocation of `bytes` takes a block of its own, which nothing
@@ -310,6 +322,7 @@ mod tests {
         }
         assert_eq!(packing.held_bytes(), 46 * 344 * MIB);
         assert_eq!(packing.free_bytes(), 46 * (MIB / 2));
+        assert_eq!(packing.stranded_bytes(), 46 * (MIB / 2));
         for _ in 0..100 {
             packing.allocate(MIB / 4, 256).unwrap();
         }
@@ -318,6 +331,8 @@ mod tests {
             packing.free_bytes(),
             46 * (MIB / 2) + FIRST_BLOCK_BYTES - 25 * MIB
         );
+        // The shared block's tail is the next small allocation's.
+        assert_eq!(packing.stranded_bytes(), 46 * (MIB / 2));
     }
 
     /// An allocation of more than half the first block takes a block of its
