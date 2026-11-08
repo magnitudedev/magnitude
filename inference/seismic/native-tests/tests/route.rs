@@ -677,7 +677,7 @@ fn graph_runs_submit_without_waiting_and_keep_their_inputs() {
         graph.export(&second.value).unwrap();
         let plan = graph.seal().unwrap();
         assert!(plan.upload_bytes() >= m * n * 4);
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         // One upload region per run kept in flight below.
         let mut slot = family.new_slot(&[family.upload_bytes(); 3]).unwrap();
         let mut runs = Vec::new();
@@ -1833,10 +1833,10 @@ fn a_sequence_submits_chained_runs_as_one_unit_in_queue_order() {
             .value;
         graph.export(&tripled).unwrap();
         let block = graph.seal().unwrap();
-        let entry_family = NativeGraphFamily::new(&[entry.clone()]).unwrap();
+        let entry_family = NativeGraphFamily::new(&[entry.clone()], 1).unwrap();
         // A launch on the block slot runs the block `blocks` times in one
         // submission, each run replaying a graph of the block's shape.
-        let block_family = NativeGraphFamily::with_launches(&[block.clone()], &[vec![block.clone(); blocks]], &[]).unwrap();
+        let block_family = NativeGraphFamily::with_launches(&[block.clone()], &[vec![block.clone(); blocks]], 1, &[]).unwrap();
         let mut entry_slot = entry_family.new_slot(&[entry_family.upload_bytes()]).unwrap();
         let mut block_slot = block_family.new_slot(&[block_family.upload_bytes()]).unwrap();
         let mut entry_output = Some(entry_family.new_output_slot().unwrap());
@@ -1931,7 +1931,7 @@ fn runs_rebinding_the_same_storage_read_their_own_inputs() {
         let nodes = 6;
         let (m, n) = (4u64, 70u64);
         let (plan, input, value) = scale_chain(&device, nodes, m, n);
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let mut output_slot = family.new_output_slot().unwrap();
         for run in 0..4u64 {

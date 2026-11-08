@@ -4,7 +4,7 @@ use super::{
     classes::{
         BlockOutputScales, BlockServed, FamilyOutline, Passes, StagedClass, Topology, UnreadScales,
         block_class_slice, block_listings, block_routed, block_served, block_split, block_stages,
-        block_upload_regions, chained_once_runs, class_topology, enumerate_block_graphs, LaunchRuns, once_class, once_graphs,
+        block_upload_regions, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class, once_graphs,
         slot_scores,
     },
     entry::{
@@ -37,7 +37,7 @@ use crate::{
 };
 use magnitude_family_contracts::{Decoder, WeightKind};
 use seismic::{
-    BackendName, GraphCensus, HostHeap, LaunchGraphs, NativeGraphClassSlice, NativeGraphLayout,
+    BackendName, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphClassSlice, NativeGraphLayout,
     NativeGraphMetadata,
 };
 use std::collections::BTreeMap;
@@ -667,8 +667,8 @@ impl FamilyLayouts {
         // own run), and, where the class splits at a block (`RunStage::Front`),
         // every graph the block runs once a group (`Stage::Once`, its fill and
         // its passes): a class served whole, as decode is, runs none. A block's
-        // layouts are its shape's first block's. The first launch class, the
-        // fewest rows, is the decode launch.
+        // layouts are its shape's first block's. A decode launch is any of
+        // the launch classes a decode step may take (`decode_launch`).
         let overflow = || GraphError::from("a target family's graph census overflows");
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
         enum Graphed {
@@ -688,11 +688,11 @@ impl FamilyLayouts {
                 .iter()
                 .map(|&(index, staged)| (index, staged, Graphed::Block(outline.first_of_shape(index), class_topology(staged)))),
         );
-        // Each launch's runs of each layout, the first launch class's (the
-        // fewest rows, decode's) its decode, and of each layout the most any
-        // launch makes its union.
+        // Each launch's runs of each layout: of each layout the most any
+        // decode launch makes its decode, and the most any launch makes its
+        // union.
         let mut most = BTreeMap::<Graphed, u64>::new();
-        let mut decode = None;
+        let mut decode = BTreeMap::<Graphed, u64>::new();
         for &class in &enumeration.launch_classes {
             let mut runs = BTreeMap::<Graphed, u64>::new();
             for &source in entries.keys() {
@@ -707,22 +707,24 @@ impl FamilyLayouts {
             for (&graphed, &count) in &runs {
                 let most = most.entry(graphed).or_default();
                 *most = (*most).max(count);
+                if decode_launch(class, limits) {
+                    let decode = decode.entry(graphed).or_default();
+                    *decode = (*decode).max(count);
+                }
             }
-            decode.get_or_insert(runs);
         }
+        let recorded = |graphed: Graphed| -> Result<GraphCensus, GraphError> {
+            let layout = match graphed {
+                Graphed::Entry(source) => &entries[&source],
+                Graphed::PerLayer => per_layer.as_ref().ok_or("a per-layer run has no layout")?,
+                Graphed::Block(index, topology) => &blocks[index].get(&topology).ok_or("a block class has no certified layout")?.layout,
+            };
+            Ok(layout.storage_bytes().recorded)
+        };
         let census = |runs: &BTreeMap<Graphed, u64>| -> Result<GraphCensus, GraphError> {
-            let mut census = GraphCensus::default();
-            for (&graphed, &count) in runs {
-                let layout = match graphed {
-                    Graphed::Entry(source) => &entries[&source],
-                    Graphed::PerLayer => per_layer.as_ref().ok_or("a per-layer run has no layout")?,
-                    Graphed::Block(index, topology) => {
-                        &blocks[index].get(&topology).ok_or("a block class has no certified layout")?.layout
-                    }
-                };
-                census = census.plus(layout.storage_bytes().recorded.times(count).ok_or_else(overflow)?).ok_or_else(overflow)?;
-            }
-            Ok(census)
+            runs.iter().try_fold(GraphCensus::default(), |census, (&graphed, &count)| {
+                census.plus(recorded(graphed)?.times(count).ok_or_else(overflow)?).ok_or_else(overflow)
+            })
         };
         // What a chain of each length beyond one launch further runs of the
         // graphs its split blocks run once a group (`chained_once_runs`),
@@ -744,11 +746,16 @@ impl FamilyLayouts {
             true => Vec::new(),
             false => (2..=limits.chain_capacity.get()).map(chain).collect::<Result<Vec<_>, _>>()?,
         };
-        let graphs = LaunchGraphs {
-            decode: census(&decode.ok_or("a target family has no launch class")?)?,
-            union: census(&most)?,
-            chained,
-        };
+        if decode.is_empty() {
+            return Err("a target family has no decode launch class".into());
+        }
+        let graphs = most
+            .iter()
+            .map(|(&graphed, &runs)| {
+                Ok(LaunchedGraph { graph: recorded(graphed)?, decode_runs: decode.get(&graphed).copied().unwrap_or(0), runs })
+            })
+            .collect::<Result<Vec<_>, GraphError>>()?;
+        let graphs = LaunchGraphs::of(graphs, chained).ok_or_else(overflow)?;
         Ok(TargetFamilyCertificate {
             outline,
             served,

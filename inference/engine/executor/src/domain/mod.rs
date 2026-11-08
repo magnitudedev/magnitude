@@ -834,6 +834,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.family.graph_replays()
     }
 
+    /// [`Self::graph_replays`] by family.
+    pub fn family_graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)> {
+        self.family.family_graph_replays()
+    }
+
     /// The expert bank's resizes so far ([`ExpertResizes`]).
     pub fn expert_resizes(&self) -> ExpertResizes {
         ExpertResizes { begun: self.resize_held.begun, running: self.resize_held.runs() }

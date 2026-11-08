@@ -953,9 +953,14 @@ pub(crate) fn checked_vision_family_resources(
 ) -> Result<CheckedGraphResources, GraphError> {
     let patch_rows = patch_rows.into_iter().collect::<Vec<_>>();
     let program = planned_program(description, load)?;
-    let (storage, _) = certify_vision_family(backend, load, &program, plan, &patch_rows)?;
+    let (storage, layouts) = certify_vision_family(backend, load, &program, plan, &patch_rows)?;
     let constants = Constant::of(&program)?;
     let mut resources = CheckedGraphFamilyResources::new();
+    // Each class's layout, a graph of its own; an encode runs on its own
+    // lane, never in a decode step's launch.
+    for layout in &layouts {
+        resources.include_graph(layout.storage_bytes().recorded, false);
+    }
     for &patches in &patch_rows {
         let rows = tower_rows(&program, patches)?;
         resources.include(
@@ -1297,8 +1302,18 @@ impl PreparedVisionGraphs {
         let (_, layouts) =
             certify_vision_family(target_device.backend(), load, &program, &plan, &patch_rows)
                 .map_err(graph_error)?;
+        // What the planner charged (`checked_vision_family_resources`), of
+        // `layouts`.
+        let planned = |layouts: &mut dyn Iterator<Item = &NativeGraphLayout>| {
+            seismic::LaunchGraphs::of(
+                layouts.map(|layout| seismic::LaunchedGraph { graph: layout.storage_bytes().recorded, decode_runs: 0, runs: 1 }),
+                Vec::new(),
+            )
+            .ok_or_else(|| invalid("vision graph census overflows"))
+        };
+        let family_graphs = planned(&mut layouts.iter())?;
         let mut variants = Vec::new();
-        for (rows, layout) in patch_rows.into_iter().zip(layouts) {
+        for (rows, layout) in patch_rows.into_iter().zip(&layouts) {
             if variants
                 .iter()
                 .any(|variant: &PreparedVisionGraph| variant.patch_rows == rows)
@@ -1306,7 +1321,7 @@ impl PreparedVisionGraphs {
                 return Err(invalid("vision graph patch class is duplicated"));
             }
             let (graph, ports) = vision_graph_draft(
-                target_device.native_graph_with_layout(&layout),
+                target_device.native_graph_with_layout(layout),
                 &handles.kernels,
                 load,
                 &program,
@@ -1316,7 +1331,7 @@ impl PreparedVisionGraphs {
             let plan = graph.seal().map_err(device)?;
             variants.push(PreparedVisionGraph {
                 patch_rows: rows,
-                outputs: NativeGraphFamily::new(std::slice::from_ref(&plan)).map_err(device)?,
+                outputs: super::graph::serial_family([(false, plan.clone())], &planned(&mut std::iter::once(layout))?).map_err(device)?,
                 plan,
                 ports,
             });
@@ -1324,11 +1339,8 @@ impl PreparedVisionGraphs {
         if variants.is_empty() {
             return Err(invalid("vision graph family has no patch class"));
         }
-        let plans = variants
-            .iter()
-            .map(|variant| variant.plan.clone())
-            .collect::<Vec<_>>();
-        let family = NativeGraphFamily::new(&plans).map_err(device)?;
+        let plans = variants.iter().map(|variant| (false, variant.plan.clone()));
+        let family = super::graph::serial_family(plans, &family_graphs).map_err(device)?;
         Ok(Self {
             device: target_device.clone(),
             variants,

@@ -9,7 +9,7 @@ use crate::{
 };
 use magnitude_kernels::copy_rows;
 use seismic::{
-    BackendName, Device, Element, HostHeap, NativeGraphBindings, NativeGraphClassSlice,
+    BackendName, Device, Element, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphBindings, NativeGraphClassSlice,
     NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata, NativeGraphOutputs,
     NativeGraphPlan, NativeGraphStorageBytes, NativePort, Tensor,
 };
@@ -224,7 +224,7 @@ impl PreparedStateCopyGraphs {
         classes: impl IntoIterator<Item = StateCopyGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
-        let (_, layouts) = certify_copy_family(target_device.backend(), &classes)
+        let (_, graphs, layouts) = certify_copy_family(target_device.backend(), &classes)
             .map_err(|error| invalid(error.to_string()))?;
         let planned = copy_family_heap(&classes, &layouts).map_err(invalid)?;
         // The graphs go into a vector of exactly the classes, and each
@@ -263,11 +263,9 @@ impl PreparedStateCopyGraphs {
         if variants.is_empty() {
             return Err(invalid("state copy graph family has no classes"));
         }
-        let plans = variants
-            .iter()
-            .map(|variant| variant.plan.clone())
-            .collect::<Vec<_>>();
-        let family = NativeGraphFamily::new(&plans).map_err(device)?;
+        // A state copy runs on its own lane, never in a decode step's launch.
+        let plans = variants.iter().map(|variant| (false, variant.plan.clone()));
+        let family = super::graph::serial_family(plans, &graphs).map_err(device)?;
         let graphs = Self {
             variants,
             family,
@@ -422,19 +420,19 @@ pub(crate) fn checked_copy_family_storage(
     backend: BackendName,
     classes: impl IntoIterator<Item = StateCopyGraphClass>,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
-    checked_copy_family(backend, classes).map(|(storage, _)| storage)
+    checked_copy_family(backend, classes).map(|(storage, _, _)| storage)
 }
 
-/// The family's storage with the host heap its prepared graphs hold
-/// (`copy_family_heap`): what a load's assessment charges, from the classes
-/// the load prepares.
+/// The family's storage, what its graphs hold, and the host heap its
+/// prepared graphs hold (`copy_family_heap`): what a load's assessment
+/// charges, from the classes the load prepares.
 pub(crate) fn checked_copy_family(
     backend: BackendName,
     classes: impl IntoIterator<Item = StateCopyGraphClass>,
-) -> Result<(NativeGraphStorageBytes, HostHeap), GraphError> {
+) -> Result<(NativeGraphStorageBytes, LaunchGraphs, HostHeap), GraphError> {
     let classes = classes.into_iter().collect::<Vec<_>>();
-    let (storage, layouts) = certify_copy_family(backend, &classes)?;
-    Ok((storage, copy_family_heap(&classes, &layouts)?))
+    let (storage, graphs, layouts) = certify_copy_family(backend, &classes)?;
+    Ok((storage, graphs, copy_family_heap(&classes, &layouts)?))
 }
 
 /// The host heap the prepared state copy graphs of `classes` hold, each
@@ -460,8 +458,11 @@ fn copy_family_heap(
 fn certify_copy_family(
     backend: BackendName,
     classes: &[StateCopyGraphClass],
-) -> Result<(NativeGraphStorageBytes, Vec<NativeGraphLayout>), GraphError> {
+) -> Result<(NativeGraphStorageBytes, LaunchGraphs, Vec<NativeGraphLayout>), GraphError> {
     let mut family: Option<NativeGraphStorageBytes> = None;
+    // Each group's layout, a graph its copies replay, none in a decode
+    // step's launch.
+    let mut graphs = Vec::new();
     let mut layouts = vec![None; classes.len()];
     let mut groups: Vec<Vec<usize>> = Vec::new();
     for (index, class) in classes.iter().enumerate() {
@@ -488,6 +489,7 @@ fn certify_copy_family(
                 .dimension("N", group.iter().map(|&index| classes[index].map_rows))])
         })?;
         let storage = layout.storage_bytes();
+        graphs.push(LaunchedGraph { graph: storage.recorded, decode_runs: 0, runs: 1 });
         match &mut family {
             Some(maximum) => {
                 maximum.workspace = maximum.workspace.max(storage.workspace);
@@ -502,6 +504,7 @@ fn certify_copy_family(
     }
     Ok((
         family.ok_or("state copy graph family has no classes")?,
+        LaunchGraphs::of(graphs, Vec::new()).ok_or("state copy graph census overflows")?,
         layouts.into_iter().map(Option::unwrap).collect(),
     ))
 }

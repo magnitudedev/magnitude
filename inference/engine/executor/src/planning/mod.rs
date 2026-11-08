@@ -810,14 +810,14 @@ pub(crate) mod tests {
             )
             .unwrap();
             assert_eq!(target.group_bytes(3).unwrap(), *checked.group_bytes.at(crate::PassLaunches::whole_chain(limits)), "{backend:?}");
-            let (assessed, chunk) = crate::programs::graph::readout::checked_readout_storage(
+            let ((assessed, _), chunk) = crate::programs::graph::readout::checked_readout_storage(
                 backend,
                 draft.load(),
                 &definition.decoder,
                 limits,
             )
             .unwrap();
-            let chunk = chunk.expect("a served readout has a prompt chunk's classes");
+            let (chunk, _) = chunk.expect("a served readout has a prompt chunk's classes");
             assert_eq!(
                 (readout.chunk_family().workspace_bytes(), readout.chunk_family().output_bytes(), readout.chunk_family().upload_bytes()),
                 (chunk.workspace, chunk.output, chunk.upload),

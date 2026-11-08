@@ -61,7 +61,7 @@ fn a_stored_result_is_written_into_the_bound_tensor() {
         let plan = graph.seal().unwrap();
         // Only the exported result has storage of its own.
         assert_eq!(plan.output_bytes(), m * n * 4, "{backend:?}");
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
 
         let values = (0..m * n).map(|value| value as f32).collect::<Vec<_>>();

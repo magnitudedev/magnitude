@@ -34,7 +34,7 @@ fn a_sampled_run_reads_the_device_time_between_its_marks() {
         assert_eq!(marks, [0, 1, 2]);
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         assert_eq!(family.graphs().decode.graphs, 1, "{backend:?}: a mark adds no graph");
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let tensor = Tensor::zeros(&device, Element::f32(), &[rows, width]).unwrap();

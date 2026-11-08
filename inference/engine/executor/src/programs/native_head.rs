@@ -1343,6 +1343,8 @@ fn certify_head_family(
             .certify(&slices)
             .map_err(|error| GraphError::from(error).context(format!("head class {largest:?}")))?;
         family.include(layout.storage_bytes(), []);
+        // A head launch runs on its own lane, never in a decode step's.
+        family.include_graph(layout.storage_bytes().recorded, false);
         for &class in &group {
             if class.steps > 0 && matches!(binding.feed_forward, FeedForwardProgramSlot::Dense(_)) {
                 family.include(
@@ -1416,7 +1418,7 @@ impl PreparedHeadGraphs {
             .first()
             .ok_or_else(|| invalid("attested head block is absent"))?
             .binding;
-        let (_, layouts) = certify_head_family(
+        let (resources, layouts) = certify_head_family(
             target_device.backend(),
             load,
             geometry,
@@ -1445,11 +1447,8 @@ impl PreparedHeadGraphs {
         if prepared.is_empty() {
             return Err(invalid("head graph family has no classes"));
         }
-        let plans = prepared
-            .values()
-            .map(|graph| graph.plan.clone())
-            .collect::<Vec<_>>();
-        let family = NativeGraphFamily::new(&plans).map_err(device)?;
+        let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
+        let family = super::graph::serial_family(plans, &resources.graphs).map_err(device)?;
         Ok(Self {
             conditioning_bytes: load.residual_conditioning().map_or(
                 geometry.hidden as usize * geometry.activation_dtype.bytes(),

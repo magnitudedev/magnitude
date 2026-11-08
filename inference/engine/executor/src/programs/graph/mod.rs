@@ -63,6 +63,26 @@ impl From<&str> for GraphError {
     }
 }
 
+/// The family of `graphs`' plans, each launch one run of one of them, those
+/// a decode step's launch runs (`decodes`) leading: its census is within
+/// what the planner charged for it (`planned`, of the same graphs through
+/// `seismic::LaunchGraphs::of`), which an exceeding one violates.
+pub(crate) fn serial_family(
+    graphs: impl IntoIterator<Item = (bool, seismic::NativeGraphPlan)>,
+    planned: &seismic::LaunchGraphs,
+) -> Result<seismic::NativeGraphFamily, seismic::WorkflowError> {
+    let (decode, rest): (Vec<_>, Vec<_>) = graphs.into_iter().partition(|(decodes, _)| *decodes);
+    let decodes = decode.len();
+    let plans = decode.into_iter().chain(rest).map(|(_, plan)| plan).collect::<Vec<_>>();
+    let family = seismic::NativeGraphFamily::new(&plans, decodes)?;
+    assert!(
+        family.graphs().within(planned),
+        "invariant violated: a family's sealed graphs, {:?}, exceed what the planner charged, {planned:?}",
+        family.graphs()
+    );
+    Ok(family)
+}
+
 /// The structural form a row class selects in every row-dependent branch of
 /// graph construction. The topology code branches on these same predicates,
 /// so classes of equal form share node order, edges and exports, and one

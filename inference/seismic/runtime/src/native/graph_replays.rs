@@ -122,15 +122,17 @@ struct Replay<G> {
     graphs: Vec<Instance<G>>,
     /// The plans the graphs' kernels belong to, kept loaded while they live.
     _retained: Arc<dyn Any + Send + Sync>,
-    /// The graphs of it kept for each launch in flight ([`Replays::ensure`]).
-    pinned: Option<Pinned>,
+    /// The graphs of it kept for each launch in flight, one demand for each
+    /// family that runs it, by its `flights` ([`Replays::ensure`]): a
+    /// shape two families run is kept for both families' launches.
+    pinned: Vec<Pinned>,
 }
 
-/// Graphs of a shape kept whatever the budget: `per_flight` for each of
-/// `flights`, a family's live slots, each a launch in flight. The family's
-/// hold counts them (`LaunchGraphs::held`: a decode launch's graphs for
-/// each launch beside one, and within the union for that one), so a
-/// release never needs them.
+/// Graphs of a shape kept whatever the budget for one family: `per_flight`
+/// for each of `flights`, its live slots, each a launch in flight. The
+/// family's hold counts them (`LaunchGraphs::held`: a decode launch's
+/// graphs for each launch beside one, and within the union for that one),
+/// so a release never needs them.
 struct Pinned {
     per_flight: usize,
     flights: Arc<std::sync::atomic::AtomicUsize>,
@@ -139,7 +141,18 @@ struct Pinned {
 impl<G> Replay<G> {
     /// The graphs of it no release takes.
     fn pinned(&self) -> usize {
-        self.pinned.as_ref().map_or(0, |pinned| pinned.per_flight * pinned.flights.load(std::sync::atomic::Ordering::Acquire))
+        self.pinned.iter().map(Pinned::kept).sum()
+    }
+
+    /// What every family but the one of `flights` keeps of it.
+    fn pinned_beside(&self, flights: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+        self.pinned.iter().filter(|pinned| !Arc::ptr_eq(&pinned.flights, flights)).map(Pinned::kept).sum()
+    }
+}
+
+impl Pinned {
+    fn kept(&self) -> usize {
+        self.per_flight * self.flights.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -257,9 +270,11 @@ impl<G: RecordedGraph> Replays<G> {
 
     /// Keep `per_flight` graphs of shape `key` for each of `flights`, those
     /// a launch of `per_flight` runs of it takes for each launch in flight,
-    /// recorded ahead of them (`record`, after `prepare`, which runs only
-    /// where one is to be recorded), each bound to nothing until its first
-    /// replay; no release takes them while `flights` stands ([`Pinned`]).
+    /// beside what every other family running it keeps, recorded ahead of
+    /// them (`record`, after `prepare`, which runs only where one is to be
+    /// recorded), each bound to nothing until its first replay; no release
+    /// takes them while `flights` stands ([`Pinned`]), and this demand
+    /// replaces only the one of the same `flights`, its family's.
     /// Graphs beyond `budget` that it does not keep are released, the least
     /// recently replayed first; its own past it break an invariant.
     pub(crate) fn ensure(
@@ -274,19 +289,22 @@ impl<G: RecordedGraph> Replays<G> {
     ) -> Result<(), seismic_compiler::errors::ExecutionError> {
         let lock = || self.entries.lock().expect("native graph replays lock is never poisoned");
         let kept = |entries: &ReplayEntries<G>| entries.graphs.get(key).map_or(0, |replay| replay.graphs.len());
-        let count = per_flight * flights.load(std::sync::atomic::Ordering::Acquire);
+        let beside = |entries: &ReplayEntries<G>| entries.graphs.get(key).map_or(0, |replay| replay.pinned_beside(flights));
         let mut entries = lock();
+        let mut count = beside(&entries) + per_flight * flights.load(std::sync::atomic::Ordering::Acquire);
         if kept(&entries) < count {
             drop(entries);
             prepare()?;
             entries = lock();
+            count = beside(&entries) + per_flight * flights.load(std::sync::atomic::Ordering::Acquire);
         }
         for _ in kept(&entries)..count {
             let graph = record()?;
             self.keep(&mut entries, key, graph, None, retained);
         }
         if let Some(replay) = entries.graphs.get_mut(key) {
-            replay.pinned = Some(Pinned { per_flight, flights: flights.clone() });
+            replay.pinned.retain(|pinned| !Arc::ptr_eq(&pinned.flights, flights));
+            replay.pinned.push(Pinned { per_flight, flights: flights.clone() });
         }
         let own = entries.graphs.get(key).map(|replay| replay.graphs.iter().map(|instance| instance.identity).collect::<Vec<_>>()).unwrap_or_default();
         Self::fit(&mut entries, &own, budget);
@@ -313,7 +331,7 @@ impl<G: RecordedGraph> Replays<G> {
         entries
             .graphs
             .entry(key.to_vec())
-            .or_insert_with(|| Replay { graphs: Vec::new(), _retained: retained.clone(), pinned: None })
+            .or_insert_with(|| Replay { graphs: Vec::new(), _retained: retained.clone(), pinned: Vec::new() })
             .graphs
             .push(Instance { identity, graph, bound, used });
         identity
@@ -621,6 +639,29 @@ mod tests {
         flights.store(0, std::sync::atomic::Ordering::Release);
         submit(&replays, &[shaped(4, 0), shaped(5, 0)], budget, |_| ());
         assert_eq!(kept(&replays), vec![vec![4], vec![5]], "with no launch in flight it is released");
+    }
+
+    /// A shape two families run is kept for both families' launches in
+    /// flight: one family's demand adds to the other's, and its launches
+    /// ending releases only its own share.
+    #[test]
+    fn a_shape_two_families_run_is_kept_for_both() {
+        let replays = Replays::<Graph<false>>::default();
+        let budget = |graphs: u64| GraphCensus { graphs, launches: 4 * graphs, arguments: 64 * graphs, largest: 16 };
+        let (first, second) = (Arc::new(std::sync::atomic::AtomicUsize::new(2)), Arc::new(std::sync::atomic::AtomicUsize::new(1)));
+        replays.ensure(&[0], 1, &first, budget(4), &retained(), || Ok(()), || Ok(graph(4))).unwrap();
+        replays.ensure(&[0], 1, &second, budget(4), &retained(), || Ok(()), || Ok(graph(4))).unwrap();
+        // Again for the first family: its demand replaces its last, beside
+        // the second's, rather than adding to it.
+        replays.ensure(&[0], 1, &first, budget(4), &retained(), || Ok(()), || Ok(graph(4))).unwrap();
+        let held = |replays: &Replays<Graph<false>>| replays.entries.lock().unwrap().graphs.get(&vec![0]).map_or(0, |replay| replay.graphs.len());
+        assert_eq!(held(&replays), 3, "both families' launches in flight are kept");
+        submit(&replays, &[shaped(1, 0)], budget(4), |_| ());
+        submit(&replays, &[shaped(2, 0)], budget(4), |_| ());
+        assert_eq!(held(&replays), 3, "a release beyond the budget takes neither family's");
+        first.store(0, std::sync::atomic::Ordering::Release);
+        submit(&replays, &[shaped(3, 0)], budget(3), |_| ());
+        assert_eq!(held(&replays), 1, "the first family's launches ended, so only the second's stays");
     }
 
     /// The budget holds every graph its owners' runs in flight can need, so

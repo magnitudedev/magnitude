@@ -64,7 +64,7 @@ fn a_gate_holds_the_work_after_it_until_the_host_opens_it() {
         graph.export(&before).unwrap();
         graph.export(&after).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let output_slot = family.new_output_slot().unwrap();
 
@@ -154,7 +154,7 @@ fn an_open_gate_lets_the_run_through() {
             .value;
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let values = (0..m * n).map(|value| value as f32).collect::<Vec<_>>();
         let tensor = Tensor::from_host(&device, Element::f32(), &[m, n], &f32_bytes(&values))
@@ -202,7 +202,7 @@ fn a_run_binds_every_timeline_node() {
         .value;
     graph.export(&value).unwrap();
     let plan = graph.seal().unwrap();
-    let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+    let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
     let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
     let tensor = Tensor::zeros(&device, Element::f32(), &[1, 4]).unwrap();
     let outputs = family.new_output_slot().unwrap().activate(&plan).unwrap();

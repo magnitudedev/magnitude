@@ -923,6 +923,8 @@ fn certify_draft_family(
             .certify(&slices)
             .map_err(|error| GraphError::from(error).context(context()))?;
         family.include(layout.storage_bytes(), parts.constants);
+        // A draft launch runs on its own lane, never in a decode step's.
+        family.include_graph(layout.storage_bytes().recorded, false);
         for &class in &group {
             family.include_plan(layout.plan_heap())?;
             layouts.insert(class, layout.clone());
@@ -3118,7 +3120,7 @@ impl PreparedDraftGraphs {
         classes: impl IntoIterator<Item = DraftGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
-        let (_, layouts) =
+        let (resources, layouts) =
             certify_draft_family(target_device.backend(), load, plan, geometry, &classes)
                 .map_err(|error| invalid(error.to_string()))?;
         let mut prepared = BTreeMap::new();
@@ -3147,11 +3149,8 @@ impl PreparedDraftGraphs {
                 },
             );
         }
-        let plans = prepared
-            .values()
-            .map(|graph| graph.plan.clone())
-            .collect::<Vec<_>>();
-        let family = NativeGraphFamily::new(&plans).map_err(device)?;
+        let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
+        let family = super::graph::serial_family(plans, &resources.graphs).map_err(device)?;
         Ok(Self {
             classes: prepared,
             family,

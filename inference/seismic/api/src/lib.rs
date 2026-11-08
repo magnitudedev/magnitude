@@ -194,7 +194,7 @@ pub mod native_cpu {
 }
 
 /// What recorded graphs are made of and what a device's hold for it.
-pub use seismic_compiler::graph_cost::{GraphBytes, GraphCensus, GraphCost, LaunchGraphs};
+pub use seismic_compiler::graph_cost::{GraphBytes, GraphCensus, GraphCost, LaunchGraphs, LaunchedGraph};
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
 pub use seismic_lang::reference_math::conversion::exact_f64;
@@ -3887,23 +3887,26 @@ pub struct NativeGraphFamily {
 }
 
 impl NativeGraphFamily {
-    /// A family of `plans` whose launch is one run of one of them.
-    pub fn new(plans: &[NativeGraphPlan]) -> Result<Self, WorkflowError> {
+    /// A family of `plans` whose launch is one run of one of them, the
+    /// first `decodes` those a decode step may make.
+    pub fn new(plans: &[NativeGraphPlan], decodes: usize) -> Result<Self, WorkflowError> {
         let launches = plans
             .iter()
             .map(|plan| vec![plan.clone()])
             .collect::<Vec<_>>();
-        Self::with_launches(plans, &launches, &[])
+        Self::with_launches(plans, &launches, decodes, &[])
     }
     /// A family of `plans` whose launches each make the runs of one of
-    /// `launches`, a plan once for each of its runs, the first its decode
-    /// launch: its plans of one layout share one graph, recorded as a run
+    /// `launches`, a plan once for each of its runs, the first `decodes`
+    /// those a decode step may make: its plans of one layout
+    /// share one graph, recorded as a run
     /// first needs it, within what its live slots hold ([`Self::graphs`]).
     /// A chain of `k + 2` launches in one submission further runs
     /// `chains[k]`, each plan its count of runs, beyond each launch's own.
     pub fn with_launches(
         plans: &[NativeGraphPlan],
         launches: &[Vec<NativeGraphPlan>],
+        decodes: usize,
         chains: &[Vec<(NativeGraphPlan, u64)>],
     ) -> Result<Self, WorkflowError> {
         let inner = |plans: &[NativeGraphPlan]| {
@@ -3917,7 +3920,7 @@ impl NativeGraphFamily {
             .iter()
             .map(|runs| runs.iter().map(|(plan, count)| (plan.inner.clone(), *count)).collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        seismic_runtime::native::graph::NativeGraphFamily::with_launches(&inner(plans), &launches, &chains)
+        seismic_runtime::native::graph::NativeGraphFamily::with_launches(&inner(plans), &launches, decodes, &chains)
             .map(|inner| Self {
                 inner: Arc::new(inner),
             })

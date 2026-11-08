@@ -8,7 +8,7 @@ use super::{
     certify::{TargetFamilyCertificate, certify_target_family},
     classes::{
         BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, LaunchControlLayout,
-        Passes, StagedClass, block_sealed_stages, block_stages, chained_once_runs, class_topology, enumerate_block_graphs, LaunchRuns, once_class,
+        Passes, StagedClass, block_sealed_stages, block_stages, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class,
         slot_selection,
     },
     entry::{
@@ -796,7 +796,14 @@ impl PreparedTargetGraphs {
         // The sealed family is what the load charges; the plan's bound
         // (`TargetFamilyCertificate::graphs`), which the assessment charged
         // before any plan was sealed, holds it.
-        let family = NativeGraphFamily::with_launches(&plans, &launches, &chains).map_err(|error| error.to_string())?;
+        // The launch classes ascend by rows, so those a decode step may take
+        // lead them.
+        let decodes = launch_classes.iter().take_while(|&&class| decode_launch(class, limits)).count();
+        assert!(
+            launch_classes.iter().skip(decodes).all(|&class| !decode_launch(class, limits)),
+            "a family's decode launch classes lead its launch classes"
+        );
+        let family = NativeGraphFamily::with_launches(&plans, &launches, decodes, &chains).map_err(|error| error.to_string())?;
         let (sealed, bound) = (family.graphs(), certificate.graphs);
         let bytes = |census| device.graph_cost().bytes(census).map_or(0, |bytes| bytes.device + bytes.upload);
         tracing::info!(

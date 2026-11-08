@@ -352,18 +352,20 @@ where
 
 impl AttestedPrograms {
     /// What the graphs of the programs' graph families cost serving so far
-    /// (`seismic::NativeGraphFamily::graph_replays`): this load's of what
-    /// its device counts.
-    pub(crate) fn graph_replays(&self) -> seismic::GraphReplays {
-        let readouts = self.target_readout_graphs.iter().flat_map(|graphs| [graphs.family(), graphs.chunk_family()]);
+    /// (`seismic::NativeGraphFamily::graph_replays`), by family: this load's
+    /// of what its device counts, each plan's once. The chunk readout
+    /// family's plans are the readout family's
+    /// (`PreparedTargetReadoutGraphs`), so the readout family counts them.
+    pub(crate) fn graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)> {
+        let named = |name: &'static str, family: &seismic::NativeGraphFamily| (name, family.graph_replays());
         self.target_graphs
             .iter()
-            .map(|graphs| graphs.family())
-            .chain(readouts)
-            .chain(self.drafter_graphs.iter().map(|graphs| graphs.family()))
-            .chain(self.vision_graphs.iter().map(|graphs| graphs.family()))
-            .chain(self.state_graphs.iter().map(|graphs| graphs.family()))
-            .fold(seismic::GraphReplays::default(), |counts, family| counts.plus(family.graph_replays()))
+            .map(|graphs| named("target", graphs.family()))
+            .chain(self.target_readout_graphs.iter().map(|graphs| named("readout", graphs.family())))
+            .chain(self.drafter_graphs.iter().map(|graphs| named("drafter", graphs.family())))
+            .chain(self.vision_graphs.iter().map(|graphs| named("vision", graphs.family())))
+            .chain(self.state_graphs.iter().map(|graphs| named("state", graphs.family())))
+            .collect()
     }
 
     pub fn readout_choices(&self) -> &[crate::ReadoutClassChoice] {

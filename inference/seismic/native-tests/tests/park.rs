@@ -43,7 +43,7 @@ fn the_host_answers_a_parked_call() {
         let after = graph.timeline(seismic::timeline::Signal);
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
 
         let values = (0..n).map(|value| value as f32).collect::<Vec<_>>();
@@ -162,7 +162,7 @@ fn a_publication_ends_a_submission_after_its_call_and_waits_for_nothing() {
         graph.export(&scaled).unwrap();
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let x = Tensor::from_host(&device, Element::f32(), &[n], &f32_bytes(&vec![1.0; n as usize])).unwrap();
         let row = Tensor::from_host(&device, Element::f32(), &[1, 4], &f32_bytes(&[1.0; 4])).unwrap();

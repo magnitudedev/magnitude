@@ -693,7 +693,7 @@ impl AssessmentGraphResourceBounds {
                     patch_rows,
                 )?;
                 Ok(Some(VisionGraphBounds {
-                    charge: NativeGraphCharge::serial(vision_graph.storage, limits.startup_slots().vision)?,
+                    charge: NativeGraphCharge::serial(vision_graph.storage, vision_graph.graphs, limits.startup_slots().vision)?,
                     binding_constant_bytes: vision_graph.binding_constant_bytes,
                 }))
             }
@@ -737,13 +737,13 @@ impl AssessmentGraphResourceBounds {
     ) -> Result<Self, GraphError> {
         // The same startup slots a load commits: one request's need.
         let slots = limits.startup_slots();
-        let (readout_storage, chunk_storage) =
+        let ((readout_storage, readout_graphs), chunk_storage) =
             crate::programs::graph::readout::checked_readout_storage(backend, load, &definition.decoder, limits)?;
-        let readout = NativeGraphCharge::serial(readout_storage, slots.readout)?;
+        let readout = NativeGraphCharge::serial(readout_storage, readout_graphs, slots.readout)?;
         // A prompt chunk's readout slots: none until a group's class grants
         // places (`ResourcePlanner::plan_with_state`).
         let chunk_readout = chunk_storage
-            .map(|storage| NativeGraphCharge::serial(storage, GraphSlots { activations: 0, output: 0 }))
+            .map(|(storage, graphs)| NativeGraphCharge::serial(storage, graphs, GraphSlots { activations: 0, output: 0 }))
             .transpose()?;
         let (head, head_constant_bytes, drafter_graph_host_bytes) =
             match (plan.head(), plan.draft(), state.head_state()) {
@@ -766,7 +766,7 @@ impl AssessmentGraphResourceBounds {
                             )?,
                         )?;
                     (
-                        Some(NativeGraphCharge::serial(head_graph.storage, slots.head)?),
+                        Some(NativeGraphCharge::serial(head_graph.storage, head_graph.graphs, slots.head)?),
                         head_graph.binding_constant_bytes,
                         head_graph.host_heap.bytes,
                     )
@@ -791,7 +791,7 @@ impl AssessmentGraphResourceBounds {
                         )?,
                     )?;
                     (
-                        Some(NativeGraphCharge::serial(draft_graph.storage, slots.head)?),
+                        Some(NativeGraphCharge::serial(draft_graph.storage, draft_graph.graphs, slots.head)?),
                         draft_graph.binding_constant_bytes,
                         draft_graph.host_heap.bytes,
                     )
@@ -827,7 +827,7 @@ impl AssessmentGraphResourceBounds {
                         )?,
                     )?;
                     (
-                        Some(NativeGraphCharge::serial(head_graph.storage, slots.head)?),
+                        Some(NativeGraphCharge::serial(head_graph.storage, head_graph.graphs, slots.head)?),
                         head_graph.binding_constant_bytes,
                         head_graph.host_heap.bytes,
                     )
@@ -843,7 +843,7 @@ impl AssessmentGraphResourceBounds {
             .into_iter()
             .map(|rows| rows as u64)
             .collect::<Vec<_>>();
-        let (state_storage, sealed_state_graphs) =
+        let (state_storage, state_graphs, sealed_state_graphs) =
             crate::programs::native_state::checked_copy_family(
                 backend,
                 crate::programs::native_state::state_copy_classes(
@@ -852,7 +852,7 @@ impl AssessmentGraphResourceBounds {
                     &row_classes,
                 )?,
             )?;
-        let state = NativeGraphCharge::serial(state_storage, slots.state)?;
+        let state = NativeGraphCharge::serial(state_storage, state_graphs, slots.state)?;
         let binding_constant_bytes = target
             .binding_constant_bytes
             .checked_add(head_constant_bytes)

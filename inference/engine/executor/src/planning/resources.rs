@@ -237,6 +237,16 @@ impl FlightDepth {
 }
 
 impl ResourceLimits {
+    /// The most rows a decode step's launch takes: a row for each of its
+    /// requests, at most a launch's slots, in the row class covering them.
+    /// A launch of no more rows is one a decode step may make, whose graphs
+    /// a family keeps live for every launch in flight and charges
+    /// (`seismic::LaunchGraphs::of`).
+    pub fn decode_rows(&self) -> u64 {
+        magnitude_batching::row_class(self.max_launch_slots.min(self.max_launch_rows))
+            .expect("a launch takes a row and no more than a class holds") as u64
+    }
+
     /// The in-flight depth these limits plan for: the one authority every
     /// per-step copy count reads.
     pub const fn flights(&self) -> FlightDepth {
@@ -510,13 +520,13 @@ impl FamilyFootprint {
 impl NativeGraphCharge {
     /// The charge of a family whose lease runs one graph at a time to
     /// completion: a launch is one run, in a submission of its own
-    /// (`seismic::NativeGraphFamily::new`), of the graphs its storage
-    /// records.
+    /// (`seismic::NativeGraphFamily::new`), of one of its graphs, which hold
+    /// `graphs` (`seismic::LaunchGraphs::of`, as its sealed family's).
     pub(crate) fn serial(
         storage: seismic::NativeGraphStorageBytes,
+        graphs: seismic::LaunchGraphs,
         slots: GraphSlots,
     ) -> Result<Self, String> {
-        let graphs = seismic::LaunchGraphs { decode: storage.recorded, union: storage.recorded, chained: Vec::new() };
         Self::from_checked(storage, serial_upload_regions(storage.upload), slots, graphs)
     }
 

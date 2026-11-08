@@ -115,9 +115,10 @@ impl GraphCensus {
     }
 }
 
-/// What a family's graphs hold with launches in flight: its decode
-/// launch's graphs, the union of every launch's, each layout's graph for
-/// the most runs of it any one launch makes, and what a chain of launches
+/// What a family's graphs hold with launches in flight: a decode launch's
+/// graphs, each layout's graph for the most runs of it any one of its
+/// decode launches makes; the union of every launch's, each layout's for
+/// the most runs of it any one launch makes; and what a chain of launches
 /// replays beyond each launch's own ([`Self::held`]).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaunchGraphs {
@@ -129,7 +130,35 @@ pub struct LaunchGraphs {
     pub chained: Vec<GraphCensus>,
 }
 
+/// One graph a family's launches replay (a layout's, or a plan's sealed
+/// alone): what recording it takes, and the most runs of it any one of the
+/// family's decode launches makes, and any one of its launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaunchedGraph {
+    pub graph: GraphCensus,
+    pub decode_runs: u64,
+    pub runs: u64,
+}
+
 impl LaunchGraphs {
+    /// What a family of `graphs` holds, with `chained` its chains' further
+    /// graphs: its decode launch's, each graph for the most runs any one
+    /// decode launch makes of it, which a family keeps live for each launch
+    /// in flight, all of them resident at once (`record_decode`), so their
+    /// sum; and its union, each graph for the most runs any one launch
+    /// makes. The one computation of a family's census, from the graphs its
+    /// plans are sealed into, for the planner's charge and the sealed
+    /// family's alike. None on overflow.
+    pub fn of(graphs: impl IntoIterator<Item = LaunchedGraph>, chained: Vec<GraphCensus>) -> Option<Self> {
+        let (mut decode, mut union) = (GraphCensus::default(), GraphCensus::default());
+        for LaunchedGraph { graph, decode_runs, runs } in graphs {
+            assert!(decode_runs <= runs, "a decode launch is one of the family's launches");
+            decode = decode.plus(graph.times(decode_runs)?)?;
+            union = union.plus(graph.times(runs)?)?;
+        }
+        Some(Self { decode, union, chained })
+    }
+
     /// What the family holds with `launches` launches in flight: the
     /// union, within which any one launch's graphs are whatever its class,
     /// so every submission fits; beside it each other launch's, a decode

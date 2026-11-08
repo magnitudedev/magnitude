@@ -53,7 +53,7 @@ fn a_chains_places_replay_their_shapes_graphs_bit_for_bit() {
             .value;
         graph.export(&after).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let created = device.graph_replays();
         let mut slots = (0..PLACES)
             .map(|_| family.new_slot(&[family.upload_bytes()]).unwrap())
@@ -165,7 +165,7 @@ fn a_launched_plans_slots_are_made_and_run_while_earlier_steps_are_in_flight() {
         }
         graph.export(&value).unwrap();
         let busy = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[busy.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[busy.clone()], 1).unwrap();
         // Made before any flight, as a load makes its slots.
         let mut busy_slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let mut busy_outputs = Some(family.new_output_slot().unwrap());
@@ -257,7 +257,7 @@ fn interleaved_classes_slots_and_places_record_each_shape_once() {
             })
             .collect::<Vec<_>>();
         let plans = sealed.iter().map(|(plan, ..)| plan.clone()).collect::<Vec<_>>();
-        let family = NativeGraphFamily::new(&plans).unwrap();
+        let family = NativeGraphFamily::new(&plans, 1).unwrap();
         let mut slots = (0..PLACES).map(|_| family.new_slot(&[family.upload_bytes()]).unwrap()).collect::<Vec<_>>();
         // A run of class `class` on slot `slot`, its rows the input's
         // doubled into the returned tensor.
@@ -350,7 +350,7 @@ fn a_layouts_classes_making_different_launches_replay_one_graph() {
             })
             .collect::<Vec<_>>();
         let plans = sealed.iter().map(|(plan, ..)| plan.clone()).collect::<Vec<_>>();
-        let family = NativeGraphFamily::new(&plans).unwrap();
+        let family = NativeGraphFamily::new(&plans, 1).unwrap();
         let created = device.graph_replays();
         let mut slots = (0..SLOTS).map(|_| family.new_slot(&[family.upload_bytes()]).unwrap()).collect::<Vec<_>>();
         let created = device.graph_replays().since(created);

@@ -3,7 +3,7 @@
 //! attaches it with the weights as a static binding, so no run writes it.
 
 use super::graph::{GraphError, draft::GraphDraft};
-use seismic::{Device, Element, HostHeap, NativeGraphStorageBytes, NativePort, Tensor};
+use seismic::{Device, Element, GraphCensus, HostHeap, LaunchGraphs, LaunchedGraph, NativeGraphStorageBytes, NativePort, Tensor};
 use std::sync::{Arc, Mutex};
 
 /// A constant of one graph: the port it binds, its value, and how that
@@ -508,6 +508,8 @@ pub(crate) struct CheckedGraphFamilyResources {
     storage: Option<NativeGraphStorageBytes>,
     constants: Vec<GraphConstant>,
     plans: HostHeap,
+    /// Each graph its launches replay ([`Self::include_graph`]).
+    graphs: Vec<LaunchedGraph>,
 }
 
 impl CheckedGraphFamilyResources {
@@ -516,7 +518,16 @@ impl CheckedGraphFamilyResources {
             storage: None,
             constants: Vec::new(),
             plans: HostHeap::default(),
+            graphs: Vec::new(),
         }
+    }
+
+    /// Count one graph of a family whose launch is one run of one of its
+    /// graphs (`seismic::NativeGraphFamily::new`): a layout's, or a plan's
+    /// sealed alone, recording `recorded`, which a decode step's launch
+    /// replays where `decodes`.
+    pub(crate) fn include_graph(&mut self, recorded: GraphCensus, decodes: bool) {
+        self.graphs.push(LaunchedGraph { graph: recorded, decode_runs: u64::from(decodes), runs: 1 });
     }
 
     /// Count the host heap of one sealed plan of the family
@@ -586,6 +597,7 @@ impl CheckedGraphFamilyResources {
                 .ok_or("checked graph host heap overflows")?,
             storage: self.storage.ok_or("checked graph family has no class")?,
             binding_constant_bytes: distinct_storage_bytes(self.constants.iter())?,
+            graphs: LaunchGraphs::of(self.graphs, Vec::new()).ok_or("checked graph family census overflows")?,
         })
     }
 }
@@ -594,6 +606,9 @@ impl CheckedGraphFamilyResources {
 /// its sealed plans and its one copy of each constant value.
 pub(crate) struct CheckedGraphResources {
     pub(crate) storage: NativeGraphStorageBytes,
+    /// What its graphs hold with launches in flight, which its sealed
+    /// family's are within ([`CheckedGraphFamilyResources::include_graph`]).
+    pub(crate) graphs: LaunchGraphs,
     pub(crate) binding_constant_bytes: u64,
     pub(crate) host_heap: HostHeap,
 }

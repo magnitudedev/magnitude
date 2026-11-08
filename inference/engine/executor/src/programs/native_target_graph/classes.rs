@@ -37,6 +37,15 @@ pub(super) fn class_topology((class, stage): StagedClass) -> Topology {
     (RowForm::of(rows), listed > 0, scored > 0, stage, pass)
 }
 
+/// Whether a launch of `class` may be a decode step's: one of no more than
+/// its rows (`ResourceLimits::decode_rows`). Their
+/// layouts differ (`RowForm`, and whether a class lists or scores), so what
+/// a family keeps for its decode launches in flight is of every one of them
+/// (`seismic::NativeGraphFamily::with_launches`).
+pub(super) fn decode_launch(class: BlockClass, limits: ResourceLimits) -> bool {
+    class.0 <= limits.decode_rows()
+}
+
 /// The routed feed-forward of block `index`'s feed-forward sublayer (a
 /// parallel sublayer's routed branch's), if it has one.
 pub(super) fn block_routed(geometry: &Decoder, index: usize) -> Result<Option<&RoutedFfn>, String> {
@@ -126,7 +135,8 @@ fn block_splits(served: &[BlockServed], index: usize, rows: u64) -> bool {
 /// (`block_splits`): a class served whole, as decode is, runs none. A decode
 /// launch of a bank that can be whole runs either form of a streamed block,
 /// as its bank is whole or not as it begins (`RunStage::Resident`): it counts
-/// both, so what is held for it (`LaunchGraphs::held`, and on CUDA the graphs
+/// both, so what is held for its every class (`decode_launch`;
+/// `LaunchGraphs::held`, and on CUDA the graphs
 /// `seismic::NativeGraphFamily::record_decode` records ahead) holds either
 /// form's, and a step that switches records none. The plan's census
 /// (`certify_target_family`) and the sealed family (`PreparedTargetGraphs`)

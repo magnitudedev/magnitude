@@ -163,7 +163,7 @@ fn host_time_per_run_of_a_300_node_graph() {
         }
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         // The plan writes no input, so the slot holds no upload region.
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let mut output_slot = Some(family.new_output_slot().unwrap());
@@ -226,7 +226,7 @@ fn graph_completion_retains_inputs_until_its_outcome_is_taken() {
         }).unwrap().value;
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
         let source = Tensor::from_host(&device, Element::f32(), &[1, 8], &[0; 32]).unwrap();
         let observer = source.observe_storage();

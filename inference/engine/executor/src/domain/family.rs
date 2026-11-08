@@ -538,10 +538,17 @@ pub trait ProgramFamily: 'static {
     /// Unbind `component`: released while idle, or its class's storage
     /// was refused.
     fn unbind_optional(&mut self, component: OptionalComponent);
-    /// What the load's graphs cost serving so far: graphs recorded and
-    /// replays that updated a graph's parameters, of its own plans alone
-    /// beside other loads on the device (`seismic::Device::graph_replays`).
-    fn graph_replays(&self) -> seismic::GraphReplays;
+    /// What the load's graphs cost serving so far, by family: graphs
+    /// recorded and replays that updated a graph's parameters, of its own
+    /// plans alone beside other loads on the device
+    /// (`seismic::Device::graph_replays`).
+    fn family_graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)>;
+
+    /// What the load's graphs cost serving so far, of every family
+    /// ([`Self::family_graph_replays`]).
+    fn graph_replays(&self) -> seismic::GraphReplays {
+        self.family_graph_replays().into_iter().fold(seismic::GraphReplays::default(), |counts, (_, family)| counts.plus(family))
+    }
 
     /// Physical target tensors held by the bound family. Test families with
     /// no resident model have no target charge.
@@ -816,8 +823,10 @@ impl ProgramFamily for NativeFamily {
     fn head_is_bound(&self) -> bool {
         self.head.is_some()
     }
-    fn graph_replays(&self) -> seismic::GraphReplays {
-        self.programs.graph_replays().plus(self.target.overlay_graph_replays())
+    fn family_graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)> {
+        let mut families = self.programs.graph_replays();
+        families.push(("target overlays", self.target.overlay_graph_replays()));
+        families
     }
     fn vision_is_bound(&self) -> bool {
         self.vision.is_some()

@@ -36,7 +36,7 @@ fn busy_graph(device: &seismic::Device) -> impl FnMut() -> seismic::NativeGraphC
     }
     graph.export(&value).unwrap();
     let plan = graph.seal().unwrap();
-    let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+    let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
     let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
     let mut output_slot = Some(family.new_output_slot().unwrap());
     let x = Tensor::from_host(device, Element::f32(), &[1, 4], &f32_bytes(&[1.0; 4])).unwrap();
@@ -132,7 +132,7 @@ fn a_wait_answered_by_host_words_alone_ends_while_other_threads_are_stuck_in_the
         let after = graph.timeline(seismic::timeline::Signal);
         graph.export(&value).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
 
         // The data the call waits for, host-shared as a host tier is, and
@@ -260,7 +260,7 @@ fn a_wait_for_a_transfer_returns_as_it_lands_beside_a_parked_call() {
         let after = graph.timeline(seismic::timeline::Signal);
         graph.export(&waited).unwrap();
         let plan = graph.seal().unwrap();
-        let family = NativeGraphFamily::new(&[plan.clone()]).unwrap();
+        let family = NativeGraphFamily::new(&[plan.clone()], 1).unwrap();
         let mut slot = family.new_slot(&[family.upload_bytes()]).unwrap();
 
         let data = Tensor::shared(&device, Element::f32(), &[n]).unwrap();

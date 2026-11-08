@@ -30,7 +30,7 @@ use magnitude_kernels::{
 };
 use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, Entry, NativeGraphClassSlice,
-    NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
+    LaunchGraphs, LaunchedGraph, NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
     NativeGraphStorageBytes, NativePort, WorkflowTensor, WorkflowTensorMut, WorkflowTensorRef,
     WorkflowTensorView,
 };
@@ -588,6 +588,7 @@ impl PreparedTargetReadoutGraphs {
         let regimes =
             certify_readout_regimes(device.backend(), geometry, norm, head, source, limits)
                 .map_err(error)?;
+        let qualified = qualified_readout_classes(limits, head, device.backend())?;
         let mut classes = BTreeMap::new();
         let mut plans = Vec::new();
         let mut chunk_plans = Vec::new();
@@ -606,18 +607,20 @@ impl PreparedTargetReadoutGraphs {
                 exports_logits(limits),
                 layout,
             )?;
-            plans.push(variant.plan.clone());
+            plans.push((readout_decodes(class, limits), variant.plan.clone()));
             if chunk_holds(class.projected) {
-                chunk_plans.push(variant.plan.clone());
+                chunk_plans.push((readout_decodes(class, limits), variant.plan.clone()));
             }
             classes.insert(class, variant);
             Ok(())
         };
-        for class in qualified_readout_classes(limits, head, device.backend())? {
+        for &class in &qualified {
             add(class)?;
         }
-        let family = NativeGraphFamily::new(&plans).map_err(|error| error.to_string())?;
-        let chunk_family = NativeGraphFamily::new(&chunk_plans).map_err(|error| error.to_string())?;
+        let family = super::serial_family(plans, &readout_graphs(&regimes, &qualified, limits, false).map_err(error)?)
+            .map_err(|error| error.to_string())?;
+        let chunk_family = super::serial_family(chunk_plans, &readout_graphs(&regimes, &qualified, limits, true).map_err(error)?)
+            .map_err(|error| error.to_string())?;
         Ok(Self {
             residual_width: load.residual_conditioning(),
             classes,
@@ -1840,20 +1843,20 @@ pub(crate) fn checked_readout_family_storage(
     geometry: &Decoder,
     limits: ResourceLimits,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
-    let (family, _) = checked_readout_storage(backend, load, geometry, limits)?;
+    let ((family, _), _) = checked_readout_storage(backend, load, geometry, limits)?;
     Ok(family)
 }
 
 /// The readout family's storage ([`checked_readout_family_storage`]) and
-/// its chunk family's: the most of a prompt chunk's classes
-/// ([`chunk_holds`]), whose slots a prompt group's class grows; none of a
-/// load whose readout has no such class.
+/// what its graphs hold ([`readout_graphs`]), and its chunk family's: the
+/// most of a prompt chunk's classes ([`chunk_holds`]), whose slots a prompt
+/// group's class grows; none of a load whose readout has no such class.
 pub(crate) fn checked_readout_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
     limits: ResourceLimits,
-) -> Result<(NativeGraphStorageBytes, Option<NativeGraphStorageBytes>), GraphError> {
+) -> Result<((NativeGraphStorageBytes, LaunchGraphs), Option<(NativeGraphStorageBytes, LaunchGraphs)>), GraphError> {
     let norm = target_readout_norm(load, geometry)?;
     let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
     let regimes = certify_readout_regimes(
@@ -1867,9 +1870,11 @@ pub(crate) fn checked_readout_storage(
     let most = |layouts: &mut dyn Iterator<Item = &NativeGraphLayout>| {
         layouts.map(NativeGraphLayout::storage_bytes).reduce(NativeGraphStorageBytes::most)
     };
+    let classes = qualified_readout_classes(limits, head, backend)?;
     let family = most(&mut regimes.values()).ok_or("readout graph family has no classes")?;
     let chunk = most(&mut regimes.iter().filter(|((_, _, chunk), _)| *chunk).map(|(_, layout)| layout));
-    Ok((family, chunk))
+    let chunk = chunk.map(|chunk| Ok::<_, GraphError>((chunk, readout_graphs(&regimes, &classes, limits, true)?))).transpose()?;
+    Ok(((family, readout_graphs(&regimes, &classes, limits, false)?), chunk))
 }
 
 /// The structure a readout class selects: its kind; for a selection, the
@@ -1878,6 +1883,38 @@ pub(crate) fn checked_readout_storage(
 /// layout of its widest, so a chunk's classes form regimes of their own:
 /// the chunk family's slots hold what a chunk exports.
 type ReadoutRegime = (ReadoutKind, u64, bool);
+
+/// Whether a decode step's launch may read out `class`: one of no more than
+/// its rows (`ResourceLimits::decode_rows`).
+fn readout_decodes(class: ReadoutClass, limits: ResourceLimits) -> bool {
+    class.rows <= limits.decode_rows()
+}
+
+/// What the readout family of `classes` holds (`seismic::LaunchGraphs::of`),
+/// each launch one run of its class's regime's graph, those of a class a
+/// decode step's launch reads out ([`readout_decodes`]) kept live; or, with
+/// `chunk`, the chunk family's, of its classes ([`chunk_holds`]), whose
+/// slots a decode step's readout of one row takes where they are free
+/// (`AllocatedResources::readout_pool`).
+fn readout_graphs(
+    regimes: &BTreeMap<ReadoutRegime, NativeGraphLayout>,
+    classes: &[ReadoutClass],
+    limits: ResourceLimits,
+    chunk: bool,
+) -> Result<LaunchGraphs, GraphError> {
+    let mut decodes = BTreeMap::<ReadoutRegime, bool>::new();
+    for &class in classes.iter().filter(|class| !chunk || chunk_holds(class.projected)) {
+        *decodes.entry(readout_regime(class)).or_default() |= readout_decodes(class, limits);
+    }
+    let graphs = decodes
+        .into_iter()
+        .map(|(regime, decodes)| {
+            let layout = regimes.get(&regime).ok_or("readout class has no resource regime")?;
+            Ok(LaunchedGraph { graph: layout.storage_bytes().recorded, decode_runs: u64::from(decodes), runs: 1 })
+        })
+        .collect::<Result<Vec<_>, GraphError>>()?;
+    Ok(LaunchGraphs::of(graphs, Vec::new()).ok_or("readout graph census overflows")?)
+}
 
 fn readout_regime(class: ReadoutClass) -> ReadoutRegime {
     let chunk = chunk_holds(class.projected);

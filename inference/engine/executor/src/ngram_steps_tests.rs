@@ -840,6 +840,162 @@ fn a_whole_banks_shrink_step_records_no_graph() {
     std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
 }
 
+/// The live-graph owner's contract: every graph a decode step replays is
+/// kept live from the load on, whichever decode launch class the step takes
+/// (its count of requests), so on CUDA no decode step records a graph: not
+/// the first of a class, not after Reclaim's surplus rung releases a prompt
+/// group's class, and not on a bank shrink's step. Each step's recordings,
+/// by family, are reported before the verdict.
+#[test]
+#[ignore = "needs a CUDA device: run with --ignored on one"]
+fn no_decode_step_records_a_graph() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let cuda = seismic::BackendName::Cuda;
+    assert!(available(&catalog, cuda), "the test runs on a host with a CUDA device");
+    decode_steps_record_no_graph(&catalog, cuda);
+}
+
+/// [`no_decode_step_records_a_graph`] on Metal, whose graphs are recorded
+/// at their shape's first use, never for a decode step's run after it, over
+/// the same release and shrink paths.
+#[test]
+fn no_decode_step_records_a_graph_on_metal() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let metal = seismic::BackendName::Metal;
+    if available(&catalog, metal) {
+        decode_steps_record_no_graph(&catalog, metal);
+    }
+}
+
+/// Decode steps' recordings, by family, of open requests at their positions.
+struct DecodeSteps {
+    requests: Vec<RequestId>,
+    positions: Vec<usize>,
+    recorded: Vec<(&'static str, Vec<(&'static str, u64)>)>,
+}
+
+impl DecodeSteps {
+    const REQUESTS: usize = 8;
+
+    /// Limits of launches of up to [`Self::REQUESTS`] requests, in chains of
+    /// up to `chain_capacity`.
+    fn limits(chain_capacity: usize) -> ResourceLimits {
+        ResourceLimits {
+            max_launch_slots: Self::REQUESTS,
+            max_selected_rows: Self::REQUESTS,
+            ..limits(Self::REQUESTS, false, chain_capacity, Self::REQUESTS)
+        }
+    }
+
+    /// [`Self::REQUESTS`] requests opened, each prompted with two tokens, the
+    /// first through a chain of `chunks` chunks.
+    fn open(domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, chunks: usize, backend: seismic::BackendName) -> (Self, crate::StateBindings) {
+        let requests = (1..=Self::REQUESTS as u64).map(RequestId).collect::<Vec<_>>();
+        let mut positions = Vec::new();
+        for (index, &request) in requests.iter().enumerate() {
+            domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+            domain.open_state(&mut bindings, request, None).unwrap();
+            let chunks = if index == 0 { chunks } else { 1 };
+            domain.plan_successors((1..chunks).map(|next| prompt_chunk(request, next, chunks, Self::REQUESTS)).collect());
+            for chunk in 0..chunks {
+                let (_, returned) = run(domain, bindings, prompt_chunk(request, chunk, chunks, Self::REQUESTS), chunk > 0, backend);
+                bindings = returned;
+            }
+            positions.push(chunks * Self::REQUESTS);
+        }
+        (Self { requests, positions, recorded: Vec::new() }, bindings)
+    }
+
+    /// A decode step of the first `count` requests, its recordings kept as
+    /// `step`'s.
+    fn step(&mut self, domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, count: usize, step: &'static str, backend: seismic::BackendName) -> crate::StateBindings {
+        let operations = self.requests[..count]
+            .iter()
+            .zip(&self.positions)
+            .map(|(&request, &position)| scored(forward(request, WorkKind::Decode, &[(position * 37 % 256) as u32], position, true)))
+            .collect::<Vec<_>>();
+        let before = domain.family_graph_replays();
+        let reserved = domain.reserve(&mut bindings, &operations).unwrap().into_resources();
+        let ReservedResources::Target(reservation) = reserved else {
+            panic!("{backend:?}: a decode step reserves the target lane");
+        };
+        let flight = domain.submit_target(bindings, &operations, reservation).unwrap_or_else(|failure| panic!("{backend:?}: {}", failure.error()));
+        let (pendings, bindings) = domain.finish_target(flight).unwrap();
+        for pending in pendings {
+            domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }).unwrap();
+        }
+        for position in &mut self.positions[..count] {
+            *position += 1;
+        }
+        let recorded = domain
+            .family_graph_replays()
+            .into_iter()
+            .zip(before)
+            .map(|((family, after), (_, before))| (family, after.since(before).recorded))
+            .filter(|&(_, graphs)| graphs > 0)
+            .collect();
+        self.recorded.push((step, recorded));
+        bindings
+    }
+
+    /// The verdict: no step recorded a graph.
+    fn assert_none(&self, backend: seismic::BackendName, context: &str) {
+        eprintln!("{backend:?}, {context}: graphs recorded by decode steps (step, graphs by family): {:?}", self.recorded);
+        assert!(self.recorded.iter().all(|(_, graphs)| graphs.is_empty()), "{backend:?}, {context}: a decode step recorded graphs: {:?}", self.recorded);
+    }
+}
+
+fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::BackendName) {
+    let test = "decode-records-no-graph";
+    let (directory, definition, package) = fixture_with(test, qwen4exp_fixture_definition_of(3, 128), streamed_experts_manifest);
+    const FOUR: usize = DecodeSteps::REQUESTS / 2;
+    // Reclaim: a load whose experts are resident chains any prompt, so the
+    // first request's two chunks grow the prompt group's class to two
+    // places, which Reclaim's surplus rung releases to one.
+    {
+        let (mut domain, bindings, _, _) = load(catalog, &definition, &package, backend, DecodeSteps::limits(2), Banked::Resident);
+        let (mut steps, mut bindings) = DecodeSteps::open(&mut domain, bindings, 2, backend);
+        assert_eq!(domain.group_places().get(), 2, "{backend:?}: the chain grew the prompt group's class");
+        bindings = steps.step(&mut domain, bindings, 1, "the first of one request", backend);
+        bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "the first of eight", backend);
+        let released = crate::domain::fixtures::shrink_settled(&mut domain, &mut bindings, magnitude_state::ShrinkPolicy::Reclaim);
+        assert_eq!(domain.group_places().get(), 1, "{backend:?}: Reclaim released the class to one place");
+        assert!(released > 0, "{backend:?}: Reclaim's surplus rung released the class's bytes and slots");
+        bindings = steps.step(&mut domain, bindings, FOUR, "the first of four, after the surplus release", backend);
+        bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "of eight, after the surplus release", backend);
+        steps.assert_none(backend, &format!("a Reclaim release of {released} bytes"));
+        drop(bindings);
+    }
+    // A bank shrink: experts streamed through a whole bank, shrunk to its
+    // floor between decode steps.
+    if STREAMING_BACKENDS.contains(&backend) {
+        let (mut domain, bindings, _, _) = load(catalog, &definition, &package, backend, DecodeSteps::limits(1), Banked::Whole);
+        let (mut steps, mut bindings) = DecodeSteps::open(&mut domain, bindings, 1, backend);
+        bindings = steps.step(&mut domain, bindings, 1, "the first of one request", backend);
+        bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "the first of eight", backend);
+        let whole = domain.expert_bank_slots();
+        let device = domain.device().clone();
+        let own = device.ledgers().own;
+        for (store, view) in &own {
+            device.bound(seismic::Ledger::Own(*store), Some(view.charged)).unwrap();
+        }
+        let step = domain.shrink_expert_bank_by(&mut bindings, u64::MAX / 4, crate::CompletionWake::new(|| {})).unwrap();
+        assert!(matches!(step, crate::BankStep::Begun(_)), "{backend:?}: a whole bank shrinks: {step:?}");
+        while domain.advance_expert_bank(crate::CompletionWake::new(|| {})).unwrap().is_none() {}
+        assert!(domain.expert_bank_slots() < whole, "{backend:?}: the bank shrank from {whole:?}");
+        for (store, view) in &own {
+            device.bound(seismic::Ledger::Own(*store), view.bound).unwrap();
+        }
+        bindings = steps.step(&mut domain, bindings, FOUR, "the first of four, the bank shrink's step", backend);
+        bindings = steps.step(&mut domain, bindings, DecodeSteps::REQUESTS, "of eight, after the bank shrink", backend);
+        steps.assert_none(backend, "a bank shrink");
+        drop(bindings);
+    }
+    std::fs::remove_dir_all(&directory).expect("the fixture's directory is removed");
+}
+
 /// The last routed layer's expert stacks stored as Q4_0, the rest as
 /// [`streamed_experts_manifest`] stores them: two record forms, so two bank
 /// groups.

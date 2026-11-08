@@ -899,6 +899,9 @@ pub(crate) fn checked_shared_head_family_storage(
         family.include_plan(parts.plan.plan_heap())?;
         let storage = GraphDraft::seal(parts.plan).map_err(|error| error.context(context()))?;
         family.include(storage, parts.constants);
+        // Each class's plan sealed alone, its own graph; a head launch runs
+        // on its own lane, never in a decode step's.
+        family.include_graph(storage.recorded, false);
     }
     Ok(family.finish()?)
 }
@@ -1013,11 +1016,15 @@ impl PreparedSharedHeadGraphs {
         if prepared.is_empty() {
             return Err(invalid("shared head graph family has no classes"));
         }
-        let plans = prepared
-            .values()
-            .map(|graph| graph.plan.clone())
-            .collect::<Vec<_>>();
-        let family = NativeGraphFamily::new(&plans).map_err(device)?;
+        // What the planner charged: each class's plan its own graph, as
+        // `checked_shared_head_family_storage` counts them.
+        let planned = seismic::LaunchGraphs::of(
+            prepared.values().map(|graph| seismic::LaunchedGraph { graph: graph.plan.recorded(), decode_runs: 0, runs: 1 }),
+            Vec::new(),
+        )
+        .ok_or_else(|| invalid("shared head graph census overflows"))?;
+        let plans = prepared.values().map(|graph| (false, graph.plan.clone()));
+        let family = super::graph::serial_family(plans, &planned).map_err(device)?;
         Ok(Self {
             classes: prepared,
             family,

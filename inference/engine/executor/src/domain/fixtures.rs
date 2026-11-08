@@ -1278,8 +1278,8 @@ impl ProgramFamily for TestFamily {
     fn head_is_bound(&self) -> bool {
         false
     }
-    fn graph_replays(&self) -> seismic::GraphReplays {
-        seismic::GraphReplays::default()
+    fn family_graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)> {
+        Vec::new()
     }
     fn vision_is_bound(&self) -> bool {
         false
