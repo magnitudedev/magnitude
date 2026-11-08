@@ -291,9 +291,6 @@ impl<'a> IntoIterator for &'a BankLayers {
 /// what pays.
 pub const HINT_LEADS: u64 = 2;
 
-/// The share of a layer's experts a bank never falls below: one in this many.
-const FLOOR_SHARE: u64 = 10;
-
 /// What a streamed routed layer's bank entries are specialized to: its
 /// group's record form and records, and the bank's word and staging
 /// extents.
@@ -767,11 +764,12 @@ impl ExpertBankPlan {
     }
 
     /// The least `slots` a load of this bank holds, and the least a shrink
-    /// leaves: a tenth of the widest layer's experts, below which a bank
-    /// serves a step mostly by reading it, or what a step needs to make
-    /// progress where that is more ([`Self::needed_slots`]).
+    /// leaves: what a step needs to make progress ([`Self::needed_slots`]),
+    /// the one bound below which a bank cannot serve. A bank of few slots
+    /// serves a step mostly by reading it; that is its cost, which the
+    /// settle weighs against the slots' bytes, never a refusal.
     pub fn floor(&self) -> u64 {
-        self.needed_slots().max(self.widest().get().div_ceil(FLOOR_SHARE))
+        self.needed_slots()
     }
 
     /// The most `slots` at which every group commits only its least records

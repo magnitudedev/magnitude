@@ -1804,7 +1804,7 @@ fn header_terms_include_exact_selected_weights_history_and_bounds() {
     // here, so no more than the startup slabs.
     assert_eq!(state.loaded_state_bytes().unwrap(), startup_state);
     let charge = terms
-        .charge(bounds, state_bytes, startup_state, startup_state, ClaimDemand::default())
+        .charge(bounds, state_bytes, startup_state, startup_state, no_group_class())
         .unwrap();
     assert_eq!(
         charge.allocation_bytes,
@@ -1847,19 +1847,35 @@ const NO_DEVICE_PROCESS: DeviceProcessBytes = DeviceProcessBytes {
     slack: 0,
 };
 
-/// A bank beyond its floor is confirmed beside its prompt groups' class:
-/// the class's device-side bytes join the serving and allocation figures,
-/// its host-reserved bytes (none a class holds, but a demand may name) do
-/// not, and nothing else moves.
+/// A bank beyond its floor is confirmed beside its prompt groups' class of
+/// the places its pass merges, and no more: the class's device-side bytes
+/// at that pass join the serving and allocation figures, its host-reserved
+/// bytes (none a class holds, but a demand may name) do not, and nothing
+/// else moves.
 #[test]
 fn a_group_class_joins_what_a_bank_beyond_its_floor_is_confirmed_at() {
+    let pass = |launches: usize| crate::PassLaunches::new(std::num::NonZeroUsize::new(launches).unwrap());
+    let classes = |pass: crate::PassLaunches| {
+        Ok::<_, ()>(match pass.get() {
+            1 => ClaimDemand::default(),
+            2 => ClaimDemand { device: GIB, ..ClaimDemand::default() },
+            _ => ClaimDemand { device: 3 * GIB, upload: GIB, host: 5 * GIB, ..ClaimDemand::default() },
+        })
+    };
     let charge = AssessmentMemoryCharge {
-        group_class: ClaimDemand { device: 3 * GIB, upload: GIB, host: 5 * GIB, ..ClaimDemand::default() },
+        group_class: crate::planning::ByPass::of(pass(4), classes).unwrap(),
         ..fixture_charge(10 * GIB, 0)
     };
-    let with = charge.clone().with_group_class().unwrap();
+    let with = charge.with_group_class(pass(4)).unwrap();
     assert_eq!((with.serving_bytes, with.allocation_bytes), (14 * GIB, 14 * GIB));
     assert_eq!(AssessmentMemoryCharge { serving_bytes: charge.serving_bytes, allocation_bytes: charge.allocation_bytes, ..with }, charge);
+    let two = charge.with_group_class(pass(2)).unwrap();
+    assert_eq!((two.serving_bytes, two.allocation_bytes), (11 * GIB, 11 * GIB), "a pass of two holds two places' class");
+}
+
+/// The class of a load whose groups never grow past one place.
+fn no_group_class() -> crate::planning::ByPass<ClaimDemand> {
+    crate::planning::ByPass::of(crate::PassLaunches::FLOOR, |_| Ok::<_, ()>(ClaimDemand::default())).unwrap()
 }
 
 fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemoryCharge {
@@ -1888,7 +1904,7 @@ fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemory
         staging_bytes,
         host_table_bytes: 0,
         weight_demand: ClaimDemand::default(),
-        group_class: ClaimDemand::default(),
+        group_class: no_group_class(),
     }
 }
 
@@ -1925,22 +1941,22 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
     };
     // The workload's state outgrows the load's startup state and peak:
     // the peak is not charged on top of it.
-    let charge = terms.charge(bounds, 90, 10, 15, ClaimDemand::default()).unwrap();
+    let charge = terms.charge(bounds, 90, 10, 15, no_group_class()).unwrap();
     assert_eq!(charge.exact_resident_bytes, 100 + 20 + 5 + 90);
     assert_eq!(charge.allocation_bytes, 125 + 40 + 90);
     assert_eq!(charge.serving_bytes, 125 + 40 + 90);
     assert_eq!(charge.staging_bytes, 7);
     // The load's startup state and peak exceed the workload's state:
     // serving holds the workload's state, not the load's peak.
-    let loading = terms.charge(bounds, 50, 10, 15, ClaimDemand::default()).unwrap();
+    let loading = terms.charge(bounds, 50, 10, 15, no_group_class()).unwrap();
     assert_eq!(loading.allocation_bytes, 125 + 40 + (10 + 60));
     assert_eq!(loading.serving_bytes, 125 + 40 + 50);
     // The loaded state follows the startup peak, so it bounds the load
     // only where it is the larger.
-    let warmed = terms.charge(bounds, 50, 10, 80, ClaimDemand::default()).unwrap();
+    let warmed = terms.charge(bounds, 50, 10, 80, no_group_class()).unwrap();
     assert_eq!(warmed.allocation_bytes, 125 + 40 + 80);
-    assert!(terms.charge(bounds, u64::MAX, 10, 15, ClaimDemand::default()).is_err());
-    assert!(terms.charge(bounds, 50, u64::MAX, 15, ClaimDemand::default()).is_err());
+    assert!(terms.charge(bounds, u64::MAX, 10, 15, no_group_class()).is_err());
+    assert!(terms.charge(bounds, 50, u64::MAX, 15, no_group_class()).is_err());
     // An optional component a request loads at the fit depth claims its
     // import window beside the workload's state: serving's peak, and a
     // dedicated device stages the larger of the two windows.
@@ -1948,12 +1964,12 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
         component_upload_bytes: 30,
         ..bounds
     };
-    let loaded = terms.charge(component, 90, 10, 15, ClaimDemand::default()).unwrap();
+    let loaded = terms.charge(component, 90, 10, 15, no_group_class()).unwrap();
     assert_eq!(loaded.allocation_bytes, 125 + 40 + 90 + 30);
     assert_eq!(loaded.serving_bytes, 125 + 40 + 90);
     assert_eq!(loaded.staging_bytes, 30);
     // The load's own peak still bounds it where it is the larger.
-    let early = terms.charge(component, 20, 10, 15, ClaimDemand::default()).unwrap();
+    let early = terms.charge(component, 20, 10, 15, no_group_class()).unwrap();
     assert_eq!(early.allocation_bytes, 125 + 40 + (10 + 60));
     assert!(
         AssessmentMemoryTerms {

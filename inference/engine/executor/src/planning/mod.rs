@@ -53,7 +53,7 @@ pub use programs::{
     TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    CPU_IMAGE_CELLS, FlightDepth, GraphSlots, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
+    ByPass, CPU_IMAGE_CELLS, FlightDepth, GraphSlots, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
     PassLaunches, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
     max_image_cells, reads_decoded_history,
@@ -809,7 +809,7 @@ pub(crate) mod tests {
                 crate::PassLaunches::whole_chain(limits),
             )
             .unwrap();
-            assert_eq!(target.group_bytes(3).unwrap(), checked.group_bytes, "{backend:?}");
+            assert_eq!(target.group_bytes(3).unwrap(), *checked.group_bytes.at(crate::PassLaunches::whole_chain(limits)), "{backend:?}");
             let (assessed, chunk) = crate::programs::graph::readout::checked_readout_storage(
                 backend,
                 draft.load(),

@@ -287,7 +287,7 @@ pub fn prepare_execution_assessment<C: HeldCharge>(
         demand: decode_demand(definition, draft)?,
         whole,
         fit_context_tokens,
-        charge: *planned.charge(),
+        charge: planned.charge().clone(),
         held: planned.held().charges(),
     })
 }
@@ -492,28 +492,36 @@ impl StructuralCharge {
     }
 }
 
-/// What a prompt group's class of `draft`'s chain places holds beyond the
-/// floor's (`AssessmentMemoryCharge::group_class`), as a group opening
+/// What a prompt group's class holds beyond the floor's
+/// (`AssessmentMemoryCharge::group_class`) at the places each pass size of
+/// `draft`'s ladder merges, up to its chain places, as a group opening
 /// grants it (`ExecutorDomain::grant_group`, `ExecutorFamily::group_demand`):
 /// the graph pools', graphs' and target buffers' (`graph`), the bank's
 /// placed words of its places and each streamed table's stagings beyond
 /// the floor's.
-fn group_class(draft: &ExecutionPlanDraft, graph: &crate::AssessmentGraphResourceBounds) -> Result<ClaimDemand, String> {
+fn group_class(
+    draft: &ExecutionPlanDraft,
+    graph: &crate::AssessmentGraphResourceBounds,
+) -> Result<crate::planning::ByPass<ClaimDemand>, String> {
     let limits = draft.policy().limits();
-    let places = limits.chain_capacity;
-    let pools = graph.group_class(limits, draft.device().graph_cost())?;
-    let bank = match (draft.load().expert_bank(), places.get()) {
-        (Some(bank), 2..) => bank.placed_demand(std::num::NonZeroU64::try_from(places).map_err(|_| "chain places exceed u64")?)?,
-        _ => ClaimDemand::default(),
-    };
-    let stagings = draft.load().weights().try_fold(0u64, |bytes, weight| {
-        let grown = weight.staging_bytes(places.get())?.checked_sub(weight.staging_bytes(1)?);
-        grown.and_then(|grown| bytes.checked_add(grown)).ok_or_else(|| "a group's stagings overflow".to_owned())
-    })?;
-    pools
-        .checked_plus(bank)
-        .and_then(|demand| demand.checked_plus(ClaimDemand { device: stagings, ..Default::default() }))
-        .ok_or_else(|| "a prompt group's class overflows".to_owned())
+    crate::planning::ByPass::of(crate::PassLaunches::whole_chain(limits), |pass| {
+        let places = pass.get();
+        let pools = graph.group_class(limits, draft.device().graph_cost(), pass)?;
+        let bank = match (draft.load().expert_bank(), places) {
+            (Some(bank), 2..) => bank.placed_demand(
+                u64::try_from(places).ok().and_then(std::num::NonZeroU64::new).ok_or("a pass's places exceed u64")?,
+            )?,
+            _ => ClaimDemand::default(),
+        };
+        let stagings = draft.load().weights().try_fold(0u64, |bytes, weight| {
+            let grown = weight.staging_bytes(places)?.checked_sub(weight.staging_bytes(1)?);
+            grown.and_then(|grown| bytes.checked_add(grown)).ok_or_else(|| "a group's stagings overflow".to_owned())
+        })?;
+        pools
+            .checked_plus(bank)
+            .and_then(|demand| demand.checked_plus(ClaimDemand { device: stagings, ..Default::default() }))
+            .ok_or_else(|| "a prompt group's class overflows".to_owned())
+    })
 }
 
 /// The plain decode step's demand of `definition` planned as `draft`,
@@ -591,7 +599,7 @@ pub fn assess_execution_fit(
         })
     };
     let mut held = prepared.held.clone();
-    Ok(match draft.with_held_experts(definition, crate::HeldBound::Room(bound), prices, &mut held, room, confirm)? {
+    Ok(match draft.with_held_experts(definition, crate::HeldBound::room(bound), prices, &mut held, room, confirm)? {
         Ok((held, (fit_context_tokens, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens,
             domains,

@@ -250,9 +250,10 @@ fn the_minimum_is_what_progress_holds_at_once() {
     // Linked, the small group's one record holds no slot of its three
     // layers; unified, the lender's least holds 438 / 37 = 11 slots.
     assert_eq!((linked.needed_slots(), unified.needed_slots()), (0, 11));
-    // A tenth of 256 experts stands above both: a load holds at least
-    // that, whatever a step needs to make progress.
-    assert_eq!((linked.floor(), unified.floor()), (26, 26));
+    // A load holds what a step needs to make progress, and no more is
+    // required of it: fewer slots cost the decode reads, which the settle
+    // weighs.
+    assert_eq!((linked.floor(), unified.floor()), (0, 11));
     for plan in [&linked, &unified] {
         for slots in 0..=plan.needed_slots() {
             assert_eq!(plan.records_at(0, slots), plan.least_records(0));

@@ -100,10 +100,10 @@ pub(crate) struct CheckedTargetFamily {
     pub upload_regions: Vec<u64>,
     /// What its graphs are made of (`TargetFamilyCertificate::graphs`).
     pub graphs: LaunchGraphs,
-    /// The bytes the own buffers of a prompt group of the plan's chain
-    /// places hold beside the floor's (`GroupRows::group_bytes`), granted
-    /// when a group opens.
-    pub group_bytes: u64,
+    /// The bytes the own buffers of a prompt group hold beside the floor's
+    /// (`GroupRows::group_bytes`), granted when a group opens: at the places
+    /// each pass size merges, up to the plan's chain places.
+    pub group_bytes: crate::planning::ByPass<u64>,
 }
 
 /// The bytes the merged experts and row table of a prompt pass over `pass`
@@ -165,10 +165,12 @@ pub(super) struct TargetFamilyCertificate {
 }
 
 impl TargetFamilyCertificate {
-    /// What the assessment charges of it, its prompt groups of `limits`'
-    /// chain places.
+    /// What the assessment charges of it, its prompt groups of each pass
+    /// size's places up to `limits`' chain places.
     fn checked(self, limits: ResourceLimits) -> Result<CheckedTargetFamily, GraphError> {
-        let group_bytes = self.group.group_bytes(&self.served, limits.chain_capacity.get())?;
+        let group_bytes = crate::planning::ByPass::of(crate::PassLaunches::whole_chain(limits), |pass| {
+            self.group.group_bytes(&self.served, pass.get())
+        })?;
         Ok(CheckedTargetFamily {
             resources: self.resources,
             sealed: self.sealed,

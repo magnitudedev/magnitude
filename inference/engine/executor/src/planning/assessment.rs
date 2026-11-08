@@ -383,7 +383,7 @@ pub struct AssessmentHeaderBounds {
 }
 
 /// The standard workload's charge in each memory role a load touches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssessmentMemoryCharge {
     /// Weights and slab-rounded state at the fit depth, all exact.
     pub exact_resident_bytes: u64,
@@ -409,11 +409,12 @@ pub struct AssessmentMemoryCharge {
     /// Complete physical weight demand, part of `allocation_bytes`: each
     /// allocation in the storage it lies in (`assess_fit`).
     pub weight_demand: ClaimDemand,
-    /// What a prompt group's class of the plan's chain places holds beyond
-    /// the floor's, granted as a group opens (`ExecutorDomain::grant_group`)
-    /// and so part of no other figure: a bank planned beyond its floor
-    /// leaves room for it (`ExecutionPlanDraft::with_bank`).
-    pub group_class: ClaimDemand,
+    /// What a prompt group's class holds beyond the floor's at the places
+    /// each pass size merges, up to the plan's chain places, granted as a
+    /// group opens (`ExecutorDomain::grant_group`) and so part of no other
+    /// figure: a plan whose pass merges launches leaves room for the class
+    /// of its pass (`ExecutionPlanDraft::with_bank`).
+    pub group_class: super::ByPass<ClaimDemand>,
 }
 
 /// A complete fit result: every domain the load touches, and whether the
@@ -459,9 +460,9 @@ pub struct TargetGraphBounds {
     pub sealed: crate::PlannedSealedGraphs,
     /// The constants and floor buffers its binding allocates.
     pub binding_constant_bytes: u64,
-    /// The bytes its own buffers of a prompt group of the plan's chain
-    /// places hold beyond the floor's (`CheckedTargetFamily::group_bytes`).
-    pub group_bytes: u64,
+    /// The bytes its own buffers of a prompt group hold beyond the floor's,
+    /// at the places each pass size merges (`CheckedTargetFamily::group_bytes`).
+    pub group_bytes: super::ByPass<u64>,
 }
 
 impl TargetGraphBounds {
@@ -535,15 +536,15 @@ pub struct AssessmentGraphResourceBounds {
 }
 
 impl AssessmentGraphResourceBounds {
-    /// What a prompt group's class of `limits`' chain places holds beyond
-    /// the floor's of one place, as a group opening grants it
+    /// What a prompt group's class of the places a pass of `pass` merges
+    /// holds beyond the floor's of one place, as a group opening grants it
     /// (`ExecutorDomain::grant_group`): its pools' slots
     /// (`ResourceLimits::class_slots`; the target's and the head's beyond
     /// their floor's, a chunk's readout slots beyond the floor's readout
     /// slots), the graphs they record priced by `cost` beyond the startup
     /// graphs', and the target's own group buffers.
-    pub fn group_class(&self, limits: ResourceLimits, cost: seismic::GraphCost) -> Result<ClaimDemand, String> {
-        let (floor, class) = (limits.class_slots(1), limits.class_slots(limits.chain_capacity.get()));
+    pub fn group_class(&self, limits: ResourceLimits, cost: seismic::GraphCost, pass: super::PassLaunches) -> Result<ClaimDemand, String> {
+        let (floor, class) = (limits.class_slots(1), limits.class_slots(pass.get()));
         let chunks = GraphSlots {
             activations: class.readout.activations.saturating_sub(floor.readout.activations),
             output: class.readout.output.saturating_sub(floor.readout.output),
@@ -555,7 +556,7 @@ impl AssessmentGraphResourceBounds {
             self.head.as_ref().map(|head| (head, floor.head, class.head)),
         ];
         let (pools, graphs) = grown.into_iter().flatten().try_fold(
-            (self.target.group_bytes, seismic::GraphCensus::default()),
+            (*self.target.group_bytes.at(pass), seismic::GraphCensus::default()),
             |(bytes, census), (charge, from, to)| {
                 let (more, graphs) = charge.growth(from, to)?;
                 bytes
@@ -1039,7 +1040,7 @@ impl AssessmentMemoryTerms {
         state_slab_bytes: u64,
         startup_state_bytes: u64,
         loaded_state_bytes: u64,
-        group_class: ClaimDemand,
+        group_class: super::ByPass<ClaimDemand>,
     ) -> Result<AssessmentMemoryCharge, String> {
         AssessmentMemoryCharge::compose(
             self.exact_resident_bytes(0)?,
@@ -1067,7 +1068,7 @@ impl AssessmentMemoryCharge {
         startup_state_bytes: u64,
         loaded_state_bytes: u64,
         host_table_bytes: u64,
-        group_class: ClaimDemand,
+        group_class: super::ByPass<ClaimDemand>,
     ) -> Result<Self, String> {
         let exact_resident_bytes = weight_bytes
             .checked_add(state_slab_bytes)
@@ -1149,21 +1150,22 @@ impl AssessmentMemoryCharge {
     }
 
     /// The charge of a load whose prompt groups hold their class of the
-    /// plan's chain places beside the rest ([`Self::group_class`]): what a
-    /// bank planned beyond its floor is confirmed at, so the bank leaves the
-    /// room a group's places take. Its device-side bytes, as
-    /// `ExecutionPlanDraft::allocated` reads the weights'.
-    pub fn with_group_class(self) -> Result<Self, String> {
-        let bytes = self
-            .group_class
+    /// places a pass of `pass` merges beside the rest
+    /// ([`Self::group_class`]): what a plan whose pass merges launches is
+    /// confirmed at, so the bank leaves the room a group's places take. Its
+    /// device-side bytes, as `ExecutionPlanDraft::allocated` reads the
+    /// weights'.
+    pub fn with_group_class(&self, pass: super::PassLaunches) -> Result<Self, String> {
+        let class = self.group_class.at(pass);
+        let bytes = class
             .checked_bytes()
-            .and_then(|bytes| bytes.checked_sub(self.group_class.host))
+            .and_then(|bytes| bytes.checked_sub(class.host))
             .ok_or("a prompt group's class overflows")?;
         let grown = |figure: u64| figure.checked_add(bytes).ok_or("assessment charge overflows");
         Ok(Self {
             serving_bytes: grown(self.serving_bytes)?,
             allocation_bytes: grown(self.allocation_bytes)?,
-            ..self
+            ..self.clone()
         })
     }
 
@@ -1192,7 +1194,7 @@ impl AssessmentMemoryCharge {
     /// working set, CUDA's usable memory) bounds it; its capacity is that
     /// room with the store's planning reserve.
     pub fn assess_fit(
-        self,
+        &self,
         topology: &DeviceTopology,
         executor: &Executor,
         status: &Status,

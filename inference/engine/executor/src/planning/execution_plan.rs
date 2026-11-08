@@ -350,6 +350,7 @@ impl ExecutionPlanDraft {
             .checked_sub(host_charge(0)?)
             .ok_or(PlanError::Arithmetic("a host tier is charged less than its floor"))?;
         let fit = charge
+            .clone()
             .with_weights(crate::memory::ClaimDemand { host: growth, ..Default::default() })
             .and_then(|charge| charge.assess_fit(topology, &self.device.executor, status, reserves))
             .map_err(PlanError::ResourcePlanning)?;
@@ -397,9 +398,9 @@ impl ExecutionPlanDraft {
     /// [`Self::with_held_experts`] decides under `cap`, when given, on the
     /// plan's `prices`, into the stable fit's room beside the load's
     /// mandatory part ([`StableRoom`]), as its assessment settles,
-    /// each way of holding them charged as a `C` ([`HeldCharge`]). A capped
-    /// load no plan holds is refused with why. An uncapped one is held whole
-    /// whatever it needs, its shortfall what assessment and admission find.
+    /// each way of holding them charged as a `C` ([`HeldCharge`]), never
+    /// more of them on the device than its room ([`HeldBound`]). A load no
+    /// plan holds is refused with why.
     pub fn with_bank<C: HeldCharge>(
         self,
         definition: &ModelDefinition,
@@ -415,8 +416,9 @@ impl ExecutionPlanDraft {
         // Every plan is confirmed as its assessment confirms it
         // ([`StableRoom::fit`]).
         let confirm = |draft: &Self, charge: &AssessmentMemoryCharge| {
-            // An uncapped load's experts that cannot stream are held whole
-            // whatever that needs.
+            // An uncapped load's experts that cannot stream are held whole:
+            // whether the device holds them is what assessment and admission
+            // find.
             if cap.is_none() && draft.load.bank.is_none() {
                 return Ok(Ok(()));
             }
@@ -425,16 +427,11 @@ impl ExecutionPlanDraft {
                 super::AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
             })
         };
-        match (self.with_held_experts(definition, HeldBound::of_cap(cap), prices, &mut held, room, confirm)?, cap) {
-            (Ok((charged, ())), _) => Ok(charged),
-            (Err(_), None) => {
-                let draft = self.held_whole(definition)?;
-                let charge = held.charge(definition, &draft)?;
-                Ok(ChargedDraft { draft, charge, held })
-            }
-            (Err(NoBank::Unstreamed(reason)), Some(_)) => Err(PlanError::Unstreamed(reason)),
-            (Err(NoBank::Bound { needed }), Some(cap)) => Err(PlanError::WeightCap { cap, needed }),
-            (Err(NoBank::Short { deficit_bytes }), Some(_)) => Err(PlanError::Resource(crate::CapacityError {
+        match self.with_held_experts(definition, HeldBound::of(cap, capacity), prices, &mut held, room, confirm)? {
+            Ok((charged, ())) => Ok(charged),
+            Err(NoBank::Unstreamed(reason)) => Err(PlanError::Unstreamed(reason)),
+            Err(NoBank::Bound { cap, needed }) => Err(PlanError::WeightCap { cap, needed }),
+            Err(NoBank::Short { deficit_bytes }) => Err(PlanError::Resource(crate::CapacityError {
                 resource: crate::ResourceKind::DeviceMemory,
                 required: capacity + deficit_bytes.get(),
                 available: capacity,
@@ -471,8 +468,12 @@ impl ExecutionPlanDraft {
             Err(NoBank::Unstreamed(reason)) => reason,
             Err(no) => return Ok(Err(no)),
         };
+        // Experts that cannot stream are held whole, within a cap; whether
+        // the device holds them is `confirm`'s. Experts that can stream are
+        // never held whole in place of a bank the room is short of.
         let whole = self.held_whole(definition)?;
-        if weight_bytes(&whole.load)? > bound.device() {
+        let bytes = weight_bytes(&whole.load)?;
+        if bound.cap.is_some_and(|cap| bytes > cap) {
             return Ok(Err(NoBank::Unstreamed(reason)));
         }
         let charge = held.charge(definition, &whole)?;
@@ -541,14 +542,17 @@ impl ExecutionPlanDraft {
                 .and_then(|bytes| bytes.checked_add(reserved))
                 .ok_or(PlanError::Arithmetic("a bank's weights hold less than its record reservations' charge"))
         };
+        // A cap below the floor's weights holds no bank. A device's room
+        // below them refuses nothing here: the plan's settle finds it short.
         let needed = weights_at(floor)?;
-        let device = bound.device();
-        if needed > device {
-            return Ok(Err(NoBank::Bound { needed }));
+        if let Some(cap) = bound.cap.filter(|&cap| needed > cap) {
+            return Ok(Err(NoBank::Bound { cap, needed }));
         }
         // The ceiling: the most slots whose weights the device holds under
-        // `bound`, where the bank's curve ends. Every bank planned from here
-        // grows to it, however few slots the machine admits now.
+        // `bound`, where the bank's curve ends, the floor at least. A plan
+        // settled from here grows no further than its room admits
+        // (`with_largest_bank`).
+        let device = bound.device();
         let mut ceiling = floor;
         while ceiling < top.min(most) && weights_at(ceiling + 1)? <= device {
             ceiling += 1;
@@ -558,7 +562,7 @@ impl ExecutionPlanDraft {
         // reserve (the tier at no slots) aside, as staging is. A banked
         // draft's re-planning never raises the cap it was planned under.
         let capped = match (bound, bank.host_ceiling()) {
-            (HeldBound::Cap(cap), Some(_)) => {
+            (HeldBound { cap: Some(cap), .. }, Some(_)) => {
                 let left = cap - weights_at(ceiling)?;
                 let host = |slots: u64| bank.host_charge(slots).map_err(PlanError::ResourcePlanning);
                 let (empty, widest) = (host(0)?, bank.widest().get());
@@ -604,9 +608,9 @@ impl ExecutionPlanDraft {
     /// ([`Self::with_held_experts`]).
     pub fn with_ceiling_bank<C: HeldCharge>(self, definition: &ModelDefinition, cap: Option<u64>) -> Result<ChargedDraft<C>, PlanError> {
         let mut held = HeldCharges::default();
-        let bound = HeldBound::of_cap(cap);
-        let draft = match (self.bank_ceiling(definition, bound)?, cap) {
-            (Ok(BankCeiling { whole, ceiling, places }), _) => {
+        let bound = HeldBound::of(cap, self.device.assessment_capacity_bytes);
+        let draft = match self.bank_ceiling(definition, bound)? {
+            Ok(BankCeiling { whole, ceiling, places }) => {
                 let mut draft = whole.resized(ceiling, ceiling, places)?;
                 let linked = matches!(draft.device.host, Ok(Some(HostTier::Linked(_))));
                 if let Some(host) = draft.bank().host_ceiling().filter(|_| linked && !draft.bank().whole()) {
@@ -614,15 +618,16 @@ impl ExecutionPlanDraft {
                 }
                 draft
             }
-            (Err(NoBank::Bound { needed }), Some(cap)) => return Err(PlanError::WeightCap { cap, needed }),
-            (Err(NoBank::Unstreamed(reason)), _) => {
+            Err(NoBank::Bound { cap, needed }) => return Err(PlanError::WeightCap { cap, needed }),
+            Err(NoBank::Unstreamed(reason)) => {
                 let whole = self.held_whole(definition)?;
-                if weight_bytes(&whole.load)? > bound.device() {
+                let bytes = weight_bytes(&whole.load)?;
+                if cap.is_some_and(|cap| bytes > cap) {
                     return Err(PlanError::Unstreamed(reason));
                 }
                 whole
             }
-            (Err(no), _) => unreachable!("a bank's ceiling asks no room, so it is never {no:?}"),
+            Err(no @ NoBank::Short { .. }) => unreachable!("a bank's ceiling asks no room, so it is never {no:?}"),
         };
         let charge = held.charge(definition, &draft)?;
         Ok(ChargedDraft { draft, charge, held })
@@ -636,7 +641,11 @@ impl ExecutionPlanDraft {
     /// of it; or why no bank's does.
     ///
     /// Each plan is the bank's structure resized ([`Self::bank_ceiling`]),
-    /// which grows to its ceiling under `bound`, the end of its curve.
+    /// whose ceiling under `bound` ends the settle's curve. The plan's own
+    /// ceiling is the most of those slots `room` admits beside everything
+    /// the plan holds: no plan holds a bank whose ceiling the machine cannot
+    /// reach, so the serving heap weighs the bank's growth only as far as it
+    /// can go.
     ///
     /// The plan's mandatory part is the bank at its floor with prompt passes
     /// of one launch and groups of one place. Beside it the settle grants,
@@ -645,12 +654,12 @@ impl ExecutionPlanDraft {
     /// allocation:
     /// - the bank's slots, a step where its charge rises
     ///   (`resident_charge`), each worth the decode seconds it saves;
-    /// - the prompt room: groups of the plan's chain places (their class,
-    ///   `AssessmentMemoryCharge::with_group_class`) with passes of two
-    ///   launches, then each larger pass size (`pass_buffer_bytes`), each
-    ///   worth the routed prefill seconds its fewer passes save. A pass of
-    ///   several launches needs a group's places to merge them, so places
-    ///   come with the first such pass.
+    /// - the prompt room: each pass size (`pass_buffer_bytes`) beside the
+    ///   class of the group places it merges
+    ///   (`AssessmentMemoryCharge::with_group_class`), each worth the routed
+    ///   prefill seconds its fewer passes save. A pass of several launches
+    ///   needs a group's places to merge them, so each pass size comes with
+    ///   its places, and none beyond them.
     ///
     /// The plan so granted is charged ([`HeldCharges`]) and confirmed: where
     /// its growth exceeds `room` or `confirm` finds it short, the settle
@@ -679,21 +688,17 @@ impl ExecutionPlanDraft {
         };
         let points = rising(floor, ceiling, &reserved)?;
         let ladder = super::pass_ladder(places);
-        let resized = |slots: u64, pass: PassLaunches| whole.resized(slots, ceiling, pass);
         // The mandatory part: what the load holds whatever it releases.
-        let mandatory = resized(points[0], PassLaunches::FLOOR)?;
-        let floor_charge = *held.charge(definition, &mandatory)?.charge();
+        let mandatory = whole.resized(points[0], ceiling, PassLaunches::FLOOR)?;
+        let floor_charge = held.charge(definition, &mandatory)?.charge().clone();
         // Host memory that admits not even the tier's floor streams nothing,
         // whatever the device holds.
         if let Some(reason) = mandatory.untiered(&floor_charge)? {
             return Ok(Err(NoBank::Unstreamed(reason)));
         }
         let mandatory_bytes = Self::allocated(&floor_charge)?;
-        let class = Self::allocated(&floor_charge.with_group_class().map_err(PlanError::ResourcePlanning)?)?
-            .checked_sub(mandatory_bytes)
-            .ok_or(PlanError::Arithmetic("a prompt group's class is charged below nothing"))?;
-        // Each pass size's buffers, and a group's class with the first pass
-        // that merges launches.
+        // Each pass size's buffers, and the class of the group places it
+        // merges with each that merges launches.
         let rungs = ladder
             .iter()
             .map(|&pass| {
@@ -704,7 +709,13 @@ impl ExecutionPlanDraft {
                     pass,
                 )
                 .map_err(PlanError::ResourcePlanning)?;
-                Ok((pass, buffers + if pass > PassLaunches::FLOOR { class } else { 0 }))
+                let class = match pass > PassLaunches::FLOOR {
+                    true => Self::allocated(&floor_charge.with_group_class(pass).map_err(PlanError::ResourcePlanning)?)?
+                        .checked_sub(mandatory_bytes)
+                        .ok_or(PlanError::Arithmetic("a prompt group's class is charged below nothing"))?,
+                    false => 0,
+                };
+                Ok((pass, buffers + class))
             })
             .collect::<Result<Vec<_>, PlanError>>()?;
         let pass_bytes = |pass: PassLaunches| -> u64 {
@@ -732,16 +743,18 @@ impl ExecutionPlanDraft {
             super::pass_rows_curve(&ladder, 0, &pass_bytes, &|pass| prices.prompt_seconds(pass, most), rates.requests_per_s, 0.0),
         ];
         let mut settled = None;
-        // The charge a draft of `slots` and `pass` needs beyond the room.
-        let mut over = |slots: u64, pass: PassLaunches| -> Result<_, E> {
-            let draft = resized(slots, pass)?;
+        // A draft of `slots` under `ceiling` and `pass`, its charge, and
+        // how far what it needs beyond the mandatory part falls short of the
+        // room (`Ok`, what it leaves) or exceeds it (`Err`).
+        let mut charged = |slots: u64, ceiling: u64, pass: PassLaunches| -> Result<_, E> {
+            let draft = whole.resized(slots, ceiling, pass)?;
             let charge = held.charge(definition, &draft)?;
-            let needed = match draft.load.holds_group_class() {
-                true => Self::allocated(&charge.charge().with_group_class().map_err(PlanError::ResourcePlanning)?)?,
-                false => Self::allocated(charge.charge())?,
+            let needed = match draft.load.group_class_pass() {
+                Some(pass) => Self::allocated(&charge.charge().with_group_class(pass).map_err(PlanError::ResourcePlanning)?)?,
+                None => Self::allocated(charge.charge())?,
             };
-            let over = needed.saturating_sub(mandatory_bytes).saturating_sub(room.free.min(room.ceiling));
-            Ok((draft, charge, over))
+            let (grown, room) = (needed.saturating_sub(mandatory_bytes), room.free.min(room.ceiling));
+            Ok((draft, charge, room.checked_sub(grown).ok_or_else(|| grown - room)))
         };
         let granted = settle_confirmed(curves, load_supply(room), |granted| -> Result<Result<(), NonZeroU64>, E> {
             let slots = points[granted[0]];
@@ -754,19 +767,32 @@ impl ExecutionPlanDraft {
                 if prices.prompt_seconds(pass, most) > granted_seconds {
                     continue;
                 }
-                let (draft, charge, excess) = over(slots, pass)?;
-                if excess == 0 {
-                    tied = Some((draft, charge));
+                if let (_, _, Ok(left)) = charged(slots, ceiling, pass)? {
+                    tied = Some((pass, left));
                     break;
                 }
             }
-            let (draft, charge) = match tied {
+            let (pass, left) = match tied {
                 Some(tied) => tied,
-                None => match over(slots, ladder[granted[1]])? {
-                    (draft, charge, 0) => (draft, charge),
-                    (_, _, excess) => return Ok(Err(NonZeroU64::new(excess).expect("a nonzero excess"))),
+                None => match charged(slots, ceiling, ladder[granted[1]])? {
+                    (_, _, Ok(left)) => (ladder[granted[1]], left),
+                    (_, _, Err(excess)) => return Ok(Err(NonZeroU64::new(excess).expect("a nonzero excess"))),
                 },
             };
+            // The bank's ceiling: the most slots the room admits beside
+            // everything the plan holds, which the bank grows to while it
+            // serves and never past. A ceiling the machine cannot reach would
+            // leave the bank's growth always short of it, its last steps
+            // weighed against what nothing can hold.
+            let base = reserved(slots)?;
+            let mut reach = slots;
+            for &more in points.iter().filter(|&&more| more > slots) {
+                if reserved(more)? - base > left {
+                    break;
+                }
+                reach = more;
+            }
+            let (draft, charge, _) = charged(slots, reach, pass)?;
             Ok(confirm(&draft, charge.charge())?.map(|found| settled = Some((draft, charge, found))))
         })?;
         Ok(match granted {
@@ -914,10 +940,12 @@ impl ExecutionPlan {
 /// however often one draft is searched, as a `C` ([`HeldCharge`]).
 #[derive(Clone, Debug)]
 pub struct HeldCharges<C = AssessmentMemoryCharge> {
-    /// A bank's, by the pass size it was certified at: a pass sizes the
-    /// target family's pass buffers and graphs, so a bank of another is
-    /// charged from its structure again.
-    banked: Option<(PassLaunches, C)>,
+    /// A bank's, by the pass size it was certified at and whether its
+    /// ceiling reaches every expert: a pass sizes the target family's pass
+    /// buffers and graphs, and a bank that can be whole has a resident form
+    /// (`ExpertBankPlan::reaches_whole`), so a bank of another is charged
+    /// from its structure again.
+    banked: Option<((PassLaunches, bool), C)>,
     whole: Option<C>,
 }
 
@@ -991,20 +1019,21 @@ impl<C: HeldCharge> HeldCharges<C> {
                 None => Ok(self.whole.insert(C::of(definition, draft)?).clone()),
             };
         };
+        let structure = (bank.pass, bank.reaches_whole());
         match &self.banked {
-            Some((pass, held)) if *pass == bank.pass => {
-                let charge = held.charge().at_bank_slots(&draft.load).map_err(PlanError::ResourcePlanning)?;
+            Some((of, held)) if *of == structure => {
+                let charge = held.charge().clone().at_bank_slots(&draft.load).map_err(PlanError::ResourcePlanning)?;
                 Ok(held.clone().at(charge))
             }
-            _ => Ok(self.banked.insert((bank.pass, C::of(definition, draft)?)).1.clone()),
+            _ => Ok(self.banked.insert((structure, C::of(definition, draft)?)).1.clone()),
         }
     }
 
     /// The charges themselves, without what else their certification gave.
     pub fn charges(&self) -> HeldCharges {
         HeldCharges {
-            banked: self.banked.as_ref().map(|(pass, held)| (*pass, *held.charge())),
-            whole: self.whole.as_ref().map(|held| *held.charge()),
+            banked: self.banked.as_ref().map(|(structure, held)| (*structure, held.charge().clone())),
+            whole: self.whole.as_ref().map(|held| held.charge().clone()),
         }
     }
 }
@@ -1075,8 +1104,9 @@ impl ChargedDraft<DraftedCharge> {
 pub enum NoBank {
     /// The plan's experts cannot stream.
     Unstreamed(UnstreamedExperts),
-    /// The bound is below the weights the plan `needed` at the bank's floor.
-    Bound { needed: u64 },
+    /// The load's weight `cap` is below the weights the plan `needed` at the
+    /// bank's floor.
+    Bound { cap: u64, needed: u64 },
     /// The plan at the bank's floor is still `deficit_bytes` short.
     Short { deficit_bytes: NonZeroU64 },
 }
@@ -1090,33 +1120,35 @@ fn unstreamed<T, E: From<PlanError>>(error: PlanError) -> Result<Result<T, NoBan
     }
 }
 
-/// What bounds the weights a plan holds its experts in. A load's weight cap
-/// bounds every weight byte the load holds, wherever it lies, its host
-/// tier's among them; the device's room bounds only what the device holds.
-/// They are kinds of their own, so no device room bounds a host tier.
+/// What bounds the weights a plan holds its experts in: always the
+/// device's room for them, which no plan's bank exceeds, and a load's weight
+/// cap where it has one. A cap bounds every weight byte the load holds,
+/// wherever it lies, its host tier's among them; the device's room bounds
+/// only what the device holds, so no device room bounds a host tier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeldBound {
-    /// Neither: a load with no weight cap, planned beside no room.
-    Unbounded,
-    /// The load's weight cap, in bytes (`ModelPolicy::weight_cap`).
-    Cap(u64),
+pub struct HeldBound {
     /// The device's room for the load's weights, in bytes.
-    Room(u64),
+    room: u64,
+    /// The load's weight cap, in bytes (`ModelPolicy::weight_cap`).
+    cap: Option<u64>,
 }
 
 impl HeldBound {
-    /// The bound of a load capped at `cap`, when it is.
-    pub fn of_cap(cap: Option<u64>) -> Self {
-        cap.map_or(Self::Unbounded, Self::Cap)
+    /// The bound of a load capped at `cap`, when it is, on a device of
+    /// `room` bytes for its weights.
+    pub fn of(cap: Option<u64>, room: u64) -> Self {
+        Self { room, cap }
     }
 
-    /// The most weight bytes the device may hold: a cap's or a room's,
-    /// none otherwise.
+    /// The bound of `room` bytes of the device for a load's weights alone.
+    pub fn room(room: u64) -> Self {
+        Self { room, cap: None }
+    }
+
+    /// The most weight bytes the device may hold: its room, or the cap
+    /// where it is less.
     fn device(self) -> u64 {
-        match self {
-            Self::Unbounded => u64::MAX,
-            Self::Cap(bytes) | Self::Room(bytes) => bytes,
-        }
+        self.cap.map_or(self.room, |cap| cap.min(self.room))
     }
 }
 
@@ -1165,23 +1197,23 @@ impl<'a> StableRoom<'a> {
     }
 
     /// The stable fit of `draft` charged `charge`: with its prompt groups'
-    /// class of the plan's chain places where the load reserves it
-    /// ([`super::ModelLoadPlan::holds_group_class`],
+    /// class of the places its pass merges where the load reserves it
+    /// ([`super::ModelLoadPlan::group_class_pass`],
     /// `AssessmentMemoryCharge::with_group_class`), as the settle's room
     /// holds it. The one confirm a load's plan and its assessment make.
     pub fn fit(&self, draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<super::AssessmentFit, PlanError> {
-        let charge = match draft.load.holds_group_class() {
-            true => charge.clone().with_group_class().map_err(PlanError::ResourcePlanning)?,
-            false => charge.clone(),
-        };
-        charge.assess_fit(self.topology, self.executor, self.status, self.reserves).map_err(PlanError::ResourcePlanning)
+        let fit = |charge: &AssessmentMemoryCharge| charge.assess_fit(self.topology, self.executor, self.status, self.reserves);
+        match draft.load.group_class_pass() {
+            Some(pass) => charge.with_group_class(pass).and_then(|charge| fit(&charge)),
+            None => fit(charge),
+        }
+        .map_err(PlanError::ResourcePlanning)
     }
 }
 
 impl SettleRoom for StableRoom<'_> {
     fn room(&self, mandatory: &AssessmentMemoryCharge, bytes: u64) -> Result<PlanRoom, PlanError> {
         let bound = mandatory
-            .clone()
             .assess_fit(self.topology, self.executor, self.status, self.reserves)
             .and_then(|fit| fit.settle_bound())
             .map_err(PlanError::ResourcePlanning)?;
@@ -1670,9 +1702,8 @@ mod tests {
     /// resident (every slot) and a pass of at least 512 rows beside it,
     /// whose prefill is no slower than 512-row passes'. Every pass ties
     /// beside the whole bank, so the plan holds the largest one whose prompt
-    /// group's class fits beside it: none above 512 rows in the device's
-    /// own room (the whole bank and the class, 1.40 GB, overrun it by
-    /// 361 MB), the largest with a GiB more.
+    /// group's class of the places it merges fits beside it, the largest
+    /// of all with a GiB more.
     #[test]
     fn gemma_q4_on_a_3090_keeps_its_bank_resident_beside_a_merged_pass() {
         use crate::planning::fixtures::{LIMITS, gemma_moe_fixture_definition, gemma_moe_fixture_manifest};
@@ -1705,7 +1736,7 @@ mod tests {
         };
         let prices = Priced::Measured(crate::assessment::synthetic::plan_prices());
         let (planned, ()) = draft
-            .with_held_experts(&definition, HeldBound::Room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
+            .with_held_experts(&definition, HeldBound::room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
                 Ok::<_, PlanError>(Ok(()))
             })
             .unwrap()
@@ -1738,18 +1769,27 @@ mod tests {
         let region = *magnitude_batching::row_classes(limits.max_launch_rows).last().unwrap() as u64;
         assert!(bank.pass.get() as u64 * region >= 512, "{:?} of {region} rows", bank.pass);
         // Every pass size prices alike beside a whole bank, compute-bound
-        // from 512 rows on: the largest whose class fits is held, the
-        // fewest submissions. A pass above 512 rows charges its group's
-        // class, which the device's room cannot hold beside every slot.
-        let charge = crate::assessment::execution_memory_charge(&definition, planned.draft()).unwrap();
-        let with_class = ExecutionPlanDraft::allocated(&charge.with_group_class().unwrap()).unwrap();
-        assert!(with_class > bound, "the whole bank and its class ({with_class} bytes) fit the room ({bound})");
-        assert_eq!(bank.pass, PassLaunches::FLOOR, "no pass above the floor fits beside the whole bank");
+        // from 512 rows on: the largest whose class of the places it merges
+        // fits is held, the fewest submissions.
+        let allocated_at = |pass: PassLaunches| {
+            let draft = planned.draft().resized(bank.slots, bank.ceiling, pass).unwrap();
+            let charge = crate::assessment::execution_memory_charge(&definition, &draft).unwrap();
+            match draft.load().group_class_pass() {
+                Some(pass) => ExecutionPlanDraft::allocated(&charge.with_group_class(pass).unwrap()).unwrap(),
+                None => ExecutionPlanDraft::allocated(&charge).unwrap(),
+            }
+        };
+        assert!(allocated_at(bank.pass) <= bound, "{:?} and its class fit beside the whole bank", bank.pass);
+        let ladder = super::super::pass_ladder(PassLaunches::new(NonZeroUsize::new(bank.places as usize).unwrap()));
+        if let Some(&next) = ladder.iter().find(|&&pass| pass > bank.pass) {
+            let with_class = allocated_at(next);
+            assert!(with_class > bound, "{next:?} and its class ({with_class} bytes) fit the room ({bound}) beside the whole bank");
+        }
         // With a GiB more, the class fits beside the whole bank: the largest
         // pass is held.
         let wider = bound + (1 << 30);
         let (wide, ()) = draft
-            .with_held_experts(&definition, HeldBound::Room(wider), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), |mandatory: u64| {
+            .with_held_experts(&definition, HeldBound::room(wider), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), |mandatory: u64| {
                 let left = wider.saturating_sub(mandatory);
                 PlanRoom { free: left, ceiling: left }
             }, |_, _| Ok::<_, PlanError>(Ok(())))
@@ -1812,10 +1852,11 @@ mod tests {
 
     /// A merged pass's saving is its misses' reads at the most the bank
     /// can hold, which is no more than the room admits, whatever its
-    /// ceiling: Gemma 26B q4 on the recorded M4 Pro, uncapped (its ceiling
-    /// every expert) but with room beside its mandatory part for half its
-    /// experts, reads the rest from storage, so passes that read them fewer
-    /// times save storage reads and the settle merges launches.
+    /// structure's ceiling: Gemma 26B q4 on the recorded M4 Pro, uncapped
+    /// (its structure's ceiling every expert) but with room beside its
+    /// mandatory part for half its experts, reads the rest from storage, so
+    /// passes that read them fewer times save storage reads and the settle
+    /// merges launches.
     #[test]
     fn a_pass_saves_the_misses_of_the_bank_the_room_admits() {
         use crate::planning::fixtures::{LIMITS, gemma_moe_fixture_definition, gemma_moe_fixture_manifest};
@@ -1839,7 +1880,7 @@ mod tests {
         let half = bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
         let room = |_: u64| PlanRoom { free: half, ceiling: half };
         let (planned, ()) = draft
-            .with_held_experts(&definition, HeldBound::Unbounded, &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
+            .with_held_experts(&definition, HeldBound::of(None, draft.device().assessment_capacity_bytes()), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
                 Ok::<_, PlanError>(Ok(()))
             })
             .unwrap()
@@ -1847,5 +1888,102 @@ mod tests {
         let held = planned.draft().load().expert_bank().unwrap();
         assert!(held.slots < held.widest().get(), "{} of {} slots", held.slots, held.widest());
         assert!(held.pass > PassLaunches::FLOOR, "{:?} beside {} streamed slots", held.pass, held.widest().get() - held.slots);
+    }
+
+    /// A DeepSeek V4.1-sized routed model (40 layers of 384 experts
+    /// choosing 8, 18.6 MB an expert, 285 GB of them) at a 64k context (a
+    /// whole-context group of 128 places), prepared on `device`, and its
+    /// plan prices.
+    fn far_larger(device: crate::platform::SelectedDevice) -> (ModelDefinition, ExecutionPlanDraft, Priced<crate::PlanPrices>) {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        let mut definition =
+            routed_fixture_definition(RoutedShape { layers: 40, experts: 384, selected: 8, hidden: 4096, intermediate: 2688 });
+        definition.decoder.context_limit = 65_536;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        (definition, draft, Priced::Measured(crate::assessment::synthetic::plan_prices()))
+    }
+
+    /// [`far_larger`]'s bank on the recorded M4 Pro as a plan of it under
+    /// `bound` holds it, with room beside its mandatory part for 20 GB.
+    fn far_larger_bank(bound: impl FnOnce(u64) -> HeldBound) -> super::super::ExpertBankPlan {
+        let (_, _, _, device) = recorded(seismic::fixtures::recorded::m4_pro(), BackendName::Metal, 0, seismic::GraphCost::None);
+        let (definition, draft, prices) = far_larger(device);
+        let bound = bound(draft.device().assessment_capacity_bytes());
+        let (planned, ()) = draft
+            .with_held_experts(
+                &definition,
+                bound,
+                &prices,
+                &mut HeldCharges::<AssessmentMemoryCharge>::default(),
+                |_: u64| PlanRoom { free: FAR_ROOM, ceiling: FAR_ROOM },
+                |_, _| Ok::<_, PlanError>(Ok(())),
+            )
+            .unwrap()
+            .unwrap_or_else(|no| panic!("a V4.1-sized model streams under {bound:?}: {no:?}"));
+        planned.draft().load().expert_bank().unwrap().clone()
+    }
+
+    const FAR_ROOM: u64 = 20_000_000_000;
+
+    /// Capped at 29 GB, below a tenth of its experts' weights beside the
+    /// rest, a model far larger than its machine streams a bank between
+    /// what a step needs and that tenth: nothing a step can run on is
+    /// refused. Its pass merges launches beside the bank: a pass of two
+    /// holds the class of two places, not of the 128 the chain may hold.
+    #[test]
+    fn a_capped_load_far_larger_than_its_machine_streams_and_merges_its_passes() {
+        let capped = far_larger_bank(|capacity| HeldBound::of(Some(29_000_000_000), capacity));
+        let tenth = capped.widest().get().div_ceil(10);
+        let found = format!("{} slots (floor {}, a tenth {tenth}), ceiling {}, {:?} of {} places", capped.slots, capped.floor(), capped.ceiling, capped.pass, capped.places);
+        assert!(capped.ceiling < tenth && capped.places == 128, "{found}");
+        assert!(capped.pass > PassLaunches::FLOOR, "{found}");
+    }
+
+    /// Uncapped, with room beside its mandatory part for 20 GB, a model far
+    /// larger than its machine holds a bank whose ceiling that room admits,
+    /// not every expert, and merges its passes beside it.
+    #[test]
+    fn an_uncapped_load_far_larger_than_its_machine_grows_only_to_its_room() {
+        let uncapped = far_larger_bank(|capacity| HeldBound::of(None, capacity));
+        let grown = uncapped.resident_charge(uncapped.ceiling).unwrap() - uncapped.resident_charge(uncapped.floor()).unwrap();
+        let found = format!(
+            "{} of {} slots, ceiling {} ({grown} bytes past the floor beside the room's {FAR_ROOM}), {:?} of {} places",
+            uncapped.slots,
+            uncapped.widest(),
+            uncapped.ceiling,
+            uncapped.pass,
+            uncapped.places,
+        );
+        assert!(uncapped.ceiling < uncapped.widest().get() && grown <= FAR_ROOM, "{found}");
+        assert!(uncapped.pass > PassLaunches::FLOOR, "{found}");
+    }
+
+    /// Planned as a load is, uncapped on the machine's own room (the
+    /// recorded RTX 3090, 24 GB, with 64 GB of host RAM free, too little
+    /// for a tenth of its experts beside the rest), a model far larger than
+    /// its machine streams a bank of the slots the device holds, merging its
+    /// passes, never imported whole.
+    #[test]
+    fn an_uncapped_load_far_larger_than_its_machine_streams_never_whole() {
+        let (_, _, _, device) = rtx3090(64 << 30);
+        let (definition, draft, prices) = far_larger(device);
+        let loaded = draft
+            .with_bank::<AssessmentMemoryCharge>(&definition, None, &prices)
+            .unwrap_or_else(|error| panic!("a V4.1-sized model plans uncapped on an RTX 3090: {error}"))
+            .into_draft();
+        let streamed = loaded.load().expert_bank().expect("an uncapped load larger than its machine streams its experts");
+        assert!(streamed.slots < streamed.widest().get(), "{} of {} slots", streamed.slots, streamed.widest());
+        assert!(streamed.pass > PassLaunches::FLOOR, "{:?} of {} places", streamed.pass, streamed.places);
     }
 }

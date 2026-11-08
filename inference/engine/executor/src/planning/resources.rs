@@ -84,6 +84,32 @@ impl PassLaunches {
     }
 }
 
+/// A value at each pass size a load may hold (`planning::pass_ladder` of
+/// its chain's places): what a prompt group of the places a pass of that
+/// size merges holds, priced at that count and no other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ByPass<T>(std::sync::Arc<[(PassLaunches, T)]>);
+
+impl<T> ByPass<T> {
+    /// `value` at each pass size of the ladder up to `most`.
+    pub fn of<E>(most: PassLaunches, mut value: impl FnMut(PassLaunches) -> Result<T, E>) -> Result<Self, E> {
+        super::pass_ladder(most)
+            .into_iter()
+            .map(|pass| value(pass).map(|value| (pass, value)))
+            .collect::<Result<Vec<_>, E>>()
+            .map(|values| Self(values.into()))
+    }
+
+    /// The value at `pass`, a size of the ladder.
+    pub fn at(&self, pass: PassLaunches) -> &T {
+        self.0
+            .iter()
+            .find(|(of, _)| *of == pass)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("invariant violated: {pass:?} is no pass size of the load's ladder"))
+    }
+}
+
 /// The most merged cells one image encodes, whatever its model declares and
 /// whatever its device: about 4.2 MP at Qwen3-VL's 32-pixel cells. A larger
 /// image is resized down to it.

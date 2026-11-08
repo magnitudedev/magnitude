@@ -17,7 +17,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentMemoryCharge, ConveyorCarrier, HeldBound, HeldCharges, PlanError, PlanPrices, PlanRoom,
+    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, HeldBound, HeldCharges, PlanError, PlanPrices, PlanRoom, StableRoom,
     assessment::{AssessmentError, ColdSource, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
     platform::{DeviceRequest, DomainRole, MemoryReserves, StoreMotion},
 };
@@ -629,7 +629,7 @@ fn a_capped_streamed_load_fits_with_its_graphs_priced() {
             Err(error) => panic!("{backend:?}: Qwen3.6 35B is planned on the RTX 3090 under the cap: {error}"),
         };
         assert!(draft.load().expert_bank().is_some(), "{backend:?}: a capped load streams");
-        let charge = *execution.memory_charge();
+        let charge = execution.memory_charge().clone();
         let graphs = charge.bounds.recorded_graph_bytes;
         assert!(0 < graphs && graphs < charge.allocation_bytes / 8, "{backend:?}: startup graphs {graphs} bytes");
     }
@@ -779,7 +779,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     // lie in.
     let replan = |draft: &magnitude_executor::ExecutionPlanDraft| {
         draft
-            .with_held_experts(&definition, HeldBound::Unbounded, &synthetic_prices(), &mut HeldCharges::<AssessmentMemoryCharge>::default(), unbounded, |_, _| {
+            .with_held_experts(&definition, HeldBound::of(None, draft.device().assessment_capacity_bytes()), &synthetic_prices(), &mut HeldCharges::<AssessmentMemoryCharge>::default(), unbounded, |_, _| {
                 Ok::<_, AssessmentError>(Ok(()))
             })
             .unwrap()
@@ -846,7 +846,8 @@ fn a_bank_shrunk_to_fit_keeps_its_host_tier() {
 /// uncapped, planned on synthetic prices into the device's stable room.
 /// The 17.35 GB that room leaves beside the 7.67 GB mandatory part holds
 /// 248 of its 256 slots, and the 248th saves nothing on these prices, so
-/// the bank holds 247; a prompt pass covers at least 512 rows.
+/// the bank holds 247, and grows to no more than the room's 248; a prompt
+/// pass covers at least 512 rows.
 #[test]
 fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     let scratch = Scratch::new("qwen36-3090-settle");
@@ -868,13 +869,14 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     };
     let prices = plan_prices(&setup.measurements, draft);
     let (planned, ()) = draft
-        .with_held_experts(definition, HeldBound::Room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
+        .with_held_experts(definition, HeldBound::room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
         .unwrap_or_else(|no| panic!("Qwen3.6 35B streams on the RTX 3090: {no:?}"));
     let bank = planned.draft().load().expert_bank().expect("a routed load banks its experts");
-    assert_eq!((bank.slots, bank.ceiling), (247, 256), "the bank holds the slots its room admits that save anything");
+    assert_eq!(bank.slots, 247, "the bank holds the slots its room admits that save anything");
+    assert!((247..=248).contains(&bank.ceiling), "a ceiling of {} slots beyond the room's 248", bank.ceiling);
     let limits = planned.draft().policy().limits();
     let region = *magnitude_executor::batching::row_classes(limits.max_launch_rows).last().unwrap() as u64;
     assert!(bank.pass.get() as u64 * region >= 512, "{:?} of {region} rows", bank.pass);
@@ -1007,20 +1009,30 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     };
 
     // The plan and the fit are one settle: a plan of the fit's room on the
-    // same prices holds the fit's slots, and a plan of half that room,
-    // as a release slower than another program's take leaves it
-    // while it serves, holds no more.
+    // same prices, confirmed by the same stable fit, holds the fit's slots,
+    // and a plan of half that room, as a release slower than another
+    // program's take leaves it while it serves, holds no more.
     let allocation = domains.iter().find(|domain| domain.role == DomainRole::Allocation).unwrap();
     let bound = allocation.capacity_bytes - allocation.reserve_bytes;
     let prices = plan_prices(&setup.measurements, draft);
+    let structure = &setup.structure;
+    let stable = StableRoom {
+        topology: &structure.topology,
+        executor: structure.topology.resolve(draft.device().selector()).unwrap(),
+        status: &structure.status,
+        reserves: &structure.reserves,
+    };
     let settled = |share: u64| {
         let room = |mandatory: u64| {
             let left = bound.saturating_sub(mandatory) / share;
             PlanRoom { free: left, ceiling: left }
         };
         let (planned, ()) = draft
-            .with_held_experts(definition, HeldBound::Room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
-                Ok::<_, AssessmentError>(Ok(()))
+            .with_held_experts(definition, HeldBound::room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |candidate, charge| {
+                Ok::<_, AssessmentError>(match stable.fit(candidate, charge).unwrap().verdict {
+                    AssessmentFitVerdict::Fits => Ok(()),
+                    AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
+                })
             })
             .unwrap()
             .unwrap();

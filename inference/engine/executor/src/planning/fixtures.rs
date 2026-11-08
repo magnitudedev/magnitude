@@ -487,36 +487,51 @@ pub fn relaid_manifest(
 /// 0.5 GB, and its whole-context prompt group 32 launches of 512 rows.
 #[cfg(test)]
 pub fn gemma_moe_fixture_definition() -> ModelDefinition {
+    routed_fixture_definition(RoutedShape { layers: 30, experts: 128, selected: 8, hidden: 2816, intermediate: 1152 })
+}
+
+/// A routed model's shape: its layers, each layer's experts and those a
+/// row selects, and its widths.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub struct RoutedShape {
+    pub layers: u64,
+    pub experts: u64,
+    pub selected: u64,
+    pub hidden: u64,
+    pub intermediate: u64,
+}
+
+/// A model of `shape`, every block attention and a routed feed-forward, as
+/// [`gemma_moe_fixture_definition`]'s are.
+#[cfg(test)]
+pub fn routed_fixture_definition(shape: RoutedShape) -> ModelDefinition {
     use magnitude_family_contracts::{ExpertSelection, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction};
-    const LAYERS: u64 = 30;
-    const EXPERTS: u64 = 128;
-    const SELECTED: u64 = 8;
-    const HIDDEN: u64 = 2816;
-    const INTERMEDIATE: u64 = 1152;
+    let RoutedShape { layers, experts, selected, hidden, intermediate } = shape;
     const HEADS: u64 = 8;
     const KV_HEADS: u64 = 2;
     const WIDTH: u64 = 128;
     let mut definition = fixture_definition();
     let decoder = &mut definition.decoder;
-    decoder.hidden = HIDDEN;
+    decoder.hidden = hidden;
     decoder.context_limit = 16_384;
     let vocabulary = decoder.vocabulary;
     let rms = |name: String, width| RmsNorm { weight: descriptor(&name, &[width]), epsilon: 1e-6 };
-    decoder.entry.embedding = descriptor("embedding", &[vocabulary, HIDDEN]);
-    decoder.exit.norm = ExitNorm::Rms(rms("output_norm".into(), HIDDEN));
-    decoder.exit.output = descriptor("output", &[vocabulary, HIDDEN]);
+    decoder.entry.embedding = descriptor("embedding", &[vocabulary, hidden]);
+    decoder.exit.norm = ExitNorm::Rms(rms("output_norm".into(), hidden));
+    decoder.exit.output = descriptor("output", &[vocabulary, hidden]);
     let block = |block: u64| {
         let name = |part: &str| format!("blk.{block}.{part}");
         let attention = Attention {
             heads: HEADS,
             kv_heads: KV_HEADS,
             width: WIDTH,
-            query: descriptor(&name("attn_qg"), &[2 * HEADS * WIDTH, HIDDEN]),
+            query: descriptor(&name("attn_qg"), &[2 * HEADS * WIDTH, hidden]),
             gate: AttentionGate::Interleaved { function: GateFunction::Sigmoid },
             query_norm: HeadNorm::Rms(rms(name("attn_q_norm"), WIDTH)),
             key_value: KeyValue::Owned {
-                key: descriptor(&name("attn_k"), &[KV_HEADS * WIDTH, HIDDEN]),
-                value: ValueSource::Projected(descriptor(&name("attn_v"), &[KV_HEADS * WIDTH, HIDDEN])),
+                key: descriptor(&name("attn_k"), &[KV_HEADS * WIDTH, hidden]),
+                value: ValueSource::Projected(descriptor(&name("attn_v"), &[KV_HEADS * WIDTH, hidden])),
                 key_norm: HeadNorm::Rms(rms(name("attn_k_norm"), WIDTH)),
                 value_norm: ValueNorm::None,
                 domain: HistoryDomain::Token,
@@ -526,14 +541,14 @@ pub fn gemma_moe_fixture_definition() -> ModelDefinition {
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
-            output: descriptor(&name("attn_output"), &[HIDDEN, HEADS * WIDTH]),
+            output: descriptor(&name("attn_output"), &[hidden, HEADS * WIDTH]),
         };
         let routed = RoutedFfn {
-            experts: EXPERTS,
-            selected: SELECTED,
-            intermediate: INTERMEDIATE,
+            experts,
+            selected,
+            intermediate,
             router: Router {
-                weight: descriptor(&name("ffn_gate_inp"), &[EXPERTS, HIDDEN]),
+                weight: descriptor(&name("ffn_gate_inp"), &[experts, hidden]),
                 input: RouterInput::Operator,
                 score: ScoreFunction::Softmax,
                 selection: ExpertSelection::TopK { bias: None },
@@ -542,10 +557,10 @@ pub fn gemma_moe_fixture_definition() -> ModelDefinition {
             },
             expert_up: FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
-                gate: descriptor(&name("ffn_gate_exps"), &[EXPERTS, INTERMEDIATE, HIDDEN]),
-                up: descriptor(&name("ffn_up_exps"), &[EXPERTS, INTERMEDIATE, HIDDEN]),
+                gate: descriptor(&name("ffn_gate_exps"), &[experts, intermediate, hidden]),
+                up: descriptor(&name("ffn_up_exps"), &[experts, intermediate, hidden]),
             },
-            expert_down: descriptor(&name("ffn_down_exps"), &[EXPERTS, HIDDEN, INTERMEDIATE]),
+            expert_down: descriptor(&name("ffn_down_exps"), &[experts, hidden, intermediate]),
             expert_scale: None,
             latent: None,
             shared: None,
@@ -553,19 +568,19 @@ pub fn gemma_moe_fixture_definition() -> ModelDefinition {
         Block {
             sublayers: vec![
                 Sublayer {
-                    input: InputNorm::Rms(rms(name("attn_norm"), HIDDEN)),
+                    input: InputNorm::Rms(rms(name("attn_norm"), hidden)),
                     op: Operator::Attention(Box::new(attention)),
                     output: OutputForm::Residual,
                 },
                 Sublayer {
-                    input: InputNorm::Rms(rms(name("ffn_norm"), HIDDEN)),
+                    input: InputNorm::Rms(rms(name("ffn_norm"), hidden)),
                     op: Operator::RoutedFfn(Box::new(routed)),
                     output: OutputForm::Residual,
                 },
             ],
         }
     };
-    decoder.blocks = (0..LAYERS).map(block).collect();
+    decoder.blocks = (0..layers).map(block).collect();
     definition
 }
 

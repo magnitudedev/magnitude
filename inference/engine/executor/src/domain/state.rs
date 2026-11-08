@@ -1093,16 +1093,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The class room the plan reserves beyond the places held
-    /// (`ModelLoadPlan::holds_group_class`): growing the class to the
-    /// chain's capacity, in the bank's device store; none where the plan
-    /// reserves none.
+    /// (`ModelLoadPlan::group_class_pass`): growing the class to the places
+    /// the plan's pass merges, in the bank's device store; none where the
+    /// plan reserves none.
     pub(super) fn planned_class_reserve(&mut self) -> u64 {
-        if !self.execution.load().holds_group_class() {
+        let Some(pass) = self.execution.load().group_class_pass() else {
             return 0;
-        }
+        };
         let held = self.resources.group_places().get();
         let (_, bytes) = self
-            .class_bytes(held, self.chain_capacity().get())
+            .class_bytes(held, pass.get())
             .expect("invariant violated: the plan charged a group class it cannot price");
         *bytes.last().expect("a class's bytes hold the places held")
     }

@@ -637,7 +637,8 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// bank's shrink makes room for (`ExecutorDomain::measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
     /// What of the prompt-group class the plan reserves room for
-    /// (`ModelLoadPlan::holds_group_class`: the class of the chain's places)
+    /// (`ModelLoadPlan::group_class_pass`: the class of the places its pass
+    /// merges)
     /// no group holds yet, in device storage: no growth of the bank takes
     /// it, so a group's places find it however the bank grew before them.
     /// Set as the domain is made, falling as groups hold places
