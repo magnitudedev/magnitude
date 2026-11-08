@@ -18,9 +18,8 @@ export interface HardwareMemoryDomainView {
   readonly kind: LocalInferenceHardware["memoryDomains"][number]["kind"]
   readonly totalBytes: number
   readonly usedBytes: number | null
-  readonly modelBytes: number | null
+  readonly weightsBytes: number | null
   readonly overheadBytes: number | null
-  readonly fixedBytes: number | null
   readonly kvCacheBytes: number | null
   readonly systemAndAppsBytes: number | null
   readonly freeBytes: number | null
@@ -142,15 +141,14 @@ export const deriveHardwareMemoryView = (
     const freeBytes = Option.getOrNull(Option.map(domain.availableBytes, (available) =>
       Math.min(domain.totalBytes, Math.max(0, available))))
     const usedBytes = freeBytes === null ? null : domain.totalBytes - freeBytes
-    const modelBytes = Option.match(allocation, {
+    const weightsBytes = Option.match(allocation, {
       onNone: () => 0,
-      onSome: (resident) => resident.modelBytes,
+      onSome: (resident) => resident.modelBytes + resident.auxiliaryBytes,
     })
     const overheadBytes = Option.match(allocation, {
       onNone: () => 0,
-      onSome: (resident) => resident.computeBytes + resident.auxiliaryBytes,
+      onSome: (resident) => resident.computeBytes,
     })
-    const fixedBytes = modelBytes + overheadBytes
     const kvCacheBytes = Option.match(allocation, {
       onNone: () => 0,
       onSome: (resident) => resident.contextBytes,
@@ -165,24 +163,22 @@ export const deriveHardwareMemoryView = (
     if (freeBytes === null || usedBytes === null) return {
       ...base,
       usedBytes: null,
-      modelBytes,
+      weightsBytes,
       overheadBytes,
-      fixedBytes,
       kvCacheBytes,
       systemAndAppsBytes: null,
       freeBytes: null,
       status: "missing_free",
       notice: "Current memory usage is unavailable.",
     }
-    const ownedBytes = fixedBytes + kvCacheBytes
+    const ownedBytes = weightsBytes + overheadBytes + kvCacheBytes
     const excessBytes = ownedBytes - usedBytes
     const toleranceBytes = Math.max(64 * MIB, domain.totalBytes * 0.001)
     if (excessBytes > toleranceBytes) return {
       ...base,
       usedBytes,
-      modelBytes: null,
+      weightsBytes: null,
       overheadBytes: null,
-      fixedBytes: null,
       kvCacheBytes: null,
       systemAndAppsBytes: null,
       freeBytes,
@@ -194,9 +190,8 @@ export const deriveHardwareMemoryView = (
     return {
       ...base,
       usedBytes: displayedUsedBytes,
-      modelBytes,
+      weightsBytes,
       overheadBytes,
-      fixedBytes,
       kvCacheBytes,
       systemAndAppsBytes: Math.max(0, displayedUsedBytes - ownedBytes),
       freeBytes: domain.totalBytes - displayedUsedBytes,
