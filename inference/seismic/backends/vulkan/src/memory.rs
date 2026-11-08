@@ -6,7 +6,8 @@
 //! block's address plus the range's offset. A pool holds the blocks of one
 //! ordered list of kinds, as the placement rule names them; its blocks grow
 //! from 64 MiB to the block cap (min(`maxMemoryAllocationSize`,
-//! `maxBufferSize`, 1 GiB)); a request beyond the cap gets a dedicated block.
+//! `maxBufferSize`, 1 GiB)); a request of more than half the first block gets a
+//! block of its own.
 //! A block is freed once it holds no allocation, so released storage returns
 //! to the device's memory budget: the engine reads the budget less usage as
 //! its headroom, and a block kept empty would hide released storage from it.
@@ -22,7 +23,10 @@
 use crate::device::{call, Inner};
 use crate::instance::Instance;
 use ash::vk;
-use seismic_compiler::blocks::{block_bytes, FreeRanges, BLOCK_CAP_BYTES};
+use seismic_compiler::blocks::{
+    block_bytes, first_fit, largest_shared, takes_own_block, FreeRanges, PackedBlock,
+    BLOCK_CAP_BYTES,
+};
 use seismic_compiler::errors::ExecutionError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -88,6 +92,18 @@ pub(crate) struct Block {
 unsafe impl Send for Block {}
 unsafe impl Sync for Block {}
 
+impl PackedBlock for Block {
+    fn bytes(&self) -> u64 {
+        self.bytes
+    }
+    fn own(&self) -> bool {
+        self.dedicated
+    }
+    fn take(&self, bytes: u64, alignment: u64) -> Option<u64> {
+        self.ranges().take(bytes, alignment)
+    }
+}
+
 impl Block {
     /// What the block takes of `heaps`: its whole allocation, padding
     /// included, where it lies on one of them.
@@ -97,10 +113,6 @@ impl Block {
         } else {
             0
         }
-    }
-
-    fn take(&self, bytes: u64, alignment: u64) -> Option<u64> {
-        self.ranges().take(bytes, alignment)
     }
 
     /// Return a range; true when the block is entirely free afterwards.
@@ -500,25 +512,17 @@ impl Memory {
         let room = room
             .filter(|_| pool.room_bounded)
             .map(|room| room.saturating_sub(self.room_bounded_slack()));
-        let take = |blocks: &[Arc<Block>]| {
-            blocks
-                .iter()
-                .filter(|block| !block.dedicated)
-                .find_map(|block| block.take(bytes, alignment).map(|offset| (block.clone(), offset)))
-        };
         let mut blocks = pool.blocks.lock().expect("pool lock is never poisoned");
-        let (block, offset) = match take(&blocks) {
+        let found = first_fit(&blocks, bytes, alignment)
+            .map(|(index, offset)| (blocks[index].clone(), offset));
+        let (block, offset) = match found {
             Some(found) => found,
             None => {
                 // A new block, decided under the pool's lock: its charge is
                 // the store's decision (`DriverMemory`), made before its
                 // transition opens.
-                let largest = blocks
-                    .iter()
-                    .filter(|block| !block.dedicated)
-                    .map(|block| block.bytes)
-                    .max();
-                let dedicated = bytes > self.block_cap;
+                let largest = largest_shared(&blocks);
+                let dedicated = takes_own_block(bytes, self.block_cap);
                 let block = self.create(device, pool, room, dedicated, Mapping::Pool, accounts, |within| {
                     block_bytes(largest, self.block_cap, bytes, within, 1)
                 })?;

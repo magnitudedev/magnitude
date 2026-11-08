@@ -653,28 +653,13 @@ mod tests {
     /// A CPU kernel of one launch reading buffer 0 and writing buffer 1, its
     /// function never run: `schedule` reads only its ABI and launches.
     fn copy_kernel(device: &std::sync::Arc<crate::api::device::DeviceInner>) -> std::sync::Arc<super::super::NativePrepared> {
-        use crate::native::{CpuInvocation, CpuLaunchVariants, CpuNativeKernels, CpuVariant};
-        use seismic_native_cpu::Tier;
-        unsafe fn unused(_: &CpuInvocation<'_>, _: [u64; 3], _: &mut [u8]) {}
-        const fn variant(tier: Tier) -> CpuVariant {
-            CpuVariant {
-                tier,
-                elements: &[],
-                function: unused,
-            }
-        }
+        use crate::native::{CpuLaunchVariants, CpuNativeKernels};
         static KERNELS: CpuNativeKernels = CpuNativeKernels {
             digest: "hazard-schedule-test",
             elements: &[],
             launches: &[CpuLaunchVariants {
                 kernel: "copy",
-                variants: &[
-                    variant(Tier::X86V2),
-                    variant(Tier::X86V3),
-                    variant(Tier::X86V4),
-                    variant(Tier::X86V4Vnni),
-                    variant(Tier::Neon),
-                ],
+                variants: &crate::native::cpu::UNRUN_VARIANTS,
             }],
         };
         use seismic_lang::checked::{check_source, SourceFile, SourceSet};

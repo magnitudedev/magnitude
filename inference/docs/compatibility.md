@@ -171,13 +171,12 @@ Apple GPUs are served by Metal. MoltenVK is not a target.
   | x86v4 | AVX-512 F/CD/BW/DQ/VL | Intel Skylake-SP/X server and workstation parts |
   | x86v4vnni | AVX-512 VNNI | Intel Ice Lake, Tiger Lake, Rocket Lake, Sapphire Rapids and newer Xeon; AMD Zen 4/5 |
   | neon | NEON | Every AArch64 CPU |
+  | neondot | `dotprod` (`sdot`) | Nearly every ARM CPU since 2018: Apple M1 and newer, Snapdragon X, Graviton 2+, Ampere Altra, Raspberry Pi 5 |
 
 - **v2 machines are supported but slow.** Hosts should prefer native builds: arm64 on Apple
   silicon and Windows on Arm.
 - **Planned tiers** (performance on hardware that is already supported):
   - x86: AVX-VNNI, on Intel 12th gen and newer Core, N100, and Zen 5
-  - AArch64: `dotprod`, on nearly every ARM CPU since 2018 (Apple M1 and newer, Snapdragon X,
-    Graviton, Raspberry Pi 5)
   - AArch64: `i8mm` and FP16 arithmetic
 - **Operating systems:**
   - Linux: glibc 2.35 (Ubuntu 22.04-compatible userspace)

@@ -26,7 +26,7 @@ use magnitude_engine::{
 };
 use magnitude_executor::{
     assessment::{
-        decode_pricing, step_seconds, Derived, DomainFit, ExecutionShortfall, ExecutorCosts,
+        decode_pricing, step_seconds, Derived, DomainFit, ExecutionFit, ExecutionShortfall, ExecutorCosts,
         FormatRates, HistoryCosts, MatrixCosts, MeasuredCost, WeightRate, MEASUREMENT_SECONDS,
     },
     platform::{DeviceRequest, MemoryReserves},
@@ -62,8 +62,9 @@ struct Options {
     topology: bool,
     /// The ceiling on every weight byte a load holds (`ModelPolicy::weight_cap`).
     weight_cap: Option<u64>,
-    /// The context each model is planned at, as a load serving it there
-    /// (`AssessmentStructure::served_context`): its declared limit when none.
+    /// The one context each model is assessed at, as a load serving it there
+    /// (`AssessmentStructure::served_context`): the largest of its served
+    /// tiers that fits when none.
     context: Option<usize>,
     models: Vec<ModelPackagePaths>,
 }
@@ -691,9 +692,24 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
         })
     };
     let mut object = match execution {
-        ModelExecution::Fits { domains, residency, bank: planned } => json!({
+        ModelExecution::Fits {
+            fit:
+                ExecutionFit {
+                    fit_context_tokens,
+                    domains,
+                    breakdown,
+                    bank: planned,
+                },
+            residency,
+        } => json!({
             "_tag": "Fits",
+            "servedContextTokens": fit_context_tokens,
             "memory": memory(domains),
+            "memoryBreakdown": {
+                "weightsBytes": breakdown.weights_bytes,
+                "contextBytes": breakdown.context_bytes,
+                "overheadBytes": breakdown.overhead_bytes,
+            },
             "expertBank": planned.as_ref().map(bank),
             "residency": match residency {
                 ModelResidency::Resident { performance: resident } => json!({
@@ -715,12 +731,13 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
             },
         }),
         ModelExecution::DoesNotFit(ExecutionShortfall {
+            fit_context_tokens,
             domains,
             limiting,
             deficit_bytes,
-            ..
         }) => json!({
             "_tag": "DoesNotFit",
+            "shortfallContextTokens": fit_context_tokens,
             "memory": memory(domains),
             "limitingResource": domain_id(setup, *limiting),
             "deficitBytes": deficit_bytes,

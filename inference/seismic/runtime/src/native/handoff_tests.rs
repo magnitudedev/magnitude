@@ -70,28 +70,13 @@ fn native_handoff_reuses_exact_subjects_but_not_changed_assets_or_statics() {
 
 #[test]
 fn abandoned_native_handoff_does_not_keep_the_device_alive() {
-    use seismic_native_cpu::Tier;
     // Only formation and ownership are exercised; the function is never submitted.
-    unsafe fn unused(_: &CpuInvocation<'_>, _: [u64; 3], _: &mut [u8]) {}
-    const fn variant(tier: Tier) -> CpuVariant {
-        CpuVariant {
-            tier,
-            elements: &[],
-            function: unused,
-        }
-    }
     static KERNELS: CpuNativeKernels = CpuNativeKernels {
         digest: "handoff-lifetime-test",
         elements: &[],
         launches: &[CpuLaunchVariants {
             kernel: "project",
-            variants: &[
-                variant(Tier::X86V2),
-                variant(Tier::X86V3),
-                variant(Tier::X86V4),
-                variant(Tier::X86V4Vnni),
-                variant(Tier::Neon),
-            ],
+            variants: &crate::native::cpu::UNRUN_VARIANTS,
         }],
     };
     let module = check_source(SourceSet::new(vec![SourceFile {
@@ -155,27 +140,12 @@ fn abandoned_native_handoff_does_not_keep_the_device_alive() {
 /// tuning handed off outlives the load on the device.
 #[test]
 fn a_promotion_withdraws_the_handoff_it_replaces_and_serving_takes_the_last() {
-    use seismic_native_cpu::Tier;
-    unsafe fn unused(_: &CpuInvocation<'_>, _: [u64; 3], _: &mut [u8]) {}
-    const fn variant(tier: Tier) -> CpuVariant {
-        CpuVariant {
-            tier,
-            elements: &[],
-            function: unused,
-        }
-    }
     static KERNELS: CpuNativeKernels = CpuNativeKernels {
         digest: "handoff-promotion-test",
         elements: &[],
         launches: &[CpuLaunchVariants {
             kernel: "project",
-            variants: &[
-                variant(Tier::X86V2),
-                variant(Tier::X86V3),
-                variant(Tier::X86V4),
-                variant(Tier::X86V4Vnni),
-                variant(Tier::Neon),
-            ],
+            variants: &crate::native::cpu::UNRUN_VARIANTS,
         }],
     };
     let module = check_source(SourceSet::new(vec![SourceFile {

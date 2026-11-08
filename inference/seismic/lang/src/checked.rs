@@ -1561,7 +1561,8 @@ pub enum NativeParameterRole {
 
 impl NativeParameterRole {
     /// The tiers a `Tier` parameter value names, by ordinal from 1.
-    pub const TIERS: [&'static str; 5] = ["x86v2", "x86v3", "x86v4", "x86v4vnni", "neon"];
+    pub const TIERS: [&'static str; 6] =
+        ["x86v2", "x86v3", "x86v4", "x86v4vnni", "neon", "neondot"];
 }
 
 impl NativeParameter {

@@ -49,10 +49,12 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       assessmentId: ModelAssessmentIdSchema.make(`assessment-${source}`),
       environmentId: AssessmentEnvironmentIdSchema.make("environment"),
       profile: { contextLength: 32_768 },
+      served: { contextLength: 32_768 },
       memory: {
         domains: [],
         totalRequiredBytes: 0,
         requiredSystemMemoryBytes: 0,
+        breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
       },
       residency: {
         _tag: "Resident",
@@ -199,6 +201,7 @@ describe("local provider offerings", () => {
           assessmentId: ModelAssessmentIdSchema.make("does-not-fit"),
           environmentId: AssessmentEnvironmentIdSchema.make("environment"),
           profile: { contextLength: 32_768 },
+          shortfall: { contextLength: 32_768 },
           memoryDomains: [{
             memoryDomainId: LocalInferenceMemoryDomainIdSchema.make("system"),
             capacityBytes: 0,

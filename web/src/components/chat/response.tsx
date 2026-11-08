@@ -2,12 +2,14 @@ import { memo, useMemo, useState } from "react"
 import { Option } from "effect"
 import {
   type ChatAssistantMessage,
+  responseExceedsContext,
   responseMetrics,
   responseStatusText,
 } from "@magnitudedev/sdk"
 import {
   ArrowCounterClockwiseIcon,
   CaretDownIcon,
+  PlusIcon,
   CaretRightIcon,
   CopyIcon,
   CheckIcon,
@@ -23,10 +25,12 @@ const partsText = (response: ChatAssistantMessage, part: "text" | "reasoning") =
 export function ChatResponse({
   response: g,
   retry,
+  newChat,
   notify,
 }: {
   response: ChatAssistantMessage
   retry?: () => void
+  newChat?: () => void
   notify: (text: string) => void
 }) {
   const [details, setDetails] = useState(false)
@@ -115,10 +119,16 @@ export function ChatResponse({
               >
                 {copied ? <CheckIcon /> : <CopyIcon />}
               </IconButton>
-              {retry && (
-                <IconButton label="Retry response" onClick={retry}>
-                  <ArrowCounterClockwiseIcon />
+              {retry && responseExceedsContext(g) && newChat ? (
+                <IconButton label="New chat" onClick={newChat}>
+                  <PlusIcon />
                 </IconButton>
+              ) : (
+                retry && (
+                  <IconButton label="Retry response" onClick={retry}>
+                    <ArrowCounterClockwiseIcon />
+                  </IconButton>
+                )
               )}
             </div>
           </div>

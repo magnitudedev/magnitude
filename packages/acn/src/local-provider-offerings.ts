@@ -1,6 +1,7 @@
 import { Context, Effect, Layer, Option, Stream } from "effect"
 import {
   localModelAssessmentProfile,
+  localModelAssessmentServedProfile,
   localModelDeprecation,
   localModelIsAvailable,
   localModelProviderModelId,
@@ -65,7 +66,10 @@ export const projectLocalProviderOfferings = (models: readonly LocalModel[]) => 
   const assessedModels = models.flatMap((model) => Option.match(localModelServingState(model), {
     onNone: () => [],
     onSome: (serving) => serving._tag === "Assessed"
-      ? Option.match(localModelAssessmentProfile(serving.assessment), {
+      ? Option.match(Option.orElse(
+        localModelAssessmentServedProfile(serving.assessment),
+        () => localModelAssessmentProfile(serving.assessment),
+      ), {
         onNone: () => [],
         onSome: (profile) => [{ model, serving, profile }],
       })

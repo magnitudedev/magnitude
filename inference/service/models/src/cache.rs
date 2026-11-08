@@ -308,7 +308,7 @@ mod tests {
     use super::*;
     use magnitude_service_contracts::MemoryDomainId;
     use magnitude_service_contracts::models::{
-        MemoryAssessment, ModelAssessmentId, ModelCapabilities, ModelPerformance,
+        MemoryAssessment, MemoryBreakdown, ModelAssessmentId, ModelCapabilities, ModelPerformance,
         ModelReasoningCapabilities, ModelResidency, PerformanceEvidence, ServingProfile,
     };
 
@@ -391,6 +391,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let fits = ModelAssessment::Fits {
             profile: profile(50_000),
+            served: profile(50_000),
             assessment_id: ModelAssessmentId("fits-assessment".to_owned()),
             memory: vec![MemoryAssessment {
                 memory_domain_id: MemoryDomainId::system(),
@@ -399,6 +400,11 @@ mod tests {
                 compatibility_reserve_bytes: 0,
                 remaining_bytes: 50,
             }],
+            memory_breakdown: MemoryBreakdown {
+                weights_bytes: 30,
+                context_bytes: 10,
+                overhead_bytes: 10,
+            },
             residency: ModelResidency::Resident {
                 performance: ModelPerformance::Estimated {
                     samples: vec![PerformanceEvidence {
@@ -412,6 +418,7 @@ mod tests {
         };
         let does_not_fit = ModelAssessment::DoesNotFit {
             profile: profile(100_000),
+            shortfall: profile(32_768),
             assessment_id: ModelAssessmentId("non-fit-assessment".to_owned()),
             memory: vec![MemoryAssessment {
                 memory_domain_id: MemoryDomainId::system(),

@@ -132,11 +132,13 @@ export function ChatSettingsPanel({
   settings: s,
   patch,
   context,
+  contextLimit,
   defaults: d,
 }: {
   settings: ChatRequestSettings
   patch: (change: Partial<ChatRequestSettings>) => void
   context?: number
+  contextLimit?: number
   defaults?: ChatDefaultsState
 }) {
   const [advanced, setAdvanced] = useState(false)
@@ -293,11 +295,17 @@ export function ChatSettingsPanel({
         <div className="flex items-center justify-between text-[13px]">
           <span className="font-medium">Context window</span>
           <span className="text-slate-500">
-            {context === undefined ? "—" : number(context)}
+            {context === undefined
+              ? "—"
+              : contextLimit === undefined
+                ? number(context)
+                : `${number(context)} of ${number(contextLimit)}`}
           </span>
         </div>
         <p className="mt-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
-          Configured when the model is loaded.
+          {contextLimit === undefined
+            ? "Configured when the model is loaded."
+            : "The most this computer has memory for with this model. A longer chat needs a new one."}
         </p>
       </div>
     </>

@@ -38,7 +38,7 @@ pub mod synthetic;
 pub use assess::{
     assess_execution_fit, decode_demand, decode_pricing, decode_step, estimate_execution, execution_memory_charge, execution_memory_charge_with_undrafted, undrafted_memory_charge, StructuralCharge,
     prepare_execution_assessment, AssessmentRequest, ColdSource, DomainFit, ExecutionAssessment,
-    ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, PreparedExecutionAssessment, Residency,
+    ExecutionFit, ExecutionShortfall, ExpertShares, FileOnly, MemoryBreakdown, PreparedExecutionAssessment, Residency,
 };
 pub use demand::{Bytes, Call, DecodeDemand, Experts, Flops, HistoryRead, Work};
 pub use estimate::{

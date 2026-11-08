@@ -1,6 +1,7 @@
 """The local hosts file: only our choices per host: pools, cache root, model store and host
 environment (`env`, applied to every step on that host, e.g. a toolkit location). A host
-entry may omit `root` or `models` to use the defaults.
+entry may omit `root` or `models` to use the defaults. `"temperatures": false` declares a host
+that exposes no temperature sensors (a cloud VM), whose thermal gate then judges idleness alone.
 
 A host is an ssh alias, or, with `"local": true`, this machine, reached by a subprocess
 instead of ssh and otherwise a host like any other. `local` names this machine whether or
@@ -30,6 +31,7 @@ class HostConfig:
     models: str
     env: tuple[tuple[str, str], ...] = ()  # applied to every step on the host; `~` allowed
     local: bool = False  # this machine, reached without ssh
+    temperatures: bool = True  # the host exposes temperature sensors the gate must read
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,7 @@ class Hosts:
                 entry.get("models", defaults["models"]),
                 tuple(entry.get("env", {}).items()),
                 entry.get("local", alias == LOCAL),
+                entry.get("temperatures", True),
             )
             for alias, entry in data.get("hosts", {}).items()
         }

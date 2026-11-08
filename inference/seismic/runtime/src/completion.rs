@@ -37,6 +37,9 @@ pub(crate) enum Committed {
         outcome: Result<(), ExecutionError>,
         /// Execution interval on the [`crate::native::trace::host_seconds`] clock.
         interval: (f64, f64),
+        /// Each launch's interval at launch detail (`cpu::run`), on the
+        /// same clock.
+        launches: Option<Vec<Option<(f64, f64)>>>,
     },
     #[cfg(target_os = "macos")]
     Metal(seismic_metal::DirectSubmission),

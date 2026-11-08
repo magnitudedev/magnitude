@@ -9060,28 +9060,13 @@ mod tests {
     /// The ledger of a unit timed at `points` points, its defaults measured
     /// at one second each.
     fn recorded(points: usize) -> Recorded {
-        use crate::native::cpu::{CpuInvocation, CpuLaunchVariants, CpuVariant};
-        use seismic_native_cpu::Tier;
-        unsafe fn unused(_: &CpuInvocation<'_>, _: [u64; 3], _: &mut [u8]) {}
-        const fn variant(tier: Tier) -> CpuVariant {
-            CpuVariant {
-                tier,
-                elements: &[],
-                function: unused,
-            }
-        }
+        use crate::native::cpu::CpuLaunchVariants;
         static KERNELS: CpuNativeKernels = CpuNativeKernels {
             digest: "ledger-test",
             elements: &[],
             launches: &[CpuLaunchVariants {
                 kernel: "project",
-                variants: &[
-                    variant(Tier::X86V2),
-                    variant(Tier::X86V3),
-                    variant(Tier::X86V4),
-                    variant(Tier::X86V4Vnni),
-                    variant(Tier::Neon),
-                ],
+                variants: &crate::native::cpu::UNRUN_VARIANTS,
             }],
         };
         let module = check_source(SourceSet::new(vec![SourceFile {

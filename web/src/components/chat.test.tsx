@@ -241,3 +241,25 @@ it("shows a stopped response's token count from the engine's report", () => {
   expect(html).toContain("20 tokens")
   expect(html).toContain("Stopped")
 })
+
+it("offers a new chat instead of a retry when the chat outgrew the model's served context", () => {
+  const failed = ended({
+    type: "failed",
+    error: { type: "inference", code: "context_length_exceeded", message: "prompt is too long" },
+  })
+  const html = renderToStaticMarkup(
+    <ChatResponse response={failed} retry={() => {}} newChat={() => {}} notify={() => {}} />
+  )
+  expect(html).toContain("longer than the context this computer serves this model at")
+  expect(html).toContain('aria-label="New chat"')
+  expect(html).not.toContain('aria-label="Retry response"')
+  const other = renderToStaticMarkup(
+    <ChatResponse
+      response={ended({ type: "failed", error: { type: "inference", code: "backend", message: "boom" } })}
+      retry={() => {}}
+      newChat={() => {}}
+      notify={() => {}}
+    />
+  )
+  expect(other).toContain('aria-label="Retry response"')
+})

@@ -1,7 +1,7 @@
 //! Model-derived memory charges for metadata-only assessment.
 //!
-//! The standard assessment workload is one conversation at the fit depth
-//! `min(context_limit, 100_000)` on a clean load. Its charge is composed of
+//! The standard assessment workload is one conversation at the fit depth,
+//! the served context limit, on a clean load. Its charge is composed of
 //! exact header terms (resident weights, history at the fit depth, recurrent
 //! banks, the prepared programs' owner) and upper bounds taken from the same
 //! checked class enumeration and slot multipliers production preparation
@@ -14,7 +14,7 @@ use super::resources::{GraphSlots, NativeGraphCharge, history_row_bytes, recurre
 use super::{
     ComponentSelection, ModelLoadPlan, PlannedMethod, ResourceLimits,
 };
-use crate::assessment::DomainFit;
+use crate::assessment::{DomainFit, MemoryBreakdown};
 use crate::memory::ClaimDemand;
 use crate::platform::{DomainRole, Fit, FitMode, HostRoom, StorageDemand};
 use crate::{AttestedPrograms, GraphError};
@@ -134,15 +134,23 @@ impl DeviceProcessCosts {
     /// already excludes it: measured on the device at discovery, and under
     /// WDDM the free figure read after the context exists, which also
     /// excludes WDDM's own share. It is not charged again. Kernel modules
-    /// showed no device cost. Vulkan: the device's creation (67–74 MB)
+    /// showed no device cost. Their stack is the driver's per-thread stack
+    /// reservation, which every context makes when it is retained
+    /// (`seismic_cuda`'s reserved stack), so the capacity excludes it too.
+    /// Vulkan: the device's creation (67–74 MB)
     /// takes from the heap or budget that is the capacity, and the driver
     /// objects beyond the charge grow with the kernels (at most 7.5 MB each
     /// on Windows, 3.5 MB on Linux).
     ///
     /// The block allocator holds free space beside the charge at every
     /// moment, the fit depth included; it depends on the order of
-    /// allocations, not on a count the plan fixes. On CUDA it never exceeded
-    /// one block cap (0.28–1.04 GB measured), which is its cost. On Vulkan,
+    /// allocations, not on a count the plan fixes. On CUDA, where every
+    /// allocation of more than half the first block takes a block of its own
+    /// (`seismic_compiler::blocks::takes_own_block`), it stays within one
+    /// block cap, which is its cost: replaying the tensors of Nemotron 3.5
+    /// Lightning, Qwen3.8 Flash Next, Qwen3.8 27B and Gemma 4 31B gives
+    /// 0.05–0.78 GB, where doubled blocks shared by expert stacks held up to
+    /// 5.4 GB (measured). On Vulkan,
     /// whose upload storage has blocks of its own, it reached 1.151 GB on
     /// both systems, the most measured. Metal and the CPU are unified: their
     /// kernels and runtime are measured in the worker's host bytes.
@@ -174,16 +182,27 @@ const VULKAN_BLOCK_SLACK: u64 = 1_151_000_000;
 
 impl DeviceProcessBytes {
     /// The device bytes of a load on `backend` that prepares `kernels`
-    /// native kernels (`HostProcessBytes::kernels`).
-    pub fn derive(backend: BackendName, kernels: u64) -> Result<Self, String> {
+    /// native kernels (`HostProcessBytes::kernels`) and whose weights
+    /// allocate `allocations` of the device's memory in order
+    /// (`ModelLoadPlan::device_allocations`). The blocks' free space is the
+    /// measured allowance, or what those allocations leave free when
+    /// replayed through the backend's own block rule
+    /// (`seismic::device_block_packing`), whichever is more: a layout whose
+    /// blocks hold more free space than was measured is charged it.
+    pub fn derive(
+        backend: BackendName,
+        kernels: u64,
+        allocations: impl IntoIterator<Item = u64>,
+    ) -> Result<Self, String> {
         let costs = DeviceProcessCosts::of(backend);
+        let replayed = replayed_block_free_bytes(backend, allocations)?;
         Ok(Self {
             context: costs.context,
             programs: costs
                 .per_kernel
                 .checked_mul(kernels)
                 .ok_or("prepared program device bytes overflow")?,
-            slack: costs.slack,
+            slack: costs.slack.max(replayed),
         })
     }
 
@@ -193,6 +212,23 @@ impl DeviceProcessBytes {
             .and_then(|bytes| bytes.checked_add(self.slack))
             .ok_or_else(|| "worker device bytes overflow".to_owned())
     }
+}
+
+/// What `backend`'s blocks leave free holding `allocations`, in order,
+/// placed by its own block rule; 0 where the device's memory is the host's.
+fn replayed_block_free_bytes(
+    backend: BackendName,
+    allocations: impl IntoIterator<Item = u64>,
+) -> Result<u64, String> {
+    let Some(mut packing) = seismic::device_block_packing(backend) else {
+        return Ok(0);
+    };
+    for bytes in allocations {
+        packing
+            .allocate(bytes, 1)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(packing.free_bytes())
 }
 
 /// What a load's worker holds in host RAM that no planned holding names:
@@ -288,7 +324,7 @@ impl HostProcessCosts {
 /// storage is host RAM (`host`, a unified device), its runtime and programs' host bytes
 /// (`HostProcessCosts`), which a load's worker is charged for the same.
 pub fn measurement_process_bytes(backend: BackendName, kernels: u64, host: bool) -> Result<u64, String> {
-    let device = DeviceProcessBytes::derive(backend, kernels)?.bytes()?;
+    let device = DeviceProcessBytes::derive(backend, kernels, [])?.bytes()?;
     if !host {
         return Ok(device);
     }
@@ -917,10 +953,10 @@ impl AssessmentHeaderBounds {
 /// their occupied state exceeds it.
 pub const CONVERSATION_CHECKPOINTS: usize = 3;
 
-/// The depth of each of the workload's conversations: the lesser of the
-/// supported context and 100,000 tokens.
+/// The depth of each of the workload's conversations: the context the
+/// definition is served at.
 pub(crate) fn fit_depth(definition: &ModelDefinition) -> u64 {
-    definition.decoder.context_limit.min(100_000)
+    definition.decoder.context_limit
 }
 
 /// The state store's own capacity rule for the workload's conversations
@@ -948,7 +984,7 @@ pub(super) fn conversation_banks(limits: ResourceLimits) -> Result<u64, String> 
 impl AssessmentMemoryTerms {
     /// The assessment workload is the load's conversations
     /// (`ResourceLimits::conversations`, one for a served load), each at the
-    /// lesser of the supported context and 100,000 tokens. Method state and optional
+    /// served context. Method state and optional
     /// components are included only when selected by the planned method; the
     /// conversation's in-flight banks follow the planned lookahead.
     pub fn derive(
@@ -1178,6 +1214,27 @@ impl AssessmentMemoryCharge {
             .and_then(|bytes| bytes.checked_add(self.bounds.drafter_graph_host_bytes))
             .and_then(|bytes| bytes.checked_add(self.bounds.host_process.bytes().ok()?))
             .ok_or_else(|| "host charge overflows".to_owned())
+    }
+
+    /// What `domains`, this charge's fit, require in all: the weights (their
+    /// complete physical demand, [`Self::weight_demand`], in every storage
+    /// it lies in: of a streamed plan, what its bank and host tier hold),
+    /// the workload's state, and the rest as overhead.
+    pub fn breakdown(&self, domains: &[DomainFit]) -> Result<MemoryBreakdown, String> {
+        let weights_bytes = self.weight_demand.checked_bytes().ok_or("weight demand overflows")?;
+        let required_bytes = domains
+            .iter()
+            .try_fold(0u64, |total, domain| total.checked_add(domain.required_bytes))
+            .ok_or("required bytes overflow")?;
+        let overhead_bytes = required_bytes
+            .checked_sub(weights_bytes)
+            .and_then(|bytes| bytes.checked_sub(self.state_bytes))
+            .ok_or("the fit requires less than the weights and state it holds")?;
+        Ok(MemoryBreakdown {
+            weights_bytes,
+            context_bytes: self.state_bytes,
+            overhead_bytes,
+        })
     }
 
     /// Whether the charge fits `executor` at stable capacity: its device

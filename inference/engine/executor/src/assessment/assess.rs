@@ -26,7 +26,9 @@ use std::num::NonZeroU64;
 /// Engine inputs to one assessment. No service profile or model identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AssessmentRequest {
-    /// The served context ceiling: the model's supported maximum.
+    /// The context the model is served at: its supported maximum or a
+    /// served tier below it, the depth of the standard workload's
+    /// conversations and the deepest decode estimated.
     pub context_limit: u32,
     /// Requested decode-speed depths before filtering.
     pub performance_depths: Vec<u32>,
@@ -52,6 +54,19 @@ pub struct DomainFit {
     pub remaining_bytes: i64,
 }
 
+/// What the standard workload's required bytes hold, summed across every
+/// domain the load touches (`AssessmentMemoryCharge::breakdown`): the
+/// weights as the plan holds them (of a streamed plan, its bank and host
+/// tier), the conversation's state at the served context, and everything
+/// else the load holds (prepared programs and graphs, workspace, process
+/// bytes and the loading peak).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryBreakdown {
+    pub weights_bytes: u64,
+    pub context_bytes: u64,
+    pub overhead_bytes: u64,
+}
+
 /// Whether the standard workload fits, each verdict with its own evidence.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExecutionAssessment {
@@ -59,13 +74,15 @@ pub enum ExecutionAssessment {
     DoesNotFit(ExecutionShortfall),
 }
 
-/// The standard workload fits every domain the load touches, the plan's
-/// routed experts held in `bank`, whole or streamed (none for a plan that
-/// banks no experts).
+/// The standard workload fits every domain the load touches at the served
+/// context `fit_context_tokens`, requiring `breakdown` across them, the
+/// plan's routed experts held in `bank`, whole or streamed (none for a plan
+/// that banks no experts).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecutionFit {
     pub fit_context_tokens: u32,
     pub domains: Vec<DomainFit>,
+    pub breakdown: MemoryBreakdown,
     pub bank: Option<crate::planning::ExpertBankPlan>,
 }
 
@@ -440,8 +457,11 @@ impl StructuralCharge {
         let host_process =
             HostProcessBytes::derive(definition, draft.load(), draft.programs(), policy.limits(), backend)
                 .map_err(AssessmentError::Memory)?;
-        let device_process =
-            DeviceProcessBytes::derive(backend, host_process.kernels).map_err(AssessmentError::Memory)?;
+        let device_process = draft
+            .load()
+            .device_allocations()
+            .and_then(|allocations| DeviceProcessBytes::derive(backend, host_process.kernels, allocations))
+            .map_err(AssessmentError::Memory)?;
         let state_bytes = || -> Result<_, String> {
             Ok((state.capacity().workload_state_bytes, state.startup_state_bytes()?, state.loaded_state_bytes()?))
         };
@@ -570,6 +590,7 @@ pub fn assess_execution_fit(
         AssessmentFitVerdict::Fits => {
             return Ok(ExecutionAssessment::Fits(ExecutionFit {
                 fit_context_tokens: prepared.fit_context_tokens,
+                breakdown: prepared.charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
                 domains: fit.domains,
                 bank: draft.load().expert_bank().cloned(),
             }));
@@ -586,15 +607,18 @@ pub fn assess_execution_fit(
     let confirm = |candidate: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge| {
         let fit = room.fit(candidate, charge)?;
         Ok::<_, AssessmentError>(match fit.verdict {
-            AssessmentFitVerdict::Fits => Ok((prepared.fit_context_tokens, fit.domains)),
+            AssessmentFitVerdict::Fits => {
+                Ok((charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?, fit.domains))
+            }
             AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
         })
     };
     let mut held = prepared.held.clone();
     Ok(match draft.with_held_experts(definition, crate::HeldBound::Room(bound), prices, &mut held, room, confirm)? {
-        Ok((held, (fit_context_tokens, domains))) => ExecutionAssessment::Fits(ExecutionFit {
-            fit_context_tokens,
+        Ok((held, (breakdown, domains))) => ExecutionAssessment::Fits(ExecutionFit {
+            fit_context_tokens: prepared.fit_context_tokens,
             domains,
+            breakdown,
             bank: held.draft().load().expert_bank().cloned(),
         }),
         Err(_) => ExecutionAssessment::DoesNotFit(ExecutionShortfall {
@@ -759,8 +783,13 @@ pub(crate) mod tests {
             panic!("the fixture fits every supported host");
         };
         assert_eq!(fit.residency(), Residency::Resident);
-        let ExecutionFit { fit_context_tokens, domains, .. } = fit;
-        assert_eq!(fit_context_tokens, 100_000);
+        let ExecutionFit { fit_context_tokens, domains, breakdown, .. } = fit;
+        assert_eq!(fit_context_tokens, 150_000);
+        assert!(breakdown.weights_bytes > 0 && breakdown.context_bytes > 0);
+        assert_eq!(
+            breakdown.weights_bytes + breakdown.context_bytes + breakdown.overhead_bytes,
+            domains.iter().map(|domain| domain.required_bytes).sum::<u64>()
+        );
         assert!(domains
             .iter()
             .any(|domain| domain.role == DomainRole::Allocation));
@@ -832,7 +861,7 @@ pub(crate) mod tests {
         let prepared =
             prepare_execution_assessment(&environment.definition, &environment.planned(), 150_000)
                 .expect("a context the domain cannot back is not a planning failure");
-        assert_eq!(prepared.fit_context_tokens, 100_000);
+        assert_eq!(prepared.fit_context_tokens, 150_000);
         assert!(assess_execution_fit(
             &environment.definition,
             &prepared,

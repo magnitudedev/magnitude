@@ -1,6 +1,7 @@
 """Thermal gate stability logic over synthetic readings."""
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -147,3 +148,18 @@ def test_wait_times_out_with_readings(tmp_path):
         wait(FixedProbe(lambda: reading(cpu_busy=90)), settings, tmp_path / "gate.jsonl", cpu_own=True)
     assert raised.value.latest.utilization_pct["cpu"] == 90
     assert "cpu busy" in str(raised.value)
+
+
+def test_a_host_without_sensors_is_judged_on_idleness():
+    settings = replace(SETTINGS, temperatures=False)
+    idle = judge(series(lambda t: reading(cpu=None, gpu=None, errors={"thermal": "none"})), settings, cpu_own=True)
+    assert idle.passed, idle.reasons
+    busy = judge(series(lambda t: reading(cpu=None, gpu=None, cpu_busy=40)), settings, cpu_own=True)
+    assert not busy.passed and "cpu busy" in busy.reasons[0]
+
+
+def test_a_host_with_nothing_of_the_runs_own_to_judge_fails():
+    settings = replace(SETTINGS, temperatures=False)
+    verdict = judge(series(lambda t: reading(cpu=None, gpu=None, gpu_busy=None)), settings, cpu_own=False)
+    assert not verdict.passed
+    assert verdict.reasons == ["nothing of the run's own to judge: no temperature or utilization reading"]

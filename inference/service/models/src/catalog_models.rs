@@ -173,6 +173,21 @@ impl ModelDomainResolver {
         }
     }
 
+    /// Whether `subject`'s configuration still waits on how its catalog model serves without
+    /// its catalog drafter: a catalog model with a drafter whose fit without it isn't worked out.
+    /// Its configuration until then is a placeholder, the catalog one, so it isn't assessed yet.
+    pub fn awaits_catalog_drafter_fit(&self, subject: &ModelAssessmentSubject) -> bool {
+        let ModelAssessmentSubject::Catalog { model_id, .. } = subject else {
+            return false;
+        };
+        self.catalog_definition(model_id).is_ok_and(|definition| {
+            matches!(
+                definition.configuration.bundle,
+                ServableModelBundle::SpeculativeDecoding { .. }
+            ) && !self.knows_catalog_drafter_fit(model_id)
+        })
+    }
+
     /// What installing catalog model `model_id` fetches and serves on this computer.
     pub(crate) fn desired_catalog_configuration(
         &self,

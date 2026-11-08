@@ -1061,9 +1061,12 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
     Ok([bytes(target)?, bytes(head)?, bytes(vision)?])
 }
 
-fn weight_demands_by_component(load: &ModelLoadPlan) -> Result<[ClaimDemand; 3], String> {
+/// Each weight of `load` whose storage it holds, once (tied roles share one
+/// storage, `WeightPlan::storage_identity`), with its component's index
+/// (target, head, vision), in the order the load imports them.
+fn weight_storages(load: &ModelLoadPlan) -> Result<Vec<(usize, &WeightPlan)>, String> {
     let mut seen = HashMap::new();
-    let mut demands = [ClaimDemand::default(); 3];
+    let mut stored = Vec::new();
     for (index, weights) in [
         load.target.as_slice(),
         load.head.as_deref().unwrap_or_default(),
@@ -1083,9 +1086,7 @@ fn weight_demands_by_component(load: &ModelLoadPlan) -> Result<[ClaimDemand; 3],
             match seen.entry(weight.storage_identity()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     entry.insert(storage);
-                    demands[index] = demands[index]
-                        .checked_plus(load.weight_storage_demand(weight)?)
-                        .ok_or("resident weight byte count overflow")?;
+                    stored.push((index, weight));
                 }
                 std::collections::hash_map::Entry::Occupied(entry) if entry.get() != &storage => {
                     return Err("tied weight roles disagree on their physical storage".into());
@@ -1093,6 +1094,16 @@ fn weight_demands_by_component(load: &ModelLoadPlan) -> Result<[ClaimDemand; 3],
                 std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
+    }
+    Ok(stored)
+}
+
+fn weight_demands_by_component(load: &ModelLoadPlan) -> Result<[ClaimDemand; 3], String> {
+    let mut demands = [ClaimDemand::default(); 3];
+    for (index, weight) in weight_storages(load)? {
+        demands[index] = demands[index]
+            .checked_plus(load.weight_storage_demand(weight)?)
+            .ok_or("resident weight byte count overflow")?;
     }
     // The bank's committed records are charged by its banked weights; what
     // it is charged beyond them is the target's weights' too (a cap bounds
@@ -1439,17 +1450,20 @@ impl ModelLoadPlan {
     }
 
     /// A weight's physical demand ([`Self::weight_storage_bytes`]) by where
-    /// each of its allocations lies.
+    /// each of its allocations lies: its device storage is
+    /// [`Self::weight_device_allocations`].
     fn weight_storage_demand(&self, weight: &WeightPlan) -> Result<ClaimDemand, String> {
         let bytes = weight.storage_bytes()?;
-        let mut demand = if weight.banked().is_some() {
-            ClaimDemand { reserved: weight.resident_bytes,
-                device: bytes.checked_sub(weight.resident_bytes).ok_or("banked weight storage underflows")?,
-                ..ClaimDemand::default() }
-        } else if weight.stored_in_slots() {
-            if let Some((bank, table)) = self.bank.as_ref().and_then(|bank| {
-                bank.tables.iter().find(|table| table.role == weight.role).map(|table| (bank, table))
-            }) {
+        let device = self
+            .weight_device_allocations(weight)?
+            .into_iter()
+            .try_fold(0u64, u64::checked_add)
+            .ok_or("device weight storage overflows")?;
+        if weight.banked().is_some() {
+            return Ok(ClaimDemand { reserved: weight.resident_bytes, device, ..ClaimDemand::default() });
+        }
+        if weight.stored_in_slots() {
+            if let Some((bank, table)) = self.bank_table(weight) {
                 // StoredTable::new commits the complete reservation at load,
                 // not its floor. Its own table replaces the ordinary table.
                 let committed = table.record_bytes.get().checked_mul(table.records.get())
@@ -1461,25 +1475,67 @@ impl ModelLoadPlan {
                     .ok_or("stored table directory charge underflows")?).ok_or("stored table demand overflows")?;
                 return Ok(demand);
             }
-            ClaimDemand { shared: bytes, ..ClaimDemand::default() }
-        } else {
-            // DeviceTable owns ordinary slots and regular staging, but its
-            // directory, landed-read staging and notice are host-shared.
-            let [directory, _, landed, notice] = weight.streamed_bytes()?;
-            let shared = directory.checked_add(landed).and_then(|bytes| bytes.checked_add(notice))
-                .ok_or("streamed table shared storage overflows")?;
-            ClaimDemand { device: bytes.checked_sub(shared).ok_or("shared table storage exceeds its weight")?,
-                shared, ..ClaimDemand::default() }
-        };
-        // Ordinary record tables use api::record_table -> DeviceInner::allocate
-        // on every backend, independently of the tensor's own placement.
+            return Ok(ClaimDemand { shared: bytes, device, ..ClaimDemand::default() });
+        }
+        // DeviceTable owns ordinary slots and regular staging, but its
+        // directory, landed-read staging and notice are host-shared.
+        let [directory, _, landed, notice] = weight.streamed_bytes()?;
+        let shared = directory.checked_add(landed).and_then(|bytes| bytes.checked_add(notice))
+            .ok_or("streamed table shared storage overflows")?;
+        Ok(ClaimDemand { device, shared, ..ClaimDemand::default() })
+    }
+
+    /// The bank's own table of `weight`, a table whose slots the host fills
+    /// (`WeightPlan::stored_in_slots`), where the bank holds it.
+    fn bank_table(&self, weight: &WeightPlan) -> Option<(&super::ExpertBankPlan, &super::bank::BankTable)> {
+        self.bank.as_ref().and_then(|bank| {
+            bank.tables.iter().find(|table| table.role == weight.role).map(|table| (bank, table))
+        })
+    }
+
+    /// The device storage `weight`, one of this load's, allocates from the
+    /// device's own memory (a dedicated device's blocks,
+    /// `seismic::device_block_packing`), each allocation in the order its
+    /// import makes it: its resident tensor, packing bound and scale, the
+    /// record table its import binds (Seismic's rule,
+    /// `seismic::record_table_bytes`; ordinary record tables use
+    /// `DeviceInner::allocate` on every backend, independently of the
+    /// tensor's own placement) and a streamed table's staging. A banked
+    /// stack's records lie in the bank's reserved pages, and a stored
+    /// table's slots and every table's directory, landing staging and
+    /// notice in host-shared storage, outside these. Their sum is the
+    /// weight's device demand.
+    pub fn weight_device_allocations(&self, weight: &WeightPlan) -> Result<Vec<u64>, String> {
         let tables = match self.record_ports {
             Some(backend) if backend.binds_record_tables() => seismic::record_table_bytes(weight.record_table_entries()?)
                 .ok_or_else(|| "record table byte count overflows".to_owned())?,
             Some(_) | None => 0,
         };
-        demand.device = demand.device.checked_add(tables).ok_or("record table demand overflows")?;
-        Ok(demand)
+        let allocations = if weight.stored_in_slots() {
+            // The bank's own table replaces the ordinary record table.
+            vec![if self.bank_table(weight).is_some() { 0 } else { tables }]
+        } else {
+            vec![
+                if weight.banked().is_some() { 0 } else { weight.resident_bytes },
+                weight.bound.checked_mul(4).ok_or("packing bound byte count overflows")?,
+                weight.scale.as_ref().map_or(0, |scale| scale.resident_bytes),
+                tables,
+                weight.streamed_bytes()?[1],
+            ]
+        };
+        Ok(allocations.into_iter().filter(|bytes| *bytes > 0).collect())
+    }
+
+    /// Every device allocation of the load's weights
+    /// ([`Self::weight_device_allocations`]) in the order the load imports
+    /// them, each storage once: what a replay of the device's block
+    /// allocator places.
+    pub fn device_allocations(&self) -> Result<Vec<u64>, String> {
+        let mut allocations = Vec::new();
+        for (_, weight) in weight_storages(self)? {
+            allocations.extend(self.weight_device_allocations(weight)?);
+        }
+        Ok(allocations)
     }
 
     /// Offer lossless bounded-selection views of the target's output

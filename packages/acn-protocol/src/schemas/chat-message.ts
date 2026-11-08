@@ -151,7 +151,9 @@ const statusLabels: { readonly [Status in ResponseStatus]: Option.Option<string>
 const failureText = (error: ResponseFailure): string => {
   switch (error._tag) {
     case "inference":
-      return `The inference service failed: ${error.message}`
+      return error.code === CONTEXT_LENGTH_EXCEEDED
+        ? "This chat is longer than the context this computer serves this model at. Start a new chat to continue."
+        : `The inference service failed: ${error.message}`
     case "unreachable":
     case "rejected":
     case "storage":
@@ -159,6 +161,19 @@ const failureText = (error: ResponseFailure): string => {
       return error.message
   }
 }
+
+const CONTEXT_LENGTH_EXCEEDED = "context_length_exceeded"
+
+/**
+ * Whether a response failed because its chat no longer fits the context the model is served at:
+ * retrying sends the same chat again, so only a new chat continues.
+ */
+export const responseExceedsContext = (message: ChatAssistantMessage): boolean => Option.exists(
+  message.end,
+  ({ outcome }) => outcome._tag === "failed"
+    && outcome.error._tag === "inference"
+    && outcome.error.code === CONTEXT_LENGTH_EXCEEDED,
+)
 
 /** How a response's status is labelled, and what went wrong with it, if anything. */
 export const responseStatusText = (

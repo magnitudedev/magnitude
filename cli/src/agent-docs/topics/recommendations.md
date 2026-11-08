@@ -26,10 +26,13 @@ model is best for every workload.
 - **Memory** is the estimated memory needed while the model is running, not its download size. A
   model that normally fits can still need other memory-intensive applications to be closed before
   it loads.
-- **Context** is the amount of conversation and working material available to the local serving
-  configuration. It is not necessarily the model architecture's absolute maximum. Magnitude may
-  choose a smaller context for compact models because longer context uses more memory and can slow
-  generation, especially on resource-constrained computers.
+- **Context** is the longest conversation this computer serves the model at. It is the model's own
+  context when that fits in memory, and otherwise the largest power of two below it, down to 32K, that
+  does, shown as "64K of 256K". Below 32K a model is reported as not fitting, since a coding agent's
+  prompt and tools alone fill much of a smaller context. A request longer than the served context
+  fails with `context_length_exceeded` rather than running the computer out of memory; connected
+  harnesses are updated with the served context. Recommendations prefer a version that serves 64K
+  or more over a higher-fidelity one that serves less.
 - **Intelligence** is the model's Artificial Analysis Intelligence Index score. Magnitude displays
   it with a percent sign, but it is an index score—not a probability or the percentage of questions
   the model answers correctly. Quantized variants of the same source model generally share this

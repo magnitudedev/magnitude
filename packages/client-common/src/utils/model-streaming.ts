@@ -61,7 +61,7 @@ export const fitResidencyFacts = (
 export const localModelFitFacts = (model: LocalModel): readonly ModelFact[] => {
   const serving = Option.getOrUndefined(localModelServingState(model))
   return serving?._tag === "Assessed" && serving.assessment._tag === "Fits"
-    ? fitResidencyFacts(serving.assessment.residency, serving.assessment.profile.contextLength)
+    ? fitResidencyFacts(serving.assessment.residency, serving.assessment.served.contextLength)
     : []
 }
 

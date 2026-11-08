@@ -284,8 +284,10 @@ describe("LocalModelSchema invariants", () => {
         assessmentId: "assessment",
         environmentId: "environment",
         profile: { contextLength: 4096 },
+        served: { contextLength: 4096 },
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
+          breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
         },
         residency: {
           _tag: "Resident",
@@ -305,7 +307,11 @@ describe("LocalModelSchema invariants", () => {
       assessmentId: "assessment",
       environmentId: "environment",
       profile: { contextLength: 4096 },
-      memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
+      served: { contextLength: 4096 },
+      memory: {
+        domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
+        breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
+      },
       residency,
     })
     const decode = Schema.decodeUnknownEither(LocalModelFitsAssessmentSchema)
@@ -348,8 +354,10 @@ describe("LocalModelSchema invariants", () => {
         assessmentId: "assessment",
         environmentId: "environment",
         profile: { contextLength: 4096 },
+        served: { contextLength: 4096 },
         memory: {
           domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0,
+          breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 },
         },
         residency: {
           _tag: "Resident",

@@ -1,18 +1,18 @@
 import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import type { CatalogLocalModel } from "@magnitudedev/sdk"
-import { LoadModelButton, loadRefusal } from "./model-fit"
+import { LoadModelButton, loadRefusal, servedContextNote } from "./model-fit"
 
 const assessed = (assessment: object) => ({ servingState: { _tag: "Assessed", assessment } }) as unknown as Pick<CatalogLocalModel, "servingState">
-const doesNotFit = assessed({ _tag: "DoesNotFit", deficitBytes: 1_825_361_000 })
-const fits = assessed({ _tag: "Fits" })
+const doesNotFit = assessed({ _tag: "DoesNotFit", deficitBytes: 1_825_361_000, shortfall: { contextLength: 32_768 } })
+const fits = assessed({ _tag: "Fits", profile: { contextLength: 262_144 }, served: { contextLength: 262_144 } })
 
 describe("Load model action", () => {
   it("is disabled with the shortfall when the model does not fit", () => {
     const html = renderToStaticMarkup(<LoadModelButton model={doesNotFit} pending={false} onLoad={() => {}} />)
     expect(html).toContain("Load model")
     expect(html).toMatch(/<button[^>]*disabled=""/)
-    expect(html).toContain("needs 1.9 GB more memory than this computer can provide")
+    expect(html).toContain("needs 1.9 GB more memory than this computer can provide, even for a 32K context")
     expect(loadRefusal(doesNotFit)).toContain("1.9 GB")
   })
   it("is enabled when the model fits or is still being assessed", () => {
@@ -26,5 +26,14 @@ describe("Load model action", () => {
     const unsupported = assessed({ _tag: "Unsupported", reasons: [{ _tag: "Architecture", architecture: "deepseek4" }], detail: "PRIVATE" })
     expect(loadRefusal(unsupported)).toBe("Magnitude can’t run this model. No kernels for the deepseek4 architecture.")
     expect(renderToStaticMarkup(<LoadModelButton model={unsupported} pending={false} onLoad={() => {}} />)).toMatch(/<button[^>]*disabled=""/)
+  })
+})
+
+describe("Served context", () => {
+  it("names the context a fitting model is served at when this computer has memory for less than its own", () => {
+    const reduced = assessed({ _tag: "Fits", profile: { contextLength: 262_144 }, served: { contextLength: 65_536 } })
+    expect(servedContextNote(reduced)).toBe("64K of 256K context")
+    expect(servedContextNote(fits)).toBeNull()
+    expect(servedContextNote(doesNotFit)).toBeNull()
   })
 })

@@ -388,6 +388,12 @@ impl Generation {
     pub fn accepted_position(&self) -> usize {
         self.accepted_position
     }
+    /// The numerical position the accepted path reconciles to: every accepted
+    /// token except a successor sampled from the last context row, which no
+    /// later row reads.
+    pub fn reconciled_position(&self) -> usize {
+        self.accepted_position.min(self.options.context_limit)
+    }
     pub fn causal_progress(&self) -> CausalProgress {
         CausalProgress {
             accepted_position: self.accepted_position(),
@@ -794,13 +800,11 @@ impl Generation {
     /// commits the input row that produced a successor, not the successor row
     /// itself. This fact is independent of why a checkpoint is requested.
     pub fn pending_reconciliation(&self) -> Option<PendingReconciliation> {
-        let progress = self.causal_progress();
-        (self.resident && progress.resident_position < progress.accepted_position).then_some(
-            PendingReconciliation {
-                start: progress.resident_position,
-                end: progress.accepted_position,
-            },
-        )
+        let end = self.reconciled_position();
+        (self.resident && self.resident_position < end).then_some(PendingReconciliation {
+            start: self.resident_position,
+            end,
+        })
     }
 
     /// Advance accepted successors without selecting or publishing another

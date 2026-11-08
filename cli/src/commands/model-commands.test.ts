@@ -555,7 +555,7 @@ const plan = { contextWindowTokens: 4096, requiredMemoryBytes: 10, device: { dev
 const withEvidence = <M extends CatalogLocalModel | CustomLocalModel>(model: M): M => {
   const serving = model.servingState
   if (serving._tag !== "Assessed" || serving.assessment._tag !== "Fits") return model
-  return { ...model, servingState: { ...serving, assessment: { ...serving.assessment, memory: { domains: [memoryEvidence], totalRequiredBytes: 10, requiredSystemMemoryBytes: 0 } } } }
+  return { ...model, servingState: { ...serving, assessment: { ...serving.assessment, memory: { domains: [memoryEvidence], totalRequiredBytes: 10, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 7, contextBytes: 2, overheadBytes: 1 } } } } }
 }
 
 const residencies = [
@@ -583,7 +583,7 @@ const leakyModels = () => {
   const assessed = makeAddedModel().servingState as Extract<CustomLocalModel["servingState"], { _tag: "Assessed" }>
   const tooLarge = makeFolderModel({
     modelId: CustomFormModelIdSchema.make("local:too-large-q8_0:ffffffffffff"),
-    servingState: { ...assessed, assessment: { _tag: "DoesNotFit", assessmentId: ModelAssessmentIdSchema.make("assessment_large"), environmentId: AssessmentEnvironmentIdSchema.make("environment_test"), profile: { contextLength: 4096 }, memoryDomains: [memoryEvidence], totalRequiredBytes: 10, deficitBytes: 4, limitingResource: "cuda0" } },
+    servingState: { ...assessed, assessment: { _tag: "DoesNotFit", assessmentId: ModelAssessmentIdSchema.make("assessment_large"), environmentId: AssessmentEnvironmentIdSchema.make("environment_test"), profile: { contextLength: 4096 }, shortfall: { contextLength: 32_768 }, memoryDomains: [memoryEvidence], totalRequiredBytes: 10, deficitBytes: 4, limitingResource: "cuda0" } },
   })
   return { catalog, catalogs, optimizing, found, loadingFound, tooLarge, added: withEvidence(makeAddedModel()) }
 }
@@ -645,7 +645,7 @@ describe("--json never leaks internals", () => {
     const shown = encode(catalogDetailJson, { model: catalog, models: [] })
     expect(shown.model).toMatchObject({
       catalogData: { intelligence: 75, quantizationAware: false },
-      servingState: { assessment: { _tag: "Fits", memory: { totalRequiredBytes: 10 } } },
+      servingState: { assessment: { _tag: "Fits", memory: { totalRequiredBytes: 10, breakdown: { weightsBytes: 7, contextBytes: 2, overheadBytes: 1 } } } },
     })
   })
 })
