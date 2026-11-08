@@ -488,22 +488,32 @@ inline span_start form_locate(device const int *visible, device const int *fresh
     return tile_locate(visible, fresh, row, 1, row + 1, spans, key, lane);
 }
 
-// One attended column of query head `head` of `row` times its gate: value
+// The gate of one attended column of query head `head` of `row`: value
 // column % count of its interleaved gates (after its queries in `query`) or
-// its separate ones (in `gate`); sigmoid, or softplus when `softplus`.
-// Rounded to the activation.
-inline Scalar gate_output(device const Scalar *query, device const Scalar *gate, ulong row, ulong head,
-    uint column, float attended, bool softplus) {
+// its separate ones (in `gate`); 0 when the layer has none.
+inline float gate_logit(device const Scalar *query, device const Scalar *gate, ulong row, ulong head,
+    uint column) {
     const ulong at = row * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + head;
-    float g;
     if (ATTENTION_I > 0)
-        g = float(query[at * ATTENTION_QUERY_STRIDE + ATTENTION_W + column]);
-    else if (ATTENTION_U > 0)
-        g = float(gate[at * ATTENTION_U + column % metal::max(uint(ATTENTION_U), 1u)]);
-    else
+        return float(query[at * ATTENTION_QUERY_STRIDE + ATTENTION_W + column]);
+    if (ATTENTION_U > 0)
+        return float(gate[at * ATTENTION_U + column % metal::max(uint(ATTENTION_U), 1u)]);
+    return 0.0f;
+}
+
+// An attended column times its gate `g` (`gate_logit`): sigmoid, or softplus
+// when `softplus`. Rounded to the activation.
+inline Scalar gated(float attended, float g, bool softplus) {
+    if (ATTENTION_I == 0 && ATTENTION_U == 0)
         return Scalar(attended);
     return Scalar(softplus ? attended * (metal::max(g, 0.0f) + metal::log(1.0f + metal::exp(-metal::abs(g))))
                            : attended / (1.0f + metal::exp(-g)));
+}
+
+// One attended column of query head `head` of `row` times its gate.
+inline Scalar gate_output(device const Scalar *query, device const Scalar *gate, ulong row, ulong head,
+    uint column, float attended, bool softplus) {
+    return gated(attended, gate_logit(query, gate, row, head, column), softplus);
 }
 
 // The decode merge of one (query head, row) over 32 of its columns, one
@@ -514,6 +524,12 @@ inline Scalar gate_output(device const Scalar *query, device const Scalar *gate,
 // ordered chains for its column, so the result is `merge`'s (with the head's
 // sink, if any, against the merged maximum). A row that sees no key attends
 // to zero.
+//
+// Few threads cover a whole launch, so a load at a time would leave every
+// partition a memory round trip: once the row's partitions are known, the
+// gate, the statistics and the first BATCH partitions' partials issue
+// together, and each later batch issues all its loads before its chains
+// consume them.
 template <uint SPAN, uint PARTS, uint TOKENS>
 inline void decode_output(device const Scalar *query, device const Scalar *gate, device const int *visible,
     device const int *fresh, device Scalar *result, device const float *partials,
@@ -529,6 +545,12 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
     const uint span_keys = partition_span(total, SPAN, PARTS);
     const uint active = (total + span_keys - 1) / span_keys;
     const ulong first = (row * KV * G + head) * PARTS;
+    constexpr uint BATCH = PARTS < 64 ? PARTS : 64;
+    const float g = gate_logit(query, gate, row, head, column);
+    float values[BATCH];
+    ATTENTION_UNROLL
+    for (uint i = 0; i < BATCH; ++i)
+        values[i] = i < active ? partials[(first + i) * W + column] : 0.0f;
     float maximum = -INFINITY;
     for (uint p = lane; p < active; p += 32) {
         if (statistics[(first + p) * 2 + 1] > 0.0f)
@@ -541,17 +563,14 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
         weights[2 * p + 1] = d;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // Each batch issues all its partial loads before its chains consume
-    // them: few threads cover a whole launch, so a load at a time would
-    // leave every partition a memory round trip.
-    constexpr uint BATCH = 32;
     float denominator = 0.0f;
     float accumulated = 0.0f;
     for (uint p0 = 0; p0 < active; p0 += BATCH) {
-        float values[BATCH];
-        ATTENTION_UNROLL
-        for (uint i = 0; i < BATCH; ++i)
-            values[i] = p0 + i < active ? partials[(first + p0 + i) * W + column] : 0.0f;
+        if (p0 > 0) {
+            ATTENTION_UNROLL
+            for (uint i = 0; i < BATCH; ++i)
+                values[i] = p0 + i < active ? partials[(first + p0 + i) * W + column] : 0.0f;
+        }
         ATTENTION_UNROLL
         for (uint i = 0; i < BATCH; ++i) {
             const uint p = p0 + i;
@@ -563,7 +582,7 @@ inline void decode_output(device const Scalar *query, device const Scalar *gate,
         }
     }
     const float attended = accumulated / divisor(sinks, head, maximum, denominator);
-    result[(row * KV * G + head) * W + column] = gate_output(query, gate, row, head, column, attended, softplus);
+    result[(row * KV * G + head) * W + column] = gated(attended, g, softplus);
 }
 
 #include "history.h"
