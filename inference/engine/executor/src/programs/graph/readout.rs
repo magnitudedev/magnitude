@@ -10,6 +10,9 @@
 //! When a separate draft drafts, the features are its conditioning instead:
 //! the fusion of the target taps (`project_rows` over the draft input rows
 //! the tapped blocks wrote) gathered through `out_rows` (`feature_rows`).
+//! Such a load also holds the drafter-free readout's projecting classes
+//! (`readout_sources`): a readout none of whose rows demands features runs
+//! one of them, as a load without the drafter does, and fuses nothing.
 
 use super::GraphError;
 use crate::{
@@ -371,6 +374,47 @@ impl<'p> FeatureSource<'p> {
     }
 }
 
+/// One source a load's readout prepares classes from.
+#[derive(Clone, Copy)]
+struct ReadoutSource<'p> {
+    features: FeatureSource<'p>,
+    /// Whether its classes fuse a separate draft's taps.
+    fuses: bool,
+    /// Whether it prepares the features classes, or the projecting ones
+    /// alone.
+    features_classes: bool,
+}
+
+impl<'p> ReadoutSource<'p> {
+    /// Every class from `features`.
+    fn whole(features: FeatureSource<'p>) -> Self {
+        Self { features, fuses: matches!(features, FeatureSource::Taps { .. }), features_classes: true }
+    }
+
+    /// Its classes of `classes`.
+    fn classes(self, classes: Vec<ReadoutClass>) -> Vec<ReadoutClass> {
+        classes
+            .into_iter()
+            .filter(|class| self.features_classes || class.kind != ReadoutKind::Features)
+            .collect()
+    }
+}
+
+/// The sources `load`'s readout prepares classes from: its own
+/// ([`FeatureSource::of`]), every class; and where that fuses a separate
+/// draft's taps, also the same target's without its drafter
+/// ([`FeatureSource::Output`]), its projecting classes, which a readout none
+/// of whose rows demands features runs (`BoundTargetReadoutGraphs::class`):
+/// what a drafter-free load's readout runs, fusing nothing. A features class
+/// is demanded features, so it has no drafter-free one.
+fn readout_sources(load: &ModelLoadPlan) -> Vec<ReadoutSource<'_>> {
+    let own = ReadoutSource::whole(FeatureSource::of(load));
+    match own.fuses {
+        true => vec![own, ReadoutSource { features: FeatureSource::Output, fuses: false, features_classes: false }],
+        false => vec![own],
+    }
+}
+
 /// The feature entries of a readout graph, by its feature source.
 enum FeatureEntries<'a, G: GraphDraft + 'a> {
     Residual(G::Binding<'a, feature_rows::Entry>),
@@ -417,7 +461,11 @@ pub(crate) struct PreparedTargetReadoutGraph {
 #[derive(Clone)]
 pub struct PreparedTargetReadoutGraphs {
     pub(crate) residual_width: Option<u64>,
-    classes: BTreeMap<ReadoutClass, PreparedTargetReadoutGraph>,
+    /// Each class, by whether it fuses the draft's taps
+    /// (`readout_sources`).
+    classes: BTreeMap<(bool, ReadoutClass), PreparedTargetReadoutGraph>,
+    /// Whether the load's own feature source fuses a separate draft's taps.
+    fuses: bool,
     /// Every class: any launch's readout runs in its slots.
     family: NativeGraphFamily,
     /// The classes a prompt chunk's readout runs ([`chunk_holds`]), whose
@@ -431,7 +479,8 @@ pub(crate) struct BoundTargetReadoutGraphs {
     /// The prepared graphs these bind: the load's one copy, shared with
     /// its attested programs.
     pub prepared: std::sync::Arc<PreparedTargetReadoutGraphs>,
-    bound: BTreeMap<ReadoutClass, BoundNativeGraphPlan>,
+    /// By whether the class fuses the draft's taps, and the class.
+    bound: BTreeMap<(bool, ReadoutClass), BoundNativeGraphPlan>,
 }
 
 /// Whether a readout projecting `projected` rows is of a prompt chunk's
@@ -584,17 +633,13 @@ impl PreparedTargetReadoutGraphs {
     ) -> Result<Self, String> {
         let norm = target_readout_norm(load, geometry)?;
         let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
-        let source = FeatureSource::of(load);
-        let regimes =
-            certify_readout_regimes(device.backend(), geometry, norm, head, source, limits)
-                .map_err(error)?;
-        let qualified = qualified_readout_classes(limits, head, device.backend())?;
+        let (regimes, qualified) = load_readout_regimes(device.backend(), load, geometry, norm, head, limits).map_err(error)?;
         let mut classes = BTreeMap::new();
         let mut plans = Vec::new();
         let mut chunk_plans = Vec::new();
-        let mut add = |class: ReadoutClass| -> Result<(), String> {
+        for &(source, class) in &qualified {
             let layout = regimes
-                .get(&readout_regime(class))
+                .get(&(source.fuses, readout_regime(class)))
                 .ok_or("readout class has no resource regime")?;
             let variant = PreparedTargetReadoutGraph::prepare(
                 device,
@@ -602,7 +647,7 @@ impl PreparedTargetReadoutGraphs {
                 geometry,
                 norm,
                 head,
-                source,
+                source.features,
                 class,
                 exports_logits(limits),
                 layout,
@@ -611,11 +656,7 @@ impl PreparedTargetReadoutGraphs {
             if chunk_holds(class.projected) {
                 chunk_plans.push((readout_decodes(class, limits), variant.plan.clone()));
             }
-            classes.insert(class, variant);
-            Ok(())
-        };
-        for &class in &qualified {
-            add(class)?;
+            classes.insert((source.fuses, class), variant);
         }
         let family = super::serial_family("readout", plans, &readout_graphs(&regimes, &qualified, limits, false).map_err(error)?)
             .map_err(|error| error.to_string())?;
@@ -624,6 +665,7 @@ impl PreparedTargetReadoutGraphs {
         Ok(Self {
             residual_width: load.residual_conditioning(),
             classes,
+            fuses: qualified.iter().any(|(source, _)| source.fuses),
             family,
             chunk_family,
             max_projected_rows: max_projected_rows(limits),
@@ -666,7 +708,7 @@ impl PreparedTargetReadoutGraphs {
         resident: &ResidentTarget,
     ) -> Result<BoundTargetReadoutGraphs, String> {
         let mut bound = BTreeMap::new();
-        for (class, graph) in &self.classes {
+        for ((fuses, class), graph) in &self.classes {
             let mut fixed = Vec::new();
             let absent_scale = seismic::Tensor::from_host(
                 &resident.embedding.tensor().device(),
@@ -719,7 +761,7 @@ impl PreparedTargetReadoutGraphs {
                 ));
             }
             bound.insert(
-                *class,
+                (*fuses, *class),
                 graph
                     .plan
                     .bind_static(&fixed)
@@ -734,19 +776,25 @@ impl PreparedTargetReadoutGraphs {
 }
 
 impl BoundTargetReadoutGraphs {
+    /// The graph of `class` for a readout whose rows demand features or
+    /// not (`features`): on a load whose readout fuses a draft's taps, the
+    /// fusing class where some row demands features, the drafter-free one
+    /// otherwise (`readout_sources`); a load's one source else.
     pub(crate) fn class(
         &self,
         class: ReadoutClass,
+        features: bool,
     ) -> Result<(&PreparedTargetReadoutGraph, &BoundNativeGraphPlan), String> {
+        let fuses = self.prepared.fuses && features;
         let graph = self
             .prepared
             .classes
-            .get(&class)
-            .ok_or_else(|| format!("readout graph class {class:?} was not sealed"))?;
+            .get(&(fuses, class))
+            .ok_or_else(|| format!("readout graph class {class:?} (fusing taps: {fuses}) was not sealed"))?;
         let bound = self
             .bound
-            .get(&class)
-            .ok_or_else(|| format!("readout graph class {class:?} was not bound"))?;
+            .get(&(fuses, class))
+            .ok_or_else(|| format!("readout graph class {class:?} (fusing taps: {fuses}) was not bound"))?;
         Ok((graph, bound))
     }
 }
@@ -1859,22 +1907,46 @@ pub(crate) fn checked_readout_storage(
 ) -> Result<((NativeGraphStorageBytes, LaunchGraphs), Option<(NativeGraphStorageBytes, LaunchGraphs)>), GraphError> {
     let norm = target_readout_norm(load, geometry)?;
     let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false)?;
-    let regimes = certify_readout_regimes(
-        backend,
-        geometry,
-        norm,
-        head,
-        FeatureSource::of(load),
-        limits,
-    )?;
+    let (regimes, classes) = load_readout_regimes(backend, load, geometry, norm, head, limits)?;
     let most = |layouts: &mut dyn Iterator<Item = &NativeGraphLayout>| {
         layouts.map(NativeGraphLayout::storage_bytes).reduce(NativeGraphStorageBytes::most)
     };
-    let classes = qualified_readout_classes(limits, head, backend)?;
     let family = most(&mut regimes.values()).ok_or("readout graph family has no classes")?;
-    let chunk = most(&mut regimes.iter().filter(|((_, _, chunk), _)| *chunk).map(|(_, layout)| layout));
+    let chunk = most(&mut regimes.iter().filter(|((_, (_, _, chunk)), _)| *chunk).map(|(_, layout)| layout));
     let chunk = chunk.map(|chunk| Ok::<_, GraphError>((chunk, readout_graphs(&regimes, &classes, limits, true)?))).transpose()?;
     Ok(((family, readout_graphs(&regimes, &classes, limits, false)?), chunk))
+}
+
+/// A readout regime of one of a load's sources: whether that source fuses a
+/// separate draft's taps (`ReadoutSource::fuses`), and the regime. A fusing
+/// source's graphs and its drafter-free source's are distinct graphs of one
+/// family, each certified, sealed and charged as its own.
+type SourcedRegime = (bool, ReadoutRegime);
+
+/// Every regime `load`'s readout certifies, from each of its sources
+/// ([`readout_sources`]), with every class it prepares by its source: the
+/// one account of a load's readout graphs, for the sealer
+/// (`PreparedTargetReadoutGraphs::prepare`) and the planner's charge
+/// ([`checked_readout_storage`]) alike.
+fn load_readout_regimes<'p>(
+    backend: BackendName,
+    load: &'p ModelLoadPlan,
+    geometry: &Decoder,
+    norm: Option<&crate::WeightPlan>,
+    head: HeadPlans<'_>,
+    limits: ResourceLimits,
+) -> Result<(BTreeMap<SourcedRegime, NativeGraphLayout>, Vec<(ReadoutSource<'p>, ReadoutClass)>), GraphError> {
+    let qualified = qualified_readout_classes(limits, head, backend)?;
+    let (mut regimes, mut classes) = (BTreeMap::new(), Vec::new());
+    for source in readout_sources(load) {
+        regimes.extend(
+            certify_readout_regimes(backend, geometry, norm, head, source, limits)?
+                .into_iter()
+                .map(|(regime, layout)| ((source.fuses, regime), layout)),
+        );
+        classes.extend(source.classes(qualified.clone()).into_iter().map(|class| (source, class)));
+    }
+    Ok((regimes, classes))
 }
 
 /// The structure a readout class selects: its kind; for a selection, the
@@ -1897,14 +1969,14 @@ fn readout_decodes(class: ReadoutClass, limits: ResourceLimits) -> bool {
 /// slots a decode step's readout of one row takes where they are free
 /// (`AllocatedResources::readout_pool`).
 fn readout_graphs(
-    regimes: &BTreeMap<ReadoutRegime, NativeGraphLayout>,
-    classes: &[ReadoutClass],
+    regimes: &BTreeMap<SourcedRegime, NativeGraphLayout>,
+    classes: &[(ReadoutSource<'_>, ReadoutClass)],
     limits: ResourceLimits,
     chunk: bool,
 ) -> Result<LaunchGraphs, GraphError> {
-    let mut decodes = BTreeMap::<ReadoutRegime, bool>::new();
-    for &class in classes.iter().filter(|class| !chunk || chunk_holds(class.projected)) {
-        *decodes.entry(readout_regime(class)).or_default() |= readout_decodes(class, limits);
+    let mut decodes = BTreeMap::<SourcedRegime, bool>::new();
+    for &(source, class) in classes.iter().filter(|(_, class)| !chunk || chunk_holds(class.projected)) {
+        *decodes.entry((source.fuses, readout_regime(class))).or_default() |= readout_decodes(class, limits);
     }
     let graphs = decodes
         .into_iter()
@@ -1924,16 +1996,17 @@ fn readout_regime(class: ReadoutClass) -> ReadoutRegime {
     }
 }
 
+/// The layouts of the classes a readout prepares from `source`, by regime.
 fn certify_readout_regimes(
     backend: BackendName,
     geometry: &Decoder,
     norm: Option<&crate::WeightPlan>,
     head: HeadPlans<'_>,
-    source: FeatureSource<'_>,
+    source: ReadoutSource<'_>,
     limits: ResourceLimits,
 ) -> Result<BTreeMap<ReadoutRegime, NativeGraphLayout>, GraphError> {
     // The entry whose `O` is the class's feature outputs.
-    let features_entry = match source {
+    let features_entry = match source.features {
         FeatureSource::Output => readout_features_rows::Entry::NAME,
         FeatureSource::Taps { .. } | FeatureSource::Residual { .. } => feature_rows::Entry::NAME,
     };
@@ -1950,7 +2023,7 @@ fn certify_readout_regimes(
         readout_refine_rows::Entry::NAME,
         readout_exact_rows::Entry::NAME,
     ];
-    for class in qualified_readout_classes(limits, head, backend)? {
+    for class in source.classes(qualified_readout_classes(limits, head, backend)?) {
         regimes
             .entry(readout_regime(class))
             .or_default()
@@ -2008,7 +2081,7 @@ fn certify_readout_regimes(
                 geometry,
                 norm,
                 Some(head),
-                source,
+                source.features,
                 template,
                 exports_logits(limits),
             )?
@@ -2439,6 +2512,70 @@ mod resource_regime_tests {
         assert!(certifies(&[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0]));
     }
 
+    /// A load whose readout fuses a separate draft's taps also holds the
+    /// readout of the same target without its drafter: every projecting
+    /// class, certified into exactly the layouts a drafter-free load's
+    /// readout certifies, and no features class, which only rows demanding
+    /// features run.
+    #[test]
+    fn a_tapped_load_holds_the_drafter_free_readouts_projecting_classes() {
+        use crate::planning::fixtures::{separate_draft_fixture, LIMITS};
+        let (definition, manifest) = separate_draft_fixture(false);
+        let (mut plain_definition, mut plain_manifest) = (definition.clone(), manifest.clone());
+        plain_definition.draft = None;
+        plain_manifest.draft = None;
+        let load = |definition: &magnitude_family_contracts::ModelDefinition, manifest, method| {
+            ModelLoadPlan::derive(
+                manifest,
+                definition,
+                ComponentSelection { head: method != crate::PlannedMethod::Plain, vision: false },
+                seismic::Layout::Rows16,
+                method,
+                LIMITS,
+            )
+            .unwrap()
+        };
+        let drafting = crate::PlannedMethod::DFlash { proposals: 3, widths: crate::DraftWidths::Adaptive };
+        let tapped = load(&definition, &manifest, drafting);
+        let alone = load(&plain_definition, &plain_manifest, crate::PlannedMethod::Plain);
+        let shape = |sources: Vec<ReadoutSource<'_>>| {
+            sources
+                .iter()
+                .map(|source| (matches!(source.features, FeatureSource::Taps { .. }), source.fuses, source.features_classes))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(readout_sources(&tapped)), [(true, true, true), (false, false, false)]);
+        assert_eq!(shape(readout_sources(&alone)), [(false, false, true)]);
+        let unfused = readout_sources(&tapped)[1];
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let regimes = |load: &ModelLoadPlan, source| {
+                let head = HeadPlans::for_recipe(load, WeightScope::Target, WeightScope::Target, false).unwrap();
+                let norm = target_readout_norm(load, &definition.decoder).unwrap();
+                certify_readout_regimes(backend, &definition.decoder, norm, head, source, LIMITS).unwrap()
+            };
+            let unfused = regimes(&tapped, unfused);
+            let drafter_free = regimes(&alone, readout_sources(&alone)[0]);
+            // The planner charges each source's graphs as its own, a fused
+            // regime and its drafter-free one alike: every graph of both,
+            // none of one in place of the other's.
+            let fused = regimes(&tapped, readout_sources(&tapped)[0]);
+            let ((_, charged), _) = checked_readout_storage(backend, &tapped, &definition.decoder, LIMITS).unwrap();
+            let recorded = fused.values().chain(unfused.values()).map(|layout| layout.storage_bytes().recorded.graphs).sum::<u64>();
+            assert_eq!(charged.union.graphs, recorded, "{backend:?}");
+            assert!(unfused.keys().all(|(kind, ..)| *kind != ReadoutKind::Features), "{backend:?}");
+            let projecting = drafter_free
+                .iter()
+                .filter(|((kind, ..), _)| *kind != ReadoutKind::Features)
+                .map(|(regime, layout)| (*regime, layout.storage_bytes()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                unfused.iter().map(|(regime, layout)| (*regime, layout.storage_bytes())).collect::<Vec<_>>(),
+                projecting,
+                "{backend:?}"
+            );
+        }
+    }
+
     #[test]
     fn every_readout_class_fits_its_shared_regime_layout() {
         // A Q8_0 head, so a backend that reads progressive heads places it
@@ -2542,7 +2679,7 @@ mod resource_regime_tests {
                     &definition.decoder,
                     norm,
                     head,
-                    FeatureSource::Output,
+                    ReadoutSource::whole(FeatureSource::Output),
                     limits,
                 )
                 .unwrap();
@@ -2638,7 +2775,7 @@ mod resource_regime_tests {
                 decoder,
                 None,
                 head,
-                FeatureSource::Output,
+                ReadoutSource::whole(FeatureSource::Output),
                 limits,
             )
             .unwrap();

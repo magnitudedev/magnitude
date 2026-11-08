@@ -257,6 +257,81 @@ pub(crate) fn fixture_manifest(definition: &ModelDefinition) -> PackageManifest 
     }
 }
 
+/// The planning fixture with a separate DFlash draft, which owns its output
+/// projection or reads the target's (`owns_output`). The projection the
+/// draft reads is Q8_0, the form a progressive readout is offered for.
+#[cfg(test)]
+pub(crate) fn separate_draft_fixture(owns_output: bool) -> (ModelDefinition, PackageManifest) {
+    use magnitude_family_contracts::{
+        BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod, TapPoint,
+        TokenId,
+    };
+    let mut definition = fixture_definition();
+    let mut manifest = fixture_manifest(&definition);
+    let (hidden, vocabulary) = (definition.decoder.hidden, definition.decoder.vocabulary);
+    let norm = |name: &str| RmsNorm {
+        weight: WeightDescriptor::stored(name, &[hidden]),
+        epsilon: 1e-6,
+    };
+    definition.draft = Some(DraftDefinition {
+        method: DraftMethod::DFlash,
+        convolutions: None,
+        taps: vec![TapPoint::Exit],
+        fusion: WeightDescriptor::stored("draft_fusion", &[hidden, hidden]),
+        fusion_norm: norm("draft_fusion_norm"),
+        embedding: DraftEmbedding::Target,
+        output: owns_output
+            .then(|| WeightDescriptor::stored("draft_output", &[vocabulary, hidden])),
+        embedding_scale: 1.0,
+        blocks: definition.decoder.blocks.clone(),
+        block_attention: vec![BlockAttention::Bidirectional],
+        output_norm: norm("draft_output_norm"),
+        logit_softcap: Some(0.1),
+        block_size: 2,
+        mask_token: TokenId(0),
+        layout: BlockLayout::MaskSlots,
+    });
+    definition.validate().unwrap();
+    let draft = definition.draft.as_ref().unwrap();
+    let mut offset = 0;
+    let tensors = crate::operators::draft::fusion_weights(draft)
+        .into_iter()
+        .chain(crate::operators::draft::draft_weights(draft).unwrap())
+        .map(|(_, descriptor)| {
+            let nbytes = descriptor.shape.iter().product::<u64>() * 2;
+            let tensor = TensorDescriptor {
+                name: descriptor.name.clone(),
+                shape: descriptor.shape.clone(),
+                encoding: Encoding::F16,
+                offset,
+                nbytes,
+            };
+            offset += nbytes;
+            tensor
+        })
+        .collect();
+    manifest.draft = Some(ComponentManifest {
+        files: vec![ComponentFile {
+            path: "draft-fixture.gguf".into(),
+            size: offset,
+        }],
+        identity: ArtifactIdentity([9; 32]),
+        tensors,
+    });
+    let (component, descriptor) = match &draft.output {
+        Some(output) => (manifest.draft.as_mut().unwrap(), output),
+        None => (&mut manifest.target, &definition.decoder.exit.output),
+    };
+    let output = component
+        .tensors
+        .iter_mut()
+        .find(|tensor| tensor.name == descriptor.name)
+        .unwrap();
+    output.encoding = Encoding::Q8_0;
+    output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
+    (definition, manifest)
+}
+
 /// The planning fixture over four hyper-connection streams: its lone
 /// attention mixer reads through a mix site and scatters into the
 /// streams, and its exit is a hyper-connection head, with no output

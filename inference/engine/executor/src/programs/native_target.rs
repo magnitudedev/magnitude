@@ -806,6 +806,9 @@ impl NativeTargetProgram {
         let mut projected_output_rows = Vec::new();
         // Whether a selected row also reads its logits on the host.
         let mut selection_reads_logits = false;
+        // Whether a row demands features: only then does a tapped load's
+        // readout fuse its draft's taps (`BoundTargetReadoutGraphs::class`).
+        let mut features = false;
         for &output_index in batch.select_rows {
             projected_output_rows.push(
                 usize::try_from(output_index)
@@ -821,6 +824,7 @@ impl NativeTargetProgram {
                 .ok_or_else(|| invalid("readout demand is absent or invalid"))?;
             let selected = projected_output_rows[..actual_selected].contains(&output_index);
             selection_reads_logits |= selected && demand.contains(Demand::LOGITS);
+            features |= demand.contains(Demand::FEATURES);
             if demand.computes_logits() && !selected {
                 projected_output_rows.push(output_index);
             } else if selected && !demand.computes_logits() {
@@ -867,7 +871,7 @@ impl NativeTargetProgram {
             selected: selected_class as u64,
             kind,
         };
-        let (graph, bound) = self.readout_graphs.class(class).map_err(invalid)?;
+        let (graph, bound) = self.readout_graphs.class(class, features).map_err(invalid)?;
         let mut active = workspace.slot_mut().activate(&graph.plan).map_err(device)?;
         let tap_rows = graph
             .taps
