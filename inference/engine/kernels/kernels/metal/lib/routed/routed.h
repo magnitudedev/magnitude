@@ -215,13 +215,13 @@ inline void expert_plain(thread const In &in, thread const Out &out, thread cons
 }
 
 // A resident combine's projections of one channel in threadgroup memory:
-// slot k's at `projected[k * TILE + tid]`, A-rounded.
+// slot k's at `projected[k * stride + tid]`, A-rounded.
 struct TileProjections {
     threadgroup const float *projected;
-    uint tile;
+    uint stride;
     uint tid;
     float at(uint k) const thread {
-        return Act::round(projected[k * tile + tid]);
+        return Act::round(projected[k * stride + tid]);
     }
 };
 
