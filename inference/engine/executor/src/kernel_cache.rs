@@ -387,12 +387,6 @@ impl KernelCache {
         self.readout_field(key, "costs")
     }
 
-    /// Whether a stored recipe choice's bounded levels selected the
-    /// canonical tokens on every row it compared.
-    pub(crate) fn readout_agreed(&self, key: &TuningCacheKey) -> Option<bool> {
-        self.readout_field(key, "agreed")
-    }
-
     /// One field of a stored recipe choice; none when it is absent or null.
     fn readout_field<T: serde::de::DeserializeOwned>(
         &self,

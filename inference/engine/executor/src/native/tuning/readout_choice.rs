@@ -1,14 +1,7 @@
 //! Whole-recipe readout qualification within the ordinary first-load allocation.
-//! Packed is canonical. A class's bounded levels serve it where they select
-//! the same tokens as the canonical projection and cost less than the planes'
-//! full pass, the other way a scope stored as planes reads the class
-//! ([`reads`]). The census establishes both, before any
-//! optional work: the selection on noise and resolved rows, the costs on the
-//! resolved rows. The qualification, once its canonical is final, prices the
-//! class again against it. Evidence a load's allowance did not complete is
-//! recorded unsettled, so a later load completes it, and every load reads
-//! what was measured: an open whose qualification did not run decides its
-//! scope's stored form on its census, as an open that qualified does.
+//! Packed is canonical. A dependent bounded recipe must confirm the same
+//! selected tokens and a lower complete invocation cost; missing evidence is
+//! a completed packed choice, never a request to continue on another load.
 //!
 //! The bounded recipe's cost depends on its rows: its later levels read only
 //! the vocabulary rows the earlier bounds keep. Rows of noise score every
@@ -56,7 +49,7 @@ use magnitude_kernels::{
     readout_exact_rows, readout_features_rows, readout_head_rows, readout_planes_rows,
     readout_project_rows, readout_refine_rows, readout_top_rows,
 };
-use seismic::measure::{Shuffle, SustainedClock, Tally};
+use seismic::measure::{Shuffle, SustainedClock, Tally, Verdict};
 use seismic::{
     BackendName, BoundEntry, BuildError, Element, Entry, NativeKernel, NativeSpecialization,
     NativeTensorBatch, Tensor,
@@ -90,9 +83,6 @@ pub(crate) struct QualifiedRecipe {
     /// The class's measured costs, from its census on and its qualification
     /// once timed; kept whatever the class's choice.
     pub costs: Option<RecipeCosts>,
-    /// Whether its bounded levels selected the canonical projection's tokens
-    /// on every row its census and qualification compared.
-    pub agreed: bool,
     /// The class's executions per decode step of the load's demand: each
     /// decode term's launches of it times the term's weight
     /// ([`super::workload::terms`]), whatever is measured of the terms'
@@ -114,40 +104,14 @@ pub(crate) struct RecipeCosts {
     pub planes: f64,
 }
 
-/// What a class whose reader and rows allow `levels` ([`class_levels`])
-/// reads through its scope's planes, on its evidence: its bounded levels
-/// where they `agreed` with the canonical selection and its `costs` show
-/// them cheaper than the full pass, the other way a scope stored as planes
-/// reads it, whatever they cost against packed; the full pass where not.
-/// A proposing or full-pass class reads what it allows.
-pub(crate) fn reads(levels: Levels, costs: Option<RecipeCosts>, agreed: bool) -> Levels {
-    let serve = agreed
-        && costs.is_some_and(|costs| costs.bounded.is_some_and(|bounded| bounded < costs.planes));
-    match levels {
-        Levels::Certified if !serve => Levels::Full,
-        levels => levels,
-    }
-}
-
-impl QualifiedRecipe {
-    /// What the class reads through its scope's planes when its reader and
-    /// rows allow `levels` ([`reads`]).
-    pub(crate) fn reads(&self, levels: Levels) -> Levels {
-        reads(levels, self.costs, self.agreed)
-    }
-}
-
 impl RecipeCosts {
-    /// The class's cost in each stored form: through the planes, as it
-    /// `reads` them ([`reads`]): its bounded levels, or its uncertified read
-    /// (the full pass, or a proposing class's first view).
-    pub(crate) fn stored(self, reads: Levels) -> FormCosts {
-        let planes = match (reads, self.bounded) {
-            (Levels::Full | Levels::View, _) => self.planes,
-            (Levels::Certified, Some(bounded)) => bounded,
-            (Levels::Certified, None) => {
-                panic!("a certified class was timed through its bounded levels")
-            }
+    /// The class's cost in each stored form: through the planes, its bounded
+    /// levels when they are `certified` and the full pass otherwise.
+    pub(crate) fn stored(self, certified: bool) -> FormCosts {
+        let planes = match (certified, self.bounded) {
+            (false, _) => self.planes,
+            (true, Some(bounded)) => bounded,
+            (true, None) => panic!("a certified class was timed through its bounded levels"),
         };
         FormCosts {
             packed: self.packed,
@@ -234,9 +198,6 @@ pub(crate) struct ReadoutContender<'a> {
     /// without bounded levels is priced through the packed projection and
     /// that read alone.
     levels: Levels,
-    /// The qualification ran out of the load's allowance: what it measured
-    /// is kept unsettled, for a later load to complete.
-    expired: bool,
     canonical_seconds: f64,
     candidate_seconds: f64,
     receipt: ReadoutChoiceReceipt,
@@ -252,9 +213,6 @@ struct ReadoutChoiceReceipt {
     pairs: Vec<(f64, f64)>,
     /// The class's costs as its scope's stored form weighs them.
     costs: Option<RecipeCosts>,
-    /// Whether the bounded levels selected the canonical tokens on every
-    /// compared row ([`QualifiedRecipe::agreed`]).
-    agreed: bool,
     settled: bool,
 }
 
@@ -290,7 +248,6 @@ impl<'a> ReadoutContender<'a> {
             dependency,
             preparation,
             levels,
-            expired: false,
             canonical_seconds: 0.0,
             candidate_seconds: 0.0,
             receipt: ReadoutChoiceReceipt {
@@ -316,25 +273,14 @@ impl<'a> ReadoutContender<'a> {
         Ok(self.record.insert(key))
     }
 
-    /// The settled choice stored under `record`, when one is. What is stored
-    /// there is the class's evidence, the costs it measured and whether its
-    /// bounded levels agreed, which price its scope's stored form: a settled
-    /// record's always, an unsettled one's where this open measured nothing
-    /// of its own.
+    /// The settled choice stored under `record`, when one is, with the
+    /// costs it measured the class at, which price its scope's stored form.
     fn stored_choice(&mut self, record: &TuningCacheKey) -> Option<bool> {
         let cache = self.stored?;
-        let selected = cache.readout_choice(record);
-        let evidence = cache
-            .readout_costs(record)
-            .filter(|_| selected.is_some() || self.receipt.costs.is_none());
-        if let Some(costs) = evidence {
-            self.receipt.costs = Some(costs);
-            self.receipt.agreed = cache.readout_agreed(record).unwrap_or(false);
-            let mut state = self.state.borrow_mut();
-            state.costs = self.receipt.costs;
-            state.agreed = self.receipt.agreed;
-        }
-        selected
+        let selected = cache.readout_choice(record)?;
+        self.receipt.costs = cache.readout_costs(record);
+        self.state.borrow_mut().costs = self.receipt.costs;
+        Some(selected)
     }
 
     /// The deferred lookup of a load that searched the canonical unit
@@ -1152,31 +1098,8 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         }
         let preparation = preparation.elapsed();
         self.receipt.preparation_seconds = preparation.as_secs_f64();
-        let progressive = formed.progressive.as_ref().unwrap();
-        // Each form writes its outputs here first, outside the timed runs.
-        case.packed(inputs.device, self.recipe, &packed)?;
-        case.uncertified(inputs.device, self.recipe, progressive, self.levels)?;
-        if self.levels == Levels::Certified {
-            // Noise rows test every bound; the rows the head resolves are
-            // the ones the levels serve, and are timed.
-            case.bounded(inputs.device, self.recipe, progressive)?;
-            self.receipt.agreed = case.same_winners(self.point.rows, self.recipe.vocabulary)?;
-            if self.receipt.agreed {
-                let resolved = match case.resolved_rows(inputs, self.recipe, self.point.rows, 1) {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        self.receipt.reason = format!("candidate inputs not admitted: {error}");
-                        return Ok(None);
-                    }
-                };
-                case.set_hidden(inputs.device, self.recipe, &feature, resolved)?;
-                case.packed(inputs.device, self.recipe, &packed)?;
-                case.bounded(inputs.device, self.recipe, progressive)?;
-                self.receipt.agreed =
-                    case.same_winners(self.point.rows, self.recipe.vocabulary)?;
-            }
-        }
         let measured = Instant::now();
+        let progressive = formed.progressive.as_ref().unwrap();
         self.canonical_seconds = case.packed(inputs.device, self.recipe, &packed)?;
         let bounded = match self.levels {
             Levels::Certified => {
@@ -1189,22 +1112,21 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             Levels::Full | Levels::View => None,
         };
         let planes = case.uncertified(inputs.device, self.recipe, progressive, self.levels)?;
-        // Until a qualification times the class against its final
-        // canonical, its census prices it.
+        // Until a qualification times the class, its census prices it: the
+        // packed and full passes and the first view read every row alike,
+        // and the bounded levels only serve a class its qualification
+        // certifies.
         self.receipt.costs = Some(RecipeCosts {
             packed: self.canonical_seconds,
             bounded,
             planes,
         });
-        self.receipt.reason = match (self.levels, self.receipt.agreed) {
-            (Levels::Certified, false) => "canonical and bounded selection disagree at the census".into(),
-            _ => "censused; qualification not admitted within first-load allocation".into(),
-        };
+        self.receipt.reason =
+            "censused; qualification not admitted within first-load allocation".into();
         {
             let mut state = self.state.borrow_mut();
             state.progressive = formed.progressive;
             state.costs = self.receipt.costs;
-            state.agreed = self.receipt.agreed;
         }
         let rounds = Tally::default().fewest(super::SEARCH_SETTINGS.error_rate);
         // The comparison's clock is established by its first raise: twice
@@ -1240,7 +1162,6 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             () => {
                 if std::time::Instant::now() >= before {
                     self.receipt.reason = "first-load tuning allowance expired".into();
-                    self.expired = true;
                     return Ok(false);
                 }
             };
@@ -1295,7 +1216,6 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             check_deadline!();
             if !case.same_winners(self.point.rows, self.recipe.vocabulary)? {
                 self.receipt.reason = "canonical and bounded selection disagree".into();
-                self.receipt.agreed = false;
                 return Ok(false);
             }
             let resolved = match case.resolved_rows(inputs, self.recipe, self.point.rows, seed) {
@@ -1317,7 +1237,6 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             check_deadline!();
             if !case.same_winners(self.point.rows, self.recipe.vocabulary)? {
                 self.receipt.reason = "canonical and bounded selection disagree".into();
-                self.receipt.agreed = false;
                 return Ok(false);
             }
             cases.push(case);
@@ -1326,14 +1245,13 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         // recipe runs: a round raises the device to a sustained clock, then
         // runs both recipes and the planes' full pass at every seed in random
         // order, each behind a lead of its own work, and is ahead when the
-        // bounded levels cost less over the seeds than the full pass, the
-        // other way a scope stored as planes reads the class. Every round's
-        // samples of all three price the class for its scope's stored form.
-        // The comparison is admitted the fewest rounds in which it can
-        // resolve as a lead at the search's error rate, and ends with its
-        // first round that is not ahead. A class without bounded levels
-        // compares nothing: its rounds, as many, price the packed projection
-        // and its planes read alone.
+        // bounded recipe cost less over the seeds. The full pass is not in
+        // the comparison: every round's samples of all three price the class
+        // for its scope's stored form. The comparison is admitted the fewest
+        // rounds in which it can resolve as a lead at the search's error
+        // rate, and ends with its first round that is not ahead. A class
+        // without bounded levels compares nothing: its rounds, as many,
+        // price the packed projection and its planes read alone.
         let rate = super::SEARCH_SETTINGS.error_rate;
         let mut tally = Tally::default();
         let mut shuffle = Shuffle::default();
@@ -1363,7 +1281,6 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 Err(Some(error)) => return Err(error),
                 Err(None) => {
                     self.receipt.reason = "first-load tuning allowance expired".into();
-                    self.expired = true;
                     return Ok(false);
                 }
             }
@@ -1400,7 +1317,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 }
                 if certified {
                     self.receipt.pairs.push((seconds[0], seconds[1]));
-                    difference += seconds[1] / seconds[2] - 1.;
+                    difference += seconds[1] / seconds[0] - 1.;
                 }
                 for (sum, seconds) in round.iter_mut().zip(seconds) {
                     *sum += seconds;
@@ -1434,49 +1351,25 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             );
             return Ok(false);
         }
-        // Every seed's selections agreed with the canonical's here; the
-        // census's own compared rows stand beside them.
-        let certified =
-            reads(self.levels, self.receipt.costs, self.receipt.agreed) == Levels::Certified;
-        self.receipt.reason = match (self.receipt.agreed, certified) {
-            (false, _) => "canonical and bounded selection disagreed at the census".into(),
-            (true, true) => format!(
-                "same selected tokens; bounded levels cost less than the full pass over {} rounds",
+        if tally.verdict(rate) != Some(Verdict::Leads) {
+            self.receipt.reason = format!(
+                "bounded whole recipe did not resolve as faster than canonical in {} rounds",
                 tally.rounds()
-            ),
-            (true, false) => format!(
-                "same selected tokens; bounded levels cost no less than the full pass over {} rounds",
-                tally.rounds()
-            ),
-        };
-        Ok(certified)
-    }
-    fn finalize(
-        &mut self,
-        device: &seismic::Device,
-        chosen: &HashMap<TuningKey, NativeSpecialization>,
-    ) -> Result<(), CatalogFailure> {
-        // Never qualified: its census is recorded, unsettled, against the
-        // canonical's final choice, so the load reads it and a later load
-        // qualifies it. Another load's settled comparison there stands.
-        if self.record.is_none() {
-            if let Some(canonical) = chosen.get(&self.dependency) {
-                let record = self.record(device, canonical)?.clone();
-                self.adopted = self.stored.and_then(|cache| cache.readout_choice(&record)).is_some();
-            }
+            );
+            return Ok(false);
         }
-        let certified = self.state.borrow().reads(self.levels) == Levels::Certified;
-        self.conclude(certified, false)
+        self.receipt.reason = format!(
+            "same selected tokens; bounded whole recipe resolved as faster in {} rounds",
+            tally.rounds()
+        );
+        Ok(true)
     }
     fn conclude(&mut self, selected: bool, settled: bool) -> Result<(), CatalogFailure> {
         self.receipt.selected = selected;
-        // What an expired qualification measured is evidence, not a choice:
-        // a later load completes it.
-        self.receipt.settled = settled && !self.expired;
+        self.receipt.settled = settled;
         {
             let mut state = self.state.borrow_mut();
             state.costs = self.receipt.costs;
-            state.agreed = self.receipt.agreed;
             if !selected {
                 state.progressive = None;
             }
@@ -1497,7 +1390,6 @@ mod tests {
     use crate::{ExecutionPath, resident_layout};
 
     fn class(weight: f64, certified: bool, [packed, bounded, planes]: [f64; 3]) -> ClassCost {
-        let reads = if certified { Levels::Certified } else { Levels::Full };
         ClassCost {
             weight,
             costs: Some(
@@ -1506,7 +1398,7 @@ mod tests {
                     bounded: Some(bounded),
                     planes,
                 }
-                .stored(reads),
+                .stored(certified),
             ),
         }
     }
@@ -1603,7 +1495,7 @@ mod tests {
             planes: 3.,
         };
         assert_eq!(
-            priced.stored(Levels::Full),
+            priced.stored(false),
             FormCosts {
                 packed: 2.,
                 planes: 3.
@@ -1621,7 +1513,7 @@ mod tests {
             bounded: None,
             planes: 3.,
         }
-        .stored(Levels::Certified);
+        .stored(true);
     }
 
     /// A class runs in its graph's decode launches at its rows, never in a
@@ -1902,102 +1794,6 @@ mod tests {
             }
             std::fs::remove_dir_all(root).unwrap();
         }
-    }
-
-    /// An open whose allowance ends before its recipe qualifies (its head
-    /// was searched to the end, as after a key change) records its census
-    /// unsettled against the head's final choice. The load after it reads
-    /// that evidence, so it certifies the class and prices the scope as an
-    /// open that qualified does; a later open still finds no settled
-    /// choice and qualifies, and a qualification that runs out of the
-    /// allowance settles nothing either.
-    #[test]
-    fn an_open_that_never_qualified_records_its_census_for_the_load() {
-        for device in devices() {
-            let backend = device.backend();
-            let (recipe, plain) = recipe_on(&device);
-            let root = std::env::temp_dir().join(format!(
-                "magnitude-readout-census-{backend:?}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
-            let cache =
-                KernelCache::open(root.clone(), crate::kernel_cache::DEFAULT_KERNEL_CACHE_BYTES)
-                    .unwrap();
-            let dependency: TuningKey =
-                ("readout_head_rows", "head".into(), super::super::FixedValues::default());
-            let chosen = HashMap::from([(dependency.clone(), plain.clone())]);
-            let point = PointShape {
-                label: "m1".into(),
-                weight: 1.,
-                terms: Vec::new(),
-                rows: 1,
-                sequences: 1,
-                context: None,
-                class: None,
-            };
-            let open = |state: RecipeState| {
-                ReadoutContender::new(
-                    recipe,
-                    point.clone(),
-                    TuningCacheKey::of("readout recipe unit"),
-                    Some(&cache),
-                    Some(&cache),
-                    state,
-                    dependency.clone(),
-                    RecipePreparation::default(),
-                    Levels::Certified,
-                )
-            };
-            // Its census: the levels agreed, and cost less than the full
-            // pass (the M4 Pro's one-row class, seconds).
-            let costs = RecipeCosts { packed: 2.19e-3, bounded: Some(1.63e-3), planes: 2.24e-3 };
-            let mut first = open(RecipeState::default());
-            assert_eq!(first.cached(&device, &HashMap::new()).unwrap(), None);
-            first.conclude(false, false).unwrap();
-            first.receipt.costs = Some(costs);
-            first.receipt.agreed = true;
-            {
-                let mut state = first.state.borrow_mut();
-                state.costs = Some(costs);
-                state.agreed = true;
-            }
-            first.finalize(&device, &chosen).unwrap();
-            // The load: no settled choice, the census's evidence.
-            let state = RecipeState::default();
-            assert_eq!(open(state.clone()).cached(&device, &chosen).unwrap(), None, "{backend:?}");
-            assert_eq!(state.borrow().reads(Levels::Certified), Levels::Certified, "{backend:?}");
-            assert_eq!(state.borrow().costs, Some(costs), "{backend:?}");
-            // A qualification that expires records what it measured, unsettled.
-            let mut expired = open(RecipeState::default());
-            assert_eq!(expired.cached(&device, &chosen).unwrap(), None);
-            expired.expired = true;
-            expired.conclude(false, true).unwrap();
-            assert_eq!(open(RecipeState::default()).cached(&device, &chosen).unwrap(), None);
-            // One that completes settles it.
-            let mut qualified = open(RecipeState::default());
-            assert_eq!(qualified.cached(&device, &chosen).unwrap(), None);
-            qualified.conclude(true, true).unwrap();
-            assert_eq!(open(RecipeState::default()).cached(&device, &chosen).unwrap(), Some(true));
-            std::fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    /// Bounded levels serve a class where they agreed and cost less than the
-    /// full pass, whatever they cost against packed: a scope stored as
-    /// planes reads the class one of those two ways. A class without
-    /// evidence reads the full pass, and a proposing class its view.
-    #[test]
-    fn bounded_levels_serve_where_they_agree_and_beat_the_full_pass() {
-        let costs = |bounded| Some(RecipeCosts { packed: 2.0, bounded: Some(bounded), planes: 3.0 });
-        let certified = Levels::Certified;
-        assert_eq!(reads(certified, costs(1.5), true), Levels::Certified);
-        assert_eq!(reads(certified, costs(2.5), true), Levels::Certified, "slower than packed");
-        assert_eq!(reads(certified, costs(3.5), true), Levels::Full);
-        assert_eq!(reads(certified, costs(1.5), false), Levels::Full);
-        assert_eq!(reads(certified, None, true), Levels::Full);
-        assert_eq!(reads(Levels::View, costs(1.5), false), Levels::View);
-        assert_eq!(reads(Levels::Full, costs(1.5), true), Levels::Full);
     }
 
     /// A first load that searches the canonical head itself knows no record
