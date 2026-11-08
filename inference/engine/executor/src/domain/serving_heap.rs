@@ -119,22 +119,71 @@ pub(super) enum GroupSource {
     Modelled { submission: f64, held: Option<crate::assessment::HeldSlots> },
 }
 
-/// What a prompt group's places are priced at ([`ExecutorDomain::places_seconds`]):
-/// the places held, the chunks they may grow to, the wait bound (its bits)
-/// and the group's source.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct PlacesKey {
-    held: usize,
-    chunks: usize,
-    wait: Option<u64>,
+/// One prompt group's seconds at each size up to the chain's capacity, as
+/// `source` last priced them ([`ExecutorDomain::group_sizes`]); none where
+/// it prices no group.
+pub(super) struct PlacesPrompt {
     source: GroupSource,
+    groups: Option<std::rc::Rc<[f64]>>,
 }
 
-/// The prompt's seconds at each place count from `key`'s held, as last
-/// priced.
-pub(super) struct PlacesPrompt {
-    key: PlacesKey,
-    prompt: std::rc::Rc<[f64]>,
+/// What a settle of the serving heap read that moves its outcome
+/// ([`ExecutorDomain::settle_memory`]), and the room in each store it
+/// stands in: a settle on the same holdings within that room settles the
+/// same, so none runs ([`SettleStands::holds`]). The serving rates and the
+/// decode's price move at every reading; their drift alone changes no step
+/// a holding holds or offers, so it is no input (a request's arrival or end
+/// is, `requests` and `idle`).
+#[derive(Clone, Debug, PartialEq)]
+struct SettleKey {
+    resizes: super::ExpertResizes,
+    places: usize,
+    head: bool,
+    vision: bool,
+    idle: bool,
+    measuring: bool,
+    requests: u64,
+    /// The owner's cached prefixes: how many, and their bytes.
+    prefixes: (usize, u64),
+    /// Each store's room (`MemoryPace::supply`): free and borrowable
+    /// together, and what is owed.
+    rooms: Vec<(seismic::StoreId, u64, u64)>,
+}
+
+/// The last settle's inputs and, in each store, how far its room may move
+/// before the settle could take another step: up by the least step offered
+/// that it did not grant, down by the least held step it did not release;
+/// none where no step is.
+pub(super) struct SettleStands {
+    key: SettleKey,
+    moves: StoreMoves,
+}
+
+/// Each store's room's moves a settle stands across ([`SettleStands`]):
+/// up, down.
+type StoreMoves = Vec<(seismic::StoreId, Option<u64>, Option<u64>)>;
+
+impl SettleStands {
+    /// Whether a settle at `key` settles as this one did: the same holdings,
+    /// no more owed, and each store's room within the steps it stands
+    /// between.
+    fn holds(&self, key: &SettleKey) -> bool {
+        let SettleKey { rooms, .. } = key;
+        let same = SettleKey { rooms: self.key.rooms.clone(), ..key.clone() };
+        same == self.key
+            && rooms.len() == self.key.rooms.len()
+            && rooms.iter().zip(&self.key.rooms).all(|(&(store, room, owed), &(was, before, owing))| {
+                let (up, down) = self
+                    .moves
+                    .iter()
+                    .find(|(of, _, _)| *of == store)
+                    .map_or((None, None), |&(_, up, down)| (up, down));
+                store == was
+                    && owed <= owing
+                    && up.is_none_or(|up| room < before.saturating_add(up))
+                    && down.is_none_or(|down| room > before.saturating_sub(down))
+            })
+    }
 }
 
 /// The room a release settles into: none free, `owed` to cover.
@@ -169,6 +218,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// A request arrived, its input encoded by the vision projector where
     /// `vision`; counted once the meter runs.
     pub fn served_request(&mut self, vision: bool) {
+        self.requests += 1;
         if let Some(meter) = self.workload.as_mut() {
             meter.requested(Instant::now(), vision);
         }
@@ -262,14 +312,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// ([`Self::places_seconds`]) at `rates`' requests a second, none past a
     /// count whose group runs longer than the wait bound.
     fn places_curve(&self, chunks: usize, bytes: &[u64], rates: &WorkloadRates) -> Result<Curve<Holding>, DomainError> {
-        let key = PlacesKey {
-            held: self.resources.group_places().get(),
-            chunks,
-            wait: self.pace.borrow().wait_bound().map(f64::to_bits),
-            source: self.group_source()?,
-        };
-        let held = key.held;
-        let prompt = self.places_seconds(key)?;
+        let held = self.resources.group_places().get();
+        let prompt = self.places_seconds(held, chunks)?;
         Ok(crate::planning::places_curve(
             held,
             held + prompt.len() - 1,
@@ -282,41 +326,38 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         ))
     }
 
-    /// The prompt's seconds at each place count from those `key` holds to
-    /// the most whose group runs within its wait bound
-    /// ([`Self::group_seconds`]). They change only with what `key` names
-    /// and the load's measures, so a settle at every reading prices them
-    /// once per change, not once per reading (a priced group's seconds
-    /// take each layer's union and merge, a count's seconds two groups).
-    fn places_seconds(&self, key: PlacesKey) -> Result<std::rc::Rc<[f64]>, DomainError> {
-        if let Some(memo) = self.places_prompt.borrow().as_ref().filter(|memo| memo.key == key) {
-            return Ok(memo.prompt.clone());
-        }
-        let group = self.group_seconds(&key.source)?;
-        // Each group size's seconds once: every count's prompt is of groups
-        // of at most `key.chunks` chunks.
-        let sizes = vec![std::cell::Cell::new(None); key.chunks + 1];
-        let seconds = |chunks: usize, places: usize| {
-            group.as_ref().map(|group| {
-                crate::planning::grouped(chunks, places, |steps| {
-                    let size = &sizes[steps];
-                    size.get().unwrap_or_else(|| {
-                        let seconds = group(steps);
-                        size.set(Some(seconds));
-                        seconds
-                    })
-                })
-            })
-        };
-        let wait = key.wait.map(f64::from_bits);
-        let most = (key.held + 1..=key.chunks)
+    /// The prompt's seconds at each place count from `held` to the most
+    /// whose group runs within the wait bound, `chunks` chunks in groups of
+    /// that many ([`Self::group_sizes`], `planning::grouped`).
+    fn places_seconds(&self, held: usize, chunks: usize) -> Result<Vec<f64>, DomainError> {
+        let groups = self.group_sizes()?;
+        let seconds = |chunks: usize, places: usize| groups.as_ref().map(|groups| crate::planning::grouped(chunks, places, |steps| groups[steps]));
+        let wait = self.pace.borrow().wait_bound();
+        let most = (held + 1..=chunks)
             .take_while(|&places| !wait.zip(seconds(places, places)).is_some_and(|(wait, group)| group > wait))
             .last()
-            .unwrap_or(key.held);
-        let prompt: std::rc::Rc<[f64]> = (key.held..=most).map(|places| seconds(key.chunks, places).unwrap_or(0.)).collect();
-        drop(group);
-        *self.places_prompt.borrow_mut() = Some(PlacesPrompt { key, prompt: prompt.clone() });
-        Ok(prompt)
+            .unwrap_or(held);
+        Ok((held..=most).map(|places| seconds(chunks, places).unwrap_or(0.)).collect())
+    }
+
+    /// One prompt group's seconds at each size up to the chain's capacity,
+    /// the most chunks a group holds ([`Self::group_seconds`]); none where
+    /// no group is priced. They change only with the group's source and the
+    /// load's measures, never with a reading's wait bound or request rate,
+    /// which apply to them as they are read: a settle at every reading
+    /// prices each size once per change of its source, not once per
+    /// reading (a priced group's seconds take each layer's union and merge).
+    fn group_sizes(&self) -> Result<Option<std::rc::Rc<[f64]>>, DomainError> {
+        let source = self.group_source()?;
+        if let Some(memo) = self.places_prompt.borrow().as_ref().filter(|memo| memo.source == source) {
+            return Ok(memo.groups.clone());
+        }
+        let capacity = self.chain_capacity().get();
+        let groups = self
+            .group_seconds(&source)?
+            .map(|group| (0..=capacity).map(|steps| if steps == 0 { 0. } else { group(steps) }).collect::<std::rc::Rc<[f64]>>());
+        *self.places_prompt.borrow_mut() = Some(PlacesPrompt { source, groups: groups.clone() });
+        Ok(groups)
     }
 
     /// What prices a prompt group's seconds now ([`GroupSource`]).
@@ -490,10 +531,58 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// store's room
     /// ([`Self::growth_supply`]). Nothing grows beside the measurement
     /// job's claim.
+    ///
+    /// It runs only when its inputs changed since the last
+    /// ([`SettleStands::holds`]): settling the same holdings in the same
+    /// room again decides the same, so a reading changes nothing where it
+    /// moved neither. One whose decision the owner could not carry out
+    /// settles again at the next reading ([`Self::settle_again`]).
     pub fn settle_memory(&mut self, owner: &OwnerHoldings) -> Result<ServingSettlement, DomainError> {
         let held = self.resources.group_places().get();
+        let key = self.settle_key(owner);
+        if self.settled.as_ref().is_some_and(|stands| stands.holds(&key)) {
+            return Ok(ServingSettlement { places: held, ..ServingSettlement::default() });
+        }
+        #[cfg(test)]
+        self.settles.set(self.settles.get() + 1);
         let (_, bytes) = self.class_bytes(held, self.chain_capacity().get())?;
-        self.settle_with(owner, &bytes, false)
+        let (settlement, moves) = self.settle_with(owner, &bytes, false)?;
+        self.settled = Some(SettleStands { key, moves });
+        Ok(settlement)
+    }
+
+    /// The last settle's decision was not carried out (a resize deferred or
+    /// refused): the next settles afresh.
+    pub fn settle_again(&mut self) {
+        self.settled = None;
+    }
+
+    /// What a settle reads now that moves its outcome ([`SettleKey`]).
+    fn settle_key(&self, owner: &OwnerHoldings) -> SettleKey {
+        let pace = self.pace.borrow();
+        let mut rooms = self
+            .bank_stores()
+            .into_iter()
+            .map(|(store, _)| store)
+            .chain(self.store_of(seismic::Contract::DeviceOnly))
+            .filter_map(|store| {
+                pace.supply(store, self.memory_probe().charged_in(store), WORKLOAD_SPAN)
+                    .map(|supply| (store, supply.free.saturating_add(supply.borrowable), supply.owed))
+            })
+            .collect::<Vec<_>>();
+        rooms.sort_by_key(|&(store, _, _)| store);
+        rooms.dedup_by_key(|&mut (store, _, _)| store);
+        SettleKey {
+            resizes: self.expert_resizes(),
+            places: self.resources.group_places().get(),
+            head: self.family.head_is_bound(),
+            vision: self.family.vision_is_bound(),
+            idle: self.optional_idle(),
+            measuring: self.measurement_claim.is_some(),
+            requests: self.requests,
+            prefixes: (owner.prefixes.len(), owner.prefixes.iter().map(|&(bytes, _)| bytes).sum()),
+            rooms,
+        }
     }
 
     /// The places a prompt group of `chunks` chunks holds as it opens
@@ -505,17 +594,19 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// the requests (at most the workload span), against the moves of the
     /// slots it takes, their return included.
     pub(super) fn settle_places(&mut self, bytes: &[u64]) -> Result<usize, DomainError> {
-        Ok(self.settle_with(&OwnerHoldings::default(), bytes, true)?.places)
+        Ok(self.settle_with(&OwnerHoldings::default(), bytes, true)?.0.places)
     }
 
     /// [`Self::settle_memory`] with a group's places offered at the class
-    /// bytes `bytes`, for the group opening where `group`.
-    fn settle_with(&mut self, owner: &OwnerHoldings, bytes: &[u64], group: bool) -> Result<ServingSettlement, DomainError> {
+    /// bytes `bytes`, for the group opening where `group`; with how far each
+    /// store's room may move before it would settle differently
+    /// ([`SettleStands`]).
+    fn settle_with(&mut self, owner: &OwnerHoldings, bytes: &[u64], group: bool) -> Result<(ServingSettlement, StoreMoves), DomainError> {
         let held = self.resources.group_places().get();
         // Before the load is priced every holding's worth is unknown, which
         // is no low worth: a settle then moves nothing.
         let Some(rates) = self.serving_rates()? else {
-            return Ok(ServingSettlement { places: held, ..ServingSettlement::default() });
+            return Ok((ServingSettlement { places: held, ..ServingSettlement::default() }, Vec::new()));
         };
         let horizon = match group && rates.requests_per_s > 0. {
             true => WORKLOAD_SPAN.min(Duration::from_secs_f64(1. / rates.requests_per_s)),
@@ -559,6 +650,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let bank = self.bank_heap(rates.decode_steps_per_s, reach)?;
         let mut settlement = ServingSettlement { places: held, ..ServingSettlement::default() };
+        let mut moves = Vec::new();
         for (store, tiers, supply) in supplies {
             let mut heap: Vec<Curve<Holding>> =
                 bank.iter().filter(|(curve, _)| tiers.contains(&curve.kind)).map(|(_, heap)| heap.clone()).collect();
@@ -566,6 +658,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 heap.extend(device_curves.iter().cloned());
             }
             let settled = value::settle(&heap, supply);
+            let steps = |of: &[(Holding, usize)], holding: &Holding| of.iter().find(|(by, _)| by == holding).map_or(0, |&(_, steps)| steps);
+            let least = |next: &dyn Fn(&Curve<Holding>) -> Option<u64>| heap.iter().filter_map(next).min();
+            moves.push((
+                store,
+                least(&|curve| curve.offered.get(steps(&settled.granted, &curve.holding)).map(|step| step.bytes)),
+                least(&|curve| curve.held.get(steps(&settled.released, &curve.holding)).map(|step| step.bytes)),
+            ));
             let curve = |holding: &BankHolding| bank.iter().find(|(curve, _)| curve.holding == *holding);
             for (holding, steps) in &settled.released {
                 match holding {
@@ -608,7 +707,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         settlement.grants.sort_by(|a, b| b.per_byte.total_cmp(&a.per_byte));
         settlement.releases.sort_by(|a, b| a.per_byte.total_cmp(&b.per_byte));
-        Ok(settlement)
+        Ok((settlement, moves))
     }
 
     /// The lowest rate per byte the bank holds at the load's serving rates:
@@ -814,6 +913,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub(crate) fn grow_settled(&mut self, wake: crate::CompletionWake) -> Result<BankStep, DomainError> {
         self.probe_memory()?;
         let settled = self.settle_memory(&OwnerHoldings::default())?;
+        // A test's step stands alone: the next settles afresh.
+        self.settle_again();
         match settled.grants.first() {
             Some(grant) => self.grow_expert_bank(&grant.clone(), wake),
             None => Ok(BankStep::AtLimit),

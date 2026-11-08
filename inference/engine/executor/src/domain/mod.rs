@@ -58,7 +58,7 @@ pub use family::{
     NativeFamily,
     ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, ShrinkCause, TierFill, TrafficHold, Trip,
 };
-pub use heap::{ClaimRefusal, DeviceHeap, Reclaimed, StatusReading, require_normal};
+pub use heap::{ClaimRefusal, DeviceHeap, MachineReading, Published, Reclaimed, StatusReading, require_normal};
 pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };
@@ -677,10 +677,23 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// owner takes it ([`Self::take_running_release`]): the storage it
     /// resizes and what the process held as it was decided.
     running_release: Option<(crate::planning::BankTier, MemoryMoment)>,
-    /// A prompt group's places' seconds as last priced
+    /// One prompt group's seconds by size as last priced
     /// (`serving_heap::PlacesPrompt`); cleared as the load's measures
     /// change.
     places_prompt: RefCell<Option<serving_heap::PlacesPrompt>>,
+    /// The outcome of the newest periodic reading observed that the owner
+    /// has not taken yet ([`Self::take_published_memory`]): one observed
+    /// between a chain's submissions is the owner's reading too.
+    unseen_reading: RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
+    /// The last serving settle's inputs and the room it stands in
+    /// (`serving_heap::SettleStands`); none before one, after a decision the
+    /// owner could not carry out, or as the load's measures change.
+    settled: Option<serving_heap::SettleStands>,
+    /// Requests served so far (`served_request`): an input of the settle.
+    requests: u64,
+    /// The serving settles run: a test's count of them.
+    #[cfg(test)]
+    settles: std::cell::Cell<u64>,
 }
 
 impl<F: ProgramFamily> Drop for ExecutorDomain<F> {
@@ -890,6 +903,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         tracing::info!(costs = measures.costs.as_ref().err().map_or("measured", String::as_str), "the load is priced");
         self.measures = Some(measures);
         *self.places_prompt.get_mut() = None;
+        self.settled = None;
         Ok(())
     }
 
@@ -1040,6 +1054,8 @@ struct MemoryProbe<'d> {
     domain: &'d ResourceDomain,
     memory: &'d RefCell<DeviceHeap>,
     pace: &'d RefCell<MemoryPace>,
+    /// [`ExecutorDomain::unseen_reading`].
+    unseen: &'d RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
     bank_claim: Option<&'d GrowthClaim>,
     resizing: bool,
     /// [`ExecutorDomain::planned_unheld`], read when the probe was taken.
@@ -1052,11 +1068,12 @@ impl<'d> MemoryProbe<'d> {
         domain: &'d ResourceDomain,
         memory: &'d RefCell<DeviceHeap>,
         pace: &'d RefCell<MemoryPace>,
+        unseen: &'d RefCell<Option<Result<Vec<DomainReading>, DomainError>>>,
         bank_claim: Option<&'d GrowthClaim>,
         held: &ResizeHeld,
         planned: u64,
     ) -> Self {
-        Self { domain, memory, pace, bank_claim, resizing: held.runs(), planned }
+        Self { domain, memory, pace, unseen, bank_claim, resizing: held.runs(), planned }
     }
 
     /// [`ExecutorDomain::observe_memory`], beside `bank`.
@@ -1095,12 +1112,36 @@ impl<'d> MemoryProbe<'d> {
         Ok(())
     }
 
-    /// [`ExecutorDomain::probe_memory`], beside `bank`: the readings the
-    /// memory pace is measured from, taken while no bank resize runs are
-    /// settled ones.
+    /// [`ExecutorDomain::probe_memory`], beside `bank`: a reading taken now.
     fn probe(&self, bank: Option<&dyn ElasticBank>) -> Result<(), DomainError> {
         let readings = self.observe(bank)?;
-        let host = self.host_witness(&readings);
+        self.observed(bank, readings, || self.memory.borrow().footprint(), Instant::now())
+    }
+
+    /// [`Self::probe`] of the periodic reading published since the last
+    /// (`DeviceHeap::refresh_published`), read off this thread, its outcome
+    /// held for the owner until it takes it
+    /// ([`ExecutorDomain::take_published_memory`]): none where none was
+    /// published since.
+    fn probe_published(&self, bank: Option<&dyn ElasticBank>) -> Option<Result<(), DomainError>> {
+        let _rises = bank.map(|bank| bank.hold_rises());
+        let (readings, footprint, at) = self.memory.borrow_mut().refresh_published(self.planned)?;
+        let observed = readings
+            .map_err(|error| DomainError::Blind(error.to_string()))
+            .and_then(|readings| {
+                self.settle_growth_claim(bank)?;
+                self.observed(bank, readings.clone(), || footprint, at).map(|()| readings)
+            });
+        let outcome = observed.as_ref().map(drop).map_err(Clone::clone);
+        *self.unseen.borrow_mut() = Some(observed);
+        Some(outcome)
+    }
+
+    /// The readings `readings` taken at `at`, the process's footprint then
+    /// `footprint`: the memory pace is measured from them, those taken while
+    /// no bank resize runs settled ones.
+    fn observed(&self, bank: Option<&dyn ElasticBank>, readings: Vec<DomainReading>, footprint: impl FnOnce() -> Option<u64>, at: Instant) -> Result<(), DomainError> {
+        let host = self.host_witness(&readings, footprint);
         let releasable = bank.map(releasable).transpose()?.unwrap_or_default();
         let release = self.memory.borrow().release_rate();
         self.pace.borrow_mut().observe(
@@ -1110,7 +1151,7 @@ impl<'d> MemoryProbe<'d> {
             !self.resizing,
             releasable,
             release,
-            Instant::now(),
+            at,
         );
         // Every fit from the next reading on holds the line at the motion
         // and release latency measured now.
@@ -1138,14 +1179,14 @@ impl<'d> MemoryProbe<'d> {
     /// pages of the process, so its footprint (`seismic::ProcessMemory`), which the
     /// system frees as they leave it (a GB10's fell by each bank slot within
     /// its release). None where the system reports neither.
-    fn host_witness(&self, readings: &[DomainReading]) -> Option<u64> {
+    fn host_witness(&self, readings: &[DomainReading], footprint: impl FnOnce() -> Option<u64>) -> Option<u64> {
         match self.domain.device().backend() {
             seismic::BackendName::Metal => readings
                 .iter()
                 .find(|reading| reading.identity == seismic::StoreIdentity::HostRam)
                 .and_then(|reading| reading.held)
                 .map(|held| held.wired_bytes),
-            _ => self.memory.borrow().footprint(),
+            _ => footprint(),
         }
     }
 
@@ -1187,24 +1228,21 @@ impl<'d> MemoryProbe<'d> {
     }
 
     /// What the expert bank's storage is short of now, read between a
-    /// chain's submissions (`ExpertBank::release_running`): a probe as the
-    /// owner's ([`ExecutorDomain::probe_memory`]) at most every reading
-    /// interval, and the shortfall it leaves the bank's store
+    /// chain's submissions (`ExpertBank::release_running`): the periodic
+    /// reading published since the last ([`Self::probe_published`]), taken
+    /// without waiting, and the shortfall it leaves the bank's store
     /// ([`Self::shortfall`]: the level's, or the borrowed room the bank owes
     /// back on displacement now or for the load's claims), with what the
     /// process held then. None
     /// while a bank resize runs (its advance is a boundary's, and the bank
-    /// begins no cut beside it), between readings, where the reading is
+    /// begins no cut beside it), with no reading published since, where it is
     /// blind (the heap holds it so, and the owner's next probe reads again),
     /// or where nothing is short.
     fn running_pressure(&self, bank: &dyn ElasticBank) -> Option<RunningPressure> {
         if self.resizing {
             return None;
         }
-        if !self.pace.borrow().due(Instant::now()) {
-            return None;
-        }
-        if let Err(DomainError::Blind(_)) = self.probe(Some(bank)) {
+        if let None | Some(Err(DomainError::Blind(_))) = self.probe_published(Some(bank)) {
             return None;
         }
         let kind = bank.holding_storage(BankHolding::Experts).expect("an expert bank holds its experts");
@@ -1568,11 +1606,6 @@ impl MemoryPace {
         }
     }
 
-    /// Whether memory is due a reading at `now`: a reading interval since
-    /// the last, or none read yet.
-    fn due(&self, now: Instant) -> bool {
-        self.read.is_none_or(|read| now.duration_since(read) >= READING_INTERVAL)
-    }
 
     /// Fold in a probe of every domain, the process charging each store as
     /// `charges` say and host RAM's witness of what it holds resident
@@ -1982,6 +2015,17 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
     }
 
+    /// The owner's periodic observation: the newest reading published off
+    /// its thread observed (`MemoryProbe::probe_published`) where one was
+    /// since, and the outcome of the newest one observed, here or between a
+    /// chain's submissions, that it has not taken yet; none where there is
+    /// none: its readings where it is in no Reclaim band. It waits for no
+    /// reading.
+    pub fn take_published_memory(&mut self) -> Option<Result<Vec<DomainReading>, DomainError>> {
+        self.memory_probe().probe_published(self.family.expert_bank());
+        self.unseen_reading.get_mut().take()
+    }
+
     /// Observe every domain the device uses from a reading taken now, set
     /// Seismic's allocation ceiling from the readings, and refresh the
     /// heap's view of the charge ([`Self::refresh_memory`]): a memory
@@ -2005,7 +2049,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// What reads memory for the domain ([`MemoryProbe`]).
     fn memory_probe(&self) -> MemoryProbe<'_> {
-        MemoryProbe::of(&self.domain, &self.memory, &self.pace, self.bank_claim.as_ref(), &self.resize_held, self.planned_unheld())
+        MemoryProbe::of(&self.domain, &self.memory, &self.pace, &self.unseen_reading, self.bank_claim.as_ref(), &self.resize_held, self.planned_unheld())
     }
 
     /// Submit a chain of target launches and its spare output slot
@@ -2023,7 +2067,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // The family is lent to the chain, so the probe borrows the rest,
         // the plan's unheld holdings read before it is.
         let planned = self.planned_unheld();
-        let probe = MemoryProbe::of(&self.domain, &self.memory, &self.pace, self.bank_claim.as_ref(), &self.resize_held, planned);
+        let probe = MemoryProbe::of(&self.domain, &self.memory, &self.pace, &self.unseen_reading, self.bank_claim.as_ref(), &self.resize_held, planned);
         let submitted = self.family.submit_target(chain, spare, &|bank| probe.running_pressure(bank));
         self.note_running_cut();
         submitted
@@ -2871,6 +2915,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             refreshes: std::cell::Cell::new(0),
             running_release: None,
             places_prompt: RefCell::new(None),
+            unseen_reading: RefCell::new(None),
+            settled: None,
+            requests: 0,
+            #[cfg(test)]
+            settles: std::cell::Cell::new(0),
         };
         let mut domain = domain;
         domain.class_reserve = domain.planned_class_reserve();

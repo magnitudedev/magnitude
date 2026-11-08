@@ -71,8 +71,8 @@ planning line `P` the host may take what lies above the emergency reserve `E` at
 the fastest rate `r` the memory probes measured it taking
 (`MemoryPace::wait_bound`).
 
-A prompt group's chain is encoded at the device's pace, and memory is read between
-its submissions at the probes' interval (`ExecutorDomain::submit_chain`). Where the
+A prompt group's chain is encoded at the device's pace, and between its submissions
+it takes the periodic reading published since the last (`ExecutorDomain::submit_chain`). Where the
 expert bank lies in the one store (unified memory) and that reading is short, the
 store is cut beside the running chain (`ExpertBank::release_running`): the watcher
 drops the records past the cut, moving nothing, and unmaps their experts from the
@@ -153,9 +153,16 @@ changed. Indivisible input spans retain their [boundary semantics](inputs.md).
 Numerical storage for fresh requests is allocated during negotiated preparation,
 not unconditionally during logical admission. Capacity facts come from the shared
 runtime resource domain, including retained model weights, state, and scratch.
-The memory stores are read fresh only by the owner's memory probes, a deficit's
-retry and claims; between them the heap follows the process's own charge in
-Seismic's ledgers, so a step reads nothing of the OS. Every host-RAM question reads one
+The memory stores are read periodically on a thread of their own, every reading
+interval, each reading published for the owner to take without waiting
+(`MachineReading`); fresh where they are read only by claims, an admission and the
+release ladder. Between readings the heap follows the process's own charge in
+Seismic's ledgers, so a step reads nothing of the OS and waits on no reading. A
+reading settles the serving heap only where it moved the settle's inputs: its
+holdings, a request's arrival or end, the load's measures, and each store's room by
+a step the settle could take (`SettleStands`). The serving rates' and the decode
+price's drift between them moves no step. A settle prices the bank's steps on the
+decode model, which is no step's work, so none runs where nothing moved. Every host-RAM question reads one
 measure, what the OS gives without compressing or swapping another program's data
 (free, file-backed and purgeable pages): a load's admission, its band, its deficits and
 its claims (`HostRoom::Load`). So another program's ask that takes it to the planning line

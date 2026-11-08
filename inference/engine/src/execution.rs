@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use magnitude_artifacts::{ArtifactIdentity, Package, PackageIdentity};
 use magnitude_batching::Demand;
 use magnitude_executor::{
-    AttestedPrograms, ClaimRefusal, ComponentLoader, DEFAULT_KERNEL_CACHE_BYTES, DeviceHeap,
+    AttestedPrograms, ClaimRefusal, ComponentLoader, DEFAULT_KERNEL_CACHE_BYTES, DeviceHeap, MachineReading,
     ExecutionPlanDraft, ExecutorDomain, KernelCache, Operation, RequestId, ReservedResources,
     ResidencyError, ResidencyStore, ResourceAllocator, ResourceCapacity, ResourceDomainId,
     CatalogError, CatalogFailure, ResourcePlan, ResourcePlanner, SEARCH_VERSION, StateBindings,
@@ -228,7 +228,7 @@ fn plan_on_device(
     report_load_memory("device opened", &catalog, opened.device());
     let numerical_profile = numerical_profile(manifest)?;
     let mut startup = StartupClaims {
-        heap: DeviceHeap::open(catalog.clone(), reserves, Rc::new(opened.device().clone()))
+        heap: DeviceHeap::open(Rc::new(MachineReading::new(catalog.clone())), reserves, Rc::new(opened.device().clone()))
             .map_err(|error| platform_error(PlatformError::Memory(error)))?,
         held: None,
     };

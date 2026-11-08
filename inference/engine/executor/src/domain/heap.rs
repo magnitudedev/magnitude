@@ -14,6 +14,8 @@ use crate::planning::BankTier;
 use seismic::{Contract, Device, Devices};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
 
 /// Why the heap refused a claim.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +162,23 @@ pub trait StatusReading {
     /// it holding there, which witnesses the releases of a device whose
     /// allocations are pages of the process (`ExecutorDomain::host_witness`).
     fn footprint(&self) -> Option<u64>;
+
+    /// The periodic reading taken since the last one this returned, without
+    /// waiting for one ([`DeviceHeap::refresh_published`]); none where none
+    /// was published since. By default it reads now: a test's readings are
+    /// taken where the test asks for them. The live machine's are read on a
+    /// thread of their own ([`MachineReading`]).
+    fn published(&self, device: &Device) -> Option<Published> {
+        Some(Published { status: self.status(device), footprint: self.footprint(), at: Instant::now() })
+    }
+}
+
+/// One periodic reading of the machine ([`StatusReading::published`]): its
+/// status, the process's footprint and when both were read.
+pub struct Published {
+    pub status: seismic::Status,
+    pub footprint: Option<u64>,
+    pub at: Instant,
 }
 
 impl StatusReading for Devices {
@@ -169,6 +188,99 @@ impl StatusReading for Devices {
 
     fn footprint(&self) -> Option<u64> {
         seismic::ProcessMemory::footprint_now()
+    }
+}
+
+/// The live machine's readings: a claim's read where it is made, as a claim
+/// is judged against the machine now, and the periodic ones on a thread of
+/// their own every [`crate::platform::READING_INTERVAL`], each published for
+/// the owner to take without waiting ([`StatusReading::published`]). A
+/// reading's system calls and driver queries never sit between a step and
+/// the next, however long either takes.
+pub struct MachineReading {
+    devices: Rc<Devices>,
+    reader: std::cell::OnceCell<Reader>,
+}
+
+impl MachineReading {
+    pub fn new(devices: Rc<Devices>) -> Self {
+        Self { devices, reader: std::cell::OnceCell::new() }
+    }
+}
+
+impl StatusReading for MachineReading {
+    fn status(&self, device: &Device) -> seismic::Status {
+        StatusReading::status(&*self.devices, device)
+    }
+
+    fn footprint(&self) -> Option<u64> {
+        seismic::ProcessMemory::footprint_now()
+    }
+
+    /// The reader starts at the first ask, which therefore finds none yet.
+    fn published(&self, device: &Device) -> Option<Published> {
+        let reader = self.reader.get_or_init(|| {
+            let devices = Devices::new(self.devices.inventory().clone());
+            Reader::start(devices, device.topology().clone(), device.info().id())
+        });
+        reader.shared.lock().latest.take()
+    }
+}
+
+/// The thread [`MachineReading`] reads on, stopped and joined as it drops.
+struct Reader {
+    shared: Arc<ReaderShared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct ReaderShared {
+    state: Mutex<ReaderState>,
+    stop: Condvar,
+}
+
+struct ReaderState {
+    /// The newest reading not yet taken: an older one untaken is replaced.
+    latest: Option<Published>,
+    stopped: bool,
+}
+
+impl ReaderShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReaderState> {
+        self.state.lock().expect("the machine reader's state lock is never poisoned")
+    }
+}
+
+impl Reader {
+    fn start(devices: Devices, topology: Arc<seismic::DeviceTopology>, executor: seismic::ExecutorId) -> Self {
+        let shared = Arc::new(ReaderShared { state: Mutex::new(ReaderState { latest: None, stopped: false }), stop: Condvar::new() });
+        let reading = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("magnitude-memory".into())
+            .spawn(move || loop {
+                let status = devices.status(&topology, executor);
+                let footprint = seismic::ProcessMemory::footprint_now();
+                let mut state = reading.lock();
+                state.latest = Some(Published { status, footprint, at: Instant::now() });
+                let (state, _) = reading
+                    .stop
+                    .wait_timeout_while(state, crate::platform::READING_INTERVAL, |state| !state.stopped)
+                    .expect("the machine reader's state lock is never poisoned");
+                if state.stopped {
+                    return;
+                }
+            })
+            .expect("invariant violated: the memory reading thread could not start");
+        Self { shared, thread: Some(thread) }
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        self.shared.lock().stopped = true;
+        self.shared.stop.notify_all();
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("the memory reading thread does not panic");
+        }
     }
 }
 
@@ -356,6 +468,14 @@ impl DeviceHeap {
     pub fn refresh(&mut self, planned: u64) -> Result<Vec<DomainReading>, MemoryPolicyError> {
         let status = self.reading.status(&self.device);
         self.observe(&status, planned)
+    }
+
+    /// [`Self::refresh`] from the periodic reading published since the last
+    /// ([`StatusReading::published`]), with the footprint and time it was
+    /// read; none, refreshing nothing, where none was published since.
+    pub fn refresh_published(&mut self, planned: u64) -> Option<(Result<Vec<DomainReading>, MemoryPolicyError>, Option<u64>, Instant)> {
+        let Published { status, footprint, at } = self.reading.published(&self.device)?;
+        Some((self.observe(&status, planned), footprint, at))
     }
 
     /// [`Self::refresh`] from the status sample `status`, Seismic's bound

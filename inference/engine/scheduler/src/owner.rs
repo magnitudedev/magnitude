@@ -1789,22 +1789,34 @@ trait MemoryStep: MemoryHost + Sized {
     fn observe_memory(&mut self, bindings: Option<&mut StateBindings>) -> Result<bool, RequestError> {
         let memory = |error: String| invariant("memory observation")(error);
         let now = self.now();
-        if now >= self.memory().next_observation {
+        // A reading is taken off this thread and published
+        // (`ExecutorDomain::take_published_memory`): one is looked for once
+        // an interval has passed, and none waited for, so no reading sits
+        // between a step and the next however long either takes.
+        let published = match now >= self.memory().next_observation {
+            true => {
+                self.memory().next_observation = now.saturating_add(OBSERVATION_INTERVAL_NS);
+                self.domain().take_published_memory()
+            }
+            false => None,
+        };
+        if let Some(published) = published {
             let resizing = self.memory().resizing();
             self.memory().room_owed.probed(resizing);
-            self.memory().next_observation = now.saturating_add(OBSERVATION_INTERVAL_NS);
-            let observation = memory_observation(self.domain().probe_memory()).map_err(memory)?;
+            let readings = published.as_ref().ok().cloned();
+            let observation = memory_observation(published.map(drop)).map_err(memory)?;
             let next = self.memory().condition.observe(observation, now);
             self.enter_memory_condition(next);
-            // Each reading settles the heap afresh: its supply holds the
+            // Each reading may settle the heap afresh: its supply holds the
             // reserve derived from the host's measured motion, so what it
-            // grants is room no wait would make safer.
+            // grants is room no wait would make safer. The settle runs only
+            // where the reading moved its inputs (`ExecutorDomain::settle_memory`).
             self.memory().settle_owed = observation == MemoryObservation::Normal;
             if !matches!(self.memory().condition, MemoryCondition::Reclaim { .. }) {
                 self.memory().ladder.owed = false;
                 self.memory().ladder.covered = false;
-                if observation == MemoryObservation::Normal {
-                    self.reopen_memory_deficits().map_err(memory)?;
+                if let (MemoryObservation::Normal, Some(readings)) = (observation, readings) {
+                    self.reopen_memory_deficits(&readings);
                 }
             } else if observation == MemoryObservation::Reclaim {
                 // Releases are measured against a fresh reading; a Blind
@@ -1945,17 +1957,10 @@ trait MemoryStep: MemoryHost + Sized {
     /// A request blocked on a memory deficit waits for an availability
     /// change. Memory another process frees is one: advance the epoch once a
     /// deficit's domain ceiling covers it, so blocked work retries.
-    fn reopen_memory_deficits(&mut self) -> Result<(), String> {
+    fn reopen_memory_deficits(&mut self, readings: &[magnitude_executor::platform::DomainReading]) {
         if self.memory().deficits.is_empty() {
-            return Ok(());
+            return;
         }
-        let readings = match self.domain().observe_memory() {
-            Ok(readings) => readings,
-            // A failed reading says nothing about the deficit; the next
-            // periodic observation looks again.
-            Err(DomainError::Blind(_)) => return Ok(()),
-            Err(error) => return Err(error.to_string()),
-        };
         let deficits = &mut self.memory().deficits;
         let before = deficits.len();
         deficits.retain(|deficit| {
@@ -1966,7 +1971,6 @@ trait MemoryStep: MemoryHost + Sized {
         if deficits.len() != before {
             self.advance_epoch();
         }
-        Ok(())
     }
 
     /// Settle the memory heap (`ExecutorDomain::settle_memory`) on
@@ -2010,6 +2014,9 @@ trait MemoryStep: MemoryHost + Sized {
             // is settled again at the next reading.
             let step = self.domain().shrink_expert_bank_to(bindings, holding, to, wake).map_err(classify_domain_error)?;
             tracing::info!(?holding, to, per_byte, ?step, "expert bank release settled");
+            if matches!(step, BankStep::Deferred | BankStep::Running) {
+                self.domain().settle_again();
+            }
             // A holding worth more per byte won the bank's memory.
             if let BankStep::Begun(tier) = step {
                 let begun = BankBegun { held: before, cause: BankBegunFor::Shrink(ShrinkCause::Rebalance) };

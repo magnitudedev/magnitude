@@ -64,7 +64,7 @@ pub use device_resources::{
     ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, ClaimRefusal, BankCurve, Reach, BankGrant, BankRelease, OwnerHoldings, ServingSettlement, SizeStep, TableResidency, DeviceHeap, DomainError, Reclaimed, DomainRequirements, DomainReservation, ExecutorDomain,
+    MEMORY_TRACE, BankHolding, BankResize, BankResized, BankStep, ClaimRefusal, BankCurve, Reach, BankGrant, BankRelease, OwnerHoldings, ServingSettlement, SizeStep, TableResidency, DeviceHeap, MachineReading, DomainError, Reclaimed, DomainRequirements, DomainReservation, ExecutorDomain,
     ExpertMeasures, LoadCosts, LoadMeasures, ExpertResidency, ExpertResizes, HeldBy, HostResidency, ThreadHeld, OptionalComponent, ShrinkCause, TierFill, DecodeStep,
     HeadFlight, LaunchDuration, MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, NativeFamily, OpenRequirements,
     PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,

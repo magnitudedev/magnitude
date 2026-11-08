@@ -838,8 +838,17 @@ fn a_refused_tier_copy_changes_neither_its_grid_nor_its_price() {
 
 /// The storage kinds the heap's settle grows (`settle_memory`) at a fresh
 /// probe, as the owner settles, the most valuable per byte first, with
-/// nothing of an owner's; none before the bank is priced.
+/// nothing of an owner's; none before the bank is priced. Nothing carries
+/// the decision out, so the next settles afresh (`settle_again`).
 fn paying(domain: &mut ExecutorDomain<TestFamily>) -> Vec<crate::planning::BankTier> {
+    let kinds = settled_kinds(domain);
+    domain.settle_again();
+    kinds
+}
+
+/// [`paying`], its decision standing: a settle on the same inputs settles
+/// nothing.
+fn settled_kinds(domain: &mut ExecutorDomain<TestFamily>) -> Vec<crate::planning::BankTier> {
     domain.probe_memory().unwrap();
     let settled = domain.settle_memory(&crate::OwnerHoldings::default()).unwrap();
     let mut kinds = Vec::new();
@@ -1074,6 +1083,36 @@ fn finish(domain: &mut ExecutorDomain<TestFamily>) -> crate::BankResized {
         if let Some((finished, _)) = domain.advance_expert_bank(unwatched()).unwrap() {
             return finished;
         }
+    }
+}
+
+/// A settle runs only where its inputs moved (`SettleStands`): a reading
+/// that moved no holding, no request and no room past a step decides
+/// nothing anew, so it settles nothing however often readings come. Run at
+/// every reading, a settle took a resident Qwen3.6 q4 4k decode on an RTX
+/// 3090 from about 10 ms a step to 108 ms: each step outlasted the reading
+/// interval, so every step read memory and settled. A request's arrival and
+/// new measures settle again, as does a decision the owner could not carry
+/// out (`settle_again`).
+#[test]
+fn a_settle_runs_only_where_its_inputs_moved() {
+    for backend in bank_backends() {
+        let (mut domain, mut bindings) = banked(backend, 4, 1);
+        price_growth(&mut domain, &mut bindings, misses_at(2, 100));
+        let settles = domain.settles.get();
+        assert!(settled_kinds(&mut domain).contains(&crate::planning::BankTier::Bank), "{backend:?}: the first settle grants the bank's step");
+        assert_eq!(domain.settles.get(), settles + 1);
+        for _ in 0..3 {
+            assert!(settled_kinds(&mut domain).is_empty(), "{backend:?}: an unmoved reading settles nothing");
+        }
+        assert_eq!(domain.settles.get(), settles + 1, "{backend:?}: nor runs the settle");
+        domain.settle_again();
+        assert!(settled_kinds(&mut domain).contains(&crate::planning::BankTier::Bank), "{backend:?}: a decision not carried out is settled again");
+        domain.served_request(false);
+        assert!(settled_kinds(&mut domain).contains(&crate::planning::BankTier::Bank), "{backend:?}: a request's arrival settles again");
+        measure_load(&mut domain, &mut bindings);
+        assert!(settled_kinds(&mut domain).contains(&crate::planning::BankTier::Bank), "{backend:?}: new measures settle again");
+        assert_eq!(domain.settles.get(), settles + 4);
     }
 }
 
@@ -1867,21 +1906,6 @@ fn the_shrink_horizon_runs_from_a_decision_to_the_next_effect() {
     assert_eq!(pace.motions().release, Some(crate::platform::ReleaseRate::new(GB as f64 / 0.15)));
     pace.released(GB, &times(300, 400));
     assert_eq!(pace.motions().release, Some(crate::platform::ReleaseRate::new(GB as f64 / 0.15)));
-}
-
-/// A chain's encoding reads memory between its submissions at most every
-/// reading interval, as the owner probes it (`MemoryProbe::running_pressure`):
-/// due before any reading, then once the interval since the last has passed,
-/// whoever read it.
-#[test]
-fn memory_is_due_a_reading_once_an_interval_has_passed() {
-    let store = seismic::Devices::discover(&[]).unwrap().topology().host_ram().id();
-    let mut pace = MemoryPace::new();
-    assert!(pace.due(Instant::now()), "before any reading");
-    read_pace(&mut pace, store, 7 * PACE_GB, 20 * PACE_GB, 20 * PACE_GB);
-    let read = pace.read.expect("a reading is timed");
-    assert!(!pace.due(read + Duration::from_millis(99)));
-    assert!(pace.due(read + READING_INTERVAL));
 }
 
 /// The wait bound is what the host may take from the planning line to the
