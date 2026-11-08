@@ -217,7 +217,6 @@ struct Record {
     timing_phase: TimingPhase,
     error: Option<RequestError>,
     preemption_debt: u32,
-    protected_until: Option<usize>,
     /// Whether the request resumes from and contributes to the prefix cache.
     prefix_cache: bool,
     /// The cached prefix the request's residency forked, protected while
@@ -306,6 +305,41 @@ enum Wait {
     },
     /// Blind or Reclaim.
     Memory,
+    /// Preempted for another request's state. The request replays only
+    /// once a request has retired, or none holds state: every other release
+    /// is a peer's preemption, and replaying then would retake the state
+    /// that preemption released.
+    Retirement { at: AvailabilityEpoch },
+}
+
+/// What a waiting request's wait is measured against.
+#[derive(Clone, Copy)]
+struct Availability {
+    epoch: AvailabilityEpoch,
+    retirements: AvailabilityEpoch,
+    memory_normal: bool,
+    resident: bool,
+}
+
+impl Wait {
+    fn ended(self, availability: Availability) -> bool {
+        match self {
+            Self::Capacity { at, .. } => availability.epoch.changed_since(at),
+            Self::Memory => availability.memory_normal,
+            Self::Retirement { at } => {
+                availability.retirements.changed_since(at) || !availability.resident
+            }
+        }
+    }
+}
+
+/// Why live requests are preempted, which decides when they replay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Preemption {
+    /// For another request's state: the victim waits for a retirement.
+    Capacity,
+    /// In the Reclaim band: the victim replays once the band is Normal.
+    Reclaim,
 }
 
 enum Stage {
@@ -728,6 +762,7 @@ struct Service<F: ProgramFamily> {
     /// Requests outside the pipeline.
     requests: BTreeMap<RequestId, Request>,
     epoch: AvailabilityEpoch,
+    retirements: AvailabilityEpoch,
     next_id: u64,
     now: u64,
     prefix_cache: PrefixCache<ResumeState>,
@@ -776,6 +811,7 @@ impl<F: ProgramFamily> Owner<F> {
                 scheduler: Scheduler::new(limits)?,
                 requests: BTreeMap::new(),
                 epoch: AvailabilityEpoch::default(),
+                retirements: AvailabilityEpoch::default(),
                 next_id: 1,
                 now: 0,
                 prefix_cache: PrefixCache::new(capacity),
@@ -1052,7 +1088,6 @@ impl<F: ProgramFamily> Service<F> {
                     timing_phase: TimingPhase::Prompt,
                     error: None,
                     preemption_debt: 0,
-                    protected_until: None,
                     prefix_cache,
                     prefix_source: None,
                     prefill_retained: false,
@@ -1208,7 +1243,7 @@ impl<F: ProgramFamily> Service<F> {
                     available,
                 };
             }
-            Some(Wait::Memory) => return Status::Preempted,
+            Some(Wait::Memory | Wait::Retirement { .. }) => return Status::Preempted,
             None => {}
         }
         match &request.state {
@@ -1582,7 +1617,7 @@ impl<F: ProgramFamily> Service<F> {
                 != 0;
         }
         while self.reclaim_needed()? {
-            if !self.evict_victims(&[], false)? {
+            if !self.evict_victims(&[], false, Preemption::Reclaim)? {
                 break;
             }
             self.release_surplus(bindings)?;
@@ -1675,12 +1710,16 @@ impl<F: ProgramFamily> Service<F> {
     /// start out of the map.
     fn candidates(&mut self) -> BTreeMap<RequestId, (Record, Candidate)> {
         let memory_normal = self.memory_condition == MemoryCondition::Normal;
-        let epoch = self.epoch;
-        let ended_wait = |wait: Option<Wait>| match wait {
-            Some(Wait::Capacity { at, .. }) => epoch.changed_since(at),
-            Some(Wait::Memory) => memory_normal,
-            None => true,
+        let availability = Availability {
+            epoch: self.epoch,
+            retirements: self.retirements,
+            memory_normal,
+            resident: self
+                .requests
+                .values()
+                .any(|request| request.state.generation().is_resident()),
         };
+        let ended_wait = |wait: Option<Wait>| wait.is_none_or(|wait| wait.ended(availability));
         let awaiting = self
             .requests
             .iter()
@@ -2187,7 +2226,7 @@ impl<F: ProgramFamily> Service<F> {
         }
         while matches!(current, Err(DomainError::Capacity(_))) {
             if !self
-                .evict_victims(&[], true)
+                .evict_victims(&[], true, Preemption::Capacity)
                 .map_err(|error| release("preemption")(error.to_string()))?
             {
                 break;
@@ -2433,7 +2472,7 @@ impl<F: ProgramFamily> Service<F> {
                 Err(whole) => whole,
             };
             let selected = round.members.keys().copied().collect::<Vec<_>>();
-            while short(&current) && self.evict_victims(&selected, false)? {
+            while short(&current) && self.evict_victims(&selected, false, Preemption::Capacity)? {
                 self.domain
                     .shrink_state(bindings, ShrinkPolicy::Reclaim)
                     .map_err(classify_domain_error)?;
@@ -2806,21 +2845,15 @@ impl<F: ProgramFamily> Service<F> {
         let mut members = members;
         for (index, request) in selection.requests().iter().enumerate() {
             let share = base + u64::from((index as u64) < remainder);
-            let (record, generation) = match members.get_mut(request) {
-                Some(member) => (&mut member.record, member.state.generation()),
+            let record = match members.get_mut(request) {
+                Some(member) => &mut member.record,
                 None => match self.requests.get_mut(request) {
-                    Some(request) => (&mut request.record, request.state.generation()),
+                    Some(request) => &mut request.record,
                     None => continue,
                 },
             };
             record.service_ns = record.service_ns.saturating_add(share);
             record.waiting_since = self.now;
-            if record
-                .protected_until
-                .is_some_and(|boundary| generation.resident_position() > boundary)
-            {
-                record.protected_until = None;
-            }
         }
         self.scheduler.completed(selection, elapsed);
         let ids = members.keys().copied().collect::<Vec<_>>();
@@ -3117,24 +3150,28 @@ impl<F: ProgramFamily> Service<F> {
         self.domain.close(id).map_err(invariant("request retirement"))?;
         self.requests.remove(&id);
         self.epoch.advance();
+        self.retirements.advance();
         Ok(())
     }
 
+    /// Preempt the cheapest set of live requests outside `selected` that
+    /// releases state. A victim never holds work on the device, so it loses
+    /// only rows it replays.
     fn evict_victims(
         &mut self,
         selected: &[RequestId],
         release_resident_slot: bool,
+        cause: Preemption,
     ) -> Result<bool, RequestError> {
+        let wait = (cause == Preemption::Capacity).then_some(Wait::Retirement {
+            at: self.retirements,
+        });
         let mut victims = Vec::new();
         for (&id, request) in &self.requests {
             let Some((generation, output_blocked)) = request.state.preemptible() else {
                 continue;
             };
-            if selected.contains(&id)
-                || !generation.is_resident()
-                || generation.finish_reason().is_some()
-                || request.record.protected_until.is_some()
-            {
+            if selected.contains(&id) || !generation.is_resident() || generation.finish_reason().is_some() {
                 continue;
             }
             let executor_bytes = self
@@ -3178,13 +3215,12 @@ impl<F: ProgramFamily> Service<F> {
             for id in set {
                 let Request { mut record, state } = self.requests.remove(&id).expect("victim");
                 let generation = state.evicted().map_err(invariant("preemption"))?;
-                record.protected_until = Some(generation.accepted_position());
                 record.preemption_debt = record.preemption_debt.saturating_add(1);
                 self.requests.insert(
                     id,
                     Request {
                         record,
-                        state: State::Between(generation, Stage::NonResident(None)),
+                        state: State::Between(generation, Stage::NonResident(wait)),
                     },
                 );
             }
@@ -3454,7 +3490,7 @@ mod timing_tests {
         let record = || Record {
             waiting_since: 0, service_ns: 0, physical_timings: PhysicalTimings::default(),
             timing_phase: TimingPhase::Prompt, error: None, preemption_debt: 0,
-            protected_until: None, prefix_cache: true, prefix_source: None,
+            prefix_cache: true, prefix_source: None,
             prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
             publication: None, publication_batch_limit: 4, pending_publication: None,
             publication_permits: VecDeque::new(),
@@ -3503,7 +3539,7 @@ mod timing_tests {
         let mut record = Record {
             waiting_since: 0, service_ns: 0, physical_timings: PhysicalTimings::default(),
             timing_phase: TimingPhase::Prompt, error: None, preemption_debt: 0,
-            protected_until: None, prefix_cache: true, prefix_source: None,
+            prefix_cache: true, prefix_source: None,
             prefill_retained: false, terminal_retained: false, branches: BTreeSet::new(),
             publication: None, publication_batch_limit: 4, pending_publication: None,
             publication_permits: VecDeque::new(),
@@ -3695,6 +3731,37 @@ mod pending_retention_tests {
         assert_eq!(blocked.preemptible().map(|(_, blocked)| blocked), Some(true));
         let nonresident = State::Between(evicted, Stage::NonResident(Some(wait)));
         assert!(nonresident.preemptible().is_none());
+    }
+
+    /// Four prompts that each need nearly the whole state budget grow
+    /// together until only one fits, preempting the others. A preempted
+    /// request must not replay on its peers' preemptions, which would retake
+    /// the state just released for the survivor and stall every request
+    /// again: it waits until a request retires, or none holds state.
+    #[test]
+    fn a_request_preempted_for_capacity_waits_for_a_retirement() {
+        let mut epoch = AvailabilityEpoch::default();
+        let mut retirements = AvailabilityEpoch::default();
+        let wait = Wait::Retirement { at: retirements };
+        let availability = |epoch, retirements, resident| Availability {
+            epoch,
+            retirements,
+            memory_normal: true,
+            resident,
+        };
+        epoch.advance();
+        assert!(!wait.ended(availability(epoch, retirements, true)), "a peer's preemption");
+        assert!(wait.ended(availability(epoch, retirements, false)), "nothing holds state");
+        retirements.advance();
+        assert!(wait.ended(availability(epoch, retirements, true)), "a request retired");
+
+        let blocked = Wait::Capacity {
+            at: AvailabilityEpoch::default(),
+            resource: ResourceKind::DeviceMemory,
+            required: 2,
+            available: 1,
+        };
+        assert!(blocked.ended(availability(epoch, AvailabilityEpoch::default(), true)));
     }
 
     #[test]

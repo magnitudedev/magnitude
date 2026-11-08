@@ -170,7 +170,7 @@ impl Scheduler {
     }
 }
 
-/// Candidate eligibility (live, resident, unsubmitted, unprotected, unselected)
+/// Candidate eligibility (live, resident, unsubmitted, unselected)
 /// belongs to the service. Byte prices come from the model for actual ownership.
 pub struct Victim {
     pub identity: RequestId,
