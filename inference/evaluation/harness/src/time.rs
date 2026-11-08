@@ -191,7 +191,7 @@ pub fn run(
                 cell["model"] = judged(model.map(|(model, _)| model))?;
                 let bar = resident_decode(time, *context, concurrency).and_then(|(_, resident, resident_ms)| {
                     let link = ceilings.as_ref().and_then(|ceilings| ceilings.link.clone());
-                    let inputs = BarInputs::of(&engine, &machine, &storage, link, options.weight_cap, &resident)?;
+                    let inputs = BarInputs::of(&engine, &machine, &storage, link, options.weight_bound, &resident)?;
                     streamed_bar(&cell, &resident, resident_ms, concurrency, &inputs, priced)
                 });
                 cell["bar"] = judged(bar)?;
@@ -1604,8 +1604,8 @@ pub struct BarInputs {
     /// The overlap efficiency `η` ([`crate::bar`]) the resident decode
     /// measured on the host ([`overlap`]), where it did.
     pub overlap: Option<f64>,
-    /// The cap the load holds to, in bytes, where one was set.
-    pub weight_cap: Option<u64>,
+    /// The bound the load holds its weights to, where one was set.
+    pub weight_bound: Option<magnitude_executor::WeightBound>,
 }
 
 impl BarInputs {
@@ -1615,7 +1615,7 @@ impl BarInputs {
         machine: &crate::machine::CpuMachine,
         storage: &Option<Result<crate::machine::StorageMachine, String>>,
         link: Option<Result<f64, String>>,
-        weight_cap: Option<u64>,
+        weight_bound: Option<magnitude_executor::WeightBound>,
         resident: &Value,
     ) -> Result<Self, Unjudged> {
         let lines = expert_lines(engine)?.to_vec();
@@ -1623,7 +1623,7 @@ impl BarInputs {
             Some(magnitude_executor::assessment::Priced::Measured(pass)) => Some((0..lines.len()).map(|layer| pass.expert(layer)).collect()),
             _ => None,
         };
-        Ok(Self { lines, experts, machine: machine.clone(), storage: storage.clone(), link, overlap: overlap_of(resident), weight_cap })
+        Ok(Self { lines, experts, machine: machine.clone(), storage: storage.clone(), link, overlap: overlap_of(resident), weight_bound })
     }
 
     /// The link's ceiling, a byte's seconds, or why it is unmeasured.
@@ -1847,7 +1847,7 @@ fn streamed_bar(
             })
             .collect()
     };
-    // The ceiling (`crate::bar`): Bélády at the most records the cap holds,
+    // The ceiling (`crate::bar`): Bélády at the most records the bound holds,
     // every read ahead, through what the misses cross.
     let group_bytes = (0..records.len())
         .map(|group| layers.iter().position(|&of| of == group).map(|layer| inputs.lines[layer].host.record_bytes).ok_or("a bank group of no layer"))
@@ -1858,8 +1858,17 @@ fn streamed_bar(
     if every_step == 0 {
         return Err(unavailable("no owner of the weights beside the bank"));
     }
-    let cap = inputs.weight_cap.unwrap_or_else(|| owned.iter().map(|(_, bytes)| bytes).sum());
-    let capacity = crate::bar::records_at_cap(&records, &group_bytes, cap.saturating_sub(every_step));
+    // The bank's records lie on the device alone, so what a host tier
+    // holds is never theirs: a cap counts the tier's bytes among its own,
+    // a device room never does, and an unbounded load's owners hold it
+    // beside the device's.
+    let tier = owned.iter().filter(|(owner, _)| owner.starts_with("host tier")).map(|(_, bytes)| bytes).sum::<u64>();
+    let device = match inputs.weight_bound {
+        Some(magnitude_executor::WeightBound::Cap(cap)) => cap.saturating_sub(tier),
+        Some(magnitude_executor::WeightBound::Room(room)) => room,
+        None => owned.iter().map(|(_, bytes)| bytes).sum::<u64>() - tier,
+    };
+    let capacity = crate::bar::records_at_cap(&records, &group_bytes, device.saturating_sub(every_step));
     let at_cap = replay_routing(&capacity, &layers, experts, &held, &reads, EvictionRecency::NextRead)?;
     let record_bytes = inputs.lines.iter().map(|lines| lines.host.record_bytes).collect::<Vec<_>>();
     let moved_byte = match unified {

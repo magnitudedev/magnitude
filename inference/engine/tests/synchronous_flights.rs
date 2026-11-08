@@ -54,7 +54,7 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,
-            weight_cap: None,
+            weight_bound: None,
         },
         context_tokens: Some(1024),
         service: limits.clone(),

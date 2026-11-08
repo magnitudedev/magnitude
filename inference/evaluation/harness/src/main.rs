@@ -335,14 +335,28 @@ struct EngineArgs {
     /// Tune the run's first load afresh, ignoring stored tuning results.
     #[arg(long)]
     fresh_tuning: bool,
-    /// A ceiling on every weight byte a load holds: past it, the routed
-    /// experts stream through an expert bank.
-    #[arg(long, value_name = "BYTES")]
+    /// A ceiling on every weight byte a load holds, its host tier's among
+    /// them: past it, the routed experts stream through an expert bank.
+    #[arg(long, value_name = "BYTES", conflicts_with = "device_room")]
     weight_cap: Option<u64>,
+    /// A bound on the weights the device holds alone: past it, the routed
+    /// experts stream through an expert bank, a discrete GPU's host tier
+    /// sized by host memory.
+    #[arg(long, value_name = "BYTES")]
+    device_room: Option<u64>,
     #[command(flatten)]
     pin: development::PinArgs,
     #[command(flatten)]
     survey: development::SurveyArgs,
+}
+
+impl EngineArgs {
+    /// The load's one weight bound, of whichever flag gave it (clap admits
+    /// one of them).
+    fn weight_bound(&self) -> Option<magnitude_executor::WeightBound> {
+        use magnitude_executor::WeightBound;
+        self.weight_cap.map(WeightBound::Cap).or(self.device_room.map(WeightBound::Room))
+    }
 }
 
 fn on_off(value: &str) -> Result<bool, String> {
@@ -465,7 +479,7 @@ fn engine_options(
                 .parse()
                 .map_err(|error| format!("--kv-codec: {error}"))?,
             numerical_profile,
-            weight_cap: engine.weight_cap,
+            weight_bound: engine.weight_bound(),
             budget,
             fresh: Cell::new(engine.fresh_tuning),
             tuning_trace: inputs.run.path(tuning::TRACE),

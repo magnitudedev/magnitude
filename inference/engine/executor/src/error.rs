@@ -62,10 +62,10 @@ pub enum PlanError {
     /// model's shapes are beyond what the engine's kernels execute.
     KernelDomain(seismic::KernelDomainViolation),
     Resource(CapacityError),
-    /// The weight cap is below the weights a load holds with its expert
-    /// bank at its minimum: each group's least records, what its steps need
+    /// The load's weight bound (a cap or a device room) is below the
+    /// weights a load holds with its expert bank at its minimum: each group's least records, what its steps need
     /// resident at once to make progress (`ExpertBankPlan::least_records`).
-    WeightCap { cap: u64, needed: u64 },
+    WeightBound { bound: crate::WeightBound, needed: u64 },
     /// The load's routed experts cannot be streamed.
     Unstreamed(UnstreamedExperts),
     /// The plan's settle has no prices for its holdings
@@ -184,10 +184,10 @@ impl fmt::Display for PlanError {
             }
             Self::KernelDomain(violation) => violation.fmt(formatter),
             Self::Resource(source) => source.fmt(formatter),
-            Self::WeightCap { cap, needed } => write!(
+            Self::WeightBound { bound, needed } => write!(
                 formatter,
-                "a weight cap of {cap} bytes is below the {needed} the load's weights need with \
-                 its expert bank at its minimum, the records its steps need at once"
+                "{bound} is below the {needed} bytes the load's weights need with its expert bank \
+                 at its minimum, the records its steps need at once"
             ),
             Self::Unstreamed(reason) => write!(formatter, "experts cannot stream: {reason}"),
             Self::Unpriced { pending: true, reason } => write!(formatter, "the plan's prices are pending: {reason}"),

@@ -463,11 +463,11 @@ pub enum ModelOperationFailure {
         retryable: bool,
     },
     MemoryShortage(MemoryShortage),
-    /// The weight cap is below the load's least weights: the caller's bound, which no wait
+    /// The weight bound is below the load's least weights: the caller's bound, which no wait
     /// clears, so never retryable. Reported to clients as an operation failure of its own code
-    /// with both numbers in its message: the cap is a bound of the service's evaluation
+    /// with both numbers in its message: the bound is the service's evaluation's
     /// (`serve --weight-cap`), which no client sets.
-    WeightCap(magnitude_engine::error::WeightCapBelowWeights),
+    WeightBound(magnitude_engine::error::WeightBoundBelowWeights),
 }
 
 fn memory_shortage_message(shortage: &MemoryShortage) -> String {
@@ -497,7 +497,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { code, .. } => code,
             Self::MemoryShortage(_) => MEMORY_SHORTAGE_FAILURE_CODE,
-            Self::WeightCap(_) => magnitude_serving::error::WEIGHT_CAP_BELOW_WEIGHTS,
+            Self::WeightBound(_) => magnitude_serving::error::WEIGHT_BOUND_BELOW_WEIGHTS,
         }
     }
 
@@ -505,7 +505,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { message, .. } => message.clone(),
             Self::MemoryShortage(shortage) => memory_shortage_message(shortage),
-            Self::WeightCap(cap) => cap.to_string(),
+            Self::WeightBound(bound) => bound.to_string(),
         }
     }
 
@@ -513,7 +513,7 @@ impl ModelOperationFailure {
         match self {
             Self::Operation { retryable, .. } => *retryable,
             Self::MemoryShortage(_) => true,
-            Self::WeightCap(_) => false,
+            Self::WeightBound(_) => false,
         }
     }
 
@@ -534,9 +534,9 @@ impl ModelOperationFailure {
                 retryable: true,
                 shortage,
             },
-            Self::WeightCap(cap) => ModelInstanceFailure::Operation {
-                code: magnitude_serving::error::WEIGHT_CAP_BELOW_WEIGHTS.to_owned(),
-                message: cap.to_string(),
+            Self::WeightBound(bound) => ModelInstanceFailure::Operation {
+                code: magnitude_serving::error::WEIGHT_BOUND_BELOW_WEIGHTS.to_owned(),
+                message: bound.to_string(),
                 retryable: false,
             },
         }

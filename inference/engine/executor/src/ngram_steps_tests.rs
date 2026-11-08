@@ -1371,7 +1371,7 @@ fn load(
         Banked::Streamed { numerator, denominator } => {
             let resident = draft.allocation_bytes(definition).unwrap();
             draft
-                .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(resident * numerator / denominator), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
+                .with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(resident * numerator / denominator)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices()))
                 .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
                 .into_draft()
         }
@@ -1380,7 +1380,7 @@ fn load(
             let whole = draft.clone().with_bank::<crate::AssessmentMemoryCharge>(definition, None, &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft();
             let bank = whole.load().expert_bank().unwrap_or_else(|| panic!("{backend:?}: the uncapped load banks its experts"));
             let cap = whole.load().weight_bytes().unwrap() - bank.slot_bytes().unwrap() * (bank.widest().get() / 2);
-            draft.with_bank::<crate::AssessmentMemoryCharge>(definition, Some(cap), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
+            draft.with_bank::<crate::AssessmentMemoryCharge>(definition, Some(crate::WeightBound::Cap(cap)), &crate::assessment::Priced::Measured(crate::assessment::synthetic::plan_prices())).unwrap_or_else(|error| panic!("{backend:?}: {error}")).into_draft()
         }
     };
     let state = ResourcePlanner::state_plan(

@@ -22,7 +22,7 @@ use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry, log_to_std
 use magnitude_engine::worker::transport::stdio_worker_transport;
 use magnitude_engine::worker::{EngineClient, WorkerExit, serve_worker};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
-use magnitude_executor::{ExecutionPath, TuningSettings};
+use magnitude_executor::{ExecutionPath, WeightBound, TuningSettings};
 use magnitude_serving::engine::{EngineHost, EngineInvocation};
 use magnitude_serving::{
     HostChat, LoadProgress, ModelInvocation, ServedModels, Serving, ServingError,
@@ -49,7 +49,7 @@ struct Options {
     kv_codec: KvCodec,
     numerical_profile: Option<magnitude_executor::NumericalProfile>,
     lookahead: bool,
-    weight_cap: Option<u64>,
+    weight_bound: Option<WeightBound>,
     telemetry_endpoint: String,
     device: DeviceRequest,
     kernel_cache: Option<PathBuf>,
@@ -60,9 +60,18 @@ struct Options {
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
 [--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2|lilicorr] [--mtp-proposals N] [--draft-budget JSON|adaptive] \
-[--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--lookahead on|off] [--weight-cap BYTES] [--telemetry URL] \
+[--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--lookahead on|off] [--weight-cap BYTES | --device-room BYTES] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR] \
 [--tuning-budget SECONDS] [--fresh-tuning] [--tuning-trace FILE]";
+
+/// The load's one weight bound, `given`: `--weight-cap` and `--device-room`
+/// bound the weights in ways of their own, so a load takes one of them.
+fn bound(set: Option<WeightBound>, given: WeightBound) -> Result<Option<WeightBound>, String> {
+    match set {
+        None => Ok(Some(given)),
+        Some(_) => Err("--weight-cap and --device-room are one bound each: give one, once".into()),
+    }
+}
 
 /// `on` or `off`.
 fn switch(flag: &str, value: &str) -> Result<bool, String> {
@@ -107,7 +116,7 @@ fn parse() -> Result<Options, String> {
     let mut kv_codec = defaults.kv_codec;
     let mut numerical_profile = defaults.numerical_profile;
     let mut lookahead = defaults.lookahead;
-    let mut weight_cap = defaults.weight_cap;
+    let mut weight_bound = defaults.weight_bound;
     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
     let mut device = DeviceRequest::Automatic;
     let mut kernel_cache = None;
@@ -156,7 +165,8 @@ fn parse() -> Result<Options, String> {
                 );
             }
             "--lookahead" => lookahead = switch(&flag, &value(&flag, &mut args)?)?,
-            "--weight-cap" => weight_cap = Some(number(&flag, &mut args)?),
+            "--weight-cap" => weight_bound = bound(weight_bound, WeightBound::Cap(number(&flag, &mut args)?))?,
+            "--device-room" => weight_bound = bound(weight_bound, WeightBound::Room(number(&flag, &mut args)?))?,
             "--telemetry" => telemetry_endpoint = value(&flag, &mut args)?,
             "--device" => {
                 device = value(&flag, &mut args)?
@@ -207,7 +217,7 @@ fn parse() -> Result<Options, String> {
         kv_codec,
         numerical_profile,
         lookahead,
-        weight_cap,
+        weight_bound,
         telemetry_endpoint,
         device,
         kernel_cache,
@@ -362,7 +372,7 @@ fn run() -> Result<(), String> {
             lookahead: options.lookahead,
             exported_logits_rows: 0,
             numerical_profile: options.numerical_profile,
-            weight_cap: options.weight_cap,
+            weight_bound: options.weight_bound,
         },
         context_tokens: options.context_tokens,
         service,

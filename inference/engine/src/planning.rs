@@ -76,14 +76,14 @@ pub fn plan_execution<C: HeldCharge>(
 
 /// [`plan_execution`]'s structure, whatever room the machine has: its
 /// experts held as its largest plan holds them under the model policy's
-/// weight cap (`ExecutionPlanDraft::with_ceiling_bank`), what metadata-only
+/// weight bound (`ExecutionPlanDraft::with_ceiling_bank`), what metadata-only
 /// assessment prepares from the structure alone.
 pub fn plan_ceiling<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
 ) -> Result<ChargedDraft<C>, ExecutionPlanningError> {
     plan_resident(manifest, selected)?
-        .with_ceiling_bank(&manifest.definition, manifest.model.weight_cap)
+        .with_ceiling_bank(&manifest.definition, manifest.model.weight_bound)
         .map_err(ExecutionPlanningError::Plan)
 }
 
@@ -140,7 +140,7 @@ pub fn plan_banked<C: HeldCharge>(
     }
     let prices = crate::assessment::plan_prices(&measurements, &resident);
     resident
-        .with_bank(&manifest.definition, manifest.model.weight_cap, &prices)
+        .with_bank(&manifest.definition, manifest.model.weight_bound, &prices)
         .map_err(ExecutionPlanningError::Plan)
 }
 
@@ -267,7 +267,7 @@ mod tests {
             lookahead: false,
             exported_logits_rows,
             numerical_profile: None,
-            weight_cap: None,
+            weight_bound: None,
         }
     }
 

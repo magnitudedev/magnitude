@@ -42,7 +42,7 @@ pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, Co
 #[cfg(test)]
 pub(crate) use execution_plan::bank_substrate;
 pub use execution_plan::{
-    BackendPlan, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, DraftedCharge, HeldBound, HeldCharge, HeldCharges, NoBank, PlanRoom, PlannedDevice, SettleRoom, StableRoom,
+    BackendPlan, ChargedDraft, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, DraftedCharge, HeldBound, HeldCharge, HeldCharges, NoBank, WeightBound, PlanRoom, PlannedDevice, SettleRoom, StableRoom,
     ResolvedPolicy,
 };
 pub use programs::{

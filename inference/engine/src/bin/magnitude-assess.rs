@@ -60,8 +60,9 @@ struct Options {
     /// Print the topology, its discovery diagnostics, its measurements and
     /// the executor costs rather than assess models.
     topology: bool,
-    /// The ceiling on every weight byte a load holds (`ModelPolicy::weight_cap`).
-    weight_cap: Option<u64>,
+    /// The bound on a load's weights (`ModelPolicy::weight_bound`): a cap on
+    /// every weight byte, or a device room.
+    weight_bound: Option<magnitude_executor::WeightBound>,
     /// The context each model is planned at, as a load serving it there
     /// (`AssessmentStructure::served_context`): its declared limit when none.
     context: Option<usize>,
@@ -75,7 +76,7 @@ const JOB_ONLY: &str = "--measurement-job-only";
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu --kernels DIR \
      [--storage DIR] [--seconds 10] [--depths 25000,50000,75000] [--sequences 1] [--breakdown] \
-     [--method auto|plain] [--weight-cap BYTES] [--context TOKENS] \
+     [--method auto|plain] [--weight-cap BYTES | --device-room BYTES] [--context TOKENS] \
      (--topology | TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...)";
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
@@ -94,7 +95,7 @@ fn parse() -> Result<Options, String> {
     let mut seconds = MEASUREMENT_SECONDS;
     let mut method = ModelMethod::Auto;
     let mut topology = false;
-    let mut weight_cap = None;
+    let mut weight_bound = None;
     let mut context = None;
     let mut job = None;
     let mut models = Vec::new();
@@ -139,12 +140,17 @@ fn parse() -> Result<Options, String> {
                 }
             }
             "--topology" => topology = true,
-            "--weight-cap" => {
-                weight_cap = Some(
-                    value(&argument, &mut args)?
-                        .parse()
-                        .map_err(|error| format!("--weight-cap: {error}"))?,
-                )
+            "--weight-cap" | "--device-room" => {
+                let bytes = value(&argument, &mut args)?
+                    .parse()
+                    .map_err(|error| format!("{argument}: {error}"))?;
+                if weight_bound.is_some() {
+                    return Err("--weight-cap and --device-room are one bound each: give one, once".into());
+                }
+                weight_bound = Some(match argument.as_str() {
+                    "--weight-cap" => magnitude_executor::WeightBound::Cap(bytes),
+                    _ => magnitude_executor::WeightBound::Room(bytes),
+                });
             }
             "--context" => {
                 context = Some(
@@ -202,7 +208,7 @@ fn parse() -> Result<Options, String> {
             .map_err(|error| format!("--seconds: {error}"))?,
         job,
         topology,
-        weight_cap,
+        weight_bound,
         context,
         models,
     })
@@ -332,7 +338,7 @@ fn run() -> Result<bool, String> {
         options.device,
         Some(options.kernels.as_path()),
         MemoryReserves::of_machine(Some((options.kernels.as_path(), &*catalog.topology()))),
-        ModelPolicy { weight_cap: options.weight_cap, ..ModelPolicy::default() },
+        ModelPolicy { weight_bound: options.weight_bound, ..ModelPolicy::default() },
         standard_service_limits(),
     )
     .map_err(|error| error.to_string())?;

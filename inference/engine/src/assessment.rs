@@ -414,7 +414,7 @@ pub enum ModelAssessmentError {
     ContextLimit(u64),
     Configuration(String),
     /// The weight cap is below the load's least weights.
-    WeightCap(crate::error::WeightCapBelowWeights),
+    WeightBound(crate::error::WeightBoundBelowWeights),
     Planning(String),
     Platform(PlatformError),
     Assessment(AssessmentError),
@@ -431,7 +431,7 @@ impl fmt::Display for ModelAssessmentError {
                 )
             }
             Self::Configuration(error) => write!(formatter, "engine configuration: {error}"),
-            Self::WeightCap(error) => error.fmt(formatter),
+            Self::WeightBound(error) => error.fmt(formatter),
             Self::Planning(error) => write!(formatter, "execution planning: {error}"),
             Self::Platform(error) => write!(formatter, "platform: {error}"),
             Self::Assessment(error) => error.fmt(formatter),
@@ -829,7 +829,7 @@ fn inventory(
 ) -> Result<Result<Vec<seismic::KernelRequest>, UnsupportedModel>, ModelAssessmentError> {
     let refused = |outcome: PlanOutcome| match outcome {
         PlanOutcome::Unsupported(unsupported) => Ok(Err(unsupported)),
-        PlanOutcome::WeightCap(error) => Err(ModelAssessmentError::WeightCap(error)),
+        PlanOutcome::WeightBound(error) => Err(ModelAssessmentError::WeightBound(error)),
         PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
         PlanOutcome::PricesPending(reason) => unpriced(&reason),
     };
@@ -864,7 +864,7 @@ impl Refusal {
     fn of(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(unsupported) => Self::Unsupported(unsupported),
-            PlanOutcome::WeightCap(error) => Self::Failed(ModelAssessmentError::WeightCap(error)),
+            PlanOutcome::WeightBound(error) => Self::Failed(ModelAssessmentError::WeightBound(error)),
             PlanOutcome::Internal(reason) => Self::Failed(ModelAssessmentError::Planning(reason)),
             PlanOutcome::PricesPending(reason) => unpriced(&reason),
         }

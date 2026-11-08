@@ -40,8 +40,8 @@ const RETAINED_CONFIGURATIONS: usize = 1;
 /// admits.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LoadBounds {
-    /// The ceiling on every load's weights (`ModelPolicy::weight_cap`).
-    pub weight_cap: Option<u64>,
+    /// The bound on every load's weights (`ModelPolicy::weight_bound`).
+    pub weight_bound: Option<magnitude_executor::WeightBound>,
     /// The context every load serves, in place of its model's declared one.
     pub context_tokens: Option<usize>,
     /// Every load decodes plainly, its drafter left out.
@@ -169,7 +169,7 @@ fn engine_configuration(
         },
         model: ModelPolicy {
             method: if bounds.plain { ModelMethod::Plain } else { package.method },
-            weight_cap: bounds.weight_cap,
+            weight_bound: bounds.weight_bound,
             ..serving_policy()
         },
         context_tokens: bounds.context_tokens,

@@ -301,7 +301,7 @@ fn plan(
     let policy = ModelPolicy {
         method: ModelMethod::Plain,
         numerical_profile,
-        weight_cap,
+        weight_bound: weight_cap.map(magnitude_executor::WeightBound::Cap),
         ..ModelPolicy::default()
     };
     let devices = Devices::discover(&[]).map_err(|error| error.to_string())?;

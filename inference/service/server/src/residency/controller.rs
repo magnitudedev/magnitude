@@ -516,7 +516,7 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
         PreviewError::Unsupported(_) => ("unsupported_model", false),
         PreviewError::Device(_) => ("device_unavailable", true),
         PreviewError::MemoryObservationUnavailable { .. } => ("memory_observation_unavailable", true),
-        PreviewError::WeightCap(cap) => return ModelOperationFailure::WeightCap(*cap),
+        PreviewError::WeightBound(bound) => return ModelOperationFailure::WeightBound(*bound),
         PreviewError::PricesPending { .. } => ("prices_pending", true),
         PreviewError::Internal { .. } => ("load_preview_failed", false),
     };
@@ -537,7 +537,7 @@ fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailur
         LoadError::MemoryPressure { .. } => {
             return ModelOperationFailure::MemoryShortage(MemoryShortage::UnderPressure {});
         }
-        LoadError::WeightCap(cap) => return ModelOperationFailure::WeightCap(*cap),
+        LoadError::WeightBound(bound) => return ModelOperationFailure::WeightBound(*bound),
         LoadError::Artifact(_) => "invalid_model_package",
         LoadError::Unsupported(_) => "unsupported_model",
         LoadError::Device(_) => "device_unavailable",
@@ -1084,10 +1084,10 @@ mod tests {
     /// code and both numbers, never retried: not a memory shortage, which clears with memory.
     #[test]
     fn a_weight_cap_below_the_least_weights_is_never_retried() {
-        let cap = magnitude_engine::error::WeightCapBelowWeights { cap: 2_100_000_000, needed: 2_130_136_892 };
-        let failure = preview_failure(PreviewError::WeightCap(cap));
-        assert!(matches!(&failure, ModelOperationFailure::WeightCap(found) if *found == cap));
-        assert_eq!(failure.code(), magnitude_serving::error::WEIGHT_CAP_BELOW_WEIGHTS);
+        let cap = magnitude_engine::error::WeightBoundBelowWeights { bound: magnitude_executor::WeightBound::Cap(2_100_000_000), needed: 2_130_136_892 };
+        let failure = preview_failure(PreviewError::WeightBound(cap));
+        assert!(matches!(&failure, ModelOperationFailure::WeightBound(found) if *found == cap));
+        assert_eq!(failure.code(), magnitude_serving::error::WEIGHT_BOUND_BELOW_WEIGHTS);
         assert!(!failure.retryable());
         assert!(failure.message().contains("2100000000") && failure.message().contains("2130136892"));
     }

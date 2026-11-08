@@ -159,7 +159,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             plain,
         } => {
             magnitude_service_utils::owner::spawn("the allocator's release of free memory", allocator::release_free_memory());
-            let bounds = LoadBounds { weight_cap, context_tokens, plain };
+            let bounds = LoadBounds { weight_bound: weight_cap.map(magnitude_executor::WeightBound::Cap), context_tokens, plain };
             let installation = installation::Installation::load(&installation)
                 .context("invalid ICN installation")?;
             let release_catalog = Arc::new(open_installation_catalog(&installation)?);

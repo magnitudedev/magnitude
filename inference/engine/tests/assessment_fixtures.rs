@@ -17,7 +17,7 @@ use magnitude_engine::{
     options::{ModelMethod, ModelPolicy, PROFILE_SEQUENCES, standard_service_limits},
 };
 use magnitude_executor::{
-    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, HeldBound, HeldCharges, PlanError, PlanPrices, PlanRoom, StableRoom,
+    AssessmentFitVerdict, AssessmentMemoryCharge, ConveyorCarrier, HeldBound, HeldCharges, PlanError, PlanPrices, PlanRoom, StableRoom, WeightBound,
     assessment::{AssessmentError, ColdSource, ExpertShares, Priced, Residency, execution_memory_charge, synthetic},
     platform::{DeviceRequest, DomainRole, MemoryReserves, StoreMotion},
 };
@@ -562,7 +562,7 @@ fn a_discrete_banks_conveyor_lies_in_host_storage() {
         BackendName::Cuda,
         MemoryReserves::of_machine(None),
         ModelPolicy {
-            weight_cap: Some(cap),
+            weight_bound: Some(WeightBound::Cap(cap)),
             ..ModelPolicy::default()
         },
         standard_service_limits(),
@@ -619,7 +619,7 @@ fn a_capped_streamed_load_fits_with_its_graphs_priced() {
     let scratch = Scratch::new("qwen36-priced-graphs");
     let package = qwen36_35b(&scratch);
     for backend in [BackendName::Cuda, BackendName::Vulkan] {
-        let policy = ModelPolicy { weight_cap: Some(6_890_894_474), ..ModelPolicy::default() };
+        let policy = ModelPolicy { weight_bound: Some(WeightBound::Cap(6_890_894_474)), ..ModelPolicy::default() };
         let setup = rtx3090_setup(backend, MemoryReserves::of_machine(None), policy, standard_service_limits());
         let (draft, execution) = match prepare_model_assessment(&package, &setup.structure) {
             Ok(PreparedModelAssessment::Planned { draft, execution, .. }) => (draft, execution),
@@ -644,11 +644,11 @@ fn a_capped_streamed_load_fits_with_its_graphs_priced() {
 fn a_weight_cap_grants_the_largest_bank_it_holds() {
     let scratch = Scratch::new("qwen36-weight-cap");
     let package = qwen36_35b(&scratch);
-    let assess = |weight_cap| {
+    let assess = |weight_cap: Option<u64>| {
         let setup = m4_pro_setup(
             MemoryReserves::of_machine(None),
             ModelPolicy {
-                weight_cap,
+                weight_bound: weight_cap.map(WeightBound::Cap),
                 ..ModelPolicy::default()
             },
             // One decode row a step: the selected reads, and so the
@@ -667,14 +667,14 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     else {
         panic!("Qwen3.6 35B is planned resident");
     };
-    let Err(PlanError::WeightCap {
+    let Err(PlanError::WeightBound {
         needed: floor_weights,
         ..
-    }) = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, Some(0), &synthetic_prices())
+    }) = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(0)), &synthetic_prices())
     else {
         panic!("no bank holds no weights");
     };
-    let floor = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, Some(floor_weights), &synthetic_prices()).unwrap().into_draft();
+    let floor = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(floor_weights)), &synthetic_prices()).unwrap().into_draft();
     let bank = floor.load().expert_bank().unwrap().clone();
     assert_eq!(bank.slots, bank.floor());
     // A bank's weights at `slots`, its record tensors reserved as the
@@ -702,7 +702,7 @@ fn a_weight_cap_grants_the_largest_bank_it_holds() {
     // floor's weights, not a model the backend does not support.
     assert!(matches!(
         assess(Some(floor_weights - 1)),
-        Err(ModelAssessmentError::WeightCap(error)) if error.needed == floor_weights
+        Err(ModelAssessmentError::WeightBound(error)) if error.needed == floor_weights
     ));
     for slots in [bank.floor(), 128, 240] {
         let cap = weights(slots);
@@ -724,7 +724,7 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
     let scratch = Scratch::new("qwen36-tier-floor");
     let package = qwen36_35b(&scratch);
     let prepare = |reserves| {
-        let policy = ModelPolicy { weight_cap: Some(6_890_894_474), ..ModelPolicy::default() };
+        let policy = ModelPolicy { weight_bound: Some(WeightBound::Cap(6_890_894_474)), ..ModelPolicy::default() };
         let setup = rtx3090_setup(BackendName::Cuda, reserves, policy, standard_service_limits());
         prepare_model_assessment(&package, &setup.structure).unwrap_or_else(|error| panic!("operational failure: {error}"))
     };
@@ -740,7 +740,7 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
     let PreparedModelAssessment::Planned { definition, draft, .. } = roomless else {
         panic!("a capped load is prepared from its structure");
     };
-    let Err(PlanError::Unstreamed(reason)) = draft.with_bank::<AssessmentMemoryCharge>(&definition, Some(6_890_894_474), &synthetic_prices()) else {
+    let Err(PlanError::Unstreamed(reason)) = draft.with_bank::<AssessmentMemoryCharge>(&definition, Some(WeightBound::Cap(6_890_894_474)), &synthetic_prices()) else {
         panic!("no host room leaves the experts unstreamed");
     };
     assert!(format!("{reason:?}").contains("landing reserve"), "{reason:?}");
@@ -759,7 +759,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     let scratch = Scratch::new("qwen36-tier-size");
     let package = qwen36_35b(&scratch);
     let prepare = |reserves| {
-        let policy = ModelPolicy { weight_cap: Some(6_890_894_474), ..ModelPolicy::default() };
+        let policy = ModelPolicy { weight_bound: Some(WeightBound::Cap(6_890_894_474)), ..ModelPolicy::default() };
         let setup = rtx3090_setup(BackendName::Cuda, reserves, policy, standard_service_limits());
         let prepared = prepare_model_assessment(&package, &setup.structure)
             .unwrap_or_else(|error| panic!("operational failure: {error}"));
@@ -1002,8 +1002,8 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
     let PreparedModelAssessment::Planned { definition, draft, .. } = &prepared else {
         unreachable!("the model was assessed");
     };
-    let Err(PlanError::WeightCap { needed: floor_weights, .. }) =
-        draft.clone().with_bank::<AssessmentMemoryCharge>(definition, Some(0), &synthetic_prices())
+    let Err(PlanError::WeightBound { needed: floor_weights, .. }) =
+        draft.clone().with_bank::<AssessmentMemoryCharge>(definition, Some(WeightBound::Cap(0)), &synthetic_prices())
     else {
         panic!("no bank holds no weights");
     };

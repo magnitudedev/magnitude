@@ -147,11 +147,14 @@ pub struct ModelPolicy {
     /// The caller's numerical requirement (α and the allowed deviation
     /// classes); the engine's standard profile when absent.
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
-    /// An optional ceiling on every weight byte the load holds, wherever it
-    /// lies: its expert bank grows no further than the cap holds, and a host
-    /// tier holds what it leaves beside the bank at its ceiling, its landing
-    /// reserve aside as staging (`ExecutionPlanDraft::bank_ceiling`).
-    pub weight_cap: Option<u64>,
+    /// An optional bound on the load's weights, one kind at once
+    /// ([`magnitude_executor::WeightBound`]): a weight cap bounds every weight
+    /// byte the load holds, wherever it lies, its expert bank growing no
+    /// further than the cap holds and a host tier holding what it leaves
+    /// beside the bank at its ceiling, its landing reserve aside as staging;
+    /// a device room bounds only what the device holds, a discrete GPU's host
+    /// tier sized by host memory alone (`ExecutionPlanDraft::bank_ceiling`).
+    pub weight_bound: Option<magnitude_executor::WeightBound>,
 }
 
 impl Default for ModelPolicy {
@@ -164,7 +167,7 @@ impl Default for ModelPolicy {
             lookahead: true,
             exported_logits_rows: 0,
             numerical_profile: None,
-            weight_cap: None,
+            weight_bound: None,
         }
     }
 }
@@ -252,8 +255,8 @@ pub struct ResolvedModelPolicy {
     pub exported_logits_rows: usize,
     /// The caller's profile, checked before device opening.
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
-    /// The caller's ceiling on the load's weights (`ModelPolicy::weight_cap`).
-    pub weight_cap: Option<u64>,
+    /// The caller's bound on the load's weights (`ModelPolicy::weight_bound`).
+    pub weight_bound: Option<magnitude_executor::WeightBound>,
 }
 
 impl ResolvedModelPolicy {
@@ -391,7 +394,7 @@ impl ModelPolicy {
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
             exported_logits_rows: self.exported_logits_rows,
             numerical_profile: self.numerical_profile.clone(),
-            weight_cap: self.weight_cap,
+            weight_bound: self.weight_bound,
         })
     }
 }

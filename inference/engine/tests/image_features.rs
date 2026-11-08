@@ -43,7 +43,7 @@ fn resolved() -> ResolvedEngineConfiguration {
             lookahead: false,
             exported_logits_rows: 512,
             numerical_profile: None,
-            weight_cap: None,
+            weight_bound: None,
         },
         context_tokens: Some(4096),
         service: ServiceLimits {

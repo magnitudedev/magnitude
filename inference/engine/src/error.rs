@@ -244,21 +244,21 @@ impl fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
-/// A weight cap below what the load's weights need with its expert bank at its floor: a bound
+/// A weight bound (a cap or a device room) below what the load's weights need with its expert bank at its floor: a bound
 /// the caller set that no machine meets and no wait clears, so it is never retried, unlike a
 /// memory shortage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WeightCapBelowWeights {
-    pub cap: u64,
+pub struct WeightBoundBelowWeights {
+    pub bound: magnitude_executor::WeightBound,
     pub needed: u64,
 }
 
-impl fmt::Display for WeightCapBelowWeights {
+impl fmt::Display for WeightBoundBelowWeights {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "a weight cap of {} bytes is below the {} bytes the load's weights need with its expert bank at its floor",
-            self.cap, self.needed
+            "{} is below the {} bytes the load's weights need with its expert bank at its floor",
+            self.bound, self.needed
         )
     }
 }
@@ -270,8 +270,8 @@ pub enum PreviewError {
     Device(DeviceSelectionError),
     /// A required memory observation failed (Blind). Retryable.
     MemoryObservationUnavailable { reason: String },
-    /// The weight cap is below the load's least weights. Never retryable.
-    WeightCap(WeightCapBelowWeights),
+    /// The weight bound is below the load's least weights. Never retryable.
+    WeightBound(WeightBoundBelowWeights),
     /// The plan prices its holdings on this machine's standing figures, which the measurement
     /// job has not stored yet ([`PlanOutcome::PricesPending`]). Retryable once it has.
     PricesPending { reason: String },
@@ -283,7 +283,7 @@ impl fmt::Display for PreviewError {
         match self {
             Self::Unsupported(error) => error.fmt(formatter),
             Self::Device(error) => error.fmt(formatter),
-            Self::WeightCap(error) => error.fmt(formatter),
+            Self::WeightBound(error) => error.fmt(formatter),
             Self::MemoryObservationUnavailable { reason } => {
                 write!(formatter, "memory observation unavailable: {reason}")
             }
@@ -323,8 +323,8 @@ pub enum LoadError {
     WorkerLost { reason: String },
     /// A configuration control is malformed.
     Configuration { reason: String },
-    /// The weight cap is below the load's least weights. Never retryable.
-    WeightCap(WeightCapBelowWeights),
+    /// The weight bound is below the load's least weights. Never retryable.
+    WeightBound(WeightBoundBelowWeights),
     /// The plan prices its holdings on this machine's standing figures, which the measurement
     /// job has not stored yet ([`PlanOutcome::PricesPending`]). Retryable once it has.
     PricesPending { reason: String },
@@ -365,7 +365,7 @@ impl fmt::Display for LoadError {
             Self::DeviceLost { reason } => write!(formatter, "device lost: {reason}"),
             Self::WorkerLost { reason } => write!(formatter, "worker lost during load: {reason}"),
             Self::Configuration { reason } => write!(formatter, "invalid engine configuration: {reason}"),
-            Self::WeightCap(error) => error.fmt(formatter),
+            Self::WeightBound(error) => error.fmt(formatter),
             Self::PricesPending { reason } => write!(formatter, "the plan's prices are pending: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal load failure: {reason}"),
         }
@@ -588,7 +588,7 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
         | PlanError::Deferred(_)
         | PlanError::UnportedScale(_)
         | PlanError::Unstreamed(_)) => unsupported(&error),
-        PlanError::WeightCap { cap, needed } => PlanOutcome::WeightCap(WeightCapBelowWeights { cap, needed }),
+        PlanError::WeightBound { bound, needed } => PlanOutcome::WeightBound(WeightBoundBelowWeights { bound, needed }),
         PlanError::Unpriced { pending: true, reason } => PlanOutcome::PricesPending(reason),
         PlanError::KernelDomain(violation) => PlanOutcome::Unsupported(kernel_domain(
             violation.backend.as_str(),
@@ -646,9 +646,9 @@ fn kernel_domain(backend: &str, entry: &str, statics: Vec<(String, u64)>) -> Uns
 
 pub(crate) enum PlanOutcome {
     Unsupported(UnsupportedModel),
-    /// The caller's weight cap is below the load's least weights: no
+    /// The caller's weight bound is below the load's least weights: no
     /// property of the model or the backend.
-    WeightCap(WeightCapBelowWeights),
+    WeightBound(WeightBoundBelowWeights),
     /// The plan prices its holdings on the machine's standing figures, which the measurement
     /// job has not stored yet: no property of the model or the engine. The engine never waits
     /// for them; whoever holds the device for the load waits without it.
@@ -716,7 +716,7 @@ impl From<PlanOutcome> for PreviewError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
-            PlanOutcome::WeightCap(error) => Self::WeightCap(error),
+            PlanOutcome::WeightBound(error) => Self::WeightBound(error),
             PlanOutcome::PricesPending(reason) => Self::PricesPending { reason },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
@@ -727,7 +727,7 @@ impl From<PlanOutcome> for LoadError {
     fn from(outcome: PlanOutcome) -> Self {
         match outcome {
             PlanOutcome::Unsupported(error) => Self::Unsupported(error),
-            PlanOutcome::WeightCap(error) => Self::WeightCap(error),
+            PlanOutcome::WeightBound(error) => Self::WeightBound(error),
             PlanOutcome::PricesPending(reason) => Self::PricesPending { reason },
             PlanOutcome::Internal(reason) => Self::Internal { reason },
         }
@@ -740,16 +740,16 @@ mod tests {
     use magnitude_executor::{DeviceError, InvariantError};
     use magnitude_scheduler::{owner::AdmissionError, publication::RequestError as Scheduled};
 
-    /// A weight cap below the load's least weights reaches preview and load as the typed,
+    /// A weight bound below the load's least weights reaches preview and load as the typed,
     /// never-retried refusal it is, both numbers kept, not a memory shortage or a string.
     #[test]
     fn a_weight_cap_below_the_least_weights_stays_typed_and_unretried() {
-        let cap = || PlanError::WeightCap { cap: 2_100_000_000, needed: 2_130_136_892 };
-        let typed = WeightCapBelowWeights { cap: 2_100_000_000, needed: 2_130_136_892 };
+        let cap = || PlanError::WeightBound { bound: magnitude_executor::WeightBound::Cap(2_100_000_000), needed: 2_130_136_892 };
+        let typed = WeightBoundBelowWeights { bound: magnitude_executor::WeightBound::Cap(2_100_000_000), needed: 2_130_136_892 };
         let preview = PreviewError::from(classify_plan(cap(), seismic::BackendName::Metal));
-        assert_eq!(preview, PreviewError::WeightCap(typed));
+        assert_eq!(preview, PreviewError::WeightBound(typed));
         let load = LoadError::from(classify_plan(cap(), seismic::BackendName::Metal));
-        assert_eq!(load, LoadError::WeightCap(typed));
+        assert_eq!(load, LoadError::WeightBound(typed));
         assert!(!load.retryable());
         assert!(load.to_string().contains("2100000000") && load.to_string().contains("2130136892"));
     }
