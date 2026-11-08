@@ -2594,6 +2594,10 @@ enum Phase<'a> {
     Count {
         launches: HashMap<TuningKey, usize>,
         searching: Vec<TuningKey>,
+        /// Each unit whose search the count opened, at the canonical
+        /// default the mandatory phase publishes for it: its choice as it
+        /// stands until its search promotes another.
+        canonical: HashMap<TuningKey, NativeSpecialization>,
     },
     /// Every searching unit's mandatory work is done: it serves its
     /// published canonical default. The walk collects the units with
@@ -3592,23 +3596,10 @@ pub(crate) struct Tuner<'a> {
     /// Every unit's served choice as it stands: its canonical default from
     /// the mandatory phase, replaced when a challenger is promoted.
     chosen: HashMap<TuningKey, NativeSpecialization>,
-    /// The units this round's count opened a search of: a dependant of one
-    /// waits for the next round ([`Self::following`]).
-    opened: std::collections::HashSet<TuningKey>,
-    /// The dependants this round deferred, each a unit of the next round
-    /// at its prerequisite's final choice ([`Self::deferred`]).
-    deferred: std::collections::HashSet<TuningKey>,
-    /// When this round's count began, on the tuning clock, and what its
-    /// count walk and mandatory phase took, with the longest canonical
-    /// compile it ran: they price the round that forms its deferred
-    /// dependants ([`Self::deferred_round`]).
-    round_began: Duration,
-    round_counted: Duration,
-    round_mandatory: Duration,
-    round_compile: Duration,
-    /// The mandatory compiles this load has run: a wave runs no more at
-    /// once than have been observed ([`Self::census`]).
-    compiled: usize,
+    /// The arithmetic values dependants were counted at from a choice this
+    /// round's search may replace: the prerequisite, the parameter and its
+    /// value ([`Self::following`], [`Self::stale`]).
+    provisional: std::collections::HashSet<(TuningKey, String, u64)>,
     /// The digest of each native implementation a unit's key was formed
     /// with, by its entry, element bindings and static values
     /// ([`Self::implementation_digest`]).
@@ -3692,25 +3683,31 @@ impl<'a> Tuner<'a> {
     /// unit `prerequisite` as it stands: a dependant whose results carry its
     /// prerequisite's bits (a streamed layer's route, its resident route's)
     /// is fixed at the parameters that set them and searches the others,
-    /// which its declaration holds to bit-identical results. None while
-    /// this round searches the prerequisite: the dependant, `follower` at
-    /// `fixed`, is then no unit of this round, and the next round counts it
-    /// once, at the prerequisite's final choice ([`Self::deferred`]).
+    /// which its declaration holds to bit-identical results. A choice a
+    /// search of this round may still replace (a count's or census's of a
+    /// unit it searches) is recorded: if the search replaces it, another
+    /// round counts the dependant at the replacement ([`Self::stale`]).
     pub(super) fn following(
         &mut self,
         prerequisite: &TuningKey,
-        follower: (&'static str, &str),
         implementation: &NativeImplementation,
         fixed: NativeSpecialization,
-    ) -> Result<Option<NativeSpecialization>, String> {
-        if matches!(self.phase, Phase::Count { .. } | Phase::Census { .. })
-            && self.opened.contains(prerequisite)
-        {
-            self.deferred
-                .insert(unit_key(follower.0, follower.1.to_owned(), &fixed));
-            return Ok(None);
-        }
-        let choice = self.chosen.get(prerequisite).ok_or_else(|| {
+    ) -> Result<NativeSpecialization, String> {
+        let (choice, provisional) = match &self.phase {
+            // A count holds the choices of the units it settled (stored or
+            // pinned) and earlier rounds decided; each unit it searches
+            // stands at its canonical default.
+            Phase::Count { canonical, .. } => match self.chosen.get(prerequisite) {
+                Some(choice) => (Some(choice), false),
+                None => (canonical.get(prerequisite), true),
+            },
+            Phase::Census { launches, .. } => (
+                self.chosen.get(prerequisite),
+                launches.contains_key(prerequisite),
+            ),
+            Phase::Searched | Phase::Serve(_) => (self.chosen.get(prerequisite), false),
+        };
+        let choice = choice.ok_or_else(|| {
             format!(
                 "its prerequisite {} [{}] was not tuned before it",
                 prerequisite.0, prerequisite.1
@@ -3718,47 +3715,35 @@ impl<'a> Tuner<'a> {
         })?;
         let arithmetic = arithmetic_of(implementation, choice)
             .map_err(|name| format!("its prerequisite {} has no parameter `{name}`", prerequisite.0))?;
-        Ok(Some(
-            arithmetic
-                .into_iter()
-                .fold(fixed, |fixed, (name, value)| fixed.with_param(name, value)),
-        ))
-    }
-
-    /// Whether this round deferred a dependant ([`Self::following`]): the
-    /// next round ([`Self::recount`]) counts it at its prerequisite's final
-    /// choice, forms it and searches it.
-    pub fn deferred(&self) -> bool {
-        !self.deferred.is_empty()
-    }
-
-    /// What the round after this one takes before its search, priced from
-    /// this round's: its count, a walk of the same plan; its census, this
-    /// round's census per unit it measured, for each deferred dependant;
-    /// and its mandatory phase, their canonical compiles in the waves the
-    /// compile threads afford, each as long as this round's longest.
-    /// Nothing while no dependant was deferred.
-    fn deferred_round(&self) -> Duration {
-        let deferred = self.deferred.len() as u32;
-        if deferred == 0 {
-            return Duration::ZERO;
+        if provisional {
+            self.provisional.extend(
+                arithmetic
+                    .iter()
+                    .map(|(name, value)| (prerequisite.clone(), name.clone(), *value)),
+            );
         }
-        let census = self
-            .started
-            .elapsed()
-            .saturating_sub(self.round_began + self.round_counted + self.round_mandatory);
-        let measured = self.opened.len().max(1) as u32;
-        let threads = self
-            .memory
-            .compile_threads(self.device)
-            .map_or(deferred, |threads| threads.max(1) as u32);
-        self.round_counted + census * deferred / measured + self.round_compile * deferred.div_ceil(threads)
+        Ok(arithmetic
+            .into_iter()
+            .fold(fixed, |fixed, (name, value)| fixed.with_param(name, value)))
     }
 
-    /// Another round of the search, after a search that deferred a
-    /// dependant ([`Self::deferred`]): on the same tuning clock and budget,
-    /// a count that opens only the units no round has decided, with every
-    /// choice published so far.
+    /// Whether this round's search replaced a choice a dependant was
+    /// counted at ([`Self::following`]): the dependant is then a unit at
+    /// the replacement's values, which another round forms and searches
+    /// ([`Self::recount`]).
+    pub fn stale(&self) -> bool {
+        self.provisional.iter().any(|(prerequisite, name, value)| {
+            self.chosen
+                .get(prerequisite)
+                .and_then(|choice| choice.param(name))
+                != Some(*value)
+        })
+    }
+
+    /// Another round of the search, after a search that left a dependant
+    /// stale ([`Self::stale`]): on the same tuning clock and budget, a count
+    /// that opens only the units no round has decided, with every choice
+    /// published so far.
     pub fn recount(mut self) -> Self {
         let Phase::Searched = self.phase else {
             unreachable!("a round follows a search");
@@ -3766,10 +3751,9 @@ impl<'a> Tuner<'a> {
         self.phase = Phase::Count {
             launches: HashMap::new(),
             searching: Vec::new(),
+            canonical: HashMap::new(),
         };
-        self.opened.clear();
-        self.deferred.clear();
-        self.round_began = self.started.elapsed();
+        self.provisional.clear();
         self.staff = Some(Staff::of(self.device));
         self
     }
@@ -3897,6 +3881,7 @@ impl<'a> Tuner<'a> {
             Phase::Count {
                 launches: HashMap::new(),
                 searching: Vec::new(),
+                canonical: HashMap::new(),
             },
         )
     }
@@ -3952,13 +3937,7 @@ impl<'a> Tuner<'a> {
             first_load_search: false,
             tuned: Vec::new(),
             chosen: HashMap::new(),
-            opened: std::collections::HashSet::new(),
-            deferred: std::collections::HashSet::new(),
-            round_began: Duration::ZERO,
-            round_counted: Duration::ZERO,
-            round_mandatory: Duration::ZERO,
-            round_compile: Duration::ZERO,
-            compiled: 0,
+            provisional: std::collections::HashSet::new(),
             digests: std::cell::RefCell::new(HashMap::new()),
             composed_counted: std::collections::HashSet::new(),
             composed_censused: std::collections::HashSet::new(),
@@ -4082,9 +4061,7 @@ impl<'a> Tuner<'a> {
         // another or of the device's queue. The canonical compiles come
         // first, in the order of `searching`.
         let began = self.started.elapsed();
-        self.round_counted = began.saturating_sub(self.round_began);
         let untuned_programs = untuned.len();
-        let mut compile = Duration::ZERO;
         let groundings = searching
             .iter()
             .map(|key| {
@@ -4147,13 +4124,11 @@ impl<'a> Tuner<'a> {
         }
         while grounded.len() < groundings.len() {
             let observed = grounded.len();
-            // As many as this load has run, its earlier rounds' with this
-            // one's: the most seen held is the load's.
             let threads = self
                 .memory
                 .compile_threads(self.device)
                 .map_or(1, |threads| threads.max(1))
-                .min((self.compiled + observed).max(1))
+                .min(observed.max(1))
                 .min(groundings.len() - observed);
             let narrowed = workers.narrowed(threads);
             let (before, peak) = (
@@ -4182,7 +4157,6 @@ impl<'a> Tuner<'a> {
         if self.memory.host_ceiling_bytes.is_some() {
             self.memory.host_mandatory_bytes = self.memory.host_grown();
         }
-        self.compiled += grounded.len();
         let untuned = grounded.split_off(searching.len());
         let mut untuned_forming = Duration::ZERO;
         for formed in untuned {
@@ -4205,7 +4179,6 @@ impl<'a> Tuner<'a> {
             let formed = grounded
                 .as_ref()
                 .map_or(Duration::ZERO, seismic::Grounded::elapsed);
-            compile = compile.max(formed);
             let mut unit = self
                 .prepared
                 .remove(key)
@@ -4240,8 +4213,6 @@ impl<'a> Tuner<'a> {
             .device_ledger()
             .charged;
         self.memory.peak_bytes = self.memory.mandatory_bytes;
-        self.round_mandatory = self.started.elapsed().saturating_sub(began);
-        self.round_compile = compile;
         let searches = !launches.is_empty() || !self.composed_counted.is_empty();
         self.first_load_search = searches;
         self.phase = Phase::Census {
@@ -4264,9 +4235,7 @@ impl<'a> Tuner<'a> {
             unreachable!("a search follows the census");
         };
         let clock = Elapsed(self.started);
-        // The round that forms the dependants this one deferred runs inside
-        // the budget: this round's work ends before that round's is due.
-        let budget = self.budget().saturating_sub(self.deferred_round());
+        let budget = self.budget();
         // A composed recipe's census is its discovery: work of a class
         // this load has not observed, started while it is not late.
         let discovery = seismic::Quote {
@@ -4729,7 +4698,10 @@ impl<'a> Tuner<'a> {
             if let Some(slot) = slot {
                 self.slots.insert(key.clone(), slot);
             }
-            self.opened.insert(key.clone());
+            let Phase::Count { canonical, .. } = &mut self.phase else {
+                unreachable!("the phase is the count");
+            };
+            canonical.insert(key.clone(), defaults.clone());
             false
         };
         // A surveyed unit is surveyed by the walk after the search.
