@@ -3,6 +3,19 @@
 **One service owner coordinates requests with one physical batch in flight.**
 It schedules legal work and negotiates resource prices without knowing tensor layouts.
 
+## Prompt units
+
+| Unit | What it is | What sets it |
+| --- | --- | --- |
+| Chunk (launch) | One prefill launch: at most the launch class's rows of one prompt | Fixed at load by the plan's launch classes |
+| Prompt group | A prompt's consecutive chunks run layer-major as one chain; its length is the chunks it holds | At each group open: `min(chunks left, places granted)` |
+| Places | The chunks a group's chain holds at once, each with the class's graph slots and buffers | The target is a settled holding: the plan's pass at load, then moved by each Normal reading's settle. A group takes `min(chunks, target)` when it opens |
+| Pass size (`PassLaunches`) | The launches one merged-expert pass covers; its rows are launches × the launch region's rows | Fixed at load: the plan's pass, capped by the workspace arena the launches' graphs fix (`group_pass_rows`) |
+
+A group's places can exceed one pass: a group of more places than the pass covers
+runs `ceil(places / pass launches)` passes over its chain, each reading the routed
+experts once. A banked plan starts its places at the pass it merges.
+
 ## Ownership and progress
 
 | Owner | Responsibility |
