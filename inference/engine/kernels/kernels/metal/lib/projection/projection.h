@@ -1845,7 +1845,9 @@ inline void gemm_tall_paired(thread const In &in, thread const Out &out, thread 
 // C^T = W X^T per block of 8 weight rows, in F32: the A fragment holds 8
 // weight rows by 8 columns, each lane decoding its two values (lane (y, x)
 // holds row y, columns x and x + 1 of the step; the four lanes of a row read
-// the same packet) as scale * code + bias with one F32 rounding. The B
+// the same packet; a decoder that decodes by quarter permutes the columns
+// instead, `gemv_batch_quarters`) as scale * code + bias with one F32
+// rounding. The B
 // fragments are X^T for the step, NB = 1 (M <= 8) or 2 (M <= 16) blocks of 8
 // activation rows, loaded from the activations staged in F32 (exact), whose
 // rows past m_rows are zero. Products are F32 and accumulate in F32, so this
@@ -1901,14 +1903,42 @@ inline typename W::packet gemv_batch_load(thread const Weights<W> &w,
     return w.packet(at, p, run);
 }
 
+// Whether a packet decoder's batched GEMV decodes by quarter: a decoder
+// whose step decodes all eight of its codes at once (a step's every pair
+// costs the whole step, as the progressive exact view's bit planes do)
+// specializes this to true. Its lane of pair index p then decodes step p
+// alone and feeds the pair (2s, 2s + 1) of it to matrix step s: matrix step
+// s, fragment column 2p + t contracts code 8p + 2s + t of the packet, and the
+// activations are staged in that column order (`gemv_batch_column`). The
+// four lanes of a fragment row decode the packet's four steps once, where
+// otherwise each decodes all four steps for its pair. Products are those of
+// the step order and sums differ from it only in their order.
+template <typename W>
+struct gemv_batch_quarters {
+    static constant constexpr bool value = false;
+};
+
+// Where the staging places packet column c (0..31) of a batched GEMV:
+// matrix step s's eight contracted columns are staged consecutively, so its
+// step c / 8 in step order, and the transposed quarter order
+// (`gemv_batch_quarters`) where the decoder decodes by quarter.
+template <bool QUARTERS>
+constexpr uint gemv_batch_column(uint c) {
+    return QUARTERS ? 8u * ((c % 8u) / 2u) + 2u * (c / 8u) + c % 2u : c;
+}
+
 // Accumulate one packet of this lane's weight row into `acc`: the decoded
 // F32 values times the staged steps `x`.
 template <typename W, uint NB>
 inline void gemv_batch_packet(thread simdgroup_float8x8 (&acc)[NB], thread const typename W::packet &a,
     thread const simdgroup_float8x8 (&x)[4][NB], uint pair_index) {
+    float4 even, odd;
+    if (gemv_batch_quarters<W>::value)
+        W::values(a, pair_index, even, odd);
     for (uint step = 0; step < 4; ++step) {
         simdgroup_float8x8 weights;
-        reinterpret_cast<thread float2 &>(weights.thread_elements()) = W::pair_values(a, step, pair_index);
+        reinterpret_cast<thread float2 &>(weights.thread_elements())
+            = gemv_batch_quarters<W>::value ? float2(even[step], odd[step]) : W::pair_values(a, step, pair_index);
         for (uint b = 0; b < NB; ++b)
             simdgroup_multiply_accumulate(acc[b], weights, x[step][b], acc[b]);
     }
@@ -1977,6 +2007,9 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
     uint simdgroups, uint sg, uint lane) {
     constexpr uint chunk = gemv_batch_chunk<NB>();
     constexpr uint pitch = chunk + 4u;
+    constexpr bool QUARTERS = gemv_batch_quarters<W>::value;
+    static_assert(!PAIRED || gemv_batch_quarters<U>::value == QUARTERS,
+        "a paired batched GEMV stages one column order for both tensors");
     threadgroup float *staged = reinterpret_cast<threadgroup float *>(shared);
     ushort2 at = fragment_coordinate(lane);
     uint pair_index = at.x / 2u;
@@ -2023,9 +2056,17 @@ inline void gemv_batch_body(thread const In &in, thread const Out &out, thread c
             float4 even = float4(0.0f), odd = float4(0.0f);
             if (m < m_rows)
                 in.load8(m, c0 + 8u * g, 0.0f, even, odd);
-            threadgroup float4 *dst = reinterpret_cast<threadgroup float4 *>(staged + m * pitch + 8u * g);
-            dst[0] = float4(even.x, odd.x, even.y, odd.y);
-            dst[1] = float4(even.z, odd.z, even.w, odd.w);
+            if (QUARTERS) {
+                // Step g % 4's pair j is packet columns 8 (g % 4) + 2j, + 1.
+                threadgroup float *packet = staged + m * pitch + 32u * (g / 4u);
+                for (uint j = 0; j < 4u; ++j)
+                    *reinterpret_cast<threadgroup float2 *>(packet + gemv_batch_column<true>(8u * (g % 4u) + 2u * j))
+                        = float2(even[j], odd[j]);
+            } else {
+                threadgroup float4 *dst = reinterpret_cast<threadgroup float4 *>(staged + m * pitch + 8u * g);
+                dst[0] = float4(even.x, odd.x, even.y, odd.y);
+                dst[1] = float4(even.z, odd.z, even.w, odd.w);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (!active)

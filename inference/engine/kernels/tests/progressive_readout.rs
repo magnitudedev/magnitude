@@ -575,7 +575,7 @@ fn progressive_selection_selects_what_the_full_readout_selects() {
     let head = Head::new(3001, 2048, 41);
     let mut rng = Rng(5);
     for peaked in [false, true] {
-        for o in [1usize, 2, 3, 5, 8] {
+        for o in [1usize, 2, 3, 4, 5, 8] {
             let case = Case::new(o, &head, peaked, &mut rng);
             let t = case.tensors(&device, &head);
             for params in [(8u64, 2u64, 8u64), (4, 1, 4), (8, 4, 4)] {
@@ -781,6 +781,90 @@ fn planes_readout_projects_every_row_class() {
                 assert!(
                     (device - host).abs() <= 4e-3 * magnitude + 1e-6,
                     "O {o} row {row} token {token}: planes {device} host {host}"
+                );
+            }
+        }
+    }
+}
+
+/// Metal's batched full pass (from BATCH_FROM rows) decodes each code once
+/// for every row, where the scalar GEMV decodes it once a row; both project
+/// the same exact view. At every verify row count the batched pass serves
+/// by default (3, 4, 5 and 8 rows), on flat and peaked rows, it selects what
+/// the scalar pass selects, and each logit stays within F32 rounding of the
+/// scalar one (relative to the terms' magnitude).
+#[test]
+fn planes_batched_full_pass_selects_what_the_scalar_pass_selects() {
+    let Some(device) = device() else { return };
+    if device.backend() != BackendName::Metal {
+        return;
+    }
+    let head = Head::new(3001, 2048, 47);
+    let (v, d) = (head.v, head.d);
+    let mut rng = Rng(13);
+    let project = |t: &Tensors, batch_from: u64| {
+        read_f32(
+            &readout_planes_rows::native_for_device_with(
+                &device,
+                readout_planes_rows::Elements {
+                    NW: Element::bf16(),
+                    A: Element::bf16(),
+                },
+                &scan_spec(&device, &head, true, 8, 2).with_param("BATCH_FROM", batch_from),
+            )
+            .unwrap()
+            .call(readout_planes_rows::Args {
+                softcap: 0.0,
+                hidden: &t.hidden,
+                norm: &t.norm,
+                top: &t.top,
+                bit3: &t.bit3,
+                rest: &t.rest,
+                scales: &t.scales,
+                out_rows: &t.out_rows,
+                epsilon: EPSILON,
+            })
+            .unwrap()
+            .value,
+        )
+    };
+    for peaked in [false, true] {
+        for o in [3usize, 4, 5, 8] {
+            let case = Case::new(o, &head, peaked, &mut rng);
+            let t = case.tensors(&device, &head);
+            // The scalar GEMV serves below BATCH_FROM 9, the batched pass from 3.
+            let (scalar, batched) = (project(&t, 9), project(&t, 3));
+            for row in 0..o {
+                let source = case.out_rows[row] as usize;
+                let hidden = &case.hidden[source * d..(source + 1) * d];
+                let mean = hidden.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / d as f64;
+                let inverse = 1.0 / (mean + f64::from(EPSILON)).sqrt();
+                let features = hidden
+                    .iter()
+                    .zip(&case.norm)
+                    .map(|(x, w)| {
+                        f64::from(bf16_round(
+                            (f64::from(*x) * inverse * f64::from(bf16_round(*w))) as f32,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                for token in 0..v {
+                    let magnitude = head
+                        .row(token)
+                        .iter()
+                        .zip(&features)
+                        .map(|(w, x)| (f64::from(*w) * x).abs())
+                        .sum::<f64>();
+                    let (a, b) = (scalar[row * v + token], batched[row * v + token]);
+                    assert!(
+                        (f64::from(a) - f64::from(b)).abs() <= 1e-5 * (magnitude + 1e-6),
+                        "peaked {peaked} O {o} row {row} token {token}: scalar {a} batched {b}"
+                    );
+                }
+                assert_eq!(
+                    case.selection.select(row, &batched, v),
+                    case.selection.select(row, &scalar, v),
+                    "peaked {peaked} O {o} row {row}: the batched pass selects differently"
                 );
             }
         }

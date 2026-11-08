@@ -159,6 +159,14 @@ struct Weights<packets::ProgressiveTop> {
     static located after(located at, uint r) { return at + r; }
 };
 
+// The exact view's step assembles all eight of its codes from five planes at
+// once, so its batched GEMV decodes by quarter (`gemv_batch_quarters`): a
+// pair alone costs the whole step.
+template <>
+struct gemv_batch_quarters<packets::ProgressiveExact> {
+    static constant constexpr bool value = true;
+};
+
 template <>
 struct Weights<packets::ProgressiveExact> {
     device const uint *top;
