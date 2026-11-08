@@ -108,13 +108,9 @@ fn attention_output[M, D, SN, IN, Q, W, OS, OB](hidden: &tensor[M, SN * D] f32, 
 # scratch, over the gated rows (the weights' factors a simdgroup per weight
 # row), for weights admitted to it (`form(OW, PACK)`); devices without the
 # packed path run the staged tile, with its results.
-# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
-# 0.85x the time batched that they took on the GEMV (30 opens, at most
-# 0.90x), and 0.86x for a 2560-wide model. Fewer than 3 rows and more than 4
-# launch alike either way.
 native attention_output for metal from "metal/attention_output.metal":
     static (D, SN, IN, Q, W, OS, OB)
-    params (arithmetic BATCH_FROM in [3, 5, 9] default 3, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
+    params (arithmetic BATCH_FROM in [5, 3, 9] default 5, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
         arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
     where Q * W > 0 and (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0 and form(OW, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and OB > 0 and form(OW, PACK_RESIDUE) == 1)) and (MATRIX == 0 or (Q * W % 256 == 0 and form(OW, MATRIX) == 1))
     scratch partials bytes (SPLIT * M * D * 4) when M > 64 and SPLIT > 1
@@ -755,17 +751,11 @@ fn attention_decode[M, T, KV, G, P, S, I, U, F, N, NV, R, SK](
 # holds the G / SLICES query heads of its slice, W / 32 columns per lane.
 # (CUDA: equal partitions.) MATRIX selects the grouped-query matrix form, as
 # `attention_decode_k8v4`'s: keys enter the score product in the activation
-# dtype, values the output product as F16. SLICES defaults to the fewest
-# slices that hold a lane to 8 elements, else to 4 (the most the default 4
-# simdgroups take) or the most the group splits into. On M4 Pro (2026-11-07)
-# against 1 slice, the other parameters at their defaults: 2 slices (8
-# elements against 16) took 0.84x the time at G = 4, W = 128 (26 opens of
-# Qwen3.6 35B's drafter, 2 to 8 rows, at most 0.88x), and 4 slices (16 against
-# 64) 0.45x at G = 8, W = 256 (6 opens, 1 row).
+# dtype, values the output product as F16.
 native attention_decode for metal from "metal/attention_decode.metal":
     static (KV, G, P, S, I, U, F, N, NV, SK)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
-        arithmetic SIMDS in [4, 8, 2, 16] default 4, arithmetic SLICES in [1, 2, 4, 8] default least where G % SLICES == 0 and ((G / SLICES) * ((2 * P + S) / 32) <= 8 or SLICES == 4 or G % (2 * SLICES) != 0),
+        arithmetic SIMDS in [4, 8, 2, 16] default 4, arithmetic SLICES in [1, 2, 4, 8] default 1,
         arithmetic form MATRIX in [0, 1] default 0, arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1)
     where SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ceil_div(TOKENS * G, 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * G, 8) * 8 * KEYS * 4, ceil_div(TOKENS * G, 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * ceil_div(TOKENS * G, 8) * 8 * 8 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
@@ -1352,16 +1342,13 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, B, BR, L, HT, KC
 # were each the best somewhere; 64 was never the best and at its closest 1.33x
 # the best (17 units), 128 at its closest 5.7x (8), 256 13x (2). So a lane
 # holds more than 32 elements only where the group cannot be split further.
-# SLICES defaults to the fewest slices that hold a lane to 8 elements, else to
-# 4 (the most the default 4 simdgroups take) or the most the group splits
-# into, as `attention_decode`'s does. On M4 Pro (2026-11-07, Qwen3.6 35B: G =
-# 8, W = 256) 4 slices (16 elements) against 2 (32), the other parameters at
-# their defaults, took 0.63x the time at 1 row (49 opens, at most 0.76x, at
-# 1792 to 28297 keys of history), 0.88x at 2 rows, 0.74x at 4 and 0.69x at 8.
+# SLICES starts at 2: over the 22 units searched to exhaustion the first
+# admitted configuration is then at most 1.67x the best (median 1.11x), where
+# starting at 1 it was at most 9.17x (median 1.53x).
 native attention_decode_k8v4 for metal from "metal/attention_decode_k8v4.metal":
     static (KV, G, P, S, I, U, F, N, NV, KC, KP, VC, VP, SK)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
-        arithmetic SIMDS in [4, 8, 2, 16] default 4, arithmetic SLICES in [2, 1, 4, 8] default least where G % SLICES == 0 and ((G / SLICES) * ((2 * P + S) / 32) <= 8 or SLICES == 4 or G % (2 * SLICES) != 0),
+        arithmetic SIMDS in [4, 8, 2, 16] default 4, arithmetic SLICES in [2, 1, 4, 8] default 2,
         arithmetic form MATRIX in [0, 1] default 0, arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1, arithmetic form HEAD_BAND in [0, 8] default 0)
     where SK <= 1 and ((HEAD_BAND == 0 and (32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or (G / SLICES) * ((2 * P + S) / 32) <= 32 or SLICES == 8 or G % (2 * SLICES) != 0) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 - min(2, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)))) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max((SIMDS * KEYS * ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) * 2), (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4))) + min(1, max(1, SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) - 1) * (((ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 2) + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + (min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * (ceil_div(TOKENS * G, 8) * 8) * KEYS * 4), (ceil_div(TOKENS * G, 8) * 8) * (2 * P + S) * 4) + (SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * (ceil_div(TOKENS * G, 8) * 8) * 8))) <= 32768 or (min(TOKENS / 4, 4 / TOKENS) * min(1, 8 / G) * min((2 * P + S) / 128, 256 / (2 * P + S)) * min(SIMDS / TOKENS, TOKENS / SIMDS) * min(1, 32768 / (max(TOKENS * 8 * (2 * P + S) * 2, max(KEYS * (2 * P + S) * 4, 8 * (2 * P + S) * 4)) + 8 * 8))) == 1)))) or (32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and P % ((2 * P + S) / 32) == 0 and HEAD_BAND == 8 and MATRIX == 1 and TOKENS == 2 and SIMDS == 4 and SLICES == 1 and (2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and max(2 * 8 * (2 * P + S) * 2, KEYS * (2 * P + S) * 4 + 2 * SIMDS * 8 * KEYS * 4) + 64 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)

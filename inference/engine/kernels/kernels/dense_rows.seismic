@@ -95,12 +95,9 @@ fn dense_expand[M, O, H, F, GS, US, GB, UB](residual: &tensor[M, H] f32, norm: &
     glu(gate, up, product, activation)
     return product
 
-# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
-# 0.91x the time batched that they took on the GEMV (24 opens, at most
-# 0.94x). Fewer than 3 rows and more than 4 launch alike either way.
 native dense_expand for metal from "metal/dense_expand.metal":
     static (H, F, GS, US, GB, UB)
-    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default 3, form TALL in [1, 0] default 1, arithmetic form INT8 in [0, 1] default 0,
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5, form TALL in [1, 0] default 1, arithmetic form INT8 in [0, 1] default 0,
         arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
     where GS <= 1 and US <= 1 and (TALL == 0 or H % 128 == 0) and (INT8 == 0 or (TALL == 1 and H % 512 == 0 and F % 32 == 0 and form(GW, INT8) == 1 and form(UW, INT8) == 1 and form(GW, INT8_INTERLEAVED) == form(UW, INT8_INTERLEAVED))) and (PACK == 0 or (TALL == 1 and INT8 == 0 and H % 256 == 0 and H < 1048576 and F % 32 == 0 and form(GW, PACK) == 1 and form(UW, PACK) == 1 and form(GW, PACK_FOLDS) == form(UW, PACK_FOLDS) and form(GW, PACK_RESIDUE) == form(UW, PACK_RESIDUE))) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and ((GB > 0 and form(GW, PACK_RESIDUE) == 1) or (UB > 0 and form(UW, PACK_RESIDUE) == 1)))) and (MATRIX == 0 or (H % 256 == 0 and form(GW, MATRIX) == 1 and form(UW, MATRIX) == 1))
     scratch normalized bytes ((O + TALL * (ceil_div(O, 64) * 64 - O)) * H * 2) when O >= BATCH_FROM
@@ -273,12 +270,9 @@ fn dense_output[M, O, H, F, DS, DB](residual: &tensor[M, H] f32,
 # that the F16 fold cannot overflow. `dense_expand` packs its normalized rows
 # alike, with one such pair of tables per weight (`gate_factors`,
 # `up_factors`, `gate_scales`, `up_scales`).
-# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
-# 0.94x the time batched that they took on the GEMV (23 opens, at most
-# 0.94x). Fewer than 3 rows and more than 4 launch alike either way.
 native dense_output for metal from "metal/dense_output.metal":
     static (H, F, DS, DB)
-    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default 3, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
         arithmetic form INT8 in [0, 1] default 0, arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
     where DS <= 1 and (TALL == 0 or (SPLIT == 1 and F % 128 == 0)) and (INT8 == 0 or (TALL == 1 and F % 512 == 0 and H % 64 == 0 and form(DW, INT8) == 1)) and (INT8 == 1 or INT8_TILE == 128) and (PACK == 0 or (TALL == 1 and INT8 == 0 and F % 256 == 0 and F < 1048576 and H % 64 == 0 and form(DW, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and DB > 0 and form(DW, PACK_RESIDUE) == 1)) and (MATRIX == 0 or form(DW, MATRIX) == 1)
     scratch partials bytes (SPLIT * O * H * 4) when O > 64 and SPLIT > 1
@@ -743,13 +737,9 @@ fn project_rows[M, K, N, WS, WB](source: &tensor[M, K] A, weight: &tensor[N, K] 
 # source rows into `fragments`; the PACK form's launches, error class and
 # transient scratch are `dense_output`'s, the weights' factors per 32-row
 # weight tile).
-# BATCH_FROM defaults to 3: on M4 Pro (2026-11-07, Qwen3.6 35B) 4 rows took
-# 0.81x the time batched that they took on the GEMV (22 opens, at most
-# 0.84x), and 0.91x for a 2560-wide model. Fewer than 3 rows and more than 4
-# launch alike either way.
 native project_rows for metal from "metal/project_rows.metal":
     static (K, N, WS, WB)
-    params (arithmetic BATCH_FROM in [3, 5, 9, 2] default 3, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
+    params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
         arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
     where WS <= 1 and (TALL == 0 or (SPLIT == 1 and K % 128 == 0)) and (PACK == 0 or (TALL == 1 and K % 256 == 0 and K < 1048576 and N % 64 == 0 and form(W, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and WB > 0 and form(W, PACK_RESIDUE) == 1)) and (MATRIX == 0 or form(W, MATRIX_SYMMETRIC) == 1)
     scratch partials bytes (SPLIT * M * N * 4) when M > 64 and SPLIT > 1
