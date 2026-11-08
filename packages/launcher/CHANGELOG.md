@@ -1,5 +1,38 @@
 # @magnitudedev/cli
 
+## 0.2.17
+
+### Patch Changes
+
+- [`a68074a`](https://github.com/magnitudedev/magnitude/commit/a68074ae49f6c6bdfb3a41943883d79d6adf8261) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Faster CPU inference on ARM. On ARM CPUs with the dot-product instructions, such as AWS Graviton and Ampere, Q8_0 models use new kernels for prompt processing and generation, and Linux ARM64 builds now detect these instructions at run time.
+
+  - Prompt processing is 4–13× faster and generation 1.4–5× faster than 0.2.16. For example, Qwen3.5 4B Q4 on Graviton4 goes from 3.8 to 45 tokens/s for prompts and from 3.0 to 14.7 tokens/s for generation.
+
+- [`a68074a`](https://github.com/magnitudedev/magnitude/commit/a68074ae49f6c6bdfb3a41943883d79d6adf8261) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Removing one version of a catalog model no longer deletes the image file shared by another installed version, which left that version unable to read images.
+
+  - Concurrent requests to a model that drafts with its own MTP heads no longer fail with "a causal head in a drafting batch has no selection".
+  - A dropped connection while a download is starting is now retried instead of failing the download, and a failed download logs the reason.
+  - When a newer release comes out after an update was downloaded, Magnitude offers the newer one and replaces the older download.
+  - The macOS app icon has its tighter rounded corners back.
+
+- [`a68074a`](https://github.com/magnitudedev/magnitude/commit/a68074ae49f6c6bdfb3a41943883d79d6adf8261) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - See what a model's memory is made of: weights, context and overhead.
+
+  - In the app, the info icon next to a model's memory on its card, and next to Fit on the Discover radar, shows the breakdown.
+  - `magnitude catalog show`, `magnitude models status` and their `--json` output include the breakdown. `magnitude hardware` shows a loaded model's weights, context and overhead separately, counted the same way as in Settings.
+
+- [`a68074a`](https://github.com/magnitudedev/magnitude/commit/a68074ae49f6c6bdfb3a41943883d79d6adf8261) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - More accurate memory estimates on NVIDIA and AMD GPUs, so models fit when they should and don't run out of memory when loaded.
+
+  - On CUDA, the estimate counts only memory the allocator can't reuse instead of a fixed 1 GB allowance. Small GPUs fit more: models on an 8 GB card that were limited to 32K now get up to their full 128K context.
+  - Mixture-of-experts models no longer use gigabytes more GPU memory than their estimate on CUDA and Vulkan.
+  - On CUDA, memory the driver reserves for running kernels is now counted, so it can't push a loaded model past what was estimated.
+
+- [`a68074a`](https://github.com/magnitudedev/magnitude/commit/a68074ae49f6c6bdfb3a41943883d79d6adf8261) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Run models your computer can't hold at full context. Each model is now served at the largest context that fits in memory, from 32K up to its full length, instead of being refused when its full context doesn't fit.
+
+  - Discover recommends the highest-quality version that reaches 64K context, falling back to 32K.
+  - Chat, the API (`/v1/models`) and connected agents such as Claude Code, Codex and OpenCode use the served context. Claude Code compacts before reaching it instead of assuming 200K. A prompt longer than the served context is refused with `context_length_exceeded`.
+  - A model's memory breakdown shows the context it's served at when the full context doesn't fit, and `models status` explains why a model doesn't fit.
+  - A model waits for its memory check before loading, so it never loads at a context the computer can't hold.
+
 ## 0.2.16
 
 ### Patch Changes
