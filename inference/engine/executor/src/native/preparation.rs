@@ -46,7 +46,7 @@ use crate::operators::streams::SiteEntryBindings;
 use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
 use crate::{
     DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, ShortConvBinding,
-    StateSpaceBinding, SublayerTail, WeightPlan,
+    StateSpaceBinding, SublayerTail,
 };
 use magnitude_family_contracts::{
     ModelDefinition, SublayerIndex, WeightKind, WeightScope,
@@ -631,17 +631,6 @@ fn selected_row_classes(bound: usize) -> Vec<u64> {
         .collect()
 }
 
-/// The weights a stored readout recipe was qualified over, `packed` and its
-/// norm (none for unnormalized partials), by their persistent identities:
-/// the same at every open of the package, so a winner stored by one open is
-/// read by the next.
-fn readout_weights(packed: &WeightPlan, norm: Option<&WeightPlan>) -> String {
-    match norm {
-        Some(norm) => format!("{:?}/{:?}", packed.persistent_identity(), norm.persistent_identity()),
-        None => format!("{:?}/no-norm", packed.persistent_identity()),
-    }
-}
-
 /// A reader of a candidate scope, prepared on its packed projection until
 /// every reader of the scope is known ([`Preparation::resolve_readout_scopes`]).
 /// A scope is stored in one form: when it is stored as its views, every
@@ -883,7 +872,10 @@ impl<'a> Preparation<'a> {
             .or_insert_with(|| Rc::new(RefCell::new(None)))
             .clone();
         let digest = format!("{top}/{levels:?}");
-        let weights = readout_weights(packed, norm_plan);
+        let norm_identity = norm_plan.map_or_else(
+            || "no-norm".to_owned(),
+            |plan| format!("{:?}", plan.storage_identity()),
+        );
         let mut certified = Vec::new();
         for rows in selected_rows {
             let point = super::tuning::PointShape {
@@ -899,8 +891,10 @@ impl<'a> Preparation<'a> {
             // budget it was qualified within.
             let budget = self.tuning.settings().map(|settings| settings.budget);
             let key = crate::TuningCacheKey::of(&format!(
-                "readout-recipe-v5/budget={budget:?}/device={:?}/{weights}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/dependency={dependency:?}/{digest}",
+                "readout-recipe-v5/budget={budget:?}/device={:?}/{:?}/{}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/dependency={dependency:?}/{digest}",
                 device.tuning_identity(),
+                packed.storage_identity(),
+                norm_identity,
                 self.epsilon.to_bits(),
                 softcap.to_bits(),
                 point.rows
@@ -928,19 +922,37 @@ impl<'a> Preparation<'a> {
             else {
                 continue;
             };
-            // The choice and its costs are the record of the comparison
-            // against this load's canonical (`ReadoutContender::record`).
-            let class_certified = selected && reader.certifies();
+            let specification = self
+                .tuning
+                .choice(&dependency)
+                .map(|choice| format!("{choice:?}"));
+            let evidence = state.borrow().canonical_specification.clone().or_else(|| {
+                self.tuning
+                    .stored_results()
+                    .and_then(|cache| cache.readout_canonical_choice(&key))
+            });
+            // Cached evidence is consumed as-is. A mismatch falls back;
+            // it never grants a new search or post-budget qualification.
+            // A pin's choice stands on the pin.
+            let class_certified = selected
+                && reader.certifies()
+                && specification.is_some()
+                && (super::tuning::pinned::tunes_nothing() || evidence == specification);
             if class_certified {
+                state.borrow_mut().canonical_specification = specification;
                 certified.push(point.rows);
             }
-            let state = state.borrow();
+            let costs = state.borrow().costs.or_else(|| {
+                self.tuning
+                    .stored_results()
+                    .and_then(|cache| cache.readout_costs(&key))
+            });
             self.readout_classes.entry(scope).or_default().insert(
                 key.as_str().to_owned(),
                 ClassCost {
-                    weight: state.weight,
+                    weight: state.borrow().weight,
                     certified: class_certified,
-                    costs: state.costs,
+                    costs,
                 },
             );
         }
@@ -3928,59 +3940,5 @@ impl<'a> Preparation<'a> {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::readout_weights;
-    use crate::planning::fixtures::{LIMITS, separate_draft_fixture};
-    use crate::{ComponentSelection, ModelLoadPlan, PlannedMethod};
-    use magnitude_artifacts::{ArtifactIdentity, PackageManifest};
-    use magnitude_family_contracts::{ModelDefinition, WeightKind, WeightScope};
-
-    /// A readout recipe one open stores is read by every later open of the
-    /// package: the weights its record is keyed on render alike whatever
-    /// identities each open issued, from a plain open to a later one that
-    /// adds a draft reading the target's projection.
-    #[test]
-    fn a_stored_recipe_is_read_by_a_later_open() {
-        let (mut drafting_definition, mut drafting) = separate_draft_fixture(false);
-        let (mut plain_definition, mut plain) = (drafting_definition.clone(), drafting.clone());
-        plain_definition.draft = None;
-        plain.draft = None;
-        // Each open issues its own identities.
-        plain.identity.target = ArtifactIdentity([1; 32]);
-        plain_definition.artifact_identity = plain.identity;
-        drafting.identity.target = ArtifactIdentity([2; 32]);
-        drafting_definition.artifact_identity = drafting.identity;
-        let weights = |definition: &ModelDefinition, manifest: &PackageManifest, method: PlannedMethod| {
-            let load = ModelLoadPlan::derive(
-                manifest,
-                definition,
-                ComponentSelection {
-                    head: method != PlannedMethod::Plain,
-                    vision: false,
-                },
-                seismic::Layout::Rows16,
-                method,
-                LIMITS,
-            )
-            .unwrap()
-            .with_readout_candidates(definition)
-            .unwrap();
-            let plan = |kind| {
-                super::super::tuning::weight_plan(&load, WeightScope::Target, kind).unwrap()
-            };
-            readout_weights(plan(WeightKind::Output), Some(plan(WeightKind::OutputNorm)))
-        };
-        let drafting_method = PlannedMethod::DFlash {
-            proposals: 3,
-            widths: crate::DraftWidths::Adaptive,
-        };
-        assert_eq!(
-            weights(&plain_definition, &plain, PlannedMethod::Plain),
-            weights(&drafting_definition, &drafting, drafting_method),
-        );
     }
 }

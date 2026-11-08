@@ -993,9 +993,76 @@ fn target_reading_head_plans_its_program_weights_and_charge() {
 /// once the scope is stored as them.
 #[test]
 fn a_separate_draft_reads_the_projection_as_it_is_stored() {
+    use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
+    use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest};
+    use magnitude_family_contracts::{
+        BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod, RmsNorm,
+        TapPoint, TokenId, WeightDescriptor,
+    };
     for owns_output in [false, true] {
-        let (definition, manifest) =
-            crate::planning::fixtures::separate_draft_fixture(owns_output);
+        let mut definition = crate::planning::fixtures::fixture_definition();
+        let mut manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let (hidden, vocabulary) = (definition.decoder.hidden, definition.decoder.vocabulary);
+        let norm = |name: &str| RmsNorm {
+            weight: WeightDescriptor::stored(name, &[hidden]),
+            epsilon: 1e-6,
+        };
+        definition.draft = Some(DraftDefinition {
+            method: DraftMethod::DFlash,
+            convolutions: None,
+            taps: vec![TapPoint::Exit],
+            fusion: WeightDescriptor::stored("draft_fusion", &[hidden, hidden]),
+            fusion_norm: norm("draft_fusion_norm"),
+            embedding: DraftEmbedding::Target,
+            output: owns_output
+                .then(|| WeightDescriptor::stored("draft_output", &[vocabulary, hidden])),
+            embedding_scale: 1.0,
+            blocks: definition.decoder.blocks.clone(),
+            block_attention: vec![BlockAttention::Bidirectional],
+            output_norm: norm("draft_output_norm"),
+            logit_softcap: Some(0.1),
+            block_size: 2,
+            mask_token: TokenId(0),
+            layout: BlockLayout::MaskSlots,
+        });
+        definition.validate().unwrap();
+        let draft = definition.draft.as_ref().unwrap();
+        let mut offset = 0;
+        let tensors = crate::operators::draft::fusion_weights(draft)
+            .into_iter()
+            .chain(crate::operators::draft::draft_weights(draft).unwrap())
+            .map(|(_, descriptor)| {
+                let nbytes = descriptor.shape.iter().product::<u64>() * 2;
+                let tensor = TensorDescriptor {
+                    name: descriptor.name.clone(),
+                    shape: descriptor.shape.clone(),
+                    encoding: Encoding::F16,
+                    offset,
+                    nbytes,
+                };
+                offset += nbytes;
+                tensor
+            })
+            .collect();
+        manifest.draft = Some(ComponentManifest {
+            files: vec![ComponentFile {
+                path: "draft-fixture.gguf".into(),
+                size: offset,
+            }],
+            identity: ArtifactIdentity([9; 32]),
+            tensors,
+        });
+        let (component, descriptor) = match &draft.output {
+            Some(output) => (manifest.draft.as_mut().unwrap(), output),
+            None => (&mut manifest.target, &definition.decoder.exit.output),
+        };
+        let output = component
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == descriptor.name)
+            .unwrap();
+        output.encoding = Encoding::Q8_0;
+        output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,

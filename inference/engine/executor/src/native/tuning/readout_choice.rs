@@ -49,7 +49,7 @@ use seismic::{
     BackendName, BoundEntry, BuildError, Element, Entry, NativeKernel, NativeSpecialization,
     NativeTensorBatch, Tensor,
 };
-use std::{cell::RefCell, collections::HashMap, rc::Rc, time::Instant};
+use std::{cell::RefCell, rc::Rc, time::Instant};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadoutRecipe {
@@ -75,6 +75,7 @@ pub(crate) struct ReadoutRecipe {
 #[derive(Default)]
 pub(crate) struct QualifiedRecipe {
     pub progressive: Option<ProgressiveReadoutKernels>,
+    pub canonical_specification: Option<String>,
     /// The class's measured costs, from its census on and its qualification
     /// once timed; kept whatever the class's choice.
     pub costs: Option<RecipeCosts>,
@@ -132,13 +133,7 @@ pub(crate) type RecipePreparation = Rc<RefCell<Option<ProgressiveReadoutKernels>
 pub(crate) struct ReadoutContender<'a> {
     pub recipe: ReadoutRecipe,
     pub point: PointShape,
-    /// The recipe's unit: its weights, programs, rows and canonical unit.
     pub key: TuningCacheKey,
-    /// Where its comparison is recorded ([`Self::record`]), once the
-    /// canonical unit's choice is final.
-    record: Option<TuningCacheKey>,
-    /// The record was another load's, taken as it stands.
-    adopted: bool,
     /// Where the completed choice is stored.
     pub cache: Option<&'a KernelCache>,
     /// Where a stored choice is read from: none for a fresh preparation.
@@ -187,8 +182,6 @@ impl<'a> ReadoutContender<'a> {
             recipe,
             point,
             key,
-            record: None,
-            adopted: false,
             cache,
             stored,
             state,
@@ -201,48 +194,6 @@ impl<'a> ReadoutContender<'a> {
                 ..Default::default()
             },
         }
-    }
-
-    /// Key the record of the comparison against `canonical`, the canonical
-    /// unit's final choice, as it serves the compared rows
-    /// ([`ReadoutRecipe::served_canonical`]): loads whose canonicals serve
-    /// those rows alike share a record, and one whose canonical serves them
-    /// otherwise compares against its own and keeps its own.
-    fn record(
-        &mut self,
-        device: &seismic::Device,
-        canonical: &NativeSpecialization,
-    ) -> Result<&TuningCacheKey, CatalogFailure> {
-        let served = self.recipe.served_canonical(device, canonical, self.point.rows)?;
-        self.receipt.canonical_specification = Some(served.clone());
-        let key = TuningCacheKey::of(&format!("{}\ncanonical {served}", self.key.as_str()));
-        Ok(self.record.insert(key))
-    }
-
-    /// The settled choice stored under `record`, when one is, with the
-    /// costs it measured the class at, which price its scope's stored form.
-    fn stored_choice(&mut self, record: &TuningCacheKey) -> Option<bool> {
-        let cache = self.stored?;
-        let selected = cache.readout_choice(record)?;
-        self.receipt.costs = cache.readout_costs(record);
-        self.state.borrow_mut().costs = self.receipt.costs;
-        Some(selected)
-    }
-
-    /// The deferred lookup of a load that searched the canonical unit
-    /// itself: once its choice `canonical` is final, another load's settled
-    /// comparison against a canonical that serves these rows alike is taken
-    /// as it stands, and is not recorded again. None when this load is the
-    /// first to compare against it.
-    fn adopt(
-        &mut self,
-        device: &seismic::Device,
-        canonical: &NativeSpecialization,
-    ) -> Result<Option<bool>, CatalogFailure> {
-        let record = self.record(device, canonical)?.clone();
-        let stored = self.stored_choice(&record);
-        self.adopted = stored.is_some();
-        Ok(stored)
     }
 }
 
@@ -433,48 +384,6 @@ impl ReadoutRecipe {
                 .map(ProjectionKernels::RawPacked)
                 .map_err(fail)
         }
-    }
-
-    /// The canonical projection under `specialization` as it serves `rows`
-    /// rows ([`seismic::served_key`]): what a paired comparison at `rows`
-    /// measured the bounded recipe against. A choice that differs only in
-    /// what other row counts run, such as the row count from which a
-    /// batched launch serves, serves `rows` alike.
-    pub(crate) fn served_canonical(
-        self,
-        device: &seismic::Device,
-        specialization: &NativeSpecialization,
-        rows: u64,
-    ) -> Result<String, CatalogFailure> {
-        if self.prepared {
-            self.served(device, &self.project_entry(), specialization, rows)
-        } else {
-            self.served(device, &self.head_entry(), specialization, rows)
-        }
-    }
-
-    fn served<E: Entry>(
-        self,
-        device: &seismic::Device,
-        entry: &BoundEntry<E>,
-        specialization: &NativeSpecialization,
-        rows: u64,
-    ) -> Result<String, CatalogFailure> {
-        let implementation = entry
-            .offered(device)
-            .map_err(fail)?
-            .ok_or_else(|| fail("the canonical projection is not offered on the device"))?;
-        // The rows read (`M`) are the rows projected (`O`), as the paired
-        // comparison runs them (`RecipeCase::new`).
-        let dimensions = std::collections::BTreeMap::from([("M".into(), rows), ("O".into(), rows)]);
-        let key = seismic::served_key(
-            &implementation,
-            &self.statics(device.backend(), entry)?,
-            &dimensions,
-            specialization,
-        )
-        .map_err(fail)?;
-        Ok(format!("{key:?}"))
     }
 }
 
@@ -932,16 +841,8 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
     fn label(&self) -> &'static str {
         "readout_recipe"
     }
-    fn cached(
-        &mut self,
-        device: &seismic::Device,
-        chosen: &HashMap<TuningKey, NativeSpecialization>,
-    ) -> Result<Option<bool>, CatalogFailure> {
-        let Some(canonical) = chosen.get(&self.dependency) else {
-            return Ok(None);
-        };
-        let record = self.record(device, canonical)?.clone();
-        Ok(self.stored_choice(&record))
+    fn cached(&self) -> Option<bool> {
+        self.stored.and_then(|c| c.readout_choice(&self.key))
     }
     fn census(
         &mut self,
@@ -1046,11 +947,11 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             self.receipt.reason = "canonical dependency has no finalized choice".into();
             return Ok(false);
         };
-        if let Some(selected) = self.adopt(inputs.device, &specialization)? {
-            return Ok(selected);
-        }
         let packed = self.recipe.canonical(inputs.device, &specialization)?;
         check_deadline!();
+        let canonical_specification = format!("{specialization:?}");
+        self.receipt.canonical_specification = Some(canonical_specification.clone());
+        self.state.borrow_mut().canonical_specification = Some(canonical_specification);
         let state = self.state.borrow();
         let Some(progressive) = &state.progressive else {
             self.receipt.reason = "candidate was not formed".into();
@@ -1213,13 +1114,11 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             state.costs = self.receipt.costs;
             if !selected {
                 state.progressive = None;
+                state.canonical_specification = None;
             }
         }
-        // A comparison is recorded against the canonical it compared with:
-        // none is known before that unit's choice is final, and a record
-        // taken from another load stands as it was.
-        if let (Some(cache), Some(record), false) = (self.cache, &self.record, self.adopted) {
-            cache.store_readout_choice(record, &self.receipt);
+        if let Some(cache) = self.cache {
+            cache.store_readout_choice(&self.key, &self.receipt);
         }
         Ok(())
     }
@@ -1374,231 +1273,6 @@ mod tests {
                         .unwrap_or_else(|error| panic!("{form}: {error:?}"));
                 }
             }
-        }
-    }
-
-    /// The recipe of the projection a Metal or CUDA test device reads, with
-    /// its canonical head's declared defaults.
-    fn recipe_on(device: &seismic::Device) -> (ReadoutRecipe, NativeSpecialization) {
-        let backend = device.backend();
-        let recipe = ReadoutRecipe {
-            scope: WeightScope::Target,
-            norm_scope: WeightScope::Target,
-            norm: Element::bf16(),
-            weight: Element::stored("q8g32s", resident_layout(ExecutionPath::Native, backend))
-                .unwrap(),
-            activation: Element::bf16(),
-            epsilon: 1e-6,
-            softcap: 0.,
-            prepared: false,
-            vocabulary: 4096,
-            hidden: 2048,
-            parts: 1,
-            norm_extent: 2048,
-            depth: ProgressiveCodeDepth::Eight,
-            scale_extent: 0,
-        };
-        let head = recipe.head_entry();
-        let defaults = recipe
-            .statics(backend, &head)
-            .and_then(|statics| declared_defaults(device, &head, &statics))
-            .unwrap();
-        (recipe, defaults)
-    }
-
-    /// The test devices that read progressive heads.
-    fn devices() -> Vec<seismic::Device> {
-        let catalog = seismic::Devices::discover(&[]).unwrap();
-        [BackendName::Metal, BackendName::Cuda]
-            .into_iter()
-            .filter(|&backend| crate::test_support::available(&catalog, backend))
-            .map(|backend| {
-                catalog
-                    .open_backend(backend)
-                    .unwrap_or_else(|error| panic!("an available {backend:?} executor opens: {error}"))
-            })
-            .collect()
-    }
-
-    /// A canonical head choice as it serves the compared rows: one that
-    /// differs only in what other row counts run (on Metal the row count
-    /// from which the batched launch serves, on CUDA the large-batch GEMM's
-    /// rotation) serves one row as the compared choice does, and one that
-    /// differs in what those rows run does not.
-    #[test]
-    fn a_canonical_is_compared_as_the_rows_serve_it() {
-        for device in devices() {
-            let backend = device.backend();
-            let (recipe, compared) = recipe_on(&device);
-            let (other, rows) = match backend {
-                BackendName::Metal => (compared.clone().with_param("BATCH_FROM", 3), 4),
-                _ => (compared.clone().with_launch_param(4, "ROTATE", 1), 65),
-            };
-            let served = |specialization: &NativeSpecialization, rows| {
-                recipe.served_canonical(&device, specialization, rows).unwrap()
-            };
-            assert_eq!(served(&compared, 1), served(&other, 1), "{backend:?}");
-            assert_ne!(served(&compared, rows), served(&other, rows), "{backend:?}");
-        }
-    }
-
-    /// A plain open, then a drafting open whose canonical head serves one
-    /// row otherwise (on Metal the one-row GEMV's mapping, on CUDA its
-    /// K split, as two loads tuned over different row counts pick), each
-    /// find no record of their own canonical, compare against it and
-    /// record their winner beside the other's. A third open of either kind
-    /// finds its winner and searches nothing, and a canonical that serves
-    /// the row as the plain one does reads the plain open's record.
-    #[test]
-    fn each_canonical_keeps_its_own_record_across_opens() {
-        for device in devices() {
-            let backend = device.backend();
-            let (recipe, plain) = recipe_on(&device);
-            let drafting = match backend {
-                BackendName::Metal => plain
-                    .clone()
-                    .with_launch_param(1, "ROWS", 2)
-                    .with_launch_param(1, "SIMDGROUPS", 8),
-                _ => plain.clone().with_launch_param(1, "KSPLIT", 2),
-            };
-            let alike = match backend {
-                BackendName::Metal => plain.clone().with_param("BATCH_FROM", 3),
-                _ => plain.clone().with_launch_param(4, "ROTATE", 1),
-            };
-            let root = std::env::temp_dir().join(format!(
-                "magnitude-readout-records-{backend:?}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
-            let cache =
-                KernelCache::open(root.clone(), crate::kernel_cache::DEFAULT_KERNEL_CACHE_BYTES)
-                    .unwrap();
-            let dependency: TuningKey =
-                ("readout_head_rows", "head".into(), super::super::FixedValues::default());
-            let point = PointShape {
-                label: "m1".into(),
-                weight: 1.,
-                terms: Vec::new(),
-                rows: 1,
-                sequences: 1,
-                context: None,
-                class: None,
-            };
-            let open = || {
-                ReadoutContender::new(
-                    recipe,
-                    point.clone(),
-                    TuningCacheKey::of("readout recipe unit"),
-                    Some(&cache),
-                    Some(&cache),
-                    RecipeState::default(),
-                    dependency.clone(),
-                    RecipePreparation::default(),
-                )
-            };
-            let found = |contender: &mut ReadoutContender, canonical: &NativeSpecialization| {
-                contender
-                    .cached(&device, &HashMap::from([(dependency.clone(), canonical.clone())]))
-                    .unwrap()
-            };
-            for canonical in [&plain, &drafting] {
-                let mut first = open();
-                assert_eq!(found(&mut first, canonical), None, "{backend:?}");
-                first.conclude(true, true).unwrap();
-            }
-            for canonical in [&plain, &drafting, &alike] {
-                assert_eq!(found(&mut open(), canonical), Some(true), "{backend:?}");
-            }
-            std::fs::remove_dir_all(root).unwrap();
-        }
-    }
-
-    /// A first load that searches the canonical head itself knows no record
-    /// while the head's choice is open: it stores nothing then, however its
-    /// recipe's mandatory work concludes. Once the choice is final it takes
-    /// another load's record for a canonical that serves the row alike as
-    /// it stands, without recording it again, and with none it compares and
-    /// records its own under that canonical, which a later open finds.
-    #[test]
-    fn a_load_that_searches_its_head_looks_its_record_up_once_the_head_is_final() {
-        for device in devices() {
-            let backend = device.backend();
-            let (recipe, plain) = recipe_on(&device);
-            let drafting = match backend {
-                BackendName::Metal => plain
-                    .clone()
-                    .with_launch_param(1, "ROWS", 2)
-                    .with_launch_param(1, "SIMDGROUPS", 8),
-                _ => plain.clone().with_launch_param(1, "KSPLIT", 2),
-            };
-            let root = std::env::temp_dir().join(format!(
-                "magnitude-readout-deferred-{backend:?}-{}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&root);
-            let cache =
-                KernelCache::open(root.clone(), crate::kernel_cache::DEFAULT_KERNEL_CACHE_BYTES)
-                    .unwrap();
-            // Every stored record, by name, with its bytes.
-            let records = || {
-                std::fs::read_dir(root.join("readout"))
-                    .unwrap()
-                    .map(|entry| {
-                        let path = entry.unwrap().path();
-                        (path.clone(), std::fs::read(path).unwrap())
-                    })
-                    .collect::<std::collections::BTreeMap<_, _>>()
-            };
-            let dependency: TuningKey =
-                ("readout_head_rows", "head".into(), super::super::FixedValues::default());
-            let point = PointShape {
-                label: "m1".into(),
-                weight: 1.,
-                terms: Vec::new(),
-                rows: 1,
-                sequences: 1,
-                context: None,
-                class: None,
-            };
-            let open = || {
-                ReadoutContender::new(
-                    recipe,
-                    point.clone(),
-                    TuningCacheKey::of("readout recipe unit"),
-                    Some(&cache),
-                    Some(&cache),
-                    RecipeState::default(),
-                    dependency.clone(),
-                    RecipePreparation::default(),
-                )
-            };
-            // Another load recorded its winner against the plain canonical.
-            let mut earlier = open();
-            let chosen = |canonical: &NativeSpecialization| {
-                HashMap::from([(dependency.clone(), canonical.clone())])
-            };
-            assert_eq!(earlier.cached(&device, &chosen(&plain)).unwrap(), None);
-            earlier.conclude(true, true).unwrap();
-            let before = records();
-            for (canonical, stored) in [(&plain, Some(true)), (&drafting, None)] {
-                let mut first = open();
-                // The head is still searched: no record is known, and the
-                // recipe's mandatory conclusion stores nothing.
-                assert_eq!(first.cached(&device, &HashMap::new()).unwrap(), None, "{backend:?}");
-                first.conclude(false, false).unwrap();
-                assert_eq!(records(), before, "{backend:?}: stored under a guess");
-                // The head is final.
-                assert_eq!(first.adopt(&device, canonical).unwrap(), stored, "{backend:?}");
-                first.conclude(true, true).unwrap();
-            }
-            // The adopted record was not written again; the new one was.
-            let after = records();
-            assert_eq!(after.len(), before.len() + 1, "{backend:?}");
-            assert!(before.iter().all(|(path, bytes)| after.get(path) == Some(bytes)), "{backend:?}");
-            for canonical in [&plain, &drafting] {
-                assert_eq!(open().cached(&device, &chosen(canonical)).unwrap(), Some(true));
-            }
-            std::fs::remove_dir_all(root).unwrap();
         }
     }
 

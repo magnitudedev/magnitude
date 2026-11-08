@@ -378,6 +378,12 @@ impl KernelCache {
             .flatten()
     }
 
+    /// The exact finalized canonical specialization against which a selected
+    /// optional recipe completed its paired comparison.
+    pub(crate) fn readout_canonical_choice(&self, key: &TuningCacheKey) -> Option<String> {
+        self.readout_field(key, "canonical_specification")
+    }
+
     /// The costs a stored recipe choice measured its class at, in each form
     /// its scope can be stored in.
     pub(crate) fn readout_costs(

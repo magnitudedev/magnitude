@@ -1682,46 +1682,6 @@ fn launch_key(
     }
 }
 
-/// What `specialization` runs at the dimensions `dimensions` gives (and its
-/// statics), keyed as a search of the unit keys its points ([`Keying`]): the
-/// launches whose conditions hold there and the values of the parameters
-/// they read. Configurations with one key there run the same work there, so
-/// evidence gathered against one holds for the other there.
-pub fn served_key(
-    implementation: &NativeImplementation,
-    statics: &NativeSpecialization,
-    dimensions: &BTreeMap<String, u64>,
-    specialization: &NativeSpecialization,
-) -> Result<LaunchKey, TuneError> {
-    let dimension = |name: &str| {
-        dimensions
-            .get(name)
-            .copied()
-            .or_else(|| statics.static_value(name))
-    };
-    let mut working = Vec::new();
-    for (ordinal, launch) in implementation.launches.iter().enumerate() {
-        let holds = launch.when.as_ref().map_or(Ok(true), |when| {
-            when.holds(&dimension, &|name| {
-                specialization
-                    .launch_param(ordinal, name)
-                    .or_else(|| specialization.param(name))
-            })
-        });
-        if holds.map_err(|error| {
-            TuneError::Declaration(format!("launch {ordinal}'s condition: {error:?}"))
-        })? {
-            working.push(ordinal);
-        }
-    }
-    let keying = if implementation.launch_scoped() {
-        Keying::Launches(plan::boundary_parameters(implementation))
-    } else {
-        Keying::Whole(Influence::of(implementation))
-    };
-    Ok(keying.key(implementation, working, specialization))
-}
-
 /// The key of a point as the unit's programs are formed: what a
 /// configuration's measurement there depends on.
 type Key<'k> = &'k dyn Fn(Vec<usize>, &NativeSpecialization) -> LaunchKey;
@@ -9580,44 +9540,6 @@ mod tests {
             launch_key(implementation, &[], vec![1], &default),
             launch_key(implementation, &[], vec![1], &split)
         );
-    }
-
-    /// A configuration is keyed at a shape by the launches its conditions
-    /// select there: a boundary parameter that moves no launch at the shape
-    /// leaves its key, one that moves a launch changes it.
-    #[test]
-    fn a_served_key_is_the_work_a_shape_runs() {
-        let text = "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    params (arithmetic BATCH_FROM in [5, 3] default 5, SPLIT in [1, 2] default 1)\n    launch one when N < 2:\n        threadgroups (N, 1, SPLIT)\n        threads_per_threadgroup (32, 1, 1)\n    launch rows when N >= 2 and N < BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n    launch batch when N >= BATCH_FROM:\n        threadgroups (N, 1, 1)\n        threads_per_threadgroup (64, 1, 1)\n";
-        let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "scale.seismic".into(),
-            text: text.into(),
-        }]))
-        .unwrap();
-        let implementation = module
-            .native_implementation(module.entry_named("scale").unwrap(), BackendName::Metal)
-            .unwrap();
-        let statics = NativeSpecialization::new();
-        let default = implementation
-            .device_independent()
-            .unwrap()
-            .default_specialization(&statics)
-            .unwrap();
-        let earlier = default.clone().with_param("BATCH_FROM", 3);
-        let key = |rows: u64, specialization: &NativeSpecialization| {
-            served_key(
-                implementation,
-                &statics,
-                &BTreeMap::from([("N".into(), rows)]),
-                specialization,
-            )
-            .unwrap()
-        };
-        assert_eq!(key(1, &default), key(1, &earlier));
-        assert_eq!(key(1, &default).launches, vec![0]);
-        assert_ne!(key(4, &default), key(4, &earlier));
-        let split = default.clone().with_param("SPLIT", 2);
-        assert_ne!(key(1, &default), key(1, &split));
-        assert_eq!(key(4, &default), key(4, &split));
     }
 
     /// What a search formed stays held whatever was formed after it: a
