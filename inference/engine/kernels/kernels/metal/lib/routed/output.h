@@ -5,8 +5,7 @@
 // expert's down rows, simdgroup K the shared
 // expert's down rows. Each lane group (LANES lanes) of a simdgroup owns ROWS
 // channels; its lanes own the packets sub, sub + LANES, ... of every
-// channel's row (`routed::project_channels`), each simdgroup staging its
-// product row in threadgroup memory.
+// channel's row (`routed::project_channels`).
 //
 // The projections meet in threadgroup memory; their join is
 // `lib/routed/output_sum.h`'s.
@@ -25,22 +24,28 @@ template <uint ROWS, uint LANES> constexpr uint output_tile() {
 }
 
 // The product packets each simdgroup stages at once (`project_channels`).
-constexpr uint output_stage() {
+template <uint LANES> constexpr uint output_stage() {
     constexpr uint COLUMNS = uint(SEISMIC_DIM_F) > uint(SEISMIC_DIM_S) ? uint(SEISMIC_DIM_F) : uint(SEISMIC_DIM_S);
-    return stage_packets<uint(SEISMIC_DIM_K) + 1u, (COLUMNS + 31u) / 32u>();
+    return stage_packets<uint(SEISMIC_DIM_K) + 1u, LANES, (COLUMNS + 31u) / 32u>();
+}
+
+// Each simdgroup's region of the projections in threadgroup memory, in
+// floats (`projection_region`).
+template <uint ROWS, uint LANES> constexpr uint output_region() {
+    return projection_region<output_tile<ROWS, LANES>(), output_stage<LANES>()>();
 }
 
 // Simdgroup `sg`'s projection: choice k = sg < K of row m (its down rows of
 // `expert_down` as bound, `choice_record`, `choice_weights`: a bank record of
 // its table or a host tier record of `tier_down` read in place, or a
 // resident layer's expert of its stack), or the shared expert (sg = K), into
-// `projected` (TILE channels from `first`), staging its product in `staged`
-// (`output_stage() * 4` words).
+// `projected` (TILE channels from `first`; its `output_region()` floats, a
+// stage of its product while it projects).
 template <uint ROWS, uint LANES, typename STACK>
 inline void output_project(device const uchar *expert_product, device const uchar *shared_product,
     device const int *routes, device const int *sources, device const STACK *expert_down,
     device const ulong *tier_down, device const uchar *shared_down, ulong m, uint first, uint sg, uint lane,
-    threadgroup uint4 *staged, threadgroup float *projected, constant ulong *seismic_words) {
+    threadgroup float *projected, constant ulong *seismic_words) {
     constexpr uint TILE = output_tile<ROWS, LANES>();
     constexpr uint K = uint(SEISMIC_DIM_K);
     const uint rows = uint(SEISMIC_DIM_H);
@@ -64,8 +69,8 @@ inline void output_project(device const uchar *expert_product, device const ucha
         // operands), which each simdgroup forms alone.
         const auto x = projection::operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4>::lone_row(
             in, uint(SEISMIC_DIM_F), lane);
-        project_channels<packets::W0, ROWS, LANES, uint(SEISMIC_DIM_F), output_stage()>(x, down, first, rows,
-            uint(SEISMIC_DIM_F), staged, projected, lane);
+        project_channels<packets::W0, ROWS, LANES, uint(SEISMIC_DIM_F), output_stage<LANES>()>(x, down, first, rows,
+            uint(SEISMIC_DIM_F), projected, lane);
         return;
     }
     const auto in = activation(shared_product + m * SEISMIC_SHARED_PRODUCT_STRIDE_0 * Act::bytes, 0,
@@ -73,8 +78,8 @@ inline void output_project(device const uchar *expert_product, device const ucha
     const auto down = weights<packets::W1>(shared_down, KERNEL_W1_LAYOUT(SEISMIC_DIM_S), 0, SEISMIC_DIM_S);
     const auto x = projection::operands<projection::OperandRecipe<packets::W1_OPERANDS_NVFP4>::NVFP4>::lone_row(
         in, uint(SEISMIC_DIM_S), lane);
-    project_channels<packets::W1, ROWS, LANES, uint(SEISMIC_DIM_S), output_stage()>(x, down, first, rows,
-        uint(SEISMIC_DIM_S), staged, projected, lane);
+    project_channels<packets::W1, ROWS, LANES, uint(SEISMIC_DIM_S), output_stage<LANES>()>(x, down, first, rows,
+        uint(SEISMIC_DIM_S), projected, lane);
 }
 
 } // namespace routed

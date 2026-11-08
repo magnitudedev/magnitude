@@ -29,17 +29,17 @@
 // The body, of either binding of the stack (`routed::down_project`).
 #define ROUTED_DOWN_BODY                                                                                          \
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();                                                       \
-    threadgroup float projected[uint(SEISMIC_DIM_K)][TILE];                                                       \
-    threadgroup uint4 staged[uint(SEISMIC_DIM_K)][4 * routed::down_stage()];                                      \
+    constexpr uint REGION = routed::down_region<ROWS, LANES>();                                                   \
+    threadgroup float projected[uint(SEISMIC_DIM_K)][REGION];                                                     \
     const ulong m = group.y;                                                                                      \
     const uint first = group.x * TILE;                                                                            \
     routed::down_project<ROWS, LANES>(product, routes, sources, expert_down, tier_down, m, first, sg, lane,       \
-        staged[sg], projected[sg], seismic_words);                                                                \
+        projected[sg], seismic_words);                                                                            \
     threadgroup_barrier(mem_flags::mem_threadgroup);                                                              \
     const uint n = first + tid;                                                                                   \
     if (tid >= TILE || n >= uint(SEISMIC_DIM_H))                                                                  \
         return;                                                                                                   \
-    routed::down_publish(base, weights, value, m, n, routed::TileProjections{&projected[0][0], TILE, tid},        \
+    routed::down_publish(base, weights, value, m, n, routed::TileProjections{&projected[0][0], REGION, tid},      \
         routed::Answer{false, 0.0f}, seismic_words);
 
 #ifdef SEISMIC_FORMING_ROUTED_DOWN

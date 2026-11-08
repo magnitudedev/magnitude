@@ -21,12 +21,11 @@ kernel void routed_down_project(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint TILE = routed::down_tile<ROWS, LANES>();
-    threadgroup float projected[uint(SEISMIC_DIM_K)][TILE];
-    threadgroup uint4 staged[uint(SEISMIC_DIM_K)][4 * routed::down_stage()];
+    threadgroup float projected[uint(SEISMIC_DIM_K)][routed::down_region<ROWS, LANES>()];
     const ulong m = group.y;
     const uint first = group.x * TILE;
     routed::down_project<ROWS, LANES>(product, routes, sources, expert_down, tier_down, m, first, sg, lane,
-        staged[sg], projected[sg], seismic_words);
+        projected[sg], seismic_words);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint n = first + tid;
     if (tid >= TILE || n >= uint(SEISMIC_DIM_H))

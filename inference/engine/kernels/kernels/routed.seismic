@@ -427,8 +427,9 @@ fn decode_output_join[M, H, SN, IN, K, SF, R](residual: &tensor[M, SN * H] f32,
 # Metal: the K choices and the shared expert project side by side, one
 # simdgroup each, over a tile of (32 / LANES) * ROWS output channels; each
 # lane group of LANES lanes owns ROWS channels and issues all their packet
-# loads at once, against the product row its simdgroup stages in
-# threadgroup memory. LANES sets each projection's summation order (so it is
+# loads at once, against the product row: read straight into registers at 16
+# or 32 lanes, below 16 staged once a simdgroup in threadgroup memory for its
+# lane groups to share. LANES sets each projection's summation order (so it is
 # arithmetic); down to 4 lanes, a short down row still keeps several loads
 # in flight a lane. The projections meet in threadgroup memory, and one
 # thread per channel carries the slot-order sum. A lane holds
