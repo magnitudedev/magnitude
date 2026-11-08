@@ -944,15 +944,6 @@ impl ModelLoadPlan {
         self.bank.as_ref().map_or(crate::PassLaunches::whole_chain(limits), |bank| bank.pass)
     }
 
-    /// Whether the plan leaves room for its prompt groups' class of its
-    /// chain places (`AssessmentMemoryCharge::with_group_class`): where its
-    /// bank's pass merges several launches, which a group's places merge.
-    /// The room is the class's from the plan on: no growth of the bank takes
-    /// it (`ExecutorDomain::class_reserve`).
-    pub fn holds_group_class(&self) -> bool {
-        self.bank.as_ref().is_some_and(|bank| bank.pass > crate::PassLaunches::FLOOR)
-    }
-
     /// Every weight byte the load holds, wherever it lies (what a weight
     /// cap bounds): each component's, the expert bank's, and its host
     /// tier's slots. The tier's landing reserve (the tier at no slots) is

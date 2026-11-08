@@ -146,13 +146,6 @@ pub trait ElasticBank {
     /// sizes, and a decision that can move a few steps prices no others.
     fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reach: Reach) -> Result<Vec<BankCurve>, super::DomainError>;
 
-    /// What weighs a prompt group's places against the bank's slots
-    /// (`GroupReads::grant`): the run's measured group reads and the bank's
-    /// slots, floor and slot bytes; none before the run measured them.
-    fn group_reads(
-        &self,
-    ) -> Result<Option<(crate::assessment::GroupReads, crate::assessment::BankSlots)>, super::DomainError>;
-
     /// What the load's counted decode read and ran so far, which its decode
     /// is priced on; none before it counted a step.
     fn live(&self) -> Option<crate::assessment::LiveDecode>;

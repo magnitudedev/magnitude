@@ -1970,7 +1970,8 @@ trait MemoryStep: MemoryHost + Sized {
 
     /// Settle the memory heap (`ExecutorDomain::settle_memory`) on
     /// `bindings` and apply it: the prefixes it released evicted, the idle
-    /// optional components it released unbound, then one bank resize: its
+    /// optional components it released unbound, then the prompt-group
+    /// places held beyond the target it settled, else one bank resize: its
     /// least valuable release first (what it gives back is what the
     /// settle's growths and places are paid with), else its most valuable
     /// growth, each to its settled size; the rest settle again at the next
@@ -2003,6 +2004,13 @@ trait MemoryStep: MemoryHost + Sized {
         }
         let before = self.domain().memory_moment();
         let wake = self.completion();
+        // Places the settle released are given back first, between groups:
+        // their room is what its growths may be paid with.
+        if settled.places_released {
+            let (released, slots) = self.domain().release_group_places(wake).map_err(classify_domain_error)?;
+            tracing::info!(released, ?slots, "prompt places release settled");
+            return Ok(());
+        }
         if let Some(release) = settled.releases.first().copied() {
             let magnitude_executor::BankRelease { holding, to, per_byte } = release;
             // A shrink deferred (a chain under way, a step still running)

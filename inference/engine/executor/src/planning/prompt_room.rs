@@ -1,17 +1,19 @@
 //! A prompt group's room as priced holdings of the one heap
-//! (`domain::value`): its places beyond the first, its merged-expert pass
-//! size beyond one launch ([`PassLaunches`]).
+//! (`domain::value`): its merged-expert pass size beyond one launch
+//! ([`PassLaunches`]), which a plan's settle grants with the class of its
+//! chain places (`ExecutionPlanDraft::with_largest_bank`), and its places
+//! beyond one ([`Holding::Places`]), which every serving settle prices
+//! beside the bank's slots.
 //! Each is worth the prefill (or launch) seconds it saves times how often
 //! that happens, in seconds of serving saved per second: the same unit the
 //! bank's slots are valued in, so a pass buffer that saves little never
 //! holds bytes a resident bank's last slot is worth far more for.
 //!
-//! The seconds come from the caller: at load, the step model over the
-//! executor's generic costs ([`routed_prompt_seconds`]); while serving, the
-//! load's measured group reads (`GroupReads`), or before they are measured
-//! the same step model by group ([`routed_group_seconds`]), beside each
-//! group's submission. The rates of prompts and replays come from the
-//! caller too. Nothing here reads recorded per-model data.
+//! The seconds come from the caller: the step model over the executor's
+//! generic costs ([`routed_prompt_seconds`], by group
+//! [`routed_group_seconds`], a prompt's groups [`grouped`]). The rates of prompts and replays come from
+//! the caller too. Nothing here reads recorded per-model data, nor
+//! anything the load measured of its own prompts.
 
 use crate::assessment::ExpertPass;
 use crate::domain::value::{Curve, Holding, Rate, Step};
@@ -51,7 +53,7 @@ fn ladder_curve<T: Copy>(
     };
     let steps = ladder.windows(2).map(step).collect::<Vec<_>>();
     let (held_steps, offered) = steps.split_at(held);
-    Curve { holding, borrows: false, held: held_steps.iter().rev().copied().collect(), offered: offered.to_vec() }
+    Curve { holding, borrows: false, lends: false, held: held_steps.iter().rev().copied().collect(), offered: offered.to_vec() }
 }
 
 /// The pass size as a priced holding ([`Holding::PassRows`]): the steps of
@@ -70,21 +72,23 @@ pub(crate) fn pass_rows_curve(
     ladder_curve(Holding::PassRows, ladder, held, pass_bytes, prompt_seconds, prompts_per_second, move_seconds)
 }
 
-/// A prompt group's places beyond the `held` it holds, up to `most`, as a
-/// priced holding ([`Holding::Places`]): each place more the class bytes it
-/// adds (`place_bytes`, as `grant_group` grants them) against the prompt
-/// seconds a group of more places saves (`prompt_seconds`),
-/// `prompts_per_second` times a second. A group holds its places while it
-/// runs, so none is offered for release.
+/// A prompt group's places from one to `most`, holding `held` of them, as
+/// a priced holding ([`Holding::Places`]): each place more the class bytes
+/// it adds (`class_bytes(p)`, a class of `p` places' bytes beyond one
+/// place's) against the prompt seconds a group of more places saves
+/// (`prompt_seconds(p)`), `prompts_per_second` times a second. The places
+/// held beyond one are offered for release, the last first: a group holds
+/// them only while it runs, and gives back between groups those a settle
+/// released.
 pub(crate) fn places_curve(
-    held: usize,
-    most: usize,
-    place_bytes: &dyn Fn(usize) -> u64,
+    held: NonZeroUsize,
+    most: NonZeroUsize,
+    class_bytes: &dyn Fn(usize) -> u64,
     prompt_seconds: &dyn Fn(usize) -> f64,
     prompts_per_second: f64,
 ) -> Curve<Holding> {
-    let ladder = (held..=most.max(held)).collect::<Vec<_>>();
-    ladder_curve(Holding::Places, &ladder, 0, place_bytes, prompt_seconds, prompts_per_second, 0.0)
+    let ladder = (1..=most.max(held).get()).collect::<Vec<_>>();
+    ladder_curve(Holding::Places, &ladder, held.get() - 1, class_bytes, prompt_seconds, prompts_per_second, 0.0)
 }
 
 /// The routed seconds a prompt of `prompt_rows` rows takes in passes over
@@ -187,6 +191,7 @@ mod tests {
         Curve {
             holding: Holding::Bank(crate::domain::BankHolding::Experts),
             borrows: false,
+            lends: false,
             held: vec![],
             offered: vec![Step { bytes: 130 * MB, worth: Rate::new(RESIDENT_SAVING), move_seconds: 0.0 }],
         }
@@ -244,14 +249,20 @@ mod tests {
         assert!(settled.released.iter().any(|(holding, _)| *holding == Holding::PassRows));
     }
 
-    /// A group's places step from those it holds as their class bytes do,
-    /// each worth the prompt seconds it saves; none is offered for release.
+    /// A group's places step from one as their class bytes do, each worth
+    /// the prompt seconds it saves; those held beyond one are offered for
+    /// release, the last first.
     #[test]
-    fn places_step_from_those_held_by_what_they_save() {
-        let places = places_curve(2, 4, &|places| places as u64 * 10 * MB, &|places| 1.0 / places as f64, 1.0);
-        assert_eq!((places.held.len(), places.offered.len()), (0, 2));
+    fn places_step_from_one_by_what_they_save() {
+        let count = |places: usize| NonZeroUsize::new(places).unwrap();
+        let class = |places: usize| (places as u64 - 1) * 10 * MB;
+        let seconds = |places: usize| 1.0 / places as f64;
+        let places = places_curve(count(2), count(4), &class, &seconds, 1.0);
+        assert_eq!((places.held.len(), places.offered.len()), (1, 2));
+        assert_eq!(places.held[0].worth, Rate::new(0.5), "the second place saves half the prompt");
         assert_eq!(places.offered[0].bytes, 10 * MB);
         assert_eq!(places.offered[0].worth, Rate::new(0.5 - 1.0 / 3.0));
-        assert!(places_curve(4, 3, &|_| 0, &|_| 0.0, 1.0).offered.is_empty());
+        let one = places_curve(count(1), count(1), &class, &seconds, 1.0);
+        assert!(one.held.is_empty() && one.offered.is_empty(), "a chain of one place holds nothing to price");
     }
 }

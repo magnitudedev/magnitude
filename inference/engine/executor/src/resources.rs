@@ -583,16 +583,25 @@ impl AllocatedResources {
     }
 
     /// Release every pool's free slots beyond its held class, the held
-    /// prompt-group class down to the floor of one place once `reclaim`
-    /// releases it, and vision's free storage, on the load's release thread
-    /// (`Releases`), `wake` completed once they are released: whether a
-    /// release began, which a later boundary finishes
+    /// prompt-group class down to `class`'s places where given (the
+    /// places of a class whose pools hold its slots: a settle's target,
+    /// or Reclaim's floor of one place), and vision's free storage, on the
+    /// load's release thread (`Releases`), `wake` completed once they are
+    /// released: whether a release began, which a later boundary finishes
     /// ([`Self::released_slots`]). None begins while one runs
     /// ([`Self::releasing_slots`]).
-    pub(crate) fn release_idle_slots(&mut self, reclaim: bool, wake: crate::CompletionWake) -> bool {
+    pub(crate) fn release_idle_slots(
+        &mut self,
+        class: Option<(std::num::NonZeroUsize, crate::StartupSlots)>,
+        wake: crate::CompletionWake,
+    ) -> bool {
         assert!(self.releasing.is_none(), "a graph slot release begins only once the one before it finished");
-        if reclaim {
-            self.places = std::num::NonZeroUsize::MIN;
+        if let Some((places, slots)) = class {
+            assert!(places <= self.places, "a class is released to no more places than it holds");
+            for (pool, slots) in self.class_pools(slots) {
+                pool.keep(slots);
+            }
+            self.places = places;
         }
         let mut idle = IdleSlots::default();
         for pool in [
@@ -605,7 +614,7 @@ impl AllocatedResources {
         .into_iter()
         .flatten()
         {
-            pool.release_idle(reclaim, &mut idle);
+            pool.release_idle(&mut idle);
         }
         if let Some(vision) = self.vision_graph.as_mut() {
             vision.release_idle(&mut idle);

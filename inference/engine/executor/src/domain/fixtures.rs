@@ -523,15 +523,10 @@ pub fn price_growth(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut Stat
     measure_load(domain, bindings);
 }
 
-/// What a fixture's prompt group's submission costs beyond a chained
-/// launch: 50 µs, a host round trip's order.
-pub const SUBMISSION: f64 = 50e-6;
-
 /// The load measured its costs: a step of 15 ms in either form at every
-/// depth, a banked load's all-hit steps' time, and each prompt group's
-/// submission [`SUBMISSION`]; a banked load's experts on the fixtures' read
-/// line, its decode priced on whatever the fake bank counted, the generic
-/// model alone before any.
+/// depth, a banked load's all-hit steps' time; a banked load's experts on
+/// the fixtures' read line, its decode priced on whatever the fake bank
+/// counted, the generic model alone before any.
 pub fn measure_load(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut StateBindings) {
     let experts = domain.family.bank.is_some().then(|| crate::ExpertMeasures {
         lines: crate::assessment::Priced::Measured(std::sync::Arc::from([])),
@@ -544,6 +539,10 @@ pub fn measure_load(domain: &mut ExecutorDomain<TestFamily>, bindings: &mut Stat
     domain.measure_load(crate::LoadMeasures { costs: Ok(load_costs()), experts }, bindings).unwrap();
 }
 
+/// What a fixture's prompt group's submission costs beyond a chained
+/// launch: 50 µs, a host round trip's order.
+pub const SUBMISSION: f64 = 50e-6;
+
 /// A fixture's costs: a step of 15 ms in either form at every depth, and
 /// each prompt group's submission [`SUBMISSION`].
 pub fn load_costs() -> crate::LoadCosts {
@@ -554,13 +553,10 @@ pub fn load_costs() -> crate::LoadCosts {
 }
 
 /// A domain launching one-row prompt chunks in chains of up to three on
-/// the device `device_request` selects, its device's store read with a
-/// gigabyte of room ([`with_room`]): a load whose prompt groups take their
-/// places by their price once it is priced.
+/// the device `device_request` selects: a load whose plan holds its prompt
+/// groups' class of three places (`ResourceLimits::holds_group_class`).
 pub fn chained(device_request: platform::DeviceRequest) -> Fixture {
-    let (mut domain, bindings) = fixture_of(tiny_definition(), limits(2, 3, false), None, false, device_request);
-    with_room(&mut domain, 1 << 30);
-    (domain, bindings)
+    fixture_of(tiny_definition(), limits(2, 3, false), None, false, device_request)
 }
 
 /// A reading of `domain`'s device store with `room` bytes of headroom, in
@@ -589,6 +585,22 @@ pub fn with_room<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, room: u64) {
 /// The places a prompt group of four one-row chunks opened on `fixture`
 /// holds, its first chunk submitted with the rest planned behind it.
 pub fn group_places_opened<F: ProgramFamily>((mut domain, mut bindings): (ExecutorDomain<F>, StateBindings)) -> usize {
+    let operations = group_opening(&mut domain, &mut bindings);
+    let ReservedResources::Target(reservation) = domain.reserve(&mut bindings, &operations).unwrap().into_resources() else {
+        panic!("a prompt chunk reserves a target group")
+    };
+    let flight = domain
+        .submit_target(bindings, &operations, reservation)
+        .unwrap_or_else(|failure| panic!("target submission failed: {}", failure.error()));
+    let places = domain.group_places().get();
+    domain.finish_target(flight).unwrap();
+    places
+}
+
+/// The first chunk of a prompt group of four one-row chunks on `domain`,
+/// its request open and the rest planned behind it: what
+/// [`group_places_opened`] submits.
+pub fn group_opening<F: ProgramFamily>(domain: &mut ExecutorDomain<F>, bindings: &mut StateBindings) -> Vec<Operation> {
     let request = RequestId(80);
     let chunk = |position: usize| Operation::Forward {
         request,
@@ -602,18 +614,9 @@ pub fn group_places_opened<F: ProgramFamily>((mut domain, mut bindings): (Execut
         prime: None,
     };
     domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
-    assert!(domain.open_state(&mut bindings, request, None).unwrap().is_empty());
+    assert!(domain.open_state(bindings, request, None).unwrap().is_empty());
     domain.plan_successors((1..4).map(chunk).collect());
-    let operations = vec![chunk(0)];
-    let ReservedResources::Target(reservation) = domain.reserve(&mut bindings, &operations).unwrap().into_resources() else {
-        panic!("a prompt chunk reserves a target group")
-    };
-    let flight = domain
-        .submit_target(bindings, &operations, reservation)
-        .unwrap_or_else(|failure| panic!("target submission failed: {}", failure.error()));
-    let places = domain.group_places().get();
-    domain.finish_target(flight).unwrap();
-    places
+    vec![chunk(0)]
 }
 
 /// The bytes of a row of `domain`'s fake bank ([`banked`]).
@@ -1069,12 +1072,6 @@ impl ElasticBank for FakeBank {
             curves.push(crate::BankCurve { holding: crate::BankHolding::Host, kind: host, at, held: vec![], offered });
         }
         Ok(curves)
-    }
-
-    fn group_reads(
-        &self,
-    ) -> Result<Option<(crate::assessment::GroupReads, crate::assessment::BankSlots)>, DomainError> {
-        Ok(None)
     }
 
     fn live(&self) -> Option<crate::assessment::LiveDecode> {

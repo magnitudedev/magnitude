@@ -62,7 +62,7 @@ pub use step::{LayerLoad, Lead, ReadAhead, StepInputs, StepTime};
 pub use streamed::{DecodePrice, FormSeconds, LayerReads, LiveDecode, StreamedError, StreamedFigures, StreamedLayers};
 pub use misses::{Anticipated, HeldSlots, HintCounts, LayerStep, StreamedStep, TableCurve, TableRange};
 pub use streaming::{
-    BankSlots, GroupLayerTerms, GroupReads, GroupUnion, Notice, Stages,
+    GroupLayerTerms, GroupUnion, Notice, Stages,
 };
 pub use streaming_costs::{
     CeilingError, ConvertCosts, ConvertForm, FileLine, MemoryCosts, MemoryError, MoveCosts, MoveError, MoveForm, RecordLine,

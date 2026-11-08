@@ -76,10 +76,6 @@ pub struct Stack {
     /// The rows and context tokens of the decode steps `curve` counts,
     /// summed: each step's launch's, counted with it.
     launches: CountedLaunch,
-    /// Each prompt group's union by its depth, `steps` the groups counted,
-    /// and the last group's read sequence ([`Self::read_group`]).
-    group_curve: MissCurve,
-    grouped: Option<Step>,
     /// Every decode step read, counted or not, by depth
     /// ([`Self::decoded`]), and the last of them.
     decoded: MissCurve,
@@ -200,11 +196,6 @@ impl Stack {
             },
             counted: None,
             launches: CountedLaunch::default(),
-            group_curve: MissCurve {
-                steps: 0,
-                layers: vec![empty.clone(); layers],
-            },
-            grouped: None,
             decoded: MissCurve {
                 steps: 0,
                 layers: vec![empty; layers],
@@ -253,17 +244,14 @@ impl Stack {
     }
 
     /// A prompt group's union `read`, read at its last step `read.sequence`
-    /// ([`Self::read`]), counted into the group-read curve, and its group
-    /// with it the first time one of its reads is (groups end in sequence
-    /// order): a bank of `s` slots holds the union's experts less than `s`
-    /// deep, `routed` each expert's choices over the group's steps. Each
-    /// expert's depth, in slots, in `read.experts`' ascending order.
+    /// ([`Self::read`]) into the ranking: a bank of `s` slots holds the
+    /// union's experts less than `s` deep, `routed` each expert's choices
+    /// over the group's steps. Each expert's depth, in slots, in
+    /// `read.experts`' ascending order.
     pub fn read_group(&mut self, read: &RoutedRead, routed: &[u32]) -> Vec<usize> {
         assert!(read.experts.windows(2).all(|pair| pair[0] < pair[1]), "a group's union lists each expert once, ascending");
         assert_eq!(read.experts.len(), routed.len(), "each expert of a group's union has its choices");
-        let depths = self.rank(read, read.experts.iter().copied().zip(routed.iter().copied()).collect());
-        count(&mut self.group_curve, &mut self.grouped, read, &depths);
-        depths
+        self.rank(read, read.experts.iter().copied().zip(routed.iter().copied()).collect())
     }
 
     /// Read `read`'s experts into the ranking ([`Reuse::read`]), each at its
@@ -292,11 +280,6 @@ impl Stack {
     /// promotions the ranking asks of a layer a step at any share.
     pub fn decoded(&self) -> &MissCurve {
         &self.decoded
-    }
-
-    /// The group-read curve ([`Self::read_group`]).
-    pub fn group_curve(&self) -> &MissCurve {
-        &self.group_curve
     }
 }
 

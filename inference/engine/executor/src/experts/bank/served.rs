@@ -1,5 +1,5 @@
 use super::{ExpertBank, HeldTable, count};
-use crate::assessment::{BankSlots, DecodePrice, GroupReads, LiveDecode};
+use crate::assessment::{DecodePrice, LiveDecode};
 use crate::planning::Placer;
 use crate::domain::{BankCurve, BankHolding, BankResize, BankResized, BankStep, DomainError, ElasticBank, ExpertResidency, Reach, ResizeTimes, SizeStep, TableResidency};
 use crate::CompletionWake;
@@ -452,16 +452,6 @@ impl ElasticBank for ServedBank {
             curve.held = self.curve(*holding, *at, *range, release, saves)?.held;
         }
         Ok(curves)
-    }
-
-    fn group_reads(&self) -> Result<Option<(GroupReads, BankSlots)>, DomainError> {
-        let Some(reads) = self.bank.watcher.shared().group_reads() else {
-            return Ok(None);
-        };
-        let plan = &self.bank.plan;
-        let bytes = plan.slot_bytes().map_err(DomainError::invariant)?;
-        let host = self.bank.host_slots();
-        Ok(Some((reads, BankSlots { now: self.bank.slots(), floor: self.bank.counts.floor(), bytes, host })))
     }
 
     fn live(&self) -> Option<LiveDecode> {

@@ -375,6 +375,12 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
     domain
         .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
         .unwrap();
+    // A settle lowers the places target while the chain runs: its launches
+    // hold the class, so nothing is released until the chain ends.
+    assert_eq!(domain.group_places().get(), 3);
+    domain.places_target = std::num::NonZeroUsize::new(2).unwrap();
+    assert_eq!(domain.release_group_places(crate::CompletionWake::new(|| {})).unwrap().0, 0);
+    assert_eq!(domain.group_places().get(), 3, "the chain holds its class");
     for position in 1..3 {
         assert_eq!(domain.chain_holder(), Some(request));
         assert!(domain.resume_state(request).is_err(), "the chain holds the state");
@@ -390,36 +396,88 @@ fn a_prompt_chunk_opens_a_chain_its_holder_claims() {
     let state = domain.resume_state(request).unwrap().target;
     let token = magnitude_state::HistoryDomainId(0);
     assert_eq!((state.position(), state.history_ranges(token).len()), (3, 1));
-    // The group's class is kept while memory is Normal, and released to the
-    // floor of one place at Reclaim's surplus rung.
+    // Once the chain ends, the class beyond the lowered target is released
+    // and reserves nothing; a target raised again reserves its room from
+    // the bank's growth for the next group. The class the target grants is
+    // kept while memory is Normal, and released to the floor of one place at
+    // Reclaim's surplus rung.
     assert_eq!(domain.group_places().get(), 3);
     super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
-    assert_eq!(domain.group_places().get(), 3);
+    assert_eq!(domain.group_places().get(), 2, "the class beyond the target is released");
+    assert_eq!(domain.class_reserve(), 0);
+    domain.places_target = std::num::NonZeroUsize::new(3).unwrap();
+    assert_eq!(domain.class_reserve(), domain.class_ladder_bytes(3) - domain.class_ladder_bytes(2));
+    super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Idle);
+    assert_eq!(domain.group_places().get(), 2, "a raised target grows nothing until a group opens");
     super::fixtures::shrink_settled(&mut domain, &mut bindings, ShrinkPolicy::Reclaim);
     assert_eq!(domain.group_places().get(), 1);
+    assert_eq!(domain.class_reserve(), domain.class_ladder_bytes(3), "the target's whole class is reserved again");
 }
 
-/// A prompt group's places are granted by their price like any holding:
-/// with the device's gigabyte of room, a priced load's group takes its
-/// chunks' places, each saving a group's submission at the prior's
-/// requests a second, banked or not; an unpriced load's places are worth
-/// nothing known, and its group takes none, the room left free.
+/// A prompt group's places are priced on the plan's model once per load's
+/// measures, never per reading: every settle after reads the same prices,
+/// and pricing the load again prices them afresh. A load without a bank
+/// prices a place by the submissions its fewer groups save: three chunks
+/// in groups of one, two and three run three, two and one groups.
 #[test]
-fn a_group_takes_its_places_by_price() {
+fn places_are_priced_once_per_measures() {
+    let (mut domain, mut bindings) = chain_load(false);
+    assert!(domain.places_seconds().unwrap().is_none(), "nothing priced before the load's measures");
+    measure_load(&mut domain, &mut bindings);
+    let priced = domain.places_seconds().unwrap().expect("a priced load's places");
+    let close = |actual: f64, expected: f64| assert!((actual - expected).abs() < 1e-15, "{actual} ≠ {expected}");
+    for (seconds, groups) in priced.iter().zip([3., 2., 1.]) {
+        close(*seconds, groups * super::fixtures::SUBMISSION);
+    }
+    assert!(std::rc::Rc::ptr_eq(&priced, &domain.places_seconds().unwrap().unwrap()), "read again, not priced again");
+    measure_load(&mut domain, &mut bindings);
+    assert!(!std::rc::Rc::ptr_eq(&priced, &domain.places_seconds().unwrap().unwrap()), "new measures price afresh");
+}
+
+/// A prompt group's places are the plan's: where the plan holds its
+/// groups' class (a chain of three places), a group opening with four
+/// chunks takes three places, banked or not, priced or not; a plan of one
+/// place holds no class, and its group takes none more.
+#[test]
+fn a_group_takes_the_places_its_plan_holds() {
     for backend in bank_backends() {
-        let banked = |priced: bool| {
+        let chained_bank = |priced: bool| {
             let (mut domain, mut bindings) = banked_chain(backend, 4, 3);
-            with_room(&mut domain, 1 << 30);
             if priced {
                 measure_load(&mut domain, &mut bindings);
             }
             (domain, bindings)
         };
-        assert_eq!(group_places_opened(banked(true)), 3, "{backend:?}: the group holds its chunks' places");
-        assert_eq!(group_places_opened(banked(false)), 1, "{backend:?}: an unpriced group takes no place");
+        assert_eq!(group_places_opened(chained_bank(true)), 3, "{backend:?}: the group holds its chunks' places");
+        assert_eq!(group_places_opened(chained_bank(false)), 3, "{backend:?}: the plan's places need no price");
+        assert_eq!(group_places_opened(banked(backend, 4, 3)), 1, "{backend:?}: a plan of one place holds no class");
     }
-    assert_eq!(group_places_opened(chain_load(true)), 3, "a load without a bank prices its places too");
-    assert_eq!(group_places_opened(chain_load(false)), 1, "an unpriced group takes no place");
+    assert_eq!(group_places_opened(chain_load(true)), 3, "a load without a bank holds its plan's places");
+    assert_eq!(group_places_opened(chain_load(false)), 3, "the plan's places need no price");
+    assert_eq!(group_places_opened(fixture_with(None, false, false)), 1, "a plan of one place holds no class");
+}
+
+/// A load's first group can open before any probe read memory: its places
+/// are the plan's, so it takes them as every later group does, never one
+/// place for want of a reading.
+#[test]
+fn a_group_opening_before_any_reading_takes_its_places() {
+    let (domain, bindings) = chain_load(true);
+    domain.pace.borrow_mut().domains.clear();
+    assert_eq!(group_places_opened((domain, bindings)), 3);
+}
+
+/// No forecast trims a group's places: in the Normal band, however fast
+/// the host is read taking memory, the group takes its plan's places.
+#[test]
+fn a_group_takes_its_places_under_any_take_rate() {
+    let (mut domain, bindings) = chain_load(true);
+    with_room(&mut domain, 1 << 30);
+    for pace in domain.pace.borrow_mut().domains.values_mut() {
+        pace.thresholds = crate::platform::DomainThresholds { planning_bytes: 1, emergency_bytes: 0 };
+        pace.rate = 1e12;
+    }
+    assert_eq!(group_places_opened((domain, bindings)), 3);
 }
 
 /// A prompt chunk's readout exports at most its final row, so the places a
@@ -969,12 +1027,15 @@ fn the_bank_grows_on_the_prior_before_a_decode_is_counted() {
     }
 }
 
-/// The class room a plan reserves is the places' from the plan on
-/// (`class_reserve`): a partial bank that grows before the first group
-/// takes its places grows only into the room beside it, never by timing,
-/// and the group then takes every place from the room kept for it.
+/// The class room the places target reserves is kept from the bank's
+/// growth (`class_reserve`), and given to it only by the settle, by price:
+/// here the plan holds its experts whole, so a place saves only the
+/// submissions its fewer groups save, and the third place's class (most of
+/// the room) is worth far less per byte than the bank's slots. The settle
+/// lowers the target to the places worth their bytes, the bank grows into
+/// the room they gave up, and the group then opens with the target's places.
 #[test]
-fn a_bank_grown_before_the_first_group_leaves_its_places_room() {
+fn a_bank_takes_the_places_room_only_where_its_slots_are_worth_more() {
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked_chain(backend, 4, 1);
         // Each slot saves fewer reads than the one before it, and some reads
@@ -990,8 +1051,10 @@ fn a_bank_grown_before_the_first_group_leaves_its_places_room() {
         // The plan's class keeps all but a row and a half of the room: the
         // least reserve that leaves the growth no more (the room is the
         // device's less the reserve, within the bank's own reservation).
+        // The class's bytes at the target's places, beyond one place's.
+        let target = domain.places_target().get();
         let leaves = |domain: &mut ExecutorDomain<TestFamily>, reserve: u64| {
-            domain.class_reserve = reserve;
+            domain.class_ladder = (1..=target).map(|places| if places == target { reserve } else { 0 }).collect();
             room(domain)
         };
         let (mut low, mut high) = (0u64, u64::MAX / 2);
@@ -1006,12 +1069,14 @@ fn a_bank_grown_before_the_first_group_leaves_its_places_room() {
         let left = leaves(&mut domain, reserve);
         assert!(left > row && left <= row + row / 2, "{backend:?}: the reserve leaves a row and a half ({left} of {row})");
         assert_eq!(domain.grow_settled(unwatched()).unwrap(), BankStep::Begun(crate::planning::BankTier::Bank));
+        let resized = finish(&mut domain);
         assert!(
-            matches!(finish(&mut domain), crate::BankResized::Grown { from: 1, to: 2, .. }),
-            "{backend:?}: the bank grows by the row beside the class's room"
+            matches!(resized, crate::BankResized::Grown { from: 1, to: 4, .. }),
+            "{backend:?}: the bank grows into the third place's room, not {resized:?}"
         );
-        assert_eq!(domain.class_reserve, reserve, "{backend:?}: no growth takes the class's room");
-        assert_eq!(group_places_opened((domain, bindings)), 3, "{backend:?}: the group takes its places from the room kept for them");
+        assert_eq!(domain.places_target().get(), 2, "{backend:?}: the second place costs no bytes and is kept");
+        assert_eq!(domain.class_reserve(), 0, "{backend:?}: the room given up is no longer reserved");
+        assert_eq!(group_places_opened((domain, bindings)), 2, "{backend:?}: the group opens with the target's places");
     }
 }
 
@@ -1293,8 +1358,8 @@ fn a_shrink_with_a_step_still_running_is_deferred_to_the_gap() {
 #[test]
 fn a_shrink_during_a_chain_is_deferred_to_its_end() {
     for backend in bank_backends() {
-        // Priced, with room beside the bank, the prompt's group takes its
-        // chunks' places and chains them (`a_group_takes_its_places_by_price`).
+        // The prompt's group takes its plan's places and chains them
+        // (`a_group_takes_the_places_its_plan_holds`).
         let (mut domain, mut bindings) = banked_chain(backend, 4, 4);
         with_room(&mut domain, 1 << 30);
         measure_load(&mut domain, &mut bindings);
@@ -1847,36 +1912,6 @@ fn memory_is_due_a_reading_once_an_interval_has_passed() {
     let read = pace.read.expect("a reading is timed");
     assert!(!pace.due(read + Duration::from_millis(99)));
     assert!(pace.due(read + READING_INTERVAL));
-}
-
-/// The wait bound is what the host may take from the planning line to the
-/// emergency reserve at the rate it sustains taking now: 8 GB at 1 GB/s is
-/// 8 s. None in a domain taking nothing now, nor in one that grows nothing;
-/// none of a pace before any probe.
-#[test]
-fn the_wait_bound_is_the_reserve_between_the_lines_at_the_sustained_taking() {
-    const GB: u64 = 1_000_000_000;
-    let domain = |role, rate| DomainPace {
-        role,
-        headroom: 0,
-        thresholds: crate::platform::DomainThresholds { planning_bytes: 10 * GB, emergency_bytes: 2 * GB },
-        charged: 0,
-        band: MemoryBand::Normal,
-        unseen: 0,
-        witness: None,
-        untaken: Default::default(),
-        rate,
-        fluctuation: Fluctuation::default(),
-        host: false,
-        grant_left: None,
-        borrowable: None,
-        takes: None,
-        first: std::time::Instant::now(),
-    };
-    assert_eq!(domain(DomainRole::Allocation, 1e9).wait_bound(), Some(8.0));
-    assert_eq!(domain(DomainRole::Allocation, 0.0).wait_bound(), None);
-    assert_eq!(domain(DomainRole::Staging, 1e9).wait_bound(), None);
-    assert_eq!(MemoryPace::new().wait_bound(), None);
 }
 
 /// What a serving load measured of the rest of the host's motion, which

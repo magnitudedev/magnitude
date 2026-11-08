@@ -7,7 +7,7 @@ use crate::operation::LaunchWork;
 use super::core::{Extents, Layer, RoutingRecord};
 use super::steps::{CompletedRoute, CompletedStep, Decoded, EndedReads, Recording, Step};
 use crate::assessment::{
-    ExpertLines, ExpertPass, FileLine, GroupLayerTerms, GroupReads, GroupUnion, LayerStep, Notice, ReadLine,
+    ExpertLines, ExpertPass, FileLine, GroupLayerTerms, GroupUnion, LayerStep, Notice, ReadLine,
     ReadLineError, RequestReads, Stages,
 };
 use crate::experts::Words;
@@ -1257,27 +1257,6 @@ impl Telemetry {
         let stack = self.stack.lock().expect("watcher telemetry stack");
         let decoded = stack.decoded();
         (std::mem::replace(seen, decoded.steps) != decoded.steps).then(|| decoded.clone())
-    }
-
-    /// What weighs a prompt group's places against the bank's slots
-    /// (`GroupReads`): each layer's terms ([`GroupFacts::terms`]) and last
-    /// group union, one expert's stored bytes a layer, the group-read curve
-    /// and the run's read line; none until the run has measured every
-    /// layer's compute and counted a group's reads at every layer.
-    pub(super) fn group_reads(&self, lines: Option<Arc<[ExpertLines]>>, notice: Notice) -> Option<GroupReads> {
-        let stack = self.fed();
-        let recorded = self.lock();
-        let unions = recorded.facts.unions.iter().cloned().collect::<Option<Vec<_>>>()?;
-        let curve = stack.group_curve().clone();
-        GroupReads::new(
-            recorded.facts.terms()?,
-            unions,
-            self.with_observed(&recorded.costs, &lines?),
-            curve,
-            recorded.costs.line?,
-            recorded.facts.resident.is_some(),
-            notice,
-        )
     }
 
     /// Whether layer `layer` holds a group union, every ended step's group

@@ -41,9 +41,10 @@ pub struct ResourceLimits {
     /// The most launches one chain runs (`TargetProgram::submit`): a
     /// prompt's consecutive chunks run layer-major as one chain, each with
     /// its own region of the launch-row buffers and its own output slot of
-    /// the chain's rotation. Every chunk of a whole-context prompt; a group
-    /// holds the places of the class granted when it opens
-    /// (`ExecutorDomain::grant_group`).
+    /// the chain's rotation. The places a load's prompt groups hold: every
+    /// chunk of a whole-context prompt where the plan holds their class
+    /// ([`Self::holds_group_class`]), one otherwise. A group holds as many
+    /// of them as its chunks as it opens (`ExecutorDomain::grant_group`).
     pub chain_capacity: NonZeroUsize,
     /// Conversations the load holds at once at the fit depth: the workload
     /// whose history and recurrent banks the plan charges and opportunistic
@@ -211,6 +212,18 @@ impl FlightDepth {
 }
 
 impl ResourceLimits {
+    /// Whether the plan holds its prompt groups' class of its chain places
+    /// (`AssessmentMemoryCharge::with_group_class`): where it chains
+    /// several, the most places its groups hold. The plan's settle grants
+    /// the class, the places target a load starts at; serving settles move
+    /// the target within it (`ExecutorDomain::places_target`), its room
+    /// reserved from the bank's growth (`ExecutorDomain::class_reserve`),
+    /// and a group opening takes its places in it
+    /// (`ExecutorDomain::grant_group`).
+    pub const fn holds_group_class(&self) -> bool {
+        self.chain_capacity.get() > 1
+    }
+
     /// The in-flight depth these limits plan for: the one authority every
     /// per-step copy count reads.
     pub const fn flights(&self) -> FlightDepth {
