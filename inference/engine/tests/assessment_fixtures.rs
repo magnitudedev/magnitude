@@ -845,10 +845,11 @@ fn a_bank_shrunk_to_fit_keeps_its_host_tier() {
 /// holding by what it saves: Qwen3.6 35B on the recorded RTX 3090,
 /// uncapped, planned on synthetic prices into the device's stable room
 /// beside its mandatory part, which holds one conversation's state at the
-/// model's whole 262,144-token context: 227 of its 256 slots, the most that
-/// room admits that save anything on these prices (a load lends them the
-/// state no request has committed), and grows to no more than the room's
-/// 228; a prompt pass covers at least 512 rows.
+/// model's whole 262,144-token context, and CUDA's blocks charged only the
+/// tails no allocation reuses: 240 of its 256 slots, the most that room
+/// admits that save anything on these prices (a load lends them the state
+/// no request has committed), and grows to no more than the room's 243; a
+/// prompt pass covers at least 512 rows.
 #[test]
 fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     let scratch = Scratch::new("qwen36-3090-settle");
@@ -876,8 +877,8 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
         .unwrap()
         .unwrap_or_else(|no| panic!("Qwen3.6 35B streams on the RTX 3090: {no:?}"));
     let bank = planned.draft().load().expert_bank().expect("a routed load banks its experts");
-    assert_eq!(bank.slots, 227, "the bank holds the slots its room admits that save anything");
-    assert!((227..=228).contains(&bank.ceiling), "a ceiling of {} slots beyond the room's 228", bank.ceiling);
+    assert_eq!(bank.slots, 240, "the bank holds the slots its room admits that save anything");
+    assert!((240..=243).contains(&bank.ceiling), "a ceiling of {} slots beyond the room's 243", bank.ceiling);
     let limits = planned.draft().policy().limits();
     let region = *magnitude_executor::batching::row_classes(limits.max_launch_rows).last().unwrap() as u64;
     assert!(bank.pass.get() as u64 * region >= 512, "{:?} of {region} rows", bank.pass);
