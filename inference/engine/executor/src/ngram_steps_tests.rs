@@ -72,9 +72,14 @@ fn write_gguf(manifest: &magnitude_artifacts::PackageManifest, path: &std::path:
                 }
             }
             Encoding::F16 => {
+                // A gated delta decay rate (`ssm_a`, -exp(A_log)) is negative,
+                // as every model's is, so the recurrent state decays: a
+                // positive one grows it exponentially along the prompt.
+                let decay_rate = tensor.name.ends_with(".ssm_a");
                 for _ in 0..values {
                     // Within ±1/16: a small F16.
                     let value = ((next() % 2001) as f32 - 1000.0) / 16_000.0;
+                    let value = if decay_rate { -value.abs() } else { value };
                     payload.extend_from_slice(&half_bits(value).to_le_bytes());
                 }
             }
