@@ -578,11 +578,23 @@ impl DeviceHeap {
         table: u64,
         mode: FitMode,
     ) -> Result<Option<ClaimRefusal>, ClaimRefusal> {
+        let fit = Fit::new(self.device.topology(), status, &self.reserves, self.room());
+        self.refusal_in(&fit, readings, claim, table, mode)
+    }
+
+    /// [`Self::refusal`] at `fit`, the fit of the status `readings` observed.
+    fn refusal_in(
+        &self,
+        fit: &Fit<'_>,
+        readings: &[DomainReading],
+        claim: ClaimDemand,
+        table: u64,
+        mode: FitMode,
+    ) -> Result<Option<ClaimRefusal>, ClaimRefusal> {
         let total = self.heap.claimed().plus(claim);
         let topology = self.device.topology();
         let info = self.device.info();
         let executor = info.id();
-        let fit = Fit::new(topology, status, &self.reserves, self.room());
         let host = fit
             .host_staging(info, total.staged)
             .saturating_add(self.host_table_bytes)
@@ -613,13 +625,15 @@ impl DeviceHeap {
     /// The most bytes [`Self::claim_reserved`] of `kind` storage beside
     /// `beside` device bytes admits now in `mode`'s room, from one fresh
     /// status sample: by halving over [`Self::refusal`], the one test of a
-    /// claim, which never admits more bytes where it refuses fewer. Refused
-    /// while a domain is in the Reclaim band, or blind.
+    /// claim, which never admits more bytes where it refuses fewer, at the
+    /// sample's one fit. Refused while a domain is in the Reclaim band, or
+    /// blind.
     pub fn reserved_room(&mut self, kind: BankTier, beside: u64, mode: FitMode, planned: u64) -> Result<u64, ClaimRefusal> {
         let (status, readings) = self.sample(planned)?;
+        let fit = Fit::new(self.device.topology(), &status, &self.reserves, self.room());
         let fits = |bytes: u64| -> Result<bool, ClaimRefusal> {
             let claim = besides(reserved(kind, bytes), beside)?;
-            Ok(self.refusal(&status, &readings, claim, 0, mode)?.is_none())
+            Ok(self.refusal_in(&fit, &readings, claim, 0, mode)?.is_none())
         };
         if !fits(0)? {
             return Ok(0);
