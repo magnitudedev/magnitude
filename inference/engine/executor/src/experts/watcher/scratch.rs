@@ -23,7 +23,10 @@
 //! and returns them empty, so it takes no other layer's records: every
 //! layer keeps its decode experts through it. Beside a host tier its last
 //! step seeds the bank, copying its experts' slots into records the bank's
-//! ranking gives them (`Directory::seed`); on the one store nothing seeds.
+//! ranking gives them (`Directory::seed`). On the one store its reads seed
+//! the store as they land: each cold expert read into a conveyor record
+//! lands from it into a record of the store in place of a less ranked
+//! expert of its own layer (`Directory::seed_store`), mapped past the group.
 //! A claim takes no record a step that may still resolve it names: the
 //! group runs after every step begun before it, a claimed record's expert
 //! is unmapped from the group's first step on, and the group's steps read
@@ -101,6 +104,9 @@ struct Tier {
     /// The cold experts whose read failed, with why: the step
     /// that reads each fails at its round, at once.
     failed: Vec<(usize, String)>,
+    /// On the one store, the experts seeded into it since a request here
+    /// was last counted (`Scratch::land_conveyed`).
+    seeded: u64,
 }
 
 /// The record step `step`'s pass reads `layer`'s `expert` in, as the device
@@ -604,6 +610,7 @@ impl Scratch {
                     reader: vec![None; experts],
                     round: vec![None; experts],
                     failed: Vec::new(),
+                    seeded: 0,
                 });
                 self.tiers.len() - 1
             }
@@ -904,25 +911,64 @@ impl Scratch {
         })
     }
 
-    /// Beside a host tier (where the device places), land each expert just
-    /// read whole into the conveyor, `landed` (layer, expert, conveyor
-    /// record), into its group's host tier from its conveyor record, where
-    /// the tier lacks it and nothing lands it: a prompt group's read is the
-    /// tier's landing too (`experts::landing`, as every landing), so neither
-    /// the tier's fill nor a later miss reads it again. It takes a ready
-    /// record as a demand landing does (`Directory::claim_landing` leaving no
-    /// reserve, which the tier refills by reuse), so the prompt's experts
-    /// displace the tier's least reused; with none ready it lands nothing.
+    /// Land experts just read whole into the conveyor, `landed` (layer,
+    /// expert, conveyor record), into the host records from their conveyor
+    /// records: a prompt group's read is a landing too (`experts::landing`,
+    /// as every landing), so neither the fill nor a later miss reads it
+    /// again. Each takes a ready record as a demand landing does
+    /// (`Directory::claim_landing` leaving no reserve, which the reserve
+    /// refills); with none ready it lands nothing.
+    /// - Beside a host tier (where the device places), every expert the
+    ///   tier lacks lands, displacing the tier's least reused.
+    /// - On the one store, where decode reads the records in place, the
+    ///   group seeds them (`Directory::seed_store`): an expert lands only
+    ///   in place of a less ranked one of its own layer, so the store ends
+    ///   the group holding each layer's most ranked experts at its share.
+    ///   Only experts read into conveyor records land: a scratch slot's
+    ///   bytes are converted over by its own expert's round, which no
+    ///   landing holds back.
+    ///
     /// The conveyor record takes no read until its landing ends
-    /// (`Conveyor::free_conveyor`).
+    /// (`Conveyor::free_conveyor`), and the conveyor clears only once every
+    /// landing has (`Conveyor::quiet`).
     fn land_conveyed(&mut self, core: &mut Core, shared: &Shared, landed: Vec<(usize, usize, u32)>) {
-        if !copies_from_tier(core) {
-            return;
-        }
-        for (layer, expert, record) in landed {
-            let crate::experts::host_records::Claim::Taken(grant) = core.directory.claim_landing(layer, expert, 0) else {
-                continue;
-            };
+        let reader = |tiers: &[Tier], layer: usize, expert: usize| {
+            tiers.iter().find(|tier| tier.layer == layer).and_then(|tier| tier.reader[expert])
+        };
+        let grants = match core.extents.placer {
+            crate::planning::Placer::Tier => landed
+                .into_iter()
+                .filter_map(|(layer, expert, record)| match core.directory.claim_landing(layer, expert, 0) {
+                    crate::experts::host_records::Claim::Taken(grant) => Some((layer, expert, record, grant)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            crate::planning::Placer::Bank => {
+                let mut by_layer = std::collections::BTreeMap::<usize, Vec<(usize, u32)>>::new();
+                for (layer, expert, record) in landed {
+                    if self.conveyor.slot_of(record).is_none() {
+                        by_layer.entry(layer).or_default().push((expert, record));
+                    }
+                }
+                let mut grants = Vec::new();
+                for (layer, conveyed) in by_layer {
+                    let read = conveyed
+                        .iter()
+                        .filter_map(|&(expert, _)| Some((expert, reader(&self.tiers, layer, expert)?)))
+                        .collect::<Vec<_>>();
+                    let seeds = core.directory.seed_store(layer, &read);
+                    if let Some(tier) = self.tiers.iter_mut().find(|tier| tier.layer == layer) {
+                        tier.seeded += seeds.len() as u64;
+                    }
+                    for (expert, grant) in seeds {
+                        let record = conveyed.iter().find(|&&(of, _)| of == expert).expect("a seed was conveyed").1;
+                        grants.push((layer, expert, record, grant));
+                    }
+                }
+                grants
+            }
+        };
+        for (layer, expert, record, grant) in grants {
             let tier = grant.record();
             let pools = self.conveyor.pools();
             let landing = core.landing_from(grant, |pool| (&pools[pool], u64::from(record)));
@@ -934,7 +980,7 @@ impl Scratch {
                 Converting::new(landing, Urgency::waited(), shared.landings.clone(), ended.clone(), || {})
             };
             shared.compute.submit(std::sync::Arc::new(converting));
-            let read = self.tiers.iter().find(|tier| tier.layer == layer).and_then(|tier| tier.reader[expert]);
+            let read = reader(&self.tiers, layer, expert);
             self.conveyor.land(ConveyorLanding { layer, expert, record, tier, read, ended });
         }
     }
@@ -1215,10 +1261,9 @@ impl Scratch {
         // unmapped for every step of the group on. After the last round its
         // seed copy and commit read the list, and the host maps each seed
         // committed once the device is past it (`Core::retire`). On the one
-        // store nothing seeds: the group took no layer's records, and the
-        // fill lands each layer's ranked share once the group returns its
-        // lent records. An earlier step's list names another step: they seed
-        // nothing.
+        // store no step's list seeds: its reads seed the store as they land
+        // (`Self::land_conveyed`). An earlier step's list names another
+        // step: they seed nothing.
         let last = self.conveyor.serving.expect("a scratch request's group is served").last;
         let mut seeded = 0;
         if sequence == last && core.extents.placer == crate::planning::Placer::Tier {
@@ -1385,10 +1430,10 @@ impl Scratch {
         took.parked = served.parked;
         shared.telemetry.serve(layer, sequence, served);
         let last = self.conveyor.serving.expect("a scratch request's group is served").last;
-        let tier = &self.tiers[index];
+        let tier = &mut self.tiers[index];
         took.union = tier.routed.iter().filter(|&&count| count > 0).count() as u64;
         took.hits = hits.len() as u64;
-        took.seeded = seeded;
+        took.seeded = seeded + std::mem::take(&mut tier.seeded);
         shared.telemetry.group(point, last, took);
         match failure {
             // The device's time after a failed step is no layer's compute.

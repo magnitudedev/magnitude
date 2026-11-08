@@ -27,10 +27,10 @@
 mod replay;
 mod stack;
 
-use super::host_records::{Claim, Demand, HostRecords, InboundTable, Kept, Located, Resolution};
+use super::host_records::{Claim, Demand, Grant, HostRecords, InboundTable, Kept, Located, Resolution};
 use super::map::{LandingMap, StampedMap};
 use super::records::{BankRecords, Lent, Record};
-use super::reuse::{Rank, Ranking, Reuse, Score};
+use super::reuse::{Rank, Ranking, Reuse};
 use super::staging::Staged;
 use super::watcher::{Lending, LentRecords, Step, Steps, Unbegun};
 use std::collections::{BTreeSet, HashMap};
@@ -244,10 +244,11 @@ fn beside(prompt_reads: &HashMap<Staged, Step>, staged: Staged, read: Option<Ste
 }
 
 /// How the host records rank what they keep, by `reuse`, one hold of the
-/// ranking for the whole choice: an expert's reuse beside its reads
-/// ([`beside`]).
-fn store_rank<'a>(reuse: &'a Reuse, prompt_reads: &'a HashMap<Staged, Step>) -> impl Fn(Staged, Option<Step>) -> Score + Copy + 'a {
-    move |staged @ (layer, expert): Staged, read: Option<Step>| reuse.rank(layer, expert, beside(prompt_reads, staged, read)).score()
+/// ranking for the whole choice: an expert's whole rank beside its reads
+/// ([`beside`]), so experts the reads tie keep the order earlier reads gave
+/// them, never their indices'.
+fn store_rank<'a>(reuse: &'a Reuse, prompt_reads: &'a HashMap<Staged, Step>) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
+    move |staged @ (layer, expert): Staged, read: Option<Step>| reuse.rank(layer, expert, beside(prompt_reads, staged, read))
 }
 
 /// A group's wanted experts as their copies price them
@@ -527,6 +528,59 @@ impl Directory {
         self.tier(layer).claim((layer, expert), keep)
     }
 
+    /// Seed the one store with `layer`'s experts a prompt group read into
+    /// its conveyor, `read` (each expert with the step that reads it): the
+    /// most ranked first, each it lacks and no graced record keeps
+    /// ([`HostRecords::graces`]) lands into a ready record
+    /// ([`Self::claim_landing`], leaving no reserve) in place of the least
+    /// ranked expert the layer keeps, while the seed outranks it. That
+    /// record is displaced: the reserve unmaps it before any other
+    /// ([`HostRecords::displace`]), graced through the steps that may still
+    /// resolve it, so a layer's seeds take only its own records and no
+    /// layer's share moves to another. The prompt's read lands where the
+    /// store keeps it, and neither the fill nor a decode miss reads it
+    /// again. Each seed with its landing's grant.
+    pub fn seed_store(&mut self, layer: usize, read: &[(usize, Step)]) -> Vec<(usize, Grant)> {
+        let group = self.bank.group(layer);
+        let (mut seeds, displaceable) = {
+            let reuse = self.reuse_now();
+            let rank = store_rank(&reuse, &self.prompt_reads);
+            let tier = &self.host[group];
+            let seeds = read
+                .iter()
+                .filter(|&&(expert, _)| matches!(tier.located((layer, expert)), Located::Lacked) && !tier.graces((layer, expert)))
+                .map(|&(expert, step)| {
+                    let kept = match self.bank.held(layer, expert) {
+                        Some(_) => Kept::Banked,
+                        None => Kept::Alone,
+                    };
+                    (kept, rank((layer, expert), Some(step)), (layer, expert))
+                })
+                .collect::<Vec<_>>();
+            (seeds, tier.displaceable(layer, rank))
+        };
+        seeds.sort_unstable_by(|a, b| b.cmp(a));
+        let mut displaceable = displaceable.into_iter().peekable();
+        let mut seeded = Vec::new();
+        for place in seeds {
+            let Some(&(least, record)) = displaceable.peek().filter(|&&(least, _)| place > least) else {
+                break;
+            };
+            let (_, _, (_, expert)) = place;
+            match self.claim_landing(layer, expert, 0) {
+                Claim::Taken(grant) => {
+                    displaceable.next();
+                    self.host[group].displace(record, least.2);
+                    seeded.push((expert, grant));
+                }
+                // A read posted meanwhile lands it.
+                Claim::Kept(_) | Claim::Landing => {}
+                Claim::Short => break,
+            }
+        }
+        seeded
+    }
+
     /// Where `layer`'s `expert` is in its group's host tier: lacked
     /// without a tier.
     pub fn located(&self, layer: usize, expert: usize) -> Located {
@@ -552,7 +606,7 @@ impl Directory {
     pub fn fill_order(&self, keep: usize, count: usize, skip: impl Fn(Staged) -> bool) -> Vec<Staged> {
         let reuse = self.reuse_now();
         let rank = store_rank(&reuse, &self.prompt_reads);
-        let order = |score: Score, (layer, expert): Staged| (!reuse.in_top(layer, expert), std::cmp::Reverse(score), expert, layer);
+        let order = |rank: Rank, (layer, expert): Staged| (!reuse.in_top(layer, expert), std::cmp::Reverse(rank), expert, layer);
         let mut order = self
             .host
             .iter()
@@ -685,9 +739,16 @@ impl Directory {
     }
 
     /// Whether any group's host tier falls short of `reserve`
-    /// ([`HostRecords::short_of`]): whether a refill may unmap anything.
+    /// ([`HostRecords::short_of`]) or owes records seeds displaced
+    /// ([`HostRecords::owed`]): whether a refill may unmap anything.
     pub fn refill_short(&self, reserve: usize) -> bool {
-        self.host.iter().any(|records| records.short_of(reserve, 0))
+        self.host.iter().any(|records| records.short_of(reserve, 0) || !records.owed().is_empty())
+    }
+
+    /// Whether a graced record keeps `layer`'s `expert`
+    /// ([`HostRecords::graces`]): no landing off a park takes it yet.
+    pub fn graces(&self, layer: usize, expert: usize) -> bool {
+        self.host(self.bank.group(layer)).graces((layer, expert))
     }
 
     /// Each group's records its reserve of `reserve` tier records unmaps

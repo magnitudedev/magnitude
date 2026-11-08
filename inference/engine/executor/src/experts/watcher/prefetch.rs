@@ -678,12 +678,12 @@ impl Prefetch {
     }
 
     /// Whether `staged` is a hint's candidate: an expert that lives only in
-    /// the file (the bank lacks it, its host tier holds none of it) and
-    /// nothing lands (whatever lands it took its tier record,
-    /// `Directory::lands`).
+    /// the file (the bank lacks it, its host tier holds none of it), nothing
+    /// lands (whatever lands it took its tier record, `Directory::lands`),
+    /// and no graced record keeps (`Directory::graces`).
     fn candidate(core: &Core, staged: Staged) -> bool {
         let (layer, expert) = staged;
-        !(core.directory.lands(layer, expert) || core.directory.held(layer, expert).is_some() || core.directory.in_tier(layer, expert))
+        !(core.directory.lands(layer, expert) || core.directory.held(layer, expert).is_some() || core.directory.in_tier(layer, expert) || core.directory.graces(layer, expert))
     }
 
     /// Admit the hints `hinted` (each expert with the rank of the choice it
@@ -822,8 +822,9 @@ impl Prefetch {
     /// record beyond its reserve that the fill takes
     /// (`Directory::fill_pending`). Not once the tier holds every record it
     /// is planned to and each beyond the reserve keeps an expert, or the
-    /// tier keeps every expert: from then only misses' landings change what
-    /// the tier keeps, displacing it at the same records.
+    /// tier keeps every expert: from then only misses' landings and a prompt
+    /// group's reads (`Scratch::land_conveyed`) change what the tier keeps,
+    /// displacing it at the same records.
     pub(super) fn filling(&self, core: &Core) -> bool {
         self.inbound.values().any(|inbound| matches!(inbound.need, Need::Ahead { hinted: None, .. })) || core.directory.fill_pending(core.extents.reserve)
     }

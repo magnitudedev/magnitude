@@ -19,8 +19,8 @@
 //! Where the reads leave experts tied, their order is the one the reads
 //! gave them before ([`Rank`]): each read hands its experts the next places
 //! in one order of logging, among themselves as they ranked before it. No
-//! choice of the bank's reads the experts' indices (the host tier's still
-//! tie by them), so a prompt group's union read of
+//! choice of the bank's or the host records' reads the experts' indices,
+//! so a prompt group's union read of
 //! every expert once leaves a layer's decode share above the experts only
 //! the group read, at recency as at every half-life. A read's experts enter
 //! the stack and the pool least ranked first ([`Measure::entering`]), so the

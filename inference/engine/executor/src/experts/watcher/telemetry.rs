@@ -266,7 +266,9 @@ pub struct GroupLayer {
     pub cold_bytes: u64,
     pub pulled: u64,
     pub tier_bytes: u64,
-    /// The experts the group's last step seeded.
+    /// The experts the group seeded into the bank: its last step's seed
+    /// copies beside a host tier, its reads landed in place of less ranked
+    /// experts on the one store.
     pub seeded: u64,
     /// What the group's steps waited here for their experts: the watcher's
     /// serving of each step's request, from its round 0 to its last.

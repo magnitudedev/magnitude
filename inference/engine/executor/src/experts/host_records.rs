@@ -64,7 +64,6 @@
 
 use super::directory::Point;
 use super::map::LandingMap;
-use super::reuse::Score;
 use super::staging::Staged;
 use super::watcher::{Step, Unbegun};
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -218,11 +217,12 @@ pub(super) enum Claim {
     Short,
 }
 
-/// How the tier is ranked: an expert's reuse beside a read the ranking may
-/// not have brought yet (`Reuse::rank`).
-pub(super) trait Rank: Fn(Staged, Option<Step>) -> Score {}
+/// How the tier is ranked: an expert's rank beside a read the ranking may
+/// not have brought yet (`Reuse::rank`), in an order `K` that breaks the
+/// reads' ties as the reads before broke them, never by the expert's index.
+pub(super) trait Rank<K: Ord + Copy>: Fn(Staged, Option<Step>) -> K {}
 
-impl<F: Fn(Staged, Option<Step>) -> Score> Rank for F {}
+impl<K: Ord + Copy, F: Fn(Staged, Option<Step>) -> K> Rank<K> for F {}
 
 /// An expert a record keeps whole, mapped: as `kept`, ranked beside
 /// `read`, held by `holds` copies reading it.
@@ -288,9 +288,9 @@ impl Host {
 }
 
 /// A kept record's place in the taking order at `rank`: what it keeps, its
-/// expert's reuse beside its landing's `read`, and the expert (a tie by the
-/// expert, never by where it lies).
-fn taking(kept: Kept, staged: Staged, read: Option<Step>, rank: &impl Rank) -> (Kept, Score, Staged) {
+/// expert's rank beside its landing's `read`, and the expert (where `rank`
+/// ties, never by where it lies).
+fn taking<K: Ord + Copy>(kept: Kept, staged: Staged, read: Option<Step>, rank: &impl Rank<K>) -> (Kept, K, Staged) {
     (kept, rank(staged, read), staged)
 }
 
@@ -335,6 +335,11 @@ pub(super) struct HostRecords {
     victims: VecDeque<(u32, Staged)>,
     /// The step the victims were prepared at, and how many.
     prepared: Option<(Step, usize)>,
+    /// The kept records a prompt group's seeds displace, each with the
+    /// expert it kept as the seed chose it ([`Self::displace`]): the
+    /// reserve unmaps them before any other, so each seed takes a record of
+    /// its own layer's.
+    displaced: Vec<(u32, Staged)>,
     /// The read path's mirror of where every expert is, whose words of the
     /// group's layers these records alone clear.
     inbound: Arc<InboundTable>,
@@ -375,6 +380,7 @@ impl HostRecords {
             holdings: 0,
             victims: VecDeque::new(),
             prepared: None,
+            displaced: Vec::new(),
             inbound,
         };
         assert!(lent <= records, "a tier lends {lent} of its {records} records");
@@ -513,6 +519,23 @@ impl HostRecords {
         self.graced.len()
     }
 
+    /// Whether a graced record keeps `staged`: a step begun before it was
+    /// unmapped may still resolve it there (a running prompt group's steps
+    /// plan their hits on it as each opens), so no landing off a park
+    /// takes the expert until the grace retires; one would map it anew and
+    /// leave those resolutions unmapped.
+    pub fn graces(&self, staged: Staged) -> bool {
+        self.graced_experts().any(|graced| graced == staged)
+    }
+
+    /// The experts graced records keep ([`Self::graces`]).
+    fn graced_experts(&self) -> impl Iterator<Item = Staged> + '_ {
+        self.graced.iter().map(|&record| match self.records[record as usize] {
+            Host::Graced { staged, .. } => staged,
+            other => panic!("graced record {record} is {other:?}"),
+        })
+    }
+
     /// The record keeping `staged` whole, if one does.
     pub fn kept_record(&self, staged: Staged) -> Option<u32> {
         self.kept.get(&staged).copied()
@@ -574,11 +597,49 @@ impl HostRecords {
     /// Kept record `record`'s place in the taking order at `rank`; none for
     /// a record that keeps nothing, or is an outstanding answer: only a
     /// kept record is ever taken.
-    fn place(&self, record: u32, rank: &impl Rank) -> Option<(Kept, Score, Staged)> {
+    fn place<K: Ord + Copy>(&self, record: u32, rank: &impl Rank<K>) -> Option<(Kept, K, Staged)> {
         match self.records[record as usize] {
             Host::Kept(Whole { staged, kept, read, .. }) => Some(taking(kept, staged, read, rank)),
             _ => None,
         }
+    }
+
+    /// Whether record `record` still keeps `staged` whole, no copy holding
+    /// it and no answer outstanding: as a seed found it when it chose to
+    /// displace it.
+    fn still_keeps(&self, record: u32, staged: Staged) -> bool {
+        matches!(self.records[record as usize], Host::Kept(Whole { staged: kept, holds: 0, .. }) if kept == staged)
+    }
+
+    /// The records seeds displaced that still keep what they kept: owed
+    /// back to the reserve, each in place of the seed that took a ready
+    /// record ([`Self::refill_victims`]).
+    pub fn owed(&self) -> Vec<(u32, Staged)> {
+        self.displaced.iter().copied().filter(|&(record, staged)| self.still_keeps(record, staged)).collect()
+    }
+
+    /// The kept records of `layer`'s experts a prompt group's seed of the
+    /// layer may displace, the least ranked first at `rank`, each with its
+    /// place in the taking order: past the lent records, no copy holding
+    /// it, no answer outstanding, none already displaced.
+    pub fn displaceable<K: Ord + Copy>(&self, layer: usize, rank: impl Rank<K>) -> Vec<((Kept, K, Staged), u32)> {
+        let mut order = (self.lent..self.records())
+            .filter(|&record| {
+                matches!(self.records[record as usize], Host::Kept(Whole { staged: (of, _), holds: 0, .. }) if of == layer)
+                    && !self.displaced.iter().any(|&(displaced, _)| displaced == record)
+            })
+            .filter_map(|record| Some((self.place(record, &rank)?, record)))
+            .collect::<Vec<_>>();
+        order.sort_unstable();
+        order
+    }
+
+    /// A prompt group's seed displaces kept record `record`, which keeps
+    /// `staged` ([`Self::displaceable`]): the reserve unmaps it before any
+    /// other ([`Self::refill_victims`]), unless it changed meanwhile.
+    pub fn displace(&mut self, record: u32, staged: Staged) {
+        assert!(self.still_keeps(record, staged), "a seed displaces record {record}, which no longer keeps {staged:?} alone");
+        self.displaced.push((record, staged));
     }
 
     /// Whether no copy holds record `record`.
@@ -598,7 +659,7 @@ impl HostRecords {
 
     /// The kept records `admits`, first in taking order at `rank`, the
     /// outstanding answers among them where `answers`.
-    fn taking_order(&self, rank: &impl Rank, answers: bool, admits: impl Fn(u32) -> bool) -> Vec<u32> {
+    fn taking_order<K: Ord + Copy>(&self, rank: &impl Rank<K>, answers: bool, admits: impl Fn(u32) -> bool) -> Vec<u32> {
         let place = |record: u32| match self.records[record as usize] {
             Host::Answering(Whole { staged, kept, read, .. }, _) if answers => Some(taking(kept, staged, read, rank)),
             _ => self.place(record, rank),
@@ -671,11 +732,12 @@ impl HostRecords {
     /// over, in the order its fill lands them: by `order` of each one's
     /// reuse at `rank` (the directory's one fill order,
     /// `Directory::fill_order`), with its key.
-    pub fn lacking<K: Ord>(&self, rank: impl Rank, count: usize, skip: impl Fn(Staged) -> bool, order: impl Fn(Score, Staged) -> K) -> Vec<(K, Staged)> {
+    pub fn lacking<R: Ord + Copy, K: Ord>(&self, rank: impl Rank<R>, count: usize, skip: impl Fn(Staged) -> bool, order: impl Fn(R, Staged) -> K) -> Vec<(K, Staged)> {
+        let graced = self.graced_experts().collect::<std::collections::HashSet<_>>();
         let mut lacked = self
             .lacking
             .iter()
-            .filter(|&&staged| !skip(staged))
+            .filter(|&&staged| !skip(staged) && !graced.contains(&staged))
             .map(|&staged| (order(rank(staged, None), staged), staged))
             .collect::<Vec<_>>();
         if count < lacked.len() {
@@ -773,8 +835,12 @@ impl HostRecords {
         self.set(record, Host::Ready);
     }
 
-    /// The kept records the reserve unmaps now ([`Self::refill`]): those not
-    /// held, first in taking order at `rank`, until the ready, the graced
+    /// The kept records the reserve unmaps now ([`Self::refill`]): every
+    /// record a seed displaced ([`Self::displace`]) that still keeps what it
+    /// kept, however full the reserve, since the seed's landing took its
+    /// place ([`Self::owed`]); then, of those not held, first in taking
+    /// order at `rank`,
+    /// until the ready, the graced
     /// and the lent records a prompt group holds claimed (which it returns
     /// ready, so no decode expert elsewhere is unmapped for them) make
     /// `reserve`, or the experts lacked where fewer (a tier that keeps every
@@ -782,18 +848,23 @@ impl HostRecords {
     /// is left; the lent records among them where `lent` (no prompt group
     /// held or awaited them as this read), each with the expert it keeps.
     /// It reads the ranking, and changes nothing.
-    pub fn refill_victims(&self, reserve: usize, rank: impl Rank, lent: bool) -> Vec<(u32, Staged)> {
+    pub fn refill_victims<K: Ord + Copy>(&self, reserve: usize, rank: impl Rank<K>, lent: bool) -> Vec<(u32, Staged)> {
         let short = |unmapped: usize| self.short_of(reserve, unmapped);
-        if !short(0) {
-            return Vec::new();
+        let mut victims = self.owed();
+        if !short(victims.len()) {
+            return victims;
         }
-        let mut victims = Vec::new();
-        for record in self.taking_order(&rank, true, |record| (lent || record >= self.lent) && self.unheld(record)) {
+        let order = self
+            .taking_order(&rank, true, |record| (lent || record >= self.lent) && self.unheld(record))
+            .into_iter()
+            .map(|record| (record, self.records[record as usize].whole().expect("a record in taking order keeps an expert").staged));
+        for victim in order {
             if !short(victims.len()) {
                 break;
             }
-            let staged = self.records[record as usize].whole().expect("a record in taking order keeps an expert").staged;
-            victims.push((record, staged));
+            if !victims.contains(&victim) {
+                victims.push(victim);
+            }
         }
         victims
     }
@@ -834,6 +905,10 @@ impl HostRecords {
             }
             self.set(record, Host::Graced { staged, grace: Point { group, layer: staged.0, sequence }, answer });
         }
+        // A displaced record unmapped, or changed since its seed chose it,
+        // is displaced no more.
+        let displaced = std::mem::take(&mut self.displaced);
+        self.displaced = displaced.into_iter().filter(|&(record, staged)| self.still_keeps(record, staged)).collect();
     }
 
     /// Prepare a demand's victims ([`Self::victims`]): the first `depth`
@@ -841,7 +916,7 @@ impl HostRecords {
     /// request's reads are submitted, so the scan is off every park's path;
     /// the order it leaves is a few passes old at most when a claim reads
     /// it, and each entry is checked again as it is taken.
-    pub fn prepare_demand(&mut self, rank: impl Rank, depth: usize, sequence: Step) {
+    pub fn prepare_demand<K: Ord + Copy>(&mut self, rank: impl Rank<K>, depth: usize, sequence: Step) {
         let mut order = (0..self.records())
             .filter(|&record| self.unheld(record))
             .filter_map(|record| Some((self.place(record, &rank)?, record)))
@@ -940,7 +1015,7 @@ impl HostRecords {
     /// kept record is held, read, or another request's outstanding answer.
     /// The record taken is the parked request's outstanding answer once it
     /// lands.
-    pub fn claim_demand(&mut self, staged: Staged, demand: Demand, rank: impl Rank, read: impl Fn(u32) -> bool, (parked, steps): (Point, u64)) -> Claim {
+    pub fn claim_demand<K: Ord + Copy>(&mut self, staged: Staged, demand: Demand, rank: impl Rank<K>, read: impl Fn(u32) -> bool, (parked, steps): (Point, u64)) -> Claim {
         if let Some(claim) = self.demanded(staged, demand) {
             return claim;
         }
@@ -1125,7 +1200,7 @@ impl HostRecords {
     /// mapped there from the first step not yet begun, each dropped one
     /// unmapped. The moves, (from, to), whose bytes the caller copies before
     /// any step reads them.
-    pub fn shrink(&mut self, records: u32, rank: impl Rank) -> Vec<(u32, u32)> {
+    pub fn shrink<K: Ord + Copy>(&mut self, records: u32, rank: impl Rank<K>) -> Vec<(u32, u32)> {
         let count = self.records();
         assert!(records <= count, "a host tier of {count} records shrinks to {records}");
         let floor = self.shrink_floor();
@@ -1206,11 +1281,12 @@ impl HostRecords {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::experts::reuse::Score;
 
     /// The reserve's turn on `tier` ([`HostRecords::refill_victims`] then
     /// [`HostRecords::refill`]), a prompt group holding the lent records:
     /// `latest` read only where it unmaps any.
-    fn refill(tier: &mut HostRecords, reserve: usize, rank: impl Rank, at: &Unbegun, latest: impl FnOnce() -> (Step, Step)) {
+    fn refill(tier: &mut HostRecords, reserve: usize, rank: impl Rank<Score>, at: &Unbegun, latest: impl FnOnce() -> (Step, Step)) {
         let victims = tier.refill_victims(reserve, rank, false);
         if !victims.is_empty() {
             tier.refill(victims, false, at, latest());
@@ -1338,7 +1414,7 @@ mod tests {
         /// A demand claim of lacked `staged` parked at `parked` in a group
         /// of `steps` steps, nothing read: the record taken and the expert
         /// whose record it unmapped, if one, none where short.
-        fn reclaim(&mut self, staged: Staged, rank: impl Rank, parked: Point, steps: u64) -> Option<(u32, Option<Staged>)> {
+        fn reclaim(&mut self, staged: Staged, rank: impl Rank<Score>, parked: Point, steps: u64) -> Option<(u32, Option<Staged>)> {
             let kept = self.kept.clone();
             match self.claim_demand(staged, Demand::Lacked, rank, |_| false, (parked, steps)) {
                 Claim::Taken(grant) => {

@@ -876,6 +876,51 @@ fn the_one_stores_rounds_read_a_cold_expert_the_store_keeps() {
     step.complete().unwrap();
 }
 
+/// On the one store a prompt group's reads seed the store: each cold
+/// expert read into a conveyor record lands from it into a ready record, in
+/// place of the least ranked expert its own layer keeps (here one the fill
+/// landed and nothing read), mapped past the group, which still reads it
+/// from its scratch slot. The displaced records leave as the reserve
+/// refills, so the layer keeps as many experts as before, and the group
+/// counts its seeds.
+#[test]
+fn the_one_stores_group_reads_seed_it_in_place_of_its_least_ranked() {
+    // Two layers of one group, more experts than records: a decode step
+    // lands two of layer 0's, and the rest of each layer is cold.
+    let harness = lending("seed-store", EXPERTS, EXPERTS as u64, 2, STAGING, Conveying::of(2), TIER, Placer::Bank, false);
+    let held = |layer: usize| (0..EXPERTS).filter(|&expert| harness.layers[layer].0.held(expert).is_some()).collect::<Vec<_>>();
+    let landing = harness.step();
+    harness.request_at(&landing, 0, &[0, 1]);
+    harness.request_at(&landing, 1, &[]);
+    landing.complete().unwrap();
+    eventually("the decode step's misses never landed", || [0, 1].iter().all(|expert| held(0).contains(expert)));
+    harness.tier_ready();
+    let (before, other) = (held(0), held(1));
+    assert!(!before.is_empty(), "the fill kept none of layer 0");
+    let cold = (0..EXPERTS).filter(|expert| !before.contains(expert)).take(2).collect::<Vec<_>>();
+    let step = harness.prompt_step();
+    let rounds = harness.scratch(&step, 0, &cold);
+    assert_eq!(Harness::experts(&rounds.concat()), cold.iter().map(|&expert| expert as i32).collect::<Vec<_>>());
+    let map = &harness.layers[0].0;
+    eventually("the group's reads never seeded the store", || cold.iter().any(|&expert| map.held(expert).is_some()));
+    assert!(cold.iter().all(|&expert| map.resolve(expert, step.sequence()).is_none()), "seeded past the running group");
+    // Each seed displaces one of its own layer's as the reserve refills:
+    // as many of layer 0's leave as seeds land, and none of layer 1's. The
+    // fill may land more meanwhile, into records past the reserve, which
+    // displaces nothing.
+    let left = |now: &[usize]| before.iter().filter(|expert| !now.contains(expert)).count();
+    eventually("the displaced records never left", || {
+        let now = held(0);
+        left(&now) == cold.iter().filter(|expert| now.contains(expert)).count()
+    });
+    assert!(other.iter().all(|expert| held(1).contains(expert)), "a seed of layer 0 displaced layer 1's");
+    let seeded = cold.iter().filter(|&&expert| map.held(expert).is_some()).count();
+    harness.scratch(&step, 1, &[]);
+    step.complete().unwrap();
+    let layers = harness.watcher.shared().costs().group.unwrap().layers;
+    assert_eq!(layers[0].seeded, seeded as u64);
+}
+
 /// A resident prompt group requests nothing; its passes' grouping writes
 /// its reads into its group reads record (`BankPart::GroupReads`). Once
 /// every step of it has ended the stack holds them, by layer at the
