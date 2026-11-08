@@ -482,36 +482,25 @@ impl Scratch {
     /// served group is past (their backs read no record any more), free
     /// the conveyor's records of those layers, and once it is past the
     /// group, clear the conveyor as soon as nothing of the group runs
-    /// ([`Self::clear_past`]).
+    /// ([`Self::clear_past`]). Where the group's backs lie in the device's
+    /// order is read from the steps now: a group cut in before one of its
+    /// layers moves them later.
     pub(super) fn advance(&mut self, progress: Point, core: &mut Core) {
         let Some(serving) = self.conveyor.serving.as_mut() else {
             return;
         };
-        if progress >= Point::after(serving.group) {
+        let steps = &core.steps;
+        if progress >= steps.after(serving.group) {
             serving.past = true;
         }
         let serving = *serving;
         // A tier the device is past holds nothing: its slots are the
         // scratch's, which the group returns as it clears.
-        self.tiers.retain(|tier| {
-            progress
-                <= Point {
-                    group: tier.group,
-                    layer: tier.layer,
-                    sequence: serving.last,
-                }
-        });
+        self.tiers.retain(|tier| progress <= steps.point(tier.group, tier.layer, serving.last));
         if !serving.past {
             // A layer every step of the group is past lists none of the
             // records carrying its experts.
-            self.conveyor.release_past(|layer| {
-                progress
-                    > Point {
-                        group: serving.group,
-                        layer,
-                        sequence: serving.last,
-                    }
-            });
+            self.conveyor.release_past(|layer| progress > steps.point(serving.group, layer, serving.last));
             return;
         }
         self.clear_past(core);
@@ -587,7 +576,7 @@ impl Scratch {
     /// conveyor records, as demand reads behind those taken before it
     /// (`Scratch::convey`).
     pub(super) fn publish(&mut self, at: At, place: usize, core: &mut Core, shared: &Shared) {
-        let Point { group, layer, sequence } = at.point;
+        let Point { group, layer, sequence, .. } = at.point;
         let experts = core.layers[layer].experts;
         self.published[layer] = sequence;
         self.serve_group(group, core, shared);
@@ -888,10 +877,13 @@ impl Scratch {
     /// Whether deferred expert `expert` of `tier` comes from the host tier,
     /// taking no record: beside a host tier (where the device places), the
     /// tier keeps it whole, or a landing into it is in flight (a read
-    /// ahead's, `Scratch::awaited`), which the tier copy reads once landed.
-    /// No expert is read twice.
+    /// ahead's, `Scratch::awaited`), which the tier copy reads once landed,
+    /// in a record the group may read (`Directory::tier_serves`: none a
+    /// decode step cut in during the group landed). No expert is read
+    /// twice.
     fn waits(&self, core: &Core, tier: &Tier, expert: usize) -> bool {
-        copies_from_tier(core) && (core.directory.in_tier(tier.layer, expert) || core.directory.lands(tier.layer, expert))
+        copies_from_tier(core)
+            && self.conveyor.serving.is_some_and(|serving| core.directory.tier_serves(tier.layer, expert, serving.last))
     }
 
     /// Whether the conveyor carries `staged`: a read of it, or its record,
@@ -1093,7 +1085,7 @@ impl Scratch {
     /// ended before its round 0 arrived (a device error): its experts are
     /// the next routing step's, and its failure is recorded and published.
     pub(super) fn unarrived(&mut self, at: At, place: usize, core: &Core, shared: &Shared) {
-        let Point { group, layer, sequence } = at.point;
+        let Point { group, layer, sequence, .. } = at.point;
         if let Some((index, request)) = self.take(group, layer, place) {
             self.forfeit(index, place, request.experts(), core);
         }
@@ -1144,7 +1136,7 @@ impl Scratch {
     /// the conveyor carry, its arrival counted, and, of a group's last
     /// step, its seeding.
     fn opened(&mut self, at: At, arrived: Instant, request: Request, core: &mut Core, shared: &Shared) -> Opened {
-        let Point { group, layer, sequence } = at.point;
+        let Point { group, layer, sequence, .. } = at.point;
         let Request { routed, hits, cold, .. } = request;
         // What the records freed since let the conveyor carry, this
         // request's deferred experts among them.
@@ -1197,7 +1189,7 @@ impl Scratch {
     /// host tier keeps whole the tier copy reads, which round 0's answer
     /// lists (the tier list, written before it).
     fn fix_rounds(&mut self, at: At, opened: Opened, core: &mut Core, shared: &Shared) -> Rounds {
-        let Point { group, layer, sequence } = at.point;
+        let Point { group, layer, sequence, .. } = at.point;
         let Opened { routed, hits, cold } = opened;
         self.convey(core, shared);
         let round_records = core.extents.round_records;
@@ -1226,6 +1218,7 @@ impl Scratch {
         // borrower's stored bytes is converted by a round, which
         // `compose_rounds` puts after the borrower's (or `Self::reclaim_slots`
         // holds), as the copy would overwrite them.
+        let last = self.conveyor.serving.expect("a scratch request's group is served").last;
         let mut tiered = Vec::new();
         let mut listed = Vec::new();
         let mut cold = cold
@@ -1234,7 +1227,7 @@ impl Scratch {
                 let copied = copies_from_tier(core)
                     && self.conveyor.state(layer, expert).is_none()
                     && self.conveyor.borrower(expert).is_none();
-                let record = copied.then(|| core.directory.hold_tier(layer, expert)).flatten();
+                let record = copied.then(|| core.directory.hold_for_pass(layer, expert, last)).flatten();
                 if let Some(record) = record {
                     tiered.push(expert);
                     listed.push((record.0 as i32, scratch(&self.tiers[index], expert) as i32));
@@ -1266,7 +1259,6 @@ impl Scratch {
         // store no step's list seeds: its reads seed the store as they land
         // (`Self::land_conveyed`). An earlier step's list names another
         // step: they seed nothing.
-        let last = self.conveyor.serving.expect("a scratch request's group is served").last;
         let mut seeded = 0;
         if sequence == last && core.extents.placer == crate::planning::Placer::Tier {
             let tier = &self.tiers[index];
@@ -1340,7 +1332,7 @@ impl Scratch {
     /// failed, or its step ended without the device arriving, a device
     /// error).
     fn round(&mut self, at: At, rounds: &mut Rounds, core: &mut Core, prefetch: &mut Prefetch, shared: &Shared) -> bool {
-        let Point { group, layer, sequence } = at.point;
+        let Point { group, layer, sequence, .. } = at.point;
         let round_records = core.extents.round_records;
         let table = core.layers[layer].scratch.clone();
         // A layer's cold experts fill at most its rounds (`rounds`: the

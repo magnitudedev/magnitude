@@ -7,11 +7,19 @@
 //! work before releasing a step). The one completion fact every reuse of a
 //! record rests on is the frontier ([`Steps::frontier`]): the least step not
 //! yet ended, below which every step has ended. Every exit advances it.
+//!
+//! The steps are the one owner of the device's order (`Point`): the pieces
+//! each group runs as ([`Piece`]), a group's own from its begin, and one
+//! more each time a group is cut in before one of its layers
+//! ([`Shared::begin_cut_in`]). Every point a step's resolution has yet to
+//! reach is read from them when it is compared ([`Steps::after`],
+//! [`Steps::point`], [`Steps::park`], [`Steps::served`]), since a cut moves
+//! it later; only points the device has reached are kept.
 
 use super::Shared;
 use super::core::At;
 use crate::assessment::ExpertLines;
-use crate::experts::directory::Point;
+use crate::experts::directory::{Park, Piece, Point};
 use crate::experts::events::Events;
 use crate::FlightDepth;
 use crate::operation::LaunchWork;
@@ -95,10 +103,39 @@ impl FailedRows {
     }
 }
 
+/// One of a group's pieces ([`Piece`]): its layers from `from` up to the
+/// next piece's, and where it begins in the device's order of layer runs.
+#[derive(Clone, Copy, Debug)]
+struct Opened {
+    from: usize,
+    piece: Piece,
+    base: Base,
+}
+
+/// Where a piece begins among the device's layer runs, `steps` steps' runs
+/// (the bank's streamed layers each) and `runs` more, which a step's point
+/// counts from (`At`): a group begun after every other is past the runs of
+/// every step before it, and a group cut in before a layer of another is
+/// past that group's runs before the layer and its fronts at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Base {
+    steps: u64,
+    runs: u64,
+}
+
+impl Base {
+    fn at(self, layers: usize) -> u64 {
+        self.steps * layers as u64 + self.runs
+    }
+}
+
 /// A group of steps begun: its steps, those ended, when it began, and
 /// whether the watcher has retired it (the device is past it).
 struct Begun {
     steps: u64,
+    /// The pieces it runs as, by their first layer: one, its own, until a
+    /// group is cut in before one of its layers.
+    pieces: Vec<Opened>,
     ended: u64,
     begun: Instant,
     retired: bool,
@@ -166,6 +203,10 @@ struct State {
     /// first failure's). Recorded before the request's failure is
     /// published, so before its step can complete.
     failed: BTreeMap<Step, (FailedRows, String)>,
+    /// The runs every cut added before the groups begun since
+    /// ([`State::open`]): a group begun after every other begins past
+    /// them.
+    cut_runs: u64,
     /// Steps whose runs serve their streamed layers from `layer` on over a
     /// window of the step's rows starting at batch row `first` (a stateless
     /// tail's, `Shared::window`): (layer, first). A request of such a layer
@@ -177,7 +218,106 @@ struct State {
     tainted: BTreeSet<Step>,
 }
 
+impl Begun {
+    /// The piece its steps resolve `layer` in: its pass there (a back's
+    /// read of the layer's experts).
+    fn pass(&self, layer: usize) -> &Opened {
+        self.pieces.iter().rev().find(|opened| opened.from <= layer).expect("a group's first piece is from its first layer")
+    }
+
+    /// The piece its steps request `layer` in: a front's, which at a layer a
+    /// group was cut in before runs before the group cut in (only the pass
+    /// after it is cut), and so in the piece before.
+    fn front(&self, layer: usize) -> &Opened {
+        self.pieces.iter().rev().find(|opened| opened.from < layer.max(1)).expect("a group's first piece is from its first layer")
+    }
+
+    /// The point past every layer of every one of its steps.
+    fn after(&self, group: Step) -> Point {
+        let piece = self.pieces.last().expect("a group runs a piece").piece;
+        Point { piece, layer: usize::MAX, sequence: Step::MAX, group }
+    }
+}
+
 impl State {
+    /// The point of layer `layer` of step `sequence` of group `group` that
+    /// its pass there reaches ([`Begun::pass`]): the start of the device's
+    /// order for a group forgotten, every step of which ended.
+    fn pass_point(&self, group: Step, layer: usize, sequence: Step) -> Point {
+        self.groups.get(&group).map_or(Point::START, |begun| Point { piece: begun.pass(layer).piece, layer, sequence, group })
+    }
+
+    /// The pieces of the group of `count` steps from `first` beginning now,
+    /// beside the cut it makes where it is cut in `before` (group, layer):
+    /// that group's layers from `layer` on become a piece of their own,
+    /// behind the new group's, which begins past that group's runs before
+    /// the layer and its fronts there. A cut takes the group whose piece
+    /// is the latest submitted (nothing but groups cut in before it began
+    /// since), at a layer past its first and none before its last piece's:
+    /// none of its runs from the layer on can have been submitted. At its
+    /// last piece's own layer (another group cut in at the same cut) that
+    /// piece moves behind the new group. Any other cut is an invariant
+    /// violation.
+    fn open(&mut self, first: Step, count: u64, before: Option<(Step, usize)>) -> Vec<Opened> {
+        let Some((group, layer)) = before else {
+            return vec![Opened { from: 0, piece: Piece::of(first), base: Base { steps: first, runs: self.cut_runs } }];
+        };
+        let latest = self.groups.values().map(|begun| begun.pieces.last().expect("a group runs a piece").piece).max();
+        let cut = self.groups.get_mut(&group).unwrap_or_else(|| panic!("a group cut in before group {group}, which is not running"));
+        let last = *cut.pieces.last().expect("a group runs a piece");
+        assert_eq!(Some(last.piece), latest, "a group cut in before group {group}, whose piece {:?} is not the latest submitted", last.piece);
+        assert!(cut.ended < cut.steps, "a group cut in before group {group}, every step of which ended");
+        assert!(layer > 0 && layer >= last.from, "a group cut in before layer {layer} of group {group}, whose last piece runs from layer {}", last.from);
+        let base = match layer == last.from {
+            true => last.base,
+            false => {
+                let runs = (layer - last.from + 1) as u64 * cut.steps;
+                self.cut_runs += cut.steps;
+                Base { runs: last.base.runs + runs, ..last.base }
+            }
+        };
+        let behind = Opened { from: layer, piece: Piece { opened: first, behind: true }, base: Base { steps: base.steps + count, ..base } };
+        if layer == last.from {
+            cut.pieces.pop();
+        }
+        cut.pieces.push(behind);
+        vec![Opened { from: 0, piece: Piece::of(first), base }]
+    }
+
+    /// The first step of the group of `point` or a later one whose pass at
+    /// `layer` lies after `point` (`Park::unresolved`): the first such
+    /// group's first step, or the parked step's next at its own layer; the
+    /// first step not yet begun where none.
+    fn first_unresolved(&self, point: Point, layer: usize) -> Step {
+        use std::cmp::Ordering;
+        for (&first, begun) in self.groups.range(point.group..) {
+            let unresolved = match begun.pass(layer).piece.cmp(&point.piece) {
+                Ordering::Greater => Some(first),
+                Ordering::Less => None,
+                Ordering::Equal => match layer.cmp(&point.layer) {
+                    Ordering::Greater => Some(first),
+                    Ordering::Equal => Some(point.sequence + 1).filter(|&next| next < first + begun.steps),
+                    Ordering::Less => None,
+                },
+            };
+            if let Some(unresolved) = unresolved {
+                return unresolved;
+            }
+        }
+        self.last + 1
+    }
+
+    /// The steps of groups begun before `point`'s whose pass at `layer`
+    /// lies after it, (first, last) (`Park::earlier`): a group's steps
+    /// resolve a layer in one piece, all after a point of another's or none.
+    fn unresolved_before(&self, point: Point, layer: usize) -> Option<(Step, Step)> {
+        self.groups
+            .range(..point.group)
+            .filter(|(_, begun)| begun.pass(layer).piece > point.piece)
+            .map(|(&first, begun)| (first, first + begun.steps - 1))
+            .reduce(|(first, _), (_, last)| (first, last))
+    }
+
     /// The group step `sequence` began in, by first sequence.
     fn group(&mut self, sequence: Step) -> (Step, &mut Begun) {
         self.groups
@@ -252,6 +392,7 @@ impl Steps {
                 failed: BTreeMap::new(),
                 tainted: BTreeSet::new(),
                 windows: BTreeMap::new(),
+                cut_runs: 0,
             }),
             events: Arc::default(),
             frontier: AtomicU64::new(1),
@@ -351,29 +492,88 @@ impl Steps {
         self.events.notify();
     }
 
-    /// Layer `layer` of step `sequence` in the device's order, of a bank of
-    /// `layers` layers.
-    pub(super) fn at(&self, sequence: Step, layer: usize, layers: usize) -> At {
-        let (group, steps) = self.group_of(sequence);
-        At::new(Point { group, layer, sequence }, steps, layers)
+    /// The request at layer `layer` of step `sequence` in the device's
+    /// order, of a bank of `layers` layers: its front's point
+    /// ([`Begun::front`]), and the layer runs before it.
+    pub(in crate::experts) fn at(&self, sequence: Step, layer: usize, layers: usize) -> At {
+        let mut state = self.lock();
+        let (group, begun) = state.group(sequence);
+        let opened = *begun.front(layer);
+        let position = opened.base.at(layers) + (layer - opened.from) as u64 * begun.steps + (sequence - group);
+        At::new(Point { piece: opened.piece, layer, sequence, group }, position)
+    }
+
+    /// The point of layer `layer` of step `sequence` of group `group`
+    /// (which may name the step after the group's last) that its pass
+    /// there reaches, read now: the start of the device's order for a
+    /// group forgotten, every step of which ended.
+    pub(super) fn point(&self, group: Step, layer: usize, sequence: Step) -> Point {
+        self.lock().pass_point(group, layer, sequence)
+    }
+
+    /// The point past every layer of every step of group `group`, read
+    /// now: the start of the device's order for a group forgotten, every
+    /// step of which ended.
+    pub(in crate::experts) fn after(&self, group: Step) -> Point {
+        self.lock().groups.get(&group).map_or(Point::START, |begun| begun.after(group))
+    }
+
+    /// The device parked at `point` (a decode request at its layer), of a
+    /// bank of `layers` layers ([`Park`]).
+    pub(in crate::experts) fn park(&self, point: Point, layers: usize) -> Park {
+        let state = self.lock();
+        Park {
+            point,
+            unresolved: (0..layers).map(|layer| state.first_unresolved(point, layer)).collect(),
+            earlier: (0..layers).map(|layer| state.unresolved_before(point, layer)).collect(),
+        }
+    }
+
+    /// Whether every step of `[from, until)` has passed `layer` (its pass
+    /// there lies before `progress`) or ended, read now: an entry of the
+    /// layer mapped for those steps and unmapped is then read by none, so
+    /// its record is reused. Steps not yet begun read what was stored
+    /// before they begin. A group's steps pass a layer in sequence order, so each group
+    /// running in the range is past where its last step there not ended is.
+    pub(in crate::experts) fn served(&self, from: Step, until: Step, layer: usize, progress: Point) -> bool {
+        let state = self.lock();
+        let (from, until) = (from.max(state.frontier), until.min(state.last + 1));
+        if from >= until {
+            return true;
+        }
+        let first = state.groups.range(..=from).next_back().map_or(from, |(&first, _)| first);
+        state.groups.range(first..until).all(|(&group, begun)| {
+            let mut running = (group.max(from)..(group + begun.steps).min(until)).rev().filter(|step| !state.ended.contains(step));
+            running.next().is_none_or(|last| Point { piece: begun.pass(layer).piece, layer, sequence: last, group } < progress)
+        })
+    }
+
+    /// The first group the device is not past at `progress`: the earlier
+    /// of `progress`'s own and the first whose last piece it is not past
+    /// (one it runs inside, cut in before that one's later layers).
+    pub(super) fn first_unpassed(&self, progress: Point) -> Step {
+        let state = self.lock();
+        let unpassed = state.groups.iter().find(|&(&first, begun)| begun.after(first) > progress).map(|(&first, _)| first);
+        unpassed.map_or(progress.group, |first| first.min(progress.group))
     }
 
     /// Retire the groups whose every step is below `frontier`: the device
-    /// is past them. The latest of them still known, by its first sequence,
-    /// and how many scratch-served groups retired now (each held the lent
-    /// records' reservation, `lent`).
-    pub(super) fn retire_groups(&self, frontier: Step) -> (Option<Step>, usize) {
+    /// is past them. The point past the latest of them in the device's
+    /// order, read before any is forgotten, and how many scratch-served
+    /// groups retired now (each held the lent records' reservation,
+    /// `lent`).
+    pub(super) fn retire_groups(&self, frontier: Step) -> (Option<Point>, usize) {
         let mut state = self.lock();
-        let (mut latest, mut reserving) = (None, 0);
+        let (mut past, mut reserving) = (None::<Point>, 0);
         for (&first, group) in &mut state.groups {
             if first + group.steps <= frontier {
                 reserving += usize::from(!group.retired && group.scratch);
                 group.retired = true;
-                latest = Some(first);
+                past = past.max(Some(group.after(first)));
             }
         }
         state.forget();
-        (latest, reserving)
+        (past, reserving)
     }
 
     /// The step begun in flight whose low word is `low` ([`low_word`]): the
@@ -389,23 +589,6 @@ impl Steps {
         [step, step.wrapping_sub(1 << 32)]
             .into_iter()
             .find(|step| span.contains(step) && !state.ended.contains(step))
-    }
-
-    /// `write` given the last step begun and the group it began in,
-    /// `(group, sequence)` (a group forgotten, retired and ended, names
-    /// itself by the step, a point no earlier than its own), and the first
-    /// step not yet begun, under the lock every step begins under: none
-    /// begins until it returns.
-    pub(super) fn while_none_begins<T>(&self, write: impl FnOnce((Step, Step), &Unbegun) -> T) -> T {
-        let state = self.lock();
-        let last = state.last;
-        let first = state
-            .groups
-            .range(..=last)
-            .next_back()
-            .filter(|(first, group)| last - **first < group.steps)
-            .map_or(last, |(&first, _)| first);
-        write((first, last), &Unbegun(last + 1))
     }
 
     /// The frontier: the least step not yet ended, every step below it
@@ -451,12 +634,56 @@ impl Steps {
         self.lock().groups.values().any(|group| group.prompt && group.ended < group.steps)
     }
 
-    /// Steps through `last` begun, where a test plays them without
-    /// launches: what an entry stored from the first step not yet begun is
-    /// stored from.
+    /// Steps through `last` begun, each a group of one run whole, where a
+    /// test plays them without launches: what an entry stored from the
+    /// first step not yet begun is stored from.
     #[cfg(test)]
     pub(in crate::experts) fn begin_through(&self, last: Step) {
-        self.lock().last = last;
+        while self.lock().last < last {
+            self.begin_group(1, None);
+        }
+    }
+
+    /// A group of `count` steps begun, where a test plays it without
+    /// launches, cut in `before` a running group's layer where given
+    /// ([`Shared::begin_cut_in`]): its first step.
+    #[cfg(test)]
+    pub(in crate::experts) fn begin_group(&self, count: u64, before: Option<(Step, usize)>) -> Step {
+        let mut state = self.lock();
+        let first = state.last + 1;
+        let pieces = state.open(first, count, before);
+        let begun = Begun {
+            steps: count,
+            pieces,
+            ended: 0,
+            begun: Instant::now(),
+            retired: false,
+            scratch: false,
+            merges: Vec::new(),
+            reads: None,
+            prompt: false,
+        };
+        state.groups.insert(first, begun);
+        state.last = first + count - 1;
+        state.running += count as usize;
+        first
+    }
+
+    /// Step `sequence` of a group a test began ([`Self::begin_group`])
+    /// ended: the frontier advanced past it where it was the least
+    /// running.
+    #[cfg(test)]
+    pub(in crate::experts) fn end_played(&self, sequence: Step) {
+        let mut state = self.lock();
+        let State { ended, frontier, .. } = &mut *state;
+        ended.insert(sequence);
+        while ended.remove(frontier) {
+            *frontier += 1;
+        }
+        let frontier = *frontier;
+        self.frontier.store(frontier, Ordering::Release);
+        state.group(sequence).1.ended += 1;
+        state.running -= 1;
     }
 
     /// The steps that may hold a request now: from the frontier through
@@ -626,13 +853,48 @@ impl Shared {
     /// is queued. No group begins beyond the steps in flight (`Steps::flight`):
     /// each step's routing record, its sequence's modulo them, then holds
     /// until the step ends. Each launch comes with its step; why the group
-    /// cannot begin comes with the launches.
+    /// cannot begin comes with the launches. The group runs after every
+    /// group begun before it: one piece, its own.
     pub fn begin<L>(
         self: &Arc<Self>,
         launches: Chain<L>,
         route: impl Fn(&L) -> StepRoute,
         work: impl Fn(&L) -> LaunchWork,
+        scratch: impl FnMut() -> Result<bool, String>,
+    ) -> Result<(Chain<(L, ExpertStep)>, Vec<usize>), (String, Chain<L>)> {
+        self.open(launches, route, work, scratch, None)
+    }
+
+    /// [`Self::begin`] a group cut in before layer `layer` of running group
+    /// `group` (a decode step run between two layers of a prompt chain):
+    /// it runs after that group's runs before the layer and its fronts and
+    /// fills at the layer, and before its passes from the layer on, which
+    /// become a piece of their own behind it (`Piece`), in the one lock its
+    /// begin takes, so no point of it is read before the cut. Its runs are
+    /// submitted before any of that group's from the layer on, and that
+    /// group's piece is the latest submitted (no group but those cut in
+    /// before it began since); any other cut is an invariant violation.
+    pub fn begin_cut_in<L>(
+        self: &Arc<Self>,
+        launches: Chain<L>,
+        route: impl Fn(&L) -> StepRoute,
+        work: impl Fn(&L) -> LaunchWork,
+        scratch: impl FnMut() -> Result<bool, String>,
+        (group, layer): (Step, usize),
+    ) -> Result<(Chain<(L, ExpertStep)>, Vec<usize>), (String, Chain<L>)> {
+        self.open(launches, route, work, scratch, Some((group, layer)))
+    }
+
+    /// Begin the next group of `launches` ([`Self::begin`]), cut in
+    /// `before` a running group's layer where given
+    /// ([`Self::begin_cut_in`]).
+    fn open<L>(
+        self: &Arc<Self>,
+        launches: Chain<L>,
+        route: impl Fn(&L) -> StepRoute,
+        work: impl Fn(&L) -> LaunchWork,
         mut scratch: impl FnMut() -> Result<bool, String>,
+        before: Option<(Step, usize)>,
     ) -> Result<(Chain<(L, ExpertStep)>, Vec<usize>), (String, Chain<L>)> {
         let grouped = launches.iter().any(|launch| route(launch) == StepRoute::Grouped);
         let prompt = launches.iter().any(|launch| work(launch) == LaunchWork::Prompt);
@@ -690,10 +952,12 @@ impl Shared {
                     .map(|size| if scratch { size } else { launches.len() })
                     .collect::<Vec<_>>();
                 // Known to the watcher before any of its steps' requests can be.
+                let pieces = state.open(first, count, before);
                 state.groups.insert(
                     first,
                     Begun {
                         steps: count,
+                        pieces,
                         ended: 0,
                         begun: Instant::now(),
                         retired: false,
@@ -1314,5 +1578,149 @@ mod slot_tests {
         shared.lent.copied();
         assert_eq!(waiting.join().unwrap(), Ok(1));
         assert!(shared.lent.lock().reserved(), "the group holds the lent records until it retires");
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    /// The streamed layers of a test's bank.
+    const LAYERS: usize = 4;
+
+    fn steps() -> Steps {
+        Steps::new(FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new())
+    }
+
+    /// A chain of steps 1 and 2, and a decode step 3 cut in before its
+    /// layer 2: the chain's layers 0 and 1, then its fronts at layer 2,
+    /// then step 3's every layer, then the chain's passes from layer 2 on.
+    fn cut() -> Steps {
+        let steps = steps();
+        assert_eq!(steps.begin_group(2, None), 1);
+        assert_eq!(steps.begin_group(1, Some((1, 2))), 3);
+        steps
+    }
+
+    /// A group cut in before a layer of another runs between that group's
+    /// passes before the layer and those from it on, its fronts there
+    /// before it; its runs are counted between them in the device's order,
+    /// and a group begun after both follows both.
+    #[test]
+    fn a_group_cut_in_runs_between_the_layers_it_is_cut_before() {
+        let steps = cut();
+        let decode = |layer| steps.point(3, layer, 3);
+        assert!(steps.point(1, 1, 2) < decode(0), "the chain's layer 1 runs before");
+        assert!(decode(LAYERS - 1) < steps.point(1, 2, 1), "its layer 2's passes after");
+        assert!(steps.at(2, 2, LAYERS).point < decode(0), "its fronts at layer 2 before");
+        assert!(steps.at(1, 3, LAYERS).point > decode(LAYERS - 1), "its fronts past layer 2 after");
+        assert!(steps.after(3) < steps.after(1), "the chain ends past the step cut in");
+        // Every request's position follows the device's order, the
+        // chain's passes at layer 2 (which request nothing) between the
+        // step cut in and its fronts at layer 3.
+        let order = [(1, 1), (2, 1), (1, 2), (2, 2), (3, 0), (3, 1), (3, 2), (3, 3), (1, 3), (2, 3)];
+        let positions = order.map(|(sequence, layer)| steps.at(sequence, layer, LAYERS));
+        let runs = positions.windows(2).map(|pair| pair[0].runs_until(pair[1])).collect::<Vec<_>>();
+        assert_eq!(runs, [1, 1, 1, 1, 1, 1, 1, 3, 1]);
+        // A step begun after both follows the chain's last layer.
+        let next = steps.begin_group(1, None);
+        assert!(steps.point(next, 0, next) > steps.after(1));
+        assert!(steps.at(2, 3, LAYERS).runs_until(steps.at(next, 0, LAYERS)) >= 1);
+    }
+
+    /// A second group cut in at the same cut runs after the first, the
+    /// cut layers behind both.
+    #[test]
+    fn a_second_group_cut_in_at_one_cut_runs_after_the_first() {
+        let steps = cut();
+        assert_eq!(steps.begin_group(1, Some((1, 2))), 4);
+        assert!(steps.after(3) < steps.point(4, 0, 4));
+        assert!(steps.after(4) < steps.point(1, 2, 1));
+        assert!(steps.point(1, 1, 2) < steps.point(3, 0, 3));
+        assert_eq!(steps.at(3, 3, LAYERS).runs_until(steps.at(4, 0, LAYERS)), 1);
+        assert_eq!(steps.at(4, 3, LAYERS).runs_until(steps.at(1, 3, LAYERS)), 3, "past the chain's passes at layer 2");
+    }
+
+    /// A park reads every step's resolution from the order: the step cut
+    /// in, parked, finds the chain it runs inside unresolved at the layers
+    /// past the cut, and every later resolution its own group's or later;
+    /// the chain parked before the cut finds the step cut in after its
+    /// every layer.
+    #[test]
+    fn a_park_reads_the_order_of_every_group() {
+        let steps = cut();
+        let park = steps.park(steps.at(3, 3, LAYERS).point, LAYERS);
+        assert!(park.cut_in());
+        assert_eq!(park.earlier, [None, None, Some((1, 2)), Some((1, 2))]);
+        assert_eq!(park.unresolved, [4; LAYERS], "the step cut in resolved every layer to its own");
+        assert!(!park.frees(2, 0, Step::MAX) && park.frees(2, 3, Step::MAX) && park.frees(1, 0, Step::MAX));
+        let chain = steps.park(steps.at(1, 1, LAYERS).point, LAYERS);
+        assert!(!chain.cut_in());
+        assert_eq!(chain.unresolved, [3, 2, 1, 1], "the step cut in, the chain's next, its first, its first");
+        let last = steps.park(steps.at(2, 1, LAYERS).point, LAYERS);
+        assert_eq!(last.unresolved, [3, 3, 1, 1]);
+    }
+
+    /// A record is served once each step it could serve is past its layer
+    /// or ended: the step cut in needs no wait for the chain at a layer
+    /// before the cut, nor for the chain's steps below its FROM; the chain's
+    /// steps past the cut are past it only once their passes are, or once
+    /// they end.
+    #[test]
+    fn a_record_is_served_once_its_steps_pass_its_layer_or_end() {
+        let steps = cut();
+        let decoded = steps.after(3);
+        assert!(steps.served(1, 4, 1, decoded), "the chain passed layer 1 before the step cut in");
+        assert!(!steps.served(1, 4, 2, decoded), "its layer 2 runs after");
+        assert!(steps.served(3, 4, 2, decoded), "no chain step is mapped from 3");
+        assert!(steps.served(1, 4, 2, steps.point(1, 3, 1)));
+        steps.end_played(1);
+        steps.end_played(2);
+        assert!(steps.served(1, 4, 2, decoded), "ended, the chain reads it no more");
+        assert_eq!(steps.first_unpassed(decoded), 1, "while running, the chain was not past");
+    }
+
+    /// The first group the device is not past is the chain it runs inside,
+    /// before the step cut in; with nothing cut in, its own.
+    #[test]
+    fn the_first_unpassed_group_is_the_one_run_inside() {
+        let steps = cut();
+        assert_eq!(steps.first_unpassed(steps.point(3, 2, 3)), 1);
+        let whole = self::steps();
+        whole.begin_through(4);
+        assert_eq!(whole.first_unpassed(Point::whole(3, 1, 3)), 3);
+        assert_eq!(whole.first_unpassed(whole.after(3)), 3);
+    }
+
+    /// Retiring both, the point past them is the chain's, past the step
+    /// cut in.
+    #[test]
+    fn retiring_past_a_cut_names_the_latest_in_the_order() {
+        let steps = cut();
+        for step in 1..=3 {
+            steps.end_played(step);
+        }
+        let chain = steps.after(1);
+        assert_eq!(steps.retire_groups(4), (Some(chain), 0));
+        assert_eq!(steps.after(1), Point::START, "a group forgotten is past");
+    }
+
+    /// Only the latest piece submitted is cut: a group begun since runs
+    /// after it whole, so no group cuts in before it.
+    #[test]
+    #[should_panic(expected = "is not the latest submitted")]
+    fn a_cut_behind_a_later_group_panics() {
+        let steps = steps();
+        steps.begin_group(2, None);
+        steps.begin_group(1, None);
+        steps.begin_group(1, Some((1, 2)));
+    }
+
+    /// No cut lies before a layer already cut past.
+    #[test]
+    #[should_panic(expected = "whose last piece runs from layer 2")]
+    fn a_cut_before_an_earlier_cut_panics() {
+        let steps = cut();
+        steps.begin_group(1, Some((1, 1)));
     }
 }

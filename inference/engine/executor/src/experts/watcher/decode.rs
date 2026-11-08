@@ -24,7 +24,7 @@ use super::{Shared, Step};
 use super::core::{At, Core, ReadTable, RoutingRecord};
 use super::prefetch::{self, Join, Named, Naming, Posting, Prefetch, Reading};
 use super::telemetry::{Anticipation, RequestCost};
-use crate::experts::directory::HostRecord;
+use crate::experts::directory::{HostRecord, Park};
 use crate::experts::host_records::{Claim, Demand, Grant, InboundTable, Located};
 use crate::experts::landing::{Answer, Source};
 use crate::experts::source::Ticket;
@@ -352,7 +352,7 @@ pub(super) fn parked_reads(core: &Core, layer: usize, sequence: Step) -> Vec<(us
 }
 
 /// Claim a demand landing of `staged` for `demand`, the device parked at
-/// `parked` in a group of `steps` steps (`Directory::claim_demand`): kept
+/// `park` (`Directory::claim_demand`): kept
 /// or landing already, that (a lacked expert's alone); else a ready tier
 /// record of its group, one the reserve holds ready (its graces released at
 /// the park, `Directory::release`), or one a kept record's unmapping frees
@@ -361,37 +361,20 @@ pub(super) fn parked_reads(core: &Core, layer: usize, sequence: Step) -> Vec<(us
 /// the park may name ([`parked_reads`]), nor a request's outstanding answer
 /// (`HostRecords::answer`). The record taken answers the parked request
 /// once it lands.
-fn demand_claim(core: &mut Core, staged: Staged, demand: Demand, (parked, steps): (crate::experts::directory::Point, u64)) -> Claim {
-    let read = parked_reads(core, staged.0, parked.sequence);
-    core.directory.release((parked, steps), &read);
-    core.directory.claim_demand(staged, demand, &read, (parked, steps))
+fn demand_claim(core: &mut Core, staged: Staged, demand: Demand, park: &Park) -> Claim {
+    let read = parked_reads(core, staged.0, park.point.sequence);
+    core.directory.release(park, &read);
+    core.directory.claim_demand(staged, demand, &read, park)
 }
 
 /// A posted read's tier record for `staged`: taken, or none while the tier
 /// has none to take.
-fn posted_claim(core: &mut Core, staged: Staged, parked: (crate::experts::directory::Point, u64)) -> Option<Grant> {
-    match demand_claim(core, staged, Demand::Posted, parked) {
+fn posted_claim(core: &mut Core, staged: Staged, park: &Park) -> Option<Grant> {
+    match demand_claim(core, staged, Demand::Posted, park) {
         Claim::Taken(grant) => Some(grant),
         Claim::Short => None,
         Claim::Kept(_) | Claim::Landing => unreachable!("a posted read's claim finds its expert lacked"),
     }
-}
-
-/// The landing `grant` allows of a parked step's absent expert from staging
-/// record `record`, the device parked at `parked` in a group of `steps`
-/// steps: mapped from the first step that has not resolved its layer
-/// (`Point::first_unresolved`), which the device cannot pass before the
-/// landing answers, so a step begun behind the parked one that has yet to
-/// resolve the layer hits it, as the host serving it decides.
-fn parked_landing(
-    core: &Core,
-    grant: crate::experts::host_records::Grant,
-    record: u32,
-    parked: crate::experts::directory::Point,
-    steps: u64,
-) -> crate::experts::landing::Landing {
-    let from = Some(parked.first_unresolved(grant.staged().0, steps));
-    crate::experts::landing::Landing { from, ..core.landing(grant, record) }
 }
 
 /// Give up a posted read's `landings` at `layer`, each (expert, staging
@@ -436,12 +419,12 @@ fn give_up(core: &mut Core, prefetch: &Prefetch, shared: &Shared, layer: usize, 
 /// a posted read's landings claim by, as residency serves its request and
 /// as they resume (`Decode::resume`), so they claim in the order they were
 /// read.
-fn posted_claims(core: &mut Core, layer: usize, experts: impl IntoIterator<Item = usize>, parked: (crate::experts::directory::Point, u64)) -> Vec<Option<Grant>> {
+fn posted_claims(core: &mut Core, layer: usize, experts: impl IntoIterator<Item = usize>, park: &Park) -> Vec<Option<Grant>> {
     let mut short = false;
     experts
         .into_iter()
         .map(|expert| {
-            let grant = if short { None } else { posted_claim(core, (layer, expert), parked) };
+            let grant = if short { None } else { posted_claim(core, (layer, expert), park) };
             short |= grant.is_none();
             grant
         })
@@ -495,9 +478,9 @@ impl Decode {
                 progressed = true;
                 continue;
             }
-            let steps = shared.steps.group_of(at.point.sequence).1;
+            let park = shared.steps.park(at.point, core.layers.len());
             let landings = std::mem::take(&mut unclaimed.landings);
-            let grants = posted_claims(core, layer, landings.iter().map(|landing| landing.expert), (at.point, steps));
+            let grants = posted_claims(core, layer, landings.iter().map(|landing| landing.expert), &park);
             let mut claimed = Vec::new();
             for (landing, grant) in landings.into_iter().zip(grants) {
                 match grant {
@@ -556,10 +539,10 @@ impl Decode {
                 short(&mut waiting);
                 break;
             };
-            let steps = shared.steps.group_of(waits.at.point.sequence).1;
+            let park = shared.steps.park(waits.at.point, core.layers.len());
             // Lacked, as located above: a claim takes a record, or finds
             // none ready (or a posted read claimed it since).
-            let Claim::Taken(grant) = demand_claim(core, staged, Demand::Lacked, (waits.at.point, steps)) else {
+            let Claim::Taken(grant) = demand_claim(core, staged, Demand::Lacked, &park) else {
                 prefetch.staging.release(record);
                 short(&mut waiting);
                 break;
@@ -573,7 +556,7 @@ impl Decode {
             let reads = core.table.reads(layer, expert, record);
             let count = reads.len();
             let landing = Named {
-                landing: parked_landing(core, grant, record, waits.at.point, steps),
+                landing: core.landing(grant, record),
                 staged: record,
                 reads: 0..count,
                 rows: waits.rows,
@@ -620,7 +603,6 @@ impl Decode {
         let Posted { noticed: started, choices, absent, read, .. } = posted;
         let point = at.point;
         let (layer, sequence) = (point.layer, point.sequence);
-        let steps = shared.steps.group_of(sequence).1;
         let width = core.extents.words.choices;
         let file = core.layers[layer].file.clone();
         // Choice c = m K + k is row m's (routed.seismic): the rows that
@@ -704,7 +686,7 @@ impl Decode {
         // (`Self::resume`).
         let read = read.map(|read| {
             let grants = match read.posting {
-                Ok(_) => posted_claims(core, layer, read.landings.iter().map(|&(expert, ..)| expert), (point, steps)),
+                Ok(_) => posted_claims(core, layer, read.landings.iter().map(|&(expert, ..)| expert), &shared.steps.park(point, core.layers.len())),
                 Err(_) => Vec::new(),
             };
             (read, grants)
@@ -821,11 +803,10 @@ fn land(
 ) {
     let Unclaimed { at, naming, ticket, join, .. } = unclaimed;
     let (layer, sequence) = (at.point.layer, at.point.sequence);
-    let steps = shared.steps.group_of(sequence).1;
     let (mut named, mut tracked) = (Vec::with_capacity(claimed.len()), Vec::with_capacity(claimed.len()));
     for (Landing { expert, record, reads, rows, answer }, grant) in claimed {
         tracked.push((record, (layer, expert), grant.record(), sequence));
-        named.push(Named { landing: parked_landing(core, grant, record, at.point, steps), staged: record, reads, rows, answer });
+        named.push(Named { landing: core.landing(grant, record), staged: record, reads, rows, answer });
     }
     prefetch.demand((ticket, join), named, tracked, *naming, device, shared);
 }

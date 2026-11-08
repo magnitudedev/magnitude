@@ -19,8 +19,8 @@
 //! (`Directory::promotions`, `Release`): its expert, outside its layer's
 //! share, is unmapped for every step from the first not yet begun, so the
 //! steps already queued may still read it, and the record is free once
-//! every one of them has ended, by whichever exit (the frontier reached
-//! the unmapping, `Steps::frontier`). Each group keeps a reserve of free
+//! every one it was mapped for has passed its layer in the device's order
+//! or ended, by whichever exit (`Steps::served`). Each group keeps a reserve of free
 //! or releasing records ([`reserve`]): the promotions the ranking asks
 //! while a release drains, so a promotion's copy never waits for one.
 //!
@@ -33,7 +33,7 @@
 
 use super::Shared;
 use super::core::Core;
-use crate::experts::directory::MissCurve;
+use crate::experts::directory::{MissCurve, Point};
 
 /// One routed tensor of a bank group as a promotion copies it: its host
 /// tier tensor (every record it reserves, which the copy engine reads, so
@@ -159,12 +159,12 @@ impl Promotions {
     /// them: no event follows an ask, so what it lets move moves now.
     /// Whether any moved. Where the load's traffic is `held` nothing is
     /// asked: only what is in flight is carried.
-    pub(super) fn advance(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, decoded: Option<&MissCurve>, held: bool) -> bool {
+    pub(super) fn advance(&mut self, core: &mut Core, shared: &Shared, copier: &Copier, decoded: Option<&MissCurve>, held: bool, progress: Point) -> bool {
         if let Some(decoded) = decoded {
             self.size(core, decoded);
         }
         let asked = !held && self.ask(core, shared);
-        asked | carry(core, shared, copier)
+        asked | carry(core, shared, copier, progress)
     }
 
     /// Size each group's reserve by `decoded` ([`reserve`], [`decide`]).
@@ -220,16 +220,15 @@ impl Promotions {
 
 /// Carry each promotion and release as far as it goes (each one's stage
 /// is its record's): one whose copy has completed is mapped from the first
-/// step not yet begun; a release whose unmapping the frontier reached frees
-/// its record; every promotion queued copies, its tier record held, all of
+/// step not yet begun; a release whose steps are each past its layer at
+/// `progress`, where the device is known to be, or ended frees its record; every promotion queued copies, its tier record held, all of
 /// them in one batch (one whose tier record is gone, unmapped for the
 /// tier's reserve meanwhile, copies nothing and frees its record). A copy
 /// the copy engine refuses or faults ends serving: the device is lost.
 /// Whether any moved. Nothing here waits: residency carries them again on
 /// the load's events, the frontier's advance (a step's end) and a copy's
 /// completion (`Copies::start`) among them.
-pub(super) fn carry(core: &mut Core, shared: &Shared, copier: &Copier) -> bool {
-    let frontier = core.steps.frontier();
+pub(super) fn carry(core: &mut Core, shared: &Shared, copier: &Copier, progress: Point) -> bool {
     let mut moved = false;
     // The copies' ends.
     let mut completed = Vec::new();
@@ -249,7 +248,7 @@ pub(super) fn carry(core: &mut Core, shared: &Shared, copier: &Copier) -> bool {
         moved = true;
     }
     // The releases no step still reads.
-    moved |= core.directory.drain(frontier);
+    moved |= core.directory.drain(progress, &core.steps);
     // Under the reservation's lock to the copies' queueing: a prompt group
     // reserves the lent records only once no copy into one runs, and while
     // it holds them or waits to, a promotion queued into one copies nothing

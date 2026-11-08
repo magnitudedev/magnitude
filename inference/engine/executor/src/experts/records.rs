@@ -13,7 +13,8 @@
 //!   holds reserved.
 //! - `Held → Releasing`: [`BankRecords::release`], for the reserve, its
 //!   expert unmapped from the first step not yet begun; `Releasing → Free`:
-//!   [`BankRecords::drain`], once every step below that one has ended.
+//!   [`BankRecords::drain`], once every step its entry was mapped for, from
+//!   its mapping's step to that one, has passed its layer or ended.
 //! - `Free | Held → Filling`: [`BankRecords::fill`], a prompt group's seed,
 //!   its victim unmapped from the group's first step; never of an expert
 //!   the map holds for a step of the group, whose scratch slot no round
@@ -54,9 +55,10 @@ pub(super) enum Record {
     Held(Staged),
     /// Taken by a promotion of the expert, until its copy completes.
     Promoting(Staged, Moving),
-    /// Released for the reserve: its expert is unmapped from step `until`
-    /// on, and it is free once every step below has ended.
-    Releasing { until: Step },
+    /// Released for the reserve: its expert of `layer`, mapped from step
+    /// `from`, is unmapped from step `until` on, and it is free once every
+    /// step of `[from, until)` has passed the layer or ended.
+    Releasing { layer: usize, from: Step, until: Step },
     /// Taken by a prompt group's seed of the expert placed at the point,
     /// until its step ends.
     Filling(Staged, Point),
@@ -423,28 +425,33 @@ impl BankRecords {
     /// Release record `record` of group `group` for the reserve, its expert
     /// unmapped from the first step not yet begun, under the steps' lock
     /// with `lending` (a prompt group reserves before its steps begin): it
-    /// is free once every step below has ended ([`Self::drain`]). Never a
-    /// lent record while a prompt group holds them reserved, whose lend
-    /// unmaps what it holds instead. Its expert.
+    /// is free once every step its entry was mapped for has passed its
+    /// layer or ended ([`Self::drain`]). Never a lent record while a prompt
+    /// group holds them reserved, whose lend unmaps what it holds instead.
+    /// Its expert.
     pub fn release(&mut self, group: usize, BankRecord(record): BankRecord, at: &Unbegun, lending: &Lending) -> Staged {
         let record = record as usize;
         assert!(self.usable(group, record, lending), "a release of lent record {record} a prompt group holds reserved");
-        let Some(staged) = self.vacate(group, record, at.next()) else {
+        let Some(staged @ (layer, expert)) = self.vacate(group, record, at.next()) else {
             panic!("a release of record {record} of group {group}, which holds nothing");
         };
-        self.set(group, record, Record::Releasing { until: at.next() });
+        // Its entry's FROM, which the unmapping leaves: no step before it
+        // resolves the entry to the record. None mapped without a device.
+        let from = self.maps().map_or(0, |maps| maps[layer].view().from(expert));
+        self.set(group, record, Record::Releasing { layer, from, until: at.next() });
         self.releasing.push((group, record));
         staged
     }
 
-    /// Every release whose unmapping the `frontier` reached is free: no step
-    /// reads it. Whether any was.
-    pub fn drain(&mut self, frontier: Step) -> bool {
+    /// Every release the device is past at `progress` is free: each step
+    /// its entry was mapped for has passed its layer or ended
+    /// (`Steps::served`), so no step reads it. Whether any was.
+    pub fn drain(&mut self, progress: Point, steps: &super::watcher::Steps) -> bool {
         let (drained, releasing) = std::mem::take(&mut self.releasing).into_iter().partition::<Vec<_>, _>(|&(group, record)| {
-            let Record::Releasing { until } = self.groups[group].contents[record] else {
+            let Record::Releasing { layer, from, until } = self.groups[group].contents[record] else {
                 panic!("record {record} of group {group} is listed releasing");
             };
-            frontier >= until
+            steps.served(from, until, layer, progress)
         });
         self.releasing = releasing;
         for &(group, record) in &drained {
@@ -666,7 +673,7 @@ impl BankRecords {
                     self.placing.remove(&staged);
                     lent.dropped.push(staged);
                 }
-                Record::Releasing { until } => {
+                Record::Releasing { until, .. } => {
                     assert!(until <= from, "a release of lent record {record} unmapped its expert from step {until}, past step {from} its group reads from");
                     self.releasing.retain(|&taken| taken != (group, record));
                 }
@@ -804,25 +811,26 @@ mod tests {
     /// Every transition keeps the record, the expert's index and the map
     /// together: a promotion maps its expert from the first step not yet
     /// begun, a release unmaps it from there and frees its record once the
-    /// frontier reaches it, a seed's victim leaves from its group's first
-    /// step, a seed committed is mapped.
+    /// device is past its layer of every step it was mapped for, a seed's
+    /// victim leaves from its group's first step, a seed committed is
+    /// mapped.
     #[test]
     fn each_transition_moves_a_record_and_its_map_entry_together() {
         let (mut bank, view) = bank();
+        let steps = super::super::watcher::Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
+        steps.begin_through(13);
         promoted(&mut bank, 2, 3, 4);
         assert_eq!((bank.held(0, 3), view.resolve(3, 3), view.resolve(3, 4)), (Some(2), None, Some(2)));
         let lent = LentRecords::new();
         assert_eq!(bank.release(0, BankRecord(2), &Unbegun::at(9), &lent.lock()), (0, 3));
         assert_eq!((bank.held(0, 3), view.resolve(3, 8), view.resolve(3, 9)), (None, Some(2), None), "the released expert is read until 9");
-        assert!(!bank.drain(8) && !bank.free(0).any(|record| record == 2), "steps below 9 still read it");
-        assert!(bank.drain(9) && bank.free(0).any(|record| record == 2));
-        let point = Point { group: 12, layer: 0, sequence: 13 };
+        assert!(!bank.drain(Point::whole(8, 0, 8), &steps) && !bank.free(0).any(|record| record == 2), "steps below 9 still read it");
+        assert!(bank.drain(Point::whole(9, 0, 9), &steps) && bank.free(0).any(|record| record == 2));
+        let point = Point::whole(12, 0, 13);
         promoted(&mut bank, 3, 6, 10);
         assert_eq!(bank.fill(point, (0, 7), BankRecord(3)), Some((0, 6)));
         assert_eq!((view.resolve(6, 11), view.resolve(6, 12)), (Some(3), None), "a seed's victim leaves from its group's first step");
-        let steps = super::super::watcher::Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
-        steps.begin_through(13);
-        let retired = bank.retire_fills(Point::after(13), |_, _| super::super::watcher::low_word(13), |_| super::super::directory::Ending::Ended, &steps);
+        let retired = bank.retire_fills(Point::whole(13, usize::MAX, Step::MAX), |_, _| super::super::watcher::low_word(13), |_| super::super::directory::Ending::Ended, &steps);
         assert_eq!(retired, [(0, (0, 7), true)]);
         assert_eq!((bank.held(0, 7), view.resolve(7, 14)), (Some(3), Some(3)));
     }
@@ -841,7 +849,7 @@ mod tests {
         // Group 3's steps 3 and 4 have begun: the release unmaps 5 from 5.
         let lent = LentRecords::new();
         bank.release(0, BankRecord(2), &Unbegun::at(5), &lent.lock());
-        bank.fill(Point { group: 3, layer: 0, sequence: 4 }, (0, 5), BankRecord(3));
+        bank.fill(Point::whole(3, 0, 4), (0, 5), BankRecord(3));
     }
 
     /// A regression: a record taken from a lent one after a prompt group's
@@ -929,7 +937,7 @@ mod tests {
         let lent = LentRecords::new();
         assert!(lent.reserve());
         bank.lend(3, &lent.lock());
-        bank.fill(Point { group: 3, layer: 0, sequence: 3 }, (0, 2), BankRecord(0));
+        bank.fill(Point::whole(3, 0, 3), (0, 2), BankRecord(0));
     }
 
     /// A reserve's records cover a want only where a promotion may take

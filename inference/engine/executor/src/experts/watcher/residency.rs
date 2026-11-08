@@ -291,7 +291,7 @@ impl Residency {
     fn promote(&mut self, turn: &mut Turn, copier: Option<&Copier>, decoded: Option<&MissCurve>) -> bool {
         let held = self.traffic_held();
         let promoted = !self.core.directory.shrink_pending()
-            && copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held));
+            && copier.is_some_and(|copier| self.promotions.advance(&mut self.core, &self.shared, copier, decoded, held, self.prefetch.reached()));
         turn.changed |= promoted;
         true
     }
@@ -345,9 +345,9 @@ impl Residency {
             return false;
         }
         self.core.retired = frontier;
-        let (group, reserving) = self.shared.steps.retire_groups(frontier);
-        if let Some(group) = group {
-            self.advance(Point::after(group));
+        let (past, reserving) = self.shared.steps.retire_groups(frontier);
+        if let Some(past) = past {
+            self.advance(past);
         }
         for _ in 0..reserving {
             self.shared.lent.release();
@@ -378,10 +378,10 @@ impl Residency {
     /// Keep each group's reserve of tier records ready or graced: the
     /// victims chosen from the ranking with no lock of the steps' held
     /// (`Directory::refill_victims`), then, where no step begins, each
-    /// unmapped, unchanged since (`Directory::refill`), graced through the
-    /// latest step begun; a lent record only while no prompt group holds or
+    /// unmapped, unchanged since (`Directory::refill`), graced for the
+    /// steps begun; a lent record only while no prompt group holds or
     /// awaits the lent records (which a group reserves as it begins,
-    /// `lent`), so none is graced through a group's own step. Under the
+    /// `lent`), so none is graced for a group's own step. Under the
     /// steps' lock: a check, a map store and a state change a victim.
     pub(super) fn refill_tier(&mut self) {
         let (steps, lending) = (&self.shared.steps, &self.shared.lent);
@@ -394,13 +394,13 @@ impl Residency {
         if victims.iter().all(Vec::is_empty) {
             return;
         }
-        steps.while_none_begins(|latest, at| {
+        steps.unbegun(|at| {
             let lent = !lending.lock().reserved();
-            directory.refill(victims, lent, at, latest);
+            directory.refill(victims, lent, at);
         });
-        // A grace through a step the device is already past frees now: no
+        // A grace for steps the device is already past frees now: no
         // frontier's move would come for it until the next step.
-        directory.retire_graces(self.prefetch.reached());
+        directory.retire_graces(self.prefetch.reached(), steps);
     }
 
     /// Take `layer`'s scratch requests published since, in step order,
@@ -419,15 +419,13 @@ impl Residency {
             // A request is its step's front's, which follows its step's back
             // at the layer before (the group's steps before it there too):
             // the device is past them, or past the groups before at the
-            // first layer.
+            // first layer. The back's point is its pass's piece's, read now:
+            // at a layer a group was cut in before, the front runs before the
+            // group cut in, but past the back before.
             let Point { group, sequence, .. } = at.point;
             self.advance(match layer {
                 0 => Point { sequence: group, ..at.point },
-                _ => Point {
-                    group,
-                    layer: layer - 1,
-                    sequence: sequence + 1,
-                },
+                _ => self.shared.steps.point(group, layer - 1, sequence + 1),
             });
             if self.scratch.clearing() {
                 break;

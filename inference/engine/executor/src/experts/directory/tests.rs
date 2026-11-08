@@ -8,10 +8,23 @@ fn steps() -> Steps {
     Steps::new(crate::planning::FlightDepth::SERIAL, 1, crate::experts::exchange::Pulse::new())
 }
 
+/// Steps 1 to 64 begun, each a group of one run whole, none ended: what a
+/// test's device runs.
+fn played() -> Steps {
+    let steps = steps();
+    steps.begin_through(64);
+    steps
+}
+
+/// The point past every layer of group `group`'s steps, run whole.
+fn past(group: Step) -> Point {
+    Point::whole(group, usize::MAX, Step::MAX)
+}
+
 impl Directory {
-    /// [`Self::retire`] beside steps none of which begins.
+    /// [`Self::retire`] beside steps 1 to 64 begun ([`played`]).
     fn retired(&mut self, progress: Point, commit: impl Fn(usize, BankRecord) -> i32, ending: impl Fn(Point) -> Ending) {
-        self.retire(progress, commit, ending, &steps())
+        self.retire(progress, commit, ending, &played())
     }
 
     /// What the ranking asks now, a prompt group holding the lent
@@ -89,11 +102,7 @@ fn the_directory_names_map_words_at_the_plans_homes() {
 
 /// Layer `layer` of step `sequence`, a group of one.
 fn at(sequence: Step, layer: usize) -> Point {
-    Point {
-        group: sequence,
-        layer,
-        sequence,
-    }
+    Point::whole(sequence, layer, sequence)
 }
 
 /// A group seeds the most recent experts of a prompt, as the ranking
@@ -112,7 +121,7 @@ fn seeding_keeps_the_most_recent_experts() {
         let mut directory = Directory::new(&[4], &[0, 0], &[8, 8], HostTier::replay(vec![0; 1]));
         directory.place(at(1, 0), 0, &[], &[0], |_| 0).unwrap();
         directory.place(at(1, 1), 1, &[], &[0, 1, 2], |_| 0).unwrap();
-        directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+        directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
         for (sequence, layer, expert) in [(2, 0, 0), (3, 1, 0), (7, 1, 2), (9, 1, 1)] {
             log(&directory, sequence, layer, &[expert]);
         }
@@ -150,7 +159,7 @@ fn seeding_keeps_the_most_recent_experts() {
 fn a_prompt_group_is_lent_its_bank_records_and_returns_them_free() {
     let mut directory = Directory::new(&[4], &[0, 0], &[8, 8], tiered(&[0], 2, 8, 2));
     directory.place(at(1, 0), 0, &[], &[0], |_| 0).unwrap();
-    directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+    directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
     assert_eq!(directory.held(0, 0), Some(0));
     // Records 0 and 1 are lent: 0 holds layer 0's 0, which leaves.
     let lent = LentRecords::new();
@@ -166,7 +175,7 @@ fn a_prompt_group_is_lent_its_bank_records_and_returns_them_free() {
     assert!((0..2).all(|record| directory.bank.records(0)[record] == Record::Free));
     assert!(directory.prompt_reads.is_empty(), "its reads rank nothing apart");
     // Free again: a placement takes them.
-    directory.retired(Point::after(2), |_, _| 2, |_| Ending::Ended);
+    directory.retired(past(2), |_, _| 2, |_| Ending::Ended);
     assert_eq!(directory.place(at(3, 0), 0, &[], &[1, 2], |_| 0).unwrap().records, [BankRecord(0), BankRecord(1)]);
 }
 
@@ -225,11 +234,7 @@ fn no_promotion_is_planned_into_a_reserved_lent_record() {
 #[test]
 fn a_group_retires_in_layer_major_order() {
     let mut directory = directory();
-    let point = |layer, sequence| Point {
-        group: 2,
-        layer,
-        sequence,
-    };
+    let point = |layer, sequence| Point::whole(2, layer, sequence);
     directory.place(point(0, 2), 0, &[], &[1], |_| 0).unwrap();
     directory.place(point(1, 2), 1, &[], &[1], |_| 0).unwrap();
     directory.retired(point(0, 3), |_, _| 2, |_| Ending::Ended);
@@ -238,7 +243,7 @@ fn a_group_retires_in_layer_major_order() {
     directory.retired(point(1, 2), |_, record| [2, 2, 3][record.index()], |_| Ending::Ended);
     assert_eq!(directory.held(0, 2), Some(2));
     assert_eq!(directory.held(1, 1), None, "layer 1 of step 2 is not passed");
-    directory.retired(Point::after(2), |_, record| [2, 2, 3][record.index()], |_| Ending::Ended);
+    directory.retired(past(2), |_, record| [2, 2, 3][record.index()], |_| Ending::Ended);
     assert_eq!(directory.held(1, 1), Some(1));
 }
 
@@ -252,7 +257,7 @@ fn a_tie_is_broken_by_what_records_hold() {
         for (step, expert) in order.into_iter().enumerate() {
             let step = step as Step + 1;
             directory.place(at(step, 0), 0, &[], &[expert], |_| 0).unwrap();
-            directory.retired(Point::after(step), |_, _| low_word(step), |_| Ending::Ended);
+            directory.retired(past(step), |_, _| low_word(step), |_| Ending::Ended);
         }
         let placed = directory.place(at(3, 0), 0, &[], &[7], |_| 1).unwrap();
         assert_eq!(placed.evicted, [(0, 3, 1)]);
@@ -291,7 +296,7 @@ fn a_shrink_keeps_the_most_recent_experts_below_the_commitment() {
     let mut directory = directory();
     directory.place(at(1, 0), 0, &[], &[0, 1], |_| 0).unwrap();
     directory.place(at(1, 1), 1, &[], &[0, 1], |_| 0).unwrap();
-    directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+    directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
     // Records 0, 1 hold layer 0's experts 0, 1; records 2, 3 layer 1's.
     let reads = [[Some(5), Some(2)], [Some(7), Some(3)]];
     let plan = directory.plan_shrink(0, 2, |layer, expert| reads[layer][expert]);
@@ -325,7 +330,7 @@ fn a_shrink_keeps_the_most_recent_experts_below_the_commitment() {
 fn free_records_are_placed_without_ranking_the_held() {
     let mut directory = directory();
     directory.place(at(1, 0), 0, &[], &[0, 1], |_| unreachable!()).unwrap();
-    directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+    directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
     let placed = directory.place(at(2, 0), 0, &[], &[2], |_| unreachable!()).unwrap();
     assert_eq!(placed.records, [BankRecord(2)]);
     let stamps = [4, 3];
@@ -428,7 +433,7 @@ fn the_reserve_is_graced_through_its_layer_of_the_latest_step_begun() {
         directory.landed(0, record, expert, Some(read));
     }
     let victims = directory.refill_victims(1, false);
-    directory.refill(victims, false, &crate::experts::watcher::Unbegun::at(6), (5, 5));
+    directory.refill(victims, false, &crate::experts::watcher::Unbegun::at(6));
     assert!(!directory.in_tier(0, 2) && directory.in_tier(0, 1), "the expert read least recently unmapped first");
     assert_eq!(directory.land(0, 3, 0), None, "graced through layer 0 of step 5");
     directory.retired(at(5, 0), |_, _| 0, |_| Ending::Ended);
@@ -486,7 +491,7 @@ fn a_want_and_its_victim_weigh_at_one_half_life_while_the_live_one_switches() {
         }
         directory.place(at(1, 0), 0, &[], &[1], |_| 0).unwrap();
         directory.place(at(1, 1), 1, &[], &[0], |_| 0).unwrap();
-        directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+        directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
         (0..2).for_each(|layer| directory.price_copies(layer, Some(1.)));
         for step in 1..=163 {
             match step {
@@ -539,7 +544,7 @@ fn promotions_bring_each_layers_share_into_the_bank() {
         directory.landed(layer, record, expert, None);
     }
     directory.place(at(1, 0), 0, &[], &[0, 1], |_| 0).unwrap();
-    directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+    directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
     // Records 0 and 1 hold layer 0's 0 and 1, never read; layer 0's
     // share is 4, read at 1, and layer 1's is 5, read at 2.
     log(&directory, 1, 0, &[4]);
@@ -558,7 +563,7 @@ fn promotions_bring_each_layers_share_into_the_bank() {
     assert!(directory.place(at(7, 0), 0, &[], &[6, 7], |_| 0).is_none(), "promotions' and releases' records are taken");
     assert_eq!(directory.complete(&Promotion { group: 0, record: BankRecord(2), layer: 1, expert: 5 }), (1, 5));
     assert_eq!(directory.held(1, 5), Some(2));
-    directory.drain(Step::MAX);
+    directory.drain(Point::START, &steps());
     assert_eq!(
         directory.promote(false).promotions,
         [Promotion { group: 0, record: BankRecord(0), layer: 0, expert: 4 }],
@@ -623,7 +628,7 @@ fn a_reserve_lets_a_promotion_copy_at_once() {
             releases: vec![Release { group: 0, record: zero, layer: 0, expert: 0 }],
         }
     );
-    directory.drain(Step::MAX);
+    directory.drain(Point::START, &steps());
     assert_eq!(directory.promote(false), Wants::default(), "the reserve is whole again");
 }
 
@@ -640,7 +645,7 @@ fn victims_rank_by_reuse_with_recency_the_tie_break() {
     let held = |steps: Step| {
         let mut directory = Directory::new(&[2], &[0], &[128], HostTier::replay(vec![0; 1]));
         directory.place(at(1, 0), 0, &[], &[0, 59], |_| 0).unwrap();
-        directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+        directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
         for step in 1..=steps {
             log(&directory, step, 0, &super::super::reuse::tests::every_third(step));
         }
@@ -698,7 +703,7 @@ fn a_grown_bank_beside_a_full_tier_leaves_the_rest_to_the_file() {
     }
     // The device promotes 1 and 3 into the bank; 0 and 2 stay alone.
     directory.place(at(2, 0), 0, &[], &[1, 3], |_| 0).unwrap();
-    directory.retired(Point::after(2), |_, _| 2, |_| Ending::Ended);
+    directory.retired(past(2), |_, _| 2, |_| Ending::Ended);
     directory.grow(0, 3);
     let (experts, slots) = (4, directory.records()[0]);
     let (held, alone) = (directory.held_count(0), directory.alone(0));
@@ -740,7 +745,7 @@ fn misses_evict_the_least_recently_read_records_but_the_requests_own() {
     let mut directory = directory();
     directory.place(at(1, 0), 0, &[], &[0, 1], |_| 0).unwrap();
     directory.place(at(1, 1), 1, &[], &[0, 1], |_| 0).unwrap();
-    directory.retired(Point::after(1), |_, _| 1, |_| Ending::Ended);
+    directory.retired(past(1), |_, _| 1, |_| Ending::Ended);
     // Layer 0's experts read at steps 5 and 2, layer 1's at 3, 4.
     let reads = [5, 2, 3, 4];
     let placed = directory
@@ -895,7 +900,7 @@ fn a_running_groups_planned_hits_keep_their_records_through_its_seeds_and_refill
     seed(&mut directory, 2);
     let at = Unbegun::at(1001);
     let victims = directory.refill_victims(2, false);
-    directory.refill(victims, false, &at, (500, 1000));
+    directory.refill(victims, false, &at);
     // Step 1001 reads cold what the store no longer keeps, and seeds it.
     for expert in [0, 1, 3] {
         if views[0].resolve(expert, 1001).is_none() {

@@ -69,11 +69,7 @@ pub fn replay(
     // at no step, at group 0, before every read's (each read at position p
     // is group p + 1).
     for (layer, experts) in held.iter().enumerate() {
-        let point = Point {
-            group: 0,
-            layer,
-            sequence: 0,
-        };
+        let point = Point::whole(0, layer, 0);
         let placed = directory
             .place(point, layer, &[], experts, |_| 0)
             .ok_or_else(|| format!("layer {layer}'s group holds fewer records than it held"))?;
@@ -85,17 +81,13 @@ pub fn replay(
             };
         }
     }
-    directory.retire(Point::after(0), |_, _| 0, |_| Ending::Ended, &steps);
+    directory.retire(Point::whole(0, usize::MAX, Step::MAX), |_, _| 0, |_| Ending::Ended, &steps);
     // Each read is a point of its own in the device's order, each record
     // it reads last read at its step's sequence.
     let mut misses = vec![0; reads.len()];
     for (position, read) in reads.iter().enumerate() {
         let (layer, sequence, group) = (read.layer, read.sequence, layers[read.layer]);
-        let point = Point {
-            group: position as Step + 1,
-            layer,
-            sequence,
-        };
+        let point = Point::whole(position as Step + 1, layer, sequence);
         directory.retire(point, |group, record| commits[group][record.index()], |_| Ending::Ended, &steps);
         let (held, absent): (Vec<usize>, Vec<usize>) =
             read.experts.iter().partition(|&&expert| directory.held(layer, expert).is_some());
@@ -133,7 +125,7 @@ pub fn replay(
             };
         }
     }
-    directory.retire(Point::after(reads.len() as Step + 1), |group, record| commits[group][record.index()], |_| Ending::Ended, &steps);
+    directory.retire(Point::whole(reads.len() as Step + 1, usize::MAX, Step::MAX), |group, record| commits[group][record.index()], |_| Ending::Ended, &steps);
     let held = (0..layers.len())
         .map(|layer| (0..experts).filter(|&expert| directory.held(layer, expert).is_some()).collect())
         .collect();

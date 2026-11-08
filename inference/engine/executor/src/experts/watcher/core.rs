@@ -295,22 +295,23 @@ impl ReadTable {
     }
 }
 
-/// A point in the device's order, with its position there: the layer runs
-/// the device makes before it. Groups run in sequence order, each
-/// layer-major over its steps, so point `(g, l, q)` of a group of `k` steps
-/// of a bank of `L` layers follows the `g·L` runs of the steps before its
-/// group (sequences begin at 1, each step `L` runs), then `l·k` of its own
-/// group's, then `q − g`.
+/// A request's point in the device's order, with its position there: the
+/// layer runs the device makes before it (`Steps::at`). Pieces run in
+/// submission order, each layer-major over its steps, so point `(p, l, q)`
+/// of a piece of a group from `g` of `k` steps, its layers from `f`, follows
+/// the runs before the piece, then `(l − f)·k` of its own, then `q − g`. A
+/// group run whole is one piece, whose `g·L` runs before it (of a bank of
+/// `L` layers) are the steps' before it (sequences begin at 1, each step
+/// `L` runs).
 #[derive(Clone, Copy, Debug)]
-pub(super) struct At {
-    pub(super) point: Point,
+pub(in crate::experts) struct At {
+    pub(in crate::experts) point: Point,
     position: u64,
 }
 
 impl At {
-    /// `point` of a group of `steps` steps of a bank of `layers` layers.
-    pub(super) fn new(point: Point, steps: u64, layers: usize) -> Self {
-        let position = point.group * layers as u64 + point.layer as u64 * steps + (point.sequence - point.group);
+    /// `point`, `position` runs into the device's order.
+    pub(super) fn new(point: Point, position: u64) -> Self {
         Self { point, position }
     }
 
@@ -405,8 +406,10 @@ impl Core {
     pub(super) fn retire(&mut self, progress: Point) {
         let (groups, steps) = (&self.groups, &self.steps);
         self.directory.retire(progress, |group, record| groups[group].commits.load(record.index()), |point| steps.ending(point), steps);
-        // A taint is read until every seed of its group has retired.
-        let read = self.directory.pending_from().map_or(progress.group, |group| group.min(progress.group));
+        // A taint is read until every seed of its group has retired, and
+        // while the device is not past its group.
+        let unpassed = steps.first_unpassed(progress);
+        let read = self.directory.pending_from().map_or(unpassed, |group| group.min(unpassed));
         steps.untaint_before(read);
     }
 
@@ -465,7 +468,6 @@ impl Core {
                 })
                 .collect(),
             grant,
-            from: None,
         }
     }
 

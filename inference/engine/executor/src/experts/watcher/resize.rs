@@ -588,7 +588,7 @@ impl Residency {
         self.join();
         self.retire();
         if let Some(copier) = copier {
-            super::promotions::carry(&mut self.core, &self.shared, copier);
+            super::promotions::carry(&mut self.core, &self.shared, copier, self.prefetch.reached());
         }
         self.prefetch.settle(&mut self.core.directory);
         if self.shared.life.ended().is_some() {

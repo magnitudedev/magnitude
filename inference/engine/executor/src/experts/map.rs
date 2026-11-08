@@ -12,12 +12,15 @@
 //!   device reads UNTIL, then FROM, then RECORD, each an acquire load
 //!   (`streaming_held`). A step that reads the new UNTIL reads the new FROM
 //!   and RECORD; one that reads the old UNTIL either is past it (an
-//!   unmapped entry's old record is reused only past every step below it)
-//!   or reads a record that holds the expert, old or new. So a mapping may
-//!   take effect from a step already begun that has not resolved the
-//!   layer yet.
-//! - Unmap: UNTIL alone. The record is reused only once every step below
-//!   it has ended (the frontier reached it, `Steps::frontier`), or, where the device itself
+//!   unmapped entry's old record is reused only once every step it was
+//!   mapped for is past its layer) or reads a record that holds the
+//!   expert, old or new. So a mapping may take effect from a step already
+//!   begun that has not resolved the layer yet.
+//! - Unmap: UNTIL alone. The record is reused only once every step of its
+//!   `[FROM, UNTIL)` has passed the map's layer in the device's order or
+//!   ended (`Steps::served`): a step before FROM never resolves the entry
+//!   to it, and one from UNTIL on reads the unmapping, stored before it
+//!   begins or before it resolves the layer; or, where the device itself
 //!   writes the record (a prompt group's seeds and the conveyor's claims),
 //!   once the device is past those steps in its order.
 //!
@@ -55,6 +58,12 @@ impl MapView {
 
     fn load_step(&self, expert: usize, word: u64) -> Step {
         self.words.load_u64(Self::word(expert, word))
+    }
+
+    /// The step `expert`'s entry is mapped from: no step before it
+    /// resolves the entry to its record.
+    pub fn from(&self, expert: usize) -> Step {
+        self.load_step(expert, MAP_FROM)
     }
 
     /// The record the map holds `expert` in while mapped, none unmapped.
@@ -171,11 +180,11 @@ impl LandingMap {
     }
 
     /// Map `expert` to `record`, its bytes whole, from step `from` on where
-    /// given, the first step whose resolution of the map's layer the device
-    /// has not reached (`Point::first_unresolved`, a parked step's
-    /// landing's), so a step begun that has yet to resolve the layer hits
-    /// it; else from the first step not yet begun. A plain word, for every
-    /// resolution from now.
+    /// given, the first step of the parked step's group or a later one
+    /// whose resolution of the map's layer the device has not reached
+    /// (`Park::unresolved`, a parked step's landing's), so a step begun that
+    /// has yet to resolve the layer hits it; else from the first step not
+    /// yet begun. A plain word, for every resolution from now.
     pub fn map_from(&self, expert: usize, record: u32, from: Option<Step>) {
         match self {
             Self::Tier(tier) => tier.store(expert, record as i32),
@@ -187,7 +196,7 @@ impl LandingMap {
 
     /// Unmap `expert` from its record `record`, the device parked: from
     /// step `from` on, the first step whose resolution of the map's layer
-    /// the device has not reached (`Point::first_unresolved`), or from the
+    /// the device has not reached (`Park::unresolved`), or from the
     /// first step not yet begun where that is earlier, where the entry still
     /// names `record` ([`StampedMap::unmap_record`], under the lock a
     /// landing's mapping takes too: a graced record's expert may have been

@@ -42,44 +42,105 @@ pub use replay::{Recency, replay};
 #[cfg(any(test, feature = "expert-routing"))]
 use super::exchange;
 
+/// A piece of the device's order: a run of one group's streamed layers
+/// that the device runs whole, between the pieces submitted before and
+/// after it. A group begins as one piece, its own. A group cut in before
+/// a begun group's layer (`Steps::begin_cut_in`) runs between that
+/// group's layers before it and those from it on, which become a piece of
+/// their own, ordered after the group cut in: the piece that group's begin
+/// opened `behind` it. Pieces order by the group that opened them, then
+/// behind it, which is the order they are submitted in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct Piece {
+    pub opened: Step,
+    pub behind: bool,
+}
+
+impl Piece {
+    /// The piece group `group`'s begin opens: its own.
+    pub fn of(group: Step) -> Self {
+        Self { opened: group, behind: false }
+    }
+}
+
 /// A point in the device's order of streamed layers. Steps begin in groups
 /// (a chain's launches, a lone step a group of one), named by their first
-/// sequence and run in submission order; a group runs layer-major, each
-/// layer over its steps in sequence order. So a request at layer `l` of a
-/// group's step `q` (a scratch step's round 0 there) proves the device past
-/// layer `l` of the group's steps before `q` and past every earlier layer of
-/// all its steps: the order is (group, layer, sequence).
+/// sequence; the device runs pieces ([`Piece`]) in submission order, each
+/// layer-major, each layer over its steps in sequence order. So a request
+/// at layer `l` of step `q` in a piece (a scratch step's round 0 there)
+/// proves the device past layer `l` of the piece's steps before `q`, past
+/// every earlier layer of the piece, and past every earlier piece: the
+/// order is (piece, layer, sequence). A group run whole is one piece,
+/// whose order is (group, layer, sequence). Its group names it for
+/// lookups; no two pieces share a (layer, sequence), so the group decides
+/// no order. A point the device has not reached may move later as its
+/// group is cut (`Steps::begin_cut_in`): one about a resolution yet to
+/// come is read from the steps when compared (`Steps::after`,
+/// `Steps::point`), never kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Point {
-    pub group: Step,
+    pub piece: Piece,
     pub layer: usize,
     pub sequence: Step,
+    pub group: Step,
 }
 
 impl Point {
-    /// The point past every layer of every step of group `group`.
-    pub fn after(group: Step) -> Self {
-        Self {
-            group,
-            layer: usize::MAX,
-            sequence: Step::MAX,
-        }
+    /// Before every point: what the device is known past before any
+    /// request, and where a group the steps forgot lies (every step of it
+    /// ended, so the device runs none of it).
+    pub const START: Self = Self::whole(0, 0, 0);
+
+    /// Layer `layer` of step `sequence` of group `group`, run whole: one
+    /// piece, its own.
+    pub const fn whole(group: Step, layer: usize, sequence: Step) -> Self {
+        Self { piece: Piece { opened: group, behind: false }, layer, sequence, group }
+    }
+}
+
+/// A park read from the steps where it is served (`Steps::park`): the
+/// device parked at `point` (a decode request's tier wait), and per layer
+/// what its order says of every step's resolution there. Read once a
+/// serve, at use: a group cut in after it only moves resolutions later,
+/// so what it says stays true.
+#[derive(Clone, Debug)]
+pub(super) struct Park {
+    pub point: Point,
+    /// Per layer, the first step of the parked step's group or a later
+    /// one whose resolution of the layer lies after the park (the parked
+    /// step's own at its layer is done): every step of those groups below
+    /// it has resolved the layer.
+    pub unresolved: Vec<Step>,
+    /// Per layer, the steps of groups begun before the parked step's that
+    /// have yet to resolve the layer, `(first, last)`: a group the parked
+    /// one was cut in before, at that group's layers from the cut on.
+    /// None while nothing cuts in.
+    pub earlier: Vec<Option<(Step, Step)>>,
+}
+
+impl Park {
+    /// The first step whose resolution of `layer` is not before the park,
+    /// of the parked step's group or a later one ([`Self::unresolved`]):
+    /// what an unmapping or a landing at the park is stored from.
+    pub fn unresolved(&self, layer: usize) -> Step {
+        self.unresolved[layer]
     }
 
-    /// The device parked here, in a group of `steps` steps: the first step
-    /// whose resolution of `layer` is not before this point. A layer past
-    /// the parked one no step of the group has resolved, so the group's
-    /// first; the parked layer, every step of the group up to the parked
-    /// one has, so the one after it; a layer before it, every step of the
-    /// group has, so the first after the group. Every resolution of `layer`
-    /// by a step before it lies before this point, but the parked step's
-    /// own at its layer.
-    pub fn first_unresolved(self, layer: usize, steps: u64) -> Step {
-        match layer.cmp(&self.layer) {
-            std::cmp::Ordering::Greater => self.group,
-            std::cmp::Ordering::Equal => self.sequence + 1,
-            std::cmp::Ordering::Less => self.group + steps,
-        }
+    /// Whether an entry of `layer` mapped for steps `[from, until)` leaves
+    /// no step of an earlier group able to resolve it once the park
+    /// unmaps it: no step of a group the parked one was cut in before that
+    /// has yet to resolve the layer lies in it. Only such an entry may be
+    /// unmapped or its record reused at the park: that group's request at
+    /// the layer may have been served already, reading in place what the
+    /// map resolves for it.
+    pub fn frees(&self, layer: usize, from: Step, until: Step) -> bool {
+        self.earlier[layer].is_none_or(|(first, last)| until <= first || from > last)
+    }
+
+    /// Whether the parked step was cut in before a group it runs inside:
+    /// it may land into the records set aside for cut-ins.
+    pub fn cut_in(&self) -> bool {
+        self.earlier.iter().any(Option::is_some)
     }
 }
 
@@ -687,21 +748,22 @@ impl Directory {
     }
 
     /// Claim a demand landing of `layer`'s `expert` while the device is
-    /// parked at `parked` (`layer` of a step in a group of `steps` steps),
-    /// leaving no reserve: where none is ready, one a kept record's
-    /// unmapping frees at once, any the parked step's route did not resolve
-    /// there (`read`, [`HostRecords::claim_demand`]), its unmapping
-    /// stored before the claim returns, so before the landing writes the
-    /// record. Short without a tier.
-    pub fn claim_demand(&mut self, (layer, expert): Staged, demand: Demand, read: &[(usize, u32)], parked: (Point, u64)) -> Claim {
+    /// parked at `park`, leaving no reserve but the records set aside for
+    /// cut-ins, which a cut-in's park takes too ([`Self::set_pool`]): where
+    /// none is ready, one a kept record's unmapping frees at once, any the
+    /// parked step's route did not resolve there (`read`) and no earlier
+    /// group's step may still resolve ([`HostRecords::claim_demand`]), its
+    /// unmapping stored before the claim returns, so before the landing
+    /// writes the record. Short without a tier.
+    pub fn claim_demand(&mut self, (layer, expert): Staged, demand: Demand, read: &[(usize, u32)], park: &Park) -> Claim {
         let group = self.bank.group(layer);
         let read = |record| read.contains(&(group, record));
-        if let Some(claim) = self.host[group].claim_prepared((layer, expert), demand, read, parked) {
+        if let Some(claim) = self.host[group].claim_prepared((layer, expert), demand, read, park) {
             return claim;
         }
         let reuse = Reuse::of(&self.ranking);
         let rank = store_rank(&reuse, &self.prompt_reads);
-        self.host[group].claim_demand((layer, expert), demand, rank, read, parked)
+        self.host[group].claim_demand((layer, expert), demand, rank, read, park)
     }
 
     /// The posted read of `layer`'s `expert`, which no record took, ended
@@ -769,12 +831,23 @@ impl Directory {
     }
 
     /// Unmap each group's `victims` ([`HostRecords::refill`]), under the
-    /// lock every step begins under, `at` the first step not yet begun and
-    /// `latest` the last step begun, the lent records only where `lent`.
-    pub fn refill(&mut self, victims: Vec<Vec<(u32, Staged)>>, lent: bool, at: &Unbegun, latest: (Step, Step)) {
+    /// lock every step begins under, `at` the first step not yet begun, the
+    /// lent records only where `lent`.
+    pub fn refill(&mut self, victims: Vec<Vec<(u32, Staged)>>, lent: bool, at: &Unbegun) {
         for (records, victims) in self.host.iter_mut().zip(victims) {
-            records.refill(victims, lent, at, latest);
+            records.refill(victims, lent, at);
         }
+    }
+
+    /// Group `group`'s host tier sets `records` ready records aside for
+    /// the decode steps cut in during a prompt pass from now, none once
+    /// the pass ends ([`HostRecords::set_pool`]): one decode step's
+    /// expected misses of the group's layers (`misses`), and never fewer
+    /// than a cut-in step's choices at one layer (`choices`), which it may
+    /// hold answering at one park: so a cut-in never waits on its own
+    /// pool.
+    pub fn set_pool(&mut self, group: usize, misses: u32, choices: u32) {
+        self.host[group].set_pool(if misses == 0 { 0 } else { misses.max(choices) });
     }
 
     /// The tier record keeping `layer`'s `expert` whole, if one does.
@@ -786,6 +859,23 @@ impl Directory {
     /// it the device serves in place, with no read.
     pub fn in_tier(&self, layer: usize, expert: usize) -> bool {
         self.host(self.bank.group(layer)).keeps((layer, expert))
+    }
+
+    /// Whether the prompt group whose last step is `last` reads `layer`'s
+    /// `expert` from its group's host tier, kept or landing there
+    /// ([`HostRecords::serves`]): none a cut-in landed, which the cut-ins
+    /// recycle.
+    pub fn tier_serves(&self, layer: usize, expert: usize, last: Step) -> bool {
+        self.host(self.bank.group(layer)).serves((layer, expert), last)
+    }
+
+    /// Hold the tier record keeping `layer`'s `expert` whole for the copy
+    /// of the prompt group whose last step is `last`
+    /// ([`Self::tier_serves`]), which holds it until the group is past:
+    /// the record, none where the tier keeps no copy that group reads.
+    pub fn hold_for_pass(&mut self, layer: usize, expert: usize, last: Step) -> Option<HostRecord> {
+        let tier = self.tier(layer);
+        tier.serves((layer, expert), last).then(|| tier.hold((layer, expert))).flatten().map(HostRecord)
     }
 
     /// Hold the tier record keeping `layer`'s `expert` whole for a pull
@@ -1031,10 +1121,10 @@ impl Directory {
         }
     }
 
-    /// Every release whose unmapping the `frontier` reached is free
+    /// Every release the device is past at `progress` is free
     /// ([`BankRecords::drain`]): whether any was.
-    pub fn drain(&mut self, frontier: Step) -> bool {
-        self.bank.drain(frontier)
+    pub fn drain(&mut self, progress: Point, steps: &Steps) -> bool {
+        self.bank.drain(progress, steps)
     }
 
     /// The promotions queued, which copy now ([`BankRecords::queued`]).
@@ -1334,7 +1424,8 @@ impl Directory {
     /// group ended on its still pulse, so its seed copy may have read a
     /// slot whose round was never answered) whatever the device committed.
     /// A seed of a group still running stays pending, though the device is
-    /// past its layer: its taint is known only once it ends. Every tier record graced through a point the device is past
+    /// past its layer: its taint is known only once it ends. Every tier
+    /// record graced for steps the device is past at the record's layer
     /// is ready. The seeds committed, (layer, expert, record), which the
     /// host maps.
     pub fn retire(&mut self, progress: Point, commit: impl Fn(usize, BankRecord) -> i32, ending: impl Fn(Point) -> Ending, steps: &Steps) {
@@ -1346,7 +1437,7 @@ impl Directory {
             }
             self.resettle(layer, expert);
         }
-        self.retire_graces(progress);
+        self.retire_graces(progress, steps);
     }
 
     /// The first group a pending seed was placed in: the taints of its steps
@@ -1355,23 +1446,25 @@ impl Directory {
         self.bank.pending_from()
     }
 
-    /// The device is parked at `parked`, a decode request (its tier wait)
-    /// of a group of `steps` steps, steps running in (group, layer,
-    /// sequence) order, so every resolution before it is done: every graced
-    /// record ready but those the parked step resolved there (`read`,
-    /// (group, record), `decode::parked_reads`), each one a stamped map may
-    /// still name first restamped ([`HostRecords::release`]).
-    pub fn release(&mut self, parked: (Point, u64), read: &[(usize, u32)]) {
+    /// The device is parked at `park`, a decode request (its tier wait),
+    /// so every resolution before it in the device's order is done: every
+    /// graced record ready but those the parked step resolved there
+    /// (`read`, (group, record), `decode::parked_reads`) and those a step
+    /// of a group the parked one was cut in before may still resolve, each
+    /// one a stamped map may still name first restamped
+    /// ([`HostRecords::release`]).
+    pub fn release(&mut self, park: &Park, read: &[(usize, u32)]) {
         for (group, records) in self.host.iter_mut().enumerate() {
-            records.release(parked, |record| read.contains(&(group, record)));
+            records.release(park, |record| read.contains(&(group, record)));
         }
     }
 
-    /// The device is at `progress`: every host tier record graced through a
-    /// point before it is ready ([`HostRecords::retire`]).
-    pub fn retire_graces(&mut self, progress: Point) {
+    /// The device is at `progress`: every host tier record graced for
+    /// steps each past the record's layer there, or ended, is ready
+    /// ([`HostRecords::retire`]).
+    pub fn retire_graces(&mut self, progress: Point, steps: &Steps) {
         for records in self.host.iter_mut() {
-            records.retire(progress);
+            records.retire(progress, steps);
         }
     }
 

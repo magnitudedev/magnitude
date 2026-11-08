@@ -399,7 +399,7 @@ impl Prefetch {
         Self {
             staging: Arc::new(StagingPool::new(records)),
             inbound: HashMap::new(),
-            past: Point { group: 0, layer: 0, sequence: 0 },
+            past: Point::START,
             rings: vec![[0; crate::planning::HINT_LEADS as usize]; layers],
             routed: vec![0; layers],
         }

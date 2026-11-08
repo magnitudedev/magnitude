@@ -74,7 +74,7 @@ fn a_step_whose_wait_outlasted_a_still_pulse_is_interrupted_and_the_load_goes_on
     harness.expire(&step, 0);
     let sequence = step.sequence();
     // A lone step: its group's only one.
-    let starved = crate::experts::directory::Point { group: sequence, layer: 0, sequence };
+    let starved = crate::experts::directory::Point::whole(sequence, 0, sequence);
     match step.complete() {
         Err(StepFailure::Interrupted(reason)) => assert!(reason.contains("pulse"), "{reason}"),
         outcome => panic!("a step whose wait expired completed {:?}", outcome.map(|_| ())),

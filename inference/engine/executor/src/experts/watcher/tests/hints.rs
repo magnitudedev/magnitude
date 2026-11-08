@@ -248,14 +248,18 @@ fn hints_never_take_the_demand_reserve() {
 /// earlier step's request.
 #[test]
 fn a_lead_counts_layer_runs_in_the_devices_order() {
-    use super::core::At;
-    use crate::experts::directory::Point;
-    let at = |group, steps, layer, sequence| At::new(Point { group, layer, sequence }, steps, 3);
+    let steps = super::Steps::new(crate::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
+    // Lone steps 1 and 2, a chain of steps 3 and 4, a lone step 5: each run
+    // whole, of three layers.
+    for count in [1, 1, 2, 1] {
+        steps.begin_group(count, None);
+    }
+    let at = |sequence, layer| steps.at(sequence, layer, 3);
     // Lone steps: one layer of step 1 to layer 2 of step 2 is 4 runs.
-    assert_eq!(at(1, 1, 1, 1).runs_until(at(2, 1, 2, 2)), 4);
+    assert_eq!(at(1, 1).runs_until(at(2, 2)), 4);
     // A chain of steps 3 and 4: step 4 at layer 0, then step 3 at layer 1.
-    assert_eq!(at(3, 2, 0, 4).runs_until(at(3, 2, 1, 3)), 1);
-    assert_eq!(at(3, 2, 0, 3).runs_until(at(3, 2, 1, 3)), 2);
+    assert_eq!(at(4, 0).runs_until(at(3, 1)), 1);
+    assert_eq!(at(3, 0).runs_until(at(3, 1)), 2);
     // Past the chain: step 5 follows both steps' every layer.
-    assert_eq!(at(3, 2, 2, 4).runs_until(at(5, 1, 0, 5)), 1);
+    assert_eq!(at(4, 2).runs_until(at(5, 0)), 1);
 }

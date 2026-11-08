@@ -160,7 +160,7 @@ impl DeviceLanding {
         self.words.clear();
         let failed = self.file.answer_of(self.at.sequence, 0) == Some(super::exchange::Answer::Failed);
         if !failed {
-            landing.grant.map(landing.from);
+            landing.grant.map();
             self.account.device.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.ended.set(!failed);
@@ -278,14 +278,13 @@ impl LandedRecord {
 /// from each routed tensor's staging record (its records, the record and
 /// its stored bytes) into the grant's tier record of the tensor (that
 /// record alone, [`TierTensor::landed`]), then
-/// mapped by the grant ([`Converting`], [`Grant::map`]), from step `from`
-/// where the landing is a parked step's (the first step that has not
-/// resolved the layer, which the device cannot pass before the landing
-/// answers), else from the first step not yet begun.
+/// mapped by the grant ([`Converting`], [`Grant::map`]), from the step its
+/// claim names: where the landing is a parked step's, the first step that
+/// has not resolved the layer, which the device cannot pass before the
+/// landing answers; else the first step not yet begun.
 pub(in crate::experts) struct Landing {
     pub tensors: Vec<(Records, u64, u64, LandedRecord)>,
     pub grant: Grant,
-    pub from: Option<Step>,
 }
 
 impl Landing {
@@ -502,7 +501,7 @@ impl super::compute::Job for Converting {
         LandingAccount::add(&terms.converting, began.elapsed());
         terms.worked.fetch_add(self.worked.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
         terms.landings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.landing.grant.map(self.landing.from);
+        self.landing.grant.map();
         self.ended.set(true);
         if let Some(then) = self.then.lock().expect("a landing's end").take() {
             then();

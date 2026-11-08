@@ -17,15 +17,15 @@
 //! [`Grant`] its claim took: the one map write the claim allows. The states:
 //! - kept: it holds an expert whole, mapped, alone (the bank lacks it) or
 //!   banked (the bank holds a copy too);
-//! - graced: unmapped while step `q` of group `g` was the latest begun, so
-//!   layer `l`'s entries of a step at or before it may still read it (only
-//!   layer `l`'s route resolves its tier map, and only layer `l`'s entries
-//!   and its CPU site read what it resolved): it holds nothing once the
-//!   device is past layer `l` of `q`, the point `(g, l, q)`
-//!   ([`HostRecords::retire`]), or at a park that no resolution after it
-//!   names it ([`HostRecords::release`]). That is the one rule a record
-//!   frees by: once the device is past the last resolution that may name
-//!   it, which the map's [`Resolution`] bounds;
+//! - graced: unmapped from the first step not yet begun, `until`, so
+//!   layer `l`'s entries of a step from its mapping's on (`from`) and
+//!   before `until` may still read it (only layer `l`'s route resolves its
+//!   tier map, and only layer `l`'s entries and its CPU site read what it
+//!   resolved): it holds nothing once each of those steps is past layer
+//!   `l` or ended (`Steps::served`, [`HostRecords::retire`]), or at a park
+//!   that no resolution after it names it ([`HostRecords::release`]). That
+//!   is the one rule a record frees by: once the device is past the last
+//!   resolution that may name it, which the map's [`Resolution`] bounds;
 //! - ready: holding nothing any step reads, so a landing takes it at once;
 //! - landing: taken for a landing of one expert in flight, until it lands
 //!   ([`HostRecords::landed`]) or its read fails ([`HostRecords::unlanded`]);
@@ -61,11 +61,23 @@
 //! held until the copy ends ([`HostRecords::hold`]): it keeps its expert,
 //! mapped, and its place in the taking order, and the reserve never unmaps
 //! it while held, so its bytes stay whole for the copy.
+//!
+//! A decode step cut in before a prompt group's layer (`Park::cut_in`)
+//! runs while that group may still resolve its layers from the cut on.
+//! Its park unmaps, restamps or reuses no record a step of that group may
+//! still resolve (`Park::frees`, by the step each record's entry is mapped
+//! from, `from`): that group's request at the layer may have been served,
+//! reading in place what its map resolves. Its landings are mapped from
+//! its own step on, so no earlier group reads them, and the prompt group
+//! copies none ([`HostRecords::serves`]): the cut-ins recycle them among
+//! themselves. They land into the ready records the pool sets aside for
+//! them ([`HostRecords::set_pool`]), which no other landing takes, so a
+//! cut-in never waits on the prompt group it runs inside.
 
-use super::directory::Point;
+use super::directory::{Park, Point};
 use super::map::LandingMap;
 use super::staging::Staged;
-use super::watcher::{Step, Unbegun};
+use super::watcher::{Step, Steps, Unbegun};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,18 +162,6 @@ pub(super) enum Resolution {
     BeforeStamp,
 }
 
-impl Resolution {
-    /// The last point that may name a record unmapped through `grace` (its
-    /// layer of the last step that may resolve its stamp), the device now
-    /// at `now`.
-    fn bound(self, grace: Point, now: Point) -> Point {
-        match self {
-            Self::AfterStore => grace.min(now),
-            Self::BeforeStamp => grace,
-        }
-    }
-}
-
 /// Where an expert of the group is: kept whole in a record, landing (a
 /// landing of it is in flight, whoever's), or lacked. Every expert is
 /// exactly one.
@@ -173,12 +173,16 @@ pub(super) enum Located {
 }
 
 /// The one map write a landing's claim allows: once its bytes are whole,
-/// expert `staged` mapped to the record taken for it ([`Grant::map`]).
-/// Only a claim makes one ([`HostRecords::claim`]).
+/// expert `staged` mapped to the record taken for it ([`Grant::map`]),
+/// from step `from` on where given (a parked step's demand's, the first
+/// step that has not resolved its layer, `Park::unresolved`), else from
+/// the first step not yet begun. Only a claim makes one
+/// ([`HostRecords::claim`]).
 pub(in crate::experts) struct Grant {
     map: Option<LandingMap>,
     staged: Staged,
     record: u32,
+    from: Option<Step>,
     mapped: std::sync::atomic::AtomicBool,
 }
 
@@ -193,10 +197,15 @@ impl Grant {
         self.record
     }
 
-    /// Map its expert to its record, whole now, from step `from` on where
-    /// given, else from the first step not yet begun
-    /// (`LandingMap::map_from`): once.
-    pub fn map(&self, from: Option<Step>) {
+    /// Map its expert to its record, whole now, from the step its claim
+    /// names (`LandingMap::map_from`): once.
+    pub fn map(&self) {
+        self.map_at(self.from);
+    }
+
+    /// Map its expert to its record from step `from` on where given, else
+    /// from the first step not yet begun: once.
+    fn map_at(&self, from: Option<Step>) {
         assert!(!self.mapped.swap(true, std::sync::atomic::Ordering::AcqRel), "a landing of {:?} maps its record twice", self.staged);
         if let Some(map) = &self.map {
             map.map_from(self.staged.1, self.record, from);
@@ -225,13 +234,16 @@ pub(super) trait Rank<K: Ord + Copy>: Fn(Staged, Option<Step>) -> K {}
 impl<K: Ord + Copy, F: Fn(Staged, Option<Step>) -> K> Rank<K> for F {}
 
 /// An expert a record keeps whole, mapped: as `kept`, ranked beside
-/// `read`, held by `holds` copies reading it.
+/// `read`, held by `holds` copies reading it, its entry mapped for no step
+/// before `from` (a parked step's landing's: none before the first step
+/// that had not resolved its layer; else none known, 0).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Whole {
     staged: Staged,
     kept: Kept,
     read: Option<Step>,
     holds: u32,
+    from: Step,
 }
 
 /// What a host record holds.
@@ -239,10 +251,11 @@ struct Whole {
 enum Host {
     /// Nothing any step reads: a landing takes it at once.
     Ready,
-    /// Taken for a landing of the expert in flight; where a request's
-    /// demand took it, the request at `answer` (its tier wait), which the
-    /// landing answers with it.
-    Landing { staged: Staged, answer: Option<Point> },
+    /// Taken for a landing of the expert in flight, mapped for no step
+    /// before `from` once landed ([`Whole`]); where a request's demand took
+    /// it, the request at `answer` (its tier wait), which the landing
+    /// answers with it.
+    Landing { staged: Staged, answer: Option<Point>, from: Step },
     /// Its expert whole, mapped.
     Kept(Whole),
     /// Its expert whole, mapped, and the outstanding answer of a request:
@@ -251,11 +264,12 @@ enum Host {
     /// takes it until then; the reserve may unmap it, graced with its
     /// answer.
     Answering(Whole, Point),
-    /// Unmapped, the expert it held still named by the steps that may
-    /// resolve it until the device is past `grace`, and read as the
-    /// outstanding answer of the request at `answer`, if it was one, until
-    /// the device is past there: no park before frees it.
-    Graced { staged: Staged, grace: Point, answer: Option<Point> },
+    /// Unmapped from step `until` on, the expert it held still named by
+    /// the steps from `from` before it that may resolve it until each is
+    /// past its layer or ended, and read as the outstanding answer of the
+    /// request at `answer`, if it was one, until the device is past there:
+    /// no park before frees it.
+    Graced { staged: Staged, from: Step, until: Step, answer: Option<Point> },
     /// A prompt group's, for its life.
     Claimed,
 }
@@ -321,6 +335,9 @@ pub(super) struct HostRecords {
     /// The bottom records the conveyor's lending reserves for it (none but
     /// of its lender, `planning::Lender`), which no other claim takes.
     lent: u32,
+    /// The ready records set aside for decode steps cut in during a prompt
+    /// pass ([`Self::set_pool`]): every other landing leaves them ready.
+    pool: usize,
     /// Each layer's landing map, of the group's own layers, whose one
     /// writer these records are; none without a device.
     maps: Vec<Option<LandingMap>>,
@@ -373,6 +390,7 @@ impl HostRecords {
             lacking,
             alone: vec![0; layers],
             claimed: 0,
+            pool: 0,
             resolution,
             progress: None,
             lent,
@@ -496,9 +514,10 @@ impl HostRecords {
         }
     }
 
-    /// The grant of mapping `staged` to `record` once landed.
-    fn grant(&self, staged: Staged, record: u32) -> Grant {
-        Grant { map: self.maps[staged.0].clone(), staged, record, mapped: std::sync::atomic::AtomicBool::new(false) }
+    /// The grant of mapping `staged` to `record` once landed, from step
+    /// `from` on where given.
+    fn grant(&self, staged: Staged, record: u32, from: Option<Step>) -> Grant {
+        Grant { map: self.maps[staged.0].clone(), staged, record, from, mapped: std::sync::atomic::AtomicBool::new(false) }
     }
 
     /// Its records.
@@ -550,6 +569,22 @@ impl HostRecords {
     /// or a posted read no record has taken yet.
     pub fn lands(&self, staged: Staged) -> bool {
         self.located(staged) == Located::Landing
+    }
+
+    /// Whether the prompt group whose last step is `last` reads `staged`
+    /// from these records (its tier copy, `Directory::hold_for_pass`): kept
+    /// or landing in a record whose entry may be mapped for a step through
+    /// `last`, or read by a posted read no record has taken yet. A cut-in's
+    /// landing is mapped from its own step on (`Park::unresolved`), past
+    /// every step of the group it runs inside, which a copy would hold until
+    /// that group is past: the group reads it from the file instead, so the
+    /// cut-ins recycle it among themselves.
+    pub fn serves(&self, staged: Staged, last: Step) -> bool {
+        match (self.kept.get(&staged), self.landing.get(&staged)) {
+            (Some(&record), _) => self.records[record as usize].whole().is_some_and(|whole| whole.from <= last),
+            (None, Some(&record)) => matches!(self.records[record as usize], Host::Landing { from, .. } if from <= last),
+            (None, None) => self.inbound.claimed(staged),
+        }
     }
 
     /// Where `staged` is: kept, landing (a record taken for its landing, or
@@ -782,9 +817,10 @@ impl HostRecords {
         }
     }
 
-    /// Take a ready record for a landing of `staged`, which the tier
-    /// lacks and whose word its caller claimed, answering the request at `answer` where a demand takes it:
-    /// its grant. Every landing takes its record here, the lowest ready one
+    /// Take a ready record for a landing of `staged`, which the tier lacks
+    /// and whose word its caller claimed, answering the request parked at
+    /// `park` where a demand takes it, mapped from the first step whose
+    /// resolution of its layer is not before the park: its grant. Every landing takes its record here, the lowest ready one
     /// past the lent records (a lent one only where none past them is
     /// ready, as a prompt group's claim waits for a landing into it). A
     /// shrink keeps a landing in place and cuts only above it
@@ -792,15 +828,38 @@ impl HostRecords {
     /// past a cut only where every record past the lent ones below it was
     /// taken as it began: right after a growth a landing fills the records
     /// below the growth before it touches the new ones a shrink cuts first.
-    fn take_lacked(&mut self, staged: Staged, answer: Option<Point>) -> Grant {
+    fn take_lacked(&mut self, staged: Staged, park: Option<&Park>) -> Grant {
         let record = self.ready.range(self.lent..).next().or_else(|| self.ready.first()).copied().expect("a record taken is ready");
-        self.set(record, Host::Landing { staged, answer });
-        self.grant(staged, record)
+        let from = park.map(|park| park.unresolved(staged.0));
+        self.set(record, Host::Landing { staged, answer: park.map(|park| park.point), from: from.unwrap_or(0) });
+        self.grant(staged, record, from)
     }
 
-    /// Whether [`Self::claim`] of `keep` takes a record now.
+    /// Whether [`Self::claim`] of `keep` takes a record now, leaving the
+    /// pool set aside beside `keep`.
     pub fn takes(&self, keep: usize) -> bool {
+        self.ready_beyond(keep + self.pool)
+    }
+
+    /// Whether a record is ready beyond `keep`, or beyond the experts still
+    /// lacked after a landing where those are fewer (a landing beyond them
+    /// could never be demanded).
+    fn ready_beyond(&self, keep: usize) -> bool {
         self.lacked().checked_sub(1).is_some_and(|after| self.ready.len() > keep.min(after))
+    }
+
+    /// The ready records a demand at `park` leaves: the pool, but where the
+    /// parked step is a cut-in, whose pool it is.
+    fn left_by(&self, park: &Park) -> usize {
+        if park.cut_in() { 0 } else { self.pool }
+    }
+
+    /// Set `records` ready records aside for the decode steps cut in during
+    /// a prompt pass from now (none once it ends): every landing but a
+    /// cut-in's demand leaves them ready, and the reserve keeps them
+    /// ([`Self::short_of`]).
+    pub fn set_pool(&mut self, records: u32) {
+        self.pool = records as usize;
     }
 
     /// Landing `record` holds `staged` whole, and its landing mapped it
@@ -810,11 +869,11 @@ impl HostRecords {
     /// fill's); the outstanding answer of the request whose demand took it,
     /// if one did.
     pub fn landed(&mut self, record: u32, staged: Staged, read: Option<Step>, kept: Kept) {
-        let Host::Landing { staged: landing, answer } = self.records[record as usize] else {
+        let Host::Landing { staged: landing, answer, from } = self.records[record as usize] else {
             panic!("{staged:?} lands into record {record}, which no landing took");
         };
         assert_eq!(landing, staged, "{staged:?} lands into the record taken for it");
-        let whole = Whole { staged, kept, read, holds: 0 };
+        let whole = Whole { staged, kept, read, holds: 0, from };
         self.set(record, self.answering(whole, answer));
     }
 
@@ -824,7 +883,7 @@ impl HostRecords {
     pub fn keep(&mut self, record: u32, staged: Staged) {
         assert_eq!(self.records[record as usize], Host::Ready, "a kept home is ready");
         assert!(self.inbound.claim(staged), "a home of {staged:?} is kept once, before any read");
-        self.set(record, Host::Kept(Whole { staged, kept: Kept::Alone, read: None, holds: 0 }));
+        self.set(record, Host::Kept(Whole { staged, kept: Kept::Alone, read: None, holds: 0, from: 0 }));
         self.store(staged, Some(record));
     }
 
@@ -871,9 +930,10 @@ impl HostRecords {
 
     /// Whether the ready, the graced and the claimed records (every claimed
     /// one a lent one, [`Self::claim_record`]), with `unmapped` more, fall
-    /// short of `reserve`, or of the experts lacked where fewer.
+    /// short of `reserve` and the pool set aside beside it, or of the
+    /// experts lacked where fewer.
     pub fn short_of(&self, reserve: usize, unmapped: usize) -> bool {
-        self.ready.len() + self.graced.len() + self.claimed + unmapped < reserve.min(self.lacked() + unmapped)
+        self.ready.len() + self.graced.len() + self.claimed + unmapped < (reserve + self.pool).min(self.lacked() + unmapped)
     }
 
     /// Unmap the reserve's `victims` ([`Self::refill_victims`]), under the
@@ -881,12 +941,12 @@ impl HostRecords {
     /// unchanged since it was chosen in this turn of residency (a changed
     /// one is an invariant violation), a lent record only where `lent` (no
     /// prompt group holds or awaits them, read under this lock, else passed
-    /// over), is unmapped from `at` and graced through its expert's layer of
-    /// `latest`, the last step begun `(group, sequence)`, and an outstanding
-    /// answer through its request too. A lent record is never graced
-    /// through a group's own step, which would hold its claim behind it.
-    /// The work here is a check, a map store and a state change a victim.
-    pub fn refill(&mut self, victims: Vec<(u32, Staged)>, lent: bool, at: &Unbegun, (group, sequence): (Step, Step)) {
+    /// over), is unmapped from `at` and graced for the steps before it its
+    /// entry may be mapped for, and an outstanding answer through its
+    /// request too. A lent record is never graced for a group's own step,
+    /// which would hold its claim behind it. The work here is a check, a map
+    /// store and a state change a victim.
+    pub fn refill(&mut self, victims: Vec<(u32, Staged)>, lent: bool, at: &Unbegun) {
         for (record, chosen) in victims {
             // Chosen in the same turn of residency, nothing between: only
             // the reservation may have changed, which a group takes as it
@@ -896,14 +956,15 @@ impl HostRecords {
             if !lent && record < self.lent {
                 continue;
             }
-            let (staged, answer) = match self.records[record as usize] {
-                Host::Answering(Whole { staged, .. }, past) => (staged, Some(past)),
-                _ => (self.unkeep(record), None),
+            let (staged, from, answer) = match self.records[record as usize] {
+                Host::Answering(Whole { staged, from, .. }, past) => (staged, from, Some(past)),
+                Host::Kept(Whole { from, .. }) => (self.unkeep(record), from, None),
+                other => unreachable!("victim record {record} holds {other:?}"),
             };
             if let Some(map) = &self.maps[staged.0] {
                 map.store_unbegun(staged.1, None, Some(at));
             }
-            self.set(record, Host::Graced { staged, grace: Point { group, layer: staged.0, sequence }, answer });
+            self.set(record, Host::Graced { staged, from, until: at.next(), answer });
         }
         // A displaced record unmapped, or changed since its seed chose it,
         // is displaced no more.
@@ -939,18 +1000,19 @@ impl HostRecords {
 
     /// [`Self::claim_demand`] from the prepared victims alone: none where it
     /// needs a scan, every prepared victim gone (since unmapped, landed
-    /// into, held or read by the parked step).
-    pub fn claim_prepared(&mut self, staged: Staged, demand: Demand, read: impl Fn(u32) -> bool, (parked, steps): (Point, u64)) -> Option<Claim> {
+    /// into, held, read by the parked step, or one an earlier group's step
+    /// may still resolve).
+    pub fn claim_prepared(&mut self, staged: Staged, demand: Demand, read: impl Fn(u32) -> bool, park: &Park) -> Option<Claim> {
         if let Some(claim) = self.demanded(staged, demand) {
             return Some(claim);
         }
-        if self.takes(0) {
-            return Some(self.take_demanded(staged, demand, parked));
+        if self.ready_beyond(self.left_by(park)) {
+            return Some(self.take_demanded(staged, demand, park));
         }
         let record = loop {
             let (record, kept) = self.victims.pop_front()?;
-            let keeps = matches!(self.records[record as usize], Host::Kept(Whole { staged, holds: 0, .. }) if staged == kept);
-            if keeps && !read(record) {
+            let keeps = self.records[record as usize].present() == Some(kept);
+            if keeps && self.reclaims(record, &read, park) {
                 break record;
             }
         };
@@ -958,7 +1020,18 @@ impl HostRecords {
             self.victims.push_front((record, self.records[record as usize].present().expect("a victim keeps its expert")));
             return Some(Claim::Landing);
         }
-        Some(self.take_victim(staged, record, (parked, steps)))
+        Some(self.take_victim(staged, record, park))
+    }
+
+    /// Whether a demand at `park` may take kept record `record` now: no
+    /// copy holds it, the parked step did not resolve it (`read`), and no
+    /// step of a group the parked one was cut in before may still resolve
+    /// it ([`Park::frees`]). Never an outstanding answer.
+    fn reclaims(&self, record: u32, read: impl Fn(u32) -> bool, park: &Park) -> bool {
+        match self.records[record as usize] {
+            Host::Kept(Whole { staged, holds: 0, from, .. }) => !read(record) && park.frees(staged.0, from, Step::MAX),
+            _ => false,
+        }
     }
 
     /// What a demand's claim of `staged` finds before it takes a record
@@ -984,46 +1057,49 @@ impl HostRecords {
     }
 
     /// A ready record for `demand`'s landing of `staged`, answering the
-    /// request at `parked`; landing, where a posted read claimed it first.
-    fn take_demanded(&mut self, staged: Staged, demand: Demand, parked: Point) -> Claim {
+    /// request parked at `park`; landing, where a posted read claimed it
+    /// first.
+    fn take_demanded(&mut self, staged: Staged, demand: Demand, park: &Park) -> Claim {
         match self.claims(staged, demand) {
-            true => Claim::Taken(self.take_lacked(staged, Some(parked))),
+            true => Claim::Taken(self.take_lacked(staged, Some(park))),
             false => Claim::Landing,
         }
     }
 
     /// Unmap kept record `record` from the first step whose resolution of
-    /// its expert's layer is not before `parked`, and take it for `staged`,
+    /// its expert's layer is not before `park`, and take it for `staged`,
     /// whose word its caller claimed.
-    fn take_victim(&mut self, staged: Staged, record: u32, (parked, steps): (Point, u64)) -> Claim {
+    fn take_victim(&mut self, staged: Staged, record: u32, park: &Park) -> Claim {
         let unmapped = self.unkeep(record);
-        self.unmap_from(unmapped, record, parked.first_unresolved(unmapped.0, steps));
+        self.unmap_from(unmapped, record, park.unresolved(unmapped.0));
         self.set(record, Host::Ready);
-        Claim::Taken(self.take_lacked(staged, Some(parked)))
+        Claim::Taken(self.take_lacked(staged, Some(park)))
     }
 
     /// Claim a demand landing of `staged` for `demand` ([`Self::claim`]
-    /// leaving no reserve, or a record for the read the request service's
-    /// look posted, [`Demand`]), the device parked at `parked` (a group of `steps` steps):
-    /// where it is lacked and no record is ready, unmap the first kept
-    /// record, in taking order at `rank`, not held and not `read` (what the
-    /// parked step resolved at its layer, `decode::parked_reads`), from the
-    /// first step whose resolution of its expert's layer is not before
-    /// `parked` ([`Point::first_unresolved`]): every resolution that may
-    /// name it is then before `parked`, so it is ready at once, and taken,
-    /// its unmapping stored before any landing writes it. Short where every
-    /// kept record is held, read, or another request's outstanding answer.
-    /// The record taken is the parked request's outstanding answer once it
-    /// lands.
-    pub fn claim_demand<K: Ord + Copy>(&mut self, staged: Staged, demand: Demand, rank: impl Rank<K>, read: impl Fn(u32) -> bool, (parked, steps): (Point, u64)) -> Claim {
+    /// leaving no reserve but the pool, which a cut-in's park takes too, or
+    /// a record for the read the request service's look posted,
+    /// [`Demand`]), the device parked at `park`: where it is lacked and no
+    /// record is ready, unmap the first kept record, in taking order at
+    /// `rank`, that the park may take ([`Self::reclaims`]: not held, not
+    /// `read`, what the parked step resolved at its layer,
+    /// `decode::parked_reads`, and none an earlier group's step may still
+    /// resolve), from the first step whose resolution of its expert's
+    /// layer is not before the park ([`Park::unresolved`]): every
+    /// resolution that may name it is then before the park, so it is ready
+    /// at once, and taken, its unmapping stored before any landing writes
+    /// it. Short where every kept record is held, read, another request's
+    /// outstanding answer, or an earlier group's to resolve. The record
+    /// taken is the parked request's outstanding answer once it lands.
+    pub fn claim_demand<K: Ord + Copy>(&mut self, staged: Staged, demand: Demand, rank: impl Rank<K>, read: impl Fn(u32) -> bool, park: &Park) -> Claim {
         if let Some(claim) = self.demanded(staged, demand) {
             return claim;
         }
-        if self.takes(0) {
-            return self.take_demanded(staged, demand, parked);
+        if self.ready_beyond(self.left_by(park)) {
+            return self.take_demanded(staged, demand, park);
         }
         let first = (0..self.records())
-            .filter(|&record| self.unheld(record) && !read(record))
+            .filter(|&record| self.reclaims(record, &read, park))
             .filter_map(|record| Some((self.place(record, &rank)?, record)))
             .min();
         let Some((_, record)) = first else {
@@ -1032,46 +1108,49 @@ impl HostRecords {
         if !self.claims(staged, demand) {
             return Claim::Landing;
         }
-        self.take_victim(staged, record, (parked, steps))
+        self.take_victim(staged, record, park)
     }
 
-    /// The device parked at `parked` (a group of `steps` steps), steps
-    /// running in (group, layer, sequence) order, so every resolution
-    /// before it is done: every graced record the parked step did not
+    /// The device parked at `park`, so every resolution before it in the
+    /// device's order is done: every graced record the parked step did not
     /// resolve (`read`, what it resolved at its layer,
-    /// `decode::parked_reads`), nor answers a request at or after the park
-    /// (its own, which its entries read after it), is ready. A plain map's unmapping is read by
-    /// every resolution after its store, so none after the park names it.
-    /// A stamped map's names it for the steps below its stamp that have yet
-    /// to resolve its layer: its entry is restamped, where it still names
-    /// the record, from the first step whose resolution of that layer is
-    /// not before the park ([`Point::first_unresolved`]), as a demand's
-    /// reclaim unmaps, before the record is ready. So a reserve unmapped
-    /// between parks is ready at the next park, however many steps have
-    /// begun behind it, and the read ahead it is kept for finds it. True
-    /// when any became ready.
-    pub fn release(&mut self, (parked, steps): (Point, u64), read: impl Fn(u32) -> bool) -> bool {
-        self.passed(parked);
+    /// `decode::parked_reads`), that answers no request at or after the
+    /// park (its own, which its entries read after it), and that no step of
+    /// a group the parked one was cut in before may still resolve
+    /// ([`Park::frees`]: that group's resolutions lie after the park), is
+    /// ready. A plain map's unmapping is read by every resolution after its
+    /// store, so none after the park names it. A stamped map's names it for
+    /// the steps below its stamp that have yet to resolve its layer: its
+    /// entry is restamped, where it still names the record, from the first
+    /// step whose resolution of that layer is not before the park
+    /// ([`Park::unresolved`]), as a demand's reclaim unmaps, before the
+    /// record is ready. So a reserve unmapped between parks is ready at the
+    /// next park, however many steps have begun behind it, and the read
+    /// ahead it is kept for finds it. True when any became ready.
+    pub fn release(&mut self, park: &Park, read: impl Fn(u32) -> bool) -> bool {
+        self.passed(park.point);
         let resolution = self.resolution;
-        self.free(|tier, record, staged, _, answer| {
-            if read(record) || answer.is_some_and(|answer| answer >= parked) {
+        self.free(|tier, record, staged, (from, until), answer| {
+            if read(record) || answer.is_some_and(|answer| answer >= park.point) || !park.frees(staged.0, from, until) {
                 return false;
             }
             if resolution == Resolution::BeforeStamp {
-                tier.unmap_from(staged, record, parked.first_unresolved(staged.0, steps));
+                tier.unmap_from(staged, record, park.unresolved(staged.0));
             }
             true
         })
     }
 
     /// The device is past every point before `progress`: every graced
-    /// record ready whose last resolution that may name it
-    /// ([`Resolution::bound`]) is before it, and every outstanding answer of
-    /// a request before it consumed, kept. True when any became ready.
-    pub fn retire(&mut self, progress: Point) -> bool {
+    /// record ready whose steps that may name it are each past its layer
+    /// there or ended (`Steps::served`, read now), and every outstanding
+    /// answer of a request before it consumed, kept. True when any became
+    /// ready.
+    pub fn retire(&mut self, progress: Point, steps: &Steps) -> bool {
         self.passed(progress);
-        let resolution = self.resolution;
-        self.free(|_, _, _, grace, answer| resolution.bound(grace, progress) < progress && answer.is_none_or(|answer| answer < progress))
+        self.free(|_, _, staged, (from, until), answer| {
+            answer.is_none_or(|answer| answer < progress) && steps.served(from, until, staged.0, progress)
+        })
     }
 
     /// The device is past every point before `progress`: every outstanding
@@ -1088,18 +1167,19 @@ impl HostRecords {
     }
 
     /// Every graced record `past` its grace (the records, the record, the
-    /// expert it held, the grace, the request it answers) ready, in the
-    /// order graced. True when any became ready.
-    fn free(&mut self, mut past: impl FnMut(&Self, u32, Staged, Point, Option<Point>) -> bool) -> bool {
+    /// expert it held, the steps `[from, until)` that may name it, the
+    /// request it answers) ready, in the order graced. True when any became
+    /// ready.
+    fn free(&mut self, mut past: impl FnMut(&Self, u32, Staged, (Step, Step), Option<Point>) -> bool) -> bool {
         let freed = self
             .graced
             .clone()
             .into_iter()
             .filter(|&record| {
-                let Host::Graced { staged, grace, answer } = self.records[record as usize] else {
+                let Host::Graced { staged, from, until, answer } = self.records[record as usize] else {
                     unreachable!("a graced record is listed graced");
                 };
-                past(self, record, staged, grace, answer)
+                past(self, record, staged, (from, until), answer)
             })
             .collect::<Vec<_>>();
         for &record in &freed {
@@ -1285,12 +1365,33 @@ mod tests {
 
     /// The reserve's turn on `tier` ([`HostRecords::refill_victims`] then
     /// [`HostRecords::refill`]), a prompt group holding the lent records:
-    /// `latest` read only where it unmaps any.
-    fn refill(tier: &mut HostRecords, reserve: usize, rank: impl Rank<Score>, at: &Unbegun, latest: impl FnOnce() -> (Step, Step)) {
+    /// whether it unmapped any.
+    fn refill(tier: &mut HostRecords, reserve: usize, rank: impl Rank<Score>, at: &Unbegun) -> bool {
         let victims = tier.refill_victims(reserve, rank, false);
-        if !victims.is_empty() {
-            tier.refill(victims, false, at, latest());
-        }
+        let unmapped = !victims.is_empty();
+        tier.refill(victims, false, at);
+        unmapped
+    }
+
+    /// The streamed layers a test's park reads its order at.
+    const LAYERS: usize = 4;
+
+    /// Steps 1 to 1,000 begun, each a group of one run whole, none ended:
+    /// what a test's device runs.
+    fn played() -> Steps {
+        let steps = Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
+        steps.begin_through(1000);
+        steps
+    }
+
+    /// The device parked at `point`, a step of a group of `steps` steps
+    /// from `point.group` run whole, every step before a group of one:
+    /// its park.
+    fn park(point: Point, steps: u64) -> Park {
+        let played = Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new());
+        played.begin_through(point.group - 1);
+        played.begin_group(steps, None);
+        played.park(point, LAYERS)
     }
     use crate::experts::Words;
     use crate::experts::map::{MapView, StampedMap};
@@ -1313,7 +1414,7 @@ mod tests {
 
     /// A point of decode step `sequence` at layer 0.
     fn at(sequence: Step) -> Point {
-        Point { group: sequence, layer: 0, sequence }
+        Point::whole(sequence, 0, sequence)
     }
 
     /// `records` records of a group of `members` (layer, experts) of
@@ -1357,9 +1458,15 @@ mod tests {
     /// [`tier`], writing real maps: plain words where `resolution` reads
     /// after the store, else stamped.
     fn mapped(records: u32, layers: usize, members: &[(usize, usize)], resolution: Resolution) -> (HostRecords, Maps) {
-        let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let steps = std::sync::Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
         steps.begin_through(1000);
+        mapped_on(steps, records, layers, members, resolution)
+    }
+
+    /// [`mapped`], a stamped map's entries stored from the first of
+    /// `steps` not yet begun.
+    fn mapped_on(steps: Arc<Steps>, records: u32, layers: usize, members: &[(usize, usize)], resolution: Resolution) -> (HostRecords, Maps) {
+        let cpu = crate::test_support::open_backend(&seismic::Devices::discover(&[]).unwrap(), seismic::BackendName::Cpu).unwrap();
         let mut maps = vec![None; layers];
         let mut plain = Vec::new();
         let mut stamped = Vec::new();
@@ -1406,7 +1513,7 @@ mod tests {
         /// Land `staged`: claimed, its grant's map written, learned landed.
         fn land(&mut self, staged: Staged) -> u32 {
             let grant = self.grant_of(staged, 0).expect("a record for the landing");
-            grant.map(Some(0));
+            grant.map_at(Some(0));
             self.landed(grant.record(), staged, None, Kept::Alone);
             grant.record()
         }
@@ -1416,7 +1523,7 @@ mod tests {
         /// whose record it unmapped, if one, none where short.
         fn reclaim(&mut self, staged: Staged, rank: impl Rank<Score>, parked: Point, steps: u64) -> Option<(u32, Option<Staged>)> {
             let kept = self.kept.clone();
-            match self.claim_demand(staged, Demand::Lacked, rank, |_| false, (parked, steps)) {
+            match self.claim_demand(staged, Demand::Lacked, rank, |_| false, &park(parked, steps)) {
                 Claim::Taken(grant) => {
                     let unmapped = kept.into_iter().find(|&(_, record)| record == grant.record()).map(|(staged, _)| staged);
                     Some((grant.record(), unmapped))
@@ -1441,11 +1548,11 @@ mod tests {
         assert!(!inbound.claim((0, 1)), "and never twice");
         assert_eq!(tier.located((0, 1)), Located::Landing, "a posted read lands it");
         assert!(matches!(tier.claim((0, 1), 0), Claim::Landing), "a read ahead finds it landing");
-        let Claim::Taken(grant) = tier.claim_demand((0, 1), Demand::Posted, reads(&[]), |_| false, (at(5), 1)) else { panic!("the one record is ready") };
+        let Claim::Taken(grant) = tier.claim_demand((0, 1), Demand::Posted, reads(&[]), |_| false, &park(at(5), 1)) else { panic!("the one record is ready") };
         tier.landed(grant.record(), (0, 1), Some(5), Kept::Alone);
         assert_eq!(tier.located((0, 1)), Located::Kept(grant.record()));
         assert!(inbound.claim((0, 2)));
-        assert!(matches!(tier.claim_demand((0, 2), Demand::Posted, reads(&[]), |_| false, (at(5), 1)), Claim::Short), "the kept record is the request's answer");
+        assert!(matches!(tier.claim_demand((0, 2), Demand::Posted, reads(&[]), |_| false, &park(at(5), 1)), Claim::Short), "the kept record is the request's answer");
         tier.unposted((0, 2));
         assert_eq!(tier.located((0, 2)), Located::Lacked, "a posted read given up lacks it again");
         assert!(inbound.claim((0, 2)), "and the next read claims it");
@@ -1456,7 +1563,7 @@ mod tests {
         let mut tier = tier(4, 1, ONE, Resolution::BeforeStamp);
         let record = tier.take((0, 1), 0).unwrap();
         assert!(matches!(tier.claim((0, 1), 0), Claim::Landing), "a second landing of it claims the first");
-        assert!(matches!(tier.claim_demand((0, 1), Demand::Lacked, reads(&[]), |_| false, (at(1), 1)), Claim::Landing));
+        assert!(matches!(tier.claim_demand((0, 1), Demand::Lacked, reads(&[]), |_| false, &park(at(1), 1)), Claim::Landing));
         tier.landed(record, (0, 1), None, Kept::Alone);
         assert!(matches!(tier.claim((0, 1), 0), Claim::Kept(kept) if kept == record));
         let other = tier.take((0, 2), 0).unwrap();
@@ -1479,17 +1586,17 @@ mod tests {
             Some(_) => panic!("a lacked expert's claim takes a record or none"),
             None => None,
         };
-        assert_eq!(taken(records.claim_prepared((0, 4), Demand::Lacked, |_| false, (at(6), 1))), Some(two), "the least recently read first");
-        assert_eq!(taken(records.claim_prepared((0, 5), Demand::Lacked, |record| record == three, (at(6), 1))), Some(one), "the parked step's read passed over");
-        assert_eq!(taken(records.claim_prepared((0, 6), Demand::Lacked, |_| false, (at(6), 1))), None, "none left: the claim scans");
+        assert_eq!(taken(records.claim_prepared((0, 4), Demand::Lacked, |_| false, &park(at(6), 1))), Some(two), "the least recently read first");
+        assert_eq!(taken(records.claim_prepared((0, 5), Demand::Lacked, |record| record == three, &park(at(6), 1))), Some(one), "the parked step's read passed over");
+        assert_eq!(taken(records.claim_prepared((0, 6), Demand::Lacked, |_| false, &park(at(6), 1))), None, "none left: the claim scans");
         let mut stale = tier(3, 1, ONE, Resolution::BeforeStamp);
         for expert in 1..=3 {
             stale.land((0, expert));
         }
         stale.prepare_demand(reads(&ranked), 1, 5);
-        let Claim::Taken(grant) = stale.claim_demand((0, 4), Demand::Lacked, reads(&ranked), |_| false, (at(6), 1)) else { panic!("a kept record frees") };
+        let Claim::Taken(grant) = stale.claim_demand((0, 4), Demand::Lacked, reads(&ranked), |_| false, &park(at(6), 1)) else { panic!("a kept record frees") };
         assert_eq!(grant.record(), two, "the scan takes the prepared victim first");
-        assert_eq!(taken(stale.claim_prepared((0, 5), Demand::Lacked, |_| false, (at(6), 1))), None, "a victim taken since is passed over");
+        assert_eq!(taken(stale.claim_prepared((0, 5), Demand::Lacked, |_| false, &park(at(6), 1))), None, "a victim taken since is passed over");
     }
 
     /// A shrink leaves no prepared victim behind: a claim in the same step
@@ -1505,8 +1612,8 @@ mod tests {
         records.prepare_demand(reads(&ranked), 3, 5);
         records.shrink(1, reads(&ranked));
         assert!(records.unprepared(5), "the shrink's records want preparing again");
-        assert_eq!(records.claim_prepared((0, 4), Demand::Lacked, |_| false, (at(5), 1)).map(|_| ()), None, "no victim prepared before the shrink is taken");
-        let Claim::Taken(grant) = records.claim_demand((0, 4), Demand::Lacked, reads(&ranked), |_| false, (at(5), 1)) else { panic!("the kept record frees") };
+        assert_eq!(records.claim_prepared((0, 4), Demand::Lacked, |_| false, &park(at(5), 1)).map(|_| ()), None, "no victim prepared before the shrink is taken");
+        let Claim::Taken(grant) = records.claim_demand((0, 4), Demand::Lacked, reads(&ranked), |_| false, &park(at(5), 1)) else { panic!("the kept record frees") };
         assert_eq!(grant.record(), 0, "the tier's one record");
     }
 
@@ -1531,14 +1638,14 @@ mod tests {
         }
         assert!(tier.complete() && tier.lacked() == 0);
         assert!(!tier.takes(0), "no expert lacked");
-        refill(&mut tier, 2, &rank, &Unbegun::at(1), || unreachable!("a complete tier keeps no reserve"));
+        assert!(!refill(&mut tier, 2, &rank, &Unbegun::at(1)), "a complete tier keeps no reserve");
         assert!(tier.complete());
         // One dropped and its record grown back: lacking one, the reserve
         // is one record.
         tier.shrink(2, &rank);
         tier.grow(3);
         assert_eq!((tier.lacked(), tier.ready()), (1, 1));
-        refill(&mut tier, 2, &rank, &Unbegun::at(1), || unreachable!("one record ready covers the one lacked"));
+        assert!(!refill(&mut tier, 2, &rank, &Unbegun::at(1)), "one record ready covers the one lacked");
         let (_, lacked) = tier.lacking(&rank, 1, |_| false, by_reuse)[0];
         assert!(tier.take(lacked, 2).is_some(), "a fill of the lacked one itself leaves nothing a demand could need");
         assert!(tier.lands(lacked) && !tier.takes(0), "nothing lacked beyond the landing");
@@ -1557,39 +1664,39 @@ mod tests {
     /// One rule frees a record: once the device is past the last resolution
     /// that may name it. Parked at layer 1 of step 10, steps 11 and 12 begun
     /// behind it, a record the reserve unmapped while 12 was the latest
-    /// begun is graced through its layer of 12. A stamped map holds it for
-    /// every step before its stamp, so steps 10..=12 may still name it:
-    /// unparked, it frees only past that point; at the park its entry is
-    /// restamped from the first step that has not resolved its layer, so no
-    /// resolution after the park names it and it frees there, unless the
-    /// parked step resolved to it. A plain map's store is read by every
-    /// later resolution, so it frees at the park unless the parked step
-    /// resolved to it, with no restamp.
+    /// begun is graced for every step before 13, so through its layer of
+    /// 12. A stamped map holds it for every step before its stamp, so steps
+    /// 10..=12 may still name it: unparked, it frees only past that point;
+    /// at the park its entry is restamped from the first step that has not
+    /// resolved its layer, so no resolution after the park names it and it
+    /// frees there, unless the parked step resolved to it. A plain map's
+    /// store is read by every later resolution, so it frees at the park
+    /// unless the parked step resolved to it, with no restamp.
     #[test]
     fn a_record_frees_once_past_every_resolution_that_may_name_it() {
         let rank = reads(&[]);
-        let parked = (Point { group: 10, layer: 1, sequence: 10 }, 1);
+        let parked = park(Point::whole(10, 1, 10), 1);
         let graced = |resolution| {
             let (mut tier, maps) = landed_tier(resolution);
-            refill(&mut tier, 1, &rank, &Unbegun::at(13), || (12, 12));
+            refill(&mut tier, 1, &rank, &Unbegun::at(13));
             let [record] = tier.graced[..] else { panic!("one record graced") };
-            let Host::Graced { staged, grace, .. } = tier.records[record as usize] else { panic!("record {record} is graced") };
-            assert_eq!((grace.group, grace.sequence), (12, 12), "graced through the latest step begun");
-            (tier, maps, record, staged, grace)
+            let Host::Graced { staged, from, until, .. } = tier.records[record as usize] else { panic!("record {record} is graced") };
+            assert_eq!((from, until), (0, 13), "graced for every step begun");
+            (tier, maps, record, staged)
         };
-        let (mut stamped, _, _, _, grace) = graced(Resolution::BeforeStamp);
-        assert!(!stamped.retire(grace), "step 12 may still name it");
-        assert!(stamped.retire(Point { group: 13, layer: 0, sequence: 13 }), "past step 12");
-        let (mut stamped, maps, record, staged, _) = graced(Resolution::BeforeStamp);
-        assert!(!stamped.release(parked, |of| of == record), "the parked step resolved to it");
-        let from = parked.0.first_unresolved(staged.0, 1);
+        let (mut stamped, _, _, staged) = graced(Resolution::BeforeStamp);
+        assert!(!stamped.retire(Point::whole(12, staged.0, 12), &played()), "step 12 may still name it");
+        assert!(stamped.retire(Point::whole(13, 0, 13), &played()), "past step 12");
+        let (mut stamped, maps, record, staged) = graced(Resolution::BeforeStamp);
+        assert!(!stamped.release(&parked, |of| of == record), "the parked step resolved to it");
+        let from = parked.unresolved(staged.0);
         assert_eq!(maps.resolve(staged, from - 1), Some(record), "still named below the restamp");
-        assert!(stamped.release(parked, |_| false));
+        assert!(stamped.release(&parked, |_| false));
         assert_eq!((maps.resolve(staged, from - 1), maps.resolve(staged, from)), (Some(record), None), "restamped from the first unresolved step");
-        let (mut plain, maps, record, staged, _) = graced(Resolution::AfterStore);
+        let (mut plain, maps, record, staged) = graced(Resolution::AfterStore);
         assert_eq!(maps.held(staged), None, "a plain unmapping is read by every later resolution");
-        assert!(!plain.release(parked, |of| of == record), "the parked step resolved to it");
-        assert!(plain.release(parked, |_| false), "no later resolution names it");
+        assert!(!plain.release(&parked, |of| of == record), "the parked step resolved to it");
+        assert!(plain.release(&parked, |_| false), "no later resolution names it");
     }
 
     /// A reclaim, parked, unmaps from the first step whose resolution of the
@@ -1601,7 +1708,7 @@ mod tests {
     #[test]
     fn a_reclaim_unmaps_from_the_first_step_that_has_not_resolved_its_layer() {
         let rank = reads(&[]);
-        let parked = Point { group: 10, layer: 1, sequence: 10 };
+        let parked = Point::whole(10, 1, 10);
         let (mut tier, maps) = landed_tier(Resolution::BeforeStamp);
         let mut froms = std::collections::BTreeSet::new();
         // Each demand of a lacked expert reclaims a kept one, which is then
@@ -1618,8 +1725,8 @@ mod tests {
         }
         assert_eq!(froms.into_iter().collect::<Vec<_>>(), [(0, 11), (2, 10)]);
         // A group of steps 20..=23, parked at layer 1 of step 22.
-        let wave = Point { group: 20, layer: 1, sequence: 22 };
-        assert_eq!([2, 1, 0].map(|layer| wave.first_unresolved(layer, 4)), [20, 23, 24]);
+        let wave = park(Point::whole(20, 1, 22), 4);
+        assert_eq!([2, 1, 0].map(|layer| wave.unresolved(layer)), [20, 23, 24]);
     }
 
     /// The lacked experts are landed most reused first, a tie every layer's
@@ -1659,13 +1766,13 @@ mod tests {
         tier.landed(second, (0, 2), None, Kept::Alone);
         assert_eq!(tier.hold((0, 9)), None, "no record keeps (0, 9)");
         assert_eq!(tier.hold((0, 1)), Some(first));
-        refill(&mut tier, 1, &rank, &Unbegun::at(8), || (7, 7));
+        refill(&mut tier, 1, &rank, &Unbegun::at(8));
         assert!(tier.keeps((0, 1)) && !tier.keeps((0, 2)), "the held least recent is passed over");
-        tier.retire(at(7));
-        refill(&mut tier, 2, &rank, &Unbegun::at(9), || (8, 8));
+        tier.retire(at(7), &played());
+        refill(&mut tier, 2, &rank, &Unbegun::at(9));
         assert!(tier.keeps((0, 1)), "only the held record is kept, and stays");
         tier.unhold(first);
-        refill(&mut tier, 2, &rank, &Unbegun::at(10), || (9, 9));
+        refill(&mut tier, 2, &rank, &Unbegun::at(10));
         assert!(!tier.keeps((0, 1)), "released, it is unmapped");
     }
 
@@ -1679,7 +1786,7 @@ mod tests {
         assert_eq!(grant.record(), 0, "the lowest ready");
         assert_eq!(tier.take((0, 6), 2), None, "the reserve is the demand's");
         assert_eq!(maps.held((0, 5)), None, "unmapped until its bytes are whole");
-        grant.map(None);
+        grant.map();
         tier.landed(0, (0, 5), None, Kept::Alone);
         assert_eq!(maps.held((0, 5)), Some(0), "its grant mapped it");
         assert!(tier.keeps((0, 5)) && tier.holds_alone((0, 5)));
@@ -1698,8 +1805,8 @@ mod tests {
     fn a_grant_maps_once() {
         let mut tier = tier(2, 1, ONE, Resolution::AfterStore);
         let grant = tier.grant_of((0, 5), 0).unwrap();
-        grant.map(None);
-        grant.map(None);
+        grant.map();
+        grant.map();
     }
 
     /// The reserve: kept records are unmapped in taking order (alone least
@@ -1717,17 +1824,17 @@ mod tests {
         tier.banked((0, 4));
         // Two records: the alone read least recently, (0, 2) then (0, 3);
         // the banked (0, 4) is last.
-        refill(&mut tier, 2, &rank, &Unbegun::at(7), || (6, 6));
+        refill(&mut tier, 2, &rank, &Unbegun::at(7));
         assert!(maps.held((0, 2)).is_none() && maps.held((0, 3)).is_none());
         assert!(maps.held((0, 1)).is_some() && maps.held((0, 4)).is_some());
         assert!(!tier.keeps((0, 2)) && !tier.keeps((0, 3)) && tier.keeps((0, 4)));
         assert_eq!(tier.ready(), 0);
-        refill(&mut tier, 2, &rank, &Unbegun::at(1), || unreachable!("the graced records make the reserve"));
-        assert!(!tier.retire(at(6)), "step 6 could still read them");
-        assert!(tier.retire(at(7)), "the device past layer 0 of step 6");
+        assert!(!refill(&mut tier, 2, &rank, &Unbegun::at(1)), "the graced records make the reserve");
+        assert!(!tier.retire(at(6), &played()), "step 6 could still read them");
+        assert!(tier.retire(at(7), &played()), "the device past layer 0 of step 6");
         assert_eq!(tier.ready(), 2);
         // Then the next alone, (0, 1), and the banked copy.
-        refill(&mut tier, 4, &rank, &Unbegun::at(8), || (7, 7));
+        refill(&mut tier, 4, &rank, &Unbegun::at(8));
         assert!(maps.held((0, 1)).is_none() && maps.held((0, 4)).is_none());
     }
 
@@ -1744,7 +1851,7 @@ mod tests {
         tier.evicted((1, 4), None);
         assert!(tier.holds_alone((1, 4)), "evicting a banked copy costs nothing: the tier holds it alone");
         // (1, 5), read in place at step 9, outranks (1, 4), read at 8.
-        refill(&mut tier, 1, reads(&[((1, 4), 8), ((1, 5), 9)]), &Unbegun::at(10), || (9, 9));
+        refill(&mut tier, 1, reads(&[((1, 4), 8), ((1, 5), 9)]), &Unbegun::at(10));
         assert_eq!((maps.held((1, 4)), maps.held((1, 5))), (None, Some(second)));
         assert_ne!(first, second);
     }
@@ -1761,7 +1868,7 @@ mod tests {
         assert_eq!(grants.each_ref().map(Grant::record), [0, 1, 2, 3], "each the lowest ready");
         for (grant, expert) in grants.iter().zip([13, 12, 11, 10]) {
             if expert != 12 {
-                grant.map(None);
+                grant.map();
                 tier.landed(grant.record(), (0, expert), None, Kept::Alone);
             }
         }
@@ -1793,7 +1900,7 @@ mod tests {
         tier.unlanded(0);
         for (grant, expert) in grants.iter().zip([14, 13, 12, 11, 10, 9]) {
             if expert != 12 && expert != 14 {
-                grant.map(None);
+                grant.map();
                 tier.landed(grant.record(), (0, expert), None, Kept::Alone);
             }
         }
@@ -1807,7 +1914,7 @@ mod tests {
         assert_eq!(tier.shrink(4, &rank), [(4, 0), (5, 1)]);
         assert_eq!([9, 10, 11, 13].map(|expert| maps.held((0, expert))), [Some(1), Some(0), Some(3), None]);
         assert!(tier.lands((0, 12)), "the landing is in flight where it was");
-        grants[2].map(None);
+        grants[2].map();
         tier.landed(2, (0, 12), None, Kept::Alone);
         tier.unhold(3);
         assert_eq!(maps.held((0, 12)), Some(2));
@@ -1828,13 +1935,13 @@ mod tests {
         assert_eq!(grants.each_ref().map(Grant::record), [0, 1, 2, 3, 4, 5], "each the lowest ready");
         for (grant, expert) in grants.iter().zip([9, 10, 11, 12, 13, 14]) {
             if expert != 11 {
-                grant.map(Some(0));
+                grant.map_at(Some(0));
                 tier.landed(grant.record(), (0, expert), None, Kept::Alone);
             }
         }
         // Expert 11 lands into record 2, in flight: no cut lies below it.
         assert_eq!(tier.running_floor(), 3, "every record in flight lies below the floor");
-        grants[2].map(Some(0));
+        grants[2].map_at(Some(0));
         tier.landed(2, (0, 11), None, Kept::Alone);
         assert_eq!(tier.running_floor(), 0, "nothing in flight");
         // Expert 13 the chain routed; 12 and 14 it did not.
@@ -1864,19 +1971,19 @@ mod tests {
         let rank = reads(&[]);
         let request = at(5);
         let (mut tier, maps) = mapped(1, 1, ONE, Resolution::AfterStore);
-        let Claim::Taken(first) = tier.claim_demand((0, 1), Demand::Lacked, &rank, |_| false, (request, 1)) else { panic!("the one record is ready") };
-        first.map(None);
+        let Claim::Taken(first) = tier.claim_demand((0, 1), Demand::Lacked, &rank, |_| false, &park(request, 1)) else { panic!("the one record is ready") };
+        first.map();
         tier.landed(first.record(), (0, 1), Some(5), Kept::Alone);
         assert!(matches!(tier.records[0], Host::Answering(_, past) if past == request), "an outstanding answer");
         assert!(!tier.claim_record_of_lent_free(), "no prompt group's claim takes it");
-        refill(&mut tier, 1, &rank, &Unbegun::at(6), || (5, 5));
+        refill(&mut tier, 1, &rank, &Unbegun::at(6));
         assert_eq!(maps.held((0, 1)), None, "the reserve unmaps it");
         assert!(matches!(tier.records[0], Host::Graced { answer: Some(answer), .. } if answer == request), "graced with its answer");
-        assert!(!tier.release((request, 1), |_| false), "its request's park frees it not");
-        assert!(matches!(tier.claim_demand((0, 2), Demand::Lacked, &rank, |_| false, (request, 1)), Claim::Short), "the second miss waits");
-        assert!(!tier.retire(request), "the device at the request still reads it");
-        assert!(tier.retire(at(6)), "past the request it is free");
-        assert!(matches!(tier.claim_demand((0, 2), Demand::Lacked, &rank, |_| false, (at(6), 1)), Claim::Taken(_)), "then a later demand takes it");
+        assert!(!tier.release(&park(request, 1), |_| false), "its request's park frees it not");
+        assert!(matches!(tier.claim_demand((0, 2), Demand::Lacked, &rank, |_| false, &park(request, 1)), Claim::Short), "the second miss waits");
+        assert!(!tier.retire(request, &played()), "the device at the request still reads it");
+        assert!(tier.retire(at(6), &played()), "past the request it is free");
+        assert!(matches!(tier.claim_demand((0, 2), Demand::Lacked, &rank, |_| false, &park(at(6), 1)), Claim::Taken(_)), "then a later demand takes it");
     }
 
     /// A demand landing that ends once the device is past its request (its
@@ -1885,9 +1992,9 @@ mod tests {
     #[test]
     fn a_landing_past_its_request_is_kept_not_answering() {
         let mut tier = tier(2, 1, ONE, Resolution::AfterStore);
-        let Claim::Taken(grant) = tier.claim_demand((0, 1), Demand::Lacked, reads(&[]), |_| false, (at(5), 1)) else { panic!("ready") };
+        let Claim::Taken(grant) = tier.claim_demand((0, 1), Demand::Lacked, reads(&[]), |_| false, &park(at(5), 1)) else { panic!("ready") };
         assert_eq!(tier.shrink_floor(), 1, "the landing is in flight");
-        tier.retire(at(6));
+        tier.retire(at(6), &played());
         tier.landed(grant.record(), (0, 1), Some(5), Kept::Alone);
         assert!(matches!(tier.records[0], Host::Kept(_)), "kept: the device is past its request");
         assert_eq!(tier.shrink_floor(), 0, "nothing in flight");
@@ -1901,7 +2008,7 @@ mod tests {
         let mut tier = HostRecords::new(2, 1, vec![(0, 2, None)], Resolution::AfterStore, 1, inbound(1));
         for expert in 0..2 {
             let Claim::Taken(grant) = tier.claim((0, expert), 0) else { panic!("a record is ready") };
-            grant.map(None);
+            grant.map();
             tier.landed(grant.record(), (0, expert), None, Kept::Alone);
         }
         assert_eq!(tier.lacked(), 0, "every expert is kept");
@@ -1926,8 +2033,141 @@ mod tests {
     #[should_panic(expected = "gives up its expert from Answering")]
     fn an_outstanding_answer_never_gives_up_its_expert() {
         let mut tier = tier(1, 1, ONE, Resolution::AfterStore);
-        let Claim::Taken(grant) = tier.claim_demand((0, 1), Demand::Lacked, reads(&[]), |_| false, (at(5), 1)) else { panic!("ready") };
+        let Claim::Taken(grant) = tier.claim_demand((0, 1), Demand::Lacked, reads(&[]), |_| false, &park(at(5), 1)) else { panic!("ready") };
         tier.landed(grant.record(), (0, 1), None, Kept::Alone);
         tier.unkeep(0);
+    }
+
+    /// A chain of steps 1 and 2 begun on `steps`, stopped before its layer
+    /// `cut`, and a decode step cut in there: the decode step.
+    fn cut_in(steps: &Steps, cut: usize) -> Step {
+        assert_eq!(steps.begin_group(2, None), 1);
+        steps.begin_group(1, Some((1, cut)))
+    }
+
+    /// The park of decode step `step` at `layer` of [`LAYERS`].
+    fn parked_at(steps: &Steps, step: Step, layer: usize) -> Park {
+        steps.park(steps.at(step, layer, LAYERS).point, LAYERS)
+    }
+
+    /// A stamped tier of `records` records of one group of every one of
+    /// [`LAYERS`] layers, on `steps`, `kept` landed before any step (mapped
+    /// from step 0, so a chain's steps resolve them).
+    fn chain_tier(steps: &Arc<Steps>, records: u32, kept: &[Staged]) -> (HostRecords, Maps) {
+        let members = (0..LAYERS).map(|layer| (layer, EXPERTS)).collect::<Vec<_>>();
+        let (mut tier, maps) = mapped_on(steps.clone(), records, LAYERS, &members, Resolution::BeforeStamp);
+        for &staged in kept {
+            tier.land(staged);
+        }
+        (tier, maps)
+    }
+
+    /// A decode step cut in before a chain's layer 2 reuses, at the layers
+    /// before, the records the chain has passed: the first a demand takes
+    /// is the least ranked of them, though a record of layer 2 or 3 ranks
+    /// below it. It never reuses, at layers 2 and 3, a record the chain may
+    /// still resolve there: once those before are taken its demand is
+    /// short, and every one of them still resolves for the chain's steps.
+    /// Its landings are mapped from its own step on, so no chain step
+    /// resolves them.
+    #[test]
+    fn a_cut_in_reuses_only_what_the_chain_has_passed() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        let decode = cut_in(&steps, 2);
+        let kept = [(0, 1), (1, 1), (2, 1), (3, 1)];
+        let (mut tier, maps) = chain_tier(&steps, 4, &kept);
+        // The chain's layers rank least: a park that took by rank alone
+        // would take them first.
+        let rank = reads(&[((0, 1), 9), ((1, 1), 8), ((2, 1), 1), ((3, 1), 2)]);
+        let park = parked_at(&steps, decode, 3);
+        let mut taken = Vec::new();
+        for expert in 10..12 {
+            let kept = tier.kept.clone();
+            let Claim::Taken(grant) = tier.claim_demand((3, expert), Demand::Lacked, &rank, |_| false, &park) else {
+                panic!("a record the chain has passed frees")
+            };
+            taken.push(kept.into_iter().find(|&(_, record)| record == grant.record()).map(|(staged, _)| staged));
+            grant.map();
+            tier.landed(grant.record(), (3, expert), Some(decode), Kept::Alone);
+            assert_eq!(maps.resolve((3, expert), 2), None, "no chain step resolves the step cut in's landing");
+            assert!(maps.resolve((3, expert), decode + 1).is_some(), "the decode steps after it do");
+        }
+        assert_eq!(taken, [Some((1, 1)), Some((0, 1))], "layer 1's, then layer 0's");
+        assert!(matches!(tier.claim_demand((3, 12), Demand::Lacked, &rank, |_| false, &park), Claim::Short), "no record the chain may resolve is taken");
+        for staged in [(2, 1), (3, 1)] {
+            let record = tier.kept_record(staged).expect("kept");
+            assert!((1..=2).all(|step| maps.resolve(staged, step) == Some(record)), "{staged:?} resolves for the chain's steps");
+        }
+        // Graced by the reserve while the chain runs, its records past the
+        // cut free at no park of the step cut in, and only once the
+        // chain's passes there are past.
+        let records = [(2, 1), (3, 1)].map(|staged| tier.kept_record(staged).expect("kept"));
+        let graced = |tier: &HostRecords| records.iter().all(|&record| matches!(tier.records[record as usize], Host::Graced { .. }));
+        assert!(steps.unbegun(|at| refill(&mut tier, 4, &rank, at)));
+        assert!(graced(&tier));
+        tier.release(&park, |_| false);
+        assert!(graced(&tier), "the chain may still resolve them");
+        assert!((1..=2).all(|step| maps.resolve((2, 1), step) == Some(records[0])), "unrestamped");
+        tier.retire(steps.after(decode), &steps);
+        assert!(graced(&tier), "the chain's passes at layers 2 and 3 still run");
+        assert!(tier.retire(steps.after(1), &steps) && !graced(&tier), "past the chain");
+    }
+
+    /// A decode step cut in never waits on its own pool: with every record
+    /// but the pool's kept for the chain it runs inside, past the cut,
+    /// each of a run of decode steps cut in at the cut misses its layer's
+    /// choices at every layer, and every demand takes a record: the pool's
+    /// or its own earlier landings', recycled. The chain's records stay
+    /// mapped for it throughout, and no other landing takes the pool.
+    #[test]
+    fn a_cut_in_never_waits_on_its_own_pool() {
+        const CHOICES: u32 = 2;
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        let first = cut_in(&steps, 1);
+        let chain = [(1, 1), (2, 1), (3, 1), (1, 2), (2, 2), (3, 2)];
+        let (mut tier, maps) = chain_tier(&steps, chain.len() as u32 + CHOICES, &chain);
+        tier.set_pool(CHOICES);
+        assert_eq!(tier.take((0, 60), 0), None, "a fill leaves the pool");
+        let rank = reads(&[]);
+        let mut expert = 10;
+        for decode in first..first + 4 {
+            if decode > first {
+                assert_eq!(steps.begin_group(1, Some((1, 1))), decode);
+            }
+            for layer in 0..LAYERS {
+                let park = parked_at(&steps, decode, layer);
+                assert!(park.cut_in());
+                tier.release(&park, |_| false);
+                for _ in 0..CHOICES {
+                    let Claim::Taken(grant) = tier.claim_demand((layer, expert), Demand::Lacked, &rank, |_| false, &park) else {
+                        panic!("decode step {decode}'s miss at layer {layer} waited on its pool")
+                    };
+                    grant.map();
+                    tier.landed(grant.record(), (layer, expert), Some(decode), Kept::Alone);
+                    expert += 1;
+                }
+            }
+        }
+        for staged in chain {
+            let record = tier.kept_record(staged).expect("the chain's records are kept");
+            assert!((1..=2).all(|step| maps.resolve(staged, step) == Some(record)), "{staged:?} resolves for the chain's steps");
+        }
+    }
+
+    /// The prompt group's tier copy reads no landing of a decode step cut
+    /// in during it: mapped past its every step, the cut-ins recycle it.
+    /// It reads a fill's.
+    #[test]
+    fn a_prompt_group_copies_no_cut_ins_landing() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        let decode = cut_in(&steps, 1);
+        let (mut tier, _) = chain_tier(&steps, 4, &[(2, 1)]);
+        let park = parked_at(&steps, decode, 2);
+        let Claim::Taken(grant) = tier.claim_demand((2, 5), Demand::Lacked, reads(&[]), |_| false, &park) else { panic!("ready") };
+        assert!(!tier.serves((2, 5), 2), "landing for the step cut in");
+        grant.map();
+        tier.landed(grant.record(), (2, 5), Some(decode), Kept::Alone);
+        assert!(!tier.serves((2, 5), 2) && tier.serves((2, 5), decode + 1), "kept for the decode steps alone");
+        assert!(tier.serves((2, 1), 2), "the fill's landing serves the chain");
     }
 }
