@@ -5664,33 +5664,23 @@ impl Programs {
                 &mut formation.price.lock().expect("formation price lock"),
             )?;
         }
-        Ok(match self {
-            // Assembled from the held launch programs: nothing renders or
-            // compiles.
-            Self::Launches(programs) => {
-                let held = programs.all();
-                specializations
-                    .iter()
-                    .map(|specialization| {
-                        NativePrepared::assemble_held(
-                            formation.device,
-                            formation.module,
-                            formation.entry,
-                            formation.logical,
-                            formation.bindings.clone(),
-                            specialization.clone(),
-                            formation.cpu,
-                            implementation.clone(),
-                            &held,
-                        )
-                        .map_err(|error| Exclusion::Formation(prepare_message(error)))
-                        .and_then(|kernel| serving(kernel, formation.served))
-                    })
-                    .collect()
-            }
-            Self::Whole(programs) => specializations
-                .iter()
-                .map(|specialization| {
+        Ok(specializations
+            .iter()
+            .map(|specialization| match self {
+                // Assembled from the held launch programs: nothing compiles.
+                Self::Launches(_) => NativePrepared::prepare_implementation(
+                    formation.device,
+                    formation.module,
+                    formation.entry,
+                    formation.logical,
+                    formation.bindings.clone(),
+                    specialization.clone(),
+                    formation.cpu,
+                    implementation.clone(),
+                )
+                .map_err(|error| Exclusion::Formation(prepare_message(error)))
+                .and_then(|kernel| serving(kernel, formation.served)),
+                Self::Whole(programs) => {
                     let configuration = Configuration::of(specialization);
                     let kernel = programs
                         .ready
@@ -5700,9 +5690,9 @@ impl Programs {
                         programs.held.insert(configuration, kernel.programs());
                     }
                     kernel
-                })
-                .collect(),
-        })
+                }
+            })
+            .collect())
     }
 
     /// How many programs are held: launch variants, or whole programs.
@@ -5821,17 +5811,6 @@ impl LaunchPrograms {
                 })
             })
             .collect()
-    }
-
-    /// Every held program, once.
-    fn all(&self) -> Vec<&HeldPrograms> {
-        let mut all = Vec::<&Rc<HeldPrograms>>::new();
-        for (_, held) in self.held.values().flatten() {
-            if !all.iter().any(|seen| Rc::ptr_eq(seen, held)) {
-                all.push(held);
-            }
-        }
-        all.into_iter().map(|held| &**held).collect()
     }
 
     /// How many launch variants the held programs have.
@@ -9569,7 +9548,7 @@ mod tests {
                 .collect::<Vec<_>>();
             if !sources.is_empty() {
                 launches
-                    .hold(sources, Ok(HeldPrograms::Nothing))
+                    .hold(sources, Ok(HeldPrograms(Box::new(()))))
                     .unwrap();
             }
             asked
