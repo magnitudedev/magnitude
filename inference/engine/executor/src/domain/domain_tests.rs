@@ -1391,6 +1391,59 @@ fn a_shrink_during_a_chain_is_deferred_to_its_end() {
     }
 }
 
+/// A one-row decode at `position` that selects its next token on the device.
+fn decode(request: RequestId, position: usize) -> Operation {
+    Operation::Forward {
+        request,
+        kind: WorkKind::Decode,
+        tokens: vec![crate::TokenId(1)],
+        position,
+        conditioning: None,
+        demand: crate::batching::Demand::SELECT,
+        select: vec![crate::SelectSpec {
+            sampling: crate::Sampling::Greedy,
+            seed: 1,
+            position,
+            domain: 0,
+            mask: None,
+            shaping: crate::Shaping::default(),
+            history: None,
+        }],
+        committed: 1,
+        prime: None,
+    }
+}
+
+/// Pipelined decode queues each slot's next row behind a step only while
+/// every slot has one: a step filling a sequence's last context row ends
+/// that request, so nothing is queued behind it, whatever room its
+/// neighbours have. Queueing it anyway asked the state for a successor past
+/// the context, which faulted a run of four sequences decoding to the
+/// context its longest one was sized to.
+#[test]
+fn no_decode_is_queued_past_a_sequences_context() {
+    let (domain, _) = fixture_with(None, true, false);
+    let context = domain.execution.resources().target_state().context_rows;
+    let (near, far) = (RequestId(1), RequestId(2));
+    match domain.behind(&[decode(near, context - 2), decode(far, context - 4)]) {
+        queue::Behind::Continuation { operations } => {
+            let positions = operations
+                .iter()
+                .map(|operation| match operation {
+                    Operation::Forward { position, .. } => *position,
+                    _ => unreachable!("a continuation is a forward"),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(positions, [context - 1, context - 3]);
+        }
+        _ => panic!("a step with room in every slot queues its continuation"),
+    }
+    assert!(matches!(
+        domain.behind(&[decode(near, context - 1), decode(far, context - 3)]),
+        queue::Behind::Nothing
+    ));
+}
+
 /// Under pipelined decode a growth breaks no lookahead: it waits for no gap,
 /// so a successor queues behind each flight while it runs, as without one.
 #[test]
