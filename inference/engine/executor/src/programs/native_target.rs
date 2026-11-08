@@ -634,6 +634,10 @@ struct TargetRun<'l> {
     first_commit: Instant,
     /// The step of its load's expert bank it runs, of a streamed load.
     bank: Option<BankRun>,
+    /// Whether any row demands features: a launch none of whose rows does
+    /// runs each tapped block's untapped graphs, as a load without the
+    /// drafter runs the block.
+    tapped: bool,
 }
 
 impl RowState<'_> {
@@ -1646,6 +1650,11 @@ impl NativeTargetProgram {
                 );
             }
         }
+        let mut tapped = false;
+        for &bits in batch.demand.iter() {
+            let demand = Demand::from_bits(bits).ok_or_else(|| invalid("row demand is invalid"))?;
+            tapped |= demand.contains(Demand::FEATURES);
+        }
         let mut run = TargetRun {
             launch: RunLaunch {
                 batch: upload,
@@ -1669,6 +1678,7 @@ impl NativeTargetProgram {
             executed: self.geometry.blocks.len(),
             first_commit,
             bank,
+            tapped,
         };
         run.per_layer_rows = self.queue_per_layer_entry(&mut run, &media_rows, submitter)?;
         Ok(run)
@@ -1997,6 +2007,7 @@ impl NativeTargetProgram {
                     scored,
                     index,
                     stage,
+                    run.tapped,
                 )
                 .map_err(invalid)?;
             let mut active = graph_workspace

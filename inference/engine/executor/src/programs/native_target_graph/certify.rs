@@ -2,7 +2,7 @@ use super::{
     GroupRows,
     block::{BlockGraphInputs, checked_block_graph_draft},
     classes::{
-        BlockOutputScales, BlockServed, FamilyOutline, Passes, StagedClass, Topology, UnreadScales,
+        BlockGraphEnumeration, BlockOutputScales, BlockServed, FamilyOutline, Holder, Passes, StagedClass, Topology, UnreadScales,
         block_class_slice, block_listings, block_routed, block_served, block_split, block_stages,
         block_upload_regions, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class, once_graphs,
         slot_scores,
@@ -160,6 +160,10 @@ pub(super) struct TargetFamilyCertificate {
     /// list their launch's history row tiles apart.
     /// Per block, its certified graphs by topology (`class_topology`).
     pub(super) blocks: Vec<BTreeMap<Topology, CertifiedBlockGraph>>,
+    /// Per tapped block, its untapped graphs' (`FamilyOutline::untapped`):
+    /// its undrafted shape's, as a load without the drafter certifies them;
+    /// none for a block that taps nothing.
+    pub(super) untapped: Vec<BTreeMap<Topology, CertifiedBlockGraph>>,
     /// The passes a group runs (`group_pass_rows`).
     pub(super) passes: Passes,
 }
@@ -338,7 +342,7 @@ impl FamilyLayouts {
         pass: PassLaunches,
     ) -> Result<TargetFamilyCertificate, GraphError> {
         let backend = outline.backend;
-        let FamilyOutline { ref row_classes, largest_rows, max_slots, max_segments, tap_width, ref tapped, .. } = outline;
+        let FamilyOutline { ref row_classes, largest_rows, max_slots, max_segments, tap_width, ref tapped, untapped_rows, .. } = outline;
         let distinct_blocks = (0..geometry.blocks.len())
             .filter(|&index| outline.first_of_shape(index) == index)
             .collect::<Vec<_>>();
@@ -375,8 +379,10 @@ impl FamilyLayouts {
             Ok::<_, GraphError>((layout, constants, owned))
         };
         // A block's run graphs of each row regime: its launches' own (`group`
-        // false) or its group's combine (true), of a pass of `passes`.
-        let runs = |index: usize, group: bool, passes: Passes| {
+        // false) or its group's combine (true), of a pass of `passes`; of a
+        // tapped block's untapped shape (`untapped`), without its taps or
+        // exported residual, as a load without the drafter drafts them.
+        let runs = |index: usize, group: bool, passes: Passes, untapped: bool| {
             let mut graphs = ShapeLayouts::new();
             let slot = plan.blocks()[index];
             let paired = paired_block(&geometry.blocks[index]).map_err(|error| error.to_string())?;
@@ -426,9 +432,9 @@ impl FamilyLayouts {
                             slot,
                             tap_width
                                 .map(|width| (width, tapped[index].positions()))
-                                .filter(|(_, positions)| positions.any()),
+                                .filter(|(_, positions)| !untapped && positions.any()),
                             BlockGraphInputs {
-                                residual: outline.exports_residual(index),
+                                residual: !untapped && outline.exports_residual(index),
                                 ..BlockGraphInputs::of_class(load, geometry, state, index, drafted, passes.rows())
                             },
                         )?;
@@ -459,20 +465,41 @@ impl FamilyLayouts {
         // it (`PassLaunches`), at most the chain's.
         let chain = Passes { region: largest_rows, launches: pass.get().min(limits.chain_capacity.get()) };
         let mut blocks = vec![ShapeLayouts::new(); geometry.blocks.len()];
-        for &index in &distinct_blocks {
-            let shape = &outline.shapes[index];
-            let graphs = match self.launches.iter().find(|(certified, _)| certified == shape) {
+        // The untapped shapes no block has, each certified at its first
+        // tapped block (`FamilyOutline::untapped_layouts`); cached by shape
+        // as blocks' are, so a drafter-free family of the target certifies
+        // none of them again.
+        let mut untapped = vec![ShapeLayouts::new(); geometry.blocks.len()];
+        let distinct_untapped = (0..geometry.blocks.len())
+            .filter(|&index| outline.untapped_layouts(index) == Some(Holder::Untapped(index)))
+            .collect::<Vec<_>>();
+        let shaped = distinct_blocks
+            .iter()
+            .map(|&index| (index, false))
+            .chain(distinct_untapped.iter().map(|&index| (index, true)))
+            .collect::<Vec<_>>();
+        let shape_of = |index: usize, of_untapped: bool| match of_untapped {
+            true => outline.untapped(index).expect("a distinct untapped shape is a tapped block's"),
+            false => outline.shapes[index].clone(),
+        };
+        for &(index, of_untapped) in &shaped {
+            let shape = shape_of(index, of_untapped);
+            let graphs = match self.launches.iter().find(|(certified, _)| *certified == shape) {
                 Some((_, graphs)) => graphs.clone(),
                 None => {
-                    let graphs = runs(index, false, chain)?;
-                    self.launches.push((shape.clone(), graphs.clone()));
+                    let graphs = runs(index, false, chain, of_untapped)?;
+                    self.launches.push((shape, graphs.clone()));
                     graphs
                 }
             };
-            blocks[index] = graphs;
+            match of_untapped {
+                true => untapped[index] = graphs,
+                false => blocks[index] = graphs,
+            }
         }
         let arena = blocks
             .iter()
+            .chain(&untapped)
             .flat_map(BTreeMap::values)
             .map(|(graph, _)| graph.layout.storage_bytes().workspace)
             .chain(entries.values().chain(&per_layer).map(|layout| layout.storage_bytes().workspace))
@@ -488,12 +515,19 @@ impl FamilyLayouts {
                 passes
             }
         };
-        for &index in &distinct_blocks {
-            let shape = &outline.shapes[index];
-            let graphs = match self.groups.iter().find(|(certified, at, _)| certified == shape && *at == passes) {
+        for &(index, of_untapped) in &shaped {
+            let shape = shape_of(index, of_untapped);
+            let graphs = match self.groups.iter().find(|(certified, at, _)| *certified == shape && *at == passes) {
                 Some((.., graphs)) => graphs.clone(),
+                None if of_untapped => {
+                    // An untapped graph is only ever a run's: a block's once
+                    // graphs tap nothing, so the tapped block's serve.
+                    let graphs = runs(index, true, passes, true)?;
+                    self.groups.push((shape, passes, graphs.clone()));
+                    graphs
+                }
                 None => {
-                    let mut graphs = runs(index, true, passes)?;
+                    let mut graphs = runs(index, true, passes, false)?;
                     let streams = streamed::streams(load, block_scopes(index)?[1]);
                     for (stage, rows) in once_graphs(streams, block_split(load, geometry, index, limits)?.is_some(), passes) {
                         let (layout, constants, owned) = once(index, stage, rows)?;
@@ -502,17 +536,31 @@ impl FamilyLayouts {
                             (CertifiedBlockGraph { layout, owned }, Included::Once(constants)),
                         );
                     }
-                    self.groups.push((shape.clone(), passes, graphs.clone()));
+                    self.groups.push((shape, passes, graphs.clone()));
                     graphs
                 }
             };
-            blocks[index].extend(graphs);
+            match of_untapped {
+                true => untapped[index].extend(graphs),
+                false => blocks[index].extend(graphs),
+            }
         }
         for (graph, included) in distinct_blocks.iter().flat_map(|&index| blocks[index].values()) {
             let storage = graph.layout.storage_bytes();
             match included {
                 Included::Classes(constants, rows) => family.include_classes(storage, constants, rows)?,
                 Included::Once(constants) => family.include(storage, constants.iter().cloned()),
+            }
+        }
+        // An untapped shape's graphs seal only the classes an untapped launch
+        // takes, of at most `untapped_rows`.
+        for (graph, included) in distinct_untapped.iter().flat_map(|&index| untapped[index].values()) {
+            let Included::Classes(constants, rows) = included else {
+                unreachable!("an untapped shape certifies only run graphs")
+            };
+            let rows = rows.iter().copied().filter(|&rows| rows <= untapped_rows).collect::<Vec<_>>();
+            if !rows.is_empty() {
+                family.include_classes(graph.layout.storage_bytes(), constants, &rows)?;
             }
         }
         let served = block_served(load, geometry, limits, outline.chain_rows, passes)?;
@@ -522,10 +570,26 @@ impl FamilyLayouts {
                 blocks[index] = blocks[first].clone();
             }
         }
-        let blocks = blocks
-            .into_iter()
-            .map(|graphs| graphs.into_iter().map(|(topology, (graph, _))| (topology, graph)).collect::<BTreeMap<_, _>>())
+        let certified = |graphs: ShapeLayouts| {
+            graphs.into_iter().map(|(topology, (graph, _))| (topology, graph)).collect::<BTreeMap<_, _>>()
+        };
+        let blocks = blocks.into_iter().map(certified).collect::<Vec<_>>();
+        let untapped_held = untapped.into_iter().map(certified).collect::<Vec<_>>();
+        let untapped = (0..blocks.len())
+            .map(|index| match outline.untapped_layouts(index) {
+                None => BTreeMap::new(),
+                Some(Holder::Block(block)) => blocks[block].clone(),
+                Some(Holder::Untapped(first)) => untapped_held[first].clone(),
+            })
             .collect::<Vec<_>>();
+        // A block's certified graph of a class, its own or its untapped one.
+        let certified_of = |index: usize, class: StagedClass, of_untapped: bool| {
+            let layouts = match of_untapped {
+                true => &untapped[index],
+                false => &blocks[index],
+            };
+            layouts.get(&class_topology(class)).ok_or_else(|| GraphError::from("a block class has no certified layout"))
+        };
         // The graphs a load seals: two entries and the per-layer entry per row
         // class, and the enumerated block plans, each into its regime's layout.
         // Layer scales the plan does not know are taken both ways, which
@@ -538,7 +602,7 @@ impl FamilyLayouts {
             true => None,
             false => Some(enumerate(UnreadScales::Equal)?),
         };
-        let count = |sealing: &[(usize, StagedClass)]| {
+        let count = |enumeration: &BlockGraphEnumeration| {
             let mut planned = PlannedHeap::default();
             for _ in row_classes {
                 for layout in entries.values().chain(&per_layer) {
@@ -546,17 +610,18 @@ impl FamilyLayouts {
                 }
             }
             let mut sealed = GraphCounts::default();
-            for &(index, class) in sealing {
-                planned.seal_block(
-                    blocks[index]
-                        .get(&class_topology(class))
-                        .ok_or("a block class has no certified layout")?,
-                )?;
+            let sealing = enumeration
+                .sealing
+                .iter()
+                .map(|&(index, class)| (index, class, false))
+                .chain(enumeration.untapped_sealing.iter().map(|&(index, class)| (index, class, true)));
+            for (index, class, of_untapped) in sealing {
+                planned.seal_block(certified_of(index, class, of_untapped)?)?;
                 sealed.count(class.1);
             }
             Ok::<_, GraphError>((planned, sealed))
         };
-        let (planned, sealed_blocks) = count(&enumeration.sealing)?;
+        let (planned, sealed_blocks) = count(&enumeration)?;
         // The bindings a load makes of them: one for each entry graph, and one
         // for every block's every class, whichever block sealed its plan.
         let mut bound = HostHeap::default();
@@ -572,20 +637,26 @@ impl FamilyLayouts {
             }
         }
         let mut block_bindings = vec![GraphCounts::default(); blocks.len()];
-        let bound_classes = enumeration.sealing.iter().copied().chain(
-            enumeration
-                .sharing
-                .iter()
-                .map(|&(index, class, _)| (index, class)),
-        );
-        for (index, class) in bound_classes {
-            binding(
-                &blocks[index]
-                    .get(&class_topology(class))
-                    .ok_or("a block class has no certified layout")?
-                    .layout,
-            )?;
-            block_bindings[index].count(class.1);
+        let bound_classes = enumeration
+            .sealing
+            .iter()
+            .copied()
+            .chain(enumeration.sharing.iter().map(|&(index, class, _)| (index, class)))
+            .map(|(index, class)| (index, class, false))
+            .chain(
+                enumeration
+                    .untapped_sealing
+                    .iter()
+                    .copied()
+                    .chain(enumeration.untapped_sharing.iter().map(|&(index, class, _)| (index, class)))
+                    .map(|(index, class)| (index, class, true)),
+            );
+        for (index, class, of_untapped) in bound_classes {
+            binding(&certified_of(index, class, of_untapped)?.layout)?;
+            match of_untapped {
+                true => block_bindings[index].untapped += 1,
+                false => block_bindings[index].count(class.1),
+            }
         }
         let bound = bound
             .plus(block_binding_storage(&block_bindings)?)
@@ -604,7 +675,7 @@ impl FamilyLayouts {
         let at_most = graphs((planned, sealed_blocks))?;
         let at_least = match &least {
             None => at_most,
-            Some(least) => graphs(count(&least.sealing)?)?,
+            Some(least) => graphs(count(least)?)?,
         };
         let sealed = PlannedSealedGraphs {
             at_most,
@@ -641,10 +712,12 @@ impl FamilyLayouts {
                     row_classes.iter().copied(),
                     |rows| block_stages(&served, index, rows),
                     // A run's place holds each graph that takes it: a whole
-                    // decode block's either form's.
+                    // decode block's either form's, tapped or untapped.
                     |rows, stage| {
+                        let untapped = untapped[index].iter().filter(move |_| rows <= untapped_rows);
                         graphs
                             .iter()
+                            .chain(untapped)
                             .filter(|(&(form, _, _, of, _), _)| {
                                 form == RowForm::of(rows) && matches!(of, Stage::Run(of) if of.place() == stage)
                             })
@@ -675,6 +748,7 @@ impl FamilyLayouts {
             Entry(EntryTokens),
             PerLayer,
             Block(usize, Topology),
+            Untapped(usize, Topology),
         }
         let staged = enumeration
             .sealing
@@ -682,11 +756,28 @@ impl FamilyLayouts {
             .copied()
             .chain(enumeration.sharing.iter().map(|&(index, class, _)| (index, class)))
             .collect::<Vec<_>>();
+        // A launch of a class a tapped block's untapped graphs serve runs
+        // either form of the block, as its rows demand features or not: it
+        // counts both, at the layouts' holder.
+        let untapped_staged = enumeration
+            .untapped_sealing
+            .iter()
+            .copied()
+            .chain(enumeration.untapped_sharing.iter().map(|&(index, class, _)| (index, class)))
+            .map(|(index, staged)| {
+                let topology = class_topology(staged);
+                let graphed = match outline.untapped_layouts(index).expect("an untapped graph is a tapped block's") {
+                    Holder::Block(block) => Graphed::Block(outline.first_of_shape(block), topology),
+                    Holder::Untapped(first) => Graphed::Untapped(first, topology),
+                };
+                (index, staged, graphed)
+            });
         let launch_runs = LaunchRuns::of(
             &served,
             staged
                 .iter()
-                .map(|&(index, staged)| (index, staged, Graphed::Block(outline.first_of_shape(index), class_topology(staged)))),
+                .map(|&(index, staged)| (index, staged, Graphed::Block(outline.first_of_shape(index), class_topology(staged))))
+                .chain(untapped_staged),
         );
         // Each launch's runs of each layout: of each layout the most any
         // decode launch makes its decode, and the most any launch makes its
@@ -718,6 +809,9 @@ impl FamilyLayouts {
                 Graphed::Entry(source) => &entries[&source],
                 Graphed::PerLayer => per_layer.as_ref().ok_or("a per-layer run has no layout")?,
                 Graphed::Block(index, topology) => &blocks[index].get(&topology).ok_or("a block class has no certified layout")?.layout,
+                Graphed::Untapped(index, topology) => {
+                    &untapped[index].get(&topology).ok_or("an untapped block class has no certified layout")?.layout
+                }
             };
             Ok(layout.storage_bytes().recorded)
         };
@@ -767,6 +861,7 @@ impl FamilyLayouts {
             entries,
             per_layer,
             blocks,
+            untapped,
             passes,
         })
     }

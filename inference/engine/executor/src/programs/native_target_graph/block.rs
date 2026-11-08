@@ -125,13 +125,17 @@ pub(super) enum SealedBlockGraph {
 }
 
 /// A block's prepared graphs: a run's stages' graph of each class, and its
-/// group's pass's of each length (`Passes::lengths`), each ascending. A
-/// vector of exactly each: what the plan counted (`block_graph_storage`).
-/// Blocks that share a sealed plan share the prepared graph.
+/// group's pass's of each length (`Passes::lengths`), each ascending; and a
+/// tapped block's untapped run stages' graph of each class a launch none of
+/// whose rows demands features takes (`FamilyOutline::untapped`), ascending,
+/// which such a launch runs in place of its own. A vector of exactly each:
+/// what the plan counted (`block_graph_storage`). Graphs that share a sealed
+/// plan share the prepared graph.
 #[derive(Clone)]
 pub(super) struct BlockGraphs {
     pub(super) runs: Vec<(StagedClass, Arc<PreparedTargetBlockGraph>)>,
     pub(super) passes: Vec<(u64, Arc<PreparedTargetBlockGraph<PassPorts>>)>,
+    pub(super) untapped: Vec<(StagedClass, Arc<PreparedTargetBlockGraph>)>,
 }
 
 impl SealedBlockGraph {

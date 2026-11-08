@@ -674,12 +674,27 @@ pub(super) struct BlockGraphEnumeration {
     /// Where a launch's controls lie in its one upload of them.
     pub(super) controls: LaunchControlLayout,
     pub(super) launch_classes: std::collections::BTreeSet<BlockClass>,
+    /// The untapped graphs of the tapped blocks (`FamilyOutline::untapped`)
+    /// sealed, as `sealing` holds them.
+    pub(super) untapped_sealing: Vec<(usize, StagedClass)>,
+    /// The untapped graphs of the tapped blocks another graph of their
+    /// shape and output scales serves, with that graph's holder.
+    pub(super) untapped_sharing: Vec<(usize, StagedClass, Holder)>,
     /// Whether every block's sharing was decided on known output scales:
     /// always under `BlockOutputScales::Read`, and under
     /// `BlockOutputScales::Planned` when no two blocks of one shape read a
     /// layer scale. Otherwise `sealing` bounds the plans a load seals, from
     /// the side its `UnreadScales` names.
     pub(super) exact: bool,
+}
+
+/// Which of a target's block graphs holds another's plan: a block's own
+/// graphs (`BlockGraphs::runs`), or a tapped block's untapped ones
+/// (`BlockGraphs::untapped`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Holder {
+    Block(usize),
+    Untapped(usize),
 }
 
 /// What a target's graph family follows from its plan and limits before any
@@ -707,6 +722,13 @@ pub(super) struct FamilyOutline {
     /// conditioned on it reads: the exit block, of such a head's target
     /// ([`Self::exports_residual`]).
     pub(super) residual: Option<usize>,
+    /// The most rows a launch none of whose rows demands features takes:
+    /// one row of each request, a decode step's
+    /// (`ResourceLimits::decode_rows`, as `decode_launch`). A tapped block
+    /// holds its untapped graphs of the classes of at most these rows
+    /// (`Self::untapped`), which a decode launch's pins hold beside its
+    /// tapped ones.
+    pub(super) untapped_rows: u64,
 }
 
 impl FamilyOutline {
@@ -752,6 +774,7 @@ impl FamilyOutline {
             shapes,
             tap_width,
             residual,
+            untapped_rows: limits.decode_rows(),
         })
     }
 
@@ -774,6 +797,30 @@ impl FamilyOutline {
     /// The first block of `index`'s shape, whose layouts it holds.
     pub(super) fn first_of_shape(&self, index: usize) -> usize {
         self.firsts[index]
+    }
+
+    /// The shape of tapped block `index`'s untapped graphs, which a launch
+    /// none of whose rows demands features runs in its place: the block
+    /// without its drafter's writes (`BlockGraphShape::undrafted`), as a
+    /// load without the drafter seals it. None for a block that taps
+    /// nothing.
+    pub(super) fn untapped(&self, index: usize) -> Option<BlockGraphShape> {
+        self.tapped[index].positions().any().then(|| self.shapes[index].undrafted())
+    }
+
+    /// Where tapped block `index`'s untapped graphs take their layouts
+    /// from: the first block of their shape, else the first tapped block's
+    /// untapped graphs of it.
+    pub(super) fn untapped_layouts(&self, index: usize) -> Option<Holder> {
+        let shape = self.untapped(index)?;
+        Some(match self.shapes.iter().position(|other| *other == shape) {
+            Some(block) => Holder::Block(block),
+            None => Holder::Untapped(
+                (0..=index)
+                    .find(|&first| self.untapped(first).as_ref() == Some(&shape))
+                    .expect("a tapped block's untapped shape is its own"),
+            ),
+        })
     }
 
     /// Whether block `index`'s graphs export its output residual.
@@ -820,10 +867,33 @@ pub(super) fn enumerate_block_graphs(
             (0..index).find(|&first| shapes[first] == shapes[index] && equal_scales(first, index))
         })
         .collect::<Vec<_>>();
+    let untapped = (0..blocks.len()).map(|index| outline.untapped(index)).collect::<Vec<_>>();
+    // A tapped block's untapped graph shares the plan of a block's own
+    // graph of its shape, else of an earlier tapped block's untapped one.
+    let untapped_shared = (0..blocks.len())
+        .map(|index| {
+            let shape = untapped[index].as_ref()?;
+            Some(
+                (0..blocks.len())
+                    .find(|&other| shapes[other] == *shape && equal_scales(other, index))
+                    .map(Holder::Block)
+                    .or_else(|| {
+                        (0..index)
+                            .find(|&first| untapped[first].as_ref() == Some(shape) && equal_scales(first, index))
+                            .map(Holder::Untapped)
+                    }),
+            )
+        })
+        .collect::<Vec<_>>();
     let exact = match scales {
         BlockOutputScales::Read(_) => true,
         BlockOutputScales::Planned(_) => (0..blocks.len()).all(|index| {
             (0..index).all(|first| shapes[first] != shapes[index] || (unit(first) && unit(index)))
+                && untapped[index].as_ref().is_none_or(|shape| {
+                    (0..blocks.len())
+                        .filter(|&other| shapes[other] == *shape || (other < index && untapped[other].as_ref() == Some(shape)))
+                        .all(|other| unit(other) && unit(index))
+                })
         }),
     };
     // Per row class, each block's listing classes; per block, those of the
@@ -858,6 +928,8 @@ pub(super) fn enumerate_block_graphs(
         )?,
         listings: block_listed,
         launch_classes: std::collections::BTreeSet::new(),
+        untapped_sealing: Vec::new(),
+        untapped_sharing: Vec::new(),
         exact,
     };
     for (&rows, listings) in row_classes.iter().zip(&listings_at) {
@@ -877,6 +949,12 @@ pub(super) fn enumerate_block_graphs(
                         Some(first) => enumeration.sharing.push((index, staged, first)),
                         None => enumeration.sealing.push((index, staged)),
                     }
+                    match untapped_shared[index] {
+                        _ if rows > outline.untapped_rows => {}
+                        None => {}
+                        Some(Some(holder)) => enumeration.untapped_sharing.push((index, staged, holder)),
+                        Some(None) => enumeration.untapped_sealing.push((index, staged)),
+                    }
                 }
             }
         }
@@ -893,6 +971,8 @@ pub(super) fn enumerate_block_graphs(
     }
     enumeration.sealing.sort_unstable();
     enumeration.sharing.sort_unstable();
+    enumeration.untapped_sealing.sort_unstable();
+    enumeration.untapped_sharing.sort_unstable();
     Ok(enumeration)
 }
 

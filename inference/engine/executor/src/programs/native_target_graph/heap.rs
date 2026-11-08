@@ -115,8 +115,8 @@ const fn shared_block_graph_bytes<P>() -> usize {
 
 /// The host heap that stores a target's prepared block graphs: the vector
 /// of the blocks' `BlockGraphs`, each block's vectors of its `classes[block]`
-/// run graphs and passes, and one shared allocation for each of the
-/// `sealed` graphs. What the planner counts and what
+/// run graphs, passes and untapped run graphs, and one shared allocation for
+/// each of the `sealed` graphs. What the planner counts and what
 /// `PreparedTargetGraphs::prepare` allocates.
 pub(super) fn block_graph_storage(classes: &[GraphCounts], sealed: GraphCounts) -> Result<HostHeap, String> {
     use std::mem::size_of;
@@ -131,6 +131,10 @@ pub(super) fn block_graph_storage(classes: &[GraphCounts], sealed: GraphCounts) 
             .plus(HostHeap::allocation(
                 counts.passes,
                 size_of::<(u64, Arc<PreparedTargetBlockGraph<PassPorts>>)>(),
+            ))?
+            .plus(HostHeap::allocation(
+                counts.untapped,
+                size_of::<(StagedClass, Arc<PreparedTargetBlockGraph>)>(),
             ))
         })
         .and_then(|heap| heap.plus(shared(sealed.runs, shared_block_graph_bytes::<Option<SplitPorts>>())?))
@@ -148,7 +152,8 @@ pub(super) fn block_binding_storage(bindings: &[GraphCounts]) -> Result<HostHeap
         .iter()
         .try_fold(HostHeap::allocation(bindings.len(), size_of::<BlockBindings>()), |heap, counts| {
             heap.plus(HostHeap::allocation(counts.runs, size_of::<(StagedClass, BoundNativeGraphPlan)>()))?
-                .plus(HostHeap::allocation(counts.passes, size_of::<(u64, BoundNativeGraphPlan)>()))
+                .plus(HostHeap::allocation(counts.passes, size_of::<(u64, BoundNativeGraphPlan)>()))?
+                .plus(HostHeap::allocation(counts.untapped, size_of::<(StagedClass, BoundNativeGraphPlan)>()))
         })
         .ok_or_else(|| "target binding storage overflows".to_owned())
 }
@@ -243,11 +248,13 @@ impl SealedHeap {
     }
 }
 
-/// How many graphs of each kind: a run's stages' and a pass's.
+/// How many graphs of each kind: a run's stages', a pass's, and a tapped
+/// block's untapped run stages' (`BlockGraphs::untapped`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct GraphCounts {
     pub(super) runs: usize,
     pub(super) passes: usize,
+    pub(super) untapped: usize,
 }
 
 impl GraphCounts {

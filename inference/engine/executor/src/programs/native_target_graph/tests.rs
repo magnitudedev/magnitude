@@ -267,6 +267,118 @@ mod resource_template_tests {
     };
     use magnitude_state::KvCodec;
 
+    /// A load whose blocks tap for a separate draft holds, of each tapped
+    /// block, the graphs a load without the drafter runs, for each class a
+    /// launch none of whose rows demands features takes: certified into
+    /// the drafter-free family's layouts, and of no other class.
+    #[test]
+    fn a_tapped_block_holds_its_drafter_free_graphs_of_untapped_launches() {
+        use super::super::{certify::certify_target_and_undrafted, classes::Holder};
+        use crate::planning::fixtures::{LIMITS, separate_draft_fixture};
+        let (definition, manifest) = separate_draft_fixture(false);
+        let geometry = &definition.decoder;
+        let method = PlannedMethod::DFlash { proposals: 3, widths: crate::DraftWidths::Adaptive };
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let load = ModelLoadPlan::derive(
+                &manifest,
+                &definition,
+                ComponentSelection { head: true, vision: false },
+                resident_layout(ExecutionPath::Native, backend),
+                method,
+                LIMITS,
+            )
+            .unwrap();
+            let state = ResourcePlanner::state_plan(
+                &definition,
+                &load,
+                method,
+                KvCodec::Dense,
+                LIMITS,
+                ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent },
+            )
+            .unwrap();
+            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+            let [tapped, undrafted] = certify_target_and_undrafted(
+                backend,
+                &load,
+                geometry,
+                &state,
+                plan.target(),
+                LIMITS,
+                crate::PassLaunches::whole_chain(LIMITS),
+            )
+            .unwrap();
+            let outline = &tapped.outline;
+            let taps = (0..geometry.blocks.len()).filter(|&index| outline.untapped(index).is_some()).collect::<Vec<_>>();
+            assert!(!taps.is_empty(), "{backend:?}: the draft taps a block");
+            for index in 0..geometry.blocks.len() {
+                let untapped = &tapped.untapped[index];
+                if !taps.contains(&index) {
+                    assert!(untapped.is_empty(), "{backend:?} block {index}");
+                    continue;
+                }
+                assert_eq!(outline.untapped(index), Some(undrafted.outline.shapes[index].clone()));
+                // Each run topology the drafter-free family certifies, into
+                // its very layout.
+                let runs = |graphs: &std::collections::BTreeMap<super::super::classes::Topology, super::super::certify::CertifiedBlockGraph>| {
+                    graphs
+                        .iter()
+                        .filter(|(&(.., stage, _), _)| matches!(stage, Stage::Run(_)))
+                        .map(|(topology, graph)| (*topology, graph.layout.storage_bytes()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(runs(untapped), runs(&undrafted.blocks[index]), "{backend:?} block {index}");
+            }
+            // An untapped graph for every run class of a tapped block of at
+            // most `untapped_rows`, sealed or shared, and none other.
+            let enumeration = enumerate_block_graphs(
+                outline,
+                &tapped.served,
+                tapped.passes,
+                &state,
+                plan.target(),
+                BlockOutputScales::Planned(UnreadScales::Distinct),
+            )
+            .unwrap();
+            let mut expected = enumeration
+                .sealing
+                .iter()
+                .copied()
+                .chain(enumeration.sharing.iter().map(|&(index, class, _)| (index, class)))
+                .filter(|&(index, ((rows, ..), stage))| {
+                    taps.contains(&index) && matches!(stage, Stage::Run(_)) && rows <= outline.untapped_rows
+                })
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            let mut untapped = enumeration
+                .untapped_sealing
+                .iter()
+                .copied()
+                .chain(enumeration.untapped_sharing.iter().map(|&(index, class, holder)| {
+                    match holder {
+                        Holder::Block(block) => assert!(!taps.contains(&block)),
+                        Holder::Untapped(first) => assert!(first < index && taps.contains(&first)),
+                    }
+                    (index, class)
+                }))
+                .collect::<Vec<_>>();
+            untapped.sort_unstable();
+            assert!(!untapped.is_empty(), "{backend:?}");
+            assert_eq!(untapped, expected, "{backend:?}");
+            // A decode launch runs a tapped block's either form, as its rows
+            // demand features or not, so the family keeps both live for each
+            // launch in flight: its pins hold more graphs than the
+            // drafter-free family's, one each of the same launches.
+            assert_eq!(outline.untapped_rows, LIMITS.decode_rows(), "{backend:?}");
+            assert!(
+                tapped.graphs.pinned.graphs > undrafted.graphs.pinned.graphs,
+                "{backend:?}: {:?} pins no more than the drafter-free {:?}",
+                tapped.graphs.pinned,
+                undrafted.graphs.pinned
+            );
+        }
+    }
+
     /// Identical sublayers may share an interior graph, but neither the
     /// widening entry nor the exit mix may disappear through that sharing.
     #[test]

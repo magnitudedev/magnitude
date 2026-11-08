@@ -326,7 +326,8 @@ impl BoundTargetGraphs {
                 .flat_map(|per_layer| per_layer.bound.values()),
         );
         let blocks = self.bound.iter().flat_map(|block| {
-            block.runs.iter().map(|(_, bound)| bound).chain(block.passes.iter().map(|(_, bound)| bound))
+            let runs = block.runs.iter().chain(&block.untapped).map(|(_, bound)| bound);
+            runs.chain(block.passes.iter().map(|(_, bound)| bound))
         });
         let bindings = entries
             .chain(blocks)
@@ -339,7 +340,11 @@ impl BoundTargetGraphs {
         let held = self
             .bound
             .iter()
-            .map(|block| GraphCounts { runs: block.runs.capacity(), passes: block.passes.capacity() })
+            .map(|block| GraphCounts {
+                runs: block.runs.capacity(),
+                passes: block.passes.capacity(),
+                untapped: block.untapped.capacity(),
+            })
             .collect::<Vec<_>>();
         if self.bound.capacity() != held.len() {
             return Err("the blocks' bindings are held in more than their vector".into());
@@ -399,6 +404,7 @@ pub(super) fn bind_block_graphs<K: Copy + std::fmt::Debug, P>(
 pub(super) struct BlockBindings {
     pub(super) runs: Vec<(StagedClass, BoundNativeGraphPlan)>,
     pub(super) passes: Vec<(u64, BoundNativeGraphPlan)>,
+    pub(super) untapped: Vec<(StagedClass, BoundNativeGraphPlan)>,
 }
 
 /// The bound per-layer entry of a per-layer model.
@@ -528,6 +534,11 @@ impl BoundTargetGraphs {
         )
     }
 
+    /// Block `index`'s graph of a run's `stage` of its class, in a launch
+    /// some of whose rows demand features (`tapped`) or none: a tapped
+    /// block's untapped graph in the latter (`BlockGraphs::untapped`), as a
+    /// load without the drafter runs it.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn block(
         &self,
         rows: u64,
@@ -537,13 +548,18 @@ impl BoundTargetGraphs {
         scored: bool,
         index: usize,
         stage: RunStage,
+        tapped: bool,
     ) -> Result<(&PreparedTargetBlockGraph, &BoundNativeGraphPlan), String> {
         let mixer = *self
             .prepared
             .mixers
             .get(index)
             .ok_or_else(|| format!("target block {index} does not exist"))?;
-        self.staged(index, (block_class(mixer, rows, segments, slots, listed, scored), Stage::Run(stage)))
+        let key = (block_class(mixer, rows, segments, slots, listed, scored), Stage::Run(stage));
+        match tapped || !self.prepared.block_taps(index).positions().any() {
+            true => self.staged(index, key),
+            false => sealed_and_bound(&self.prepared.blocks_by_class[index].untapped, &self.bound[index].untapped, index, key),
+        }
     }
 
     /// Block `index`'s fill, sealed once (`once_class`).

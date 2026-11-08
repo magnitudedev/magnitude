@@ -7,7 +7,7 @@ use super::{
     },
     certify::{TargetFamilyCertificate, certify_target_family},
     classes::{
-        BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, LaunchControlLayout,
+        BlockGraphEnumeration, BlockListings, BlockOutputScales, BlockServed, Holder, LaunchControlLayout,
         Passes, StagedClass, block_sealed_stages, block_stages, chained_once_runs, class_topology, decode_launch, enumerate_block_graphs, LaunchRuns, once_class,
         slot_selection,
     },
@@ -521,6 +521,8 @@ impl PreparedTargetGraphs {
             listings,
             controls,
             launch_classes,
+            untapped_sealing,
+            untapped_sharing,
             exact: _,
         } = enumerate_block_graphs(
             &outline,
@@ -589,10 +591,29 @@ impl PreparedTargetGraphs {
         // the family's: each distinct one held once, whichever graphs bind
         // it.
         let constants = FamilyConstants::default();
-        let seal_block = |&(index, staged): &(usize, StagedClass)| {
+        // A tapped block's untapped graphs (`untapped`) are sealed as the
+        // block without its drafter's writes, into their own layouts.
+        let certified_of = |index: usize, staged: StagedClass, untapped: bool| {
+            let layouts = match untapped {
+                true => &certificate.untapped[index],
+                false => &certificate.blocks[index],
+            };
+            layouts.get(&class_topology(staged)).ok_or_else(|| {
+                format!("target graph class {staged:?} of block {index} (untapped: {untapped}) has no certified layout")
+            })
+        };
+        let sealing = sealing
+            .into_iter()
+            .map(|(index, staged)| (index, staged, false))
+            .chain(untapped_sealing.into_iter().map(|(index, staged)| (index, staged, true)))
+            .collect::<Vec<_>>();
+        let seal_block = |&(index, staged, untapped): &(usize, StagedClass, bool)| {
             let ((rows, segments, slots, listed, scored), stage) = staged;
             let began = Instant::now();
-            let positions = outline.tapped[index].positions();
+            let positions = match untapped {
+                true => TapPositions::default(),
+                false => outline.tapped[index].positions(),
+            };
             let tap = match (positions.any(), tap_width, &handles.taps) {
                 (false, ..) => None,
                 (true, Some(width), Some(taps)) => Some(TapEntry {
@@ -612,15 +633,15 @@ impl PreparedTargetGraphs {
                 plan.blocks()[index],
                 BlockGraphInputs {
                     output_scales: handles.blocks[index].output_scales,
-                    residual: outline.exports_residual(index),
+                    residual: !untapped && outline.exports_residual(index),
                     ..BlockGraphInputs::of_class(load, geometry, state, index, staged, capacity)
                 },
-                &certificate.blocks[index][&class_topology(staged)].layout,
+                &certified_of(index, staged, untapped)?.layout,
                 &constants,
             )
             .map_err(|error| {
                 format!(
-                    "target graph row class {rows}, history segments {segments}, request slots {slots}, listed {listed}, scored {scored}, {stage:?} of block {index}: {error}"
+                    "target graph row class {rows}, history segments {segments}, request slots {slots}, listed {listed}, scored {scored}, {stage:?} of block {index} (untapped: {untapped}): {error}"
                 )
             })?;
             if trace {
@@ -636,31 +657,41 @@ impl PreparedTargetGraphs {
         // kind, in the order enumerated, which ascends by class.
         let mut class_counts = vec![GraphCounts::default(); handles.blocks.len()];
         let mut sealed_counts = GraphCounts::default();
-        for &(index, (_, stage)) in &sealing {
-            class_counts[index].count(stage);
+        for &(index, (_, stage), untapped) in &sealing {
+            match untapped {
+                true => class_counts[index].untapped += 1,
+                false => class_counts[index].count(stage),
+            }
             sealed_counts.count(stage);
         }
         for &(index, (_, stage), _) in &sharing {
             class_counts[index].count(stage);
+        }
+        for &(index, ..) in &untapped_sharing {
+            class_counts[index].untapped += 1;
         }
         let mut blocks_by_class = class_counts
             .iter()
             .map(|counts| BlockGraphs {
                 runs: Vec::with_capacity(counts.runs),
                 passes: Vec::with_capacity(counts.passes),
+                untapped: Vec::with_capacity(counts.untapped),
             })
             .collect::<Vec<_>>();
-        for (&(index, class), block) in sealing.iter().zip(sealed) {
+        for (&(index, class, untapped), block) in sealing.iter().zip(sealed) {
             let block = block?;
             sealed_graphs += 1;
-            let certified = &certificate.blocks[index][&class_topology(class)];
-            let graph = || format!("target graph class {class:?} of block {index}");
+            let certified = certified_of(index, class, untapped)?;
+            let graph = || format!("target graph class {class:?} of block {index} (untapped: {untapped})");
             let graphs = &mut blocks_by_class[index];
             let plan = match block {
                 SealedBlockGraph::Run(block) => {
                     held.own(&block, certified, graph)?;
                     let plan = block.plan.clone();
-                    graphs.runs.push((class, block));
+                    match untapped {
+                        true => graphs.untapped.push((class, block)),
+                        false => graphs.runs.push((class, block)),
+                    }
                     plan
                 }
                 SealedBlockGraph::Pass(block) => {
@@ -695,11 +726,29 @@ impl PreparedTargetGraphs {
                 }
             }
         }
+        // A tapped block's untapped graph another serves holds its holder's
+        // prepared graph: a block's own of its shape, or an earlier tapped
+        // block's untapped one, which ascend by block.
+        for (index, class, holder) in untapped_sharing {
+            let graphs = match holder {
+                Holder::Block(block) => &blocks_by_class[block].runs,
+                Holder::Untapped(block) => &blocks_by_class[block].untapped,
+            };
+            let at = graphs
+                .binary_search_by(|(sealed, _)| sealed.cmp(&class))
+                .map_err(|_| format!("{holder:?} holds no graph of class {class:?}"))?;
+            let graph = graphs[at].1.clone();
+            blocks_by_class[index].untapped.push((class, graph));
+        }
         let storage = block_graph_storage(&class_counts, sealed_counts)?;
         let held_storage = block_graph_storage(
             &blocks_by_class
                 .iter()
-                .map(|graphs| GraphCounts { runs: graphs.runs.capacity(), passes: graphs.passes.capacity() })
+                .map(|graphs| GraphCounts {
+                    runs: graphs.runs.capacity(),
+                    passes: graphs.passes.capacity(),
+                    untapped: graphs.untapped.capacity(),
+                })
                 .collect::<Vec<_>>(),
             sealed_counts,
         )?;
@@ -749,7 +798,10 @@ impl PreparedTargetGraphs {
         let launch_runs = LaunchRuns::of(
             &served,
             blocks_by_class.iter().enumerate().flat_map(|(index, graphs)| {
-                let runs = graphs.runs.iter().map(move |(staged, block)| (index, *staged, &block.plan));
+                // A launch of a class a tapped block's untapped graphs serve
+                // runs either form of the block, as its rows demand
+                // features or not: it counts both.
+                let runs = graphs.runs.iter().chain(&graphs.untapped).map(move |(staged, block)| (index, *staged, &block.plan));
                 let passes = graphs
                     .passes
                     .iter()
@@ -1004,6 +1056,7 @@ impl PreparedTargetGraphs {
             bound.push(BlockBindings {
                 runs: bind_block_graphs(&graphs.runs, index, resident, &mut constants)?,
                 passes: bind_block_graphs(&graphs.passes, index, resident, &mut constants)?,
+                untapped: bind_block_graphs(&graphs.untapped, index, resident, &mut constants)?,
             });
         }
         // The pass's merged experts and row table, which every group's passes
