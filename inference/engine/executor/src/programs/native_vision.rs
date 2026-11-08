@@ -1307,7 +1307,6 @@ impl PreparedVisionGraphs {
         let planned = |layouts: &mut dyn Iterator<Item = &NativeGraphLayout>| {
             seismic::LaunchGraphs::of(
                 layouts.map(|layout| seismic::LaunchedGraph { graph: layout.storage_bytes().recorded, pinned_runs: 0, runs: 1 }),
-                seismic::Beside::AnyRun,
                 Vec::new(),
             )
             .ok_or_else(|| invalid("vision graph census overflows"))

@@ -1913,7 +1913,7 @@ fn readout_graphs(
             Ok(LaunchedGraph { graph: layout.storage_bytes().recorded, pinned_runs: u64::from(decodes), runs: 1 })
         })
         .collect::<Result<Vec<_>, GraphError>>()?;
-    Ok(LaunchGraphs::of(graphs, seismic::Beside::AnyRun, Vec::new()).ok_or("readout graph census overflows")?)
+    Ok(LaunchGraphs::of(graphs, Vec::new()).ok_or("readout graph census overflows")?)
 }
 
 fn readout_regime(class: ReadoutClass) -> ReadoutRegime {

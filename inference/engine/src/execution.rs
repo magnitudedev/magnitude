@@ -597,9 +597,9 @@ pub(crate) fn build(
         resources.arena_bytes()
     );
     // What the target's graphs are made of, beside what they cost on this
-    // device: what each launch in flight beside another replays, its
+    // device: what each launch in flight beside another holds, its
     // decode launches' pinned graphs, as the family is charged for it
-    // (`LaunchGraphs::flight`), and its largest launch
+    // (`LaunchGraphs::pinned`), and its largest launch
     // class's, which the family's live slots hold of its device's graph
     // budget.
     let family = target_graphs.family();
@@ -610,16 +610,16 @@ pub(crate) fn build(
         let bytes = graph_cost.bytes(graphs).expect("a charged family's graphs price at its device's cost");
         bytes.device + bytes.upload
     };
-    let flight = family.graphs().flight;
+    let pinned = family.graphs().pinned;
     // Every plan of a family runs in one of its launches, so it has one.
     let largest = census.launches.iter().copied().max_by_key(|graphs| cost(*graphs)).expect("a target family has a launch class");
     tracing::info!(
         "target graph census: {} layouts; of {} launch classes, each launch in flight beside another replays {} graphs of {} launches ({} bytes charged), the largest {} of {} ({} bytes charged)",
         census.layouts,
         census.launches.len(),
-        flight.graphs,
-        flight.launches,
-        cost(flight),
+        pinned.graphs,
+        pinned.launches,
+        cost(pinned),
         largest.graphs,
         largest.launches,
         cost(largest),

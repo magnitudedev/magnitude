@@ -808,9 +808,9 @@ impl PreparedTargetGraphs {
         let bytes = |census| device.graph_cost().bytes(census).map_or(0, |bytes| bytes.device + bytes.upload);
         tracing::info!(
             "target graphs: a decode launch holds {} bytes, the union of every launch's {} bytes; the plan bounded them at {} and {}",
-            bytes(sealed.flight),
+            bytes(sealed.pinned),
             bytes(sealed.union),
-            bytes(bound.flight),
+            bytes(bound.pinned),
             bytes(bound.union),
         );
         assert!(

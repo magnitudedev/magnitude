@@ -597,7 +597,7 @@ impl CheckedGraphFamilyResources {
                 .ok_or("checked graph host heap overflows")?,
             storage: self.storage.ok_or("checked graph family has no class")?,
             binding_constant_bytes: distinct_storage_bytes(self.constants.iter())?,
-            graphs: LaunchGraphs::of(self.graphs, seismic::Beside::AnyRun, Vec::new()).ok_or("checked graph family census overflows")?,
+            graphs: LaunchGraphs::of(self.graphs, Vec::new()).ok_or("checked graph family census overflows")?,
         })
     }
 }

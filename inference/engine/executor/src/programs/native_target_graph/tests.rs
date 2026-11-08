@@ -665,7 +665,7 @@ mod resource_template_tests {
             assert!(single.graphs >= 28 && single.within(chained[27]), "{single:?} beyond {:?}", chained[27]);
             assert!(
                 certificate.graphs.held(29).unwrap().graphs
-                    >= certificate.graphs.flight.graphs * 28 + certificate.graphs.union.graphs + single.graphs
+                    >= certificate.graphs.pinned.graphs * 28 + certificate.graphs.union.graphs + single.graphs
             );
         }
     }

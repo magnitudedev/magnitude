@@ -504,7 +504,7 @@ fn certify_copy_family(
     }
     Ok((
         family.ok_or("state copy graph family has no classes")?,
-        LaunchGraphs::of(graphs, seismic::Beside::AnyRun, Vec::new()).ok_or("state copy graph census overflows")?,
+        LaunchGraphs::of(graphs, Vec::new()).ok_or("state copy graph census overflows")?,
         layouts.into_iter().map(Option::unwrap).collect(),
     ))
 }
