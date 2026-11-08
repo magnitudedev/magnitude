@@ -373,6 +373,30 @@ impl State {
             Self::Parked(round, ..) => round.fail(),
         }
     }
+
+    /// A preemption candidate's generation, and whether its host blocks its
+    /// output: every state that may hold resident state with none of its
+    /// work on the device. Work parked short of capacity is a candidate too,
+    /// so requests that all grew until none fits release one of themselves
+    /// rather than wait on each other.
+    fn preemptible(&self) -> Option<(&Generation, bool)> {
+        match self {
+            Self::Between(generation, Stage::Ready | Stage::Pending(..)) => Some((generation, false)),
+            Self::Between(generation, Stage::AwaitingCredit) => Some((generation, true)),
+            Self::Parked(round, ..) => Some((round.generation(), false)),
+            Self::Between(_, Stage::NonResident(_) | Stage::AwaitingPrefix { .. }) => None,
+        }
+    }
+
+    /// Discard composed work after the execution owner released the
+    /// request's state: it replays from its generation as it was before any
+    /// started round.
+    fn evicted(self) -> Result<Generation, String> {
+        match self {
+            Self::Between(mut generation, _) => generation.evicted().map(|()| generation),
+            Self::Parked(round, ..) => round.evicted(),
+        }
+    }
 }
 
 struct Request {
@@ -3103,9 +3127,7 @@ impl<F: ProgramFamily> Service<F> {
     ) -> Result<bool, RequestError> {
         let mut victims = Vec::new();
         for (&id, request) in &self.requests {
-            let State::Between(generation, stage @ (Stage::Ready | Stage::AwaitingCredit)) =
-                &request.state
-            else {
+            let Some((generation, output_blocked)) = request.state.preemptible() else {
                 continue;
             };
             if selected.contains(&id)
@@ -3121,7 +3143,7 @@ impl<F: ProgramFamily> Service<F> {
                 .map_err(invariant("preemption"))?;
             victims.push(Victim {
                 identity: id,
-                output_blocked: matches!(stage, Stage::AwaitingCredit),
+                output_blocked,
                 preemption_debt: request.record.preemption_debt,
                 exclusive_bytes: executor_bytes
                     .checked_add(generation.method_reclaimable())
@@ -3155,12 +3177,9 @@ impl<F: ProgramFamily> Service<F> {
             }
             for id in set {
                 let Request { mut record, state } = self.requests.remove(&id).expect("victim");
-                let State::Between(mut generation, _) = state else {
-                    unreachable!("victims are between rounds")
-                };
+                let generation = state.evicted().map_err(invariant("preemption"))?;
                 record.protected_until = Some(generation.accepted_position());
                 record.preemption_debt = record.preemption_debt.saturating_add(1);
-                generation.evicted().map_err(invariant("preemption"))?;
                 self.requests.insert(
                     id,
                     Request {
@@ -3637,6 +3656,45 @@ mod pending_retention_tests {
             let terminal = State::Between(pending.terminate(cancel), Stage::Ready);
             assert_eq!(terminal.settled().unwrap().finish_reason(), Some(expected));
         }
+    }
+
+    /// Requests that all grew until no prompt chunk fits park their started
+    /// rounds. Parked work is a preemption candidate, so the last request
+    /// short of capacity releases a parked peer instead of every request
+    /// waiting on the others until all fail together.
+    #[test]
+    fn parked_and_pending_work_is_preemptible_and_replays_from_before_its_round() {
+        let generation = super::termination_tests::generation();
+        let Ok(RoundStart::Target(round)) = generation.start_round(RequestId(1), 4) else {
+            panic!("prompt round")
+        };
+        let work = lower_round(&round, RequestId(1), round.generation().resident_position(), None).unwrap();
+        let wait = Wait::Capacity {
+            at: AvailabilityEpoch::default(),
+            resource: ResourceKind::DeviceMemory,
+            required: 2,
+            available: 1,
+        };
+        let parked = State::Parked(round, Work::new(vec![work]).unwrap(), Some(wait));
+        let (generation, output_blocked) = parked.preemptible().expect("parked work is preemptible");
+        assert!(generation.is_resident());
+        assert!(!output_blocked);
+        let evicted = parked.evicted().unwrap();
+        assert!(!evicted.is_resident());
+        assert_eq!(evicted.resident_position(), 0);
+        assert_eq!(evicted.finish_reason(), None);
+
+        let pending = State::Between(
+            super::termination_tests::generation(),
+            Stage::Pending(priming(), Some(wait)),
+        );
+        assert!(pending.preemptible().is_some());
+        assert!(!pending.evicted().unwrap().is_resident());
+
+        let blocked = State::Between(super::termination_tests::generation(), Stage::AwaitingCredit);
+        assert_eq!(blocked.preemptible().map(|(_, blocked)| blocked), Some(true));
+        let nonresident = State::Between(evicted, Stage::NonResident(Some(wait)));
+        assert!(nonresident.preemptible().is_none());
     }
 
     #[test]
