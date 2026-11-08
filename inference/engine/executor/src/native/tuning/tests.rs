@@ -99,150 +99,6 @@ fn a_units_share_is_its_mean_fraction_of_every_terms_time() {
     );
 }
 
-/// `case`'s points weighted by the launches a plain decoding load's target
-/// makes of its layers, as a demand walk gives them to it.
-fn demanded<T: EntryTuning>(case: &T, objective: &Objective) -> Vec<PointShape> {
-    let graph = crate::programs::invocation_demand::GraphInvocationDemand::new(
-        crate::PlannedMethod::Plain,
-        objective.terms.clone(),
-        None,
-        LIMITS.max_rows,
-    );
-    let mut points = case.points(LIMITS);
-    let mut representatives = points.iter().map(|point| point.rows).collect::<Vec<_>>();
-    representatives.sort_unstable();
-    representatives.dedup();
-    let calls = graph
-        .target
-        .represented(|launch| case.invocation_rows(launch, &representatives))
-        .scaled(case.launches());
-    apply_invocation_counts(&mut points, &calls, objective);
-    points
-}
-
-/// A launch reaches only the entry the graph runs it with. Where a decode
-/// form and a grouped form share their layers' launches, each takes those
-/// of its own row classes: the decode form is the whole of every decode
-/// term, so its share is those terms' weight whatever the grouped form's
-/// defaults cost. Before, the grouped form took the decode launches at its
-/// smallest point too, and a slow grouped default shrank the decode form's
-/// share of the terms it alone serves.
-#[test]
-fn another_forms_slow_defaults_take_nothing_from_the_launches_an_entry_serves() {
-    use super::routed::{RoutedGroupTuning, RoutedOutputTuning, RoutedShape};
-    let shape = RoutedShape {
-        hidden: 64,
-        experts: 8,
-        selected: 2,
-        features: 32,
-        shared: 0,
-    };
-    let layers = 4;
-    let decode = RoutedOutputTuning {
-        expert_down: Element::bf16(),
-        shared_down: Element::bf16(),
-        activation: Element::bf16(),
-        shape,
-        scopes: (0..layers)
-            .map(|block| {
-                WeightScope::TargetSublayer(magnitude_family_contracts::SublayerIndex {
-                    block,
-                    sublayer: 1,
-                })
-            })
-            .collect(),
-    };
-    let grouped = RoutedGroupTuning {
-        shape,
-        layers: layers as usize,
-    };
-    let objective = Objective::new(workload::terms(LIMITS, &[]));
-    let (decode, grouped) = (
-        demanded(&decode, &objective),
-        demanded(&grouped, &objective),
-    );
-    let phases = |points: &[PointShape]| {
-        points
-            .iter()
-            .flat_map(|point| &point.terms)
-            .map(|(term, _)| objective.terms[*term].metric.phase)
-            .collect::<std::collections::BTreeSet<_>>()
-    };
-    assert_eq!(phases(&decode), [workload::Phase::Decode].into());
-    assert_eq!(phases(&grouped), [workload::Phase::Prefill].into());
-    let weights = objective
-        .terms
-        .iter()
-        .map(|term| term.weight)
-        .collect::<Vec<_>>();
-    let decode_weight = objective
-        .terms
-        .iter()
-        .filter(|term| term.metric.phase == workload::Phase::Decode)
-        .map(|term| term.weight)
-        .sum::<f64>();
-    let terms = objective.terms.len();
-    for grouped_seconds in [1e-4, 1.] {
-        let times = [
-            term_times(&decode, terms, |_| Some(1e-4)),
-            term_times(&grouped, terms, |_| Some(grouped_seconds)),
-        ];
-        let share = shares(&times, &weights)[0];
-        assert!(
-            (share - decode_weight).abs() < 1e-12,
-            "{share} at {grouped_seconds}"
-        );
-    }
-}
-
-/// The gated-delta projection serves the step rows only in the step form;
-/// beside the convolved projection it is timed and weighed at the chunked
-/// rows alone.
-#[test]
-fn the_convolved_forms_projection_leaves_the_step_rows_to_its_own() {
-    use super::recurrent::{RecurrentProjectTuning, RecurrentShape};
-    use crate::operators::gated_delta::graph::{StepForm, chunked};
-    let project = |form| RecurrentProjectTuning {
-        norm: Element::bf16(),
-        qkv: Element::bf16(),
-        gate: Element::bf16(),
-        alpha: Element::bf16(),
-        beta: Element::bf16(),
-        activation: Element::bf16(),
-        shape: RecurrentShape {
-            key_heads: 2,
-            value_heads: 4,
-            width: 16,
-            convolution_width: 4,
-            scopes: vec![WeightScope::Target],
-        },
-        epsilon: 1e-6,
-        form,
-    };
-    let rows = |form| {
-        project(form)
-            .points(LIMITS)
-            .into_iter()
-            .map(|point| point.rows)
-            .collect::<Vec<_>>()
-    };
-    assert!(rows(StepForm::Convolved).into_iter().all(chunked));
-    assert_eq!(
-        rows(StepForm::Step),
-        row_points(LIMITS)
-            .iter()
-            .map(|point| point.rows)
-            .collect::<Vec<_>>()
-    );
-    let objective = Objective::new(workload::terms(LIMITS, &[]));
-    assert!(
-        demanded(&project(StepForm::Convolved), &objective)
-            .iter()
-            .flat_map(|point| &point.terms)
-            .all(|(term, _)| objective.terms[*term].metric.phase == workload::Phase::Prefill)
-    );
-}
-
 /// The load's launches reach a unit's points: by rows and the sequences
 /// declared at or below theirs, a launch's history divided between the two
 /// declared histories around it and held to the longest (a window), each
@@ -1089,6 +945,9 @@ impl EntryTuning for FakeCase {
     }
     fn statics(&self, _inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         Ok(vec![("H", 8), ("F", 16), ("DS", 0), ("DB", 0)])
+    }
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
     }
     fn rotation(
         &self,

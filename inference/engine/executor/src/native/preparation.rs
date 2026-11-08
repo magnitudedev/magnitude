@@ -2042,7 +2042,6 @@ impl<'a> Preparation<'a> {
             activation: b.activation,
             shape: shape.clone(),
             epsilon: self.epsilon,
-            form,
         };
         let step = match form {
             StepForm::Step => self

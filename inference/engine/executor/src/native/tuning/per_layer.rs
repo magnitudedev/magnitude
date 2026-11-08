@@ -3,7 +3,7 @@
 //! product with the layer's slice of the per-layer inputs.
 
 use super::cases::{projection_shape, scale_extent};
-use super::{EntryTuning, ModelInputs, PointShape, TuningInputs};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::PerLayerBinding;
 use magnitude_family_contracts::{Operator, WeightKind, WeightScope};
 use magnitude_kernels::per_layer_gate;
@@ -66,6 +66,10 @@ impl EntryTuning for PerLayerGateTuning {
                 scale_extent(inputs, &self.scopes, WeightKind::PerLayerGate)?,
             ),
         ])
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
     }
 
     fn rotation(

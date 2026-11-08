@@ -9,7 +9,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, served_row_points,
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
+    served_row_points,
 };
 use magnitude_batching::{HISTORY_WIDTH, SHAPING_WIDTH};
 use magnitude_family_contracts::{WeightKind, WeightScope};
@@ -75,6 +76,10 @@ impl EntryTuning for DraftRowsTuning {
             return Err("the draft combine weight does not have two hidden inputs".into());
         }
         Ok(vec![("D", hidden)])
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
     }
 
     fn rotation(

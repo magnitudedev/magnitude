@@ -12,8 +12,11 @@
 //! argument set owns those tables as case state.
 
 use super::cases::scale_extent;
-use super::{CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs};
-use crate::operators::routed::fused_graph::{TILE_ROWS, decodes, grouped_blocks};
+use super::{
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
+    served_row_points,
+};
+use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
 use crate::planning::{BankBinding, HINT_LEADS, HintWeight};
 use magnitude_family_contracts::{Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::constants::{
@@ -33,6 +36,16 @@ pub(crate) struct RoutedShape {
     pub selected: u64,
     pub features: u64,
     pub shared: u64,
+}
+
+/// The decode points: row counts the decode form serves.
+pub(crate) fn decode_points(limits: TuningLimits) -> Vec<PointShape> {
+    served_row_points(limits, |rows| rows <= DECODE_ROWS)
+}
+
+/// The grouped points: row counts past the decode form.
+pub(crate) fn grouped_points(limits: TuningLimits) -> Vec<PointShape> {
+    served_row_points(limits, |rows| rows > DECODE_ROWS)
 }
 
 /// Distinct experts per row with the uneven expert loads of real routing: the
@@ -202,8 +215,12 @@ impl EntryTuning for RoutedRouteTuning {
         ])
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        self.decode || !decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        if self.decode {
+            row_points(limits)
+        } else {
+            grouped_points(limits)
+        }
     }
 
     fn rotation(
@@ -311,8 +328,8 @@ impl EntryTuning for RoutedRouteSharedTuning {
         ])
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
     }
 
     fn rotation(
@@ -589,8 +606,8 @@ impl EntryTuning for RoutedRouteStreamedTuning {
         Ok(statics)
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
     }
 
     fn rotation(
@@ -713,8 +730,8 @@ impl EntryTuning for RoutedGroupTuning {
         Ok(vec![("E", self.shape.experts), ("K", self.shape.selected)])
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        !decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        grouped_points(limits)
     }
 
     /// One argument set: the tables are small and stay cache resident in a
@@ -909,8 +926,8 @@ impl EntryTuning for RoutedExpandTuning {
         Ok(statics)
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
     }
 
     fn rotation(
@@ -1021,8 +1038,8 @@ impl EntryTuning for RoutedChoicesTuning {
         Ok(statics)
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
     }
 
     fn rotation(
@@ -1145,8 +1162,8 @@ impl EntryTuning for RoutedOutputTuning {
         ])
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
     }
 
     fn rotation(
@@ -1257,8 +1274,8 @@ impl EntryTuning for RoutedOutputProjectTuning {
         Ok(self.resident.statics(inputs)?.into_iter().filter(|(name, _)| !matches!(*name, "SN" | "IN")).collect())
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        decode_points(limits)
     }
 
     fn rotation(
@@ -1358,8 +1375,8 @@ impl EntryTuning for RoutedExpertsTuning {
         Ok(statics)
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        !decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        grouped_points(limits)
     }
 
     fn rotation(
@@ -1483,8 +1500,8 @@ impl EntryTuning for RoutedCombineTuning {
         ])
     }
 
-    fn serves(&self, rows: u64) -> bool {
-        !decodes(rows)
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        grouped_points(limits)
     }
 
     fn rotation(

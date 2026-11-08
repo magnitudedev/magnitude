@@ -41,11 +41,8 @@ Two descriptions of a unit must remain distinct:
   26.7 us in order), and the ranking is of a cost no step pays. Adversarial
   numerical cases do not count as serving traffic. A launch is demand of the kernel that serves
   it alone: where two kernels are alternatives for the same layers (the attention prefill that
-  lists the history tiles its rows see, and the one that lists none; a routed decode form and
-  its grouped form; a gated-delta step and its chunked advance), each takes only the launches
-  the graph gives it, by the graph's own rule for its row classes. A kernel charged with launches
-  another runs would inflate every term's time at the defaults by its cost there, and shrink the
-  shares of the kernels that do run them. A history-dependent unit is timed at three histories: empty (all
+  lists the history tiles its rows see, and the one that lists none), each takes only the
+  launches the graph gives it. A history-dependent unit is timed at three histories: empty (all
   fixed costs), 4k, and the longest its layers see (the context limit or their window). A
   launch's intermediate history is represented by demand split between its neighboring
   points. This representative-workload approximation is explicit; it does not establish

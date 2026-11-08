@@ -3,7 +3,7 @@
 //! inject values) or the exit site (without), and `stream_mix_up` at every
 //! site. The widening (`repeat_rows`) has no tuning parameters.
 
-use super::{EntryTuning, ModelInputs, PointShape, TuningInputs};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::operators::streams::{MixDownBinding, MixUpBinding, StreamsGeometry};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{stream_mix_down, stream_mix_up};
@@ -89,6 +89,10 @@ impl EntryTuning for StreamMixDownTuning {
             ("LR", geometry.rank),
             ("C", u64::from(self.binding.injected())),
         ])
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
     }
 
     fn rotation(
@@ -186,6 +190,10 @@ impl EntryTuning for StreamMixUpTuning {
             ("S", geometry.streams),
             ("LR", geometry.rank),
         ])
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
     }
 
     fn rotation(

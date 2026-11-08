@@ -3,7 +3,7 @@
 //! no tuning parameters.
 
 use super::cases::{packing_statics, projection_shape, scale_extent};
-use super::{EntryTuning, ModelInputs, PointShape, TuningInputs};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::project_rows;
 use seismic::{Element, Tensor};
@@ -69,6 +69,10 @@ impl EntryTuning for ProjectRowsTuning {
             &[("WB", Some(self.kind))],
         )?);
         Ok(statics)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
     }
 
     fn rotation(

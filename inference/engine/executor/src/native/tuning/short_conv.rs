@@ -4,7 +4,7 @@
 //! `short_conv_rows` declares no parameters.
 
 use super::cases::{packing_statics, projection_shape, scale_extent, scale_statics};
-use super::{EntryTuning, ModelInputs, PointShape, TuningInputs};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project};
@@ -88,6 +88,10 @@ impl EntryTuning for ShortConvProjectTuning {
             &[("BS", Some(b)), ("CS", Some(c)), ("XS", Some(x))],
         )?);
         Ok(statics)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
     }
 
     fn rotation(
@@ -193,6 +197,10 @@ impl EntryTuning for ShortConvOutputTuning {
             &[("OB", Some(WeightKind::RecurrentOutput))],
         )?);
         Ok(statics)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
     }
 
     fn rotation(
