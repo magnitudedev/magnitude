@@ -34,7 +34,9 @@ fn a_counted_decode_is_live_at_its_launches_rows_and_context() {
         harness.request_at(&step, 0, &[first, first + 1]);
         step.complete().unwrap();
     }
-    let live = harness.watcher.shared().live().expect("a counted decode");
+    let shared = harness.watcher.shared();
+    eventually("the decode reads were never ranked", || shared.telemetry.fed_all());
+    let live = shared.live().expect("a counted decode");
     assert_eq!((live.steps, live.rows), (steps, 4.));
     // Each launch's context is its rows' positions plus one.
     assert_eq!(live.depth, 1001 + (steps as u32 - 1) / 2);

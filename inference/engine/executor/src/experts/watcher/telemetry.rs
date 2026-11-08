@@ -791,11 +791,22 @@ enum Fed {
     Group { steps: usize, merged: usize, choices: Vec<u32> },
 }
 
+/// What the stack's readers read of it, as its last feed left it
+/// ([`Telemetry::feed_stack`]): none of them feeds it or waits on its lock,
+/// so a reader never waits behind the milliseconds a feed takes.
+struct Ranked {
+    /// The load's counted decode ([`Stack::live`]).
+    live: Option<crate::assessment::LiveDecode>,
+    /// The group-read curve ([`Stack::group_curve`]).
+    group_curve: crate::experts::directory::MissCurve,
+}
+
 /// Everything telemetry records, under its one lock.
 struct Recorded {
     costs: Costs,
     facts: GroupFacts,
     feed: Feed,
+    ranked: Ranked,
     /// Each group's committed records, which each resize carries.
     records: Vec<usize>,
 }
@@ -809,8 +820,9 @@ pub(super) struct Telemetry {
     /// placer's, as it happens.
     slots: Arc<AtomicU64>,
     /// The ranking's stack, under a lock of its own: feeding it takes
-    /// milliseconds, which no step's completion waits behind. Taken before
-    /// `recorded`, never while holding it.
+    /// milliseconds, which no step's completion waits behind, and its
+    /// readers read what each feed publishes (`Recorded::ranked`), not the
+    /// stack. Taken before `recorded`, never while holding it.
     stack: Mutex<Stack>,
     /// Per layer, whether it is whole: its route writes no routing record,
     /// so it has no reads of a decode step
@@ -961,6 +973,7 @@ impl Telemetry {
     ) -> Self {
         let groups = layers.iter().map(|layer| layer.group + 1).max().unwrap_or(0);
         let looked = vec![seismic_io::Totals::default(); volumes.len()];
+        let stack = Stack::new(ranking, layers.len(), extents.widest);
         Self {
             routing: Routing {
                 maps: layers.iter().map(|layer| (layer.group, layer.map.clone())).collect(),
@@ -1007,10 +1020,11 @@ impl Telemetry {
                     experts: layers.iter().map(|layer| layer.experts).collect(),
                 },
                 feed: Feed { pending: Vec::new(), ended: None },
+                ranked: Ranked { live: stack.live(), group_curve: stack.group_curve().clone() },
                 records,
             }),
             slots,
-            stack: Mutex::new(Stack::new(ranking, layers.len(), extents.widest)),
+            stack: Mutex::new(stack),
             whole: layers.iter().map(|_| AtomicBool::new(false)).collect(),
             feedable: AtomicU64::new(0),
             spans,
@@ -1240,14 +1254,31 @@ impl Telemetry {
         };
         reads.retain(|(_, read, _)| !read.experts.is_empty());
         reads.sort_by_key(|(group, read, _)| (*group, read.layer, read.sequence));
+        let (mut decoded, mut unions) = (false, Vec::new());
         for (_, read, fed) in reads {
             match fed {
-                Fed::Decode { counted } => stack.read(&read, counted),
+                Fed::Decode { counted } => {
+                    stack.read(&read, counted);
+                    decoded = true;
+                }
                 Fed::Group { steps, merged, choices } => {
                     let depths = stack.read_group(&read, &choices);
-                    self.lock().facts.unions[read.layer] = Some(GroupUnion::new(steps, merged, depths.into_iter().zip(choices).collect()));
+                    unions.push((read.layer, GroupUnion::new(steps, merged, depths.into_iter().zip(choices).collect())));
                 }
             }
+        }
+        // Each union with the curve it was counted into, in one take.
+        let live = decoded.then(|| stack.live());
+        let curve = (!unions.is_empty()).then(|| stack.group_curve().clone());
+        let recorded = &mut *self.lock();
+        for (layer, union) in unions {
+            recorded.facts.unions[layer] = Some(union);
+        }
+        if let Some(live) = live {
+            recorded.ranked.live = live;
+        }
+        if let Some(curve) = curve {
+            recorded.ranked.group_curve = curve;
         }
     }
 
@@ -1263,13 +1294,13 @@ impl Telemetry {
     /// What weighs a prompt group's places against the bank's slots
     /// (`GroupReads`): each layer's terms ([`GroupFacts::terms`]) and last
     /// group union, one expert's stored bytes a layer, the group-read curve
-    /// and the run's read line; none until the run has measured every
-    /// layer's compute and counted a group's reads at every layer.
+    /// and the run's read line, as the stack's last feed left the unions and
+    /// the curve ([`Ranked`]); none until the run has measured every layer's
+    /// compute and counted a group's reads at every layer.
     pub(super) fn group_reads(&self, lines: Option<Arc<[ExpertLines]>>, notice: Notice) -> Option<GroupReads> {
-        let stack = self.fed();
         let recorded = self.lock();
         let unions = recorded.facts.unions.iter().cloned().collect::<Option<Vec<_>>>()?;
-        let curve = stack.group_curve().clone();
+        let curve = recorded.ranked.group_curve.clone();
         GroupReads::new(
             recorded.facts.terms()?,
             unions,
@@ -1566,10 +1597,10 @@ impl Telemetry {
         }
     }
 
-    /// What the load's counted decode read and ran so far
-    /// ([`Stack::live`]); none before it counted a step.
+    /// What the load's counted decode read and ran so far, as the stack's
+    /// last feed left it ([`Ranked`]); none before it counted a step.
     pub(super) fn live(&self) -> Option<crate::assessment::LiveDecode> {
-        self.fed().live()
+        self.lock().ranked.live.clone()
     }
 
     /// Step `sequence`'s routing record at each streamed layer, each layer's
