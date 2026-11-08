@@ -307,11 +307,16 @@ const PAGE_FILL_PROBE_BYTES: usize = 256 << 20;
 /// taking the store, the fastest one program can take it at, measured of
 /// the machine (host RAM's page-fill rate, [`Self::of_machine`]; a volume's
 /// sequential write rate, [`super::VolumeReserve`]). So no margin is zero.
+/// That fastest rate is a burst's: what one program takes before a release
+/// lands. What another program sustains over time is `sustained`, the
+/// fastest take seen across readings, none before one is seen.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "MotionFigures")]
 pub struct StoreMotion {
     fluctuation: u64,
     take_rate: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sustained: Option<f64>,
 }
 
 /// A take rate is finite by construction ([`StoreMotion::new`]).
@@ -323,26 +328,49 @@ impl Eq for StoreMotion {}
 struct MotionFigures {
     fluctuation: u64,
     take_rate: f64,
+    #[serde(default)]
+    sustained: Option<f64>,
+}
+
+/// Whether `rate` is a measured rate: finite and positive.
+fn is_rate(rate: f64) -> bool {
+    rate.is_finite() && rate > 0.0
 }
 
 impl TryFrom<MotionFigures> for StoreMotion {
     type Error = String;
 
     fn try_from(figures: MotionFigures) -> Result<Self, String> {
-        match figures.take_rate.is_finite() && figures.take_rate > 0.0 {
-            true => Ok(Self { fluctuation: figures.fluctuation, take_rate: figures.take_rate }),
-            false => Err(format!("a take rate is measured and positive, not {}", figures.take_rate)),
+        match (is_rate(figures.take_rate), figures.sustained.is_none_or(is_rate)) {
+            (true, true) => Ok(Self { fluctuation: figures.fluctuation, take_rate: figures.take_rate, sustained: figures.sustained }),
+            _ => Err(format!(
+                "take rates are measured and positive, not {} and {:?}",
+                figures.take_rate, figures.sustained
+            )),
         }
     }
 }
 
 impl StoreMotion {
+    /// A motion measured across readings: `fluctuation`, and another
+    /// program seen taking the store at `take_rate`, sustained.
+    ///
     /// # Panics
     /// Where `take_rate` (bytes a second) is not a positive finite rate:
     /// what bounds a take is measured, never zero.
     pub fn new(fluctuation: u64, take_rate: f64) -> Self {
-        assert!(take_rate.is_finite() && take_rate > 0.0, "a take rate is measured and positive, not {take_rate}");
-        Self { fluctuation, take_rate }
+        assert!(is_rate(take_rate), "a take rate is measured and positive, not {take_rate}");
+        Self { fluctuation, take_rate, sustained: Some(take_rate) }
+    }
+
+    /// A store's motion before any reading of it: the fastest one program
+    /// can take it at, `take_rate`, a burst no program was seen sustain.
+    ///
+    /// # Panics
+    /// Where `take_rate` is not a positive finite rate.
+    pub fn prior(take_rate: f64) -> Self {
+        assert!(is_rate(take_rate), "a take rate is measured and positive, not {take_rate}");
+        Self { fluctuation: 0, take_rate, sustained: None }
     }
 
     /// The machine's own motion before any reading of it: no measured
@@ -360,7 +388,7 @@ impl StoreMotion {
     /// `PhysicalIdentity::Host`), measured and stored there when it keeps
     /// none; elsewhere, measured once per process.
     pub fn of_machine(machine: Option<(&std::path::Path, &DeviceTopology)>) -> Self {
-        Self::new(0, page_rate(machine, "page-fill", |probe| probe.fill))
+        Self::prior(page_rate(machine, "page-fill", |probe| probe.fill))
     }
 
     /// The margin a planning line holds above its store's own line, for a
@@ -369,61 +397,51 @@ impl StoreMotion {
     /// `releasing`'s bytes at its rate (none of a store nothing of ours
     /// releases in, a volume's):
     ///
-    /// `fluctuation + t·(interval + latency) + max(0, t − r)·B / r`
+    /// `fluctuation + t·(interval + latency) + max(0, s − r)·B / r`
     ///
-    /// for the take rate `t`, release rate `r` and releasable bytes `B`:
-    /// the rest of the host takes `t·(interval + latency)` before the first
-    /// release lands, and while it takes faster than the load releases, the
-    /// deficit grows at `t − r` for the `B / r` releasing runs.
+    /// for the take rate `t`, the sustained take `s`, release rate `r` and
+    /// releasable bytes `B`: one program takes at most `t` before the first
+    /// release lands, so the rest of the host takes `t·(interval + latency)`
+    /// by then; and while another program sustains a take faster than the
+    /// load releases, the deficit grows at `s − r` for the `B / r` releasing
+    /// runs. A burst is no sustained take: before one is seen across
+    /// readings, the releasing adds nothing. Held for the `B / r` seconds a
+    /// release of a 25.2 GB bank runs at 3.1 GB/s, an M4 Pro's 28.8 GB/s
+    /// page-fill burst would be a 208 GB take of a 51.5 GB store.
     ///
     /// The rest of the host never takes more of a store than it holds, so
-    /// the margin of a store a load releases in is at most the store's
-    /// bytes. Its terms are measured rates, of other programs and of the
-    /// load's releases: a margin past the store is a measurement that
-    /// cannot be, reported as an invariant violation with every input
-    /// (a panic in debug and test builds). A release build then holds the
-    /// take before the first release lands, never a line past the store
-    /// that would read every reading as Reclaim and drive the bank to its
-    /// floor.
+    /// the margin of a store a load releases in is within the store's
+    /// bytes. A margin past them is a measurement that cannot be: an
+    /// invariant violation reported with every input, a panic in debug and
+    /// test builds.
     pub fn margin(&self, interval: Duration, latency: Duration, releasing: Option<Releasing>) -> u64 {
-        let lead = self.lead(interval, latency);
+        let lead = self.fluctuation.saturating_add((self.take_rate * (interval + latency).as_secs_f64()) as u64);
         let Some(releasing) = releasing else {
             return lead;
         };
-        let shortfall = (self.shortfall_ratio(releasing.rate) * releasing.bytes as f64) as u64;
-        let margin = lead.saturating_add(shortfall);
-        if margin <= releasing.store_bytes {
-            return margin;
-        }
-        tracing::error!(
-            margin,
-            store_bytes = releasing.store_bytes,
-            fluctuation = self.fluctuation,
-            take_rate = self.take_rate,
-            release_rate = releasing.rate.bytes_per_second(),
-            releasable = releasing.bytes,
-            interval = ?interval,
-            latency = ?latency,
-            "invariant violated: a memory margin exceeds the store it is held in"
-        );
-        if cfg!(any(debug_assertions, test)) {
-            panic!(
-                "invariant violated: a margin of {margin} bytes in a store of {} ({self:?}, {releasing:?}, interval {interval:?}, latency {latency:?})",
-                releasing.store_bytes
+        let growth = self.sustained.map_or(0.0, |sustained| (sustained - releasing.rate.0).max(0.0) / releasing.rate.0);
+        let margin = lead.saturating_add((growth * releasing.bytes as f64) as u64);
+        if margin > releasing.store_bytes {
+            tracing::error!(
+                margin,
+                store_bytes = releasing.store_bytes,
+                fluctuation = self.fluctuation,
+                take_rate = self.take_rate,
+                sustained = ?self.sustained,
+                release_rate = releasing.rate.bytes_per_second(),
+                releasable = releasing.bytes,
+                interval = ?interval,
+                latency = ?latency,
+                "invariant violated: a memory margin exceeds the store it is held in"
             );
+            if cfg!(any(debug_assertions, test)) {
+                panic!(
+                    "invariant violated: a margin of {margin} bytes in a store of {} ({self:?}, {releasing:?}, interval {interval:?}, latency {latency:?})",
+                    releasing.store_bytes
+                );
+            }
         }
-        lead.min(releasing.store_bytes)
-    }
-
-    /// The fluctuation and what the host takes before a first release
-    /// lands: `fluctuation + t·(interval + latency)`.
-    fn lead(&self, interval: Duration, latency: Duration) -> u64 {
-        self.fluctuation.saturating_add((self.take_rate * (interval + latency).as_secs_f64()) as u64)
-    }
-
-    /// `g = max(0, t − r) / r`: what the deficit grows by per byte released.
-    fn shortfall_ratio(&self, release: ReleaseRate) -> f64 {
-        (self.take_rate - release.0).max(0.0) / release.0
+        margin
     }
 
     pub fn fluctuation(&self) -> u64 {
@@ -437,12 +455,17 @@ impl StoreMotion {
     /// The larger of each figure: what a later measurement adds to an
     /// earlier one, which it never lowers.
     pub fn with(self, other: Self) -> Self {
-        Self::new(self.fluctuation.max(other.fluctuation), self.take_rate.max(other.take_rate))
+        let sustained = match (self.sustained, other.sustained) {
+            (Some(one), Some(other)) => Some(one.max(other)),
+            (one, other) => one.or(other),
+        };
+        Self { fluctuation: self.fluctuation.max(other.fluctuation), take_rate: self.take_rate.max(other.take_rate), sustained }
     }
 }
 
 /// The rate a load releases memory at, measured and positive: a finished
-/// release's bytes over its span from decision to effect, the slowest
+/// release's bytes over the span they took to release (its wait for queued
+/// steps apart, `ResizeTimes::releasing`), the slowest
 /// measured; before any, the machine's page-release rate
 /// ([`Self::of_machine`]).
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2366,12 +2389,43 @@ mod tests {
         assert_eq!(serving.releasing(Some(ReleaseRate::new(16e9)), Releasable { host: 4 * GIB, device: 0 }).release_rate(), ReleaseRate::new(8e9));
     }
 
+    /// A burst is no sustained take: before another program is seen
+    /// sustaining a take, the margin holds the burst only until the first
+    /// release lands. The inputs an uncapped Flash Next load on a 48 GiB
+    /// M4 Pro read: a 28.8 GB/s page-fill rate, releases at 3.1 GB/s, 25.2 GB
+    /// of its bank releasable; the burst held over the releasing would be a
+    /// 208 GB margin.
+    #[test]
+    fn a_burst_takes_only_until_the_first_release_lands() {
+        let interval = Duration::from_millis(100);
+        let latency = Duration::from_micros(6_048);
+        let store_bytes = 48 * GIB;
+        let releasing = Some(Releasing { rate: ReleaseRate::new(3.1e9), bytes: 25_200_000_000, store_bytes });
+        let burst = StoreMotion::prior(28.8e9);
+        let lead = (28.8e9 * (interval + latency).as_secs_f64()) as u64;
+        assert_eq!(burst.margin(interval, latency, releasing), lead);
+        assert!(lead < store_bytes);
+    }
+
+    /// A take another program sustains across readings faster than the load
+    /// releases grows the deficit over the releasing: at twice the release
+    /// rate, a byte per byte released, on the burst's lead.
+    #[test]
+    fn a_sustained_take_grows_the_margin_over_the_releasing() {
+        let interval = Duration::from_millis(100);
+        let latency = Duration::from_millis(100);
+        let releasing = Some(Releasing { rate: ReleaseRate::new(3.1e9), bytes: 25_200_000_000, store_bytes: 48 * GIB });
+        let measured = StoreMotion::prior(28.8e9).with(StoreMotion::new(0, 6.2e9));
+        assert_eq!(measured.take_rate(), 28.8e9, "the burst stays the fastest seen");
+        assert_eq!(measured.margin(interval, latency, releasing), 5_760_000_000 + 25_200_000_000);
+    }
+
     /// The rest of the host never takes more of a store than it holds: a
     /// margin past it is a measurement that cannot be, an invariant
-    /// violation (a panic in test builds), never a line that would hold the
-    /// whole store. A 114 MB/s release of a 20 GB bank against a 10 GB/s
-    /// take, as a release rate read over its wait for queued steps made it,
-    /// is a 1.7 TB margin in a 48 GB store.
+    /// violation (a panic in test builds). A 114 MB/s release of a 20 GB
+    /// bank against a sustained 10 GB/s take, as a release rate read over
+    /// its wait for queued steps made it, is a 1.7 TB margin in a 48 GB
+    /// store.
     #[test]
     fn a_margin_past_its_store_is_an_invariant_violation() {
         let motion = StoreMotion::new(0, 10e9);

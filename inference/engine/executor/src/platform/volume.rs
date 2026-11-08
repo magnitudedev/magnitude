@@ -87,7 +87,7 @@ impl StoreMotion {
     /// keep none; elsewhere, measured.
     pub fn of_volume(path: &Path, volume: &VolumeId, cache: Option<&Path>) -> Result<Self, ObservationError> {
         let figure = cache.zip(volume.uuid.as_ref()).map(|(cache, uuid)| (cache, format!("volume-write:{uuid}")));
-        Ok(Self::new(0, machine_rate(figure, || write_rate(path).map_err(|error| failed(path, error)))?))
+        Ok(Self::prior(machine_rate(figure, || write_rate(path).map_err(|error| failed(path, error)))?))
     }
 }
 
