@@ -315,7 +315,9 @@ const PAGE_FILL_PROBE_BYTES: usize = 256 << 20;
 pub struct StoreMotion {
     fluctuation: u64,
     take_rate: f64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Written whether or not it is known: the worker transport's encoding
+    /// is positional (postcard), so an omitted field misreads every field
+    /// after it. JSON writes `null`, which `MotionFigures` reads as none.
     sustained: Option<f64>,
 }
 

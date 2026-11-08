@@ -1122,22 +1122,81 @@ pub(crate) mod tests {
         assert_send::<ExecutionManifest>();
     }
 
-    /// The manifest crosses to a worker process in the protocol encoding and
-    /// arrives unchanged.
+    /// The manifest crosses to a worker process in the protocol encoding, as
+    /// the `Load` the host frames for it (`FramedTransport`), and arrives
+    /// unchanged, whichever of its optional parts are known: every path the
+    /// host may or may not name, and reserves whose host motion has or has
+    /// not seen a sustained take, with or without a device's motion, either
+    /// way. Postcard is positional, so a field a serializer omits when absent
+    /// (`skip_serializing_if`) misreads everything after it; every field is
+    /// compared, not just the encoding.
     #[test]
     fn execution_manifest_round_trips_through_the_worker_encoding() {
-        let manifest = manifest_with_kernel_cache(Some(PathBuf::from("/cache/kernels")));
-        let encoded = postcard::to_allocvec(&manifest).unwrap();
-        let decoded: ExecutionManifest = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded.package, manifest.package);
-        assert_eq!(decoded.definition, manifest.definition);
-        assert_eq!(decoded.model, manifest.model);
-        assert_eq!(decoded.device, manifest.device);
-        assert_eq!(decoded.reserves, manifest.reserves);
-        assert_eq!(decoded.kernel_cache, manifest.kernel_cache);
-        assert_eq!(decoded.tuning, manifest.tuning);
-        assert_eq!(decoded.tuning_trace, manifest.tuning_trace);
-        assert_eq!(postcard::to_allocvec(&decoded).unwrap(), encoded);
+        use crate::worker::protocol::{HostMessage, WorkerMessage};
+        use crate::worker::transport::{FramedTransport, MessageReceiver, MessageSender, Transport};
+        use magnitude_executor::platform::{MemoryReserves, StoreMotion};
+        /// A byte stream both ends share.
+        #[derive(Clone, Default)]
+        struct Stream(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Stream {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let path = |known: bool, name: &str| known.then(|| PathBuf::from(name));
+        let base = manifest_with_kernel_cache(None).reserves;
+        let motions = [None, Some(StoreMotion::prior(1e9)), Some(StoreMotion::new(4096, 2e9))];
+        for known in [false, true] {
+            for host in motions {
+                for device in motions {
+                    let mut manifest = manifest_with_kernel_cache(path(known, "/cache/kernels"));
+                    manifest.model_store = path(known, "/models");
+                    manifest.tuning_trace = path(known, "/traces/tuning.jsonl");
+                    manifest.reserves = MemoryReserves::measured(base, host, device);
+                    let stream = Stream::default();
+                    let (_, mut sender) =
+                        FramedTransport::<std::io::Empty, Stream, WorkerMessage, HostMessage>::new(
+                            std::io::empty(),
+                            stream.clone(),
+                        )
+                        .split();
+                    sender
+                        .send(HostMessage::Load {
+                            manifest: manifest.clone(),
+                            unprepared: magnitude_executor::UnpreparedUnits::Report,
+                        })
+                        .unwrap();
+                    let bytes = stream.0.lock().unwrap().clone();
+                    let (mut receiver, _) = FramedTransport::<_, std::io::Sink, HostMessage, WorkerMessage>::new(
+                        std::io::Cursor::new(bytes),
+                        std::io::sink(),
+                    )
+                    .split();
+                    let case = format!("paths known {known}, host {host:?}, device {device:?}");
+                    let Some(HostMessage::Load { manifest: decoded, .. }) =
+                        receiver.receive().unwrap_or_else(|error| panic!("{case}: {error}"))
+                    else {
+                        panic!("{case}: the frame is not the Load sent");
+                    };
+                    assert_eq!(decoded.package, manifest.package, "{case}");
+                    assert_eq!(decoded.definition, manifest.definition, "{case}");
+                    assert_eq!(decoded.model, manifest.model, "{case}");
+                    assert_eq!(format!("{:?}", decoded.service), format!("{:?}", manifest.service), "{case}");
+                    assert_eq!(decoded.path, manifest.path, "{case}");
+                    assert_eq!(decoded.device, manifest.device, "{case}");
+                    assert_eq!(decoded.kernel_cache, manifest.kernel_cache, "{case}");
+                    assert_eq!(decoded.model_store, manifest.model_store, "{case}");
+                    assert_eq!(decoded.reserves, manifest.reserves, "{case}");
+                    assert_eq!(decoded.tuning, manifest.tuning, "{case}");
+                    assert_eq!(decoded.tuning_trace, manifest.tuning_trace, "{case}");
+                    assert!(receiver.receive().unwrap().is_none(), "{case}: one frame");
+                }
+            }
+        }
     }
 
     /// A fixture manifest whose host named `kernel_cache`.
