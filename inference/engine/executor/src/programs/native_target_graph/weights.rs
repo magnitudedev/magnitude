@@ -778,7 +778,7 @@ pub(crate) fn projection_ports<G: GraphDraft>(
     graph: &mut G,
     load: &ModelLoadPlan,
     scope: WeightScope,
-    levels: crate::programs::graph::readout::Levels,
+    certified: bool,
     ports: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
 ) -> Result<crate::programs::graph::readout::ProjectionPorts, GraphError> {
@@ -798,8 +798,7 @@ pub(crate) fn projection_ports<G: GraphDraft>(
             let planes = magnitude_family_contracts::ProgressivePlane::ALL
                 .into_iter()
                 .filter(|plane| {
-                    levels.reads_radius()
-                        || *plane != magnitude_family_contracts::ProgressivePlane::Radius
+                    certified || *plane != magnitude_family_contracts::ProgressivePlane::Radius
                 })
                 .map(|plane| {
                     Ok((
@@ -817,11 +816,7 @@ pub(crate) fn projection_ports<G: GraphDraft>(
                     ))
                 })
                 .collect::<Result<Vec<_>, GraphError>>()?;
-            ProjectionPorts::Progressive {
-                depth,
-                levels,
-                planes,
-            }
+            ProjectionPorts::Progressive { depth, planes }
         }
         HeadPlans::Qualified { .. } => unreachable!("a recipe was selected above"),
     })

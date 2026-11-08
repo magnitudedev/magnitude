@@ -1441,10 +1441,9 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     };
     let readout_vocabulary = vocabulary;
     let mut leading = Vec::new();
-    // Draft logits read the projection's vocabulary prefix as it is stored:
-    // the packed projection, or the planes of a scope stored as them
-    // (`ModelLoadPlan::finalize_readout`), through their first view, since a
-    // proposal is only ever verified (`readout::Levels::View`).
+    // Full draft logits read the projection's vocabulary prefix as it is
+    // stored: the packed projection, or the planes of a scope stored as them
+    // (`ModelLoadPlan::finalize_readout`), through their full pass.
     let plans = readout::HeadPlans::of(load, projection_scope)?.selected();
     let mut prefix = |plan: &crate::WeightPlan| -> Result<NativePort, GraphError> {
         let mut shape = plan.shape.clone();
@@ -1486,11 +1485,9 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 .progressive_depth()
                 .ok_or("progressive projection has no code depth")?;
             dimensions.push(("P", u64::from(depth.rest_planes())));
-            let levels = readout::Levels::proposing(outputs);
             readout::ProjectionPorts::Progressive {
                 depth,
-                levels,
-                planes: readout::HeadPlans::read_planes(planes, levels)
+                planes: readout::HeadPlans::read_planes(planes, false)
                     .map(|(plane, weight)| Ok((plane, prefix(weight)?)))
                     .collect::<Result<_, GraphError>>()?,
             }

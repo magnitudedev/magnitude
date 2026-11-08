@@ -29,20 +29,18 @@
 //!
 //! A class's choice is not its scope's stored form. A scope is stored in one
 //! form, and every reader's every class reads it: its certified classes
-//! through the bounded levels, a proposing reader's classes through the first
-//! view, every other class through the planes' full pass, or all of them
-//! through the packed projection. So each class's qualification also times
-//! its read through the planes beside the two recipes ([`RecipeCosts`]), and
-//! the scope stores whichever form its readers' classes, weighed by the load's
-//! demand, cost less in all ([`stores_planes`]). A class that cannot be
-//! certified (one past the rows the levels serve on its backend) has no
-//! bounded recipe, and a proposing class needs none ([`class_levels`]): each
-//! is priced through the packed projection and its planes read alone.
+//! through the bounded levels, every other class through the planes' full
+//! pass, or all of them through the packed projection. So each class's
+//! qualification also times the full pass beside the two recipes
+//! ([`RecipeCosts`]), and the scope stores whichever form its readers' classes,
+//! weighed by the load's demand, cost less in all ([`stores_planes`]). A class
+//! that cannot be certified (a draft's, or one past the rows the levels serve
+//! on its backend, [`bounds_rows`]) has no bounded recipe: it is priced through
+//! the packed projection and the full pass alone.
 
 use super::{ComposedCensus, ComposedContender, PointShape, TuningInputs, TuningKey};
 use crate::native::specialization::{entry_statics, prepare_program};
 use crate::native::{CatalogFailure, ProgressiveReadoutKernels, ProjectionKernels};
-use crate::programs::graph::readout::Levels;
 use crate::{KernelCache, TuningCacheKey};
 use magnitude_family_contracts::{ProgressiveCodeDepth, ProgressivePlane, WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -94,9 +92,8 @@ pub(crate) struct QualifiedRecipe {
 /// One class's measured cost of a whole readout invocation in each form its
 /// scope's projection can be read through, in seconds: the packed
 /// projection, the bounded levels over the planes where the class has them
-/// ([`class_levels`]), and its uncertified read of the planes (their full
-/// pass, or a proposing class's first view). All are timed on the same rows
-/// in the same comparison.
+/// ([`bounds_rows`]), and the planes' full pass. All are timed on the same
+/// rows in the same comparison.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RecipeCosts {
     pub packed: f64,
@@ -138,21 +135,13 @@ pub(crate) struct ClassCost {
     pub costs: Option<FormCosts>,
 }
 
-/// What a class of `rows` selected rows reads through its scope's planes.
-/// A proposing reader's selections are only ever verified, so its classes
-/// read the first view wherever the levels serve their rows
-/// ([`Levels::proposing`]). Any other class has bounded levels when its rows
-/// are within those the levels serve on `backend`
-/// ([`crate::programs::graph::readout::certified_rows`]), and reads the full
-/// pass otherwise. Only a class with bounded levels certifies a selection.
-pub(crate) fn class_levels(proposes: bool, rows: u64, backend: BackendName) -> Levels {
-    if proposes {
-        Levels::proposing(rows)
-    } else if rows <= crate::programs::graph::readout::certified_rows(backend) {
-        Levels::Certified
-    } else {
-        Levels::Full
-    }
+/// Whether a class of `rows` selected rows has bounded levels: when its
+/// reader certifies a selection and the rows are within those the levels
+/// serve on `backend` ([`crate::programs::graph::readout::certified_rows`]).
+/// Any other class is priced through the packed projection and the full
+/// pass alone, and certifies nothing.
+pub(crate) fn bounds_rows(certifies: bool, rows: u64, backend: BackendName) -> bool {
+    certifies && rows <= crate::programs::graph::readout::certified_rows(backend)
 }
 
 /// Whether a scope is stored as its planes: when every class its readers
@@ -194,10 +183,9 @@ pub(crate) struct ReadoutContender<'a> {
     pub state: RecipeState,
     pub dependency: TuningKey,
     pub preparation: RecipePreparation,
-    /// What the class reads through the planes ([`class_levels`]): one
-    /// without bounded levels is priced through the packed projection and
-    /// that read alone.
-    levels: Levels,
+    /// Whether the class has bounded levels ([`bounds_rows`]): one without
+    /// them is priced through the packed projection and the full pass alone.
+    bounded: bool,
     canonical_seconds: f64,
     candidate_seconds: f64,
     receipt: ReadoutChoiceReceipt,
@@ -234,7 +222,7 @@ impl<'a> ReadoutContender<'a> {
         state: RecipeState,
         dependency: TuningKey,
         preparation: RecipePreparation,
-        levels: Levels,
+        bounded: bool,
     ) -> Self {
         Self {
             recipe,
@@ -247,7 +235,7 @@ impl<'a> ReadoutContender<'a> {
             state,
             dependency,
             preparation,
-            levels,
+            bounded,
             canonical_seconds: 0.0,
             candidate_seconds: 0.0,
             receipt: ReadoutChoiceReceipt {
@@ -755,13 +743,13 @@ impl RecipeCase {
         Ok(start.elapsed().as_secs_f64())
     }
 
-    /// Push the first level, writing its view, floor, features and lengths.
-    fn push_top(
+    /// Run the bounded progressive recipe once; the seconds it took.
+    fn bounded(
         &mut self,
-        batch: &mut NativeTensorBatch,
+        device: &seismic::Device,
         recipe: ReadoutRecipe,
         kernels: &ProgressiveReadoutKernels,
-    ) -> Result<(), CatalogFailure> {
+    ) -> Result<f64, CatalogFailure> {
         let [top, bit3, rest, scales, radius] = &self.planes;
         // The entry reads the rows as their `[M, PT, D]` parts.
         let rows = self.hidden.extents()[0];
@@ -769,6 +757,7 @@ impl RecipeCase {
             .hidden
             .reshape(&[rows, recipe.parts, recipe.hidden])
             .map_err(fail)?;
+        let mut batch = NativeTensorBatch::new(device);
         batch
             .push(
                 &kernels.top,
@@ -796,19 +785,6 @@ impl RecipeCase {
                 },
             )
             .map_err(fail)?;
-        Ok(())
-    }
-
-    /// Run the bounded progressive recipe once; the seconds it took.
-    fn bounded(
-        &mut self,
-        device: &seismic::Device,
-        recipe: ReadoutRecipe,
-        kernels: &ProgressiveReadoutKernels,
-    ) -> Result<f64, CatalogFailure> {
-        let mut batch = NativeTensorBatch::new(device);
-        self.push_top(&mut batch, recipe, kernels)?;
-        let [top, bit3, rest, scales, radius] = &self.planes;
         batch
             .push(
                 &kernels.refine,
@@ -863,41 +839,8 @@ impl RecipeCase {
         Ok(start.elapsed().as_secs_f64())
     }
 
-    /// Run a class's read of the planes without bounded levels once: a
-    /// proposing class's first view, any other class's full pass (a class
-    /// with bounded levels reads it when its qualification does not certify
-    /// them); the seconds it took.
-    fn uncertified(
-        &mut self,
-        device: &seismic::Device,
-        recipe: ReadoutRecipe,
-        kernels: &ProgressiveReadoutKernels,
-        levels: Levels,
-    ) -> Result<f64, CatalogFailure> {
-        match levels {
-            Levels::View => self.view(device, recipe, kernels),
-            Levels::Full | Levels::Certified => self.planes(device, recipe, kernels),
-        }
-    }
-
-    /// Run the first level alone once, a proposing class's whole read of
-    /// the planes (`Levels::View`); the seconds it took.
-    fn view(
-        &mut self,
-        device: &seismic::Device,
-        recipe: ReadoutRecipe,
-        kernels: &ProgressiveReadoutKernels,
-    ) -> Result<f64, CatalogFailure> {
-        let mut batch = NativeTensorBatch::new(device);
-        self.push_top(&mut batch, recipe, kernels)?;
-        let start = Instant::now();
-        batch.submit().map_err(fail)?.wait().map_err(fail)?;
-        Ok(start.elapsed().as_secs_f64())
-    }
-
     /// Run the planes' full pass once, the readout of every class a scope
-    /// stored as planes neither certifies nor proposes from; the seconds it
-    /// took.
+    /// stored as planes does not certify; the seconds it took.
     fn planes(
         &mut self,
         device: &seismic::Device,
@@ -1101,21 +1044,20 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         let measured = Instant::now();
         let progressive = formed.progressive.as_ref().unwrap();
         self.canonical_seconds = case.packed(inputs.device, self.recipe, &packed)?;
-        let bounded = match self.levels {
-            Levels::Certified => {
+        let bounded = match self.bounded {
+            true => {
                 self.candidate_seconds = case.bounded(inputs.device, self.recipe, progressive)?;
                 self.receipt
                     .pairs
                     .push((self.canonical_seconds, self.candidate_seconds));
                 Some(self.candidate_seconds)
             }
-            Levels::Full | Levels::View => None,
+            false => None,
         };
-        let planes = case.uncertified(inputs.device, self.recipe, progressive, self.levels)?;
+        let planes = case.planes(inputs.device, self.recipe, progressive)?;
         // Until a qualification times the class, its census prices it: the
-        // packed and full passes and the first view read every row alike,
-        // and the bounded levels only serve a class its qualification
-        // certifies.
+        // packed and full passes read every row alike, and the bounded
+        // levels only serve a class its qualification certifies.
         self.receipt.costs = Some(RecipeCosts {
             packed: self.canonical_seconds,
             bounded,
@@ -1196,13 +1138,13 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 check_deadline!();
                 case.prepare_features(inputs.device, self.recipe, &feature)?;
             }
-            if self.levels != Levels::Certified {
+            if !self.bounded {
                 // Both forms read every row alike, so any rows price them;
                 // each writes its outputs here first, outside the rounds.
                 check_deadline!();
                 case.packed(inputs.device, self.recipe, &packed)?;
                 check_deadline!();
-                case.uncertified(inputs.device, self.recipe, progressive, self.levels)?;
+                case.planes(inputs.device, self.recipe, progressive)?;
                 cases.push(case);
                 continue;
             }
@@ -1251,7 +1193,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         // rounds in which it can resolve as a lead at the search's error
         // rate, and ends with its first round that is not ahead. A class
         // without bounded levels compares nothing: its rounds, as many,
-        // price the packed projection and its planes read alone.
+        // price the packed projection and the full pass alone.
         let rate = super::SEARCH_SETTINGS.error_rate;
         let mut tally = Tally::default();
         let mut shuffle = Shuffle::default();
@@ -1288,8 +1230,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             let mut round = [0.; 3];
             for case in &mut cases {
                 check_deadline!();
-                let certified = self.levels == Levels::Certified;
-                let mut order = match certified {
+                let mut order = match self.bounded {
                     true => vec![0, 1, 2],
                     false => vec![0, 2],
                 };
@@ -1309,13 +1250,13 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                             case.bounded(inputs.device, self.recipe, progressive)?
                         }
                         _ => {
-                            case.uncertified(inputs.device, self.recipe, progressive, self.levels)?;
+                            case.planes(inputs.device, self.recipe, progressive)?;
                             check_deadline!();
-                            case.uncertified(inputs.device, self.recipe, progressive, self.levels)?
+                            case.planes(inputs.device, self.recipe, progressive)?
                         }
                     };
                 }
-                if certified {
+                if self.bounded {
                     self.receipt.pairs.push((seconds[0], seconds[1]));
                     difference += seconds[1] / seconds[0] - 1.;
                 }
@@ -1329,13 +1270,12 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             }
             samples += cases.len() as u32;
             let [packed, bounded, planes] = sums.map(|sum| sum / f64::from(samples));
-            let certified = self.levels == Levels::Certified;
             self.receipt.costs = Some(RecipeCosts {
                 packed,
-                bounded: certified.then_some(bounded),
+                bounded: self.bounded.then_some(bounded),
                 planes,
             });
-            if !certified {
+            if !self.bounded {
                 continue;
             }
             tally.observe(difference);
@@ -1343,10 +1283,9 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 break;
             }
         }
-        if self.levels != Levels::Certified {
+        if !self.bounded {
             self.receipt.reason = format!(
-                "priced through the packed projection and its {:?} planes read in {} rounds; no bounded levels at this class",
-                self.levels,
+                "priced through the packed projection and the full pass in {} rounds; no bounded levels at this class",
                 tally.fewest(rate)
             );
             return Ok(false);
@@ -1472,23 +1411,18 @@ mod tests {
         assert!(!stores_planes(std::iter::empty()));
     }
 
-    /// Bounded levels exist only for a target class at rows the levels serve
-    /// on its backend; every target class past that bound reads the full
-    /// pass. A proposing reader's classes read the first view at every row
-    /// count the levels serve, on every backend, and the full pass beyond:
-    /// each class without bounded levels is priced through the packed
-    /// projection and that read alone, and certifies nothing.
+    /// Bounded levels exist only for a class a certifying reader selects at
+    /// rows the levels serve on its backend: a draft's classes and every
+    /// class past that bound are priced through the packed projection and
+    /// the full pass alone, and a class without them certifies nothing.
     #[test]
     fn bounded_levels_exist_only_where_they_serve() {
         for (backend, served) in [(BackendName::Metal, 1), (BackendName::Cuda, 4)] {
-            assert_eq!(class_levels(false, served, backend), Levels::Certified);
-            assert_eq!(class_levels(false, served + 1, backend), Levels::Full);
-            for rows in [1, served + 1, 8] {
-                assert_eq!(class_levels(true, rows, backend), Levels::View);
-            }
-            assert_eq!(class_levels(true, 9, backend), Levels::Full);
+            assert!(bounds_rows(true, served, backend));
+            assert!(!bounds_rows(true, served + 1, backend));
+            assert!(!bounds_rows(false, 1, backend));
         }
-        assert_eq!(class_levels(false, 1, BackendName::Vulkan), Levels::Full);
+        assert!(!bounds_rows(true, 1, BackendName::Vulkan));
         let priced = RecipeCosts {
             packed: 2.,
             bounded: None,
@@ -1560,7 +1494,7 @@ mod tests {
             state.clone(),
             ("readout_head_rows", "head".into(), super::super::FixedValues::default()),
             RecipePreparation::default(),
-            Levels::Full,
+            false,
         );
         let launch = |term, rows| Launch {
             term,
@@ -1776,7 +1710,7 @@ mod tests {
                     RecipeState::default(),
                     dependency.clone(),
                     RecipePreparation::default(),
-                    Levels::Certified,
+                    true,
                 )
             };
             let found = |contender: &mut ReadoutContender, canonical: &NativeSpecialization| {
@@ -1853,7 +1787,7 @@ mod tests {
                     RecipeState::default(),
                     dependency.clone(),
                     RecipePreparation::default(),
-                    Levels::Certified,
+                    true,
                 )
             };
             // Another load recorded its winner against the plain canonical.

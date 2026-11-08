@@ -256,6 +256,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     geometry: &SharedHeadGeometry<'_>,
     class: SharedHeadGraphClass,
+    backend: BackendName,
 ) -> Result<SharedHeadGraphParts<G>, GraphError> {
     if class.slots == 0 || class.steps == 0 {
         return Err(format!("shared head graph class {class:?} is inconsistent").into());
@@ -287,17 +288,13 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         &mut constants,
     )?;
     let output_norm = weight(&mut graph, load, head, WeightKind::OutputNorm, &mut weights)?;
-    // Its proposals are only ever verified, so an unclustered head stored as
-    // planes reads their first view (`readout::Levels::View`).
-    let levels = match geometry.plan.clustered {
-        Some(_) => readout::Levels::Full,
-        None => readout::Levels::proposing(slots),
-    };
+    let certified = geometry.plan.clustered.is_none()
+        && readout::HeadPlans::for_recipe(load, head, head, true)?.certifies(slots, backend);
     let own_table = projection_ports(
         &mut graph,
         load,
         head,
-        levels,
+        certified,
         &mut weights,
         &mut constants,
     )?;
@@ -896,6 +893,7 @@ pub(crate) fn checked_shared_head_family_storage(
             load,
             geometry,
             class,
+            backend,
         )
         .map_err(|error| error.context(context()))?;
         family.include_plan(parts.plan.plan_heap())?;
@@ -994,6 +992,7 @@ impl PreparedSharedHeadGraphs {
                 load,
                 geometry,
                 class,
+                target_device.backend(),
             )
             .map_err(class_error)?;
             let plan = GraphDraft::seal(parts.plan).map_err(class_error)?;
