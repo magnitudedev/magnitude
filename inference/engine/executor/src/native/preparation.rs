@@ -1,7 +1,7 @@
 use super::specialization::{Specializer, Tuning};
 use super::tuning::readout_choice::{
     ClassCost, QualifiedRecipe, ReadoutContender, ReadoutRecipe, RecipePreparation, RecipeState,
-    bounds_rows, stores_planes,
+    stores_planes,
 };
 use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
@@ -886,7 +886,6 @@ impl<'a> Preparation<'a> {
         let weights = readout_weights(packed, norm_plan);
         let mut certified = Vec::new();
         for rows in selected_rows {
-            let bounded = bounds_rows(reader.certifies(), rows, device.backend());
             let point = super::tuning::PointShape {
                 label: format!("m{rows}"),
                 weight: 1.0,
@@ -900,7 +899,7 @@ impl<'a> Preparation<'a> {
             // budget it was qualified within.
             let budget = self.tuning.settings().map(|settings| settings.budget);
             let key = crate::TuningCacheKey::of(&format!(
-                "readout-recipe-v6/budget={budget:?}/device={:?}/{weights}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/bounded={bounded}/dependency={dependency:?}/{digest}",
+                "readout-recipe-v5/budget={budget:?}/device={:?}/{weights}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/dependency={dependency:?}/{digest}",
                 device.tuning_identity(),
                 self.epsilon.to_bits(),
                 softcap.to_bits(),
@@ -922,15 +921,16 @@ impl<'a> Preparation<'a> {
                 state.clone(),
                 dependency.clone(),
                 preparation.clone(),
-                bounded,
             );
-            let Some(selected) = self.tuning.register_composed(Box::new(contender))? else {
+            let Some(selected) = self
+                .tuning
+                .register_composed(Box::new(contender), point.rows)?
+            else {
                 continue;
             };
             // The choice and its costs are the record of the comparison
-            // against this load's canonical (`ReadoutContender::record`); a
-            // class without bounded levels is never selected.
-            let class_certified = selected && bounded;
+            // against this load's canonical (`ReadoutContender::record`).
+            let class_certified = selected && reader.certifies();
             if class_certified {
                 certified.push(point.rows);
             }
@@ -939,7 +939,8 @@ impl<'a> Preparation<'a> {
                 key.as_str().to_owned(),
                 ClassCost {
                     weight: state.weight,
-                    costs: state.costs.map(|costs| costs.stored(class_certified)),
+                    certified: class_certified,
+                    costs: state.costs,
                 },
             );
         }

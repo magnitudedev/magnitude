@@ -2667,14 +2667,6 @@ pub(super) trait ComposedContender<'a> {
         invocations: &crate::programs::invocation_demand::InvocationCounts,
         objective: &Objective,
     );
-    /// The rows of the contender's class at which it runs in `launch`, a
-    /// launch of its graph in a term of `phase`; none when it does not run
-    /// there. The demand walk counts its launches by this.
-    fn serves(
-        &self,
-        launch: &crate::programs::invocation_demand::Launch,
-        phase: workload::Phase,
-    ) -> Option<u64>;
     /// Form the contender and measure both recipes once: its discovery,
     /// run to its end. None when the contender cannot be formed or built.
     fn census(

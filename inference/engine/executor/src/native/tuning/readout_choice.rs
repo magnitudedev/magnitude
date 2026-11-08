@@ -33,10 +33,7 @@
 //! pass, or all of them through the packed projection. So each class's
 //! qualification also times the full pass beside the two recipes
 //! ([`RecipeCosts`]), and the scope stores whichever form its readers' classes,
-//! weighed by the load's demand, cost less in all ([`stores_planes`]). A class
-//! that cannot be certified (a draft's, or one past the rows the levels serve
-//! on its backend, [`bounds_rows`]) has no bounded recipe: it is priced through
-//! the packed projection and the full pass alone.
+//! weighed by the load's demand, cost less in all ([`stores_planes`]).
 
 use super::{ComposedCensus, ComposedContender, PointShape, TuningInputs, TuningKey};
 use crate::native::specialization::{entry_statics, prepare_program};
@@ -81,67 +78,31 @@ pub(crate) struct QualifiedRecipe {
     /// The class's measured costs, from its census on and its qualification
     /// once timed; kept whatever the class's choice.
     pub costs: Option<RecipeCosts>,
-    /// The class's executions per decode step of the load's demand: each
-    /// decode term's launches of it times the term's weight
-    /// ([`super::workload::terms`]), whatever is measured of the terms'
-    /// times, so that every open of the load weighs it alike. Prefill
-    /// launches are not among them ([`ReadoutContender::serves`]).
+    /// The class's weight in the load's objective: the launches its graphs
+    /// demand of it ([`super::apply_invocation_counts`]).
     pub weight: f64,
 }
 
 /// One class's measured cost of a whole readout invocation in each form its
 /// scope's projection can be read through, in seconds: the packed
-/// projection, the bounded levels over the planes where the class has them
-/// ([`bounds_rows`]), and the planes' full pass. All are timed on the same
-/// rows in the same comparison.
+/// projection, the bounded levels over the planes, and the planes' full
+/// pass. All three are timed on the same rows in the same comparison.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RecipeCosts {
     pub packed: f64,
-    pub bounded: Option<f64>,
-    pub planes: f64,
-}
-
-impl RecipeCosts {
-    /// The class's cost in each stored form: through the planes, its bounded
-    /// levels when they are `certified` and the full pass otherwise.
-    pub(crate) fn stored(self, certified: bool) -> FormCosts {
-        let planes = match (certified, self.bounded) {
-            (false, _) => self.planes,
-            (true, Some(bounded)) => bounded,
-            (true, None) => panic!("a certified class was timed through its bounded levels"),
-        };
-        FormCosts {
-            packed: self.packed,
-            planes,
-        }
-    }
-}
-
-/// A class's cost of a whole readout invocation when its scope is stored
-/// packed, and when it is stored as planes, in seconds.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct FormCosts {
-    pub packed: f64,
+    pub bounded: f64,
     pub planes: f64,
 }
 
 /// What one reader's class of a scope weighs in its stored form: its
-/// executions per decode step of the load's demand
-/// ([`QualifiedRecipe::weight`]) and its measured costs in each form, if any
-/// were measured.
+/// weight in the load's objective, whether its bounded levels are certified
+/// (it reads them when the scope is stored as planes), and its measured
+/// costs, if any were measured.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ClassCost {
     pub weight: f64,
-    pub costs: Option<FormCosts>,
-}
-
-/// Whether a class of `rows` selected rows has bounded levels: when its
-/// reader certifies a selection and the rows are within those the levels
-/// serve on `backend` ([`crate::programs::graph::readout::certified_rows`]).
-/// Any other class is priced through the packed projection and the full
-/// pass alone, and certifies nothing.
-pub(crate) fn bounds_rows(certifies: bool, rows: u64, backend: BackendName) -> bool {
-    certifies && rows <= crate::programs::graph::readout::certified_rows(backend)
+    pub certified: bool,
+    pub costs: Option<RecipeCosts>,
 }
 
 /// Whether a scope is stored as its planes: when every class its readers
@@ -157,8 +118,10 @@ pub(crate) fn stores_planes(classes: impl IntoIterator<Item = ClassCost>) -> boo
         let Some(costs) = class.costs else {
             return false;
         };
+        // Stored as planes, a class reads its bounded levels where they are
+        // certified and the full pass where not.
         packed += class.weight * costs.packed;
-        planes += class.weight * costs.planes;
+        planes += class.weight * if class.certified { costs.bounded } else { costs.planes };
     }
     planes < packed
 }
@@ -183,9 +146,6 @@ pub(crate) struct ReadoutContender<'a> {
     pub state: RecipeState,
     pub dependency: TuningKey,
     pub preparation: RecipePreparation,
-    /// Whether the class has bounded levels ([`bounds_rows`]): one without
-    /// them is priced through the packed projection and the full pass alone.
-    bounded: bool,
     canonical_seconds: f64,
     candidate_seconds: f64,
     receipt: ReadoutChoiceReceipt,
@@ -222,7 +182,6 @@ impl<'a> ReadoutContender<'a> {
         state: RecipeState,
         dependency: TuningKey,
         preparation: RecipePreparation,
-        bounded: bool,
     ) -> Self {
         Self {
             recipe,
@@ -235,7 +194,6 @@ impl<'a> ReadoutContender<'a> {
             state,
             dependency,
             preparation,
-            bounded,
             canonical_seconds: 0.0,
             candidate_seconds: 0.0,
             receipt: ReadoutChoiceReceipt {
@@ -960,26 +918,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             invocations,
             objective,
         );
-        self.state.borrow_mut().weight = self
-            .point
-            .terms
-            .iter()
-            .map(|(term, launches)| objective.terms[*term].weight * launches)
-            .sum();
-    }
-    /// A readout projects in its graph's decode launches, at the rows of the
-    /// class that serves them. In prefill a draft injects without projecting,
-    /// and the target projects one row of a prompt: the demand states no
-    /// prompts per generated token to weigh that row against decode steps,
-    /// so it is not priced.
-    fn serves(
-        &self,
-        launch: &crate::programs::invocation_demand::Launch,
-        phase: super::workload::Phase,
-    ) -> Option<u64> {
-        let rows = self.point.rows;
-        let decode = phase == super::workload::Phase::Decode;
-        (decode && launch.rows > rows / 2 && launch.rows <= rows).then_some(rows)
+        self.state.borrow_mut().weight = self.point.weight;
     }
     fn key(&self) -> String {
         self.key.as_str().to_owned()
@@ -1044,23 +983,17 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         let measured = Instant::now();
         let progressive = formed.progressive.as_ref().unwrap();
         self.canonical_seconds = case.packed(inputs.device, self.recipe, &packed)?;
-        let bounded = match self.bounded {
-            true => {
-                self.candidate_seconds = case.bounded(inputs.device, self.recipe, progressive)?;
-                self.receipt
-                    .pairs
-                    .push((self.canonical_seconds, self.candidate_seconds));
-                Some(self.candidate_seconds)
-            }
-            false => None,
-        };
+        self.candidate_seconds = case.bounded(inputs.device, self.recipe, progressive)?;
         let planes = case.planes(inputs.device, self.recipe, progressive)?;
+        self.receipt
+            .pairs
+            .push((self.canonical_seconds, self.candidate_seconds));
         // Until a qualification times the class, its census prices it: the
         // packed and full passes read every row alike, and the bounded
         // levels only serve a class its qualification certifies.
         self.receipt.costs = Some(RecipeCosts {
             packed: self.canonical_seconds,
-            bounded,
+            bounded: self.candidate_seconds,
             planes,
         });
         self.receipt.reason =
@@ -1089,7 +1022,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             // clock, and runs what the census ran, for each seed: twice for
             // agreement (noise rows, then the timed rows; the two recipes
             // alone, so this bounds it), and a lead and a sample in each
-            // round it is admitted. A class without bounded levels runs less.
+            // round it is admitted.
             qualification: preparation
                 + std::time::Duration::from_secs_f64(establishment)
                 + measured.elapsed() * (QUALIFICATION_SEEDS.len() as u32 * (2 + 2 * rounds)),
@@ -1138,16 +1071,6 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 check_deadline!();
                 case.prepare_features(inputs.device, self.recipe, &feature)?;
             }
-            if !self.bounded {
-                // Both forms read every row alike, so any rows price them;
-                // each writes its outputs here first, outside the rounds.
-                check_deadline!();
-                case.packed(inputs.device, self.recipe, &packed)?;
-                check_deadline!();
-                case.planes(inputs.device, self.recipe, progressive)?;
-                cases.push(case);
-                continue;
-            }
             // Noise rows: every level keeps and reads the whole head, so
             // every bound is tested. Both recipes also write their outputs
             // here for the first time, outside the timed pairs.
@@ -1191,9 +1114,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         // the comparison: every round's samples of all three price the class
         // for its scope's stored form. The comparison is admitted the fewest
         // rounds in which it can resolve as a lead at the search's error
-        // rate, and ends with its first round that is not ahead. A class
-        // without bounded levels compares nothing: its rounds, as many,
-        // price the packed projection and the full pass alone.
+        // rate, and ends with its first round that is not ahead.
         let rate = super::SEARCH_SETTINGS.error_rate;
         let mut tally = Tally::default();
         let mut shuffle = Shuffle::default();
@@ -1230,10 +1151,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             let mut round = [0.; 3];
             for case in &mut cases {
                 check_deadline!();
-                let mut order = match self.bounded {
-                    true => vec![0, 1, 2],
-                    false => vec![0, 2],
-                };
+                let mut order = [0, 1, 2];
                 shuffle.shuffle(&mut order);
                 let mut seconds = [0.; 3];
                 for form in order {
@@ -1256,10 +1174,8 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                         }
                     };
                 }
-                if self.bounded {
-                    self.receipt.pairs.push((seconds[0], seconds[1]));
-                    difference += seconds[1] / seconds[0] - 1.;
-                }
+                self.receipt.pairs.push((seconds[0], seconds[1]));
+                difference += seconds[1] / seconds[0] - 1.;
                 for (sum, seconds) in round.iter_mut().zip(seconds) {
                     *sum += seconds;
                 }
@@ -1270,25 +1186,11 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
             }
             samples += cases.len() as u32;
             let [packed, bounded, planes] = sums.map(|sum| sum / f64::from(samples));
-            self.receipt.costs = Some(RecipeCosts {
-                packed,
-                bounded: self.bounded.then_some(bounded),
-                planes,
-            });
-            if !self.bounded {
-                continue;
-            }
+            self.receipt.costs = Some(RecipeCosts { packed, bounded, planes });
             tally.observe(difference);
             if difference >= 0. {
                 break;
             }
-        }
-        if !self.bounded {
-            self.receipt.reason = format!(
-                "priced through the packed projection and the full pass in {} rounds; no bounded levels at this class",
-                tally.fewest(rate)
-            );
-            return Ok(false);
         }
         if tally.verdict(rate) != Some(Verdict::Leads) {
             self.receipt.reason = format!(
@@ -1331,14 +1233,12 @@ mod tests {
     fn class(weight: f64, certified: bool, [packed, bounded, planes]: [f64; 3]) -> ClassCost {
         ClassCost {
             weight,
-            costs: Some(
-                RecipeCosts {
-                    packed,
-                    bounded: Some(bounded),
-                    planes,
-                }
-                .stored(certified),
-            ),
+            certified,
+            costs: Some(RecipeCosts {
+                packed,
+                bounded,
+                planes,
+            }),
         }
     }
 
@@ -1395,6 +1295,7 @@ mod tests {
     fn missing_evidence_keeps_the_packed_projection() {
         let unmeasured = ClassCost {
             weight: 1.,
+            certified: false,
             costs: None,
         };
         let certified = class(1., true, [2.05, 1.62, 2.91]);
@@ -1409,123 +1310,6 @@ mod tests {
         ]));
         assert!(!stores_planes([class(0., true, [2., 1., 1.])]));
         assert!(!stores_planes(std::iter::empty()));
-    }
-
-    /// Bounded levels exist only for a class a certifying reader selects at
-    /// rows the levels serve on its backend: a draft's classes and every
-    /// class past that bound are priced through the packed projection and
-    /// the full pass alone, and a class without them certifies nothing.
-    #[test]
-    fn bounded_levels_exist_only_where_they_serve() {
-        for (backend, served) in [(BackendName::Metal, 1), (BackendName::Cuda, 4)] {
-            assert!(bounds_rows(true, served, backend));
-            assert!(!bounds_rows(true, served + 1, backend));
-            assert!(!bounds_rows(false, 1, backend));
-        }
-        assert!(!bounds_rows(true, 1, BackendName::Vulkan));
-        let priced = RecipeCosts {
-            packed: 2.,
-            bounded: None,
-            planes: 3.,
-        };
-        assert_eq!(
-            priced.stored(false),
-            FormCosts {
-                packed: 2.,
-                planes: 3.
-            }
-        );
-    }
-
-    /// A class certified without its bounded levels timed is an invariant
-    /// violation, not a planes cost.
-    #[test]
-    #[should_panic(expected = "a certified class was timed through its bounded levels")]
-    fn a_certified_class_has_its_bounded_cost() {
-        let _ = RecipeCosts {
-            packed: 2.,
-            bounded: None,
-            planes: 3.,
-        }
-        .stored(true);
-    }
-
-    /// A class runs in its graph's decode launches at its rows, never in a
-    /// prefill launch (a draft injects without projecting there), and weighs
-    /// its executions per decode step: each decode term's launches times the
-    /// term's weight, whatever is measured of the terms' times.
-    #[test]
-    fn a_class_weighs_its_decode_executions_alone() {
-        use super::super::workload::{Metric, Phase, Term};
-        use crate::programs::invocation_demand::{InvocationCounts, Launch};
-        let layout = resident_layout(ExecutionPath::Native, BackendName::Metal);
-        let recipe = ReadoutRecipe {
-            scope: WeightScope::Target,
-            norm_scope: WeightScope::Target,
-            norm: Element::bf16(),
-            weight: Element::stored("q8g32s", layout).unwrap(),
-            activation: Element::bf16(),
-            epsilon: 1e-6,
-            softcap: 0.,
-            prepared: false,
-            vocabulary: 4096,
-            hidden: 2048,
-            parts: 1,
-            norm_extent: 2048,
-            depth: ProgressiveCodeDepth::Eight,
-            scale_extent: 0,
-        };
-        let state = RecipeState::default();
-        let point = PointShape {
-            label: "m4".into(),
-            weight: 1.,
-            terms: Vec::new(),
-            rows: 4,
-            sequences: 1,
-            context: None,
-            class: None,
-        };
-        let mut contender = ReadoutContender::new(
-            recipe,
-            point,
-            TuningCacheKey::of("readout recipe unit"),
-            None,
-            None,
-            state.clone(),
-            ("readout_head_rows", "head".into(), super::super::FixedValues::default()),
-            RecipePreparation::default(),
-            false,
-        );
-        let launch = |term, rows| Launch {
-            term,
-            rows,
-            sequences: 1,
-            history: 4096,
-        };
-        assert_eq!(contender.serves(&launch(0, 4), Phase::Prefill), None);
-        assert_eq!(contender.serves(&launch(0, 512), Phase::Prefill), None);
-        assert_eq!(contender.serves(&launch(1, 4), Phase::Decode), Some(4));
-        assert_eq!(contender.serves(&launch(1, 3), Phase::Decode), Some(4));
-        assert_eq!(contender.serves(&launch(1, 2), Phase::Decode), None);
-        let term = |phase| Term {
-            metric: Metric {
-                phase,
-                context: 4096,
-                sequences: 1,
-            },
-            width: None,
-            weight: 0.5,
-        };
-        let mut counts = InvocationCounts::default();
-        counts.launch(launch(1, 4), 2.);
-        for measured in [vec![0., 0.], vec![2.68, 0.029]] {
-            let objective = super::super::Objective {
-                terms: vec![term(Phase::Prefill), term(Phase::Decode)],
-                measured,
-            };
-            contender.set_invocations(&counts, &objective);
-            assert_eq!(state.borrow().weight, 1.);
-        }
     }
 
     /// Every program of the recipe digests and forms on each backend with
@@ -1710,7 +1494,6 @@ mod tests {
                     RecipeState::default(),
                     dependency.clone(),
                     RecipePreparation::default(),
-                    true,
                 )
             };
             let found = |contender: &mut ReadoutContender, canonical: &NativeSpecialization| {
@@ -1787,7 +1570,6 @@ mod tests {
                     RecipeState::default(),
                     dependency.clone(),
                     RecipePreparation::default(),
-                    true,
                 )
             };
             // Another load recorded its winner against the plain canonical.

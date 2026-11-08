@@ -1915,13 +1915,6 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
             _: &Objective,
         ) {
         }
-        fn serves(
-            &self,
-            _: &crate::programs::invocation_demand::Launch,
-            _: workload::Phase,
-        ) -> Option<u64> {
-            None
-        }
         fn census(
             &mut self,
             _: &mut TuningInputs<'_, 'a>,
@@ -2058,13 +2051,6 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
             _: &crate::programs::invocation_demand::InvocationCounts,
             _: &Objective,
         ) {
-        }
-        fn serves(
-            &self,
-            _: &crate::programs::invocation_demand::Launch,
-            _: workload::Phase,
-        ) -> Option<u64> {
-            None
         }
         fn census(
             &mut self,
