@@ -211,10 +211,11 @@ fn closes_prompt(round: &Round, operations: &[Operation]) -> bool {
     else {
         return false;
     };
-    round
+    let member = round
         .members
         .get(request)
-        .is_some_and(|member| position + tokens.len() == member.state.generation().prompt().len())
+        .unwrap_or_else(|| panic!("a primed prefill of request {request:?} is not a member of its round"));
+    position + tokens.len() == member.state.generation().prompt().len()
 }
 
 /// The selection bound `operations` spend: every selected target row, and one
