@@ -41,7 +41,8 @@ describe("unified catalog rows", () => {
   })
   it("keeps the memory breakdown button beside the number when a served-context note follows", () => {
     if (model.servingState._tag !== "Assessed") throw new Error("Expected an assessed fixture")
-    const html = render({ ...model, servingState: { ...model.servingState, assessment: { ...fits, profile: { contextLength: 262_144 }, served: { contextLength: 131_072 } } } })
+    const assessment: typeof fits = { ...fits, profile: { contextLength: 262_144 }, served: { contextLength: 131_072 } }
+    const html = render({ ...model, servingState: { ...model.servingState, assessment } as CatalogLocalModel["servingState"] })
     const button = html.indexOf('aria-label="Memory breakdown"')
     const note = html.indexOf("128K of 256K context")
     expect(button).toBeGreaterThan(-1)
