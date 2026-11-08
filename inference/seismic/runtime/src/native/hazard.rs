@@ -26,16 +26,6 @@
 //! launch may run before earlier launches it does not depend on, never
 //! before one it does. CUDA's graphs keep stream order. Timeline operations
 //! bound the reordering: no launch crosses one.
-//!
-//! A chained list ([`DispatchList::chained`]) runs each call after the one
-//! before it, whatever they reach: standalone calls, which time a tuning
-//! point's rotation of a model's layers as the served step runs them, each
-//! after its predecessor. A rotation of independent argument sets run at
-//! one level overlaps its calls, and ranks configurations by a cost the
-//! step does not pay: on an M4 Pro one GEMV phase read 14.09 us four at a
-//! time and 26.65 us in order, its form's fixed cost hidden by the overlap
-//! (2026-11-07). Vulkan's direct launches each follow a barrier, and CUDA's
-//! stream keeps order, so only Metal's levels overlapped them.
 
 use super::Dispatch;
 use super::DispatchList;
@@ -69,17 +59,11 @@ pub(crate) fn schedule(list: &impl DispatchList, repetitions: usize) -> Vec<Sche
     let mut buffers = Vec::new();
     let mut reaches = Vec::new();
     let mut accesses = Vec::new();
-    let chained = list.chained();
-    // A chained list's launches of the call before, which each launch of
-    // the next follows.
-    let mut previous = Vec::new();
-    let mut current = Vec::new();
     for _ in 0..repetitions {
         for index in 0..=list.count() {
             if !list.timelines(index).is_empty() {
                 order_segment(&mut segment, &mut schedule);
                 order = Order::default();
-                previous.clear();
                 schedule.push(Scheduled::Timelines(index));
             }
             if index == list.count() {
@@ -95,18 +79,9 @@ pub(crate) fn schedule(list: &impl DispatchList, repetitions: usize) -> Vec<Sche
                 if dispatch.launches[ordinal].is_none_or(|launch| launch.is_empty()) {
                     continue;
                 }
-                let mut after = order.after(&accesses);
-                if chained {
-                    after.extend(&previous);
-                    current.push(order.placed());
-                }
+                let after = order.after(&accesses);
                 let alone = dispatch.launches[ordinal].is_some_and(|launch| launch.barrier.is_some());
                 segment.push((order.place(&accesses, &after, alone), index, ordinal));
-            }
-            // An inactive call is no link of the chain.
-            if !current.is_empty() {
-                std::mem::swap(&mut previous, &mut current);
-                current.clear();
             }
         }
     }
@@ -376,11 +351,6 @@ impl Order {
         after.sort_unstable();
         after.dedup();
         after
-    }
-
-    /// How many launches are placed: the next one's index.
-    pub(crate) fn placed(&self) -> usize {
-        self.levels.len()
     }
 
     /// Place the next launch, which reaches `accesses` and depends on
@@ -704,8 +674,6 @@ mod tests {
         kernel: &'a super::super::NativePrepared,
         calls: Vec<Option<[(&'a Allocation, Range<u64>); 2]>>,
         timelines: HashMap<usize, Vec<super::super::timeline::TimelineOperation>>,
-        /// Each call after the one before, as standalone calls run.
-        chained: bool,
     }
 
     const ACTIVE: [Option<super::super::LaunchGeometry>; 1] = [Some(super::super::LaunchGeometry {
@@ -750,9 +718,6 @@ mod tests {
         fn timelines(&self, boundary: usize) -> &[super::super::timeline::TimelineOperation] {
             self.timelines.get(&boundary).map_or(&[], Vec::as_slice)
         }
-        fn chained(&self) -> bool {
-            self.chained
-        }
     }
 
     fn cpu_device() -> std::sync::Arc<crate::api::device::DeviceInner> {
@@ -795,7 +760,6 @@ mod tests {
                 Some([(a, 0..64), (d, 32..64)]),
             ],
             timelines: HashMap::from([(2, vec![wait])]),
-            chained: false,
         };
         assert_eq!(
             schedule(&calls, 1),
@@ -832,7 +796,6 @@ mod tests {
                 Some([(b, 0..64), (a, 0..64)]),
             ],
             timelines: HashMap::new(),
-            chained: false,
         };
         assert_eq!(
             schedule(&calls, 2),
@@ -846,53 +809,6 @@ mod tests {
                 Scheduled::Level(1),
                 launch(2),
             ]
-        );
-    }
-
-    /// Calls of a chained list run each after the one before, as a served
-    /// step runs one kernel's calls, though they reach nothing in common:
-    /// a rotation of independent argument sets is timed in served order,
-    /// never overlapped (an M4 Pro's in-order phase of one GEMV read 26.65
-    /// us against 14.09 us four at a time).
-    #[test]
-    fn a_chained_list_runs_each_call_after_the_one_before() {
-        let device = cpu_device();
-        let kernel = copy_kernel(&device);
-        let storage = (0..4)
-            .map(|_| device.allocate(64, 64).unwrap())
-            .collect::<Vec<_>>();
-        let [a, b, c, d] = [&*storage[0], &*storage[1], &*storage[2], &*storage[3]];
-        let calls = |chained| Calls {
-            kernel: &kernel,
-            calls: vec![Some([(a, 0..64), (b, 0..64)]), None, Some([(c, 0..64), (d, 0..64)])],
-            timelines: HashMap::new(),
-            chained,
-        };
-        assert_eq!(
-            schedule(&calls(false), 2),
-            [
-                Scheduled::Level(2),
-                launch(0),
-                launch(2),
-                Scheduled::Level(2),
-                launch(0),
-                launch(2),
-            ],
-            "independent calls share a level"
-        );
-        assert_eq!(
-            schedule(&calls(true), 2),
-            [
-                Scheduled::Level(1),
-                launch(0),
-                Scheduled::Level(1),
-                launch(2),
-                Scheduled::Level(1),
-                launch(0),
-                Scheduled::Level(1),
-                launch(2),
-            ],
-            "an inactive call is no link of the chain"
         );
     }
 
@@ -916,7 +832,6 @@ mod tests {
                     kernel: &kernel,
                     calls,
                     timelines: HashMap::new(),
-                    chained: false,
                 },
                 0..count,
             )

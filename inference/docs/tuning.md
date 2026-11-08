@@ -35,10 +35,7 @@ Two descriptions of a unit must remain distinct:
   supplies each unit's launches for every such term, with their rows, sequences and histories;
   real weight rotations stand in where reuse would otherwise distort timing, and a timed pass
   occupies several times what the device's last-level cache holds, so that, as in a served step,
-  no call finds its bytes cached by an earlier one. A rotation's calls run each after the one
-  before, as the step runs one kernel's calls across its layers: timed side by side, a form's
-  fixed cost is hidden by its neighbours' (an M4 Pro GEMV phase read 14.1 us four at a time and
-  26.7 us in order), and the ranking is of a cost no step pays. Adversarial
+  no call finds its bytes cached by an earlier one. Adversarial
   numerical cases do not count as serving traffic. A launch is demand of the kernel that serves
   it alone: where two kernels are alternatives for the same layers (the attention prefill that
   lists the history tiles its rows see, and the one that lists none), each takes only the
