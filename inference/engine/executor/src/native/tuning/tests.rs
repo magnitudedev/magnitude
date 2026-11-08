@@ -1715,277 +1715,6 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
     }
 }
 
-#[test]
-fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fails_nothing() {
-    struct Recipe {
-        published: Rc<RefCell<Vec<(bool, bool)>>>,
-        delay: Duration,
-    }
-    impl<'a> ComposedContender<'a> for Recipe {
-        fn dependencies(&self) -> Vec<TuningKey> {
-            Vec::new()
-        }
-        fn key(&self) -> String {
-            "unused".into()
-        }
-        fn pin_identity(&self) -> String {
-            self.key()
-        }
-        fn label(&self) -> &'static str {
-            "test_recipe"
-        }
-        fn cached(&self) -> Option<bool> {
-            None
-        }
-        fn set_invocations(
-            &mut self,
-            _: &crate::programs::invocation_demand::InvocationCounts,
-            _: &Objective,
-        ) {
-        }
-        fn census(
-            &mut self,
-            _: &mut TuningInputs<'_, 'a>,
-        ) -> Result<Option<ComposedCensus>, CatalogFailure> {
-            panic!("an unused recipe must not construct inputs");
-        }
-        fn qualify(
-            &mut self,
-            _: &mut TuningInputs<'_, 'a>,
-            _before: Instant,
-        ) -> Result<bool, CatalogFailure> {
-            panic!("an unused recipe must not qualify");
-        }
-        fn conclude(&mut self, selected: bool, settled: bool) -> Result<(), CatalogFailure> {
-            std::thread::sleep(self.delay);
-            self.published.borrow_mut().push((selected, settled));
-            Ok(())
-        }
-    }
-    let Some(device) = metal() else {
-        return;
-    };
-    let (definition, load) = fixture_load();
-    let import = ImportKernels {
-        import_dense: HashMap::new(),
-        repack_weight: HashMap::new(),
-        packing_bound: HashMap::new(),
-    };
-    let recorder = Recorder::default();
-    for delayed in [false, true] {
-        let published = Rc::new(RefCell::new(Vec::new()));
-        let recipe = || {
-            Box::new(Recipe {
-                published: published.clone(),
-                delay: if delayed {
-                    Duration::from_millis(100)
-                } else {
-                    Duration::ZERO
-                },
-            })
-        };
-        let mut tuner = Tuner::count(
-            &device,
-            TuningContext {
-                definition: &definition,
-                weights: &ZeroTuningWeights,
-                observer: &recorder,
-                cache: None,
-                numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
-                settings: TuningSettings {
-                    budget: Duration::from_millis(50),
-                    fresh: true,
-                },
-            },
-            LIMITS,
-            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
-            super::super::specialization::InvocationDemand {
-                units: HashMap::from([(
-                    ("test_recipe", "unused".into(), BTreeMap::new()),
-                    crate::programs::invocation_demand::InvocationCounts::default(),
-                )]),
-                objective: Objective::new(workload::terms(LIMITS, &[])),
-            },
-        );
-        assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
-        assert!(
-            published.borrow().is_empty(),
-            "counting cannot publish a choice"
-        );
-        // The recipe's mandatory work publishes the canonical choice it
-        // serves until it is qualified, unsettled: a search abandoned here
-        // leaves no choice a later walk takes.
-        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
-        assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
-        assert_eq!(*published.borrow(), [(false, false)]);
-        // The search's end settles it, and a publication that outlasts the
-        // whole budget fails nothing.
-        let mut tuner = tuner.search().unwrap();
-        assert_eq!(*published.borrow(), [(false, false), (false, true)]);
-        assert_eq!(tuner.register_composed(recipe()).unwrap(), Some(false));
-        assert_eq!(
-            published.borrow().len(),
-            2,
-            "a settled recipe's choice is not republished"
-        );
-    }
-}
-
-/// A pinned unit's choice is final at the count, so a composed recipe that
-/// depends on it resolves its prerequisite on an empty cache: a defaults
-/// load censuses the recipe and qualifies it against the unit's default.
-#[test]
-fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
-    struct Recipe {
-        dependency: TuningKey,
-        expected: NativeSpecialization,
-        qualified: Rc<Cell<bool>>,
-    }
-    impl Recipe {
-        fn point() -> PointShape {
-            PointShape {
-                label: "m1".into(),
-                weight: 1.,
-                terms: Vec::new(),
-                rows: 1,
-                sequences: 1,
-                context: None,
-                class: None,
-            }
-        }
-    }
-    impl<'a> ComposedContender<'a> for Recipe {
-        fn dependencies(&self) -> Vec<TuningKey> {
-            vec![self.dependency.clone()]
-        }
-        fn key(&self) -> String {
-            "pinned-prerequisite".into()
-        }
-        fn pin_identity(&self) -> String {
-            self.key()
-        }
-        fn label(&self) -> &'static str {
-            "test_recipe"
-        }
-        fn cached(&self) -> Option<bool> {
-            None
-        }
-        fn set_invocations(
-            &mut self,
-            _: &crate::programs::invocation_demand::InvocationCounts,
-            _: &Objective,
-        ) {
-        }
-        fn census(
-            &mut self,
-            _: &mut TuningInputs<'_, 'a>,
-        ) -> Result<Option<ComposedCensus>, CatalogFailure> {
-            Ok(Some(ComposedCensus {
-                served: vec![Self::point()],
-                measured: vec![Self::point()],
-                seconds: vec![1e-3],
-                qualification: Duration::from_millis(1),
-            }))
-        }
-        fn qualify(
-            &mut self,
-            inputs: &mut TuningInputs<'_, 'a>,
-            _before: Instant,
-        ) -> Result<bool, CatalogFailure> {
-            assert_eq!(inputs.choice(&self.dependency), Some(&self.expected));
-            self.qualified.set(true);
-            Ok(false)
-        }
-        fn conclude(&mut self, _: bool, _: bool) -> Result<(), CatalogFailure> {
-            Ok(())
-        }
-    }
-    let Some(device) = metal() else {
-        return;
-    };
-    let (definition, load) = fixture_load();
-    let import = ImportKernels {
-        import_dense: HashMap::new(),
-        repack_weight: HashMap::new(),
-        packing_bound: HashMap::new(),
-    };
-    let recorder = Recorder::default();
-    let implementation = dense_output_implementation(&device);
-    let statics = implementation
-        .statics
-        .iter()
-        .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
-        });
-    let defaults = implementation.default_specialization(&statics).unwrap();
-    let case = FakeCase::new(&implementation, &statics, "pinned-prerequisite");
-    let dependency: TuningKey = (
-        <dense_output::Entry as seismic::Entry>::NAME,
-        case.bindings(),
-        FixedValues::of(&statics),
-    );
-    let mut invocations = fixture_invocations(&case, &statics, LIMITS);
-    invocations.units.insert(
-        ("test_recipe", "pinned-prerequisite".into(), BTreeMap::new()),
-        {
-            let mut counts = crate::programs::invocation_demand::InvocationCounts::default();
-            counts.launch(
-                crate::programs::invocation_demand::Launch {
-                    term: 0,
-                    rows: 1,
-                    sequences: 1,
-                    history: 0,
-                },
-                1.,
-            );
-            counts
-        },
-    );
-    let qualified = Rc::new(Cell::new(false));
-    let recipe = || {
-        Box::new(Recipe {
-            dependency: dependency.clone(),
-            expected: defaults.clone(),
-            qualified: qualified.clone(),
-        })
-    };
-    let _pin = pinned::defaults_on_this_thread();
-    let mut tuner = Tuner::count(
-        &device,
-        TuningContext {
-            definition: &definition,
-            weights: &ZeroTuningWeights,
-            observer: &recorder,
-            cache: None,
-            numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
-            settings: TuningSettings::STANDARD,
-        },
-        LIMITS,
-        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
-        invocations,
-    );
-    tuner.tune(&case, &implementation, &statics).unwrap();
-    assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
-    // The pinned unit serves its choice from the count on, and forms and
-    // searches nothing.
-    assert_eq!(tuner.choice(&dependency), Some(&defaults));
-    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
-    assert_eq!(case.formations.get(), 0);
-    tuner.tune(&case, &implementation, &statics).unwrap();
-    assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
-    let mut tuner = tuner.search().unwrap();
-    assert!(
-        qualified.get(),
-        "the recipe was qualified against its prerequisite's pinned choice"
-    );
-    assert_eq!(
-        tuner.tune(&case, &implementation, &statics).unwrap(),
-        defaults
-    );
-    assert_eq!(tuner.register_composed(recipe()).unwrap(), Some(false));
-    assert!(case.seen.borrow().is_empty() && case.stages.borrow().is_empty());
-}
-
 /// Work that runs past the budget completes, and the load succeeds with
 /// every unit's record: exceeding the budget is never a failure.
 #[test]
@@ -2940,7 +2669,6 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
     let noise = Noise::default();
-    let choices = HashMap::new();
     let mut inputs = TuningInputs {
         model: ModelInputs {
             definition: &definition,
@@ -2951,7 +2679,6 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
-        choices: &choices,
     };
     let batch = inputs
         .batch(6, 256, &[vec![[0, 256]], vec![[256, 512]]], 512)
@@ -3044,7 +2771,6 @@ fn case_state_restores_its_written_rows() {
     let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
     let noise = Noise::default();
-    let choices = HashMap::new();
     let inputs = TuningInputs {
         model: ModelInputs {
             definition: &definition,
@@ -3055,7 +2781,6 @@ fn case_state_restores_its_written_rows() {
         weights: &mut weights,
         noise: &noise,
         shared: &mut shared,
-        choices: &choices,
     };
     let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
     let tensor = inputs.f32s(&[4, 2], &values).unwrap();

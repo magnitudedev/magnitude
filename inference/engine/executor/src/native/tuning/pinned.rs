@@ -17,9 +17,7 @@
 //! recorded choice's.
 //!
 //! A pin that replays or runs defaults tunes nothing: a load under it asks
-//! for no search ([`tunes_nothing`]). A composed recipe is one more pinned
-//! unit: [`recipe`] decides it, and whatever a search stored for it is not
-//! read, so what a pinned load runs depends on the pin alone.
+//! for no search ([`tunes_nothing`]).
 //!
 //! Only `magnitude-harness` installs a pin (`--tuning-record` /
 //! `--tuning-replay` / `--tuning-defaults`). The pin is process-global so
@@ -118,36 +116,11 @@ pub(super) fn lookup(
     key: &TuningKey,
     implementation: &OnDevice,
 ) -> Result<Pinned, String> {
-    #[cfg(test)]
-    if THREAD_DEFAULTS.get() {
-        return decide(&Installed::of(TuningPin::Defaults), key, implementation);
-    }
     let guard = PIN.lock().expect("tuning pin lock poisoned");
     let Some(installed) = guard.as_ref() else {
         return Ok(Pinned::Tune);
     };
     decide(installed, key, implementation)
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Tests share one process: a test pins the preparations of its own
-    /// thread, never the process.
-    static THREAD_DEFAULTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// [`TuningPin::Defaults`] for the tuners of the calling thread, while the
-/// returned guard lives.
-#[cfg(test)]
-pub(super) fn defaults_on_this_thread() -> impl Drop {
-    struct Unpin;
-    impl Drop for Unpin {
-        fn drop(&mut self) {
-            THREAD_DEFAULTS.set(false);
-        }
-    }
-    THREAD_DEFAULTS.set(true);
-    Unpin
 }
 
 /// What `installed` decides for one tuning key.
@@ -269,64 +242,6 @@ fn decide(
     Ok(Pinned::Chosen(specialization, PinnedChoice::Replayed))
 }
 
-/// The parameter a composed recipe's pinned configuration holds: whether
-/// the recipe was selected over its canonical one.
-const SELECTED: &str = "selected";
-
-/// A composed recipe's choice under the pin, and where it came from; none
-/// when no pin decides it (recording, or no pin). `identity` names the
-/// recipe across builds and devices, which its stored key does not.
-pub(super) fn recipe(label: &str, identity: &str) -> Option<(bool, PinnedChoice)> {
-    #[cfg(test)]
-    if THREAD_DEFAULTS.get() {
-        return Some((false, PinnedChoice::Defaults));
-    }
-    let guard = PIN.lock().expect("tuning pin lock poisoned");
-    decide_recipe(guard.as_ref()?, label, identity)
-}
-
-/// What `installed` decides for one composed recipe.
-fn decide_recipe(installed: &Installed, label: &str, identity: &str) -> Option<(bool, PinnedChoice)> {
-    if installed.defaults {
-        return Some((false, PinnedChoice::Defaults));
-    }
-    let pinned = installed
-        .configurations
-        .iter()
-        .find(|pinned| pinned.entry == label && pinned.bindings == identity);
-    match pinned {
-        Some(pinned) => Some((
-            pinned.params.get(SELECTED).is_some_and(|selected| *selected != 0),
-            PinnedChoice::Replayed,
-        )),
-        None => installed.replay.then_some((false, PinnedChoice::NotReplayed)),
-    }
-}
-
-/// `selected` as the configuration a pin states a composed recipe's choice
-/// by.
-pub(super) fn recipe_configuration(selected: bool) -> NativeSpecialization {
-    NativeSpecialization::new().with_param(SELECTED, u64::from(selected))
-}
-
-/// Record a composed recipe's stored choice when recording.
-pub(super) fn record_recipe(label: &str, identity: &str, selected: bool) {
-    let mut guard = PIN.lock().expect("tuning pin lock poisoned");
-    let Some(installed) = guard.as_mut().filter(|installed| !installed.replay) else {
-        return;
-    };
-    let recorded = |pinned: &PinnedConfiguration| pinned.entry == label && pinned.bindings == identity;
-    if !installed.configurations.iter().any(recorded) {
-        installed.configurations.push(PinnedConfiguration {
-            entry: label.to_owned(),
-            bindings: identity.to_owned(),
-            statics: BTreeMap::new(),
-            params: BTreeMap::from([(SELECTED.to_owned(), u64::from(selected))]),
-            launch_params: BTreeMap::new(),
-        });
-    }
-}
-
 /// Record a tuned choice when recording.
 pub(super) fn record(key: &TuningKey, chosen: &NativeSpecialization) {
     let mut guard = PIN.lock().expect("tuning pin lock poisoned");
@@ -353,29 +268,6 @@ mod tests {
     fn key(entry: &'static str, statics: &[(&str, u64)], params: &[(&str, u64)]) -> TuningKey {
         let named = |values: &[(&str, u64)]| values.iter().map(|(name, value)| ((*name).to_owned(), *value)).collect();
         (entry, "test".to_owned(), FixedValues { statics: named(statics), params: named(params) })
-    }
-
-    /// A composed recipe's choice is the pin's: recorded, it replays
-    /// selected; the defaults run the canonical recipe whatever is recorded;
-    /// a replay that lacks it runs the canonical recipe and says so; a
-    /// recording decides nothing until it has seen it.
-    #[test]
-    fn a_composed_recipe_is_decided_by_the_pin() {
-        let recorded = vec![PinnedConfiguration {
-            entry: "recipe".into(),
-            bindings: "rows=1".into(),
-            statics: BTreeMap::new(),
-            params: BTreeMap::from([(SELECTED.to_owned(), 1)]),
-            launch_params: BTreeMap::new(),
-        }];
-        let replay = Installed::of(TuningPin::Replay(recorded.clone()));
-        assert_eq!(decide_recipe(&replay, "recipe", "rows=1"), Some((true, PinnedChoice::Replayed)));
-        assert_eq!(decide_recipe(&replay, "recipe", "rows=2"), Some((false, PinnedChoice::NotReplayed)));
-        let defaults = Installed::of(TuningPin::Defaults);
-        assert_eq!(decide_recipe(&defaults, "recipe", "rows=1"), Some((false, PinnedChoice::Defaults)));
-        let recording = Installed::of(TuningPin::Record(recorded));
-        assert_eq!(decide_recipe(&recording, "recipe", "rows=1"), Some((true, PinnedChoice::Replayed)));
-        assert_eq!(decide_recipe(&recording, "recipe", "rows=2"), None);
     }
 
     /// A unit whose call site fixes a parameter resolves under every pin at

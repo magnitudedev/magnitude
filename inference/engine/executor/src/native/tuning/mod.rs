@@ -2176,7 +2176,6 @@ pub(crate) struct TuningInputs<'w, 'a> {
     /// Tensors shared by the units of one tuning, by a name that identifies
     /// their contents.
     shared: &'w mut HashMap<String, Tensor>,
-    choices: &'w HashMap<TuningKey, NativeSpecialization>,
 }
 
 impl<'a> std::ops::Deref for TuningInputs<'_, 'a> {
@@ -2188,10 +2187,6 @@ impl<'a> std::ops::Deref for TuningInputs<'_, 'a> {
 }
 
 impl TuningInputs<'_, '_> {
-    pub(super) fn choice(&self, key: &TuningKey) -> Option<&NativeSpecialization> {
-        self.choices.get(key)
-    }
-
     /// Drop every weight and shared tensor no built input binds any more.
     fn release_unheld(&mut self) {
         self.weights.release_unheld();
@@ -2248,26 +2243,6 @@ impl TuningInputs<'_, '_> {
         } else {
             self.weight(scope, kind)
         }
-    }
-
-    /// Retain a requested shared readout operand by physical storage identity.
-    pub fn shared_weight(
-        &mut self,
-        scope: WeightScope,
-        kind: WeightKind,
-    ) -> Result<Tensor, BuildError> {
-        let plan = weights::weight_plan(self.weights.load(), scope, kind)?;
-        let key = format!(
-            "shared_weight:{:?}:{:?}",
-            plan.storage_identity(),
-            plan.shape
-        );
-        if let Some(weight) = self.shared.get(&key) {
-            return Ok(weight.clone());
-        }
-        let weight = self.weight(scope, kind)?;
-        self.shared.insert(key, weight.clone());
-        Ok(weight)
     }
 
     /// A unit accumulator-scale port of `extent` (absent at 0): the scale's
@@ -2616,237 +2591,16 @@ enum Phase<'a> {
     Serve(UnpreparedUnits),
 }
 
-/// A composed execution recipe competes for the same first-load allowance
-/// as entry tuning. The consumer owns its qualification evidence and cache.
-pub(super) trait ComposedContender<'a> {
-    fn dependencies(&self) -> Vec<TuningKey>;
-    fn key(&self) -> String;
-    /// What names the recipe to a development pin, across builds and
-    /// devices.
-    fn pin_identity(&self) -> String;
-    fn label(&self) -> &'static str;
-    fn cached(&self) -> Option<bool>;
-    /// Weigh the recipe's point by the launches the load's graph supplied
-    /// for it ([`apply_invocation_counts`]).
-    fn set_invocations(
-        &mut self,
-        invocations: &crate::programs::invocation_demand::InvocationCounts,
-        objective: &Objective,
-    );
-    /// Form the contender and measure both recipes once: its discovery,
-    /// run to its end. None when the contender cannot be formed or built.
-    fn census(
-        &mut self,
-        inputs: &mut TuningInputs<'_, 'a>,
-    ) -> Result<Option<ComposedCensus>, CatalogFailure>;
-    /// Compare the contender with the canonical recipe, to the end: its
-    /// one piece of work, admitted on the price its census gave it.
-    fn qualify(
-        &mut self,
-        inputs: &mut TuningInputs<'_, 'a>,
-        before: Instant,
-    ) -> Result<bool, CatalogFailure>;
-    /// Retain the choice as it stands: the canonical recipe from the
-    /// mandatory phase on, the composed one once it is qualified. A choice
-    /// retained before the recipe's work ended is stored unsettled: no
-    /// later walk takes it for the recipe's choice.
-    fn conclude(&mut self, selected: bool, settled: bool) -> Result<(), CatalogFailure>;
-}
-
-/// Actual census evidence prices a composed contender; no guessed grace period.
-pub(super) struct ComposedCensus {
-    pub served: Vec<PointShape>,
-    pub measured: Vec<PointShape>,
-    pub seconds: Vec<f64>,
-    /// Remaining pair/confirmation work, priced from the actual census.
-    pub qualification: Duration,
-}
-
-struct ComposedUnit<'a> {
-    key: TuningKey,
-    contender: Box<dyn ComposedContender<'a> + 'a>,
-    census: Option<ComposedCensus>,
-    share: f64,
-    /// The recipe was qualified against its prerequisites' choices: its
-    /// one piece of work is done.
-    qualified: Option<bool>,
-    prerequisites: Vec<usize>,
-    demanded: bool,
-}
-
-impl<'a> SearchedUnit<'a> for ComposedUnit<'a> {
-    fn census_optional(&mut self, inputs: &mut TuningInputs<'_, 'a>) -> Result<(), CatalogFailure> {
-        self.census = if self.demanded {
-            self.contender.census(inputs)?
-        } else {
-            None
-        };
-        if self.census.as_ref().is_some_and(|measured| {
-            measured.measured.is_empty()
-                || measured.measured.len() != measured.seconds.len()
-                || measured
-                    .seconds
-                    .iter()
-                    .any(|seconds| !seconds.is_finite() || *seconds <= 0.)
-        }) {
-            return Err(CatalogFailure::Tuning {
-                entry: self.contender.label(),
-                bindings: self.key.1.clone(),
-                outcome: "composed census lacks finite measured service evidence".into(),
-            });
-        }
-        Ok(())
-    }
-    fn dependency_keys(&self) -> Vec<TuningKey> {
-        if self.census.is_some() {
-            self.contender.dependencies()
-        } else {
-            Vec::new()
-        }
-    }
-    fn set_prerequisites(&mut self, prerequisites: Vec<usize>) {
-        self.prerequisites = prerequisites;
-    }
-    fn prerequisites(&self) -> Vec<usize> {
-        self.prerequisites.clone()
-    }
-    fn composed(&self) -> bool {
-        true
-    }
-    fn key(&self) -> &TuningKey {
-        &self.key
-    }
-    fn times(&self, terms: usize) -> Vec<f64> {
-        self.census.as_ref().map_or_else(
-            || vec![0.; terms],
-            |census| {
-                term_times(&census.served, terms, |point| {
-                    census
-                        .measured
-                        .iter()
-                        .zip(&census.seconds)
-                        .find(|(measured, _)| measured.label == point.label)
-                        .map(|(_, seconds)| *seconds)
-                })
-            },
-        )
-    }
-    fn discovered(&self) -> bool {
-        true
-    }
-    fn share(&self) -> f64 {
-        self.share
-    }
-    fn set_share(&mut self, share: f64) {
-        self.share = share;
-    }
-
-    /// The recipe's one piece of work: its qualification against its
-    /// prerequisites' choices as they stand, priced by its own census. It
-    /// is one more contender beside the canonical recipe.
-    fn next(&self) -> Option<seismic::Work> {
-        let census = self.census.as_ref().filter(|_| self.qualified.is_none())?;
-        Some(seismic::Work {
-            stage: seismic::Stage::Measure,
-            quote: seismic::Quote {
-                priced: census.qualification,
-                unpriced: 0,
-            },
-            forming: seismic::Quote::default(),
-            opportunity: 1.,
-            // What a recipe's qualification holds is its contender's own:
-            // nothing of it was observed to price.
-            footprint: seismic::Footprint::default(),
-        })
-    }
-
-    fn forming(&self) -> Option<seismic::Forming> {
-        None
-    }
-
-    fn formed(
-        &mut self,
-        _: seismic::Formed,
-        _: Duration,
-        _: &mut Tuner<'a>,
-    ) -> Result<(), CatalogFailure> {
-        unreachable!("a composed recipe compiles nothing ahead")
-    }
-
-    fn perform(
-        &mut self,
-        tuner: &mut Tuner<'a>,
-        before: Duration,
-    ) -> Result<Duration, CatalogFailure> {
-        let work = self.next().expect("a unit performs the work it named");
-        let began = Instant::now();
-        let began_seconds = tuner.started.elapsed().as_secs_f64();
-        let cutoff = tuner.started + before;
-        let selected = if Instant::now() >= cutoff {
-            false
-        } else {
-            self.contender.qualify(&mut tuner.inputs(), cutoff)?
-        };
-        let qualified = began.elapsed();
-        self.qualified = Some(selected);
-        let publishing = Instant::now();
-        self.contender.conclude(selected, true)?;
-        tuner.composed_choices.insert(self.key.1.clone(), selected);
-        let published = publishing.elapsed();
-        tuner
-            .context
-            .observer
-            .event(&TuningEvent::Stage(StageRecord {
-                entry: self.key.0,
-                bindings: self.key.1.clone(),
-                statics: self.key.2.statics.clone(),
-                share: self.share,
-                stage: work.stage,
-                counts: None,
-                priced_seconds: work.quote.priced.as_secs_f64(),
-                unpriced: work.quote.unpriced,
-                forecast_seconds: work.quote.forecast().map(|forecast| forecast.as_secs_f64()),
-                began_seconds,
-                actual_seconds: began.elapsed().as_secs_f64(),
-                searching_seconds: qualified.as_secs_f64(),
-                interrupted: Instant::now() >= cutoff,
-                formed: None,
-                spent: seismic::Spent::default(),
-                raises: Vec::new(),
-                publishing_seconds: published.as_secs_f64(),
-                promoted: selected,
-            }));
-        Ok(qualified.max(published))
-    }
-
-    /// A recipe never qualified settles the canonical choice it served,
-    /// and releases what its census formed.
-    fn finish(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
-        if self.qualified.is_none() {
-            self.contender.conclude(false, true)?;
-            tuner.composed_choices.insert(self.key.1.clone(), false);
-        }
-        Ok(())
-    }
-}
-
 /// One unit with optional work, whatever its entry: its opened search, its
 /// case and the inputs built for it. It serves a published legal choice
 /// throughout.
 trait SearchedUnit<'a> {
-    /// Measure a composed recipe's service: its discovery.
-    fn census_optional(&mut self, _: &mut TuningInputs<'_, 'a>) -> Result<(), CatalogFailure> {
-        Ok(())
-    }
     fn dependency_keys(&self) -> Vec<TuningKey> {
         Vec::new()
     }
     fn set_prerequisites(&mut self, _: Vec<usize>) {}
     fn prerequisites(&self) -> Vec<usize> {
         Vec::new()
-    }
-    fn composed(&self) -> bool {
-        false
     }
     fn key(&self) -> &TuningKey;
     /// The unit's time in each of the objective's `terms` at its defaults,
@@ -3603,9 +3357,6 @@ pub(crate) struct Tuner<'a> {
     /// with, by its entry, element bindings and static values
     /// ([`Self::implementation_digest`]).
     digests: std::cell::RefCell<HashMap<ImplementationKey, String>>,
-    composed_counted: std::collections::HashSet<String>,
-    composed_censused: std::collections::HashSet<String>,
-    composed_choices: HashMap<String, bool>,
     /// What publishing a unit's record (deriving it and storing it) has
     /// taken in this load: the class a promotion's publication and each
     /// publication owed when the optional work stops are priced by.
@@ -3673,10 +3424,6 @@ impl Drop for Staff<'_> {
 }
 
 impl<'a> Tuner<'a> {
-    pub(super) fn choice(&self, key: &TuningKey) -> Option<&NativeSpecialization> {
-        self.chosen.get(key)
-    }
-
     /// `fixed` with each arithmetic parameter of `implementation`
     /// (`NativeParameter::arithmetic`) at its value in the choice of the
     /// unit `prerequisite` as it stands: a dependant whose results carry its
@@ -3756,14 +3503,8 @@ impl<'a> Tuner<'a> {
         self.staff = Some(Staff::of(self.device));
         self
     }
-    pub(super) fn cache(&self) -> Option<&'a KernelCache> {
-        self.context.cache
-    }
     pub(super) fn device(&self) -> &'a Device {
         self.device
-    }
-    pub(super) fn settings(&self) -> TuningSettings {
-        self.context.settings
     }
     fn budget(&self) -> Duration {
         self.context.settings.budget
@@ -3938,9 +3679,6 @@ impl<'a> Tuner<'a> {
             chosen: HashMap::new(),
             provisional: std::collections::HashSet::new(),
             digests: std::cell::RefCell::new(HashMap::new()),
-            composed_counted: std::collections::HashSet::new(),
-            composed_censused: std::collections::HashSet::new(),
-            composed_choices: HashMap::new(),
             publishing: Rc::new(Cell::new(seismic::Observed::default())),
             longest: Duration::ZERO,
             // What a search's process holds is counted from here, where
@@ -4212,7 +3950,7 @@ impl<'a> Tuner<'a> {
             .device_ledger()
             .charged;
         self.memory.peak_bytes = self.memory.mandatory_bytes;
-        let searches = !launches.is_empty() || !self.composed_counted.is_empty();
+        let searches = !launches.is_empty();
         self.first_load_search = searches;
         self.phase = Phase::Census {
             launches,
@@ -4235,23 +3973,6 @@ impl<'a> Tuner<'a> {
         };
         let clock = Elapsed(self.started);
         let budget = self.budget();
-        // A composed recipe's census is its discovery: work of a class
-        // this load has not observed, started while it is not late.
-        let discovery = seismic::Quote {
-            priced: Duration::ZERO,
-            unpriced: 1,
-        };
-        for index in 0..units.len() {
-            if !units[index].composed()
-                || !discovery.fits(budget.saturating_sub(self.started.elapsed()), self.longest)
-            {
-                continue;
-            }
-            let began = Instant::now();
-            units[index].census_optional(&mut self.inputs())?;
-            self.inputs().release_unheld();
-            self.longest = self.longest.max(began.elapsed());
-        }
         let indices = units
             .iter()
             .enumerate()
@@ -4419,87 +4140,6 @@ impl<'a> Tuner<'a> {
         Ok(self)
     }
 
-    /// Register the same contender in each walk. Cache hits never census or
-    /// qualify; misses join ordinary allocation and conclude once this load.
-    pub(super) fn register_composed(
-        &mut self,
-        mut contender: Box<dyn ComposedContender<'a> + 'a>,
-    ) -> Result<Option<bool>, CatalogFailure> {
-        let key = contender.key();
-        // A recipe has no statics and is fixed at no parameter.
-        let unit: TuningKey = (contender.label(), key.clone(), FixedValues::default());
-        let demand = self
-            .invocations
-            .units
-            .get(&(unit.0, unit.1.clone(), BTreeMap::new()))
-            .ok_or_else(|| unit_failure(&unit, "graph invocation demand is missing"))?;
-        contender.set_invocations(demand, &self.invocations.objective);
-        if let Some(selected) = self.composed_choices.get(&key).copied() {
-            return Ok(Some(selected));
-        }
-        let serving = matches!(self.phase, Phase::Serve(_));
-        let (label, identity) = (contender.label(), contender.pin_identity());
-        let decided = serving.then(|| pinned::recipe(label, &identity)).flatten();
-        if let Some((selected, choice)) = decided {
-            self.context.observer.event(&TuningEvent::Pinned {
-                entry: label,
-                bindings: identity,
-                statics: BTreeMap::new(),
-                choice,
-                configuration: Configuration::of(&pinned::recipe_configuration(selected)),
-            });
-            self.composed_choices.insert(key, selected);
-            return Ok(Some(selected));
-        }
-        if let Some(selected) = contender.cached() {
-            if serving {
-                pinned::record_recipe(label, &identity, selected);
-            }
-            self.composed_choices.insert(key, selected);
-            return Ok(Some(selected));
-        }
-        let demanded = demand.launches().any(|(_, count)| count > 0.);
-        match &self.phase {
-            Phase::Count { .. } => {
-                self.composed_counted.insert(key);
-                Ok(None)
-            }
-            Phase::Census { .. } => {
-                if !self.composed_censused.insert(key.clone()) {
-                    return Ok(None);
-                }
-                let label = contender.label();
-                // The recipe's mandatory work: publish the canonical choice
-                // it serves until it is qualified.
-                contender.conclude(false, false)?;
-                let Phase::Census { units, .. } = &mut self.phase else {
-                    unreachable!()
-                };
-                units.push(Box::new(ComposedUnit {
-                    key: (label, key, FixedValues::default()),
-                    contender,
-                    census: None,
-                    share: 0.,
-                    qualified: None,
-                    prerequisites: Vec::new(),
-                    demanded,
-                }));
-                Ok(None)
-            }
-            Phase::Searched => Err(unit_failure(
-                &unit,
-                "composed choice was not finalized inside the tuning budget",
-            )),
-            // A load qualifies nothing: a recipe without a stored choice
-            // serves its canonical one.
-            Phase::Serve(_) => {
-                self.unprepared_unit(contender.label(), key.clone(), BTreeMap::new())?;
-                self.composed_choices.insert(key, false);
-                Ok(Some(false))
-            }
-        }
-    }
-
     /// What a case builds its points' inputs from.
     fn inputs(&mut self) -> TuningInputs<'_, 'a> {
         TuningInputs {
@@ -4508,7 +4148,6 @@ impl<'a> Tuner<'a> {
             weights: &mut self.weights,
             noise: &self.noise,
             shared: &mut self.shared,
-            choices: &self.chosen,
         }
     }
 

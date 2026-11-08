@@ -202,6 +202,7 @@ pub(crate) fn plane(plane: ProgressivePlane, placement: &Placement, bytes: &[u8]
 
 /// The stored values of one matrix row from that row of its planes (`plane`'s
 /// inverse): `scale · (u − 2^(bits−1))` for each of its `columns` codes.
+#[cfg(test)]
 pub(crate) fn row_values(
     top: &[u8],
     next: &[u8],
