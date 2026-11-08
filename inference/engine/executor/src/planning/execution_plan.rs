@@ -188,9 +188,10 @@ impl ExecutionPlanDraft {
         &self.load
     }
 
-    /// Retain only empirically selected optional readout views before graph
-    /// resources or persistent residency are admitted. The canonical packed
-    /// projection remains available to every class.
+    /// Store each readout scope in its prepared form (planes where its
+    /// readers certify classes) before graph resources or persistent
+    /// residency are admitted; a load the planes do not fit keeps every
+    /// scope packed.
     pub fn finalize_readout(
         mut self,
         definition: &ModelDefinition,

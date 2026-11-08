@@ -22,7 +22,6 @@
 //!                                      from: every candidate and measurement of the
 //!                                      unit's search, named by the key and a digest
 //!                                      of its own bytes, which the choice states
-//! <root>/readout/<key>.json            completed composed-recipe choice
 //! <root>/prepared/<key>                a Prepare of the load this key names ran to
 //!                                      its end: a load asked to report unprepared
 //!                                      units finds none before it opens a device
@@ -100,7 +99,6 @@ const ABANDONED_WRITE: Duration = Duration::from_secs(60 * 60);
 const ARTIFACTS: &str = "artifacts";
 const TUNING: &str = "tuning";
 const EVIDENCE: &str = "evidence";
-const READOUT: &str = "readout";
 const PREPARED: &str = "prepared";
 const RECORDS: &str = "records";
 const MEASUREMENT_ATTEMPTS: &str = "measurement-attempts";
@@ -201,7 +199,7 @@ impl KernelCache {
     /// Open the cache at `root`, creating it, and evict the least recently
     /// used entries beyond `capacity` bytes.
     pub fn open(root: PathBuf, capacity: u64) -> Result<Self, KernelCacheError> {
-        for directory in [ARTIFACTS, TUNING, EVIDENCE, READOUT, PREPARED] {
+        for directory in [ARTIFACTS, TUNING, EVIDENCE, PREPARED] {
             let path = root.join(directory);
             fs::create_dir_all(&path).map_err(|error| KernelCacheError::Create { path, error })?;
         }
@@ -362,40 +360,6 @@ impl KernelCache {
     /// Record that a Prepare of the load `key` names ran to its end.
     pub fn store_prepared(&self, key: &TuningCacheKey) {
         self.write(&self.entry(PREPARED, key.as_str(), "json"), b"{}");
-    }
-
-    /// Completed composed-recipe choice; false is a permanent canonical
-    /// fallback for this first-load identity, including unmeasured scope.
-    /// A choice stored before its search's work ended is not settled: it is
-    /// no choice.
-    pub(crate) fn readout_choice(&self, key: &TuningCacheKey) -> Option<bool> {
-        let bytes = self.read(&self.entry(READOUT, key.as_str(), "json"))?;
-        let choice = serde_json::from_slice::<serde_json::Value>(&bytes).ok()?;
-        choice
-            .get("settled")?
-            .as_bool()?
-            .then(|| choice.get("selected")?.as_bool())
-            .flatten()
-    }
-
-    /// The exact finalized canonical specialization against which a selected
-    /// optional recipe completed its paired comparison.
-    pub(crate) fn readout_canonical_choice(&self, key: &TuningCacheKey) -> Option<String> {
-        let bytes = self.read(&self.entry(READOUT, key.as_str(), "json"))?;
-        serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()?
-            .get("canonical_specification")?
-            .as_str()
-            .map(str::to_owned)
-    }
-
-    pub(crate) fn store_readout_choice(
-        &self,
-        key: &TuningCacheKey,
-        receipt: &impl serde::Serialize,
-    ) {
-        let bytes = serde_json::to_vec(receipt).expect("a completed choice serializes");
-        self.write(&self.entry(READOUT, key.as_str(), "json"), &bytes);
     }
 
     /// What `path` is evicted with: the files of one tuning key (its choice

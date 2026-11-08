@@ -8,7 +8,7 @@
 //! a missing one.
 
 use super::CatalogFailure;
-use super::tuning::{ComposedContender, EntryTuning, ModelInputs, Tuner};
+use super::tuning::{EntryTuning, ModelInputs, Tuner};
 use seismic::{
     BackendName, BoundEntry, Device, Entry, KernelRequest, NativeImplementation, NativeKernel,
     NativeSpecialization, NativeSpecializationError,
@@ -112,7 +112,6 @@ pub(super) enum Tuning<'a> {
     Demand {
         model: ModelInputs<'a>,
         device: &'a Device,
-        settings: super::tuning::TuningSettings,
         invocations: InvocationDemand,
         current: crate::programs::invocation_demand::InvocationCounts,
         repeat_case: bool,
@@ -123,13 +122,11 @@ impl<'a> Tuning<'a> {
     pub fn demand(
         model: ModelInputs<'a>,
         device: &'a Device,
-        settings: super::tuning::TuningSettings,
         objective: super::tuning::Objective,
     ) -> Self {
         Self::Demand {
             model,
             device,
-            settings,
             invocations: InvocationDemand {
                 units: Default::default(),
                 objective,
@@ -160,15 +157,6 @@ impl<'a> Tuning<'a> {
         }
     }
 
-    pub fn dependency<T: EntryTuning>(
-        &self,
-        case: &T,
-    ) -> Result<Option<super::tuning::TuningKey>, CatalogFailure> {
-        self.device()
-            .map(|device| unit_of(device, &self.model(), case))
-            .transpose()
-    }
-
     /// `fixed`, the static values of the entry `entry` at `bindings`, with
     /// `implementation`'s arithmetic parameters at the choice of the unit
     /// of `prerequisite`'s case ([`Tuner::following`]). A walk without
@@ -192,67 +180,11 @@ impl<'a> Tuning<'a> {
         }
     }
 
-    pub fn choice(&self, key: &super::tuning::TuningKey) -> Option<&NativeSpecialization> {
-        match self {
-            Self::Tuner(tuner) => tuner.choice(key),
-            Self::Listing(_) | Self::Demand { .. } => None,
-        }
-    }
-    pub fn cache(&self) -> Option<&'a crate::kernel_cache::KernelCache> {
-        match self {
-            Self::Tuner(tuner) => tuner.cache(),
-            Self::Listing(_) | Self::Demand { .. } => None,
-        }
-    }
-    /// The cache whose stored tuning results this preparation reads: none for
-    /// a fresh preparation, which only replaces them.
-    pub fn stored_results(&self) -> Option<&'a crate::kernel_cache::KernelCache> {
-        match self {
-            Self::Tuner(tuner) => tuner.cache().filter(|_| !tuner.settings().fresh),
-            Self::Listing(_) | Self::Demand { .. } => None,
-        }
-    }
-    pub fn settings(&self) -> Option<super::tuning::TuningSettings> {
-        match self {
-            Self::Tuner(tuner) => Some(tuner.settings()),
-            Self::Demand { settings, .. } => Some(*settings),
-            Self::Listing(_) => None,
-        }
-    }
     pub fn device(&self) -> Option<&'a Device> {
         match self {
             Self::Tuner(tuner) => Some(tuner.device()),
             Self::Demand { device, .. } => Some(device),
             Self::Listing(_) => None,
-        }
-    }
-
-    pub fn register_composed(
-        &mut self,
-        contender: Box<dyn ComposedContender<'a> + 'a>,
-        rows: u64,
-    ) -> Result<Option<bool>, CatalogFailure> {
-        match self {
-            Self::Tuner(tuner) => tuner.register_composed(contender),
-            Self::Demand {
-                invocations,
-                current,
-                ..
-            } => {
-                invocations
-                    .units
-                    .entry((
-                        contender.label(),
-                        contender.key(),
-                        std::collections::BTreeMap::new(),
-                    ))
-                    .or_default()
-                    .add(&current.represented(|launch| {
-                        (launch.rows > rows / 2 && launch.rows <= rows).then_some(rows)
-                    }));
-                Ok(None)
-            }
-            Self::Listing(_) => Ok(None),
         }
     }
 

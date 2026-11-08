@@ -104,13 +104,14 @@ pub(crate) fn reads_progressive_heads(backend: BackendName) -> Result<bool, Stri
 /// The most selected rows a certified selection class serves on `backend`:
 /// the row counts whose levels take less time than the full pass. Metal's
 /// batched projection is bound by its matrix arithmetic, not the bytes it
-/// reads, so only a single row gains; CUDA's levels gain to four rows. Zero
-/// on a backend without the levels.
+/// reads, so only a single row gains. CUDA's top level at its declared
+/// configuration reads one row slower than the full pass (RTX 3090,
+/// Qwen3.6-35B-A3B: 2.09 against 0.70 ms), so it certifies none and reads
+/// the full pass. Zero on a backend without the levels.
 pub(crate) fn certified_rows(backend: BackendName) -> u64 {
     match backend {
         BackendName::Metal => 1,
-        BackendName::Cuda => 4,
-        BackendName::Cpu | BackendName::Vulkan => 0,
+        BackendName::Cuda | BackendName::Cpu | BackendName::Vulkan => 0,
     }
 }
 
@@ -1124,7 +1125,7 @@ pub(crate) enum ProjectionEntries<'a, G: GraphDraft + 'a> {
 impl<'a, G: GraphDraft + 'a> ProjectionEntries<'a, G> {
     /// Host-selected row indices are owned upload inputs of the raw recipe
     /// `ports` select: the packed projection's, or the planes' full pass,
-    /// even when this projection also offers a qualified contender.
+    /// even when its scope is stored as planes.
     pub(crate) fn raw_out_rows(
         &self,
         graph: &mut G,

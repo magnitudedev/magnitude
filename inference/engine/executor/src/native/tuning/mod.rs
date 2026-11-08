@@ -154,7 +154,6 @@ pub mod pinned;
 pub(crate) mod post_norm;
 mod precision;
 pub(crate) mod readout;
-pub(crate) mod readout_choice;
 mod record;
 pub(crate) mod recurrent;
 pub(crate) mod routed;

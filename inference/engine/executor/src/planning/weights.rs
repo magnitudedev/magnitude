@@ -735,7 +735,7 @@ pub enum ReadoutHead {
     /// The output projection's resident element and the extent of its
     /// accumulator-scale port.
     Packed { weight: Element, weight_scale: u64 },
-    /// Canonical packed projection plus cost-qualified bounded classes.
+    /// Stored as its planes: certified classes run the bounded levels.
     Qualified { weight: Element, weight_scale: u64 },
 }
 
@@ -778,10 +778,9 @@ pub struct HeadBinding {
     pub activation: Element,
 }
 
-/// Completed first-load physical choice of one reader of a projection scope.
-/// The scope is stored as its views; the reader's listed selected-row classes
-/// use bounded readout, and its other classes, and the scope's other
-/// readers, the views' full pass.
+/// One reader of a projection scope stored as its views: the reader's listed
+/// selected-row classes run the certified levels, and its other reads the
+/// views' full pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadoutClassChoice {
     pub scope: WeightScope,
@@ -856,8 +855,8 @@ pub struct ModelLoadPlan {
     pub(super) vision: Option<Vec<WeightPlan>>,
     /// The target's host-resident gathered tables.
     pub(super) host_tables: Vec<HostTablePlan>,
-    /// Optional lossless readout views used only for first-load qualification.
-    /// They are not resident requirements until a served class selects them.
+    /// The lossless readout views a scope may be stored as. They are not
+    /// resident requirements until a reader's choice stores its scope as them.
     pub(super) readout_candidates: Vec<WeightPlan>,
     pub(super) readout_choices: Vec<ReadoutClassChoice>,
     /// The output projections of the scopes stored as planes
@@ -1564,8 +1563,8 @@ impl ModelLoadPlan {
         Ok(self)
     }
 
-    /// Commit completed physical choices before resource admission. A scope
-    /// in which any reader selected a class is stored as its views: they are
+    /// Commit the stored forms before resource admission. A scope with a
+    /// reader's choice is stored as its views: they are
     /// placed, and its packed projection is planned and not placed
     /// (`unplaced_output`), so every reader of the scope reads the views.
     /// Unselected transient views are discarded.
@@ -1576,8 +1575,8 @@ impl ModelLoadPlan {
         let mut scopes = HashSet::new();
         let mut recipes = HashSet::new();
         for choice in choices {
-            if choice.rows.is_empty() || choice.rows.iter().any(|&rows| rows == 0) {
-                return Err("a retained readout view needs nonzero selected-row classes".into());
+            if choice.rows.contains(&0) {
+                return Err("a certified readout class needs nonzero selected rows".into());
             }
             if !recipes.insert((choice.scope, choice.norm_scope, choice.prepared)) {
                 return Err("readout choices duplicate a semantic recipe".into());
@@ -2360,12 +2359,8 @@ pub(super) fn planned_readout_recipe(
     choices: &[ReadoutClassChoice],
 ) -> Result<ReadoutHead, crate::PlanError> {
     let packed = planned_readout(weights, scope)?;
-    // Every reader of a scope stored as views reads them, whichever of the
-    // scope's readers selected a class.
-    if !choices
-        .iter()
-        .any(|choice| choice.scope == scope && !choice.rows.is_empty())
-    {
+    // Every reader of a scope stored as views reads them.
+    if !choices.iter().any(|choice| choice.scope == scope) {
         return Ok(packed);
     }
     if !ProgressivePlane::ALL.into_iter().all(|plane| {

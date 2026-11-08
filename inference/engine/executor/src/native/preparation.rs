@@ -1,7 +1,5 @@
 use super::specialization::{Specializer, Tuning};
-use super::tuning::readout_choice::{
-    QualifiedRecipe, ReadoutContender, ReadoutRecipe, RecipePreparation, RecipeState,
-};
+use super::readout::{ReadoutRecipe, RecipePreparation};
 use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
     ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights,
@@ -62,12 +60,8 @@ use magnitude_kernels::{
 use seismic::KernelRequest;
 use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
-#[derive(Default)]
-struct ReadoutStates {
-    choices: HashMap<String, RecipeState>,
-    programs: HashMap<String, RecipePreparation>,
-}
-type ReadoutRecipeStates = Rc<RefCell<ReadoutStates>>;
+/// Each recipe's formed levels, by the programs they are.
+type ReadoutRecipeStates = Rc<RefCell<HashMap<String, RecipePreparation>>>;
 
 /// The affine Metal matrix form can share one decoded tile across four
 /// rows for these head geometries. Give that row band its own objective,
@@ -473,7 +467,6 @@ fn invocation_demand(
                 load,
             },
             device,
-            tuning.settings,
             super::tuning::Objective::new(graph_demand.terms.clone()),
         ),
     );
@@ -595,19 +588,6 @@ fn imports(
     Ok(import)
 }
 
-/// Which reader of a projection scope a readout recipe serves: where its
-/// kernels are kept.
-#[derive(Clone, Copy)]
-enum ReadoutReader {
-    Target(crate::ReadoutBinding),
-    HeadBlock(crate::HeadBinding),
-    /// A head's own projection, which nothing else reads.
-    SharedHead,
-    /// A separate draft's projection of its proposing rows through the
-    /// target's.
-    Draft,
-}
-
 /// The selected-row counts of a reader whose selections are row classes up
 /// to `bound`.
 fn selected_row_classes(bound: usize) -> Vec<u64> {
@@ -615,17 +595,6 @@ fn selected_row_classes(bound: usize) -> Vec<u64> {
         .into_iter()
         .map(|rows| rows as u64)
         .collect()
-}
-
-/// A reader of a candidate scope that selected no class of its own. A scope
-/// is stored in one form, so when another reader of the scope selects one
-/// this reader reads the views too, through their full pass, and is given
-/// their kernels.
-struct ReadoutFollower {
-    reader: ReadoutReader,
-    scope: WeightScope,
-    recipe: ReadoutRecipe,
-    preparation: RecipePreparation,
 }
 
 struct Preparation<'a> {
@@ -636,11 +605,10 @@ struct Preparation<'a> {
     recipe_states: ReadoutRecipeStates,
     selection_limits: Option<crate::ResourceLimits>,
     readout_choices: Vec<crate::ReadoutClassChoice>,
-    /// Readers of a candidate scope that selected no class of their own
-    /// ([`Preparation::follow_readout_scopes`]).
-    readout_followers: Vec<ReadoutFollower>,
+    /// Candidate scopes a reader's recipe left packed: no reader of them
+    /// may store them as planes.
+    readout_packed: HashSet<WeightScope>,
     epsilon: f32,
-    softcap: f32,
     /// Model width: the static dimension of the feature readout.
     hidden: u64,
     /// The target's vocabulary: the static dimension of token selection.
@@ -683,9 +651,8 @@ impl<'a> Preparation<'a> {
             recipe_states,
             selection_limits,
             readout_choices: Vec::new(),
-            readout_followers: Vec::new(),
+            readout_packed: HashSet::new(),
             epsilon,
-            softcap: crate::programs::graph::readout::readout_softcap(&definition.decoder),
             hidden: definition.decoder.hidden,
             vocabulary: definition.decoder.vocabulary,
             target: TargetKernels::default(),
@@ -700,23 +667,20 @@ impl<'a> Preparation<'a> {
         }
     }
 
-    /// Register one complete physical recipe per served selected-row count
-    /// (`selected_rows`). A cache hit forms retained configurations but never
-    /// measures or searches.
-    /// A reader that selects no class still gets the views' kernels when its
-    /// scope is stored as them for another reader. `declared_rows` is the
-    /// output rows a raw reader's canonical head declares (`HeadRowsTuning`).
+    /// Store `scope` as its planes when its head admits them and the
+    /// backend has their kernels (`super::readout`): this reader's
+    /// selections of up to the backend's `certified_rows` run the certified
+    /// levels, its other reads the planes' full pass. `selected_rows` are
+    /// the reader's selection classes. Every reader of a scope reads the one
+    /// form it is stored in.
+    #[allow(clippy::too_many_arguments)]
     fn qualified_readout(
         &mut self,
-        reader: ReadoutReader,
         scope: WeightScope,
         norm_scope: WeightScope,
         norm: Element,
-        weight: Element,
         activation: Element,
-        softcap: f32,
         prepared: bool,
-        declared_rows: Option<u64>,
         selected_rows: Vec<u64>,
         canonical: Option<ProjectionKernels>,
     ) -> Result<Option<ProjectionKernels>, CatalogFailure> {
@@ -729,40 +693,18 @@ impl<'a> Preparation<'a> {
         let Some(device) = self.tuning.device() else {
             return Ok(None);
         };
-        let dependency = if prepared {
-            self.tuning.dependency(&PreparedProjectionTuning {
-                scope,
-                kind: WeightKind::Output,
-                weight,
-                activation,
-                columns: None,
-                indexed: false,
-                softcap,
-            })?
-        } else {
-            self.tuning.dependency(&HeadRowsTuning {
-                projection_scope: scope,
-                norm_scope,
-                norm,
-                weight,
-                activation,
-                epsilon: self.epsilon,
-                rows: declared_rows,
-            })?
-        };
-        let Some(dependency) = dependency else {
-            return Ok(None);
-        };
-        let model = self.tuning.model();
-        let scale_extent = model
-            .scale_extent(scope, WeightKind::Output)
-            .map_err(|error| CatalogFailure::Preparation {
+        let backend = device.backend();
+        if !crate::programs::graph::readout::reads_progressive_heads(backend)
+            .map_err(|outcome| CatalogFailure::Preparation {
                 entry: "readout_recipe",
                 bindings: format!("{scope:?}"),
-                outcome: error,
-            })?;
-        let candidates = model.load.readout_candidates();
-        let Some(rest) = candidates.iter().find(|plan| {
+                outcome,
+            })?
+        {
+            return Ok(None);
+        }
+        let model = self.tuning.model();
+        let Some(rest) = model.load.readout_candidates().iter().find(|plan| {
             plan.role
                 == magnitude_family_contracts::WeightRole {
                     scope,
@@ -773,183 +715,69 @@ impl<'a> Preparation<'a> {
         }) else {
             return Ok(None);
         };
-        let packed = super::tuning::weight_plan(model.load, scope, WeightKind::Output).map_err(
-            |outcome| CatalogFailure::Preparation {
-                entry: "readout_recipe",
-                bindings: format!("{scope:?}"),
-                outcome,
-            },
-        )?;
+        let failure = |outcome| CatalogFailure::Preparation {
+            entry: "readout_recipe",
+            bindings: format!("{scope:?}"),
+            outcome,
+        };
+        let depth = rest
+            .progressive_depth()
+            .expect("a progressive plane has a code depth");
+        let scale_extent = model
+            .scale_extent(scope, WeightKind::Output)
+            .map_err(failure)?;
+        let packed =
+            super::tuning::weight_plan(model.load, scope, WeightKind::Output).map_err(failure)?;
         let [stored_vocabulary, hidden] = packed.shape[..] else {
-            return Ok(None);
+            return Err(failure(format!(
+                "output projection shape {:?} is not a matrix",
+                packed.shape
+            )));
         };
-        let vocabulary = stored_vocabulary.min(self.vocabulary);
-        let Some(depth) = rest.progressive_depth() else {
-            return Ok(None);
-        };
-        let (parts, norm_extent) = model.readout_form(norm_scope, hidden).map_err(|outcome| {
-            CatalogFailure::Preparation {
-                entry: "readout_recipe",
-                bindings: format!("{scope:?}"),
-                outcome,
-            }
-        })?;
-        // A readout of unnormalized partials (`NM = 0`) has no norm.
-        let norm_plan = (norm_extent > 0)
-            .then(|| super::tuning::weight_plan(model.load, norm_scope, WeightKind::OutputNorm))
-            .transpose()
-            .map_err(|outcome| CatalogFailure::Preparation {
-                entry: "readout_recipe",
-                bindings: format!("{scope:?}"),
-                outcome,
-            })?;
+        let (parts, norm_extent) = model.readout_form(norm_scope, hidden).map_err(failure)?;
         let recipe = ReadoutRecipe {
-            scope,
-            norm_scope,
             norm,
-            weight,
             activation,
-            epsilon: self.epsilon,
-            softcap,
-            prepared,
-            vocabulary,
+            vocabulary: stored_vocabulary.min(self.vocabulary),
             hidden,
             parts,
             norm_extent,
             depth,
             scale_extent,
         };
+        // Readers of one scope differ only in their input form, which every
+        // level's domain admits: a scope is planes for all its readers or
+        // for none.
+        let admitted = recipe.admitted(backend)?;
+        let stored = self
+            .readout_choices
+            .iter()
+            .any(|choice| choice.scope == scope);
+        if (admitted && self.readout_packed.contains(&scope)) || (!admitted && stored) {
+            return Err(failure(
+                "readers of one scope disagree on whether its levels admit their recipes".into(),
+            ));
+        }
+        if !admitted {
+            self.readout_packed.insert(scope);
+            return Ok(None);
+        }
         let [top, levels @ ..] = recipe.digests(device)?;
-        let preparation_key = format!(
-            "readout-physical-programs/device={:?}/top={top}/levels={:?}",
-            device.tuning_identity(),
-            &levels[..3],
-        );
         let preparation = self
             .recipe_states
             .borrow_mut()
-            .programs
-            .entry(preparation_key)
+            .entry(format!(
+                "readout-physical-programs/device={:?}/top={top}/levels={levels:?}",
+                device.tuning_identity(),
+            ))
             .or_insert_with(|| Rc::new(RefCell::new(None)))
             .clone();
-        let digest = format!("{top}/{levels:?}");
-        let norm_identity = norm_plan.map_or_else(
-            || "no-norm".to_owned(),
-            |plan| format!("{:?}", plan.storage_identity()),
-        );
-        let mut chosen_rows = Vec::new();
-        let mut selected_state = None;
-        for rows in selected_rows {
-            let point = super::tuning::PointShape {
-                label: format!("m{rows}"),
-                weight: 1.0,
-                terms: Vec::new(),
-                rows,
-                sequences: 1,
-                context: None,
-                class: None,
-            };
-            // The choice is a tuning result: it is read only under the
-            // budget it was qualified within.
-            let budget = self.tuning.settings().map(|settings| settings.budget);
-            let key = crate::TuningCacheKey::of(&format!(
-                "readout-recipe-v4/budget={budget:?}/device={:?}/{:?}/{}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/dependency={dependency:?}/{digest}",
-                device.tuning_identity(),
-                packed.storage_identity(),
-                norm_identity,
-                self.epsilon.to_bits(),
-                softcap.to_bits(),
-                point.rows
-            ));
-            let state = self
-                .recipe_states
-                .borrow_mut()
-                .choices
-                .entry(key.as_str().to_owned())
-                .or_insert_with(|| Rc::new(RefCell::new(QualifiedRecipe::default())))
-                .clone();
-            let contender = ReadoutContender::new(
-                recipe,
-                point.clone(),
-                key.clone(),
-                self.tuning.cache(),
-                self.tuning.stored_results(),
-                state.clone(),
-                dependency.clone(),
-                preparation.clone(),
-            );
-            if self
-                .tuning
-                .register_composed(Box::new(contender), point.rows)?
-                == Some(true)
-            {
-                let Some(specification) = self
-                    .tuning
-                    .choice(&dependency)
-                    .map(|choice| format!("{choice:?}"))
-                else {
-                    continue;
-                };
-                let evidence = state.borrow().canonical_specification.clone().or_else(|| {
-                    self.tuning
-                        .stored_results()
-                        .and_then(|cache| cache.readout_canonical_choice(&key))
-                });
-                // Cached evidence is consumed as-is. A mismatch falls back;
-                // it never grants a new search or post-budget qualification.
-                // A pin's choice stands on the pin.
-                if !super::tuning::pinned::tunes_nothing()
-                    && evidence.as_ref() != Some(&specification)
-                {
-                    continue;
-                }
-                let needs_formation = state.borrow().progressive.is_none();
-                if needs_formation {
-                    *state.borrow_mut() = recipe.form_shared(device, &preparation)?;
-                }
-                {
-                    let mut state = state.borrow_mut();
-                    state.selected = true;
-                    state.canonical_specification = Some(specification);
-                }
-                chosen_rows.push(point.rows);
-                selected_state = Some(state);
-            }
-        }
-        let Some(state) = selected_state else {
-            // The scope's readers are prepared in a fixed order: one that
-            // selected before this reader is known here, one that selects
-            // after it is met in `follow_readout_scopes`.
-            if !self
-                .readout_choices
-                .iter()
-                .any(|choice| choice.scope == scope)
-            {
-                self.readout_followers.push(ReadoutFollower {
-                    reader,
-                    scope,
-                    recipe,
-                    preparation,
-                });
-                return Ok(None);
-            }
-            let Some(packed) = canonical else {
-                return Ok(None);
-            };
-            return Ok(Some(ProjectionKernels::Qualified {
-                packed: Box::new(packed),
-                progressive: recipe
-                    .form_shared(device, &preparation)?
-                    .progressive
-                    .expect("a formed recipe retains bounded kernels"),
-            }));
-        };
-        chosen_rows.sort_unstable();
-        chosen_rows.dedup();
+        let certified = crate::programs::graph::readout::certified_rows(backend);
+        let rows = selected_rows.into_iter().filter(|&rows| rows <= certified);
         if let Some(choice) = self.readout_choices.iter_mut().find(|choice| {
             choice.scope == scope && choice.norm_scope == norm_scope && choice.prepared == prepared
         }) {
-            choice.rows.extend(&chosen_rows);
+            choice.rows.extend(rows);
             choice.rows.sort_unstable();
             choice.rows.dedup();
         } else {
@@ -957,82 +785,18 @@ impl<'a> Preparation<'a> {
                 scope,
                 norm_scope,
                 prepared,
-                rows: chosen_rows,
+                rows: rows.collect(),
             });
         }
         // A count or a listing forms no kernels, the canonical projection
-        // among them: the class choice above is all such a pass records. A
-        // search over a cache that already stores this recipe's choice
-        // reaches here in its count.
+        // among them: the stored form above is all such a pass records.
         let Some(packed) = canonical else {
             return Ok(None);
         };
-        let state = state.borrow();
         Ok(Some(ProjectionKernels::Qualified {
             packed: Box::new(packed),
-            progressive: state
-                .progressive
-                .clone()
-                .expect("completed recipe retains bounded kernels"),
+            progressive: recipe.form_shared(device, &preparation)?,
         }))
-    }
-
-    /// Give the views' kernels to each reader that was prepared before
-    /// another reader of its scope selected a class: the target's projection
-    /// is read by the target readout and by an embedded head's blocks, and
-    /// is stored in one form for all of them.
-    fn follow_readout_scopes(&mut self) -> Result<(), CatalogFailure> {
-        let Some(device) = self.tuning.device() else {
-            return Ok(());
-        };
-        for follower in std::mem::take(&mut self.readout_followers) {
-            if !self
-                .readout_choices
-                .iter()
-                .any(|choice| choice.scope == follower.scope)
-            {
-                continue;
-            }
-            let progressive = follower
-                .recipe
-                .form_shared(device, &follower.preparation)?
-                .progressive
-                .expect("a formed recipe retains bounded kernels");
-            match follower.reader {
-                ReadoutReader::Target(binding) => {
-                    if let Some(readout) = self.target.readout.get_mut(&binding) {
-                        readout.head = ReadoutHeadKernels::Qualified {
-                            packed: Box::new(readout.head.clone()),
-                            progressive,
-                        };
-                    }
-                }
-                ReadoutReader::HeadBlock(binding) => {
-                    if let Some(logits) = self
-                        .head
-                        .as_mut()
-                        .and_then(|head| head.logits.get_mut(&binding))
-                    {
-                        *logits = ProjectionKernels::Qualified {
-                            packed: Box::new(logits.clone()),
-                            progressive,
-                        };
-                    }
-                }
-                ReadoutReader::SharedHead => {
-                    unreachable!("a head's own projection has one reader")
-                }
-                ReadoutReader::Draft => {
-                    if let Some(head) = self.draft.as_mut().and_then(|draft| draft.head.as_mut()) {
-                        *head = ProjectionKernels::Qualified {
-                            packed: Box::new(head.clone()),
-                            progressive,
-                        };
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Prepare every program entry, in a fixed order.
@@ -1052,7 +816,6 @@ impl<'a> Preparation<'a> {
         self.head(plan)?;
         self.shared_head(plan)?;
         self.draft(plan)?;
-        self.follow_readout_scopes()?;
         self.vision(plan)?;
         Ok(glue)
     }
@@ -1422,7 +1185,6 @@ impl<'a> Preparation<'a> {
         let b = target.readout();
         let bindings = format!("{b:?}");
         let features = self.target_features(&bindings, b.norm, b.activation)?;
-        let weight = b.head.packed();
         let head = match b.head {
             ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
                 let head = self.spec.tuned(
@@ -1451,15 +1213,11 @@ impl<'a> Preparation<'a> {
             }
         };
         let qualified = self.qualified_readout(
-            ReadoutReader::Target(b),
             WeightScope::Target,
             WeightScope::Target,
             b.norm,
-            weight.element,
             b.activation,
-            self.softcap,
             false,
-            None,
             selected_row_classes(
                 self.selection_limits
                     .map_or(0, |limits| limits.max_selected_rows),
@@ -3203,7 +2961,6 @@ impl<'a> Preparation<'a> {
                 .map_or((1, self.hidden), |streams| (streams.geometry.streams, 0));
             let features =
                 self.features_at(&bindings, b.output_norm, b.activation, self.hidden, form)?;
-            let weight = b.projection.packed();
             let logits = match b.projection {
                 ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
                     .spec
@@ -3222,15 +2979,11 @@ impl<'a> Preparation<'a> {
                     .map(ProjectionKernels::PreparedPacked),
             };
             let qualified = self.qualified_readout(
-                ReadoutReader::HeadBlock(b),
                 WeightScope::Target,
                 head_scope(head_index),
                 b.output_norm,
-                weight.element,
                 b.activation,
-                0.0,
                 true,
-                None,
                 selected_row_classes(self.selection_limits.map_or(0, |limits| {
                     limits.max_launch_slots.min(limits.max_launch_rows)
                 })),
@@ -3368,17 +3121,12 @@ impl<'a> Preparation<'a> {
                 .map(ProjectionKernels::PreparedPacked),
         };
         let qualified = if head.clustered.is_none() {
-            let weight = head.projection.packed();
             self.qualified_readout(
-                ReadoutReader::SharedHead,
                 head_scope(0),
                 head_scope(0),
                 head.output_norm,
-                weight.element,
                 activation,
-                0.0,
                 true,
-                None,
                 selected_row_classes(self.selection_limits.map_or(0, |limits| {
                     limits
                         .max_launch_slots
@@ -3518,34 +3266,21 @@ impl<'a> Preparation<'a> {
                 .map(ProjectionKernels::RawPacked),
         };
         // A draft through the target's projection reads it as it is stored:
-        // its planes, through their full pass, when another reader of the
-        // scope selected a class. The draft selects no class of its own: its
-        // proposals' confidences read every logit.
+        // its planes, through their full pass, when the scope is stored as
+        // them. The draft certifies no class of its own: its proposals'
+        // confidences read every logit.
         let head = match draft_plan.projection_scope() {
-            WeightScope::Target => {
-                let draft = self
-                    .tuning
-                    .model()
-                    .definition
-                    .draft
-                    .as_ref()
-                    .expect("a draft program has a draft");
-                let weight = draft_plan.projection().packed();
-                self.qualified_readout(
-                    ReadoutReader::Draft,
+            WeightScope::Target => self
+                .qualified_readout(
                     WeightScope::Target,
                     WeightScope::Draft,
                     draft_plan.output_norm(),
-                    weight.element,
                     draft_plan.activation(),
-                    draft.logit_softcap.unwrap_or(0.0) as f32,
                     false,
-                    Some(self.vocabulary),
                     Vec::new(),
                     head.clone(),
                 )?
-                .or(head)
-            }
+                .or(head),
             _ => head,
         };
         let shape = self.spec.tuned(
