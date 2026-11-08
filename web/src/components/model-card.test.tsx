@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest"
 import type { CatalogLocalModel } from "@magnitudedev/sdk"
 import { Option } from "effect"
 import { ModelCard } from "./model-card"
-import { catalogModel, doesNotFit } from "../../test/models/fixtures"
+import { catalogModel, doesNotFit, fits } from "../../test/models/fixtures"
 
 vi.mock("@magnitudedev/client-common", async importOriginal => ({
   ...await importOriginal<typeof import("@magnitudedev/client-common")>(),
@@ -38,6 +38,15 @@ describe("unified catalog rows", () => {
     expect(html).toContain("more memory than this computer")
     expect(html).toMatch(/<button[^>]*disabled=""/)
     expect(html).not.toContain('role="alert"')
+  })
+  it("keeps the memory breakdown button beside the number when a served-context note follows", () => {
+    if (model.servingState._tag !== "Assessed") throw new Error("Expected an assessed fixture")
+    const html = render({ ...model, servingState: { ...model.servingState, assessment: { ...fits, profile: { contextLength: 262_144 }, served: { contextLength: 131_072 } } } })
+    const button = html.indexOf('aria-label="Memory breakdown"')
+    const note = html.indexOf("128K of 256K context")
+    expect(button).toBeGreaterThan(-1)
+    expect(note).toBeGreaterThan(button)
+    expect(html.slice(note - 200, note)).toContain("truncate")
   })
   it("uses the same dash as unavailable speed when the drafter does not fit", () => {
     const html = render({ ...model, drafterWithheld: true })
