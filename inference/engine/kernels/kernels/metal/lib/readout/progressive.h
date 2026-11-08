@@ -73,6 +73,25 @@ struct ProgressiveTop {
         uint b = (k.low[step] >> (8u * j)) & 0xffu;
         return metal::fma(float2(k.scale), code_pair((b & 15u) | ((b >> 4) << 16), 1024.0h), float2(k.bias));
     }
+    // The factored form the library's GEMV sums (`projection::gemv_factored`):
+    // step `step`'s eight values over `factor`, H + bias / scale, each exact in
+    // half (a multiple of 1/32 below 8 in magnitude). Two nibbles move to bit 5
+    // of each half of a word, under the exponent of 32 (an ulp of 1/32), and
+    // one half subtraction takes 32 - bias / scale off. The GEMV then scales
+    // a step's sum once instead of each weight: at half a byte a weight, the
+    // per-weight scale and bias bound the one-row GEMV on instruction issue
+    // below the head's bandwidth.
+    static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
+        constexpr half lift = half(32.0f - PROGRESSIVE_COARSE_BIAS / float(PROGRESSIVE_COARSE_SCALE));
+        const uint w = k.low[step];
+        const half2 c04 = as_type<half2>(((w << 5) & 0x01e001e0u) | 0x50005000u) - lift;
+        const half2 c26 = as_type<half2>(((w >> 3) & 0x01e001e0u) | 0x50005000u) - lift;
+        const half2 c15 = as_type<half2>(((w << 1) & 0x01e001e0u) | 0x50005000u) - lift;
+        const half2 c37 = as_type<half2>(((w >> 7) & 0x01e001e0u) | 0x50005000u) - lift;
+        even = float4(c04.x, c26.x, c04.y, c26.y);
+        odd = float4(c15.x, c37.x, c15.y, c37.y);
+    }
+    static float factor(thread const packet &k) { return k.scale; }
 };
 
 // The exact view: the offset-binary codes u of every plane, as c = u - 128,

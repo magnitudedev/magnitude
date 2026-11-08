@@ -15,9 +15,10 @@ namespace projection {
 //
 // Each weight is decoded once to F32 (`fma(scale, code, bias)`, one rounding,
 // the dequantized value of the portable body) and multiplies every activation
-// row with one FMA, in column order. A lane's sum therefore depends only on
-// the packets it owns (LANES), never on M, R or SG: every row of an M-row
-// GEMV is bit-identical to the same row computed alone.
+// row with one FMA, in column order (a factored decoder's exact codes do,
+// and each step's sum is scaled once: `gemv_factored`). A lane's sum
+// therefore depends only on the packets it owns (LANES), never on M, R or SG:
+// every row of an M-row GEMV is bit-identical to the same row computed alone.
 
 // Threadgroup memory of one GEMV, a `threadgroup uchar *` bound at
 // [[threadgroup(0)]]: the staged activations. A GEMV launch over K columns
@@ -117,6 +118,43 @@ inline float gemv_step_dot(float acc, float4 we, float4 wo, float4 xe, float4 xo
     return acc;
 }
 
+// Whether a packet decoder is factored: its `codes` are a packet's values
+// over one `factor` of the packet, exactly, so a step's eight products are
+// summed over its codes and scaled once, where any other decoder's are
+// summed over its values (`fma(scale, code, bias)` a weight).
+template <typename T>
+struct gemv_void {
+    typedef void type;
+};
+template <typename W, typename = void>
+struct gemv_factored {
+    static constant constexpr bool value = false;
+};
+template <typename W>
+struct gemv_factored<W, typename gemv_void<decltype(&W::factor)>::type> {
+    static constant constexpr bool value = true;
+};
+
+// Step `step`'s eight weights of packet k as its decoder sums them: its
+// codes where it is factored, else its values.
+template <typename W>
+inline void gemv_step_weights(thread const typename W::packet &k, uint step, thread float4 &even, thread float4 &odd) {
+    if constexpr (gemv_factored<W>::value)
+        W::codes(k, step, even, odd);
+    else
+        W::values(k, step, even, odd);
+}
+
+// acc plus one step's products of packet k (its `gemv_step_weights`).
+template <typename W>
+inline float gemv_step_add(float acc, thread const typename W::packet &k, float4 we, float4 wo, float4 xe,
+    float4 xo) {
+    if constexpr (gemv_factored<W>::value)
+        return metal::fma(W::factor(k), gemv_step_dot(0.0f, we, wo, xe, xo), acc);
+    else
+        return gemv_step_dot(acc, we, wo, xe, xo);
+}
+
 // Accumulate one loaded packet (chunk-local `local`) into the accumulators of
 // all MAXM staged rows.
 template <typename W, typename U, bool PAIRED, uint R, uint MAXM, typename A>
@@ -127,9 +165,9 @@ inline void gemv_accumulate(thread float (&acc)[R][MAXM], thread float (&acc2)[R
         float4 ae[R], ao[R], be[R], bo[R];
         PROJECTION_UNROLL
         for (uint r = 0; r < R; ++r) {
-            W::values(packets.a[r], step, ae[r], ao[r]);
+            gemv_step_weights<W>(packets.a[r], step, ae[r], ao[r]);
             if (PAIRED)
-                U::values(packets.b[r], step, be[r], bo[r]);
+                gemv_step_weights<U>(packets.b[r], step, be[r], bo[r]);
         }
         threadgroup const uint4 *x = words + (local * 4u + step) * MAXM;
         PROJECTION_UNROLL
@@ -138,9 +176,9 @@ inline void gemv_accumulate(thread float (&acc)[R][MAXM], thread float (&acc2)[R
             A::split8(x[m], xe, xo);
             PROJECTION_UNROLL
             for (uint r = 0; r < R; ++r) {
-                acc[r][m] = gemv_step_dot(acc[r][m], ae[r], ao[r], xe, xo);
+                acc[r][m] = gemv_step_add<W>(acc[r][m], packets.a[r], ae[r], ao[r], xe, xo);
                 if (PAIRED)
-                    acc2[r][m] = gemv_step_dot(acc2[r][m], be[r], bo[r], xe, xo);
+                    acc2[r][m] = gemv_step_add<U>(acc2[r][m], packets.b[r], be[r], bo[r], xe, xo);
             }
         }
     }
@@ -672,16 +710,16 @@ inline void gemv_tile_row(thread const In &in, thread const Out &out, thread con
                     PROJECTION_UNROLL
                     for (uint step = 0; step < 4; ++step) {
                         float4 ae, ao, be, bo;
-                        W::values(a[j].current, step, ae, ao);
+                        gemv_step_weights<W>(a[j].current, step, ae, ao);
                         if (PAIRED)
-                            U::values(b[j].current, step, be, bo);
+                            gemv_step_weights<U>(b[j].current, step, be, bo);
                         PROJECTION_UNROLL
                         for (uint m = 0; m < MAXM; ++m) {
                             float4 xe, xo;
                             A::split8(x[step * MAXM + m], xe, xo);
-                            acc[j][m] = gemv_step_dot(acc[j][m], ae, ao, xe, xo);
+                            acc[j][m] = gemv_step_add<W>(acc[j][m], a[j].current, ae, ao, xe, xo);
                             if (PAIRED)
-                                acc2[j][m] = gemv_step_dot(acc2[j][m], be, bo, xe, xo);
+                                acc2[j][m] = gemv_step_add<U>(acc2[j][m], b[j].current, be, bo, xe, xo);
                         }
                     }
                 }
