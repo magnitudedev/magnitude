@@ -54,7 +54,7 @@ pub mod fixtures;
 mod domain_tests;
 
 pub use family::{
-    BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, BankCurve, Reach, SizeStep, HostResidency,
+    BankHolding, BankResize, BankResized, BankStep, ElasticBank, ExpertResidency, BankCurve, Reach, Reaches, SizeStep, HostResidency,
     NativeFamily,
     ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, ShrinkCause, TierFill, TrafficHold, Trip,
 };

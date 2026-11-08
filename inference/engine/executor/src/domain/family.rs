@@ -144,7 +144,7 @@ pub trait ElasticBank {
     /// saves nothing known. Each curve is priced only as far as `reach`
     /// goes ([`Reach`]): a step's price is a decode step's model at two
     /// sizes, and a decision that can move a few steps prices no others.
-    fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reach: Reach) -> Result<Vec<BankCurve>, super::DomainError>;
+    fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reach: Reaches) -> Result<Vec<BankCurve>, super::DomainError>;
 
     /// What weighs a prompt group's places against the bank's slots
     /// (`GroupReads::grant`): the run's measured group reads and the bank's
@@ -400,13 +400,37 @@ pub struct SizeStep {
     pub saves: f64,
 }
 
-/// How far a decision can move a bank holding, in bytes: what it may
+/// How far a decision can move the bank's holdings, in each tier's store
+/// ([`Reach`]): what each may
 /// release of what each holds (`held`, beyond which the bank adds what its
-/// own holdings offer, which they may take from each other by exchange) and
+/// own holdings in the same store offer, which they may take from each other
+/// by exchange) and
 /// grant beyond it (`offered`). A curve ([`BankCurve`]) steps each way until
 /// its steps' bytes reach that far, the step that crosses it included, so a
 /// settle sees every step it could move and the run each joins as far as
 /// room allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reaches {
+    /// Each tier's ([`crate::planning::BankTier::index`]).
+    pub tiers: [Reach; crate::planning::BankTier::COUNT],
+    /// Whether the tiers' storage lies in one store: only there does one
+    /// tier's release make room for another's offer by exchange.
+    pub shared: bool,
+}
+
+impl Reaches {
+    /// `reach` in every tier, the tiers in one store.
+    pub fn every(reach: Reach) -> Self {
+        Self { tiers: [reach; crate::planning::BankTier::COUNT], shared: true }
+    }
+
+    /// How far a decision can move a holding in `tier` storage.
+    pub fn of(&self, tier: crate::planning::BankTier) -> Reach {
+        self.tiers[tier.index()]
+    }
+}
+
+/// How far a decision can move a bank holding in one store, in bytes ([`Reaches`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reach {
     pub held: u64,

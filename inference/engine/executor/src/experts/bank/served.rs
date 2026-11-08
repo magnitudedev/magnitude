@@ -1,7 +1,7 @@
 use super::{ExpertBank, HeldTable, count};
 use crate::assessment::{BankSlots, DecodePrice, GroupReads, LiveDecode};
 use crate::planning::Placer;
-use crate::domain::{BankCurve, BankHolding, BankResize, BankResized, BankStep, DomainError, ElasticBank, ExpertResidency, Reach, ResizeTimes, SizeStep, TableResidency};
+use crate::domain::{BankCurve, BankHolding, BankResize, BankResized, BankStep, DomainError, ElasticBank, ExpertResidency, Reach, Reaches, ResizeTimes, SizeStep, TableResidency};
 use crate::CompletionWake;
 use std::time::{Duration, Instant};
 use crate::native::BankMoves;
@@ -383,7 +383,7 @@ impl ElasticBank for ServedBank {
         self.bank.carried()
     }
 
-    fn curves(&self, price: Option<&DecodePrice>, reach: Reach) -> Result<Vec<BankCurve>, DomainError> {
+    fn curves(&self, price: Option<&DecodePrice>, reach: Reaches) -> Result<Vec<BankCurve>, DomainError> {
         let (plan, held) = (&self.bank.plan, self.held()?);
         // What holding `to` rather than `from` saves the decode step;
         // nothing known without a price. Adjacent steps share a size, whose
@@ -440,15 +440,28 @@ impl ElasticBank for ServedBank {
             holdings.push((BankHolding::Table { table: index }, records, (records, bound), Box::new(saves)));
         }
         // What the holdings offer first, then what they hold as far as a
-        // release reaches: what is owed and what any offer, the bank's own
-        // among them, may take by exchange.
+        // release reaches: what is owed and what any offer in the same
+        // store, the bank's own among them, may take by exchange. A
+        // release in one store makes no room in another, so another
+        // store's offers reach none of its steps (on a discrete device the
+        // host tier's whole copy would otherwise price every device slot).
         let mut curves = holdings
             .iter()
-            .map(|(holding, at, range, saves)| self.curve(*holding, *at, *range, Reach { held: 0, offered: reach.offered }, saves))
+            .map(|(holding, at, range, saves)| {
+                let kind = self.storage(*holding)?;
+                self.curve(*holding, *at, *range, Reach { held: 0, offered: reach.of(kind).offered }, saves)
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let offered = curves.iter().flat_map(|curve| &curve.offered).map(|step| step.bytes).fold(0, u64::saturating_add);
-        let release = Reach { held: reach.held.saturating_add(offered), offered: 0 };
-        for (curve, (holding, at, range, saves)) in curves.iter_mut().zip(&holdings) {
+        let offered = |kind: crate::planning::BankTier| {
+            curves
+                .iter()
+                .filter(|curve| reach.shared || curve.kind == kind)
+                .flat_map(|curve| &curve.offered)
+                .map(|step| step.bytes)
+                .fold(0, u64::saturating_add)
+        };
+        let releases = curves.iter().map(|curve| Reach { held: reach.of(curve.kind).held.saturating_add(offered(curve.kind)), offered: 0 }).collect::<Vec<_>>();
+        for ((curve, (holding, at, range, saves)), release) in curves.iter_mut().zip(&holdings).zip(releases) {
             curve.held = self.curve(*holding, *at, *range, release, saves)?.held;
         }
         Ok(curves)

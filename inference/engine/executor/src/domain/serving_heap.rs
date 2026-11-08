@@ -19,7 +19,7 @@
 use super::value::{self, Curve, Holding, Rate, Step, Supply};
 use super::borrowing::Room;
 use super::holdings::OptionalHolding;
-use super::{BankCurve, BankHolding, BankStep, DomainError, ExecutorDomain, OptionalComponent, ProgramFamily, Reach, SizeStep, StateBindings};
+use super::{BankCurve, BankHolding, BankStep, DomainError, ExecutorDomain, OptionalComponent, ProgramFamily, Reach, Reaches, SizeStep, StateBindings};
 use crate::memory::HoldingClass;
 use crate::planning::BankTier;
 use crate::workload::{WorkloadMeter, WorkloadRates};
@@ -232,7 +232,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// one was timed, the bank's slots in what their shrink's moves take
     /// the device, a step moving at most a record of each group
     /// (`MoveLines`). None without a bank.
-    fn bank_heap(&self, decode_steps_per_s: f64, reach: Reach) -> Result<Vec<(BankCurve, Curve<Holding>)>, DomainError> {
+    fn bank_heap(&self, decode_steps_per_s: f64, reach: Reaches) -> Result<Vec<(BankCurve, Curve<Holding>)>, DomainError> {
         let Some(bank) = self.family.expert_bank() else {
             return Ok(Vec::new());
         };
@@ -278,6 +278,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
             _ => 0.,
         }))
+    }
+
+    /// Whether the bank's tiers' storage lies in one store ([`Reaches::shared`]).
+    fn tiers_shared(&self) -> bool {
+        self.store_of(BankTier::Bank.storage()) == self.store_of(BankTier::Host.storage())
     }
 
     /// The stores the bank's storage kinds lie in, each with its kinds.
@@ -638,16 +643,22 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let others = |steps: fn(&Curve<Holding>) -> &[Step]| -> u64 {
             device_curves.iter().flat_map(|curve| steps(curve)).map(|step| step.bytes).sum()
         };
-        let reach = Reach {
-            held: supplies.iter().map(|(_, _, supply)| supply.owed).sum::<u64>().saturating_add(others(|curve| &curve.offered)),
-            offered: match measuring {
-                true => 0,
-                false => supplies
-                    .iter()
-                    .map(|(_, _, supply)| supply.free.saturating_add(supply.borrowable))
-                    .fold(others(|curve| &curve.held), u64::saturating_add),
-            },
+        // Each in its tier's store: what is owed there and what the
+        // device's other holdings offer, in device storage's store.
+        let reach = |tier: BankTier| {
+            let store = self.store_of(tier.storage());
+            let supply = supplies.iter().find(|(of, _, _)| Some(*of) == store).map(|(_, _, supply)| supply);
+            let device = store.is_some() && store == device;
+            let beside = |steps: fn(&Curve<Holding>) -> &[Step]| if device { others(steps) } else { 0 };
+            Reach {
+                held: supply.map_or(0, |supply| supply.owed).saturating_add(beside(|curve| &curve.offered)),
+                offered: match measuring {
+                    true => 0,
+                    false => supply.map_or(0, |supply| supply.free.saturating_add(supply.borrowable)).saturating_add(beside(|curve| &curve.held)),
+                },
+            }
         };
+        let reach = Reaches { tiers: BankTier::ALL.map(reach), shared: self.tiers_shared() };
         let bank = self.bank_heap(rates.decode_steps_per_s, reach)?;
         let mut settlement = ServingSettlement { places: held, ..ServingSettlement::default() };
         let mut moves = Vec::new();
@@ -720,7 +731,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(None);
         };
         Ok(self
-            .bank_heap(rates.decode_steps_per_s, Reach { held: 1, offered: 0 })?
+            .bank_heap(rates.decode_steps_per_s, Reaches { shared: self.tiers_shared(), ..Reaches::every(Reach { held: 1, offered: 0 }) })?
             .iter()
             .filter_map(|(_, heap)| heap.held.first().map(Step::per_byte))
             .min_by(f64::total_cmp))
@@ -844,7 +855,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let (running, free): (Vec<BankTier>, Vec<BankTier>) = asked.into_iter().partition(|&kind| self.resize_held.runs_in(kind));
         let owed = short.iter().map(|&kind| deficit(kind)).max().unwrap_or(1);
-        let bank = self.bank_heap(1., Reach { held: owed, offered: 0 })?;
+        let bank = self.bank_heap(1., Reaches { shared: self.tiers_shared(), ..Reaches::every(Reach { held: owed, offered: 0 }) })?;
         let settles: Vec<(Vec<&(BankCurve, Curve<Holding>)>, u64)> = match short.is_empty() {
             true => vec![(bank.iter().filter(|(curve, _)| free.contains(&curve.kind)).collect(), 1)],
             false => free

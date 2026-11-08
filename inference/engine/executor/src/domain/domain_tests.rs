@@ -1486,11 +1486,11 @@ fn a_paying_growth_stops_at_the_line() {
         let price = domain.decode_price().unwrap();
         let kind = crate::planning::BankTier::Bank;
         let bank = domain.family.expert_bank().unwrap();
-        let step = bank.curves(price.as_ref(), crate::Reach { held: 0, offered: 1 }).unwrap()[0].offered[0].bytes;
+        let step = bank.curves(price.as_ref(), crate::Reaches::every(crate::Reach { held: 0, offered: 1 })).unwrap()[0].offered[0].bytes;
         // A curve priced only as far as a reach goes is the whole curve's
         // first steps, the step crossing the reach included.
-        let whole = bank.curves(price.as_ref(), crate::Reach { held: u64::MAX, offered: u64::MAX }).unwrap();
-        let near = bank.curves(price.as_ref(), crate::Reach { held: 2 * step - 1, offered: step + 1 }).unwrap();
+        let whole = bank.curves(price.as_ref(), crate::Reaches::every(crate::Reach { held: u64::MAX, offered: u64::MAX })).unwrap();
+        let near = bank.curves(price.as_ref(), crate::Reaches::every(crate::Reach { held: 2 * step - 1, offered: step + 1 })).unwrap();
         assert_eq!((near[0].held.len(), near[0].offered.len()), (2.min(whole[0].held.len()), 2.min(whole[0].offered.len())));
         assert_eq!(near[0].offered[..], whole[0].offered[..near[0].offered.len()]);
         assert_eq!(near[0].held[..], whole[0].held[..near[0].held.len()]);

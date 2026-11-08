@@ -1062,7 +1062,8 @@ impl ElasticBank for FakeBank {
     /// and host slots, a byte of upload storage each, up to the tier's
     /// ceiling, each saving [`HOST_SLOT_SAVES`], as `ServedBank::curves`
     /// steps them, each as far as `reach` goes.
-    fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reach: crate::Reach) -> Result<Vec<crate::BankCurve>, DomainError> {
+    fn curves(&self, price: Option<&crate::assessment::DecodePrice>, reaches: crate::Reaches) -> Result<Vec<crate::BankCurve>, DomainError> {
+        let reach = reaches.of(crate::planning::BankTier::Bank);
         use crate::SizeStep;
         let rows = self.tensor.extents()[0];
         let unit = self.tensor.byte_len() / rows;
@@ -1081,7 +1082,7 @@ impl ElasticBank for FakeBank {
         if self.host_ceiling > 0 {
             let at = self.host.load(std::sync::atomic::Ordering::Relaxed);
             let bound = price.map_or(at, |_| self.host_ceiling.max(at));
-            let offered = (at + 1..=bound).take(reach.offered as usize).map(|to| SizeStep { to, bytes: 1, saves: HOST_SLOT_SAVES }).collect();
+            let offered = (at + 1..=bound).take(reaches.of(host).offered as usize).map(|to| SizeStep { to, bytes: 1, saves: HOST_SLOT_SAVES }).collect();
             curves.push(crate::BankCurve { holding: crate::BankHolding::Host, kind: host, at, held: vec![], offered });
         }
         Ok(curves)
