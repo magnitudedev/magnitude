@@ -187,23 +187,18 @@ inline float value_of(uint k) {
     return as_type<float>((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
 }
 
-// Quarter q of a bit plane word: the bit of code 8q + e in nibble e.
-inline uint quarter(uint plane, uint q) {
-    return (plane >> q) & 0x11111111u;
+// The bits of quarter q of a plane word (code 8q + e at bit 4e + q) as +1
+// where set and -1 elsewhere: the even codes (8q, 8q + 2, ...) and the odd.
+// Two codes 16 bits apart move to the sign bits of a half2 of -1s, a set bit
+// clearing its sign: three integer operations a pair and no conversion.
+inline void signs(uint plane, uint q, thread float4 &even, thread float4 &odd) {
+    const half2 s04 = as_type<half2>(((plane << (15u - q)) & 0x80008000u) ^ 0xbc00bc00u);
+    const half2 s26 = as_type<half2>(((plane << (7u - q)) & 0x80008000u) ^ 0xbc00bc00u);
+    const half2 s15 = as_type<half2>(((plane << (11u - q)) & 0x80008000u) ^ 0xbc00bc00u);
+    const half2 s37 = as_type<half2>(((plane << (3u - q)) & 0x80008000u) ^ 0xbc00bc00u);
+    even = float4(s04.x, s26.x, s04.y, s26.y);
+    odd = float4(s15.x, s37.x, s15.y, s37.y);
 }
-
-// The even (0, 2, 4, 6) and odd codes of a nibble word, as 0..15.
-inline void nibbles(uint word, thread float4 &even, thread float4 &odd) {
-    even = float4(as_type<uchar4>(word & 0x0f0f0f0fu));
-    odd = float4(as_type<uchar4>((word >> 4) & 0x0f0f0f0fu));
-}
-
-// One group's planes.
-struct Group {
-    uint4 high;
-    uint bit3, rest0, rest1, rest2;
-    float scale;
-};
 
 // A group's 32 decoded codes, by quarter: the even (8q, 8q + 2, ...) and odd
 // codes. Decoded once per vocabulary row, they serve every output row.
@@ -211,15 +206,16 @@ struct Codes {
     float4 even[4], odd[4];
 };
 
-// The group's exact signed codes c = u - 128.
-inline Codes exact_codes(thread const Group &group) {
+// The group's exact signed codes c = u - 128: the exact view's code bytes
+// (`packets::ProgressiveExact`) as exact floats, by half subtraction rather
+// than integer conversion.
+inline Codes exact_codes(thread const packets::ProgressiveExact::packet &group) {
     Codes codes;
     for (uint q = 0; q < 4u; ++q) {
-        const uint low = (quarter(group.bit3, q) << PROGRESSIVE_LOW_PLANES) | (quarter(group.rest0, q) << (PROGRESSIVE_LOW_PLANES - 1u))
-            | (quarter(group.rest1, q) << 1) | quarter(group.rest2, q);
-        const uint high = group.high[q];
-        codes.even[q] = float4(as_type<uchar4>(((high & 0x0f0f0f0fu) << PROGRESSIVE_HALF_BITS) | (low & 0x0f0f0f0fu))) - float(PROGRESSIVE_OFFSET);
-        codes.odd[q] = float4(as_type<uchar4>(((high & 0xf0f0f0f0u) >> (4u - PROGRESSIVE_HALF_BITS)) | ((low >> 4) & 0x0f0f0f0fu))) - float(PROGRESSIVE_OFFSET);
+        uint even, odd;
+        packets::ProgressiveExact::bytes(group, q, even, odd);
+        codes.even[q] = packets::byte_floats(even, half(1024u + PROGRESSIVE_OFFSET));
+        codes.odd[q] = packets::byte_floats(odd, half(1024u + PROGRESSIVE_OFFSET));
     }
     return codes;
 }
@@ -263,15 +259,32 @@ struct Selection {
     float divisor(uint m) const {
         return temperature[ulong(m) * temperature_stride];
     }
-    float score(uint m, uint v, float logit) const {
-        return transform(logit) / divisor(m) + gumbel::noise(v, draws + ulong(m) * draw_row, draw_word);
+    // A score is its noise-free part plus noise of at most PROGRESSIVE_NOISE,
+    // so a score whose noise-free part is further than that below where it
+    // must reach (`reaches`, `raise`) is decided without drawing the noise.
+    float noise(uint m, uint v) const {
+        return gumbel::noise(v, draws + ulong(m) * draw_row, draw_word);
+    }
+    // Whether the score of `logit` in row m reaches `bar`.
+    bool reaches(uint m, uint v, float logit, float bar) const {
+        const float plain = transform(logit) / divisor(m);
+        return plain + PROGRESSIVE_NOISE >= bar && plain + noise(m, v) >= bar;
     }
     // Whether a competing row whose view logit is within `reach` of its
     // exact logit can reach `threshold`.
     bool survives(uint m, uint v, float logit, float reach, float threshold) const {
         if (!(logit > -INFINITY) || !competes(m, v))
             return false;
-        return score(m, v, logit + reach) >= threshold - PROGRESSIVE_MARGIN * (1.0f + metal::abs(threshold));
+        return reaches(m, v, logit + reach, threshold - PROGRESSIVE_MARGIN * (1.0f + metal::abs(threshold)));
+    }
+    // Raises row m's key `lowest` to the score of a competing row's lower
+    // bound `logit`, unless that score cannot reach the key already there.
+    void raise(threadgroup atomic_uint *lowest, uint m, uint v, float logit) const {
+        const float plain = transform(logit) / divisor(m);
+        const uint best = atomic_load_explicit(lowest, memory_order_relaxed);
+        if (best != 0u && plain + PROGRESSIVE_NOISE < value_of(best))
+            return;
+        atomic_fetch_max_explicit(lowest, key(plain + noise(m, v)), memory_order_relaxed);
     }
 };
 
@@ -323,9 +336,10 @@ struct Planes {
     uint third(uint v, uint g) const {
         return bit3[ulong(v) * bit3_stride + g];
     }
-    Group group(uint v, uint g) const {
+    packets::ProgressiveExact::packet group(uint v, uint g) const {
         device const uint *low = rest + ulong(v) * rest_row + ulong(g) * rest_group;
-        return Group{high(v, g), third(v, g), low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u, PROGRESSIVE_LOW_PLANES == 3u ? low[2u * rest_plane] : 0u, scale(v, g)};
+        return {high(v, g), uint4(third(v, g), low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u,
+            PROGRESSIVE_LOW_PLANES == 3u ? low[2u * rest_plane] : 0u), scale(v, g)};
     }
 };
 
@@ -333,8 +347,10 @@ struct Planes {
 // for every output row: it survives when the previous level's upper-bound
 // score reaches `floor` (that level's threshold); −inf elsewhere. The
 // simdgroup then projects each survivor, lane l summing groups l, l + 32, ...
-// REFINE: the 5-bit view, the 4-bit logit plus `s * (8 b3 - 4) x`, whose
-// lower-bound scores raise the next threshold. Otherwise: the exact logit.
+// REFINE: the 5-bit view, the 4-bit logit plus `s 2^(P-1) (2 b3 - 1) x` (the
+// code's missing bits move from their midpoint by half their span, up where
+// bit 3 is set), whose lower-bound scores raise the next threshold.
+// Otherwise: the exact logit.
 template <bool REFINE>
 inline void gather(device const uchar *features, ulong feature_stride, thread const Planes &planes,
     device const float *radius_previous, device const float *radius_next, ulong radius_stride, device const float *coarse,
@@ -389,14 +405,13 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
                     features_group(features, feature_stride, m, g, xe, xo);
                 if (REFINE) {
                     const uint plane = planes.third(v, g);
-                    float dot = 0.0f, sum = 0.0f;
+                    float dot = 0.0f;
                     for (uint q = 0; q < 4u; ++q) {
-                        float4 be, bo;
-                        nibbles(quarter(plane, q), be, bo);
-                        dot += metal::dot(be, xe[q]) + metal::dot(bo, xo[q]);
-                        sum += (xe[q].x + xe[q].y + xe[q].z + xe[q].w) + (xo[q].x + xo[q].y + xo[q].z + xo[q].w);
+                        float4 se, so;
+                        signs(plane, q, se, so);
+                        dot += metal::dot(se, xe[q]) + metal::dot(so, xo[q]);
                     }
-                    acc = metal::fma(planes.scale(v, g), metal::fma(float(1u << PROGRESSIVE_LOW_PLANES), dot, -float(1u << (PROGRESSIVE_LOW_PLANES - 1u)) * sum), acc);
+                    acc = metal::fma(planes.scale(v, g) * float(1u << (PROGRESSIVE_LOW_PLANES - 1u)), dot, acc);
                 } else {
                     acc += exact(planes.scale(v, g), exact_codes(planes.group(v, g)), xe, xo);
                 }
@@ -407,9 +422,7 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
             const float logit = REFINE ? coarse[m * coarse_row + ulong(v) * coarse_col] + acc : acc;
             out[m * out_row + ulong(v) * out_col] = REFINE ? logit : selection.transform(logit);
             if (REFINE && selection.competes(m, v))
-                atomic_fetch_max_explicit(&lowest[m],
-                    key(selection.score(m, v, logit - radius_next[v * radius_stride] * lengths[m * length_stride])),
-                    memory_order_relaxed);
+                selection.raise(&lowest[m], m, v, logit - radius_next[v * radius_stride] * lengths[m * length_stride]);
         }
     }
     if (REFINE)

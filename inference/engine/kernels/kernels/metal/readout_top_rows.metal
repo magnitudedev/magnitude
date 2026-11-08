@@ -26,16 +26,8 @@ struct BoundOut {
     progressive::Selection selection;
     void store(uint m, uint n, float value) const {
         logits[ulong(m) * row + ulong(n) * col] = value;
-        if (!selection.competes(m, n))
-            return;
-        // A score is its noise-free score plus noise of at most
-        // PROGRESSIVE_NOISE: a row that cannot reach the threshold so far
-        // cannot raise it, so it skips the noise.
-        const float lower = value - radius[ulong(n) * radius_stride] * lengths[m];
-        const uint best = atomic_load_explicit(&lowest[m], memory_order_relaxed);
-        if (best != 0u && selection.transform(lower) / selection.divisor(m) + PROGRESSIVE_NOISE < progressive::value_of(best))
-            return;
-        atomic_fetch_max_explicit(&lowest[m], progressive::key(selection.score(m, n, lower)), memory_order_relaxed);
+        if (selection.competes(m, n))
+            selection.raise(&lowest[m], m, n, value - radius[ulong(n) * radius_stride] * lengths[m]);
     }
     void store2(uint m, uint n, float first, float second) const {
         store(m, n, first);
