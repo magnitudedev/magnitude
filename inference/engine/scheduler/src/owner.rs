@@ -2006,10 +2006,10 @@ trait MemoryStep: MemoryHost + Sized {
         if settled.prefixes > 0 || !settled.optional.is_empty() {
             self.advance_epoch();
         }
-        let before = self.domain().memory_moment();
-        let wake = self.completion();
+        // What the process holds as a resize begins, read only for one.
         if let Some(release) = settled.releases.first().copied() {
             let magnitude_executor::BankRelease { holding, to, per_byte } = release;
+            let (before, wake) = (self.domain().memory_moment(), self.completion());
             // A shrink deferred (a chain under way, a step still running)
             // is settled again at the next reading.
             let step = self.domain().shrink_expert_bank_to(bindings, holding, to, wake).map_err(classify_domain_error)?;
@@ -2032,6 +2032,7 @@ trait MemoryStep: MemoryHost + Sized {
             return Ok(());
         }
         self.memory().declined = tried;
+        let (before, wake) = (self.domain().memory_moment(), self.completion());
         let decided = |outcome: &dyn std::fmt::Display| {
             let magnitude_executor::BankGrant { holding, kind, from, to, bytes, borrowed, per_byte } = grant;
             tracing::info!(?holding, ?kind, from, to, bytes, borrowed, per_byte, %outcome, "expert bank growth settled");
