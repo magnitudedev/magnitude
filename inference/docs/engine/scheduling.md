@@ -57,19 +57,50 @@ eligible again on the next round. State and retained outputs grow under device
 heap claims as requests enter, and released requests return those resources.
 
 A prompt group (a prompt's consecutive chunks run layer-major as one chain) holds
-the places of the class it is granted when it opens (`ExecutorDomain::grant_group`),
-up to every chunk of a whole-context prompt. The places its planned chunks are worth
-are weighed against the expert bank's slots by what each saves per byte
-(`GroupReads::grant`): a place saves the re-reads of the group's cold experts across
-its chunks, a slot the re-reads of decode steps and of this prompt's groups that
-miss it. Places that win memory from slots leave a want the bank's next shrink
-serves (`PlacesWant`); until then the group holds the most places that fit what a
-growth may take now (`Places::admitted`) and the heap grants. No group runs longer
-than the wait bound `W = (P − E) / r`: the ladder releases nothing while a chain
-runs, and only the one store's expert bank is cut beside it (below), so from the
-planning line `P` the host may take what lies above the emergency reserve `E` at
-the fastest rate `r` the memory probes measured it taking
-(`MemoryPace::wait_bound`).
+the places of the class it is granted when it opens (`ExecutorDomain::grant_group`):
+`min(chunks, places target)`. The target is a holding of the one memory settle,
+priced beside the expert bank's slots and the unborn workload state on one scale,
+seconds of serving saved per second, per byte:
+
+- A place more is worth the prompt seconds a group of more places saves, times
+  requests a second. The seconds come from the plan's own model on generic
+  measurements: each group's submission, and where the plan banks experts, the
+  routed passes a group merges and the expert loads its reuse saves across its
+  chunks, at the store's measured read cost (`ExecutorDomain::places_seconds`).
+  They are priced once per load's measures, never per reading, and nothing the
+  load reads of its own groups or of the host's memory motion prices them.
+- A bank slot is worth the decode step it saves, times decode steps a second.
+- The unborn state's room (planned context no sequence has committed) is lent only
+  to the bank's slots, and is worth keeping what lending costs: a sequence that
+  grows into it makes its claim owed, and the bank releases and later retakes the
+  slots on it, once a request at the bank's own move cost per byte.
+
+The plan grants the places its prompt pass merges, each pass size carrying the
+class of those places (`ModelLoadPlan::pass`: a bank's settled pass, a whole chain's
+where experts are held whole), and that grant is the
+target as the load starts, its room reserved from the bank's growth
+(`class_reserve`): the first group opens on the model's prediction, before any
+memory reading. Each Normal reading's settle then moves the target, raising it
+into free room or by exchange with bank slots worth less per byte, lowering it
+where the bank's slots are worth more. Places held beyond a lowered target are
+released between groups, before any bank resize (`release_group_places`). Only
+real overcommit refuses a group's places as it opens: the heap's claim of the
+class's bytes from a reading taken then (none in the Reclaim band or blind; the
+most places that fit where another program holds the class's room), or the
+measurement job's claim, which no growth takes while it stands.
+
+A banked plan granted no pass beyond one launch chains one place and holds no class.
+A plan holding its experts whole chains the most places up to its prompt's whose
+class fits beside them; a class grows with its places, so where only one fits that
+is one place, which holds none, and whatever admits the experts admits them so.
+
+While a chain runs the ladder defers its releases to the chain's end, so pressure
+that arrives during a group waits at most that group's run. A group takes its
+class only when it opens in Normal, and its length is the plan's: at most the
+chain capacity's chunks. Within it, only a scratch-served streamed chain reads
+memory between its submissions, and only to cut the bank in the one store beside
+it (`ExpertBank::release_running`, below); a discrete host's host tier and the
+state rungs wait the group out.
 
 A prompt group's chain is encoded at the device's pace, and between its submissions
 it takes the periodic reading published since the last (`ExecutorDomain::submit_chain`). Where the
@@ -83,17 +114,12 @@ records below the cut, and its release waits on the device work before it. So
 another program's ask that lands mid-chain is answered within the passes the watcher
 decided ahead of the encoding, not at the chain's end, and the next boundary reports
 it as any bank shrink. A host tier's shrink and a device bank's moves still run
-between flights alone. Before a load has measured its groups' reads, and on a
-load without a bank, no measure prices a group's places or its time: it groups
-every planned chunk that fits. So a plan sizes the two together: a bank beyond its
-floor leaves room for the class of every chunk of a whole-context prompt, priced as a
+between flights alone. So a plan sizes the bank and the class together: a plan that
+holds the class leaves room for every chunk of a whole-context prompt, charged as a
 group opening holds it (its graph slots and graphs, the target's group buffers, the
 bank's placed words and the tables' stagings; `AssessmentMemoryCharge::group_class`),
-and only the floor is admitted without it. That room stays the places': while no group
-holds the class, the one store's bank grows into it only as borrowed slots (below),
-and a group whose grant finds it borrowed takes it back first, unweighed: the bank
-owes what the class lacks, which a cut beside the running chain or the shrink before
-the next group gives back.
+and only the floor is admitted without it. That room stays the places': no growth of
+the bank, committed or borrowed, takes it (`ExecutorDomain::bank_unborn`).
 
 A class's slots are each launch's activation with its upload regions, its output in
 the chain's rotation of `n + 1` slots, and its readout and drafter slots
@@ -164,11 +190,10 @@ a step the settle could take (`SettleStands`). The serving rates' and the decode
 price's drift between them moves no step. A settle prices the bank's steps on the
 decode model, which is no step's work, so none runs where nothing moved. What a
 settle reads is computed once per change of its own inputs: a decode launch once
-per rows and depth, a prompt group's seconds once per size it reads and change of
-their source, the bank's releases only as far as offers in their own store reach,
+per rows and depth, the bank's releases only as far as offers in their own store reach,
 and a growth's room on the last reading while the process's own charge stands as it
 read it (its claim still reads the machine afresh). It reads the ranking's live
-decode and group-read curve as the residency thread's last feed published them,
+decode as the residency thread's last feed published it,
 never feeding the stack itself. Every host-RAM question reads one
 measure, what the OS gives without compressing or swapping another program's data
 (free, file-backed and purgeable pages): a load's admission, its band, its deficits and

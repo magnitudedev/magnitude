@@ -1975,7 +1975,8 @@ trait MemoryStep: MemoryHost + Sized {
 
     /// Settle the memory heap (`ExecutorDomain::settle_memory`) on
     /// `bindings` and apply it: the prefixes it released evicted, the idle
-    /// optional components it released unbound, then one bank resize: its
+    /// optional components it released unbound, then the prompt-group
+    /// places held beyond the target it settled, else one bank resize: its
     /// least valuable release first (what it gives back is what the
     /// settle's growths and places are paid with), else its most valuable
     /// growth, each to its settled size; the rest settle again at the next
@@ -2005,6 +2006,14 @@ trait MemoryStep: MemoryHost + Sized {
         }
         if settled.prefixes > 0 || !settled.optional.is_empty() {
             self.advance_epoch();
+        }
+        // Places the settle released are given back first, between groups:
+        // their room is what its growths may be paid with.
+        if settled.places_released {
+            let wake = self.completion();
+            let (released, slots) = self.domain().release_group_places(wake).map_err(classify_domain_error)?;
+            tracing::info!(released, ?slots, "prompt places release settled");
+            return Ok(());
         }
         // What the process holds as a resize begins, read only for one.
         if let Some(release) = settled.releases.first().copied() {

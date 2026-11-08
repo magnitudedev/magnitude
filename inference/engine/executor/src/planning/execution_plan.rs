@@ -1323,7 +1323,7 @@ fn stepped(
             Ok(Step { bytes, worth, move_seconds: 0.0 })
         })
         .collect::<Result<_, PlanError>>()?;
-    Ok(Curve { holding, borrows: false, held: Vec::new(), offered })
+    Ok(Curve { holding, borrows: false, lends: false, held: Vec::new(), offered })
 }
 
 /// Settle `curves` (none holding a step) into `supply`, then confirm what
@@ -1353,6 +1353,7 @@ fn settle_confirmed<E>(
             .map(|(curve, &steps)| Curve {
                 holding: curve.holding,
                 borrows: false,
+                lends: false,
                 held: curve.offered[..steps].iter().rev().copied().collect(),
                 offered: Vec::new(),
             })
@@ -1668,7 +1669,7 @@ mod tests {
         let points = [0, 1, 2, 3];
         let charge = |slots: u64| Ok::<_, PlanError>(slots * 10);
         let bank = stepped(Holding::Bank(BankHolding::Experts), &points, &charge, &|slots| 10.0 - slots as f64 * 3.0, 1.0).unwrap();
-        let pass = Curve { holding: Holding::PassRows, borrows: false, held: Vec::new(), offered: vec![Step { bytes: 10, worth: Rate::new(0.5), move_seconds: 0.0 }] };
+        let pass = Curve { holding: Holding::PassRows, borrows: false, lends: false, held: Vec::new(), offered: vec![Step { bytes: 10, worth: Rate::new(0.5), move_seconds: 0.0 }] };
         let room = load_supply(PlanRoom { free: 40, ceiling: u64::MAX });
         // The real charge is 5 bytes over the estimate for each step held.
         let check = |granted: &[usize]| -> Result<Result<(), NonZeroU64>, PlanError> {

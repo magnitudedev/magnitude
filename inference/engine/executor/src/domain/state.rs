@@ -860,7 +860,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if demand == crate::memory::ClaimDemand::default() {
             return Ok(());
         }
-        let (_, unborn) = self.opportunistic_room(seismic::Contract::DeviceOnly);
+        let unborn = self.unborn(seismic::Contract::DeviceOnly);
         let planned = self.planned_unheld();
         let claimed = self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live, planned);
         let claim = match claimed {
@@ -1013,23 +1013,31 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Grant the prompt group opening with `operations` its class: the
     /// places of every graph slot its chain's launches take (`behind`, which
-    /// runs at most that many). Its request's chunks in hand (the group's
-    /// planned chunks, within the load's chain capacity) offer their places
-    /// to the memory heap ([`Self::places_curve`]), settled beside the
-    /// bank's slots (`settle_places`): it holds the places the settle grants
-    /// that room admits now (`Places::admitted` of
-    /// [`Self::opportunistic_room`]), granted by the heap beside the
-    /// workload's unborn state, which refuses every growth in Reclaim. What
-    /// the settle grants beyond that is the bank's slots' memory, which the
-    /// owner's next settle shrinks the bank for. The class held already
-    /// serves any smaller one, and nothing shrinks here. The one decision of
-    /// a group's places; its pools' slots and buffers are held together or
-    /// not at all. A class's bytes are its group buffers, its places' bank
-    /// words, its pools' slots and the graphs each slot makes as it is
-    /// allocated, priced by the device's graph cost beyond its budget
-    /// (`graph_demand`).
+    /// runs at most that many). Its chunks in hand (its planned chunks,
+    /// within the load's chain capacity) take as many places as the target
+    /// grants ([`Self::places_target`]): the plan's settle's at the load's
+    /// first group, so it opens on the model's prediction whatever memory
+    /// read before it, and each serving settle's after. The room the target
+    /// grants no group holds yet is reserved from the bank's growth
+    /// ([`Self::class_reserve`]). No settle runs here: only real overcommit
+    /// refuses the places, through the heap's claim of their bytes from a
+    /// reading taken then beside the workload's unborn state: none in the
+    /// Reclaim band or blind, the most places that fit where the class's
+    /// bytes do not (another program took its room), and none while the
+    /// measurement job's claim, which no opportunistic growth takes, stands.
+    /// The class held already serves any smaller one, and nothing shrinks
+    /// here (a settle's release waits for the groups' end,
+    /// [`Self::release_group_places`]). The one decision of a group's
+    /// places; its pools' slots and buffers are held together or not at
+    /// all. A class's bytes are its group buffers, its places' bank words,
+    /// its pools' slots and the graphs each slot makes as it is allocated,
+    /// priced by the device's graph cost beyond its budget (`graph_demand`).
     pub(super) fn grant_group(&mut self, operations: &[Operation]) -> Result<(), DomainError> {
-        let capacity = self.chain_capacity().get();
+        let limits = self.execution.policy().limits();
+        if self.places_most() == std::num::NonZeroUsize::MIN || self.measurement_claim.is_some() {
+            return Ok(());
+        }
+        let capacity = limits.chain_capacity.get();
         let chunks = match (operations, self.behind_within(operations, capacity)) {
             // `behind_within` holds a chain within `capacity` launches.
             ([_], super::queue::Behind::Chain { chunks }) => chunks.len() + 1,
@@ -1037,27 +1045,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         };
         let floor = self.resources.group_places();
         let held = floor.get();
-        let limits = self.execution.policy().limits();
-        let (room, unborn) = self.opportunistic_room(seismic::Contract::DeviceOnly);
-        let wait = self.pace.borrow().wait_bound();
-        let (demands, bytes) = self.class_bytes(held, chunks)?;
-        let settled = self.settle_places(&bytes)?;
-        // What room admits now of what the settle granted.
-        let room = room.map_or(u64::MAX, |(room, _)| room);
-        let admitted = (held..)
-            .zip(&bytes)
-            .take_while(|&(places, &bytes)| places <= settled && (places == held || bytes < room))
-            .last()
-            .map_or(held, |(places, _)| places);
-        let counts = demands.iter().copied().zip(bytes.iter().copied()).enumerate()
-            .take(admitted.saturating_sub(held).saturating_add(1));
-        for (more, (demand, bytes)) in counts.skip(1).rev() {
+        let unborn = self.unborn(seismic::Contract::DeviceOnly);
+        let (demands, bytes) = self.class_bytes(held, chunks.min(self.places_target.get()))?;
+        for (more, (demand, bytes)) in demands.into_iter().zip(bytes).enumerate().skip(1).rev() {
             let grown = floor.saturating_add(more);
             let places = grown.get();
             let planned = self.planned_unheld();
             let claimed = self.memory.borrow_mut().claim_demand(demand, unborn, HoldingClass::Live, planned);
             let claim = match claimed {
                 Ok(claim) => claim,
+                // Another program holds the class's room: fewer places.
                 Err(ClaimRefusal::Deficit { .. }) => continue,
                 // Nothing grows in Reclaim, nor blind.
                 Err(ClaimRefusal::Reclaim(_) | ClaimRefusal::Blind(_)) => return Ok(()),
@@ -1072,9 +1069,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .map(|grown| self.resources.hold_class(grown));
             self.release_claim(claim);
             if held.is_ok() {
-                self.class_reserve = self.class_reserve.saturating_sub(bytes);
-                let wait = wait.map_or("none".to_owned(), |wait| format!("{wait:.1} s"));
-                tracing::info!("prompt groups hold {places} places, {bytes} bytes more; wait bound {wait}");
+                tracing::info!("prompt groups hold {places} places, {bytes} bytes more");
             }
             self.refresh_memory()?;
             return match held.map_err(|error| match error {
@@ -1092,19 +1087,53 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(())
     }
 
-    /// The class room the plan reserves beyond the places held
-    /// (`ModelLoadPlan::group_class_pass`): growing the class to the places
-    /// the plan's pass merges, in the bank's device store; none where the
-    /// plan reserves none.
-    pub(super) fn planned_class_reserve(&mut self) -> u64 {
-        let Some(pass) = self.execution.load().group_class_pass() else {
-            return 0;
-        };
-        let held = self.resources.group_places().get();
+    /// The places the plan grants prompt groups, as the domain is made:
+    /// those its prompt pass merges (`ModelLoadPlan::pass`): its bank's,
+    /// whose class beyond one place the plan reserves room for
+    /// (`ModelLoadPlan::group_class_pass`), or a whole chain's where its
+    /// experts are held whole; and the class's bytes at each place count up
+    /// to the chain's capacity, the most a group holds ([`Self::class_bytes`]
+    /// from one place), which the settle weighs them by and the target
+    /// reserves.
+    pub(super) fn plan_places(&mut self) {
+        let limits = self.execution.policy().limits();
+        assert_eq!(self.resources.group_places(), std::num::NonZeroUsize::MIN, "a new domain's groups hold one place");
         let (_, bytes) = self
-            .class_bytes(held, pass.get())
+            .class_bytes(1, limits.chain_capacity.get())
             .expect("invariant violated: the plan charged a group class it cannot price");
-        *bytes.last().expect("a class's bytes hold the places held")
+        self.class_ladder = bytes.into_boxed_slice();
+        let pass = self.execution.load().pass(limits).get();
+        assert!(pass <= self.class_ladder.len(), "invariant violated: a pass merges {pass} launches, beyond its chain's places");
+        self.places_target = std::num::NonZeroUsize::new(pass).expect("a pass merges a launch");
+    }
+
+    /// The places a prompt group takes as it opens, at most its chunks
+    /// (`grant_group`).
+    pub fn places_target(&self) -> std::num::NonZeroUsize {
+        self.places_target
+    }
+
+    /// The most places a group may hold: the plan's chain capacity where
+    /// it holds the class, else one ([`Self::plan_places`]).
+    pub(super) fn places_most(&self) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(self.class_ladder.len()).expect("a class's bytes hold one place's")
+    }
+
+    /// The class's bytes beyond one place's at `places` places
+    /// ([`Self::plan_places`]).
+    pub(super) fn class_ladder_bytes(&self, places: usize) -> u64 {
+        self.class_ladder[places - 1]
+    }
+
+    /// The room the places target grants that no group holds yet, in the
+    /// bank's device store: no growth of the bank takes it, so a group's
+    /// places find it however the bank grew before them. Whole as the
+    /// domain is made, falling as groups hold places (`grant_group`) and
+    /// with the target a settle lowers, rising as one raises it or Reclaim
+    /// releases the class to its floor.
+    pub(super) fn class_reserve(&self) -> u64 {
+        let held = self.resources.group_places().get().min(self.places_most().get());
+        self.class_ladder_bytes(self.places_target.get()).saturating_sub(self.class_ladder_bytes(held))
     }
 
     /// What growing the prompt-group class from `held` places to each count
@@ -1145,10 +1174,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 
     /// Claim `bytes` of device memory for the service's measurement job
     /// beside the model, in place of any claim before: it is held out of
-    /// what opportunistic growth may take ([`Self::opportunistic_room`],
-    /// [`Self::growth_room`]), so neither the bank's slots nor a group's
-    /// places take it, and the
-    /// bank's shrink makes it ([`Self::measurement_room`]); and the bank's
+    /// what the bank's growth may take ([`Self::growth_room`]), no group
+    /// grows its places while it stands (`grant_group`), and the bank's
+    /// shrink makes it ([`Self::measurement_room`]); and the bank's
     /// own traffic is held (`ElasticBank::hold_traffic`), so the job
     /// measures beside none of the load's copies or reads. A growth or the
     /// host tier's backing running ends at its next slot
@@ -1224,16 +1252,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let above = u128::from(residency.slots.saturating_sub(residency.floor));
         let held = charged * above / u128::from(residency.slots.max(1));
         u64::try_from(held).map_err(|_| DomainError::invariant("the bank's charge exceeds the host"))
-    }
-
-    /// What a group's places may take now in `kind` storage: the room beside
-    /// the workload there ([`Self::workload_room`]) less, in device
-    /// storage's store, the measurement job's claim; and the workload's
-    /// unborn state there.
-    fn opportunistic_room(&self, kind: seismic::Contract) -> (Option<(u64, u64)>, u64) {
-        let (room, unborn) = self.workload_room(kind);
-        let claimed = self.measurement_beside(kind);
-        (room.map(|(room, margin)| (room.saturating_sub(claimed), margin)), unborn)
     }
 
     /// The measurement job's claim in `kind` storage's store: none but in
@@ -1320,13 +1338,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// What a growth of the expert bank in `kind` storage leaves beside it:
-    /// the unborn state and components ([`Self::unborn`]) and, in device
-    /// storage's store, the class room the plan reserves that no group holds
-    /// yet (`class_reserve`), which a group's places take and the bank never
-    /// does.
+    /// the unborn state and components ([`Self::unborn`]) less the state's
+    /// room a settle lent the bank (`state_lent`, `Holding::State`) and, in
+    /// device storage's store, the class room the places target reserves
+    /// that no group holds yet ([`Self::class_reserve`]), which a group's
+    /// places take and the bank never does.
     pub(super) fn bank_unborn(&self, kind: seismic::Contract) -> u64 {
-        let reserve = if self.beside_device(kind) { self.class_reserve } else { 0 };
-        self.unborn(kind).saturating_add(reserve)
+        match self.beside_device(kind) {
+            true => self.unborn(kind).saturating_sub(self.state_lent).saturating_add(self.class_reserve()),
+            false => self.unborn(kind),
+        }
     }
 
     /// The room beside the workload in `kind` storage's store: what a growth
@@ -1509,11 +1530,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Release graph activations and output slots grown beyond the held
-    /// prompt-group class that no request or launch holds, and in Reclaim
-    /// the held class down to the floor of one place (`grant_group`): its
-    /// group buffers now, credited with the charge of the model storage the
-    /// release drops whole, as Seismic measured it before, and the slots on
-    /// the load's release thread
+    /// prompt-group class that no request or launch holds, and the held
+    /// class beyond the places it keeps: in Reclaim the floor of one place,
+    /// otherwise the places target a settle lowered ([`Self::places_target`]),
+    /// never while a chain holds the queue (its launches hold the class).
+    /// The class's group buffers now, credited with the charge of the model
+    /// storage the release drops whole, as Seismic measured it before, and
+    /// the slots on the load's release thread
     /// (`AllocatedResources::release_idle_slots`), `wake` completed once
     /// they are released. The bytes released now, and the slots' release;
     /// while one runs nothing more is released, the class and its slots
@@ -1522,40 +1545,51 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.resources.releasing_slots() {
             return Ok((0, SlotRelease::Running));
         }
-        let reclaim = policy == ShrinkPolicy::Reclaim;
-        // The class held, buffers and pools together, down to the floor.
-        let buffers = reclaim && self.resources.group_places() > std::num::NonZeroUsize::MIN;
-        let released = match buffers {
-            false => 0,
-            true => {
+        let held = self.resources.group_places();
+        let keeps = match policy {
+            ShrinkPolicy::Reclaim => std::num::NonZeroUsize::MIN,
+            ShrinkPolicy::Idle => self.places_target,
+        };
+        let class = (keeps < held && self.chain_holder().is_none()).then_some(keeps);
+        let released = match class {
+            None => 0,
+            Some(places) => {
                 // Every model allocation and its charge now, each once. Only
                 // this thread drops a model allocation (one released off it
                 // only shrinks a reservation, or is no model storage's), so
                 // those released by the time it returns are what it freed:
                 // no concurrent release or growth moves the credit.
-                let mut held = std::collections::HashMap::new();
+                let mut charged = std::collections::HashMap::new();
                 self.family.visit_model_storage(&mut |tensor| {
                     let observer = tensor.observe_storage();
-                    if let Some(charged) = observer.charged_bytes() {
-                        held.entry(observer.identity()).or_insert((observer, charged));
+                    if let Some(bytes) = observer.charged_bytes() {
+                        charged.entry(observer.identity()).or_insert((observer, bytes));
                     }
                 });
                 // A group of one holds the floor's alone, which allocates none.
-                self.family.hold_group(1).map_err(|error| DomainError::invariant(error.to_string()))?;
+                self.family.hold_group(places.get()).map_err(|error| DomainError::invariant(error.to_string()))?;
                 self.refresh_memory()?;
-                held.into_values().filter(|(observer, _)| observer.charged_bytes().is_none()).map(|(_, charged)| charged).sum()
+                charged.into_values().filter(|(observer, _)| observer.charged_bytes().is_none()).map(|(_, bytes)| bytes).sum()
             }
         };
-        let slots = match self.resources.release_idle_slots(reclaim, wake) {
+        let limits = self.execution.policy().limits();
+        let slots = match self.resources.release_idle_slots(class.map(|places| (places, limits.class_slots(places.get()))), wake) {
             true => SlotRelease::Began,
             false => SlotRelease::None,
         };
-        // A class released to the floor gives its places' room back to the
-        // plan's reserve, which no growth of the bank takes.
-        if reclaim {
-            self.class_reserve = self.planned_class_reserve();
+        if let Some(places) = class {
+            tracing::info!(places = places.get(), released, "prompt groups hold fewer places");
         }
         Ok((released, slots))
+    }
+
+    /// Release the prompt-group class held beyond the places target a
+    /// settle lowered ([`Self::release_idle_graph_slots`] at the idle
+    /// policy): the bytes released now and the slots' release; nothing while
+    /// a chain holds the queue, a release runs, or the class held is within
+    /// the target.
+    pub fn release_group_places(&mut self, wake: crate::CompletionWake) -> Result<(u64, SlotRelease), DomainError> {
+        self.release_idle_graph_slots(ShrinkPolicy::Idle, wake)
     }
 
     /// Free empty slabs and compact into held slabs without a growth claim.

@@ -46,7 +46,7 @@ pub(crate) fn prior_accepted(depth: u32) -> f64 {
 /// offered.
 fn optional(component: OptionalComponent, bound: bool, step: Step) -> OptionalHolding {
     let (held, offered) = if bound { (vec![step], vec![]) } else { (vec![], vec![step]) };
-    let curve = Curve { holding: Holding::Optional(component), borrows: false, held, offered };
+    let curve = Curve { holding: Holding::Optional(component), borrows: false, lends: false, held, offered };
     OptionalHolding { component, curve: Some(curve) }
 }
 
@@ -122,7 +122,7 @@ pub(crate) fn prefixes(entries: impl IntoIterator<Item = (u64, f64)>) -> Curve<H
             move_seconds: 0.0,
         })
         .collect();
-    Curve { holding: Holding::Prefixes, borrows: false, held, offered: vec![] }
+    Curve { holding: Holding::Prefixes, borrows: false, lends: false, held, offered: vec![] }
 }
 
 #[cfg(test)]
@@ -231,7 +231,7 @@ mod tests {
         let head = curve(drafter(100, true, drafting, 0.0, 0.5));
         let slot = Step { bytes: 50, worth: Rate::new(0.01), move_seconds: 0.0 };
         let experts = Holding::Bank(crate::BankHolding::Experts);
-        let bank = Curve { holding: experts, borrows: true, held: vec![slot, slot], offered: vec![] };
+        let bank = Curve { holding: experts, borrows: true, lends: false, held: vec![slot, slot], offered: vec![] };
         let settled = settle(&[head.clone(), bank.clone()], owed(100));
         assert_eq!(settled.released, vec![(experts, 2)]);
         let settled = settle(&[head, bank], owed(150));

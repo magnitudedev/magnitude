@@ -636,15 +636,32 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// The service's measurement job's claim beside the model, which the
     /// bank's shrink makes room for (`ExecutorDomain::measurement_room`).
     measurement_claim: Option<state::MeasurementClaim>,
-    /// What of the prompt-group class the plan reserves room for
-    /// (`ModelLoadPlan::group_class_pass`: the class of the places its pass
-    /// merges)
-    /// no group holds yet, in device storage: no growth of the bank takes
-    /// it, so a group's places find it however the bank grew before them.
-    /// Set as the domain is made, falling as groups hold places
-    /// (`grant_group`) and whole again once Reclaim releases the class to
-    /// its floor; none where the plan reserves none.
-    class_reserve: u64,
+    /// The places a prompt group takes as it opens, at most its chunks
+    /// (`grant_group`): as the domain is made, the places the plan's pass
+    /// merges, whose class the plan reserves room for
+    /// (`ModelLoadPlan::group_class_pass`), one where it reserves none; then
+    /// what each serving settle
+    /// grants places beside the bank's slots and the unborn state
+    /// ([`Self::settle_memory`]). The room of the places it grants that no
+    /// group holds yet is reserved from the bank's growth
+    /// ([`Self::class_reserve`]); places held beyond it are released
+    /// between groups ([`Self::release_group_places`]).
+    places_target: std::num::NonZeroUsize,
+    /// The class's bytes beyond one place at each place count from one to
+    /// the chain's capacity (`class_ladder[p − 1]`, [`Self::class_bytes`]
+    /// from one place), read as the domain is made: what each place weighs
+    /// in the settle, and the room the target reserves.
+    class_ladder: Box<[u64]>,
+    /// The prompt's seconds at each place count from one to the chain's
+    /// capacity ([`Self::places_seconds`]), as last priced: they change
+    /// only with the load's measures, so a settle at every reading prices
+    /// them once per load, not once per reading.
+    places_prompt: RefCell<Option<std::rc::Rc<[f64]>>>,
+    /// Of the unborn workload state's room in device storage
+    /// ([`Self::unborn`]), what a settle lent the bank's growth
+    /// (`Holding::State`): the bank may hold it until a sequence claims it,
+    /// when its claim is owed and the bank's release covers it.
+    state_lent: u64,
     /// Identity of the next target flight.
     next_flight: u64,
     host_turn: Option<in_flight::HostTurn>,
@@ -678,10 +695,6 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     /// owner takes it ([`Self::take_running_release`]): the storage it
     /// resizes and what the process held as it was decided.
     running_release: Option<(crate::planning::BankTier, MemoryMoment)>,
-    /// One prompt group's seconds by size as last priced
-    /// (`serving_heap::PlacesPrompt`); cleared as the load's measures
-    /// change.
-    places_prompt: RefCell<Option<serving_heap::PlacesPrompt>>,
     /// The outcome of the newest periodic reading observed that the owner
     /// has not taken yet ([`Self::take_published_memory`]): one observed
     /// between a chain's submissions is the owner's reading too.
@@ -745,7 +758,7 @@ pub struct LoadCosts {
     pub step: Box<DecodeStep>,
     /// What a prompt group's submission costs the host beyond a launch
     /// chained behind another (`ExecutorCosts::group_submission_seconds`):
-    /// what each group fewer saves a prompt (`ExecutorDomain::group_seconds`).
+    /// what each group fewer saves a prompt (`ExecutorDomain::places_seconds`).
     pub submission: f64,
 }
 
@@ -785,11 +798,9 @@ pub struct ExpertMeasures {
     /// a stored table's records.
     pub read: crate::assessment::Priced<crate::assessment::ReadLine>,
     /// What a routed pass over each streamed layer's experts costs on this
-    /// executor, which prices a prompt group's compute by its size
-    /// (`GroupReads::grant`), and before the load measured a group, the
-    /// routed seconds its places save (`ExecutorDomain::group_seconds`):
-    /// until measured, a measured group's places weigh its reads alone, and
-    /// before a group is measured its places are not priced.
+    /// executor, which prices a prompt group's compute by its size and the
+    /// passes its launches merge (`Stages::merge_sets`): until measured, a
+    /// group merges by its reads alone.
     pub pass: crate::assessment::Priced<crate::assessment::ExpertPass>,
     /// Each bank group's shrink move line on this executor, at its own
     /// record form and moves (`MoveCosts`): what a bank step's exchange is
@@ -1587,13 +1598,6 @@ impl DomainPace {
         let span = window.max(at.duration_since(then));
         was.saturating_sub(now) as f64 / span.as_secs_f64()
     }
-
-    /// An allocation domain's wait bound (`MemoryPace::wait_bound`): none
-    /// in a domain that grows nothing, or while the host takes none of it.
-    fn wait_bound(&self) -> Option<f64> {
-        (self.role == DomainRole::Allocation && self.rate > 0.0)
-            .then(|| self.thresholds.planning_bytes.saturating_sub(self.thresholds.emergency_bytes) as f64 / self.rate)
-    }
 }
 
 impl MemoryPace {
@@ -1845,27 +1849,6 @@ impl MemoryPace {
     /// the reserve's margin holds; none before a probe of it.
     fn fluctuation(&self, store: seismic::StoreId) -> u64 {
         self.domains.get(&store).map_or(0, |pace| pace.fluctuation.largest)
-    }
-
-    /// The wait bound: how long pressure that arrives as a prompt group
-    /// starts may wait for a release, in seconds. The owner's ladder
-    /// releases nothing while a group runs (it defers releases while a
-    /// chain is held), and only the one store's bank is cut beside it
-    /// (`ExpertBank::release_running`), down to its floor at most, so from
-    /// the planning line `P` the rest of the host may take what lies
-    /// above the domain's emergency reserve `E`
-    /// (`DomainThresholds::emergency_bytes`), at the rate `r` the host
-    /// sustains taking it at now ([`DomainPace::sustained`]): `W = (P − E) / r`, the
-    /// least of any allocation domain. The reserve is the region a load must
-    /// not run into, whatever lies past it on the host: the worker's kill
-    /// where the OS reports no pressure level, critical pressure and
-    /// compression on macOS, failed allocations in a device's own memory.
-    /// None while the host takes memory from no allocation domain.
-    fn wait_bound(&self) -> Option<f64> {
-        self.domains
-            .values()
-            .filter_map(DomainPace::wait_bound)
-            .min_by(f64::total_cmp)
     }
 
     /// From a shrink's decision to the next one's effect.
@@ -2906,7 +2889,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             planned: Vec::new(),
             workload: None,
             measurement_claim: None,
-            class_reserve: 0,
+            places_target: std::num::NonZeroUsize::MIN,
+            class_ladder: Box::new([]),
+            places_prompt: RefCell::new(None),
+            state_lent: 0,
             next_flight: 0,
             host_turn: None,
             proposed: BTreeSet::new(),
@@ -2919,7 +2905,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             #[cfg(test)]
             refreshes: std::cell::Cell::new(0),
             running_release: None,
-            places_prompt: RefCell::new(None),
             unseen_reading: RefCell::new(None),
             settled: None,
             requests: 0,
@@ -2927,7 +2912,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             settles: std::cell::Cell::new(0),
         };
         let mut domain = domain;
-        domain.class_reserve = domain.planned_class_reserve();
+        domain.plan_places();
         let bindings = StateBindings {
             target: target_state,
             head: head_state,

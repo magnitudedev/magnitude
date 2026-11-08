@@ -471,12 +471,6 @@ impl Shared {
         self.telemetry.live()
     }
 
-    /// What weighs a prompt group's places against the bank's slots
-    /// (`Telemetry::group_reads`).
-    pub fn group_reads(&self) -> Option<crate::assessment::GroupReads> {
-        self.telemetry.group_reads(self.priced(), self.notice())
-    }
-
     /// The experts each streamed layer's slot map names held, ascending.
     pub fn held(&self) -> Vec<Vec<usize>> {
         self.telemetry.held()

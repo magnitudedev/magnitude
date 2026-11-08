@@ -186,14 +186,20 @@ impl NativeGraphPool {
         Ok(())
     }
 
+    /// Hold the class of `slots` in place of the one held, never below the
+    /// floor: what [`Self::release_idle`] keeps of a class a settle or
+    /// Reclaim released.
+    pub(crate) fn keep(&mut self, slots: GraphSlots) {
+        self.held = GraphSlots {
+            activations: self.floor.activations.max(slots.activations),
+            output: self.floor.output.max(slots.output),
+        };
+    }
+
     /// Take the free activations and output slots beyond the held class's
-    /// counts, the held class being the floor's once `reclaim` releases it,
-    /// into `idle`, which releases them where it drops. Lent slots stay
-    /// until their last view drops.
-    pub(crate) fn release_idle(&mut self, reclaim: bool, idle: &mut IdleSlots) {
-        if reclaim {
-            self.held = self.floor;
-        }
+    /// counts into `idle`, which releases them where it drops. Lent slots
+    /// stay until their last view drops.
+    pub(crate) fn release_idle(&mut self, idle: &mut IdleSlots) {
         fn release<T>(free: &mut Vec<T>, allocated: &mut usize, kept: usize, into: &mut Vec<T>) {
             let releasable = allocated.saturating_sub(kept).min(free.len());
             into.extend(free.drain(free.len() - releasable..));

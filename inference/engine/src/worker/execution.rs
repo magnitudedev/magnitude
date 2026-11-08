@@ -239,7 +239,7 @@ mod tests {
     /// asserts of them holds on any host however loaded: each required
     /// point the walk's retrace finds unrecorded stored at 1 ms, the launch
     /// graph's host times 0.15 ms (each run waited for) and 0.05 ms (queued)
-    /// past its device time, so a group's submission costs 0.1 ms.
+    /// past its device time.
     fn store_costs(device: &seismic::Device, cache: &std::path::Path) {
         use magnitude_executor::assessment::{ExecutorCosts, StoredCosts};
         use seismic::measure::{Record, RecordStore, Timing};
@@ -322,7 +322,7 @@ mod tests {
     /// A load without a bank chains its prompt as a base load does, priced
     /// from the executor's costs as stored ([`store_costs`]), through the
     /// path a load's worker prices it (`load_measures`): its prompt group
-    /// takes its chunks' places, each saving a group's submission, 0.1 ms.
+    /// takes its chunks' places, the plan's chain.
     #[test]
     fn a_dense_load_chains_its_prompt_priced_from_stored_costs() {
         use magnitude_executor::platform::DeviceRequest;
@@ -332,8 +332,6 @@ mod tests {
         store_costs(&device, cache.path());
         let measures = load_measures(&pricing).unwrap();
         assert!(measures.experts.is_none(), "a load without a bank prices no experts");
-        let submission = measures.costs.as_ref().map(|costs| costs.submission).unwrap();
-        assert!((submission - 1e-4).abs() < 1e-9, "a group's submission is the round trip past a queued launch: {submission}");
         domain.measure_load(measures, &mut bindings).unwrap();
         assert_eq!(fixtures::group_places_opened((domain, bindings)), 3, "the group holds its chunks' places");
     }

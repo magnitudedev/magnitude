@@ -35,8 +35,13 @@ pub(crate) enum Holding {
     /// table's slots (`experts/bank/served.rs`).
     Bank(super::BankHolding),
     /// A prompt group's places beyond the first: the class's graph slots,
-    /// group buffers and table stagings (`planning::class_slots`).
+    /// group buffers, table stagings and bank words
+    /// (`ExecutorDomain::class_bytes`).
     Places,
+    /// The planned workload state's room no sequence has committed yet
+    /// (`ExecutorDomain::unborn`), kept for the sequences that grow into
+    /// it and lent to the expert bank's slots ([`Curve::lends`]).
+    State,
     /// Rows per merged-expert prompt pass beyond the least that is a pass:
     /// the target binding's pass buffers.
     PassRows,
@@ -101,6 +106,12 @@ pub(crate) struct Curve<H> {
     /// reading counts what it holds there (the one store's expert slots,
     /// `BankRoom`) may.
     pub(crate) borrows: bool,
+    /// Whether its held steps are room kept for a claim the load will make
+    /// itself (the unborn workload state): only a holding that may hold
+    /// borrowed room ([`Self::borrows`]: the one store's expert slots, which
+    /// a release gives back when the claim comes) takes them, by exchange,
+    /// and they cover nothing owed, which is room the load needs now.
+    pub(crate) lends: bool,
     /// The steps it holds that may be released, the last granted first.
     pub(crate) held: Vec<Step>,
     /// The steps it may take next, the next first.
@@ -223,6 +234,7 @@ pub(crate) fn settle<H: Clone>(curves: &[Curve<H>], supply: Supply) -> Settlemen
         let lowest = runs
             .iter()
             .enumerate()
+            .filter(|(index, _)| !curves[*index].lends)
             .filter_map(|(index, runs)| runs.held.get(cursors[index].released).map(|run| (index, run.step.per_byte())))
             .min_by(|a, b| a.1.total_cmp(&b.1));
         if ceiling >= 0 && borrow_left > 0 && lowest.is_none_or(|(_, per_byte)| per_byte > supply.borrow_price) {
@@ -268,7 +280,7 @@ pub(crate) fn settle<H: Clone>(curves: &[Curve<H>], supply: Supply) -> Settlemen
             borrow_left -= excess;
             cursors[index].borrowed += excess;
             free = free.min(0);
-        } else if let Some(taken) = exchange(&runs, &cursors, index, &step, per_byte, free, ceiling, supply.horizon) {
+        } else if let Some(taken) = exchange(curves, &runs, &cursors, index, &step, per_byte, free, ceiling, supply.horizon) {
             for (other, released) in taken {
                 for _ in 0..released {
                     let bytes = runs[other].held[cursors[other].released].step.bytes as i128;
@@ -310,11 +322,13 @@ pub(crate) fn settle<H: Clone>(curves: &[Curve<H>], supply: Supply) -> Settlemen
 
 /// The held runs of curves other than `index` an exchange for `step` would
 /// release, as (curve, runs) pairs, the lowest rate per byte first: only
-/// runs worth less per byte than `step`, only enough to fit it beside
+/// runs worth less per byte than `step`, a lending curve's only to a curve
+/// that borrows ([`Curve::lends`]), only enough to fit it beside
 /// `free` and within `ceiling`, and only where the rate it gains over what
 /// they lose, earned over `horizon`, pays its move and theirs.
 #[allow(clippy::too_many_arguments)]
-fn exchange(
+fn exchange<H>(
+    curves: &[Curve<H>],
     runs: &[Runs],
     cursors: &[Cursor],
     index: usize,
@@ -333,7 +347,7 @@ fn exchange(
         let (other, held) = runs
             .iter()
             .enumerate()
-            .filter(|(other, _)| *other != index)
+            .filter(|(other, _)| *other != index && (curves[index].borrows || !curves[*other].lends))
             .filter_map(|(other, runs)| {
                 let held = runs.held.get(released[other])?.step;
                 let value = held.per_byte();
@@ -371,7 +385,7 @@ mod tests {
     }
 
     fn curve(holding: &'static str, held: Vec<Step>, offered: Vec<Step>) -> Curve<&'static str> {
-        Curve { holding, borrows: true, held, offered }
+        Curve { holding, borrows: true, lends: false, held, offered }
     }
 
     /// Free room goes to the steps that save the most per byte, across
@@ -410,6 +424,37 @@ mod tests {
         let places = Curve { borrows: false, ..curve("places", vec![], vec![rate(10, 1.0)]) };
         let settled = settle(&[places], room);
         assert_eq!((settled.granted, settled.borrowed), (vec![], vec![]));
+    }
+
+    /// A lending curve's held room (the unborn state's) goes only to a
+    /// holding that borrows, by exchange where the step beats its worth per
+    /// byte, and covers nothing owed: a bank slot takes it, a place does
+    /// not, and what is owed releases the bank's slot instead.
+    #[test]
+    fn lent_room_goes_only_to_borrowers_and_covers_nothing_owed() {
+        let state = || Curve { lends: true, ..curve("state", vec![rate(10, 0.01)], vec![]) };
+        let slot = curve("bank", vec![], vec![rate(10, 1.0)]);
+        let settled = settle(&[state(), slot], supply(0));
+        assert_eq!((settled.granted, settled.released), (vec![("bank", 1)], vec![("state", 1)]));
+        let places = Curve { borrows: false, ..curve("places", vec![], vec![rate(10, 1.0)]) };
+        let settled = settle(&[state(), places], supply(0));
+        assert_eq!((settled.granted, settled.released), (vec![], vec![]));
+        let held = curve("bank", vec![rate(10, 0.5)], vec![]);
+        let settled = settle(&[state(), held], Supply { owed: 10, ..supply(0) });
+        assert_eq!(settled.released, vec![("bank", 1)]);
+    }
+
+    /// A prompt group's places yield to a bank slot worth more per byte
+    /// and come back once room returns: held places beyond one are released
+    /// for the slot by exchange, and offered again into free room.
+    #[test]
+    fn places_yield_to_a_slot_worth_more_and_return_with_room() {
+        let places = |held: Vec<Step>, offered: Vec<Step>| Curve { borrows: false, ..curve("places", held, offered) };
+        let slot = curve("bank", vec![], vec![rate(10, 1.0)]);
+        let settled = settle(&[places(vec![rate(10, 0.1)], vec![]), slot], supply(0));
+        assert_eq!((settled.granted, settled.released), (vec![("bank", 1)], vec![("places", 1)]));
+        let settled = settle(&[places(vec![], vec![rate(10, 0.1)])], supply(10));
+        assert_eq!(settled.granted, vec![("places", 1)]);
     }
 
     /// What is owed is held on borrowed room only while what it would

@@ -7,7 +7,7 @@ use crate::operation::LaunchWork;
 use super::core::{Extents, Layer, RoutingRecord};
 use super::steps::{CompletedRoute, CompletedStep, Decoded, EndedReads, Recording, Step};
 use crate::assessment::{
-    ExpertLines, ExpertPass, FileLine, GroupLayerTerms, GroupReads, GroupUnion, LayerStep, Notice, ReadLine,
+    ExpertLines, ExpertPass, FileLine, GroupLayerTerms, GroupUnion, LayerStep, Notice, ReadLine,
     ReadLineError, RequestReads, Stages,
 };
 use crate::experts::Words;
@@ -797,8 +797,6 @@ enum Fed {
 struct Ranked {
     /// The load's counted decode ([`Stack::live`]).
     live: Option<crate::assessment::LiveDecode>,
-    /// The group-read curve ([`Stack::group_curve`]).
-    group_curve: crate::experts::directory::MissCurve,
 }
 
 /// Everything telemetry records, under its one lock.
@@ -1020,7 +1018,7 @@ impl Telemetry {
                     experts: layers.iter().map(|layer| layer.experts).collect(),
                 },
                 feed: Feed { pending: Vec::new(), ended: None },
-                ranked: Ranked { live: stack.live(), group_curve: stack.group_curve().clone() },
+                ranked: Ranked { live: stack.live() },
                 records,
             }),
             slots,
@@ -1267,18 +1265,14 @@ impl Telemetry {
                 }
             }
         }
-        // Each union with the curve it was counted into, in one take.
+        // What the feed counted, in one take.
         let live = decoded.then(|| stack.live());
-        let curve = (!unions.is_empty()).then(|| stack.group_curve().clone());
         let recorded = &mut *self.lock();
         for (layer, union) in unions {
             recorded.facts.unions[layer] = Some(union);
         }
         if let Some(live) = live {
             recorded.ranked.live = live;
-        }
-        if let Some(curve) = curve {
-            recorded.ranked.group_curve = curve;
         }
     }
 
@@ -1289,27 +1283,6 @@ impl Telemetry {
         let stack = self.stack.lock().expect("watcher telemetry stack");
         let decoded = stack.decoded();
         (std::mem::replace(seen, decoded.steps) != decoded.steps).then(|| decoded.clone())
-    }
-
-    /// What weighs a prompt group's places against the bank's slots
-    /// (`GroupReads`): each layer's terms ([`GroupFacts::terms`]) and last
-    /// group union, one expert's stored bytes a layer, the group-read curve
-    /// and the run's read line, as the stack's last feed left the unions and
-    /// the curve ([`Ranked`]); none until the run has measured every layer's
-    /// compute and counted a group's reads at every layer.
-    pub(super) fn group_reads(&self, lines: Option<Arc<[ExpertLines]>>, notice: Notice) -> Option<GroupReads> {
-        let recorded = self.lock();
-        let unions = recorded.facts.unions.iter().cloned().collect::<Option<Vec<_>>>()?;
-        let curve = recorded.ranked.group_curve.clone();
-        GroupReads::new(
-            recorded.facts.terms()?,
-            unions,
-            self.with_observed(&recorded.costs, &lines?),
-            curve,
-            recorded.costs.line?,
-            recorded.facts.resident.is_some(),
-            notice,
-        )
     }
 
     /// Whether layer `layer` holds a group union, every ended step's group

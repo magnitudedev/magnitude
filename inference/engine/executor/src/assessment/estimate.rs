@@ -175,7 +175,7 @@ impl StepSeconds {
 /// bank group's three tensors, as resident) and its choices' arithmetic
 /// over their format's throughput. A prompt group's merged pass reads its
 /// steps' union once where alone their passes read each step's own: what
-/// prices a group's compute by its rows (`GroupReads`).
+/// prices a group's compute by its rows (`Stages::merge_sets`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExpertPass {
     costs: ExecutorCosts,
