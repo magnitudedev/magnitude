@@ -58,7 +58,7 @@ pub use family::{
     NativeFamily,
     ProgramFamily, ResizeTimes, RunningBegun, RunningPressure, TableResidency, OptionalComponent, ShrinkCause, TierFill, TrafficHold, Trip,
 };
-pub use heap::{ClaimRefusal, DeviceHeap, MachineReading, Published, Reclaimed, StatusReading, require_normal};
+pub use heap::{ClaimRefusal, DeviceHeap, MachineReading, Reclaimed, StatusReading, require_normal};
 pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };
