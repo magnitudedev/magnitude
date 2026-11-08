@@ -735,8 +735,9 @@ fn a_linked_bank_streams_only_beside_its_tiers_landing_reserve() {
     let bank = draft.load().expert_bank().expect("a capped load streams");
     assert!((0..bank.groups().len()).all(|group| bank.host_records(group, bank.host_slots) >= bank.landing_records()));
     // The structure is prepared whatever the room; a plan of it settles
-    // its tier into the host's room.
-    let roomless = prepare(MemoryReserves::new(StoreMotion::new(u64::MAX / 4, 10.0), magnitude_executor::platform::ReleaseRate::new(1e9)));
+    // its tier into the host's room, here a fluctuation of the whole store.
+    let host = seismic::fixtures::recorded::rtx3090().host_ram().capacity().value;
+    let roomless = prepare(host_room(host, 0));
     let PreparedModelAssessment::Planned { definition, draft, .. } = roomless else {
         panic!("a capped load is prepared from its structure");
     };
