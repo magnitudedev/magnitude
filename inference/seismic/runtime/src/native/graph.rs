@@ -3256,6 +3256,16 @@ impl NativeGraphFamily {
         Ok(())
     }
 
+    /// What its plans' runs' graphs keep on its device, beside what its
+    /// live slots hold for them ([`super::KeptGraphs`]).
+    pub fn kept_graphs(&self) -> super::KeptGraphs {
+        let backend = super::backend_name(&self.device.kind);
+        let plans = self.plans.iter().map(|plan| plan.shape.keyed(backend)).collect();
+        let (kept, shapes) = self.device.native.kept_graphs_of(&plans);
+        let slots = self.graphs.flights().load(std::sync::atomic::Ordering::Acquire) as u64;
+        super::KeptGraphs { kept, shapes, held: self.graphs.census(slots), lone: self.graphs.census(1) }
+    }
+
     /// What its graphs are made of ([`GraphFamilyCensus`]).
     pub fn census(&self) -> GraphFamilyCensus {
         GraphFamilyCensus { layouts: self.layouts, launches: self.launch_graphs.clone() }

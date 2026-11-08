@@ -89,6 +89,11 @@ impl VulkanReplays {
         self.graphs.plan_counts(plan)
     }
 
+    /// The graphs kept of `plans`' runs (`Replays::kept_of`).
+    pub(crate) fn kept_of(&self, plans: &std::collections::HashSet<u64>) -> (GraphCensus, GraphCensus) {
+        self.graphs.kept_of(plans)
+    }
+
     /// Drop every graph if none is held (`Replays::clear_unheld`).
     pub(crate) fn clear_unheld(&self, unheld: impl FnOnce() -> bool) {
         self.graphs.clear_unheld(unheld)

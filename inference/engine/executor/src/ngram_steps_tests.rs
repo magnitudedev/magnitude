@@ -1015,13 +1015,20 @@ fn decode_steps_record_no_graph(catalog: &seismic::Devices, backend: seismic::Ba
 /// (`programs::graph::serial_family` asserts it as the head, readout and
 /// state families seal), and its priming and drafting steps record no graph
 /// beyond those charges. Two passes run the same work, each over two fresh
-/// requests: each request primes its head through a prompt chunk and the
-/// chunk's pipelined successor, two primings in flight, then drafts one
-/// and two proposals, alone and beside the other request. Every graph a
-/// drafter or state-copy step replays is recorded at its shape's first use
-/// and kept within its family's charge, so the second pass records none: a
-/// graph beyond its charge would be released and recorded again. Each
-/// step's recordings, by family, are reported before the verdict.
+/// requests: each request primes its head through a chain of three prompt
+/// chunks, the last two's entries of one shape and in flight at once, then
+/// drafts one and two proposals, alone and beside the other request.
+///
+/// The head family's live slots hold every graph of it once, whatever the
+/// class of the one launch among them, and beside it what each other
+/// launch in flight takes: so with the chain's second graph of a shape
+/// kept, every graph once and that second one are within what they hold.
+/// A charge of its graphs once alone, whatever its launches in flight,
+/// does not hold them. Every graph a drafter or state-copy step replays is
+/// recorded at its shape's first use and kept within its family's charge,
+/// so the second pass records none: a graph beyond its charge would be
+/// released and recorded again. Each step's recordings, by family, are
+/// reported before the verdict.
 #[test]
 #[ignore = "needs a CUDA device: run with --ignored on one"]
 fn drafter_steps_record_no_graph_beyond_their_charge() {
@@ -1036,9 +1043,8 @@ fn drafter_steps_record_no_graph_beyond_their_charge() {
         sampled_proposals: DrafterSteps::PROPOSALS as u8,
         widths: crate::DraftWidths::Adaptive,
     };
-    // Lookahead: a prompt chunk's successor runs behind it, its own drafter
-    // entry behind it.
-    let limits = limits(DrafterSteps::ROWS, true, 1, 0);
+    // A chain of a request's chunks, each one's drafter entry behind it.
+    let limits = limits(DrafterSteps::ROWS, false, DrafterSteps::CHUNKS, 0);
     let (mut domain, mut bindings, _, _) = load_with(&catalog, &definition, &package, cuda, limits, Banked::Resident, method);
     let row_bytes = definition.decoder.hidden as usize * definition.decoder.activation_dtype.bytes();
     let mut steps = DrafterSteps { row_bytes, recorded: Vec::new() };
@@ -1050,6 +1056,9 @@ fn drafter_steps_record_no_graph_beyond_their_charge() {
             let (position, returned) = steps.prime(&mut domain, bindings, request);
             bindings = returned;
             positions.push(position);
+            if request == RequestId(1) {
+                DrafterSteps::assert_head_holds_its_flights(&domain);
+            }
         }
         // Drafts of one and two proposals, of one request and of both.
         for (count, proposals) in [(1, 1), (1, 2), (2, 1), (2, 2)] {
@@ -1078,6 +1087,8 @@ struct DrafterSteps {
 impl DrafterSteps {
     /// Rows of a prompt chunk, the launch row bound.
     const ROWS: usize = 4;
+    /// Chunks of a request's prompt, one chain.
+    const CHUNKS: usize = 3;
     /// The most proposals a draft makes.
     const PROPOSALS: usize = 2;
     /// The families a drafter step runs graphs of.
@@ -1088,33 +1099,33 @@ impl DrafterSteps {
         self.recorded.push((step, recorded_since(domain, before)));
     }
 
-    /// Open `request` and prompt it with two chunks, each entering its rows
-    /// to the head behind it: the second is the first's pipelined
-    /// successor, so both entries are in flight at once. Returns the head's
-    /// position after them.
+    /// Open `request` and prompt it with a chain of [`Self::CHUNKS`] chunks,
+    /// each entering its rows to the head behind it, all in flight at once:
+    /// each after the first enters behind the previous chunk's feature, so
+    /// theirs are of one shape. Returns the head's position after them.
     fn prime(&mut self, domain: &mut ExecutorDomain, mut bindings: crate::StateBindings, request: RequestId) -> (usize, crate::StateBindings) {
         let cuda = seismic::BackendName::Cuda;
         domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
         domain.open_state(&mut bindings, request, None).unwrap();
         let before = domain.family_graph_replays();
-        domain.plan_successors(vec![Self::primed_chunk(request, 1)]);
-        for chunk in 0..2 {
+        domain.plan_successors((1..Self::CHUNKS).map(|chunk| Self::primed_chunk(request, chunk)).collect());
+        for chunk in 0..Self::CHUNKS {
             let (_, returned) = run(domain, bindings, Self::primed_chunk(request, chunk), chunk > 0, cuda);
             bindings = returned;
         }
-        self.keep(domain, before, format!("{request:?}'s two primed chunks"));
+        self.keep(domain, before, format!("{request:?}'s chain of primed chunks"));
         // An embedded head's entry pairs each token with the feature of the
         // row before it, so it trails the target by a row.
-        (2 * Self::ROWS - 1, bindings)
+        (Self::CHUNKS * Self::ROWS - 1, bindings)
     }
 
-    /// Prompt chunk `chunk` of two of `request`'s prompt, its features
+    /// Prompt chunk `chunk` of [`Self::CHUNKS`] of `request`'s prompt, its features
     /// demanded and its rows entered to the head behind it as an embedded
     /// head enters them (`Priming::boundary`); the last selects the first
     /// token.
     fn primed_chunk(request: RequestId, chunk: usize) -> Operation {
         let position = chunk * Self::ROWS;
-        let last = chunk == 1;
+        let last = chunk + 1 == Self::CHUNKS;
         let tokens = (position..position + Self::ROWS)
             .map(|row| TokenId((row * 37 + 11 + request.0 as usize * 5) as u32 % 256))
             .collect::<Vec<_>>();
@@ -1126,7 +1137,7 @@ impl DrafterSteps {
                 boundary: true,
                 tokens: if position == 0 { tokens[1..].to_vec() } else { tokens.clone() },
                 position: position.saturating_sub(1),
-                draft_from: 2 * Self::ROWS,
+                draft_from: Self::CHUNKS * Self::ROWS,
             }),
             tokens,
             position,
@@ -1190,6 +1201,26 @@ impl DrafterSteps {
         }
         self.keep(domain, before, format!("a draft of {proposals} proposals by {drafted:?}"));
         bindings
+    }
+
+    /// The head family's graphs after a chain's entries: a second graph of
+    /// the shape two of them took in flight is kept, and its live slots hold
+    /// every graph of it once (a lone launch's hold) and that second one.
+    fn assert_head_holds_its_flights(domain: &ExecutorDomain) {
+        let (_, head) = domain
+            .family_kept_graphs()
+            .into_iter()
+            .find(|(family, _)| *family == "drafter")
+            .expect("an MTP load has a drafter family");
+        let beside = head.kept.minus(head.shapes).expect("a family keeps each shape's first graph among its graphs");
+        assert!(beside.graphs > 0, "the chain's entries in flight took a head graph each: {head:?}");
+        let worst = head.lone.plus(beside).expect("a family's graph census fits u64");
+        assert!(
+            worst.within(head.held),
+            "the head family's live slots hold every graph once and the {} kept beside them ({worst:?}), not only {:?}: {head:?}",
+            beside.graphs,
+            head.held
+        );
     }
 
     /// The verdict: no drafting family recorded a graph in the steps from

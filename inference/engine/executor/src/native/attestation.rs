@@ -357,14 +357,25 @@ impl AttestedPrograms {
     /// family's plans are the readout family's
     /// (`PreparedTargetReadoutGraphs`), so the readout family counts them.
     pub(crate) fn graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)> {
-        let named = |name: &'static str, family: &seismic::NativeGraphFamily| (name, family.graph_replays());
+        self.graph_families().into_iter().map(|(name, family)| (name, family.graph_replays())).collect()
+    }
+
+    /// The graphs each family's plans keep on the device, beside what its
+    /// live slots hold for them (`seismic::NativeGraphFamily::kept_graphs`).
+    pub(crate) fn kept_graphs(&self) -> Vec<(&'static str, seismic::KeptGraphs)> {
+        self.graph_families().into_iter().map(|(name, family)| (name, family.kept_graphs())).collect()
+    }
+
+    /// The load's graph families, by name: those [`Self::graph_replays`]
+    /// and [`Self::kept_graphs`] report.
+    fn graph_families(&self) -> Vec<(&'static str, &seismic::NativeGraphFamily)> {
         self.target_graphs
             .iter()
-            .map(|graphs| named("target", graphs.family()))
-            .chain(self.target_readout_graphs.iter().map(|graphs| named("readout", graphs.family())))
-            .chain(self.drafter_graphs.iter().map(|graphs| named("drafter", graphs.family())))
-            .chain(self.vision_graphs.iter().map(|graphs| named("vision", graphs.family())))
-            .chain(self.state_graphs.iter().map(|graphs| named("state", graphs.family())))
+            .map(|graphs| ("target", graphs.family()))
+            .chain(self.target_readout_graphs.iter().map(|graphs| ("readout", graphs.family())))
+            .chain(self.drafter_graphs.iter().map(|graphs| ("drafter", graphs.family())))
+            .chain(self.vision_graphs.iter().map(|graphs| ("vision", graphs.family())))
+            .chain(self.state_graphs.iter().map(|graphs| ("state", graphs.family())))
             .collect()
     }
 

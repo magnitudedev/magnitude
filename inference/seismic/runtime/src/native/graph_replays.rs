@@ -110,6 +110,22 @@ impl GraphReplays {
     }
 }
 
+/// What a family's graphs keep on its device, beside what its live slots
+/// hold of the device's graph budget for them
+/// ([`super::graph::NativeGraphFamily::kept_graphs`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeptGraphs {
+    /// Every graph of its plans' runs the device keeps.
+    pub kept: GraphCensus,
+    /// One of those graphs of each shape.
+    pub shapes: GraphCensus,
+    /// What its live slots, each a launch in flight, hold.
+    pub held: GraphCensus,
+    /// What one live slot holds: a lone launch's graphs, whatever its
+    /// class.
+    pub lone: GraphCensus,
+}
+
 struct ReplayEntries<G> {
     clock: u64,
     /// The next graph's identity.
@@ -203,6 +219,22 @@ impl<G> Replays<G> {
 }
 
 impl<G: RecordedGraph> Replays<G> {
+    /// The graphs kept of the shapes of `plans`' runs: every one, and one
+    /// of each shape.
+    pub(crate) fn kept_of(&self, plans: &std::collections::HashSet<u64>) -> (GraphCensus, GraphCensus) {
+        let entries = self.entries.lock().expect("native graph replays lock is never poisoned");
+        let plus = |census: GraphCensus, graph: &G| census.plus(graph.census()).expect("kept graphs' census fits u64");
+        entries
+            .graphs
+            .iter()
+            .filter(|(key, _)| plans.contains(key.first().expect("a graph's key begins with its plan")))
+            .fold((GraphCensus::default(), GraphCensus::default()), |(kept, shapes), (_, replay)| {
+                let kept = replay.graphs.iter().fold(kept, |kept, instance| plus(kept, &instance.graph));
+                let shapes = replay.graphs.first().map_or(shapes, |instance| plus(shapes, &instance.graph));
+                (kept, shapes)
+            })
+    }
+
     /// Choose, before a submission issues any work, the graph each of
     /// `graphs` replays, in order, and record those it lacks
     /// (`record(index)`, on Vulkan and Metal bound to that run's storage,

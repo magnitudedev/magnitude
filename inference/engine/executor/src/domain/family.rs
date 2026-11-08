@@ -544,6 +544,11 @@ pub trait ProgramFamily: 'static {
     /// (`seismic::Device::graph_replays`).
     fn family_graph_replays(&self) -> Vec<(&'static str, seismic::GraphReplays)>;
 
+    /// The graphs each of the load's graph families keeps on the device,
+    /// beside what its live slots hold for them
+    /// (`seismic::NativeGraphFamily::kept_graphs`).
+    fn family_kept_graphs(&self) -> Vec<(&'static str, seismic::KeptGraphs)>;
+
     /// What the load's graphs cost serving so far, of every family
     /// ([`Self::family_graph_replays`]).
     fn graph_replays(&self) -> seismic::GraphReplays {
@@ -827,6 +832,9 @@ impl ProgramFamily for NativeFamily {
         let mut families = self.programs.graph_replays();
         families.push(("target overlays", self.target.overlay_graph_replays()));
         families
+    }
+    fn family_kept_graphs(&self) -> Vec<(&'static str, seismic::KeptGraphs)> {
+        self.programs.kept_graphs()
     }
     fn vision_is_bound(&self) -> bool {
         self.vision.is_some()
