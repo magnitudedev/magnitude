@@ -74,6 +74,71 @@ pub enum OutputError {
     IllegalAliasing { result: usize },
 }
 
+/// How a native graph's exact class fails the layout certified for its
+/// topology.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayoutMismatch {
+    /// Its ports, launches, their results and scratch, exports or stores
+    /// differ from the layout's topology.
+    Topology,
+    /// Its `buffer` takes `bytes`, more than the layout's `capacity` for it.
+    Exceeds {
+        buffer: GraphBuffer,
+        bytes: u64,
+        capacity: u64,
+    },
+}
+
+/// A buffer of a native graph's storage: a port of the given extents, a
+/// launch's result of the given extents, or a launch's scratch buffer.
+/// Launches count from 0 in the graph's order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GraphBuffer {
+    Port {
+        port: usize,
+        extents: Vec<u64>,
+    },
+    Result {
+        launch: usize,
+        result: usize,
+        extents: Vec<u64>,
+    },
+    Scratch {
+        launch: usize,
+        scratch: usize,
+    },
+}
+
+impl std::fmt::Display for LayoutMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Topology => f.write_str("native graph topology differs from its certified layout"),
+            Self::Exceeds {
+                buffer,
+                bytes,
+                capacity,
+            } => {
+                f.write_str("native graph ")?;
+                match buffer {
+                    GraphBuffer::Port { port, extents } => write!(f, "port {port} {extents:?}")?,
+                    GraphBuffer::Result {
+                        launch,
+                        result,
+                        extents,
+                    } => write!(f, "launch {launch}'s result {result} {extents:?}")?,
+                    GraphBuffer::Scratch { launch, scratch } => {
+                        write!(f, "launch {launch}'s scratch {scratch}")?
+                    }
+                }
+                write!(
+                    f,
+                    " takes {bytes} bytes, beyond the {capacity} of its certified layout"
+                )
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkflowError {
     Empty,
@@ -89,6 +154,14 @@ pub enum WorkflowError {
     },
     NativePortMismatch {
         port: usize,
+    },
+    /// A tensor bound to a sealed graph's port that differs from the port's
+    /// representation, extents, strides or length, or a read-only tensor
+    /// bound where the graph writes.
+    NativePortBinding {
+        port: usize,
+        expected: String,
+        bound: String,
     },
     NativeGraphArgumentMismatch {
         parameter: usize,
@@ -167,7 +240,7 @@ pub enum WorkflowError {
         node: usize,
     },
     NativeGraphSlotMismatch,
-    NativeGraphLayoutMismatch,
+    NativeGraphLayoutMismatch(LayoutMismatch),
     NativeOutputLeaseConsumed,
     NativeExportStillLive,
     /// No upload region a family slot was created with holds the run's
@@ -236,6 +309,9 @@ impl fmt::Display for CallError {
             Self::Workflow(WorkflowError::NativePortMismatch { port }) => {
                 write!(f, "native graph port {port} has an incompatible tensor")
             }
+            Self::Workflow(WorkflowError::NativePortBinding { port, expected, bound }) => {
+                write!(f, "native graph port {port} takes {expected}, bound {bound}")
+            }
             Self::Workflow(WorkflowError::NativeGraphArgumentMismatch { parameter }) => {
                 write!(
                     f,
@@ -295,8 +371,8 @@ impl fmt::Display for CallError {
             Self::Workflow(WorkflowError::NativeGraphSlotMismatch) => {
                 f.write_str("native graph slot belongs to another graph")
             }
-            Self::Workflow(WorkflowError::NativeGraphLayoutMismatch) => {
-                f.write_str("native graph shape or topology exceeds its certified layout")
+            Self::Workflow(WorkflowError::NativeGraphLayoutMismatch(mismatch)) => {
+                write!(f, "{mismatch}")
             }
             Self::Workflow(WorkflowError::NativeOutputLeaseConsumed) => {
                 f.write_str("native graph output lease was already used")

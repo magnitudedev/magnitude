@@ -30,7 +30,7 @@ use crate::api::kernel::{
 };
 use crate::api::tensor::RecordPlacement;
 use crate::api::tensor::{Records, TensorInner};
-use crate::api::{CallError, TensorError, WorkflowError};
+use crate::api::{CallError, GraphBuffer, LayoutMismatch, TensorError, WorkflowError};
 use crate::driver::Allocation;
 use crate::layout;
 use seismic_compiler::errors::{ExecutionError, InvocationError};
@@ -832,38 +832,62 @@ impl NativeGraphLayout {
         exports: &[WorkflowResultRef],
         stores: &[Store],
     ) -> Result<StoragePlan, WorkflowError> {
-        let valid = storage_signature(ports, nodes, results, exports, stores) == self.signature
-            && ports.len() == self.port_capacity.len()
-            && ports
-                .iter()
-                .zip(&self.port_capacity)
-                .all(|(port, capacity)| port.byte_len <= *capacity)
-            && results.len() == self.result_capacity.len()
-            && results
-                .iter()
-                .zip(&self.result_capacity)
-                .all(|(row, capacities)| {
-                    row.len() == capacities.len()
-                        && row.iter().zip(capacities).all(|(result, capacity)| {
-                            match (result, capacity) {
-                                (Some(result), Some(capacity)) => result.byte_len <= *capacity,
-                                (None, None) => true,
-                                _ => false,
-                            }
-                        })
-                })
-            && nodes.len() == self.scratch_capacity.len()
-            && nodes
-                .iter()
-                .zip(&self.scratch_capacity)
-                .all(|(node, capacities)| {
-                    node.scratch.len() == capacities.len()
-                        && node.scratch.iter().zip(capacities).all(|(need, capacity)| {
-                            need.sync == capacity.sync && need.bytes <= capacity.bytes
-                        })
-                });
-        if !valid {
-            return Err(WorkflowError::NativeGraphLayoutMismatch);
+        let topology = || WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology);
+        let exceeds = |buffer, bytes, capacity| {
+            WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Exceeds {
+                buffer,
+                bytes,
+                capacity,
+            })
+        };
+        if storage_signature(ports, nodes, results, exports, stores) != self.signature
+            || ports.len() != self.port_capacity.len()
+            || results.len() != self.result_capacity.len()
+            || nodes.len() != self.scratch_capacity.len()
+        {
+            return Err(topology());
+        }
+        for (port, (spec, &capacity)) in ports.iter().zip(&self.port_capacity).enumerate() {
+            if spec.byte_len > capacity {
+                let buffer = GraphBuffer::Port {
+                    port,
+                    extents: spec.extents.clone(),
+                };
+                return Err(exceeds(buffer, spec.byte_len, capacity));
+            }
+        }
+        for (launch, (row, capacities)) in results.iter().zip(&self.result_capacity).enumerate() {
+            if row.len() != capacities.len() {
+                return Err(topology());
+            }
+            for (result, (spec, capacity)) in row.iter().zip(capacities).enumerate() {
+                match (spec, *capacity) {
+                    (Some(spec), Some(capacity)) if spec.byte_len > capacity => {
+                        let buffer = GraphBuffer::Result {
+                            launch,
+                            result,
+                            extents: spec.extents.clone(),
+                        };
+                        return Err(exceeds(buffer, spec.byte_len, capacity));
+                    }
+                    (Some(_), Some(_)) | (None, None) => {}
+                    (Some(_), None) | (None, Some(_)) => return Err(topology()),
+                }
+            }
+        }
+        for (launch, (node, capacities)) in nodes.iter().zip(&self.scratch_capacity).enumerate() {
+            if node.scratch.len() != capacities.len() {
+                return Err(topology());
+            }
+            for (scratch, (need, capacity)) in node.scratch.iter().zip(capacities).enumerate() {
+                if need.sync != capacity.sync {
+                    return Err(topology());
+                }
+                if need.bytes > capacity.bytes {
+                    let buffer = GraphBuffer::Scratch { launch, scratch };
+                    return Err(exceeds(buffer, need.bytes, capacity.bytes));
+                }
+            }
         }
         Ok(self.storage.clone())
     }
@@ -1315,7 +1339,7 @@ impl NativeGraphMetadataDraft {
                 .zip(&self.nodes)
                 .all(|(capacities, node)| capacities.len() == node.scratch.len());
         if !shaped {
-            return Err(WorkflowError::NativeGraphLayoutMismatch);
+            return Err(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Topology));
         }
         let ports = self
             .ports
@@ -2694,7 +2718,27 @@ impl NativeGraphPlan {
         if !port_matches(&self.device, &self.ports[port], tensor)
             || (self.executable.external_writes[port] && tensor.allocation().storage().read_only())
         {
-            return Err(WorkflowError::NativePortMismatch { port });
+            let spec = &self.ports[port];
+            return Err(WorkflowError::NativePortBinding {
+                port,
+                expected: format!(
+                    "{:?} extents {:?} strides {:?} {} bytes{}",
+                    spec.representation,
+                    spec.extents,
+                    spec.strides,
+                    spec.byte_len,
+                    if self.executable.external_writes[port] { ", written" } else { "" },
+                ),
+                bound: format!(
+                    "{:?} extents {:?} strides {:?} {} bytes{}{}",
+                    tensor.representation(),
+                    tensor.extents(),
+                    tensor.strides(),
+                    tensor.byte_len(),
+                    if tensor.allocation().storage().read_only() { ", read-only" } else { "" },
+                    if Arc::ptr_eq(tensor.device(), &self.device) { "" } else { ", another device's" },
+                ),
+            });
         }
         if self.executable.port_uses[port].condition && tensor.allocation().storage().host_address().is_none() {
             return Err(WorkflowError::UnaddressedCondition { parameter: format!("port {port}") });
@@ -4773,10 +4817,17 @@ mod layout_certificate_tests {
             .unwrap();
         assert_eq!(exact.scratch_bytes, charge.workspace);
         let (ports, nodes, results) = class(32);
-        assert!(matches!(
-            certified.storage_for(&ports, &nodes, &results, &[], &[]),
-            Err(WorkflowError::NativeGraphLayoutMismatch)
-        ));
+        assert_eq!(
+            certified.storage_for(&ports, &nodes, &results, &[], &[]).err(),
+            Some(WorkflowError::NativeGraphLayoutMismatch(LayoutMismatch::Exceeds {
+                buffer: GraphBuffer::Port {
+                    port: 0,
+                    extents: vec![32],
+                },
+                bytes: 128,
+                capacity: 64,
+            }))
+        );
     }
 }
 

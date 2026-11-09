@@ -2216,7 +2216,7 @@ fn external_bindings_are_checked_at_attach() {
         assert!(matches!(
             plan.bind_static(&[(&x, &wrong)]),
             Err(CallError::Workflow(
-                seismic::WorkflowError::NativePortMismatch { port: 0 }
+                seismic::WorkflowError::NativePortBinding { port: 0, .. }
             ))
         ));
         let bound = plan.bind_static(&[(&x, &input)]).unwrap();
@@ -2243,7 +2243,7 @@ fn external_bindings_are_checked_at_attach() {
         assert!(matches!(
             slot.attach(bindings, plan.new_outputs().unwrap()).err(),
             Some(CallError::Workflow(
-                seismic::WorkflowError::NativePortMismatch { port: 0 }
+                seismic::WorkflowError::NativePortBinding { port: 0, .. }
             ))
         ));
 
