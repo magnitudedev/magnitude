@@ -99,28 +99,50 @@ fn specialization(native: &NativeImplementation) -> NativeSpecialization {
 }
 
 /// Deterministic static values at which `native` has an admissible default,
-/// when the search finds any.
+/// when the search finds any. Each draw takes the statics in declaration
+/// order, each from the values its `where` condition can hold at beside
+/// those drawn before it ([`NativeImplementation::may_admit`], the rest
+/// anywhere in [`VALUES`]'s range): a draw lies within every bound the
+/// declaration states, and only what the condition's bounds cannot decide
+/// (a remainder, a joint condition) is left to the default's walk.
 fn statics(native: &NativeImplementation) -> Option<NativeSpecialization> {
-    const VALUES: [u64; 14] = [
-        1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 2560, 4096,
-    ];
+    let range = (VALUES[0], VALUES[VALUES.len() - 1]);
     let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    for _ in 0..20_000 {
-        let statics = native
-            .statics
-            .iter()
-            .fold(NativeSpecialization::new(), |statics, name| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                statics.with_static(name.as_str(), VALUES[(state >> 33) as usize % VALUES.len()])
-            });
+    'draw: for _ in 0..20_000 {
+        let mut statics = NativeSpecialization::new();
+        for name in &native.statics {
+            let admitted = VALUES
+                .into_iter()
+                .filter(|&value| {
+                    native.may_admit(&|dimension| {
+                        if dimension == name.as_str() {
+                            Some((value, value))
+                        } else {
+                            Some(statics.static_value(dimension).map_or(range, |drawn| (drawn, drawn)))
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            if admitted.is_empty() {
+                continue 'draw;
+            }
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            statics = statics.with_static(name.as_str(), admitted[(state >> 33) as usize % admitted.len()]);
+        }
         if native.device_independent().unwrap().default_specialization(&statics).is_ok() {
             return Some(statics);
         }
     }
     None
 }
+
+/// The values a static dimension is drawn from: zero (an absent operand or
+/// a flag off) and the sizes kernels declare.
+const VALUES: [u64; 15] = [
+    0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 2560, 4096,
+];
 
 /// Slow: checks the whole engine kernel library. Run it in release with
 /// `--ignored`.
@@ -188,13 +210,21 @@ fn decoded_kernel_bundle_forms_identical_native_sources() {
                     .native_implementation(decoded_entry, *backend)
                     .expect("the decoded module has the native implementation");
                 assert_eq!(native.launches, decoded_native.launches);
-                // The implementations at the binding, which preparation forms.
-                let native = checked
-                    .native_implementation_at(info.id, *backend, bound)
-                    .expect("the module has the native implementation");
-                let decoded_native = decoded
-                    .native_implementation_at(decoded_entry, *backend, bound)
-                    .expect("the decoded module has the native implementation");
+                // The implementations at the binding, which preparation
+                // forms: none where an element read has no value there, in
+                // both modules alike.
+                let (native, decoded_native) = match (
+                    checked.native_implementation_at(info.id, *backend, bound),
+                    decoded.native_implementation_at(decoded_entry, *backend, bound),
+                ) {
+                    (Some(native), Some(decoded_native)) => (native, decoded_native),
+                    (None, None) => continue,
+                    _ => panic!(
+                        "`{}` on {} forms at a binding in one module alone",
+                        info.name,
+                        backend.as_str()
+                    ),
+                };
                 let specialization = specialization(native);
                 fn asset(
                     module: &CheckedModule,
