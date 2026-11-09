@@ -243,11 +243,11 @@ pub(crate) struct PickedWeights {
 }
 
 /// The Block plane an index-list source's picks address at one graph
-/// class: its pooled source's layer (`LayerRef::Pooled`, the block's own or
-/// its source's), and the plane's rows and slab rows.
+/// class: the plane's rows and slab rows. It names no layer: blocks of one
+/// shape share the graph, and each binds its own source's plane
+/// ([`PooledSource`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PickedPlane {
-    pub source: PooledLayer,
     pub rows: u64,
     pub slab_rows: u32,
 }
@@ -312,9 +312,11 @@ pub(crate) enum Picked<'o, 'v, 'a, G: GraphDraft + 'a> {
     },
 }
 
-/// A pooled source's layer (`LayerRef::Pooled { block, part }`).
+/// A block's pooled source (`LayerRef::Pooled { block, part }`): the planes
+/// its index-list source reads (`PickedSource::pooled`), kept per block
+/// beside the graph its shape may share.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PooledLayer {
+pub(crate) struct PooledSource {
     pub block: u32,
     pub part: u32,
 }
@@ -341,13 +343,13 @@ impl<'a, G: GraphDraft + 'a> Picked<'_, '_, 'a, G> {
     }
 }
 
-/// The source's ports, bound per run: the Block plane the dense entries
+/// The source's ports, bound per run to the running block's own source
+/// ([`PooledSource`]): the Block plane the dense entries
 /// read (its own, or part `part` of its source layer's) and the launch's
 /// picks table of that read (stored by an indexing source, read by a
 /// reused one), and an indexing source's other ports.
 #[derive(Clone)]
 pub(crate) struct PickedPorts {
-    pub source: PooledLayer,
     pub plane: NativePort,
     pub picks: NativePort,
     pub index: Option<IndexPorts>,
@@ -724,7 +726,6 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
             return Ok((
                 read,
                 PickedPorts {
-                    source: plane_spec.source,
                     plane,
                     picks,
                     index: None,
@@ -978,7 +979,6 @@ pub(crate) fn picked<'a, G: GraphDraft + 'a>(
             width,
         ),
         PickedPorts {
-            source: plane_spec.source,
             plane,
             picks: stored,
             index: Some(IndexPorts {

@@ -10,7 +10,7 @@ use super::attention::graph::{
     attention_weights,
 };
 use super::attention::pooled::{
-    IndexBlock, OwnBlock, PickedBlock, PickedPlane, PickedPorts, PooledLayer, PooledWindow,
+    IndexBlock, OwnBlock, PickedBlock, PickedPlane, PickedPorts, PooledSource, PooledWindow,
 };
 use super::attention::PickedSource;
 use super::dense_ffn::graph::{CheckedDenseEntries, DenseGraphEntries, dense};
@@ -397,12 +397,11 @@ impl BlockSublayers<'_> {
         let rows = |rows: usize| u64::try_from(rows).map_err(|_| "pooled rows exceed u64");
         let state = self.state.target_state();
         let missing = "an index-list source has no pooled history";
-        let plane = |block: u32, part: u32| {
+        let plane = |PooledSource { block, part }| {
             let (window, plane) = state.pooled_history(block, part).ok_or(missing)?;
             Ok::<_, GraphError>((
                 window,
                 PickedPlane {
-                    source: PooledLayer { block, part },
                     rows: rows(plane.rows)?,
                     slab_rows: plane.slab_rows,
                 },
@@ -423,23 +422,23 @@ impl BlockSublayers<'_> {
                 key_rounding,
             })
         };
-        match attention_operator::picked_source(operator).map_err(plan)? {
-            None => Ok(None),
-            Some(PickedSource::Reused { source, part, .. }) => Ok(Some(PickedBlock::Reused {
-                plane: plane(source.block, part)?.1,
-            })),
-            Some(PickedSource::Reindex { source, part, indexer }) => {
+        let Some(picked) = attention_operator::picked_source(operator).map_err(plan)? else {
+            return Ok(None);
+        };
+        let (window, plane) = plane(picked.pooled(self.index(0)?.block))?;
+        match picked {
+            PickedSource::Reused { .. } => Ok(Some(PickedBlock::Reused { plane })),
+            PickedSource::Reindex { source, part, indexer } => {
                 let rate = attention_operator::shared_rows(self.geometry, source, part)
                     .map_err(plan)?
                     .rate;
                 Ok(Some(PickedBlock::Indexed {
-                    plane: plane(source.block, part)?.1,
+                    plane,
                     index: index(part, indexer, rate)?,
                     own: None,
                 }))
             }
-            Some(PickedSource::Own { part, rows: source, indexer }) => {
-                let (window, plane) = plane(self.index(0)?.block, part)?;
+            PickedSource::Own { part, rows: source, indexer } => {
                 // The incomplete group's tokens wait in the Window domain:
                 // none at rate 1.
                 let window = window

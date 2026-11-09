@@ -2186,7 +2186,13 @@ impl NativeTargetProgram {
                 // its Block destinations and, above rate 1, its Window planes
                 // and the window's spans and destinations.
                 if let Some(picked) = picked {
-                    let source = picked.source;
+                    // The block's own source: a graph its shape shares with
+                    // other blocks names none.
+                    let source = self
+                        .graphs
+                        .prepared
+                        .pooled_source(index)
+                        .expect("a block whose graph binds an index-list source keeps its own pooled source");
                     let pooled = state.pooled(source.block, source.part)?;
                     let block_read = pooled.block_read;
                     bindings.set(&picked.plane, pooled.rows).map_err(device)?;

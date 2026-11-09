@@ -22,7 +22,7 @@ use crate::{
     native::AttestedTarget,
     operators,
     operators::{
-        BlockKeeps, paired_block,
+        BlockKeeps, attention::pooled::PooledSource, paired_block,
         routed::split::{OnceStage, RunStage, Stage},
         streams::StreamsGeometry,
     },
@@ -65,6 +65,10 @@ pub struct PreparedTargetGraphs {
     max_output_bytes: u64,
     /// Per block, the tap indices its graph writes.
     taps: Vec<BlockTaps>,
+    /// Per block, the pooled source its index-list source reads, which its
+    /// graph's picked ports bind: a graph its shape shares with other blocks
+    /// names none (`PickedSource::pooled`).
+    pooled: Vec<Option<PooledSource>>,
     /// The first block of the stateless tail (`stateless_tail`).
     stateless_tail: usize,
     /// The per-layer entry graph per row class, of a per-layer entry.
@@ -182,6 +186,22 @@ impl BlockTaps {
             output: self.output.is_some(),
         }
     }
+}
+
+/// Each block's pooled source (`PickedSource::pooled`): the attention it
+/// opens with, as its graph's (`BlockSublayers::picked`).
+fn pooled_sources(geometry: &Decoder) -> Result<Vec<Option<PooledSource>>, String> {
+    (0..geometry.blocks.len())
+        .map(|index| {
+            let block = u32::try_from(index).map_err(|_| "block index exceeds u32")?;
+            let Some(attention) = geometry.attention(SublayerIndex { block, sublayer: 0 }) else {
+                return Ok(None);
+            };
+            Ok(operators::attention::picked_source(attention)
+                .map_err(|error| error.to_string())?
+                .map(|source| source.pooled(block)))
+        })
+        .collect()
 }
 
 /// The first block of the longest run of trailing blocks that publish no
@@ -917,6 +937,7 @@ impl PreparedTargetGraphs {
             family,
             max_output_bytes,
             taps: outline.tapped,
+            pooled: pooled_sources(geometry)?,
             stateless_tail,
             per_layer_entries,
             notice_rows: notice_rows(load, largest_rows),
@@ -969,6 +990,12 @@ impl PreparedTargetGraphs {
     /// Block `index`'s selected read's shape, when it reads one.
     pub(crate) fn selection(&self, index: usize) -> Option<crate::SelectionShape> {
         self.selections.get(index).copied().flatten()
+    }
+
+    /// The pooled source block `index`'s index-list source reads, if it has
+    /// one: what its graph's picked ports bind.
+    pub(crate) fn pooled_source(&self, index: usize) -> Option<PooledSource> {
+        self.pooled.get(index).copied().flatten()
     }
 
     /// The first row of chain region `region` of the launch-row buffers

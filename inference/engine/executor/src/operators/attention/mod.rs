@@ -152,6 +152,21 @@ pub(crate) enum PickedSource<'a> {
     },
 }
 
+impl PickedSource<'_> {
+    /// The pooled source whose planes the second source of block `block`'s
+    /// attention reads: part `part` of its own rows, or of its source
+    /// layer's. A graph shared by blocks of one shape names no block; each
+    /// block keeps its own (`PreparedTargetGraphs::pooled_source`).
+    pub(crate) fn pooled(&self, block: u32) -> pooled::PooledSource {
+        match *self {
+            Self::Own { part, .. } => pooled::PooledSource { block, part },
+            Self::Reindex { source, part, .. } | Self::Reused { source, part, .. } => {
+                pooled::PooledSource { block: source.block, part }
+            }
+        }
+    }
+}
+
 /// An attention sublayer at `index` of `decoder`: what its second source
 /// resolves of the decoder's other layers (the indexer it reuses, the
 /// pooled rows it reads, the candidate pool it produces or restricts to).
