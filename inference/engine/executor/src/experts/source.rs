@@ -462,19 +462,29 @@ mod tests {
     /// whose memory is the host's), the uncached reads land in a bank's
     /// reserved records in place, as prompt groups read into the conveyor
     /// lent from them: two 2 MiB records of a 4 MiB file, each read whole,
-    /// hold the file's bytes. Such a host's check, run on one by name with
-    /// `--ignored`.
+    /// hold the file's bytes. A CUDA device across a link reserves its
+    /// device storage in its own memory, which the host never addresses:
+    /// there the records are refused. Run on a CUDA host with `--ignored`.
     #[test]
     #[ignore]
     fn uncached_reads_land_in_a_host_reserved_bank_in_place() {
-        let device = crate::test_support::open_backend(&seismic::Devices::discover(&[]).expect("devices are discovered"), BackendName::Cuda)
-            .expect("a CUDA device opens");
+        let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+        let topology = catalog.topology();
+        let unified = seismic::testing::selected(&topology, BackendName::Cuda)
+            .is_some_and(|executor| topology.shared_ranges_lie_in_device_memory(executor));
+        let device = crate::test_support::open_backend(&catalog, BackendName::Cuda).expect("a CUDA device opens");
         const RECORD: u64 = 2 << 20;
         let (bank, _resizer) =
             crate::planning::BankAllocation::reserve(&device, crate::planning::BankTier::Bank.contract_on(&device), Element::i32(), &[2, RECORD / 4], 2, None)
                 .unwrap();
         // The host addresses reserved records through a region that pins them, as a bank's view does.
-        let records = Records::new(bank.region(Element::i32(), &[2, RECORD / 4], 0).unwrap(), RECORD, 2).expect("the host addresses the device's reserved storage");
+        let region = bank.region(Element::i32(), &[2, RECORD / 4], 0).unwrap();
+        if !unified {
+            let refused = Records::new(region, RECORD, 2).err();
+            assert!(refused.as_deref().is_some_and(|why| why.contains("no memory the host reads into")), "a linked device's reserved records are refused: {refused:?}");
+            return;
+        }
+        let records = Records::new(region, RECORD, 2).expect("the host addresses the device's reserved storage");
         let path = std::env::temp_dir().join(format!("expert-source-reserved-{}", std::process::id()));
         let bytes = (0..2 * RECORD).map(|index| (index % 251) as u8 ^ (index >> 20) as u8).collect::<Vec<_>>();
         std::fs::write(&path, &bytes).unwrap();
