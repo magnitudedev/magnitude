@@ -51,8 +51,9 @@ def test_contract_logits_output(tmp_path: Path, tiny_llama: Path) -> None:
     result = json.loads((output / "result.json").read_text())
     assert result["schema"] == "evaluation-result/1" and result["tool"] == "reference"
     from magnitude_rig.build import identify
+    from magnitude_rig.sync import INFERENCE
     # The dirty digest moves with any concurrent edit of the tree; the commit and the shape do not.
-    assert set(result["build"]) == {"commit", "dirty_digest"} and result["build"]["commit"] == identify().commit
+    assert set(result["build"]) == {"commit", "dirty_digest"} and result["build"]["commit"] == identify(INFERENCE).commit
     assert result["rendered_digest"] == header["rendered_digest"]
     assert result["artifacts"]["target"] == str(tiny_llama)
 

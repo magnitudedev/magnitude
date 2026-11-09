@@ -26,7 +26,8 @@ def build() -> dict:
     """The local working tree's contract `build` object, from the rig package, which owns build
     identity. Runs on hosts without a git checkout receive it from the controller (`--build-identity`)."""
     from magnitude_rig.build import identify
-    return identify().to_json()
+    from magnitude_rig.sync import INFERENCE
+    return identify(INFERENCE).to_json()
 
 
 def _sysctl(name: str) -> str | None:
