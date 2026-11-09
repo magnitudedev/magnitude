@@ -948,8 +948,9 @@ pub(crate) trait EntrySearch<E: seismic::Entry> {
     /// Offer the next piece with one challenger fewer; false when it has
     /// no fewer to offer.
     fn narrow(&mut self) -> bool;
-    /// The bytes of the inputs the unit holds; zero when it holds none.
-    fn holding(&self) -> u64;
+    /// The allocations the unit's resident inputs bind, each its identity
+    /// and bytes; none when it holds no inputs.
+    fn bound(&self) -> Option<Vec<(u64, u64)>>;
     /// The bytes of the formed programs the unit's search holds.
     fn programs(&self) -> u64;
     /// Give up the formed programs the unit's search holds.
@@ -1011,13 +1012,8 @@ impl<E: seismic::Entry> EntrySearch<E> for seismic::NativeSearch<'static, E> {
     fn narrow(&mut self) -> bool {
         seismic::NativeSearch::narrow(self)
     }
-    fn holding(&self) -> u64 {
-        // Inputs whose building added nothing counted are still held.
-        if seismic::NativeSearch::holds_inputs(self) {
-            seismic::NativeSearch::held_inputs(self).max(1)
-        } else {
-            0
-        }
+    fn bound(&self) -> Option<Vec<(u64, u64)>> {
+        seismic::NativeSearch::bound_allocations(self)
     }
     fn programs(&self) -> u64 {
         seismic::NativeSearch::held_programs(self)
@@ -1799,6 +1795,9 @@ pub struct BudgetReport {
     /// The pieces in flight when the allocator's ending began, never
     /// measured ([`allocation::Abandoned`]).
     pub abandoned: Vec<AbandonedPiece>,
+    /// Every unit that gave its inputs up, in order
+    /// ([`allocation::Released`]).
+    pub released: Vec<ReleasedInputs>,
     /// The allocator's own work between the last piece and its stop.
     pub ending: EndingReport,
     pub memory: TuningMemory,
@@ -1853,6 +1852,24 @@ pub struct RefusedOffer {
     /// `"seconds"`: what remained of the budget; `"bytes"`: what was free
     /// under the ceiling with every other unit's inputs given up.
     pub reason: &'static str,
+    /// What each unpriced footprint was held to.
+    pub largest_bytes: Option<u64>,
+    /// When its bytes last found nothing to give up for them: what was
+    /// free, and what giving up everything other units held would have
+    /// returned ([`allocation::Starved`]).
+    pub free_bytes: Option<u64>,
+    pub given_up_bytes: Option<u64>,
+}
+
+/// A unit that gave its inputs up: when, what giving them up was taken to
+/// return, and what was free under the ceiling before and after.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReleasedInputs {
+    pub unit: String,
+    pub began_seconds: f64,
+    pub claimed_bytes: u64,
+    pub free_before_bytes: Option<u64>,
+    pub free_after_bytes: Option<u64>,
 }
 
 /// Where a tuning unit's choice came from.
@@ -1954,6 +1971,11 @@ pub struct TuningContext<'a> {
 pub(crate) struct Noise(std::cell::RefCell<HashMap<DType, Vec<u8>>>);
 
 impl Noise {
+    /// The bytes the pool holds.
+    fn bytes(&self) -> u64 {
+        self.0.borrow().values().map(|pool| pool.capacity() as u64).sum()
+    }
+
     /// `count` encoded values of `dtype` at the window `seed` places.
     fn window(&self, dtype: DType, count: usize, seed: u64) -> Result<Vec<u8>, String> {
         let (size, encode): (usize, fn(f32, &mut Vec<u8>)) = match dtype {
@@ -2661,9 +2683,10 @@ trait SearchedUnit<'a> {
     fn settle(&mut self, _: &mut Tuner<'a>) -> Result<(), CatalogFailure> {
         Ok(())
     }
-    /// The bytes of the inputs the unit holds; zero when it holds none.
-    fn holding(&self) -> u64 {
-        0
+    /// The allocations the unit's resident inputs bind, each its identity
+    /// and bytes; none when it holds no inputs.
+    fn bound(&self) -> Option<Vec<(u64, u64)>> {
+        None
     }
     /// What building the inputs the unit holds took
     /// ([`allocation::Unit::built`]).
@@ -2814,8 +2837,36 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         Ok(longest)
     }
 
+    /// Every allocation the unit's inputs bind; inputs held that bind no
+    /// bytes are still held.
     fn holding(&self) -> u64 {
-        (**self).holding()
+        (**self).bound().map_or(0, |bound| {
+            bound
+                .iter()
+                .map(|(_, bytes)| bytes)
+                .sum::<u64>()
+                .max(1)
+        })
+    }
+
+    /// The allocations the givers' inputs bind that no other unit's inputs
+    /// bind, by the units' own bindings: the weights and shared planes the
+    /// tuner keeps leave once no built input binds them (`release_unheld`),
+    /// so an allocation returns when its last binder gives it up.
+    fn returned(units: &[Self], givers: &[usize]) -> u64 {
+        // Each allocation's bytes, and whether a unit not giving up binds it.
+        let mut allocations = HashMap::<u64, (u64, bool)>::new();
+        for (index, unit) in units.iter().enumerate() {
+            let giving = givers.contains(&index);
+            for (identity, bytes) in unit.bound().into_iter().flatten() {
+                allocations.entry(identity).or_insert((bytes, false)).1 |= !giving;
+            }
+        }
+        allocations
+            .values()
+            .filter(|(_, kept)| !kept)
+            .map(|(bytes, _)| bytes)
+            .sum()
     }
 
     fn built(&self) -> seismic::Quote {
@@ -2831,6 +2882,20 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
     }
 
     fn reclaim(tuner: &mut Tuner<'a>) {
+        tuner.memory.return_freed_pages();
+    }
+
+    /// The pool of activation noise, twice the largest activation built,
+    /// where the host's growth counts against the device's room (the one
+    /// rule, `TuningMemory::shared_host_bytes`). It is generated again when
+    /// a point is next built; its values are pseudo-random either way, and
+    /// a point built again is observed again.
+    fn spare(tuner: &Tuner<'a>) -> u64 {
+        tuner.memory.shared_host_bytes(tuner.noise.bytes(), 0)
+    }
+
+    fn drop_spare(tuner: &mut Tuner<'a>) {
+        tuner.noise = Noise::default();
         tuner.memory.return_freed_pages();
     }
 
@@ -3167,8 +3232,8 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         Ok(self.search.longest_operation().max(published))
     }
 
-    fn holding(&self) -> u64 {
-        self.search.holding()
+    fn bound(&self) -> Option<Vec<(u64, u64)>> {
+        self.search.bound()
     }
 
     fn built(&self) -> seismic::Quote {
@@ -4089,7 +4154,21 @@ impl<'a> Tuner<'a> {
                         allocation::Refusal::Seconds => "seconds",
                         allocation::Refusal::Bytes => "bytes",
                     },
+                    largest_bytes: refused.largest,
+                    free_bytes: refused.starved.and_then(|starved| starved.free),
+                    given_up_bytes: refused.starved.map(|starved| starved.given_up),
                 }
+            })
+            .collect();
+        let released = report
+            .released
+            .iter()
+            .map(|released| ReleasedInputs {
+                unit: unit_name(units[released.unit].key()),
+                began_seconds: released.began.as_secs_f64(),
+                claimed_bytes: released.claimed,
+                free_before_bytes: released.free.map(|(before, _)| before),
+                free_after_bytes: released.free.map(|(_, after)| after),
             })
             .collect();
         let abandoned = report
@@ -4133,6 +4212,7 @@ impl<'a> Tuner<'a> {
                     stages: report.admitted.len(),
                     refused,
                     abandoned,
+                    released,
                     ending: EndingReport {
                         began_seconds: report.ending.began.as_secs_f64(),
                         held_seconds: report.ending.held.as_secs_f64(),

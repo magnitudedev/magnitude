@@ -2536,6 +2536,11 @@ pub mod tensor {
         pub(crate) fn allocation(&self) -> &Arc<Allocation> {
             &self.allocation
         }
+        /// The allocation the tensor views: its identity and its backed
+        /// bytes.
+        pub(crate) fn allocation_bytes(&self) -> (u64, u64) {
+            (self.allocation.identity(), self.allocation.bytes())
+        }
         pub(crate) fn alias_identity(&self) -> u64 {
             self.alias_identity
                 .unwrap_or_else(|| self.allocation.identity())

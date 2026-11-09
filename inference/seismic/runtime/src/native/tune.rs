@@ -891,8 +891,18 @@ fn build_point<'a>(
     resident: &mut Observed,
 ) -> Result<Option<TuningPoint<'a>>, TuneError> {
     let before = device.room(seismic_topology::Contract::DeviceOnly);
+    // What the source built for a point that is not made is given up with
+    // it: nothing holds the point, so nothing would give it up later.
     let built = match source.build(index) {
-        Ok(inputs) => TuningPoint::new(spec, inputs)?.timed(device),
+        Ok(inputs) => {
+            let point = TuningPoint::new(spec, inputs);
+            if point.is_err() {
+                source.release(index);
+            }
+            point?
+                .timed(device)
+                .inspect_err(|_| source.release(index))
+        }
         Err(error) => Err(error),
     };
     match built {
@@ -3855,29 +3865,20 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         self.points().any(|point| point.resident())
     }
 
-    /// What the unit's resident inputs hold, as making them resident was
-    /// observed to add: what giving them up is taken to give back.
-    pub fn held_inputs(&self) -> u64 {
-        let indices: Box<dyn Iterator<Item = (usize, bool)> + '_> = match &self.progress {
-            Progress::Discovering(slots) => Box::new(
-                slots
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, timed)| Some((index, timed.as_ref()?.point.resident()))),
-            ),
-            Progress::Searching(searching) => Box::new(
-                searching
-                    .timed
-                    .iter()
-                    .copied()
-                    .zip(searching.points.iter().map(PreparedPoint::resident)),
-            ),
-        };
-        indices
-            .filter(|(_, resident)| *resident)
-            .filter_map(|(index, _)| self.resident_bytes[index].price())
-            .sum::<f64>()
-            .ceil() as u64
+    /// The allocations the unit's resident inputs bind, each once: its
+    /// identity and its backed bytes. None when the unit holds no inputs.
+    /// An allocation other units' inputs bind too is among them: what
+    /// giving it up returns is for whoever holds every binding to say.
+    pub fn bound_allocations(&self) -> Option<Vec<(u64, u64)>> {
+        self.holds_inputs().then(|| {
+            self.points()
+                .filter(|point| point.resident())
+                .flat_map(PreparedPoint::tensors)
+                .map(|tensor| tensor.allocation_bytes())
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect()
+        })
     }
 
     /// The price in bytes of one held program of the unit: the mean of
@@ -4692,6 +4693,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             })) => {
                 let taken = before.saturating_sub(available);
                 self.resident_bytes[index].observe(taken.saturating_add(required) as f64);
+                point.release();
+                source.release(index);
                 return Ok(None);
             }
             Err(WorkError::Failed(exclusion)) => {

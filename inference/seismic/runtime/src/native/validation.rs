@@ -130,6 +130,17 @@ impl<'a> PreparedPoint<'a> {
         self.inputs().copies.clone()
     }
 
+    /// Every tensor the point's resident inputs hold: its argument sets'
+    /// and their cold copies'.
+    pub(super) fn tensors(&self) -> impl Iterator<Item = &Arc<crate::api::tensor::TensorInner>> {
+        let inputs = self.inputs();
+        inputs
+            .rotation
+            .iter()
+            .chain(&inputs.copies)
+            .flat_map(|args| args.tensors().flatten())
+    }
+
     /// Give up the point's inputs and the default's observations of them:
     /// its argument sets, its initializer and the reference pages nothing
     /// else shares. What was measured and observed here stands; work that

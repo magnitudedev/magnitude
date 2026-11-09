@@ -1270,8 +1270,8 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
         false
     }
 
-    fn holding(&self) -> u64 {
-        u64::from(self.resident)
+    fn bound(&self) -> Option<Vec<(u64, u64)>> {
+        self.resident.then(Vec::new)
     }
 
     fn programs(&self) -> u64 {

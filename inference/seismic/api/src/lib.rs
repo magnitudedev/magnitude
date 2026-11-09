@@ -2294,10 +2294,10 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
         self.inner.holds_inputs()
     }
 
-    /// What the unit's resident inputs hold, as making them resident was
-    /// observed to add.
-    pub fn held_inputs(&self) -> u64 {
-        self.inner.held_inputs()
+    /// The allocations the unit's resident inputs bind, each once: its
+    /// identity and its backed bytes. None when the unit holds no inputs.
+    pub fn bound_allocations(&self) -> Option<Vec<(u64, u64)>> {
+        self.inner.bound_allocations()
     }
 
     /// How many programs the unit's search holds formed.

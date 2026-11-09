@@ -185,6 +185,17 @@
 //! it fits; a unit that gave its inputs up offers its next piece with
 //! their rebuilding priced in, so it competes at what it now costs.
 //!
+//! What giving inputs up returns is one account ([`Unit::returned`]): the
+//! bytes of what the givers' inputs bind and no other unit's inputs bind.
+//! Units' inputs share what several of them read, such as one weight, and
+//! that returns only when the last unit binding it gives it up, the
+//! refused piece's own unit among them. Nothing is given up for a piece
+//! that would not fit with everything the account says giving up returns,
+//! and a unit whose giving up returns nothing while others keep their
+//! share waits behind one whose giving up returns some: one DeepSeek load
+//! gave up two units' 26.5 GB of expert weights for a piece the unit
+//! binding them refused, and the device's charges did not fall.
+//!
 //! The programs a unit formed are held the same way ([`Unit::programs`]):
 //! they stay for as long as they fit, so nothing is compiled twice, and
 //! are given up by need alone, never by what they were formed for. When
@@ -285,10 +296,24 @@ pub(crate) trait Unit {
         context: &mut Self::Context,
         before: Duration,
     ) -> Result<Duration, Self::Failure>;
-    /// The bytes of the inputs the unit holds, built for its work; zero
-    /// when it holds none.
+    /// The bytes of the inputs the unit holds, built for its work: every
+    /// allocation they bind, those other units' inputs bind too among them;
+    /// zero when it holds none. What holding them takes of the ceiling,
+    /// not what giving them up returns ([`Unit::returned`]).
     fn holding(&self) -> u64 {
         0
+    }
+    /// What `givers` giving their inputs up together returns: the bytes of
+    /// the allocations their inputs bind that no other unit's inputs bind.
+    /// What only one unit's inputs bind returns when it gives them up; what
+    /// several units' inputs bind, a weight their cases all read, returns
+    /// only when every one of them does. The one account the allocator
+    /// gives up from.
+    fn returned(units: &[Self], givers: &[usize]) -> u64
+    where
+        Self: Sized,
+    {
+        givers.iter().map(|giver| units[*giver].holding()).sum()
     }
     /// What building the inputs the unit holds took, priced: what giving
     /// them up is held to before the load has observed inputs given up.
@@ -344,6 +369,24 @@ pub(crate) trait Unit {
     /// still counts against its ceiling. Asked when a chosen piece's bytes
     /// do not fit, before any unit gives its inputs up for it.
     fn reclaim(_context: &mut Self::Context)
+    where
+        Self: Sized,
+    {
+    }
+    /// What the load holds beside the units' inputs that it builds again
+    /// when next needed, counted against [`Unit::free`]: the bytes dropping
+    /// it returns. One more entry in the account given up from
+    /// ([`Unit::returned`]), dropped only when what the units' give-ups
+    /// return falls short of the room a piece needs and it makes up the
+    /// rest, so a load that never needs it never builds it again.
+    fn spare(_context: &Self::Context) -> u64
+    where
+        Self: Sized,
+    {
+        0
+    }
+    /// Drop what [`Unit::spare`] counts.
+    fn drop_spare(_context: &mut Self::Context)
     where
         Self: Sized,
     {
@@ -499,6 +542,31 @@ pub(crate) struct Refused {
     pub quote: Quote,
     pub footprint: seismic::Footprint,
     pub refusal: Refusal,
+    /// What its footprint's unpriced operations were each held to
+    /// ([`Unit::largest_footprint`]).
+    pub largest: Option<u64>,
+    /// What the room was when its bytes last found nothing to give up for
+    /// them; none when they never did.
+    pub starved: Option<Starved>,
+}
+
+/// A piece whose bytes did not fit with everything other units could give
+/// up for it: what was free, and what giving all of that up would have
+/// returned ([`Unit::returned`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Starved {
+    pub free: Option<u64>,
+    pub given_up: u64,
+}
+
+/// A unit that gave its inputs up: when, what the account said giving them
+/// up returns ([`Unit::returned`]), and what was free before and after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Released {
+    pub unit: usize,
+    pub began: Duration,
+    pub claimed: u64,
+    pub free: Option<(u64, u64)>,
 }
 
 /// What the allocator did with the budget: for the trace, whatever the
@@ -514,6 +582,8 @@ pub(crate) struct Report {
     pub refused: Vec<Refused>,
     /// The pieces in flight when the ending began, never measured.
     pub abandoned: Vec<Abandoned>,
+    /// Every unit that gave its inputs up, in order.
+    pub released: Vec<Released>,
     /// What settling the units' owed publications took, those settled
     /// when their units ran out of work with those settled at the stop.
     pub settling: Duration,
@@ -658,21 +728,30 @@ impl Unpriced {
 }
 
 /// `unit` gives up its inputs: an operation of the allocator's own, timed
-/// in its class. Returns what it took.
+/// in its class, and reported with what the account said it returns and
+/// what was free before and after. Returns what it took.
 fn give_up_inputs<U: Unit>(
     units: &mut [U],
     unit: usize,
     context: &mut U::Context,
     clock: &impl Clock,
     own: &mut Own,
-    ending: &mut Ending,
+    report: &mut Report,
 ) -> Duration {
+    let claimed = U::returned(units, &[unit]);
+    let before = U::free(context);
     let began = clock.now();
     units[unit].release(context);
     let took = clock.now().saturating_sub(began);
+    report.released.push(Released {
+        unit,
+        began,
+        claimed,
+        free: before.zip(U::free(context)),
+    });
     own.releasing.observe(took.as_secs_f64());
-    ending.released += 1;
-    ending.releasing += took;
+    report.ending.released += 1;
+    report.ending.releasing += took;
     took
 }
 
@@ -731,8 +810,9 @@ pub(crate) fn allocate<U: Unit>(
     // Units that left the work: none of their work can ever start again.
     let mut departed = vec![false; units.len()];
     // Units whose next piece does not fit the bytes free with every other
-    // unit's inputs given up: nothing changes that until a piece runs.
-    let mut starved = vec![false; units.len()];
+    // unit's inputs given up, and the room then: nothing changes that until
+    // a piece runs.
+    let mut starved = vec![None::<Starved>; units.len()];
     // Units whose next piece's compile needs more threads than are free:
     // nothing changes that until a compile ends.
     let mut crowded = vec![false; units.len()];
@@ -913,7 +993,7 @@ pub(crate) fn allocate<U: Unit>(
             for unit in 0..units.len() {
                 if !flying(unit) && !startable[unit] && units[unit].holding() > 0 {
                     apart +=
-                        give_up_inputs(units, unit, context, clock, &mut own, &mut report.ending);
+                        give_up_inputs(units, unit, context, clock, &mut own, &mut report);
                 }
             }
         }
@@ -992,14 +1072,14 @@ pub(crate) fn allocate<U: Unit>(
             .iter()
             .copied()
             .filter(|(unit, work)| work.stage == Stage::Discovery || settled(*unit))
-            .partition(|(unit, work)| !starved[*unit] && !barred[*unit] && fits(*unit, work));
+            .partition(|(unit, work)| {
+                starved[*unit].is_none() && !barred[*unit] && fits(*unit, work)
+            });
         // At the ending nothing more is admitted or measured: what is in
         // flight is abandoned, and every offer still standing is refused.
         if concluding.is_some_and(|concluding| now >= concluding) {
             let standing = fitting.into_iter().chain(refused).collect();
-            report.refused.extend(refuse(units, context, standing, |unit| {
-                starved[unit] || barred[unit]
-            }));
+            report.refused.extend(refuse(units, context, standing, &starved, &barred));
             break Ok(());
         }
         // When a piece's compile is due to start: so that the piece is
@@ -1125,12 +1205,27 @@ pub(crate) fn allocate<U: Unit>(
                     })
                     .collect::<Vec<_>>();
                 // Nothing is given up for a piece that would not fit even
-                // with everything given up.
-                let given_up = holders.iter().fold(0u64, |sum, holder| {
-                    sum.saturating_add(units[*holder].programs())
-                        .saturating_add(units[*holder].holding())
-                });
-                let victim = holders
+                // with everything given up: what that returns, by the one
+                // account. Inputs the piece's own unit binds beside them
+                // stay, and return nothing. What the load holds spare is
+                // dropped only when the units' give-ups fall short and it
+                // makes up the rest.
+                let given_up = holders
+                    .iter()
+                    .fold(U::returned(units, &holders), |sum, holder| {
+                        sum.saturating_add(units[*holder].programs())
+                    });
+                // A holder whose giving up returns nothing while the others
+                // keep theirs waits behind one whose giving up returns some:
+                // what several bind returns when the last of them gives up.
+                let returning = holders
+                    .iter()
+                    .copied()
+                    .filter(|holder| {
+                        units[*holder].programs() > 0 || U::returned(units, &[*holder]) > 0
+                    })
+                    .collect::<Vec<_>>();
+                let victim = (if returning.is_empty() { holders } else { returning })
                     .into_iter()
                     .filter(|_| {
                         work.footprint
@@ -1139,19 +1234,27 @@ pub(crate) fn allocate<U: Unit>(
                     .min_by(|left, right| worth(*left).total_cmp(&worth(*right)));
                 // The unit whose own next work is worth least gives up
                 // first: its programs, and when it holds none, its inputs.
+                let spare = U::spare(context);
                 match victim {
                     Some(victim) if units[victim].programs() > 0 => units[victim].give_up(context),
                     Some(victim) => {
-                        apart += give_up_inputs(
-                            units,
-                            victim,
-                            context,
-                            clock,
-                            &mut own,
-                            &mut report.ending,
-                        );
+                        apart +=
+                            give_up_inputs(units, victim, context, clock, &mut own, &mut report);
                     }
-                    None => starved[unit] = true,
+                    None if spare > 0
+                        && work.footprint.fits(
+                            free.map(|free| free.saturating_add(given_up).saturating_add(spare)),
+                            largest,
+                        ) =>
+                    {
+                        U::drop_spare(context);
+                    }
+                    None => {
+                        starved[unit] = Some(Starved {
+                            free,
+                            given_up: given_up.saturating_add(spare),
+                        })
+                    }
                 }
                 continue;
             }
@@ -1222,7 +1325,11 @@ pub(crate) fn allocate<U: Unit>(
                 }
                 U::reclaim(context);
                 if !fits(context) {
-                    starved[*unit] = true;
+                    // Its compile's host bytes: nothing was given up for them.
+                    starved[*unit] = Some(Starved {
+                        free: U::free(context),
+                        given_up: 0,
+                    });
                     continue;
                 }
             }
@@ -1261,7 +1368,7 @@ pub(crate) fn allocate<U: Unit>(
                 // and everything owed after it fit what is left.
                 let mut narrowing = refused
                     .iter()
-                    .filter(|(unit, _)| !starved[*unit] && !barred[*unit])
+                    .filter(|(unit, _)| starved[*unit].is_none() && !barred[*unit])
                     .map(|offer| (offer.0, value(offer)))
                     .collect::<Vec<_>>();
                 narrowing.sort_by(|left, right| right.1.total_cmp(&left.1));
@@ -1294,7 +1401,7 @@ pub(crate) fn allocate<U: Unit>(
                 // for its bytes, with nothing left to give up for it, and a
                 // unit of the objective still undiscovered can never start
                 // again. They leave the work, and the others go on.
-                let bytes = |unit: usize| starved[unit] || barred[unit];
+                let bytes = |unit: usize| starved[unit].is_some() || barred[unit];
                 let leaving = (0..units.len())
                     .filter(|unit| {
                         !departed[*unit]
@@ -1310,13 +1417,13 @@ pub(crate) fn allocate<U: Unit>(
                         .copied()
                         .filter(|(unit, _)| leaving.contains(unit))
                         .collect();
-                    report.refused.extend(refuse(units, context, standing, bytes));
+                    report.refused.extend(refuse(units, context, standing, &starved, &barred));
                     for unit in leaving {
                         departed[unit] = true;
                     }
                     continue;
                 }
-                report.refused.extend(refuse(units, context, refused, bytes));
+                report.refused.extend(refuse(units, context, refused, &starved, &barred));
                 break Ok(());
             }
             // Work is in flight and nothing can start now: wait for a
@@ -1344,7 +1451,7 @@ pub(crate) fn allocate<U: Unit>(
         // Preserve the original cutoff and terminal obligations even when
         // admitted work waits behind an underestimated piece.
         let performed = units[unit].perform(context, total.saturating_sub(owed[unit]));
-        starved.fill(false);
+        starved.fill(None);
         alone.fill(false);
         published[unit] = false;
         let ended = clock.now();
@@ -1398,7 +1505,7 @@ pub(crate) fn allocate<U: Unit>(
     // inputs leaves with the optional work.
     for unit in 0..units.len() {
         if units[unit].holding() > 0 {
-            give_up_inputs(units, unit, context, clock, &mut own, &mut report.ending);
+            give_up_inputs(units, unit, context, clock, &mut own, &mut report);
         }
     }
     // A compile runs to its end: those still running are waited for, and
@@ -1428,14 +1535,15 @@ pub(crate) fn allocate<U: Unit>(
 }
 
 /// Nothing more of theirs starts: every offer still `standing` is refused
-/// for good, for its bytes where `bytes` says so and otherwise for its
-/// seconds. A unit refused for its bytes is told before what it owes is
+/// for good, for its bytes where it was `starved` or `barred` and otherwise
+/// for its seconds. A unit refused for its bytes is told before what it owes is
 /// settled: its record states what stopped it.
 fn refuse<U: Unit>(
     units: &mut [U],
     context: &mut U::Context,
     standing: Vec<(usize, Work)>,
-    bytes: impl Fn(usize) -> bool,
+    starved: &[Option<Starved>],
+    barred: &[bool],
 ) -> Vec<Refused> {
     let refused = standing
         .into_iter()
@@ -1444,11 +1552,13 @@ fn refuse<U: Unit>(
             stage: work.stage,
             quote: work.quote,
             footprint: work.footprint,
-            refusal: if bytes(unit) {
+            refusal: if starved[unit].is_some() || barred[unit] {
                 Refusal::Bytes
             } else {
                 Refusal::Seconds
             },
+            largest: units[unit].largest_footprint(),
+            starved: starved[unit],
         })
         .collect::<Vec<_>>();
     for refused in &refused {
@@ -1753,6 +1863,13 @@ mod tests {
         /// Host bytes the unit's inputs hold beside their bytes on the
         /// device, where host RAM is a domain of its own.
         host: u64,
+        /// The inputs other units bind too that the unit's inputs bind
+        /// ([`SHARED`]): held once while any unit binding them is
+        /// resident, and given back when the last of them gives them up.
+        shared: Vec<usize>,
+        /// The bytes each discovered point after the first adds to the
+        /// unit's own inputs.
+        later: u64,
     }
 
     /// The bytes the synthetic units hold, the most they held, the ceiling
@@ -1770,9 +1887,17 @@ mod tests {
         host_peak: u64,
         host_ceiling: Option<u64>,
         shared_host: bool,
+        /// Of the bytes held, what the load holds spare, and how often it
+        /// was dropped.
+        spare: u64,
+        dropped: usize,
     }
 
     thread_local! {
+        /// Inputs several units bind, by name: their bytes, and how many
+        /// resident units bind them.
+        static SHARED: std::cell::RefCell<BTreeMap<usize, (u64, usize)>> =
+            const { std::cell::RefCell::new(BTreeMap::new()) };
         static MEMORY: Cell<Memory> = const {
             Cell::new(Memory {
                 held: 0,
@@ -1783,6 +1908,8 @@ mod tests {
                 host_peak: 0,
                 host_ceiling: None,
                 shared_host: false,
+                spare: 0,
+                dropped: 0,
             })
         };
     }
@@ -1840,6 +1967,8 @@ mod tests {
                 programs_held: 0,
                 given_up: 0,
                 host: 0,
+                shared: Vec::new(),
+                later: 0,
             }
         }
 
@@ -1859,12 +1988,68 @@ mod tests {
         }
 
         /// What the next piece adds to the bytes held: the unit's inputs,
-        /// when they are not resident.
+        /// when they are not resident, with what no resident unit binds of
+        /// those it shares; and a later point's own inputs when it
+        /// discovers one.
         fn footprint(&self) -> seismic::Footprint {
+            let building = if self.resident {
+                0
+            } else {
+                self.own() + self.unbound()
+            };
+            let point = if (1..self.points).contains(&self.discovered) {
+                self.later
+            } else {
+                0
+            };
             seismic::Footprint {
-                priced: if self.resident { 0 } else { self.inputs },
+                priced: building + point,
                 unpriced: usize::from(self.unobserved && self.discovered >= self.points),
             }
+        }
+
+        /// The bytes of the unit's own inputs, at the points discovered.
+        fn own(&self) -> u64 {
+            self.inputs + self.later * self.discovered.saturating_sub(1) as u64
+        }
+
+        /// The bytes of the shared inputs it binds that no resident unit
+        /// binds.
+        fn unbound(&self) -> u64 {
+            SHARED.with(|shared| {
+                let shared = shared.borrow();
+                self.shared
+                    .iter()
+                    .map(|name| shared[name])
+                    .filter(|(_, binders)| *binders == 0)
+                    .map(|(bytes, _)| bytes)
+                    .sum()
+            })
+        }
+
+        /// Bind or unbind the shared inputs as the unit's inputs become
+        /// resident or are given up: what the first to bind adds and the
+        /// last to unbind returns.
+        fn bind(&self, binding: bool) -> u64 {
+            SHARED.with(|shared| {
+                let mut shared = shared.borrow_mut();
+                self.shared
+                    .iter()
+                    .map(|name| {
+                        let (bytes, binders) = shared.get_mut(name).expect("a named shared input");
+                        if binding {
+                            *binders += 1;
+                        } else {
+                            *binders -= 1;
+                        }
+                        if *binders == usize::from(binding) {
+                            *bytes
+                        } else {
+                            0
+                        }
+                    })
+                    .sum()
+            })
         }
     }
 
@@ -1957,15 +2142,56 @@ mod tests {
             });
         }
 
+        fn spare(_: &Log) -> u64 {
+            MEMORY.with(Cell::get).spare
+        }
+
+        fn drop_spare(_: &mut Log) {
+            MEMORY.with(|memory| {
+                let mut now = memory.get();
+                now.held -= std::mem::take(&mut now.spare);
+                now.dropped += 1;
+                memory.set(now);
+            });
+        }
+
         fn holding(&self) -> u64 {
-            if self.resident { self.inputs } else { 0 }
+            if !self.resident {
+                return 0;
+            }
+            let shared = SHARED.with(|shared| {
+                let shared = shared.borrow();
+                self.shared.iter().map(|name| shared[name].0).sum::<u64>()
+            });
+            self.own() + shared
+        }
+
+        fn returned(units: &[Self], givers: &[usize]) -> u64 {
+            let resident = |unit: &&Synthetic| unit.resident;
+            let giving = givers.iter().map(|giver| &units[*giver]).filter(resident);
+            let own = giving.clone().map(Synthetic::own).sum::<u64>();
+            let keeping = (0..units.len())
+                .filter(|unit| !givers.contains(unit))
+                .map(|unit| &units[unit])
+                .filter(resident)
+                .flat_map(|unit| unit.shared.iter().copied())
+                .collect::<std::collections::BTreeSet<_>>();
+            let shared = giving
+                .flat_map(|unit| unit.shared.iter().copied())
+                .filter(|name| !keeping.contains(name))
+                .collect::<std::collections::BTreeSet<_>>();
+            own + SHARED.with(|bytes| {
+                let bytes = bytes.borrow();
+                shared.iter().map(|name| bytes[name].0).sum::<u64>()
+            })
         }
 
         fn release(&mut self, _: &mut Log) {
             if std::mem::take(&mut self.resident) {
+                let returned = self.own() + self.bind(false);
                 MEMORY.with(|memory| {
                     let mut now = memory.get();
-                    now.held -= self.inputs;
+                    now.held -= returned;
                     now.host -= self.host;
                     memory.set(now);
                 });
@@ -2061,9 +2287,10 @@ mod tests {
             // resident.
             if !std::mem::replace(&mut self.resident, true) {
                 self.built += 1;
+                let built = self.own() + self.bind(true);
                 MEMORY.with(|memory| {
                     let mut now = memory.get();
-                    now.held += self.inputs;
+                    now.held += built;
                     now.peak = now.peak.max(now.held);
                     now.host += self.host;
                     now.host_peak = now.host_peak.max(now.host);
@@ -2092,11 +2319,13 @@ mod tests {
             self.changed = true;
             match work.stage {
                 Stage::Discovery => {
+                    // A later point builds its own inputs.
+                    let point = if self.discovered > 0 { self.later } else { 0 };
                     self.discovered += 1;
                     self.largest = Some(self.largest.unwrap_or(0).max(self.kept));
                     MEMORY.with(|memory| {
                         let mut now = memory.get();
-                        now.held += self.kept;
+                        now.held += self.kept + point;
                         now.peak = now.peak.max(now.held);
                         memory.set(now);
                     });
@@ -2665,6 +2894,8 @@ mod tests {
                 quote: priced(SECOND * 5 / 2),
                 footprint: seismic::Footprint::default(),
                 refusal: Refusal::Seconds,
+                largest: Some(0),
+                starved: None,
             }]
         );
         // With budget for everything, the allocator stops when the work
@@ -2807,6 +3038,8 @@ mod tests {
                 quote: priced(SECOND * 5),
                 footprint: seismic::Footprint::default(),
                 refusal: Refusal::Seconds,
+                largest: Some(0),
+                starved: None,
             }]
         );
         assert_eq!(units[0].measured, [0.5], "the measurement is recorded");
@@ -3253,6 +3486,8 @@ mod tests {
                     unpriced: 0,
                 },
                 refusal: Refusal::Bytes,
+                largest: None,
+                starved: None,
             }]
         );
     }
@@ -3782,6 +4017,150 @@ mod tests {
             units.each_ref().map(|unit| unit.refused),
             [false, false, false, false, true],
             "routed_experts alone was stopped by the room, and was told"
+        );
+    }
+
+    /// What the load holds spare (the tuner's pool of activation noise,
+    /// built again when next needed) is one more entry in the account: it
+    /// stays while the freed memory reclaimed or the units' give-ups make
+    /// the room a piece needs, and is dropped only when they fall short and
+    /// it makes up the rest, the piece then running where it was refused.
+    #[test]
+    fn what_the_load_holds_spare_is_dropped_only_when_nothing_else_makes_room() {
+        let clock = Fake::default();
+        // Two units of 300 of inputs each under a ceiling of `ceiling`,
+        // beside 200 held spare.
+        let load = |ceiling: u64| {
+            let mut units = [
+                Synthetic {
+                    inputs: 300,
+                    ..Synthetic::new(0, &clock, 0.5, &[1.; 2])
+                },
+                Synthetic {
+                    inputs: 300,
+                    ..Synthetic::new(1, &clock, 0.5, &[1.; 2])
+                },
+            ];
+            MEMORY.with(|memory| {
+                memory.set(Memory {
+                    ceiling: Some(ceiling),
+                    held: 200,
+                    spare: 200,
+                    ..Memory::default()
+                })
+            });
+            // The setup: each unit's discovery builds its 300 of inputs.
+            assert!(units.iter().all(|unit| {
+                let work = unit.next().expect("a unit offers its discovery");
+                work.stage == Stage::Discovery
+                    && work.footprint == seismic::Footprint { priced: 300, unpriced: 0 }
+            }));
+            let (_, report) = run(&mut units, &clock, 60);
+            let memory = MEMORY.with(Cell::take);
+            (units, memory, report)
+        };
+        // Both units fit beside it: it stays.
+        let (units, memory, report) = load(800);
+        assert!(units.iter().all(|unit| unit.measured.len() == 2));
+        assert_eq!((memory.dropped, memory.spare), (0, 200));
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert!(
+            units.iter().all(|unit| unit.built == 1),
+            "nothing was given up for room"
+        );
+        // One unit fits beside it at a time: the other's give-ups make the
+        // room, and it stays.
+        let (units, memory, report) = load(500);
+        assert!(units.iter().all(|unit| unit.measured.len() == 2));
+        assert!(
+            units.iter().any(|unit| unit.built > 1),
+            "the units' give-ups made the room"
+        );
+        assert_eq!((memory.dropped, memory.spare), (0, 200));
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert!(memory.peak <= 500, "{} held over 500", memory.peak);
+        // No unit fits beside it: it is dropped once, and both are tuned.
+        let (units, memory, report) = load(400);
+        assert!(
+            units.iter().all(|unit| unit.measured.len() == 2),
+            "{:?}",
+            report.refused
+        );
+        assert_eq!((memory.dropped, memory.spare), (1, 0));
+        assert!(memory.peak <= 400, "{} held over 400", memory.peak);
+    }
+
+    /// What giving up returns is one account: be06f1 on Metal, in tens of
+    /// megabytes. routed_gate_up's and routed_down's inputs are the expert
+    /// weights, 19.25 and 7.27 GB, which routed_experts' resident first
+    /// point binds too; readout_head_rows binds the 1.32 GB head weight
+    /// readout_selected_rows binds beside its own 0.09 GB, and
+    /// attention_prefill holds 0.61 GB of its own. routed_experts' second
+    /// point needs 4.83 GB with 3.94 free under 35.12. Given up, gate_up
+    /// and down return nothing while routed_experts binds their weights;
+    /// holding each to what building it added, the allocator gave them up
+    /// first and the device's charges did not fall. It gives up the
+    /// readouts instead, each returning what it was said to, and the point
+    /// fits.
+    #[test]
+    fn giving_inputs_up_returns_what_the_account_says() {
+        let clock = Fake::default();
+        SHARED.with(|shared| {
+            *shared.borrow_mut() = BTreeMap::from([(0, (1925, 0)), (1, (727, 0)), (2, (132, 0))]);
+        });
+        let unit = |name, share, shared: &[usize]| Synthetic {
+            shared: shared.to_vec(),
+            ..Synthetic::new(name, &clock, share, &[1.])
+        };
+        let mut units = [
+            unit(0, 0.3, &[0]),
+            unit(1, 0.2, &[1]),
+            unit(2, 0.1, &[2]),
+            Synthetic {
+                inputs: 9,
+                ..unit(3, 0.1, &[2])
+            },
+            Synthetic {
+                inputs: 61,
+                ..unit(4, 0.1, &[])
+            },
+            Synthetic {
+                inputs: 264,
+                later: 483,
+                points: 2,
+                ..unit(5, 0.2, &[0, 1])
+            },
+        ];
+        let (memory, report) = bounded(&mut units, &clock, 600, 3512);
+        SHARED.with(|shared| shared.borrow_mut().clear());
+        assert!(memory.peak <= 3512, "{} held over 3512", memory.peak);
+        assert_eq!(units[5].discovered, 2, "{:?}", report.refused);
+        let second = report
+            .admitted
+            .iter()
+            .filter(|admitted| admitted.unit == 5 && admitted.stage == Stage::Discovery)
+            .nth(1)
+            .expect("routed_experts' second point was discovered")
+            .began;
+        let released = report
+            .released
+            .iter()
+            .filter(|released| released.began <= second)
+            .map(|released| {
+                (
+                    released.unit,
+                    released.claimed,
+                    released.free.map(|(before, after)| after - before),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            released,
+            [(3, 9, Some(9)), (2, 132, Some(132))],
+            "with 394 free of the 483 the point needs: readout_selected's own \
+             9, then the 132 head weight readout_head then binds alone; \
+             gate_up's 1925 and down's 727 return nothing while \
+             routed_experts binds them, and are kept"
         );
     }
 
