@@ -71,7 +71,7 @@ fn a_gap_publishes_what_the_last_flight_filled() {
     let harness = prompted("gap-held", EXPERTS, 4);
     let step = harness.prompt_step();
     harness.scratch(&step, 0, &[3, 5]);
-    assert_eq!(harness.commit_seeds(&step).len(), 2);
+    assert_eq!(harness.commit_seeds(&step, 0).len(), 2);
     step.complete().unwrap();
     let shared = harness.watcher.shared();
     eventually("the gap never published the fills", || shared.holdings().0[0] == 2);

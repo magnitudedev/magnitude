@@ -97,7 +97,8 @@ pub enum BankPart {
     /// the tier list (a step's experts the host tier keeps whole, each
     /// (tier record, scratch slot): its tier copy after round 0) and the
     /// seed list (a prompt group's last step beside a host tier: its seeds'
-    /// copy from their scratch slots into their bank records, then commit).
+    /// copy from their scratch slots into their bank records, then commit),
+    /// the last two each layer's own.
     ScratchFlags,
     ConvertList { round: u8 },
     /// A round's convert list staged into device memory
@@ -350,17 +351,15 @@ pub struct BankLayout<T> {
 }
 
 /// The load's words: whether the group being encoded is resident, every
-/// scratch round's convert list, the tier list and its grid, the scratch
-/// records, the seed list, and its scratch rounds' grids.
+/// scratch round's convert list, the tier and seed lists' grids and staged
+/// copies, and its scratch rounds' grids.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadAllocations<T> {
     pub resident: T,
     pub lists: Vec<T>,
     pub convert_staged: T,
-    pub tiered: T,
     pub tier_grid: T,
     pub tier_staged: T,
-    pub seeds: T,
     pub seed_grid: T,
     pub seed_staged: T,
     pub grids: T,
@@ -446,6 +445,11 @@ pub struct LayerAllocations<T> {
     /// device places, and grids, where the host places
     /// (`BankPart::LandingList`, `BankPart::LandingGrids`).
     pub landing: LandingAllocations<T>,
+    /// Its scratch request's tier and seed lists (`BankPart::TierList`,
+    /// `SeedList`): each layer's own, so a list a step's copy at the layer
+    /// launches on was written for the layer.
+    pub tiered: T,
+    pub seeds: T,
 }
 
 /// A layer's CPU site table, rows and outputs (`BankPart::SiteTable`,
@@ -492,10 +496,8 @@ impl<T> BankLayout<T> {
                     resident,
                     lists,
                     convert_staged,
-                    tiered,
                     tier_grid,
                     tier_staged,
-                    seeds,
                     seed_grid,
                     seed_staged,
                     grids,
@@ -509,10 +511,8 @@ impl<T> BankLayout<T> {
         owned.extend(lists.iter().map(|list| ("load: copy lists", list)));
         owned.extend([
             ("load: convert staged list", convert_staged),
-            ("load: tier list", tiered),
             ("load: tier grid", tier_grid),
             ("load: tier staged list", tier_staged),
-            ("load: seeds", seeds),
             ("load: seed grid", seed_grid),
             ("load: seed staged list", seed_staged),
             ("load: grids", grids),
@@ -521,7 +521,7 @@ impl<T> BankLayout<T> {
             owned.extend(records.iter().map(|(_, records)| ("group: records", records)));
             owned.extend([("group: map", map), ("group: commits", commits), ("group: moves", moves)]);
         }
-        for LayerAllocations { expert_scales, tier, file, scratch, rings, routing, policy, sited, landing } in layers {
+        for LayerAllocations { expert_scales, tier, file, scratch, rings, routing, policy, sited, landing, tiered, seeds } in layers {
             owned.extend(expert_scales.iter().filter_map(|(_, scale)| scale.as_ref()).map(|scale| ("layer: expert scales", scale)));
             owned.extend(tier.iter().map(|tier| ("layer: tier words", tier)));
             owned.extend([
@@ -533,6 +533,7 @@ impl<T> BankLayout<T> {
             ]);
             owned.extend(sited.iter().flat_map(SiteAllocations::iter).map(|site| ("layer: CPU site", site)));
             owned.extend(std::iter::once(&landing.list).chain(&landing.grids).map(|words| ("layer: landing convert", words)));
+            owned.extend([("layer: tier list", tiered), ("layer: seeds", seeds)]);
         }
         owned.extend(staging.iter().map(|pool| ("staging", pool)));
         owned.extend(host.iter().flatten().flat_map(|tier| tier.iter().map(|(_, records)| ("host tier", records))));
@@ -555,10 +556,8 @@ impl<T> BankLayout<T> {
             resident: make(&load.resident)?,
             lists: load.lists.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?,
             convert_staged: make(&load.convert_staged)?,
-            tiered: make(&load.tiered)?,
             tier_grid: make(&load.tier_grid)?,
             tier_staged: make(&load.tier_staged)?,
-            seeds: make(&load.seeds)?,
             seed_grid: make(&load.seed_grid)?,
             seed_staged: make(&load.seed_staged)?,
             grids: make(&load.grids)?,
@@ -584,6 +583,8 @@ impl<T> BankLayout<T> {
                 policy: make(&layer.policy)?,
                 sited: layer.sited.as_ref().map(|sited| sited.try_map(&mut make)).transpose()?,
                 landing: LandingAllocations { list: make(&layer.landing.list)?, grids: layer.landing.grids.as_ref().map(&mut make).transpose()? },
+                tiered: make(&layer.tiered)?,
+                seeds: make(&layer.seeds)?,
             });
         }
         let staging = self.staging.iter().map(&mut make).collect::<Result<Vec<_>, E>>()?;
@@ -797,6 +798,8 @@ impl ExpertBankPlan {
                         list: words(index, BankPart::LandingList)?,
                         grids: (self.placer() == Placer::Bank).then(|| words(index, BankPart::LandingGrids)).transpose()?,
                     },
+                    tiered: words(index, BankPart::TierList)?,
+                    seeds: words(index, BankPart::SeedList)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -809,10 +812,8 @@ impl ExpertBankPlan {
                 })
                 .collect::<Result<Vec<_>, String>>()?,
             convert_staged: device(0, BankPart::ConvertStaged)?,
-            tiered: words(0, BankPart::TierList)?,
             tier_grid: device(0, BankPart::TierGrid)?,
             tier_staged: device(0, BankPart::TierStaged)?,
-            seeds: words(0, BankPart::SeedList)?,
             seed_grid: device(0, BankPart::SeedGrid)?,
             seed_staged: device(0, BankPart::SeedStaged)?,
             grids: device(0, BankPart::ScratchGrids)?,

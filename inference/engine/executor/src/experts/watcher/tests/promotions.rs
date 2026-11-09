@@ -54,7 +54,7 @@ fn a_hit_a_promotion_evicts_during_its_group_is_never_seeded() {
     // bank no longer holds, is the group's only candidate.
     harness.publish(&steps[1], 0, &[]);
     harness.rounds(&steps[1], 0);
-    let seeds = harness.commit_seeds(&steps[1]);
+    let seeds = harness.commit_seeds(&steps[1], 0);
     assert!(seeds.iter().all(|&(expert, _)| expert != 5), "5, a hit no round filled, is seeded: {seeds:?}");
     for step in steps {
         step.complete().unwrap();
@@ -106,7 +106,7 @@ fn a_group_beginning_beside_promotions_into_its_lent_records_reads_no_hit_there(
                 assert_eq!(bytes, [(100 * kind + expert) as u8; RECORD as usize], "expert {expert}'s slot of tensor {kind}");
             }
         }
-        harness.commit_seeds(&step);
+        harness.commit_seeds(&step, 0);
         drop(step.complete());
     }
 }
@@ -140,7 +140,7 @@ fn decode_keeps_the_rankings_top_share(harness: &Harness) {
         harness.reads[0].store(record * 2 * EXPERTS + expert, if expert == 3 { 9 } else { 1 });
     }
     drop(harness.scratch(&step, 0, &(0..EXPERTS).collect::<Vec<_>>()));
-    harness.commit_seeds(&step);
+    harness.commit_seeds(&step, 0);
     step.complete().unwrap();
     for _ in 0..24 {
         harness.request(&[5, 6, 7]).complete().unwrap();

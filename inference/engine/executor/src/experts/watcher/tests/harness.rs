@@ -99,11 +99,14 @@ pub(super) struct Harness {
     pub(super) reads: Vec<Words>,
     /// The group's commits.
     commits: Words,
-    /// Scratch flags, convert lists and the seed list.
-    pub(super) load: (Words, Vec<Words>, Words),
-    /// The tier list: a request's experts the host tier keeps whole, which
-    /// the device's tier copy reads (the harness plays it at round 0).
-    pub(super) tiered: Words,
+    /// Scratch flags and convert lists.
+    pub(super) load: (Words, Vec<Words>),
+    /// Each layer's tier list: a request's experts the host tier keeps
+    /// whole, which the device's tier copy reads (the harness plays it at
+    /// round 0).
+    pub(super) tiered: Vec<Words>,
+    /// Each layer's seed list.
+    pub(super) seeds: Vec<Words>,
     /// The second chain place's scratch flags (the first's are `load.0`).
     pub(super) second: Words,
     staging: Tensor,
@@ -433,9 +436,9 @@ pub(super) fn lending_bank(
     let load = (
         words(EXPERTS as u64, 0),
         (0..WORDS.rounds).map(|_| words(magnitude_kernels::list_extent(2), 0)).collect::<Vec<_>>(),
-        words(magnitude_kernels::list_extent(EXPERTS as u64), 0),
     );
-    let tiered = words(magnitude_kernels::list_extent(EXPERTS as u64), 0);
+    let lists = || (0..layers).map(|_| words(magnitude_kernels::list_extent(EXPERTS as u64), 0)).collect::<Vec<_>>();
+    let (tiered, seeds) = (lists(), lists());
     // Each tensor's conveyor: the bytes of the lent records it lies on,
     // which the harness addresses apart from the tier's.
     let conveyor = Tensor::shared(&device, Element::i32(), &[conveyor_records * 3 * 4]).unwrap();
@@ -532,6 +535,8 @@ pub(super) fn lending_bank(
                     },
                     conveyor: conveyor_records,
                 },
+                tiered: tiered[index].clone(),
+                seeds: seeds[index].clone(),
             })
             .collect(),
         group_reads: reads.iter().map(|reads| PlacedLayerWords { group_reads: reads.clone(), stride: EXPERTS }).collect(),
@@ -546,8 +551,6 @@ pub(super) fn lending_bank(
         load: LoadWords {
             flags: vec![load.0.clone(), second.clone()],
             lists: load.1.clone(),
-            tiered: tiered.clone(),
-            seeds: load.2.clone(),
         },
         pools,
         extents: Extents {
@@ -587,6 +590,7 @@ pub(super) fn lending_bank(
         commits,
         load,
         tiered,
+        seeds,
         second,
         staging,
         conveyor,
@@ -948,17 +952,25 @@ impl Harness {
         self.holding_all(layer);
     }
 
-    /// Play `routed_seed_commit` of `step` at layer `layer`, after its last
-    /// round there: each seed the step's list names is committed by the
-    /// step, which the host maps once the device is past it. The seeds;
-    /// none where the list is another step's.
-    pub(super) fn commit_seeds(&self, step: &ExpertStep) -> Vec<(i32, i32)> {
-        let seeds = &self.load.2;
+    /// The (expert, bank record) pairs of layer `layer`'s seed list for
+    /// `step`, as `routed_copy` copies and `routed_seed_commit` commits
+    /// them after its last round there: none where the list is another
+    /// step's.
+    pub(super) fn seed_pairs(&self, step: &ExpertStep, layer: usize) -> Vec<(i32, i32)> {
+        let seeds = &self.seeds[layer];
         if seeds.load(constants::LIST_SEQUENCE as usize) != low_word(step.sequence()) {
             return Vec::new();
         }
         let first = self.seeded_from as i32;
-        let pairs = listed(seeds).into_iter().map(|(expert, record)| (expert, first + record)).collect::<Vec<_>>();
+        listed(seeds).into_iter().map(|(expert, record)| (expert, first + record)).collect()
+    }
+
+    /// Play `routed_seed_commit` of `step` at layer `layer`, after its last
+    /// round there: each seed the step's list names is committed by the
+    /// step, which the host maps once the device is past it. The seeds;
+    /// none where the list is another step's.
+    pub(super) fn commit_seeds(&self, step: &ExpertStep, layer: usize) -> Vec<(i32, i32)> {
+        let pairs = self.seed_pairs(step, layer);
         for &(_, record) in &pairs {
             self.commits.store(record as usize, low_word(step.sequence()));
         }
@@ -973,7 +985,7 @@ impl Harness {
         let mut seeds = Vec::new();
         for index in 0..self.layers.len() {
             self.scratch(&step, index, if index == layer { experts } else { &[] });
-            let committed = self.commit_seeds(&step);
+            let committed = self.commit_seeds(&step, index);
             if index == layer {
                 seeds = committed;
             }
@@ -1032,7 +1044,7 @@ impl Harness {
     /// other reads: where records or slots cycle within a request.
     pub(super) fn rounds_checked(&self, step: &ExpertStep, layer: usize) -> Vec<Vec<(i32, i32)>> {
         let sequence = low_word(step.sequence());
-        let (_, lists, _) = &self.load;
+        let (_, lists) = &self.load;
         let mut rounds = Vec::new();
         self.park_answering(step, layer, true, |index| {
             let list = &lists[index as usize];
@@ -1049,7 +1061,7 @@ impl Harness {
     /// ([`Self::arrive_after`]).
     pub(super) fn rounds_arriving(&self, step: &ExpertStep, layer: usize, after: bool) -> Vec<Vec<(i32, i32)>> {
         let sequence = low_word(step.sequence());
-        let (_, lists, _) = &self.load;
+        let (_, lists) = &self.load;
         let converting = self.park_arriving(step, layer, after);
         let pairs = |list: &Words| {
             assert_eq!(list.load(constants::LIST_SEQUENCE as usize), sequence);
@@ -1092,7 +1104,7 @@ impl Harness {
             scratch.request(sequence, round(index));
             assert_eq!(until_answered(scratch, sequence, round(index)), Answer::Answered);
             if index == 0 {
-                self.tier_copy(sequence);
+                self.tier_copy(sequence, layer);
                 converting = (scratch.load(sequence, constants::SCRATCH_ASK, constants::SCRATCH_STAGED) as u64)
                     .div_ceil(ROUND_RECORDS);
                 if converting == 0 {
@@ -1120,14 +1132,15 @@ impl Harness {
     /// Play the device's tier copy after `sequence`'s round 0: each
     /// (tier record, scratch slot) the tier list names for the step, the
     /// tier record's bytes of every routed tensor into the expert's slot.
-    fn tier_copy(&self, sequence: u64) {
-        if self.tiered.load(constants::LIST_SEQUENCE as usize) != low_word(sequence) {
+    fn tier_copy(&self, sequence: u64, layer: usize) {
+        let tiered = &self.tiered[layer];
+        if tiered.load(constants::LIST_SEQUENCE as usize) != low_word(sequence) {
             return;
         }
         let records = u32::try_from(self.host.tier[0].extents()[0]).unwrap();
         for (records, slots) in self.host.views(records).iter().zip(&self.scratch) {
             // Slot `e` holds expert `e`.
-            for (record, expert) in listed(&self.tiered) {
+            for (record, expert) in listed(tiered) {
                 let mut bytes = vec![0u8; RECORD as usize];
                 // SAFETY: the harness plays the device; nothing else
                 // writes the record or the slot meanwhile.

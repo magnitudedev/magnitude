@@ -30,7 +30,7 @@ fn a_conveyors_records_cycle_as_rounds_convert() {
         harness.publish(&step, 0, &cold);
         let sequence = low_word(step.sequence());
         let scratch = &harness.layer.2;
-        let (_, lists, _) = &harness.load;
+        let (_, lists) = &harness.load;
         let (mut converted, mut rounds, mut index) = (Vec::new(), 1, 0);
         while index < rounds {
             scratch.request(step.sequence(), round(index));
@@ -107,13 +107,13 @@ fn a_rounds_answer_needs_no_transfer() {
     let absent = (0..EXPERTS).find(|&expert| expert != 5 && harness.in_tier(0, expert).is_none()).unwrap();
     assert!(harness.ask_at(&decode, 0, &[absent]));
     let served = within(&|| harness.verdict(0, decode.sequence()).is_some());
-    let tiered = listed(&harness.tiered);
+    let tiered = listed(&harness.tiered[0]);
     release.send(()).unwrap();
     writer.join().unwrap();
     assert!(answered, "round 0 is answered while no transfer can be issued");
     assert!(served, "the decode request is served meanwhile");
     assert_eq!(harness.verdict(0, decode.sequence()), Some(Answer::Answered));
-    assert_eq!(harness.tiered.load(constants::LIST_SEQUENCE as usize), low_word(prompt.sequence()));
+    assert_eq!(harness.tiered[0].load(constants::LIST_SEQUENCE as usize), low_word(prompt.sequence()));
     assert_eq!(tiered, [(record, 5)], "the tier list names 5 at its tier record");
     harness.park(&prompt, 0);
     decode.complete().unwrap();
@@ -222,7 +222,7 @@ fn a_groups_steps_read_each_expert_once_per_layer() {
     // again, or copied from the host tier its group's read landed it in.
     let next = harness.prompt_step();
     let mut filled = listed(&[0, 3], &next, 1);
-    filled.extend(super::tests::listed(&harness.tiered).into_iter().map(|(_, expert)| expert));
+    filled.extend(super::tests::listed(&harness.tiered[1]).into_iter().map(|(_, expert)| expert));
     filled.sort_unstable();
     assert_eq!(filled, [0, 3], "a new group, {first}'s tier forgotten");
     next.complete().unwrap();
@@ -441,7 +441,7 @@ fn a_rounds_records_free_once_whichever_proof_of_its_converts_comes_first() {
 fn a_groups_last_step_seeds_the_most_recent_experts() {
     let harness = prompted("seeds", EXPERTS, 4);
     let steps = harness.group(&[StepRoute::Grouped; 2]);
-    let seeds = &harness.load.2;
+    let seeds = &harness.seeds[0];
     harness.scratch(&steps[0], 0, &[6, 7]);
     assert_ne!(seeds.load(constants::LIST_SEQUENCE as usize), low_word(steps[0].sequence()));
     harness.scratch(&steps[1], 0, &[0, 1, 2, 3, 4, 5, 7]);
@@ -466,7 +466,7 @@ fn a_running_steps_seeds_wait_for_its_end_and_a_tainted_ones_are_never_mapped() 
     let pulse = harness.watcher.shared().steps.pulse();
     let step = harness.prompt_step();
     harness.scratch(&step, 0, &[3, 4]);
-    assert_eq!(harness.commit_seeds(&step).len(), 2, "layer 0 seeds 3 and 4");
+    assert_eq!(harness.commit_seeds(&step, 0).len(), 2, "layer 0 seeds 3 and 4");
     let before = pulse.late_beats();
     pulse.beat_after(Duration::from_millis(4 * constants::PULSE_SPINS as u64 * 70 / 1_000_000));
     assert_eq!(pulse.late_beats(), before + 1, "the late beat was never counted");
@@ -483,6 +483,27 @@ fn a_running_steps_seeds_wait_for_its_end_and_a_tainted_ones_are_never_mapped() 
     drop(harness.route_at(&next, 1, &[]));
     next.complete().unwrap();
     assert!(map.held(3).is_none() && map.held(4).is_none(), "a tainted step's seeds were mapped");
+}
+
+/// A group's last step whose wait at a layer outlasts the still pulse
+/// before the host takes its request there seeds nothing there: the seed
+/// copy after the layer's last round reads the layer's own seed list, which
+/// holds only earlier steps', never the list the step's request at the
+/// layer before wrote. That list names records of the layer before's bank
+/// group, which in the next layer's group may hold live experts.
+#[test]
+fn a_last_step_expiring_before_its_request_is_taken_seeds_nothing_there() {
+    let harness = hosted_prompted("seed-expired", 4, 2, TIER);
+    let pulse = harness.watcher.shared().steps.pulse();
+    let step = harness.prompt_step();
+    harness.scratch(&step, 0, &[3, 4]);
+    assert_eq!(harness.commit_seeds(&step, 0).len(), 2, "layer 0 seeds 3 and 4");
+    // The device reaches layer 1, the host's pulse still, and its wait
+    // there ends on it before the host takes the request.
+    pulse.beat_after(Duration::from_millis(4 * constants::PULSE_SPINS as u64 * 70 / 1_000_000));
+    harness.expire(&step, 1);
+    assert_eq!(harness.seed_pairs(&step, 1), [], "layer 1's seed copy copies layer 0's seeds");
+    assert!(matches!(step.complete(), Err(StepFailure::Interrupted(_))));
 }
 
 /// Beside a host tier a prompt group's scratch lies in its lender's bottom
@@ -508,7 +529,7 @@ fn a_discrete_groups_scratch_claims_its_bank_records_and_returns_them_free() {
     for expert in [0, 1] {
         assert_eq!((map.held(expert), map.resolve(expert, first)), (None, None), "{expert} left the bank from the group's first step");
     }
-    assert_eq!(harness.commit_seeds(&step), [], "no seed takes a lent record or a share's");
+    assert_eq!(harness.commit_seeds(&step, 0), [], "no seed takes a lent record or a share's");
     // A step the load interrupts fails here; its seeds are none anyway.
     drop(step.complete());
     eventually("the lent records never returned free", || !lent(0) && !lent(1));
@@ -522,7 +543,7 @@ fn a_discrete_groups_scratch_claims_its_bank_records_and_returns_them_free() {
     // The group began once every promotion's copy into one had completed;
     // its lend drops one yet to copy.
     eventually("the next group was never lent the records again", || lent(0) && lent(1));
-    harness.commit_seeds(&step);
+    harness.commit_seeds(&step, 0);
     drop(step.complete());
 }
 
@@ -562,7 +583,7 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         // its share: into the free record, and the one outside every share,
         // evicting layer 1's 5.
         harness.rounds(&steps[1], 0);
-        assert_eq!(listed(&harness.load.2).len(), 2);
+        assert_eq!(listed(&harness.seeds[0]).len(), 2);
         let first = steps[0].sequence();
         assert_eq!(harness.layers[1].0.held(5), None, "the evicted hit is unmapped");
         assert_eq!(harness.layers[1].0.resolve(5, first), None, "for every step of the group");
@@ -586,7 +607,7 @@ fn a_hit_the_layer_befores_seeding_evicts_is_read() {
         // let it go before the device arrived, its tier copy reads it: the
         // one race here is which, and either fills its slot once.
         let converted = harness.from_conveyor(&harness.rounds(&steps[1], 1).concat());
-        let tiered = listed(&harness.tiered).iter().any(|&(_, expert)| expert == 3);
+        let tiered = listed(&harness.tiered[1]).iter().any(|&(_, expert)| expert == 3);
         assert!(converted == [3] || (converted.is_empty() && tiered), "converted {converted:?}, tier copied {tiered}");
         for step in steps {
             step.complete().unwrap();
@@ -821,7 +842,7 @@ fn a_group_claims_its_lent_records_and_returns_them_empty() {
     eventually("the lent records were never claimed", || harness.in_tier(0, 0).is_none() && harness.in_tier(0, 1).is_none());
     harness.conveying(2);
     harness.rounds(&step, 0);
-    harness.commit_seeds(&step);
+    harness.commit_seeds(&step, 0);
     step.complete().unwrap();
     // The group returns its lent records once the watcher learns the device
     // is past it and its conveyor quiet, after its step completes. The tier
@@ -880,7 +901,7 @@ fn the_one_stores_rounds_read_a_cold_expert_the_store_keeps() {
     converted.sort_unstable();
     assert_eq!(converted, kept, "the rounds convert every one");
     assert_eq!(harness.from_conveyor(rounds.last().unwrap()).len(), 1, "the last, read into the conveyor once a record freed");
-    assert_eq!(listed(&harness.tiered), [], "no tier copy on the one store");
+    assert_eq!(listed(&harness.tiered[0]), [], "no tier copy on the one store");
     step.complete().unwrap();
 }
 
@@ -1059,7 +1080,7 @@ fn ranked_share(placer: Placer) {
     let every = (0..EXPERTS).collect::<Vec<_>>();
     for layer in 0..LAYERS {
         harness.scratch(&step, layer, &every);
-        harness.commit_seeds(&step);
+        harness.commit_seeds(&step, layer);
         for expert in 0..EXPERTS {
             harness.reads[layer].store(record * 2 * EXPERTS + expert, 1);
         }
@@ -1095,7 +1116,7 @@ fn a_prompt_group_grows_no_layer_past_its_share() {
     let mut seeded = Vec::new();
     for layer in 0..LAYERS {
         harness.scratch(&step, layer, &every);
-        seeded.push(harness.commit_seeds(&step).len());
+        seeded.push(harness.commit_seeds(&step, layer).len());
         for expert in 0..EXPERTS {
             harness.reads[layer].store(record * 2 * EXPERTS + expert, 1);
         }
