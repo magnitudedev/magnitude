@@ -6,6 +6,15 @@
 //! consumer sums) and scatters its output into the streams with the site's
 //! inject values (the output entries' join), and the last block ends with
 //! the decoder's exit site, whose partials the readout sums.
+//!
+//! Under Sinkhorn mixing each site is one entry (`stream_mix_sinkhorn`): it
+//! reads the streams and the previous site's `pre`, and gives its sublayer
+//! one input row (normalized by the sublayer's input norm), its own `pre`
+//! and the join row post | comb its sublayer's output joins with. The `pre`
+//! crosses every boundary between graphs beside the streams
+//! ([`ResidualCarry`]); block 0 starts it one-hot, and the decoder's exit
+//! collapses the streams by the last site's (`stream_collapse`), which the
+//! readout normalizes.
 
 pub(crate) mod graph;
 
@@ -15,13 +24,52 @@ use magnitude_family_contracts::{
 };
 use seismic::Element;
 
-/// The geometry of a decoder's streams: S streams of `hidden`, and the low
-/// rank of its mix sites.
+/// The geometry of a decoder's streams: S streams of `hidden`, and how its
+/// mix sites form their coefficients.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StreamsGeometry {
     pub hidden: u64,
     pub streams: u64,
-    pub rank: u64,
+    pub mixing: StreamsMixing,
+}
+
+/// How every mix site of a decoder forms its coefficients
+/// (`HyperConnectionMixing`): through a low-rank bottleneck, or by one
+/// Sinkhorn projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StreamsMixing {
+    LowRank { rank: u64 },
+    Sinkhorn(SinkhornMixing),
+}
+
+/// The Sinkhorn mixing's numerics, as `stream_mix_sinkhorn` takes them: its
+/// iteration count, the epsilon of `pre`, the comb and its normalizations,
+/// and its projection's RMS epsilon.
+#[derive(Clone, Copy, Debug)]
+pub struct SinkhornMixing {
+    pub iterations: u32,
+    pub epsilon: f32,
+    pub norm_epsilon: f32,
+}
+
+impl SinkhornMixing {
+    fn key(&self) -> (u32, u32, u32) {
+        (self.iterations, self.epsilon.to_bits(), self.norm_epsilon.to_bits())
+    }
+}
+
+impl PartialEq for SinkhornMixing {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for SinkhornMixing {}
+
+impl std::hash::Hash for SinkhornMixing {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.key().hash(state)
+    }
 }
 
 impl StreamsGeometry {
@@ -34,19 +82,113 @@ impl StreamsGeometry {
         let ResidualForm::HyperConnections(form) = residual else {
             return Ok(None);
         };
-        let HyperConnectionMixing::LowRankGated { rank } = form.mixing else {
-            return Err(PlanError::Unsupported("hyper-connection mixing"));
+        let mixing = match form.mixing {
+            HyperConnectionMixing::LowRankGated { rank } => StreamsMixing::LowRank { rank },
+            HyperConnectionMixing::Sinkhorn {
+                iterations,
+                epsilon,
+                norm_epsilon,
+            } => StreamsMixing::Sinkhorn(SinkhornMixing {
+                iterations: u32::try_from(iterations)
+                    .map_err(|_| PlanError::Arithmetic("Sinkhorn iterations exceed u32"))?,
+                epsilon: epsilon as f32,
+                norm_epsilon: norm_epsilon as f32,
+            }),
         };
         Ok(Some(Self {
             hidden,
             streams: form.streams,
-            rank,
+            mixing,
         }))
     }
 
     /// The width of a row of the streams, `S * H`.
     pub fn width(&self) -> u64 {
         self.streams * self.hidden
+    }
+
+    /// The low-rank sites' geometry, of low-rank mixing.
+    pub fn low_rank(&self) -> Option<LowRankGeometry> {
+        match self.mixing {
+            StreamsMixing::LowRank { rank } => Some(LowRankGeometry {
+                hidden: self.hidden,
+                streams: self.streams,
+                rank,
+            }),
+            StreamsMixing::Sinkhorn(_) => None,
+        }
+    }
+
+    /// The Sinkhorn numerics, of Sinkhorn mixing.
+    pub fn sinkhorn(&self) -> Option<SinkhornMixing> {
+        match self.mixing {
+            StreamsMixing::Sinkhorn(mixing) => Some(mixing),
+            StreamsMixing::LowRank { .. } => None,
+        }
+    }
+
+    /// The width of a row of the streams' join values `IN`: an inject value
+    /// per stream, and under Sinkhorn mixing the comb after them.
+    pub fn join_width(&self) -> u64 {
+        match self.mixing {
+            StreamsMixing::LowRank { .. } => self.streams,
+            StreamsMixing::Sinkhorn(_) => self.streams + self.streams * self.streams,
+        }
+    }
+}
+
+/// S low-rank streams of `hidden`, and the rank of their mix sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LowRankGeometry {
+    pub hidden: u64,
+    pub streams: u64,
+    pub rank: u64,
+}
+
+impl LowRankGeometry {
+    /// The width of a row of the streams, `S * H`.
+    pub fn width(&self) -> u64 {
+        self.streams * self.hidden
+    }
+}
+
+/// What crosses every boundary between graphs of the residual: its rows (the
+/// `[rows, S * H]` streams, or one `[rows, H]` stream), and under Sinkhorn
+/// mixing the `[rows, S]` F32 `pre` of the last site run over them, which
+/// the next site reads. A block's graph reads and leaves one, as its input
+/// and output ports; a split block's front leaves it to its back; a run
+/// binds it from graph to graph.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResidualCarry<T> {
+    pub rows: T,
+    pub pre: Option<T>,
+}
+
+impl<T> ResidualCarry<T> {
+    /// The rows of a residual that carries no `pre`.
+    pub fn rows(rows: T) -> Self {
+        Self { rows, pre: None }
+    }
+
+    pub fn as_ref(&self) -> ResidualCarry<&T> {
+        ResidualCarry {
+            rows: &self.rows,
+            pre: self.pre.as_ref(),
+        }
+    }
+
+    pub fn map<U>(self, mut map: impl FnMut(T) -> U) -> ResidualCarry<U> {
+        ResidualCarry {
+            rows: map(self.rows),
+            pre: self.pre.map(map),
+        }
+    }
+
+    pub fn try_map<U, E>(self, mut map: impl FnMut(T) -> Result<U, E>) -> Result<ResidualCarry<U>, E> {
+        Ok(ResidualCarry {
+            rows: map(self.rows)?,
+            pre: self.pre.map(map).transpose()?,
+        })
     }
 }
 
@@ -126,11 +268,52 @@ impl<T> Sites<Option<T>> {
     }
 }
 
-/// The streams a block's graph reads and writes, and the elements of each
-/// mix site it runs over them, as that site's own weights planned them.
+/// The streams a block's graph reads and writes, as its kernels bind them:
+/// low-rank sites, each at its own weights' elements, or Sinkhorn sites.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlockStreams {
+    LowRank(StreamsBinding),
+    Sinkhorn(SinkhornBinding),
+}
+
+impl BlockStreams {
+    /// The block's streams of `geometry`, whose low-rank sites `low_rank`
+    /// binds.
+    pub(crate) fn of(
+        geometry: StreamsGeometry,
+        low_rank: impl FnOnce(LowRankGeometry) -> Result<StreamsBinding, PlanError>,
+    ) -> Result<Self, PlanError> {
+        Ok(match geometry.mixing {
+            StreamsMixing::LowRank { rank } => Self::LowRank(low_rank(LowRankGeometry {
+                hidden: geometry.hidden,
+                streams: geometry.streams,
+                rank,
+            })?),
+            StreamsMixing::Sinkhorn(mixing) => Self::Sinkhorn(SinkhornBinding {
+                hidden: geometry.hidden,
+                streams: geometry.streams,
+                mixing,
+            }),
+        })
+    }
+}
+
+/// A block's Sinkhorn streams: S streams of `hidden` and their mixing,
+/// whose sites' weights are F32 (`is_fixed_dense_role`), so their entries
+/// bind no element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SinkhornBinding {
+    pub hidden: u64,
+    pub streams: u64,
+    pub mixing: SinkhornMixing,
+}
+
+/// The low-rank streams a block's graph reads and writes, and the elements
+/// of each mix site it runs over them, as that site's own weights planned
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StreamsBinding {
-    pub geometry: StreamsGeometry,
+    pub geometry: LowRankGeometry,
     pub mixer: InjectingSite,
     pub feed_forward: Option<InjectingSite>,
     pub exit: Option<MixSite>,
@@ -217,7 +400,7 @@ impl StreamsBinding {
 /// the exit site at `exit` (when the block ends with one). `lookup` resolves
 /// the planned element of a role in a scope; each site binds its own.
 pub(crate) fn binding(
-    geometry: StreamsGeometry,
+    geometry: LowRankGeometry,
     mixer: WeightScope,
     feed_forward: Option<WeightScope>,
     exit: Option<WeightScope>,

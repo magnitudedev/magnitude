@@ -63,6 +63,30 @@ pub fn output_gate(function: i32, z: f32) -> f32 {
     }
 }
 
+/// `scatter` (functions.seismic) of one column of one row: stream `stream`'s
+/// joined value from the output `y`, the row's `inject_width` (`IN`) inject
+/// values (`inject(i)`) over `streams` (`SN`) streams, and the streams'
+/// values of the column (`residual(s)`): the stream's own value, or (a comb
+/// after the inject values, `IN > SN`) the streams mixed by `comb[., stream]`
+/// in source order, plus `y`, times the stream's inject value where the row
+/// has them.
+#[inline(always)]
+pub fn scatter(
+    streams: usize,
+    inject_width: usize,
+    stream: usize,
+    y: f32,
+    inject: impl Fn(usize) -> f32,
+    residual: impl Fn(usize) -> f32,
+) -> f32 {
+    let mixed = if inject_width > streams {
+        (0..streams).fold(0.0f32, |mixed, from| mixed + inject(streams + from * streams + stream) * residual(from))
+    } else {
+        residual(stream)
+    };
+    if inject_width == 0 { mixed + y } else { mixed + y * inject(stream) }
+}
+
 #[inline(always)]
 pub fn softcap(cap: f32, z: f32) -> f32 {
     cap * (2.0 / (1.0 + (-2.0 * z / cap).exp()) - 1.0)

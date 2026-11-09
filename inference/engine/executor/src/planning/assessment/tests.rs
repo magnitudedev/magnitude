@@ -585,7 +585,10 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
     // the same topology that execution uses.
     definition.decoder = crate::planning::fixtures::hyper_connection_fixture_definition().decoder;
     let mut site = match &definition.decoder.exit.norm {
-        ExitNorm::HyperConnectionHead(site) => site.clone(),
+        ExitNorm::HyperConnectionHead(exit) => match crate::operators::ExitMix::of(exit).unwrap() {
+            crate::operators::ExitMix::Own(site) => site.clone(),
+            crate::operators::ExitMix::Previous(_) => unreachable!(),
+        },
         _ => unreachable!(),
     };
     let head = &mut definition.head.as_mut().unwrap().blocks[0];
@@ -600,14 +603,14 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
         site.down.name = format!("head_mix_{index}_down");
         site.up.name = format!("head_mix_{index}_up");
         site.inject = Some(descriptor(&format!("mix_{index}_inject"), &[4, 4 * hidden]));
-        sublayer.input = InputNorm::HyperConnectionMix(site.clone());
+        sublayer.input = crate::planning::fixtures::mix_input(site.clone());
         sublayer.output = magnitude_family_contracts::OutputForm::Scatter;
     }
     site.norm.weight.name = "head_exit_norm".into();
     site.down.name = "head_exit_down".into();
     site.up.name = "head_exit_up".into();
     site.inject = None;
-    head.output_norm = ExitNorm::HyperConnectionHead(site);
+    head.output_norm = crate::planning::fixtures::exit_norm(site);
     let Operator::RoutedFfn(routed) = &mut head.blocks[0].sublayers[1].op else {
         unreachable!()
     };

@@ -33,6 +33,9 @@ enum RowRule {
     Empty { element: Element, width: u64 },
     /// The rank-1 `i32` table of `rows` copies of one value.
     Filled(i32),
+    /// The F32 matrix `[rows, width]` of ones in column 0 and zeros
+    /// elsewhere: each row one-hot on its first column.
+    OneHot { width: u64 },
     /// The one `i32` `rows` itself.
     Count,
 }
@@ -60,6 +63,16 @@ impl RowRule {
                 value: ConstantValue::Bytes(Arc::from([])),
             },
             Self::Filled(value) => table(vec![value; usize::try_from(rows).map_err(|_| "row count exceeds usize")?]),
+            Self::OneHot { width } => {
+                let width = usize::try_from(width).map_err(|_| "one-hot width exceeds usize")?;
+                let rows = usize::try_from(rows).map_err(|_| "row count exceeds usize")?;
+                let values = (0..rows * width).map(|at| if at % width == 0 { 1.0f32 } else { 0.0 });
+                ConstantStorage {
+                    element: Element::f32(),
+                    extents: vec![rows as u64, width as u64],
+                    value: ConstantValue::Bytes(values.flat_map(f32::to_le_bytes).collect()),
+                }
+            }
             Self::Count => {
                 let rows = i32::try_from(rows).map_err(|_| "row count exceeds i32")?;
                 ConstantStorage {
@@ -461,6 +474,17 @@ impl GraphConstant {
         let tensor = constant.port().tensor().clone();
         constants.push(constant);
         Ok(tensor)
+    }
+
+    /// The F32 matrix `[rows, width]` at the class's `rows` rows, each row
+    /// one-hot on its first column.
+    pub(crate) fn row_one_hot<G: GraphDraft>(
+        graph: &mut G,
+        rows: u64,
+        width: u64,
+        class: Option<&'static str>,
+    ) -> Result<Self, GraphError> {
+        Self::of_rows(graph, RowRule::OneHot { width }, rows, class)
     }
 
     /// The rank-1 `i32` table of `value` for each of the class's `rows`

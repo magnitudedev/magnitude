@@ -43,7 +43,8 @@ pub(crate) use target::{
     PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
     RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
     LowRankQueryKernels, SelectedPrefillKernel, SelectionKernels,
-    ShortConvKernels, StateSpaceKernels, StreamsEntryKernels, StreamsKernels,
+    MixingKernels, ShortConvKernels, SinkhornKernels, StateSpaceKernels, StreamsEntryKernels,
+    StreamsKernels,
     SublayerOutput, TableConversion,
     TapKernels,
 };

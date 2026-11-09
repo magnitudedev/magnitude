@@ -29,7 +29,7 @@ impl<'a> QualificationView<'a> {
                 &label,
             )?;
             let streams = binding.streams.map_or(1, |s| s.geometry.streams);
-            let form = SublayerRows { form: crate::operators::InputForm { parts: streams, normalized: binding.streams.is_none() }, streams, injected: binding.streams.is_some() };
+            let form = SublayerRows { form: crate::operators::InputForm { parts: streams, normalized: binding.streams.is_none() }, streams, width: binding.streams.map_or(0, |s| s.geometry.streams) };
             let pattern = (0..hidden * streams)
                 .map(|column| [1.0_f32, -2.0, 3.0, -4.0][column as usize % 4])
                 .collect::<Vec<_>>();

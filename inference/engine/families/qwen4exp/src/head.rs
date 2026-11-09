@@ -1,13 +1,13 @@
 //! Prediction blocks sharing the target's token tables: packaged
 //! separately, or stored after the target's last block in its own file.
 
-use super::{Error, FAMILY_ID, hyper_site, recognize};
+use super::{Error, FAMILY_ID, exit_norm, hyper_site, mix_input, recognize};
 use magnitude_artifacts::gguf::{Directory, Scalar, Value};
 use magnitude_family_common::Tensors;
 use magnitude_family_contracts::{
-    Block, ExitNorm, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput,
-    HeadReadout, HyperConnectionMixing, InputNorm, ModelDefinition, Operator, OutputForm,
-    ResidualForm, Sublayer, VocabularyProjection,
+    Block, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout,
+    HyperConnectionMixing, ModelDefinition, Operator, OutputForm, ResidualForm, Sublayer,
+    VocabularyProjection,
 };
 use magnitude_family_qwen::{
     GEOMETRY_KEYS, Geometry, MIXER_KEYS, Metadata, ROUTED_KEYS, Weight, product,
@@ -142,7 +142,7 @@ pub(crate) fn prediction_head(
     let block = Block {
         sublayers: vec![
             Sublayer {
-                input: InputNorm::HyperConnectionMix(hyper_site(
+                input: mix_input(hyper_site(
                     &geometry,
                     weight,
                     "hc_attn",
@@ -154,7 +154,7 @@ pub(crate) fn prediction_head(
                 output: OutputForm::Scatter,
             },
             Sublayer {
-                input: InputNorm::HyperConnectionMix(hyper_site(
+                input: mix_input(hyper_site(
                     &geometry,
                     weight,
                     "hc_ffn",
@@ -167,7 +167,7 @@ pub(crate) fn prediction_head(
             },
         ],
     };
-    let output_norm = ExitNorm::HyperConnectionHead(hyper_site(
+    let output_norm = exit_norm(hyper_site(
         &geometry,
         weight,
         "nextn.hc_head",

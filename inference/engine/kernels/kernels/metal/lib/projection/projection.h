@@ -245,8 +245,10 @@ struct Residual {
 // `scatter`: each of the STREAMS hyper-connection streams of the residual
 // plus the output times the stream's inject value,
 //   y[m, s * width + n] = residual[row(m), s * width + n] + round_A(acc) * inject[m, s]   (F32),
+// or (COMBED) the streams mixed by the comb that follows the inject values,
+//   y[m, d * width + n] = sum_s comb[m, s, d] residual[row(m), s * width + n] + round_A(acc) * inject[m, d],
 // with `Residual`'s interface (column strides are the streams' too).
-template <typename A, typename Rows, uint STREAMS>
+template <typename A, typename Rows, uint STREAMS, bool COMBED>
 struct Scatter {
     device float *y;
     ulong stride0, stride1;
@@ -264,10 +266,28 @@ struct Scatter {
         uint width;
         void store(uint n, float value) const {
             const float rounded = A::round(value);
+            if (!COMBED) {
+                PROJECTION_UNROLL
+                for (uint s = 0; s < STREAMS; ++s) {
+                    const ulong column = ulong(s * width + n);
+                    y[column * stride1] = residual[column * residual1] + rounded * inject[s];
+                }
+                return;
+            }
+            float streams[STREAMS];
             PROJECTION_UNROLL
             for (uint s = 0; s < STREAMS; ++s) {
-                const ulong column = ulong(s * width + n);
-                y[column * stride1] = residual[column * residual1] + rounded * inject[s];
+                streams[s] = residual[ulong(s * width + n) * residual1];
+            }
+            device const float *comb = inject + STREAMS;
+            PROJECTION_UNROLL
+            for (uint d = 0; d < STREAMS; ++d) {
+                float mixed = 0.0f;
+                PROJECTION_UNROLL
+                for (uint s = 0; s < STREAMS; ++s) {
+                    mixed = mixed + comb[s * STREAMS + d] * streams[s];
+                }
+                y[ulong(d * width + n) * stride1] = mixed + rounded * inject[d];
             }
         }
         void store8(uint n, float4 even, float4 odd) const {
@@ -290,18 +310,18 @@ struct Scatter {
 };
 
 // An output entry's epilogue: `Residual`, or `Scatter` over STREAMS streams
-// when the entry takes inject values. `make` forms either from every field
-// (`Residual` reads the leading ones).
-template <typename A, typename Rows, uint STREAMS, bool INJECTED>
+// when the entry takes inject values (COMBED: and a comb after them). `make`
+// forms either from every field (`Residual` reads the leading ones).
+template <typename A, typename Rows, uint STREAMS, bool INJECTED, bool COMBED>
 struct OutputOf {
-    typedef Scatter<A, Rows, STREAMS> type;
+    typedef Scatter<A, Rows, STREAMS, COMBED> type;
     static type make(device float *y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
         ulong residual1, Rows rows, device const float *inject, ulong inject0, uint width) {
         return type{y, stride0, stride1, residual, residual0, residual1, rows, inject, inject0, width};
     }
 };
 template <typename A, typename Rows>
-struct OutputOf<A, Rows, 1, false> {
+struct OutputOf<A, Rows, 1, false, false> {
     typedef Residual<A, Rows> type;
     static type make(device float *y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
         ulong residual1, Rows rows, device const float *, ulong, uint) {

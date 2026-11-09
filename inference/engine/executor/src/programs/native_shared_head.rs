@@ -23,6 +23,7 @@ use crate::operators::block::{
     BlockControlPorts, BlockLane, BlockStatePorts, BlockSublayers, CheckedFeedForwardEntries,
     CheckedMixerEntries, FeedForwardEntries, MixerEntries,
 };
+use crate::operators::streams::ResidualCarry;
 use crate::operators::{InputForm, SharedHead, paired_block};
 use crate::{
     DeviceError, HeadLaunchCore, InvariantError, ModelLoadPlan,
@@ -505,7 +506,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 &mut graph,
                 (entries.mixer)(index)?,
                 None,
-                &residual,
+                &ResidualCarry::rows(residual),
                 &mut weights,
                 &mut constants,
             )?;
@@ -524,7 +525,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 return Err("a head block other than unlisted attention".into());
             };
             // A draft head's blocks hold their experts whole: no bank.
-            (residual, _) = sublayers.feed_forward(
+            (ResidualCarry { rows: residual, .. }, _) = sublayers.feed_forward(
                 &mut graph,
                 crate::operators::block::FeedForwardGraph {
                     entries: (entries.feed_forward)(index)?,

@@ -1,4 +1,4 @@
-use crate::operators::streams::{MixDownBinding, MixUpBinding, Sites, StreamsBinding};
+use crate::operators::streams::{BlockStreams, MixDownBinding, MixUpBinding, SinkhornBinding, Sites};
 use crate::planning::RecordTensors;
 use crate::{
     AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding, GeneralRoutedBinding,
@@ -289,12 +289,29 @@ pub struct MixSiteKernels {
     pub up: NativeKernel<magnitude_kernels::stream_mix_up::Entry>,
 }
 
-/// A block's hyper-connection streams (`operators::streams`): each mix
-/// site's entries, at that site's own binding, and the widening of the
-/// embedded rows (`repeat`).
+/// The entries of Sinkhorn streams (`operators::streams`): every site's
+/// (`stream_mix_sinkhorn`), the exit's collapse, and the join of a
+/// sublayer whose output entry joins nothing itself.
+#[derive(Clone, Debug)]
+pub struct SinkhornKernels {
+    pub site: NativeKernel<magnitude_kernels::stream_mix_sinkhorn::Entry>,
+    pub collapse: NativeKernel<magnitude_kernels::stream_collapse::Entry>,
+    pub join: NativeKernel<magnitude_kernels::stream_join::Entry>,
+}
+
+/// A block's mix sites' entries, by its streams' mixing: each low-rank
+/// site's, at that site's own binding, or the Sinkhorn entries.
+#[derive(Clone, Debug)]
+pub enum MixingKernels {
+    LowRank(Sites<MixSiteKernels>),
+    Sinkhorn(SinkhornKernels),
+}
+
+/// A block's hyper-connection streams (`operators::streams`): its mix
+/// sites' entries, and the widening of the embedded rows (`repeat`).
 #[derive(Clone, Debug)]
 pub struct StreamsKernels {
-    pub sites: Sites<MixSiteKernels>,
+    pub mixing: MixingKernels,
     pub repeat: NativeKernel<magnitude_kernels::repeat_rows::Entry>,
 }
 
@@ -305,22 +322,28 @@ pub struct StreamsEntryKernels {
     pub(super) down:
         HashMap<MixDownBinding, NativeKernel<magnitude_kernels::stream_mix_down::Entry>>,
     pub(super) up: HashMap<MixUpBinding, NativeKernel<magnitude_kernels::stream_mix_up::Entry>>,
+    pub(super) sinkhorn: HashMap<SinkhornBinding, SinkhornKernels>,
     pub(super) repeat: Option<NativeKernel<magnitude_kernels::repeat_rows::Entry>>,
 }
 
 impl StreamsEntryKernels {
     /// The entries of `binding`'s sites; none when any was not prepared.
-    pub(super) fn kernels(&self, binding: StreamsBinding) -> Option<StreamsKernels> {
+    pub(super) fn kernels(&self, binding: BlockStreams) -> Option<StreamsKernels> {
         Some(StreamsKernels {
-            sites: binding
-                .entries()
-                .map(|site| {
-                    Some(MixSiteKernels {
-                        down: self.down.get(&site.down)?.clone(),
-                        up: self.up.get(&site.up)?.clone(),
-                    })
-                })
-                .flatten()?,
+            mixing: match binding {
+                BlockStreams::LowRank(binding) => MixingKernels::LowRank(
+                    binding
+                        .entries()
+                        .map(|site| {
+                            Some(MixSiteKernels {
+                                down: self.down.get(&site.down)?.clone(),
+                                up: self.up.get(&site.up)?.clone(),
+                            })
+                        })
+                        .flatten()?,
+                ),
+                BlockStreams::Sinkhorn(binding) => MixingKernels::Sinkhorn(self.sinkhorn.get(&binding)?.clone()),
+            },
             repeat: self.repeat.clone()?,
         })
     }

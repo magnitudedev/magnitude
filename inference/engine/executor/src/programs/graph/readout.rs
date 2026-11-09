@@ -1720,9 +1720,12 @@ fn head_topology<'a, G: GraphDraft + 'a>(
 pub(crate) fn readout_epsilon(geometry: &Decoder) -> Result<f32, String> {
     match &geometry.exit.norm {
         ExitNorm::Rms(norm) => Ok(norm.epsilon as f32),
-        // The exit site mixes the streams in the last block with its norm;
-        // the readout sums its partials and normalizes nothing.
-        ExitNorm::HyperConnectionHead(site) => Ok(site.norm.epsilon as f32),
+        // A low-rank exit site mixes the streams in the last block with its
+        // norm, and the readout sums its partials and normalizes nothing; a
+        // Sinkhorn exit's collapse the readout normalizes by the exit norm.
+        ExitNorm::HyperConnectionHead(exit) => crate::operators::ExitMix::of(exit)
+            .map(|exit| exit.epsilon() as f32)
+            .map_err(|error| error.to_string()),
         _ => Err("readout requires an RMS final normalization".into()),
     }
 }

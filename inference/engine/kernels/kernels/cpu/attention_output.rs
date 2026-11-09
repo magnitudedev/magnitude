@@ -6,7 +6,7 @@
 // weight's second-level scale, where it has one) published to A, as the
 // portable body adds it.
 
-use lib::core::activation;
+use lib::core::{activation, functions};
 use lib::projection::projection;
 
 fn attention_output_stage<L: Isa, E: Elements>(
@@ -51,7 +51,7 @@ fn attention_output_rows<L: Isa, E: Elements>(
     );
     let rows = projection::item_rows(group[0], cx.param_rows(), d);
     let (hidden, result, inject) = (cx.arg_hidden(), cx.result_0(), cx.arg_inject());
-    let (streams, injected) = (cx.dim_sn() as usize, cx.dim_in() != 0);
+    let (streams, inject_width) = (cx.dim_sn() as usize, cx.dim_in() as usize);
     let output_scale = if cx.dim_os() == 0 { 1.0 } else { cx.arg_output_scale().get([0]) };
     // SAFETY: the stage launch wrote every row before this launch.
     let staged = unsafe { cx.scratch_staged().slice::<f32>(0, m * k) };
@@ -66,20 +66,21 @@ fn attention_output_rows<L: Isa, E: Elements>(
         staged,
         quantized,
         |row, projected| {
-            // `scatter`: the residual plus the projection, or each stream's
-            // residual plus the projection times its inject value.
+            // `scatter` of the projection into each stream.
             for stream in 0..streams {
                 let first = stream * d + rows.start;
-                let factor = injected.then(|| inject.get([row, stream]));
-                let source = hidden.span([row, first], rows.len());
                 // SAFETY: each work item writes its own columns of every row.
                 let out = unsafe { result.span_mut([row, first], rows.len()) };
-                for ((target, hidden), projected) in out.iter_mut().zip(source).zip(projected) {
+                for (column, (target, projected)) in out.iter_mut().zip(projected).enumerate() {
                     let y = activation::publish::<E::A>(output_scale * *projected);
-                    *target = match factor {
-                        None => hidden + y,
-                        Some(factor) => hidden + y * factor,
-                    };
+                    *target = functions::scatter(
+                        streams,
+                        inject_width,
+                        stream,
+                        y,
+                        |at| inject.get([row, at]),
+                        |from| hidden.get([row, from * d + rows.start + column]),
+                    );
                 }
             }
         },

@@ -9,7 +9,10 @@
 # consumer entry (`form_input` in functions.seismic, PT = S, NM = 0), and its
 # output joins the streams through the output entry's `scatter` with the
 # inject values (`functions.seismic`). The decoder's exit is a mix site
-# without inject (C = 0) whose partials the readout sums.
+# without inject (C = 0) whose partials the readout sums. Under Sinkhorn
+# mixing a site is one entry (`stream_mix_sinkhorn`) reading the previous
+# site's pre, and the exit collapses the streams by the last site's pre
+# (`stream_collapse`).
 #
 # The mix entries read the streams and their norm through `[M, S, H]` and
 # `[S, H]` views of the row-major `[M, S * H]` and `[S * H]` tensors, which
@@ -82,6 +85,111 @@ fn stream_mix_up[M, H, S, LR](low: &tensor[M, LR] A, up_weight: &tensor[S * H, L
                 let normalized = hidden[row, stream, column] * inverse[row, stream] * f32(norm[stream, column])
                 partials[row, at] = gate * normalized / f32(S)
     return partials
+
+# A Sinkhorn mix site (`SinkhornSite`, DeepSeek V4.1's single pass) over
+# each row's streams X: one projection of the flattened S * H values by
+# `function` under one RMS statistic of all of them,
+#   m    = (function x) rsqrt(mean(x^2) + norm_epsilon)
+#   pre  = sigmoid(m[0:S] scale[0] + base[0:S]) + epsilon
+#   post = 2 sigmoid(m[S:2S] scale[1] + base[S:2S])
+#   comb = rowsoftmax(m[2S:] scale[2] + base[2S:]) + epsilon      ([S, S], source major)
+#   comb = comb / (colsum + epsilon), then iterations - 1 times
+#          comb / (rowsum + epsilon), comb / (colsum + epsilon)
+# in F32. Results: the sublayer's input `sum_s previous[s] X[s]` (the
+# previous site's pre, which its consumer normalizes: `form_input`, PT = 1),
+# this site's pre (the next site's `previous`), and the join row
+# post | comb its sublayer's output entry scatters with (`scatter`,
+# IN = S + S * S). `iterations`, the model's Sinkhorn iteration count, is a
+# runtime argument, as epsilon is; zero leaves comb at its softmax rows.
+fn stream_mix_sinkhorn[M, H, S](hidden: &tensor[M, S, H] f32, previous: &tensor[M, S] f32,
+    function: &tensor[(2 + S) * S, S * H] f32, base: &tensor[(2 + S) * S] f32, scale: &tensor[3] f32,
+    epsilon: f32, norm_epsilon: f32, iterations: u32)
+    -> (tensor[M, H] f32, tensor[M, S] f32, tensor[M, S + S * S] f32) where S >= 1:
+    let mut flat = tensor[M, S * H] f32
+    let mut mixes = tensor[M, (2 + S) * S] f32
+    let mut input = tensor[M, H] f32
+    let mut pre = tensor[M, S] f32
+    let mut join = tensor[M, S + S * S] f32
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            parallel for column in 0..H:
+                flat[row, stream * H + column] = hidden[row, stream, column]
+    linear(flat, function, mixes)
+    parallel for row in 0..M:
+        let mut squares = f32(0.0)
+        for at in 0..S * H:
+            let v = flat[row, at]
+            squares = squares + v * v
+        let inverse = rsqrt(squares / f32(S * H) + norm_epsilon)
+        for stream in 0..S:
+            pre[row, stream] = 1.0 / (1.0 + exp(-(mixes[row, stream] * inverse * scale[0] + base[stream]))) + epsilon
+            join[row, stream] = 2.0 / (1.0 + exp(-(mixes[row, S + stream] * inverse * scale[1] + base[S + stream])))
+        let mut comb = tensor[S, S] f32
+        for source in 0..S:
+            let mut maximum = -inf
+            for target in 0..S:
+                let at = 2 * S + source * S + target
+                comb[source, target] = mixes[row, at] * inverse * scale[2] + base[at]
+                maximum = max(maximum, comb[source, target])
+            let mut total = f32(0.0)
+            for target in 0..S:
+                comb[source, target] = exp(comb[source, target] - maximum)
+                total = total + comb[source, target]
+            for target in 0..S:
+                comb[source, target] = comb[source, target] / total + epsilon
+        for sweep in 0..iterations:
+            if sweep > 0:
+                for source in 0..S:
+                    let mut sum = f32(0.0)
+                    for target in 0..S:
+                        sum = sum + comb[source, target]
+                    for target in 0..S:
+                        comb[source, target] = comb[source, target] / (sum + epsilon)
+            for target in 0..S:
+                let mut sum = f32(0.0)
+                for source in 0..S:
+                    sum = sum + comb[source, target]
+                for source in 0..S:
+                    comb[source, target] = comb[source, target] / (sum + epsilon)
+        for source in 0..S:
+            for target in 0..S:
+                join[row, S + source * S + target] = comb[source, target]
+    collapse(hidden, previous, input)
+    return input, pre, join
+
+# Each row's streams collapsed by its per-stream scalars `carried`:
+# `sum_s carried[s] X[s]` in F32, in stream order. A Sinkhorn site's
+# sublayer input (with the previous site's pre) and the decoder's exit (with
+# the last site's pre, `stream_collapse`).
+fn collapse[M, H, S](hidden: &tensor[M, S, H] f32, carried: &tensor[M, S] f32,
+    result: &mut tensor[M, H] f32):
+    parallel for row in 0..M:
+        parallel for column in 0..H:
+            let mut sum = f32(0.0)
+            for stream in 0..S:
+                sum = sum + carried[row, stream] * hidden[row, stream, column]
+            result[row, column] = sum
+
+# The decoder's exit over Sinkhorn streams (`ExitSite::PreviousSite`): the
+# streams collapsed by the last site's pre (`collapse`), which the readout
+# normalizes by the exit norm.
+fn stream_collapse[M, H, S](hidden: &tensor[M, S, H] f32, pre: &tensor[M, S] f32) -> tensor[M, H] f32
+    where S >= 1:
+    let mut result = tensor[M, H] f32
+    collapse(hidden, pre, result)
+    return result
+
+# A sublayer's F32 output `y` joining the streams by its site's inject
+# values (`scatter`: IN = SN, a low-rank site's; IN = SN + SN * SN, a
+# Sinkhorn site's post | comb; IN = 0, one stream), for a sublayer whose
+# output entry joins nothing itself (the general routed feed-forward's
+# branch, `RoutedSum::Branch`).
+fn stream_join[M, H, SN, IN](residual: &tensor[M, SN * H] f32, y: &tensor[M, H] f32,
+    inject: &tensor[M, IN] f32) -> tensor[M, SN * H] f32
+    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1) or (IN == SN + SN * SN and SN >= 1)):
+    let mut result = tensor[M, SN * H] f32
+    scatter(residual, y, inject, result)
+    return result
 
 # S scaled copies of each row: copy s is `scales[s]` times the row. The
 # streams' entry is the copies of the embedded rows at scale 1 (exact).
@@ -312,6 +420,54 @@ native stream_mix_up for cpu from "cpu/stream_mix_up.rs":
         threadgroups (ceil_div(S * H, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (S * H * 4)
+
+# Metal: one threadgroup per row reduces its squares and every mix in fixed
+# order; its first thread forms the coefficients, and every thread mixes
+# the input columns. CUDA and Vulkan have no native yet (build.rs).
+native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
+    static (H, S)
+    where S <= 8
+    launch stream_mix_sinkhorn:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row, which forms its coefficients in place (to 8
+# streams) and mixes its input row.
+native stream_mix_sinkhorn for cpu from "cpu/stream_mix_sinkhorn.rs":
+    static (S)
+    where S <= 8
+    launch stream_mix_sinkhorn:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal: one threadgroup per row, its threads over the columns.
+native stream_collapse for metal from "metal/stream_collapse.metal":
+    static (H, S)
+    launch stream_collapse:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row.
+native stream_collapse for cpu from "cpu/stream_collapse.rs":
+    launch stream_collapse:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal: the projection library's output epilogue (`projection::OutputOf`,
+# the `Scatter` of every output entry's join) over the F32 rows, one thread
+# per column of a row. CUDA and Vulkan have no native yet (build.rs).
+native stream_join for metal from "metal/stream_join.metal":
+    static (H, SN, IN)
+    launch stream_join:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row, through the projection epilogues' scatter
+# (`lib::core::functions::scatter`).
+native stream_join for cpu from "cpu/stream_join.rs":
+    launch stream_join:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
 
 # One thread per value.
 native repeat_rows for metal from "metal/repeat_rows.metal":

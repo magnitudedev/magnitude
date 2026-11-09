@@ -18,8 +18,9 @@ use magnitude_artifacts::{
 use magnitude_family_common::Tensors;
 use magnitude_family_contracts::{
     ActivationDType, Block, Decoder, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
-    GateFunction, HeadComponent, HistoryReads, HyperConnectionMixing, HyperConnectionWeights,
-    HyperConnections, Indexer, InputNorm, InputSemantics, ModelDefinition, NGramHash, NGramInput,
+    ExitSite, GateFunction, HeadComponent, HistoryReads, HyperConnectionExit, HyperConnectionInput,
+    HyperConnectionMixing, HyperConnectionWeights, HyperConnections, Indexer, InputNorm,
+    LowRankGatedSite, InputSemantics, ModelDefinition, NGramHash, NGramInput,
     Operator, OutputForm, ResidualForm, Sublayer, WeightDescriptor,
 };
 use magnitude_family_qwen::{
@@ -182,7 +183,7 @@ impl Extensions {
         weight: &mut Weight,
         prefix: &str,
         inject: bool,
-    ) -> Result<HyperConnectionWeights, Error> {
+    ) -> Result<LowRankGatedSite, Error> {
         hyper_site(geometry, weight, prefix, self.streams, self.rank, inject)
     }
 
@@ -267,12 +268,12 @@ fn block(
         )),
     };
     sublayers.push(Sublayer {
-        input: InputNorm::HyperConnectionMix(extensions.site(geometry, weight, "hc_attn", true)?),
+        input: mix_input(extensions.site(geometry, weight, "hc_attn", true)?),
         op: mixer,
         output: OutputForm::Scatter,
     });
     sublayers.push(Sublayer {
-        input: InputNorm::HyperConnectionMix(extensions.site(geometry, weight, "hc_ffn", true)?),
+        input: mix_input(extensions.site(geometry, weight, "hc_ffn", true)?),
         op: geometry.feed_forward(weight, geometry.intermediate)?,
         output: OutputForm::Scatter,
     });
@@ -382,7 +383,7 @@ pub fn inspect_components(
             },
             blocks,
             exit: ExitForm {
-                norm: ExitNorm::HyperConnectionHead(exit),
+                norm: exit_norm(exit),
                 output,
                 softcap: None,
             },
@@ -415,12 +416,29 @@ fn hyper_site(
     streams: u64,
     rank: u64,
     inject: bool,
-) -> Result<HyperConnectionWeights, Error> {
+) -> Result<LowRankGatedSite, Error> {
     let wide = product(&[streams, geometry.hidden])?;
-    Ok(HyperConnectionWeights {
+    Ok(LowRankGatedSite {
         norm: geometry.rms(weight(&format!("{prefix}_norm.weight"), &[wide])?),
         down: weight(&format!("{prefix}_down.weight"), &[rank, wide])?,
         up: weight(&format!("{prefix}_up.weight"), &[wide, rank])?,
         inject: inject.then(|| weight(&format!("{prefix}_inject.weight"), &[streams, wide])).transpose()?,
+    })
+}
+
+/// A sublayer's input through its low-rank site: the mixed row is the
+/// operator's input as it is.
+fn mix_input(site: LowRankGatedSite) -> InputNorm {
+    InputNorm::HyperConnectionMix(HyperConnectionInput {
+        site: HyperConnectionWeights::LowRankGated(site),
+        norm: None,
+    })
+}
+
+/// The exit through its own low-rank site, unnormalized after the mix.
+fn exit_norm(site: LowRankGatedSite) -> ExitNorm {
+    ExitNorm::HyperConnectionHead(HyperConnectionExit {
+        site: ExitSite::Own(site),
+        norm: None,
     })
 }

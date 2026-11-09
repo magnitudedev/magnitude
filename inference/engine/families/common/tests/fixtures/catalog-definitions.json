@@ -288,19 +288,19 @@
     "draft": "952a3bf05021295f8e57ce70155b5eb9a80c4f4affe92e51e95ba1c38ecabc5f"
   },
   "qwen3.8-flash-next:gguf:nvfp4": {
-    "target": "e7d90cdd5e3bfe9bc3453e09645910731b2eb6e1f37ffdd907e8bb3ba7f669ac",
+    "target": "8aa24e5a64ccd6ca8e2815cc1ea8ab971789adedc64556fd90ea95f6c3384976",
     "draft": "rejected"
   },
   "qwen3.8-flash-next:gguf:q4": {
-    "target": "94c31ad983a4914e59851a14eaa557845c087fb578467e4b6eba4a8254bf9a1e",
+    "target": "4c62116204eb1be192c8a69648305331a1f02fab24d7e8f7ff1a8b538266ac6f",
     "draft": "rejected"
   },
   "qwen3.8-flash-next:gguf:q6": {
-    "target": "94c31ad983a4914e59851a14eaa557845c087fb578467e4b6eba4a8254bf9a1e",
+    "target": "4c62116204eb1be192c8a69648305331a1f02fab24d7e8f7ff1a8b538266ac6f",
     "draft": "rejected"
   },
   "qwen3.8-flash-next:gguf:q8": {
-    "target": "94c31ad983a4914e59851a14eaa557845c087fb578467e4b6eba4a8254bf9a1e",
+    "target": "4c62116204eb1be192c8a69648305331a1f02fab24d7e8f7ff1a8b538266ac6f",
     "draft": "rejected"
   }
 }

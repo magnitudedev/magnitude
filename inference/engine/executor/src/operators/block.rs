@@ -35,8 +35,8 @@ use super::short_conv::graph::{
 use super::state_space::graph::{
     CheckedStateSpaceEntries, StateSpaceBlock, StateSpaceGraphEntries, state_space,
 };
-use super::streams::StreamsGeometry;
-use super::streams::graph::{SiteEntries, mix_site};
+use super::streams::graph::{SiteEntry, StreamsEntries, join as stream_join, mix_site, sinkhorn_site};
+use super::streams::{ResidualCarry, StreamsGeometry};
 use super::{
     FeedForward, InputForm, Join, Mixer, PairedBlock, SublayerInput, SublayerSource,
     attention as attention_operator, bank_component_index, dense_ffn, gated_delta,
@@ -265,6 +265,16 @@ fn single_stream(form: InputForm) -> Result<(), GraphError> {
     Ok(())
 }
 
+/// What a sublayer reads of the residual, and how its output joins it
+/// (`BlockSublayers::read`).
+struct SublayerRead {
+    input: WorkflowTensor,
+    form: InputForm,
+    join: Join,
+    /// A Sinkhorn site's pre, which the next site reads.
+    pre: Option<WorkflowTensor>,
+}
+
 /// Whose block a graph fragment builds:the scope of its weights, and the
 /// target layer whose history its attention mixer reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,36 +343,49 @@ impl BlockSublayers<'_> {
         })
     }
 
+    /// The decoder's residual streams; an error for a single stream.
+    fn streams_geometry(&self) -> Result<StreamsGeometry, GraphError> {
+        Ok(StreamsGeometry::of(self.geometry)
+            .map_err(|error| error.to_string())?
+            .ok_or("a mix site without residual streams")?)
+    }
+
     /// What sublayer `sublayer` reads of the residual `hidden` (its
     /// `source`), and how its output joins it: the residual itself under its
-    /// input norm, joined as one stream; or its mix site's partials over the
-    /// streams, joined by the scatter with the site's inject values.
+    /// input norm, joined as one stream; a low-rank mix site's partials over
+    /// the streams, joined by the scatter with the site's inject values; or
+    /// a Sinkhorn site's input row under the sublayer's norm, joined by the
+    /// scatter with the site's post | comb, the site's pre carried on.
     #[allow(clippy::too_many_arguments)]
     fn read<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
         source: SublayerSource<'_>,
-        site: Option<SiteEntries<'e, G>>,
+        streams: Option<StreamsEntries<'e, G>>,
         sublayer: u32,
-        hidden: &WorkflowTensor,
+        hidden: &ResidualCarry<WorkflowTensor>,
         weights: &mut Vec<(WeightPort, NativePort)>,
-    ) -> Result<(WorkflowTensor, InputForm, Join), GraphError> {
+    ) -> Result<SublayerRead, GraphError> {
+        let site = streams.and_then(|entries| entries.site(sublayer));
         match source {
-            SublayerSource::Norm(_) => {
-                Ok((hidden.clone(), InputForm::SINGLE, Join::single(Some("M"))))
-            }
+            SublayerSource::Norm(_) => Ok(SublayerRead {
+                input: hidden.rows.clone(),
+                form: InputForm::SINGLE,
+                join: Join::single(Some("M")),
+                pre: hidden.pre.clone(),
+            }),
             SublayerSource::Mix(_) => {
-                let geometry = StreamsGeometry::of(self.geometry)
-                    .map_err(|error| error.to_string())?
-                    .ok_or("a mix site without residual streams")?;
-                let entries = site.ok_or("a mix site without its streams entries")?;
+                let geometry = self.streams_geometry()?;
+                let (Some(low_rank), Some(SiteEntry::LowRank(entries))) = (geometry.low_rank(), site) else {
+                    return Err("a low-rank mix site without low-rank streams and their entries".into());
+                };
                 let site = mix_site(
                     graph,
                     entries,
                     self.load,
                     self.scope(sublayer)?,
-                    geometry,
-                    hidden,
+                    low_rank,
+                    &hidden.rows,
                     self.rows,
                     source.epsilon() as f32,
                     true,
@@ -371,16 +394,35 @@ impl BlockSublayers<'_> {
                 let inject = site
                     .inject
                     .ok_or("a sublayer's mix site without inject values")?;
-                Ok((
-                    site.partials,
-                    source.form(geometry.streams),
-                    Join {
-                        values: Some(inject),
-                        streams: geometry.streams,
-                        injected: true,
-                        class: Some("M"),
-                    },
-                ))
+                Ok(SublayerRead {
+                    input: site.partials,
+                    form: source.form(geometry.streams),
+                    join: Join::streams(geometry, inject, Some("M")),
+                    pre: None,
+                })
+            }
+            SublayerSource::Sinkhorn(_) => {
+                let geometry = self.streams_geometry()?;
+                let (Some(mixing), Some(SiteEntry::Sinkhorn(entry))) = (geometry.sinkhorn(), site) else {
+                    return Err("a Sinkhorn mix site without Sinkhorn streams and their entries".into());
+                };
+                let site = sinkhorn_site(
+                    graph,
+                    entry,
+                    self.load,
+                    self.scope(sublayer)?,
+                    geometry,
+                    mixing,
+                    hidden,
+                    self.rows,
+                    weights,
+                )?;
+                Ok(SublayerRead {
+                    input: site.input,
+                    form: source.form(geometry.streams),
+                    join: Join::streams(geometry, site.join, Some("M")),
+                    pre: Some(site.pre),
+                })
             }
         }
     }
@@ -391,11 +433,11 @@ impl BlockSublayers<'_> {
         &self,
         graph: &mut G,
         entries: MixerEntries<'e, G>,
-        site: Option<SiteEntries<'e, G>>,
-        hidden: &WorkflowTensor,
+        streams: Option<StreamsEntries<'e, G>>,
+        carry: &ResidualCarry<WorkflowTensor>,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<(WorkflowTensor, BlockStatePorts, BlockControlPorts), GraphError> {
+    ) -> Result<(ResidualCarry<WorkflowTensor>, BlockStatePorts, BlockControlPorts), GraphError> {
         let Self {
             paired,
             load,
@@ -414,13 +456,14 @@ impl BlockSublayers<'_> {
         let epsilon = paired.epsilon() as f32;
         let component_index = bank_component_index(&geometry.blocks, block_index)
             .map_err(|error| error.to_string())?;
-        let (input_rows, form, join) =
-            self.read(graph, paired.mixer_input, site, 0, hidden, weights)?;
+        let SublayerRead { input: input_rows, form, join, pre } =
+            self.read(graph, paired.mixer_input, streams, 0, carry, weights)?;
+        let hidden = &carry.rows;
         let input = SublayerInput {
             rows: &input_rows,
             form,
         };
-        Ok(match (paired.mixer, entries) {
+        let (mixed, state_ports, controls) = match (paired.mixer, entries) {
             (Mixer::Attention(operator), MixerEntries::Attention(entries)) => {
                 let shape = attention_operator::shape(geometry.hidden, operator)
                     .map_err(|error| error.to_string())?;
@@ -601,7 +644,8 @@ impl BlockSublayers<'_> {
                 )
             }
             _ => return Err("target block mixer and its kernel entries disagree".into()),
-        })
+        };
+        Ok((ResidualCarry { rows: mixed, pre }, state_ports, controls))
     }
 
     /// A scratch-served step's fill of the block's streamed routed layer
@@ -680,21 +724,23 @@ impl BlockSublayers<'_> {
         }
     }
 
-    /// The block's feed-forward over the mixer's residual `mixed`; a lone
-    /// mixer block's output is `mixed`. A routed feed-forward reads its
+    /// The block's feed-forward over the mixer's residual `carry`; a lone
+    /// mixer block's output is `carry`. A routed feed-forward reads its
     /// experts as `FeedForwardGraph::bank` says, and returns the sequence
     /// input a run writes when it reads its sequence; a split one is built
-    /// as its front or its back (`split`).
+    /// as its front, which exports the carry it read, or its back, which
+    /// reads its site again from that carry (`split`).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn feed_forward<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
         feed_forward: FeedForwardGraph<'_, 'e, G>,
-        site: Option<SiteEntries<'e, G>>,
-        mixed: WorkflowTensor,
+        streams: Option<StreamsEntries<'e, G>>,
+        carry: ResidualCarry<WorkflowTensor>,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
         split: Option<Split<'_>>,
-    ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
+    ) -> Result<(ResidualCarry<WorkflowTensor>, Option<NativePort>), GraphError> {
         let FeedForwardGraph { entries, bank } = feed_forward;
         let Self {
             paired,
@@ -706,20 +752,32 @@ impl BlockSublayers<'_> {
         } = *self;
         let scope = self.scope(1)?;
         let epsilon = paired.epsilon() as f32;
-        // A mix site's sublayer reads its partials; the others read `mixed`.
+        let mixed = &carry.rows;
+        // A mix site's sublayer reads its site; the others read `mixed`.
         let read = |graph: &mut G,
                     weights: &mut Vec<(WeightPort, NativePort)>,
                     source: Option<SublayerSource<'_>>| {
             let source = source.ok_or("a routed feed-forward without its input source")?;
-            self.read(graph, source, site, 1, &mixed, weights)
+            self.read(graph, source, streams, 1, &carry, weights)
+        };
+        // A split layer's front exports the carry it read; the others carry
+        // their output rows on with the site's pre.
+        let front = matches!(split, Some(Split::Front(_)));
+        let carried = |output: WorkflowTensor, pre: Option<WorkflowTensor>| match front {
+            true => carry.clone(),
+            false => ResidualCarry { rows: output, pre },
+        };
+        let single = |source: Option<SublayerSource<'_>>, what: &str| -> Result<(), GraphError> {
+            match source {
+                None | Some(SublayerSource::Norm(_)) => Ok(()),
+                Some(_) => Err(format!("a {what} feed-forward over residual streams").into()),
+            }
         };
         let output = match (paired.feed_forward, entries) {
-            (None, None) => mixed,
+            (None, None) => carry.rows.clone(),
             (Some(sublayer), Some(entries)) => match (sublayer.op, entries) {
                 (FeedForward::Dense(operator), FeedForwardEntries::Dense(entries)) => {
-                    if matches!(sublayer.input, Some(SublayerSource::Mix(_))) {
-                        return Err("a dense feed-forward over residual streams".into());
-                    }
+                    single(sublayer.input, "dense")?;
                     dense(
                         graph,
                         entries,
@@ -727,7 +785,7 @@ impl BlockSublayers<'_> {
                         scope,
                         weights,
                         constants,
-                        &mixed,
+                        mixed,
                         rows,
                         epsilon,
                         dense_ffn::activation_code(operator.up.activation()),
@@ -736,8 +794,9 @@ impl BlockSublayers<'_> {
                     )?
                 }
                 (FeedForward::Routed(shape), FeedForwardEntries::Routed(entries)) => {
-                    let (input_rows, form, join) = read(graph, weights, sublayer.input)?;
-                    return routed_graph::routed(
+                    let SublayerRead { input: input_rows, form, join, pre } =
+                        read(graph, weights, sublayer.input)?;
+                    let (output, sequence) = routed_graph::routed(
                         graph,
                         entries,
                         bank,
@@ -749,38 +808,68 @@ impl BlockSublayers<'_> {
                             rows: &input_rows,
                             form,
                         },
-                        &mixed,
+                        mixed,
                         &join,
                         rows,
                         geometry.hidden,
                         &ExpertShape::of_operator(shape)?,
                         epsilon,
                         split,
-                    );
+                    )?;
+                    return Ok((carried(output, pre), sequence));
                 }
                 (
                     FeedForward::GeneralRouted(operator),
                     FeedForwardEntries::GeneralRouted(entries),
                 ) => {
-                    return general_routed(
-                        graph,
-                        entries,
-                        bank,
-                        load,
-                        scope,
-                        weights,
-                        constants,
-                        &mixed,
-                        RoutedSum::Residual,
-                        rows,
-                        &GeneralRoutedShape::of(geometry.hidden, operator)
-                            .map_err(|error| error.to_string())?,
-                        epsilon,
-                        split,
-                    );
+                    let shape = GeneralRoutedShape::of(geometry.hidden, operator).map_err(|error| error.to_string())?;
+                    let routed = |graph: &mut G,
+                                  weights: &mut Vec<(WeightPort, NativePort)>,
+                                  constants: &mut Vec<GraphConstant>,
+                                  input: &WorkflowTensor,
+                                  sum| {
+                        general_routed(
+                            graph, entries, bank, load, scope, weights, constants, input, sum, rows, &shape, epsilon,
+                            split,
+                        )
+                    };
+                    return match sublayer.input {
+                        None | Some(SublayerSource::Norm(_)) => {
+                            let (output, sequence) = routed(graph, weights, constants, mixed, RoutedSum::Residual)?;
+                            Ok((carried(output, carry.pre.clone()), sequence))
+                        }
+                        // Over Sinkhorn streams the routed branch sums onto
+                        // zeros, and `stream_join` joins it into the streams.
+                        Some(source @ SublayerSource::Sinkhorn(_)) => {
+                            let read = self.read(graph, source, streams, 1, &carry, weights)?;
+                            let (branch, sequence) =
+                                routed(graph, weights, constants, &read.input, RoutedSum::Branch)?;
+                            if front {
+                                return Ok((carry.clone(), sequence));
+                            }
+                            let entry = streams
+                                .and_then(|streams| streams.sinkhorn())
+                                .ok_or("a Sinkhorn join without its entry")?
+                                .join;
+                            let joined = stream_join(
+                                graph,
+                                entry,
+                                self.streams_geometry()?,
+                                mixed,
+                                &branch,
+                                read.join.values.as_ref().ok_or("a Sinkhorn site without its join values")?,
+                                rows,
+                            )?;
+                            Ok((ResidualCarry { rows: joined, pre: read.pre }, sequence))
+                        }
+                        Some(SublayerSource::Mix(_)) => {
+                            Err("a general routed feed-forward over low-rank streams".into())
+                        }
+                    };
                 }
                 (FeedForward::Parallel(branches), FeedForwardEntries::Parallel(entries)) => {
-                    return parallel(
+                    single(sublayer.input, "parallel")?;
+                    let (output, sequence) = parallel(
                         graph,
                         entries,
                         bank,
@@ -788,7 +877,7 @@ impl BlockSublayers<'_> {
                         self.index(1)?,
                         weights,
                         constants,
-                        &mixed,
+                        mixed,
                         rows,
                         &GeneralRoutedShape::of(geometry.hidden, branches.routed)
                             .map_err(|error| error.to_string())?,
@@ -796,13 +885,14 @@ impl BlockSublayers<'_> {
                         dense_ffn::activation_code(branches.dense.up.activation()),
                         output_scales.feed_forward,
                         split,
-                    );
+                    )?;
+                    return Ok((carried(output, carry.pre.clone()), sequence));
                 }
                 _ => return Err("target block feed-forward and its kernel entries disagree".into()),
             },
             _ => return Err("target block feed-forward and its kernel entries disagree".into()),
         };
-        Ok((output, None))
+        Ok((ResidualCarry { rows: output, pre: carry.pre.clone() }, None))
     }
 
     /// The block's per-layer input sublayer over `residual`: the new

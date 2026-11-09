@@ -14,14 +14,14 @@ use crate::error::PlanError;
 use crate::operators::routed::GeneralRoutedBinding;
 use crate::operators::short_conv::ShortConvBinding;
 use crate::operators::state_space::StateSpaceBinding;
-use crate::operators::streams::StreamsBinding;
+use crate::operators::streams::BlockStreams;
 use crate::operators::vision::VisionKernel;
 use crate::operators::{
     self, CausalHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
 };
 use magnitude_family_contracts::{
     AffinePart, CandidateCorrector, CorrectorSite, CorrectorWeight, DraftDefinition,
-    DraftEmbedding, DraftMethod, ExitNorm, HistoryReads, ModelDefinition, Operator,
+    DraftEmbedding, DraftMethod, HistoryReads, ModelDefinition, Operator,
     ProposalReadoutPolicy, SublayerIndex, TapPoint, TokenId, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
@@ -109,9 +109,9 @@ pub struct TargetBlockProgramSlot {
     /// The per-layer input sublayer after the feed-forward.
     per_layer: Option<PerLayerBinding>,
     /// The decoder's hyper-connection streams, which the block reads and
-    /// writes through its mix sites, each bound at its own weights'
-    /// elements.
-    streams: Option<StreamsBinding>,
+    /// writes through its mix sites, each low-rank site bound at its own
+    /// weights' elements.
+    streams: Option<BlockStreams>,
     /// The n-gram input after the feed-forward.
     ngram: Option<NGramBinding>,
 }
@@ -156,11 +156,13 @@ impl TargetBlockProgramSlot {
         self.per_layer
     }
 
-    pub fn with_streams(self, streams: Option<StreamsBinding>) -> Self {
+    pub fn with_streams(self, streams: Option<BlockStreams>) -> Self {
         Self { streams, ..self }
     }
 
-    pub fn streams(&self) -> Option<StreamsBinding> {
+    /// The block's streams, as its kernels bind them: none of a single
+    /// stream.
+    pub fn block_streams(&self) -> Option<BlockStreams> {
         self.streams
     }
 
@@ -738,16 +740,18 @@ pub(super) fn derive_program_plan(
             .with_streams(
                 streams
                     .map(|geometry| {
-                        // The last block ends with the decoder's exit site.
-                        let last = index as usize + 1 == decoder.blocks.len();
-                        operators::streams::binding(
-                            geometry,
-                            mixer,
-                            paired.feed_forward.is_some().then_some(feed_forward),
-                            last.then_some(WeightScope::Target),
-                            |scope, kind| lookup(target, scope, kind),
-                            active_element,
-                        )
+                        BlockStreams::of(geometry, |geometry| {
+                            // The last block ends with the decoder's exit site.
+                            let last = index as usize + 1 == decoder.blocks.len();
+                            operators::streams::binding(
+                                geometry,
+                                mixer,
+                                paired.feed_forward.is_some().then_some(feed_forward),
+                                last.then_some(WeightScope::Target),
+                                |scope, kind| lookup(target, scope, kind),
+                                active_element,
+                            )
+                        })
                     })
                     .transpose()?,
             )
@@ -828,10 +832,11 @@ pub(super) fn derive_program_plan(
         .transpose()?;
     let readout_head = planned_readout_recipe(target, WeightScope::Target, readout_choices)?;
     let readout = ReadoutBinding {
-        // A hyper-connection exit's partials bind an empty F32 norm.
-        norm: match &decoder.exit.norm {
-            ExitNorm::HyperConnectionHead(_) => Element::f32(),
-            _ => lookup(target, WeightScope::Target, WeightKind::OutputNorm)?,
+        // A low-rank exit site's partials bind an empty F32 norm; every
+        // other exit row the readout normalizes (`InputForm::exit`).
+        norm: match operators::InputForm::exit(decoder).normalized {
+            false => Element::f32(),
+            true => lookup(target, WeightScope::Target, WeightKind::OutputNorm)?,
         },
         head: readout_head,
         activation: active_element,
@@ -923,6 +928,10 @@ pub(super) fn derive_program_plan(
                     &head_block.residual,
                 )?
                 .map(|geometry| {
+                    // Admission runs heads over low-rank streams only.
+                    let geometry = geometry.low_rank().ok_or(PlanError::Unsupported(
+                        operators::SINKHORN_HEAD,
+                    ))?;
                     operators::streams::binding(
                         geometry,
                         mixer,

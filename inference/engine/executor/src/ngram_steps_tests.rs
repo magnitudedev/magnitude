@@ -25,8 +25,13 @@ use std::sync::Arc;
 
 /// A GGUF of every tensor `manifest` names (its n-gram tables IQ4_NL
 /// blocks, a streamed load's expert stacks Q8_0 or Q4_0 blocks, everything else
-/// F16), with small deterministic values.
-fn write_gguf(manifest: &magnitude_artifacts::PackageManifest, path: &std::path::Path) {
+/// F16), with small deterministic values: each F16 tensor `constant` names
+/// holds its value throughout.
+fn write_gguf(
+    manifest: &magnitude_artifacts::PackageManifest,
+    path: &std::path::Path,
+    constant: &dyn Fn(&str) -> Option<f32>,
+) {
     let mut header = Vec::new();
     let string = |bytes: &mut Vec<u8>, value: &str| {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
@@ -77,10 +82,13 @@ fn write_gguf(manifest: &magnitude_artifacts::PackageManifest, path: &std::path:
                 // as every model's is, so the recurrent state decays: a
                 // positive one grows it exponentially along the prompt.
                 let decay_rate = tensor.name.ends_with(".ssm_a");
+                let constant = constant(&tensor.name);
                 for _ in 0..values {
                     // Within ±1/16: a small F16.
-                    let value = ((next() % 2001) as f32 - 1000.0) / 16_000.0;
-                    let value = if decay_rate { -value.abs() } else { value };
+                    let value = constant.unwrap_or_else(|| {
+                        let value = ((next() % 2001) as f32 - 1000.0) / 16_000.0;
+                        if decay_rate { -value.abs() } else { value }
+                    });
                     payload.extend_from_slice(&half_bits(value).to_le_bytes());
                 }
             }
@@ -1310,8 +1318,18 @@ fn fixture_of(
 /// [`fixture_of`] the decoder `definition`.
 fn fixture_with(
     test: &str,
+    definition: ModelDefinition,
+    manifest: fn(&ModelDefinition) -> magnitude_artifacts::PackageManifest,
+) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
+    fixture_valued(test, definition, manifest, &|_| None)
+}
+
+/// [`fixture_with`], each tensor `constant` names holding its value.
+fn fixture_valued(
+    test: &str,
     mut definition: ModelDefinition,
     manifest: fn(&ModelDefinition) -> magnitude_artifacts::PackageManifest,
+    constant: &dyn Fn(&str) -> Option<f32>,
 ) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
     let directory = std::env::temp_dir().join(format!(
         "magnitude-{test}-{}-{}",
@@ -1323,7 +1341,7 @@ fn fixture_with(
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("qwen4exp-fixture.gguf");
-    write_gguf(&manifest(&definition), &path);
+    write_gguf(&manifest(&definition), &path, constant);
     let package = Package::open_without_projector(&path).unwrap();
     definition.artifact_identity = package.manifest().identity;
     (directory, Rc::new(definition), Arc::new(package))
@@ -2180,4 +2198,308 @@ fn selected_token_of(steps: &[StepBits], backend: seismic::BackendName) -> u32 {
         .and_then(|(_, _, selected)| *selected)
         .unwrap_or_else(|| panic!("{backend:?}: the step selects a token"))
         .0
+}
+
+/// The Sinkhorn fixture's streams, hidden width and numerics
+/// (`sinkhorn_fixture_definition`).
+const SINKHORN: (usize, usize, f32, u32) = (4, 128, 1e-6, 20);
+
+/// The BF16 rounding stages a reordered F32 sum can tip on the deepest path
+/// from the embedding to the features, per block (kernels `routed.seismic`,
+/// `functions.seismic`):
+/// 1. the routed input under its norm, published in A (`routed_select`,
+///    986-1016: `normalized` 992, 995);
+/// 2. the gate (and, beside it, the up) projection in A (decode
+///    `routed_gate_up` 1139-1181: 1163-1177; prompt `routed_experts`
+///    625-689: 634-669);
+/// 3. `glu`'s activation in A (`functions.seismic:28`);
+/// 4. `glu`'s product with up in A (`functions.seismic:31`);
+/// 5. the down projection in A (decode `decode_down` 1224-1240: 1239;
+///    prompt `routed_experts` 679).
+///
+/// None else counts. The slot sum is F32 (`decode_selected` 1280-1290,
+/// `routed_scatter`); the Sinkhorn site, its collapse and the joins are F32
+/// throughout (`streams.seismic` 104-171, 187-191; `functions.seismic`
+/// 60-76); the attention adds an exact zero (its output projection is zero
+/// in this fixture, so no tip reaches past it); the embedding's BF16 import
+/// has no arithmetic before it, so nothing reorders it (`resident_weights.rs`
+/// 301). Two blocks make 10 stages.
+const STAGES: u8 = 10;
+
+/// The most a device feature may be from the reference, in units of 2^-8 of
+/// the reference row's RMS. The reference rounds where the device rounds
+/// ([`STAGES`], the resident BF16 weights), so what differs is F32 order
+/// (the natives' reductions, fma or not, `exp`, `rsqrt`): a few F32 ulps,
+/// which tip a BF16 rounding across a midpoint by at most one ulp. Each
+/// stage's tip is counted as one BF16 ulp at row scale: a BF16 ulp is at
+/// most 2^-7 of its value, so at most 2^-7 · RMS = 2 units. The features'
+/// own rounding (`readout_features_rows`, `readout.seismic:14-18`) adds one
+/// ulp of the feature itself: 2 units for a feature no larger than the
+/// RMS, and the check takes each feature's own ulp. So 2 + 2 · 10 = 22 at
+/// row scale.
+const BOUND: f32 = 2.0 + TIPS;
+
+/// [`STAGES`]' tips at row scale, in [`BOUND`]'s units.
+const TIPS: f32 = 2.0 * STAGES as f32;
+
+/// The host reference of the Sinkhorn fixture as written, and the faults it
+/// tells apart from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum SinkhornHost {
+    Faithful,
+    /// Every site reads the one-hot pre, not its predecessor's.
+    FirstPre,
+    /// The routed branch joins without the site's post.
+    UnscaledJoin,
+}
+
+fn sigmoid(value: f32) -> f32 {
+    1.0 / (1.0 + (-value).exp())
+}
+
+fn dot(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).map(|(left, right)| left * right).sum()
+}
+
+/// `dot` as the projections accumulate it: one F32 fma a term, in order.
+fn fused_dot(left: &[f32], right: &[f32]) -> f32 {
+    left.iter().zip(right).fold(0.0, |sum, (left, right)| left.mul_add(*right, sum))
+}
+
+/// `value` published in BF16: rounded to nearest, ties to even.
+fn bf16(value: f32) -> f32 {
+    let bits = value.to_bits();
+    f32::from_bits((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
+}
+
+/// One BF16 ulp at `value`, a normal number's.
+fn bf16_ulp(value: f32) -> f32 {
+    f32::from_bits(value.abs().to_bits() & 0x7f80_0000) * 2f32.powi(-7)
+}
+
+/// `values` under an RMS norm of unit weight.
+fn rms_normalized(values: &[f32], epsilon: f32) -> Vec<f32> {
+    let inverse = 1.0 / (dot(values, values) / values.len() as f32 + epsilon).sqrt();
+    values.iter().map(|value| value * inverse).collect()
+}
+
+/// A Sinkhorn site over streams `x` `[S·H]` after the pre `previous`, in
+/// F32 by its formulas (pre `sigmoid + ε`, post `2·sigmoid`, the comb a row
+/// softmax plus ε, then alternating column and row normalization): the
+/// sublayer's input, the site's pre, post and comb `[S, S]` (source major).
+fn sinkhorn_site(x: &[f32], previous: &[f32], weights: [&[f32]; 3]) -> [Vec<f32>; 4] {
+    let (s, h, epsilon, iterations) = SINKHORN;
+    let [function, base, scale] = weights;
+    let inverse = 1.0 / (dot(x, x) / (s * h) as f32 + epsilon).sqrt();
+    let mix = |at: usize, scale: f32| dot(&function[at * s * h..(at + 1) * s * h], x) * inverse * scale + base[at];
+    let pre = (0..s).map(|at| sigmoid(mix(at, scale[0])) + epsilon).collect();
+    let post = (0..s).map(|at| 2.0 * sigmoid(mix(s + at, scale[1]))).collect();
+    let mut comb = (0..s * s).map(|at| mix(2 * s + at, scale[2])).collect::<Vec<_>>();
+    for row in comb.chunks_mut(s) {
+        let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        row.iter_mut().for_each(|value| *value = (*value - maximum).exp());
+        let total = row.iter().sum::<f32>();
+        row.iter_mut().for_each(|value| *value = *value / total + epsilon);
+    }
+    let columns = |comb: &mut Vec<f32>| {
+        for target in 0..s {
+            let sum = (0..s).map(|source| comb[source * s + target]).sum::<f32>();
+            (0..s).for_each(|source| comb[source * s + target] /= sum + epsilon);
+        }
+    };
+    for sweep in 0..iterations {
+        if sweep > 0 {
+            for row in comb.chunks_mut(s) {
+                let sum = row.iter().sum::<f32>();
+                row.iter_mut().for_each(|value| *value /= sum + epsilon);
+            }
+        }
+        columns(&mut comb);
+    }
+    let input = (0..h).map(|column| (0..s).map(|stream| previous[stream] * x[stream * h + column]).sum()).collect();
+    [input, pre, post, comb]
+}
+
+/// The Sinkhorn fixture's readout features of `token`'s row, from the
+/// resident weights `tensor` reads, rounded where the device rounds
+/// ([`BOUND`]): per block its attention (whose zero output projection adds
+/// nothing, so its join is the comb's mix) and its routed branch over every
+/// expert, joined by post and comb in F32; then the streams collapsed by
+/// the last pre under the unit output norm, published in BF16.
+fn sinkhorn_reference(tensor: &dyn Fn(&str) -> Rc<Vec<f32>>, blocks: usize, token: usize, host: SinkhornHost) -> Vec<f32> {
+    let (s, h, epsilon, _) = SINKHORN;
+    let embedding = tensor("embedding");
+    let mut x = embedding[token * h..(token + 1) * h].repeat(s);
+    let first = (0..s).map(|stream| f32::from(u8::from(stream == 0))).collect::<Vec<_>>();
+    let mut previous = first.clone();
+    for block in 0..blocks {
+        for sublayer in ["attn", "ffn"] {
+            let name = |part: &str| format!("blk.{block}.{sublayer}_{part}");
+            let [function, base, scale] = ["hc_fn", "hc_base", "hc_scale"].map(|part| tensor(&name(part)));
+            let [input, pre, post, comb] = sinkhorn_site(&x, &previous, [&function, &base, &scale]);
+            previous = if host == SinkhornHost::FirstPre { first.clone() } else { pre };
+            let y = match sublayer {
+                "attn" => vec![0.0; h],
+                _ => routed_reference(tensor, block, &input),
+            };
+            let post = if host == SinkhornHost::UnscaledJoin { vec![1.0; s] } else { post };
+            x = (0..s * h)
+                .map(|at| {
+                    let (stream, column) = (at / h, at % h);
+                    (0..s).map(|from| comb[from * s + stream] * x[from * h + column]).sum::<f32>() + y[column] * post[stream]
+                })
+                .collect();
+        }
+    }
+    let collapsed = (0..h).map(|column| (0..s).map(|stream| previous[stream] * x[stream * h + column]).sum()).collect::<Vec<f32>>();
+    rms_normalized(&collapsed, epsilon).into_iter().map(bf16).collect()
+}
+
+/// Block `block`'s routed branch over its sublayer input `input`, as the
+/// general routed entries' bodies round it (`routed.seismic`): the input
+/// under its unit norm in BF16 (`routed_select`); every expert selected,
+/// in slot order of ascending score (`rank_experts`), weighted by its
+/// softmax score over their sum; per expert the BF16 gate and up
+/// projections, `glu`'s BF16 activation and product, the BF16 down
+/// projection; their F32 fma sum in slot order onto zeros (`routed_down`,
+/// `routed_scatter`).
+fn routed_reference(tensor: &dyn Fn(&str) -> Rc<Vec<f32>>, block: usize, input: &[f32]) -> Vec<f32> {
+    let (h, epsilon) = (input.len(), SINKHORN.2);
+    let name = |part: &str| format!("blk.{block}.{part}");
+    let (router, gate, up, down) =
+        (tensor(&name("ffn_gate_inp")), tensor(&name("ffn_gate_exps")), tensor(&name("ffn_up_exps")), tensor(&name("ffn_down_exps")));
+    let normalized = rms_normalized(input, epsilon).into_iter().map(bf16).collect::<Vec<_>>();
+    let experts = router.len() / h;
+    let features = gate.len() / experts / h;
+    let logits = router.chunks(h).map(|row| fused_dot(&normalized, row)).collect::<Vec<_>>();
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let exponentials = logits.iter().map(|logit| (logit - maximum).exp()).collect::<Vec<_>>();
+    let total = exponentials.iter().sum::<f32>();
+    let scores = exponentials.iter().map(|exponential| exponential / total).collect::<Vec<_>>();
+    let mut slots = (0..experts).collect::<Vec<_>>();
+    slots.sort_by(|&one, &other| scores[one].total_cmp(&scores[other]).then(one.cmp(&other)));
+    let denominator = slots.iter().map(|&expert| scores[expert]).sum::<f32>();
+    let mut y = vec![0.0f32; h];
+    for expert in slots {
+        let rows = |stack: &[f32], at: usize| stack[(expert * features + at) * h..(expert * features + at + 1) * h].to_vec();
+        let product = (0..features)
+            .map(|at| {
+                let gated = bf16(fused_dot(&normalized, &rows(&gate, at)));
+                let up = bf16(fused_dot(&normalized, &rows(&up, at)));
+                bf16(bf16(gated * sigmoid(gated)) * up)
+            })
+            .collect::<Vec<_>>();
+        let weight = scores[expert] / denominator;
+        for (column, value) in y.iter_mut().enumerate() {
+            let row = &down[(expert * h + column) * features..(expert * h + column + 1) * features];
+            *value = weight.mul_add(bf16(fused_dot(&product, row)), *value);
+        }
+    }
+    y
+}
+
+/// On Metal and on the CPU, the Sinkhorn fixture (two blocks of attention
+/// and a general routed feed-forward over four Sinkhorn streams) equals
+/// its host reference (`sinkhorn_reference`, rounding where the device
+/// rounds) at every row of a prompt
+/// group, whose routed layers split into fronts and backs around the
+/// group's pass, and at a decode step; and a chain of its prompt chunks
+/// equals its chunks one step at a time. The output projections are zero
+/// (rows stay apart), the norms one and the site scales 4 (so each comb is
+/// far from uniform). Every row is within [`BOUND`] of the reference, and
+/// each fault the reference can play (`SinkhornHost`) lies past twice it
+/// at some row.
+#[test]
+fn a_sinkhorn_decoder_matches_its_host_reference() {
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let constant = |name: &str| match name {
+        "o" => Some(0.0),
+        _ if name.ends_with("_hc_scale") => Some(4.0),
+        _ if name.ends_with("norm") => Some(1.0),
+        _ => None,
+    };
+    let blocks = 2;
+    let (directory, definition, package) = fixture_valued(
+        "sinkhorn-steps",
+        crate::planning::fixtures::sinkhorn_fixture_definition(blocks as u64),
+        crate::planning::fixtures::fixture_manifest,
+        &constant,
+    );
+    let tensors = std::cell::RefCell::new(std::collections::HashMap::<String, Rc<Vec<f32>>>::new());
+    let tensor = |name: &str| -> Rc<Vec<f32>> {
+        tensors
+            .borrow_mut()
+            .entry(name.to_owned())
+            .or_insert_with(|| {
+                let bytes = package.target().tensor(name).unwrap().read().unwrap();
+                // Resident as BF16, apart from the sites' F32 roles.
+                let resident = if name.contains("_hc_") { |value: f32| value } else { bf16 };
+                Rc::new(bytes.chunks_exact(2).map(|bits| resident(half_value(u16::from_le_bytes([bits[0], bits[1]])))).collect())
+            })
+            .clone()
+    };
+    let references = std::cell::RefCell::new(std::collections::HashMap::new());
+    let check = |features: &Option<Vec<u32>>, row: usize, token: usize, label: &str| {
+        // Each row's features read back as its step's BF16 feature rows, two
+        // values to each word `step_bits` reads.
+        let words = features.as_ref().unwrap_or_else(|| panic!("{label}: features"));
+        let h = SINKHORN.1;
+        let device = words
+            .iter()
+            .flat_map(|bits| [bits << 16, bits & 0xffff_0000].map(f32::from_bits))
+            .skip(row * h)
+            .take(h)
+            .collect::<Vec<_>>();
+        assert_eq!(device.len(), h, "{label}: the step's BF16 features hold the row's");
+        let reference = |host| {
+            references.borrow_mut().entry((token, host)).or_insert_with(|| sinkhorn_reference(&tensor, blocks, token, host)).clone()
+        };
+        // In units of 2^-8 of the faithful row's RMS.
+        let faithful = reference(SinkhornHost::Faithful);
+        let unit = 2f32.powi(-8) * (dot(&faithful, &faithful) / faithful.len() as f32).sqrt();
+        let error = |host: Vec<f32>| device.iter().zip(&host).map(|(device, host)| (device - host).abs() / unit).fold(0.0, f32::max);
+        for (device, host) in device.iter().zip(&faithful) {
+            // The stages' tips at row scale, and the feature's own rounding.
+            let allowed = TIPS + bf16_ulp(*host) / unit;
+            let units = (device - host).abs() / unit;
+            assert!(units <= allowed, "{label}: {device} is {units} units from {host}, past {allowed}");
+        }
+        [error(faithful.clone()), error(reference(SinkhornHost::FirstPre)), error(reference(SinkhornHost::UnscaledJoin))]
+    };
+    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
+    for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
+        let prompts = Prompts { requests: 1, chunks: 2, rows: CHUNK_ROWS };
+        let (alone, _) = chained_prompts(&catalog, &definition, &package, backend, prompts, 1, Banked::Resident);
+        let (chained, _) = chained_prompts(&catalog, &definition, &package, backend, prompts, 2, Banked::Resident);
+        assert_steps_equal(&alone, &chained, prompts, &format!("{backend:?} chain of 2"));
+        // The most units any prompt row (the chain's rows, being equal) is
+        // from the reference, and from each fault.
+        let worse = |worst: [f32; 3], units: [f32; 3]| std::array::from_fn(|at| worst[at].max(units[at]));
+        let mut prompt = [0.0f32; 3];
+        for (chunk, (bits, _)) in alone[..prompts.chunks].iter().enumerate() {
+            for (row, (features, ..)) in bits.iter().enumerate() {
+                let position = chunk * CHUNK_ROWS + row;
+                let token = (position * 37 + 11 + 5) % 256;
+                prompt = worse(prompt, check(features, row, token, &format!("{backend:?} prompt row {position}")));
+            }
+        }
+        let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits(2, false, 1, 0), Banked::Resident);
+        let request = RequestId(1);
+        domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+        domain.open_state(&mut bindings, request, None).unwrap();
+        let mut decode = forward(request, WorkKind::Decode, &[5], 0, false);
+        if let Operation::Forward { demand, .. } = &mut decode {
+            *demand |= crate::batching::Demand::FEATURES;
+        }
+        let (outcome, returned) = run(&mut domain, bindings, decode, false, backend);
+        drop(returned);
+        let decoded = check(&step_bits(&outcome)[0].0, 0, 5, &format!("{backend:?} decode"));
+        for (mode, [within, first, unscaled]) in [("prompt", prompt), ("decode", decoded)] {
+            eprintln!("{backend:?} {mode}: within {within} units (bound {BOUND}); faults at {first} (first pre), {unscaled} (unscaled join)");
+        }
+        let [_, first, unscaled] = worse(prompt, decoded);
+        assert!(first > 2.0 * BOUND && unscaled > 2.0 * BOUND, "{backend:?}: a fault within twice the bound");
+    }
+    std::fs::remove_dir_all(&directory).ok();
 }

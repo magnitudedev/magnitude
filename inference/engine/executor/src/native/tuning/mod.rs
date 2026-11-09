@@ -2127,8 +2127,8 @@ impl ModelInputs<'_> {
     }
 
     /// The residual join of the sublayers `scopes` name (`scatter`): its
-    /// streams `SN` and inject extent `IN`, (S, S) for a scatter into the
-    /// hyper-connection streams, else (1, 0).
+    /// streams `SN` and join width `IN` (`StreamsGeometry::join_width`) for
+    /// a scatter into the hyper-connection streams, else (1, 0).
     pub fn join(&self, scopes: &[WeightScope]) -> Result<(u64, u64), String> {
         match self.sublayer(scopes)? {
             Some((
@@ -2138,25 +2138,32 @@ impl ModelInputs<'_> {
                 },
                 residual,
             )) => {
-                let streams = Self::streams(residual)?;
-                Ok((streams, streams))
+                let geometry = crate::operators::streams::StreamsGeometry::from_residual(self.definition.decoder.hidden, residual)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("the sublayer has a single residual stream")?;
+                Ok((geometry.streams, geometry.join_width()))
             }
             _ => Ok((1, 0)),
         }
     }
 
-    /// The input form of the sublayers `scopes` name (`form_input`): its
-    /// parts `PT` and norm extent `NM`, a mix site's S partials without a
-    /// norm, else one row normalized by a norm of `width`.
+    /// The input form of the sublayers `scopes` name (`form_input`,
+    /// `SublayerSource::form`): its parts `PT` and norm extent `NM`, a
+    /// low-rank site's S partials without a norm, else one row normalized
+    /// by a norm of `width` (a Sinkhorn site's input among them).
     pub fn input_form(&self, scopes: &[WeightScope], width: u64) -> Result<(u64, u64), String> {
         match self.sublayer(scopes)? {
             Some((
                 Sublayer {
-                    input: InputNorm::HyperConnectionMix(_),
+                    input: input @ InputNorm::HyperConnectionMix(_),
                     ..
                 },
                 residual,
-            )) => Ok((Self::streams(residual)?, 0)),
+            )) => {
+                let source = crate::operators::sublayer_source(input).map_err(|error| error.to_string())?;
+                let [(_, parts), (_, norm)] = source.form(Self::streams(residual)?).dimensions(width);
+                Ok((parts, norm))
+            }
             _ => Ok((1, width)),
         }
     }

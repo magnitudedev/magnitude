@@ -53,19 +53,27 @@ fn sum_parts[M, H, P](parts: &tensor[M, P * H] f32, result: &mut tensor[M, H] U)
 # A sublayer's output `y` joining the residual: `residual + y` (`IN = 0`, one
 # stream), or `residual[s] + y · inject[s]` for each of the `SN`
 # hyper-connection streams (`IN = SN`, the inject values of the sublayer's mix
-# site). Natives apply it as the projection library's output epilogue.
+# site), or `Σ_s comb[s, d] · residual[s] + y · inject[d]` (`IN = SN + SN²`:
+# the inject values, then the site's `[SN, SN]` comb, source stream major).
+# Absent, the comb is the identity. Natives apply it as the projection
+# library's output epilogue.
 fn scatter[M, D, SN, IN](residual: &tensor[M, SN * D] f32, y: &tensor[M, D] T,
     inject: &tensor[M, IN] f32, result: &mut tensor[M, SN * D] f32)
-    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)):
+    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1) or (IN == SN + SN * SN and SN >= 1)):
     # Every stream is written: stream s < IN scales `y` by its inject value
-    # (`IN = SN`); the one stream of `IN = 0` adds `y` itself.
+    # (`IN >= SN`); the one stream of `IN = 0` adds `y` itself.
     parallel for row in 0..M:
         parallel for stream in 0..SN:
             parallel for column in 0..D:
                 let mut joined = f32(y[row, column])
                 if stream < IN:
                     joined = joined * inject[row, stream]
-                result[row, stream * D + column] = residual[row, stream * D + column] + joined
+                let mut mixed = residual[row, stream * D + column]
+                if IN > SN:
+                    mixed = f32(0.0)
+                    for source in 0..SN:
+                        mixed = mixed + inject[row, SN + source * SN + stream] * residual[row, source * D + column]
+                result[row, stream * D + column] = mixed + joined
 
 # A gated delta net's output gate on z, by code (natives in
 # `<backend>/lib/core/functions.*`):

@@ -352,14 +352,14 @@ pub fn hyper_connection_fixture_definition() -> ModelDefinition {
     // A dense feed-forward has no streams form: the block is its mixer.
     let sublayers = &mut decoder.blocks[0].sublayers;
     sublayers.truncate(1);
-    sublayers[0].input = InputNorm::HyperConnectionMix(site("attn_hc", true, hidden));
+    sublayers[0].input = mix_input(site("attn_hc", true, hidden));
     sublayers[0].output = OutputForm::Scatter;
-    decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output_hc", false, hidden));
+    decoder.exit.norm = exit_norm(site("output_hc", false, hidden));
     definition
 }
 
 /// The streams and low rank of the hyper-connection fixtures.
-const STREAMS: u64 = 4;
+pub(crate) const STREAMS: u64 = 4;
 const RANK: u64 = 64;
 
 /// The smallest multiple of the planning fixture's hidden width at which
@@ -404,9 +404,9 @@ pub(crate) fn mix_site_hidden() -> u64 {
 
 /// A mix site at hidden width `hidden`, with inject weights when
 /// `injected`.
-fn site(prefix: &str, injected: bool, hidden: u64) -> magnitude_family_contracts::HyperConnectionWeights {
+fn site(prefix: &str, injected: bool, hidden: u64) -> magnitude_family_contracts::LowRankGatedSite {
     let wide = STREAMS * hidden;
-    magnitude_family_contracts::HyperConnectionWeights {
+    magnitude_family_contracts::LowRankGatedSite {
         norm: RmsNorm {
             weight: descriptor(&format!("{prefix}_norm"), &[wide]),
             epsilon: 1e-6,
@@ -415,6 +415,93 @@ fn site(prefix: &str, injected: bool, hidden: u64) -> magnitude_family_contracts
         up: descriptor(&format!("{prefix}_up"), &[wide, RANK]),
         inject: injected.then(|| descriptor(&format!("{prefix}_inject"), &[STREAMS, wide])),
     }
+}
+
+/// A sublayer's input through the low-rank `site`, unnormalized after it.
+pub fn mix_input(site: magnitude_family_contracts::LowRankGatedSite) -> InputNorm {
+    InputNorm::HyperConnectionMix(magnitude_family_contracts::HyperConnectionInput {
+        site: magnitude_family_contracts::HyperConnectionWeights::LowRankGated(site),
+        norm: None,
+    })
+}
+
+/// The exit through its own low-rank `site`, unnormalized after it.
+pub fn exit_norm(site: magnitude_family_contracts::LowRankGatedSite) -> ExitNorm {
+    ExitNorm::HyperConnectionHead(magnitude_family_contracts::HyperConnectionExit {
+        site: magnitude_family_contracts::ExitSite::Own(site),
+        norm: None,
+    })
+}
+
+/// A DeepSeek V4.1-shaped decoder over the fixture geometry: `blocks`
+/// blocks of attention then a general routed feed-forward of 32 experts,
+/// all selected, every sublayer reading through its Sinkhorn site over the
+/// hyper-connection fixtures' streams (20 iterations) under its own norm,
+/// and an exit that collapses the streams by the last site's pre under the
+/// output norm.
+pub fn sinkhorn_fixture_definition(blocks: u64) -> ModelDefinition {
+    use magnitude_family_contracts::{
+        ExitSite, ExpertSelection, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
+        HyperConnectionWeights, HyperConnections, RouteNormalization, RoutedFfn, Router, RouterInput,
+        ScoreFunction, SinkhornSite,
+    };
+    const EXPERTS: u64 = 32;
+    const FEATURES: u64 = 64;
+    let mut definition = fixture_definition();
+    let decoder = &mut definition.decoder;
+    let (hidden, wide) = (decoder.hidden, STREAMS * decoder.hidden);
+    decoder.residual = ResidualForm::HyperConnections(HyperConnections {
+        streams: STREAMS,
+        mixing: HyperConnectionMixing::Sinkhorn { iterations: 20, epsilon: 1e-6, norm_epsilon: 1e-6 },
+    });
+    let rms = |name: &str| RmsNorm { weight: descriptor(name, &[hidden]), epsilon: 1e-6 };
+    let mixes = (2 + STREAMS) * STREAMS;
+    let sited = |prefix: &str, op: Operator| Sublayer {
+        input: InputNorm::HyperConnectionMix(HyperConnectionInput {
+            site: HyperConnectionWeights::Sinkhorn(SinkhornSite {
+                function: descriptor(&format!("{prefix}_hc_fn"), &[mixes, wide]),
+                base: descriptor(&format!("{prefix}_hc_base"), &[mixes]),
+                scale: descriptor(&format!("{prefix}_hc_scale"), &[3]),
+            }),
+            norm: Some(rms(&format!("{prefix}_norm"))),
+        }),
+        op,
+        output: OutputForm::Scatter,
+    };
+    let attention = decoder.blocks[0].sublayers[0].op.clone();
+    decoder.blocks = (0..blocks)
+        .map(|block| {
+            let name = |part: &str| format!("blk.{block}.{part}");
+            let routed = Operator::RoutedFfn(Box::new(RoutedFfn {
+                experts: EXPERTS,
+                selected: EXPERTS,
+                intermediate: FEATURES,
+                router: Router {
+                    weight: descriptor(&name("ffn_gate_inp"), &[EXPERTS, hidden]),
+                    input: RouterInput::Operator,
+                    score: ScoreFunction::Softmax,
+                    selection: ExpertSelection::TopK { bias: None },
+                    normalization: RouteNormalization::Sum,
+                    scale: 1.0,
+                },
+                expert_up: FeedForwardUp::Gated {
+                    activation: ActivationFunction::Silu,
+                    gate: descriptor(&name("ffn_gate_exps"), &[EXPERTS, FEATURES, hidden]),
+                    up: descriptor(&name("ffn_up_exps"), &[EXPERTS, FEATURES, hidden]),
+                },
+                expert_down: descriptor(&name("ffn_down_exps"), &[EXPERTS, hidden, FEATURES]),
+                expert_scale: None,
+                latent: None,
+                shared: None,
+            }));
+            Block { sublayers: vec![sited(&name("attn"), attention.clone()), sited(&name("ffn"), routed)] }
+        })
+        .collect();
+    decoder.exit.norm = ExitNorm::HyperConnectionHead(HyperConnectionExit {
+        site: ExitSite::PreviousSite,
+        norm: Some(rms("output_norm")),
+    });
+    definition
 }
 
 /// A qwen4exp-shaped decoder over the hyper-connection fixture's
@@ -456,7 +543,7 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
         up,
     };
     let mixing = |prefix: &str, op: Operator| Sublayer {
-        input: InputNorm::HyperConnectionMix(site(prefix, true, hidden)),
+        input: mix_input(site(prefix, true, hidden)),
         op,
         output: OutputForm::Scatter,
     };

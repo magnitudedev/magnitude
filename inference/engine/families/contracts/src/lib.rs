@@ -22,14 +22,16 @@ mod vision;
 pub use decoder::{
     ActivationFunction, Attention, AttentionGate, Block, Branch, BranchOutput, Decoder,
     DeferredForm, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
-    FeedForwardUp, GateFunction, GateGranularity, GatedDelta, HeadNorm,
-    HistoryDomain, HistoryReads, HyperConnectionMixing, HyperConnectionWeights, HyperConnections,
+    ExitSite, FeedForwardUp, GateFunction, GateGranularity, GatedDelta, HeadNorm, HistoryDomain,
+    HistoryReads, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
+    HyperConnectionWeights, HyperConnections, LowRankGatedSite,
     Indexer, InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention,
     NGramHash, NGramInput, Operator, OutputForm, OutputProjection, OutputRotary, PerLayerEntry,
     PerLayerInput, QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
     RotaryDivisors, RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement,
     RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
-    SharedExpertGate, ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms, ValueNorm,
+    SharedExpertGate, ShortConv, SinkhornSite, StateSpace, Sublayer, SublayerIndex,
+    UnweightedRms, ValueNorm,
     ValueSource,
 };
 pub use draft::{
@@ -514,6 +516,10 @@ pub enum WeightKind {
     HyperConnectionDown,
     HyperConnectionUp,
     HyperConnectionInject,
+    /// A Sinkhorn site's projection, bias and scales.
+    HyperConnectionFunction,
+    HyperConnectionBase,
+    HyperConnectionScale,
     /// The query heads' projection: a full query's, or a low-rank query's
     /// `up` (`QueryProjection`).
     Query,
@@ -1349,13 +1355,24 @@ mod tests {
     }
 
     /// A two-stream, rank-3 site over hidden 4.
-    fn site(name: &str, inject: bool) -> HyperConnectionWeights {
-        HyperConnectionWeights {
+    fn low_rank(name: &str, inject: bool) -> LowRankGatedSite {
+        LowRankGatedSite {
             norm: rms(&format!("{name}.hc_norm"), 8),
             down: weight(&format!("{name}.hc_down"), &[3, 8]),
             up: weight(&format!("{name}.hc_up"), &[8, 3]),
             inject: inject.then(|| weight(&format!("{name}.hc_inject"), &[2, 8])),
         }
+    }
+
+    fn site(name: &str, inject: bool) -> HyperConnectionWeights {
+        HyperConnectionWeights::LowRankGated(low_rank(name, inject))
+    }
+
+    fn exit(site: LowRankGatedSite) -> ExitNorm {
+        ExitNorm::HyperConnectionHead(HyperConnectionExit {
+            site: ExitSite::Own(site),
+            norm: None,
+        })
     }
 
     fn ngram() -> Sublayer {
@@ -1391,12 +1408,15 @@ mod tests {
             streams: 2,
             mixing: HyperConnectionMixing::LowRankGated { rank: 3 },
         });
-        model.decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output", false));
+        model.decoder.exit.norm = exit(low_rank("output", false));
         model
     }
 
     fn mixed(mut sublayer: Sublayer, name: &str) -> Sublayer {
-        sublayer.input = InputNorm::HyperConnectionMix(site(name, true));
+        sublayer.input = InputNorm::HyperConnectionMix(HyperConnectionInput {
+            site: site(name, true),
+            norm: None,
+        });
         sublayer.output = OutputForm::Scatter;
         sublayer
     }
@@ -1441,11 +1461,76 @@ mod tests {
             "n-gram input sublayer disagrees with the residual form"
         );
         let mut exit_injects = hyper_connected(vec![mixed(plain, "a")]);
-        exit_injects.decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output", true));
+        exit_injects.decoder.exit.norm = exit(low_rank("output", true));
+        assert_eq!(rejects(exit_injects), "decoder output norm injects into no stream");
+    }
+
+    /// Two streams over hidden 4 under single-pass Sinkhorn mixing: each
+    /// sublayer's site forms (2 + 2)·2 = 8 mixes of the 8 stream values.
+    fn sinkhorn(sublayers: Vec<Sublayer>) -> ModelDefinition {
+        let mut model = definition(sublayers);
+        model.decoder.residual = ResidualForm::HyperConnections(HyperConnections {
+            streams: 2,
+            mixing: HyperConnectionMixing::Sinkhorn {
+                iterations: 20,
+                epsilon: 1e-6,
+                norm_epsilon: 1e-20,
+            },
+        });
+        model.decoder.exit.norm = ExitNorm::HyperConnectionHead(HyperConnectionExit {
+            site: ExitSite::PreviousSite,
+            norm: Some(rms("output_norm", 4)),
+        });
+        model
+    }
+
+    fn sinkhorn_site(name: &str, mixes: u64, scales: u64) -> HyperConnectionWeights {
+        HyperConnectionWeights::Sinkhorn(SinkhornSite {
+            function: weight(&format!("{name}.hc_fn"), &[mixes, 8]),
+            base: weight(&format!("{name}.hc_base"), &[mixes]),
+            scale: weight(&format!("{name}.hc_scale"), &[scales]),
+        })
+    }
+
+    fn sinkhorn_mixed(mut sublayer: Sublayer, name: &str) -> Sublayer {
+        sublayer.input = InputNorm::HyperConnectionMix(HyperConnectionInput {
+            site: sinkhorn_site(name, 8, 3),
+            norm: Some(rms(&format!("{name}.norm"), 4)),
+        });
+        sublayer.output = OutputForm::Scatter;
+        sublayer
+    }
+
+    #[test]
+    fn single_pass_sinkhorn_sites_validate_against_their_mixing() {
+        let plain = attention("a", owned("a", HistoryDomain::Token));
+        let rejects = |model: ModelDefinition| model.validate().unwrap_err().to_string();
+        let model = sinkhorn(vec![sinkhorn_mixed(plain.clone(), "a")]);
+        model.validate().unwrap();
+        assert_eq!(model.deferred_forms(), []);
+        // Only Sinkhorn mixing has a previous site's pre at the exit.
+        let mut previous = hyper_connected(vec![mixed(plain.clone(), "a")]);
+        previous.decoder.exit.norm = model.decoder.exit.norm.clone();
         assert_eq!(
-            rejects(exit_injects),
-            "decoder output norm disagrees with the residual form"
+            rejects(previous),
+            "decoder output norm reads the previous site's coefficients without Sinkhorn mixing"
         );
+        // A low-rank site under Sinkhorn mixing, and the reverse.
+        assert_eq!(
+            rejects(sinkhorn(vec![mixed(plain.clone(), "a")])),
+            "sublayer input norm's site disagrees with the decoder's hyper-connection mixing"
+        );
+        assert_eq!(
+            rejects(hyper_connected(vec![sinkhorn_mixed(plain.clone(), "a")])),
+            "sublayer input norm's site disagrees with the decoder's hyper-connection mixing"
+        );
+        // A sublayer's site forms (2 + S)·S mixes.
+        let mut short = sinkhorn_mixed(plain, "a");
+        let InputNorm::HyperConnectionMix(input) = &mut short.input else {
+            unreachable!()
+        };
+        input.site = sinkhorn_site("a", 2, 1);
+        assert!(sinkhorn(vec![short]).validate().is_err());
     }
 
     #[test]

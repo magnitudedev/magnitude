@@ -2,12 +2,16 @@
 //! define the contract; native implementations are checked against them on
 //! the host's GPU backend and on the CPU, at every row class of their
 //! launches, at a small geometry and at Qwen3.8 Flash Next's (H 2560, four
-//! streams, rank 320).
+//! streams, rank 320). The Sinkhorn site and its comb join are checked
+//! against the formulas of DeepSeek V4.1 Flash's single pass, written here,
+//! at its geometry (H 5120, four streams, 20 iterations).
 
 mod common;
 mod declared;
 
-use magnitude_kernels::{repeat_rows, stream_mix_down, stream_mix_up};
+use magnitude_kernels::{
+    attention_output, repeat_rows, stream_mix_down, stream_mix_sinkhorn, stream_mix_up,
+};
 use seismic_lang::{
     checked::{CheckedModule, SourceFile},
     entry::ElementBindings,
@@ -20,6 +24,11 @@ use seismic_lang::{
 
 fn module() -> CheckedModule {
     let mut sources = seismic_std::sources();
+    // `stream_join` joins through `scatter`.
+    sources.push(SourceFile {
+        path: "functions.seismic".into(),
+        text: include_str!("../kernels/functions.seismic").into(),
+    });
     sources.push(SourceFile {
         path: "streams.seismic".into(),
         text: include_str!("../kernels/streams.seismic").into(),
@@ -531,6 +540,620 @@ fn native_repeat_rows_matches_portable_body() {
                     device.backend()
                 );
             }
+        }
+    }
+}
+
+/// DeepSeek V4.1 Flash's mix sites: H, S, Sinkhorn iterations, and the
+/// mixing's epsilon and RMS statistic's (`hc_eps`, `norm_eps`).
+const V41: (usize, usize, usize) = (5120, 4, 20);
+const V41_EPSILON: f32 = 1e-6;
+const V41_NORM_EPSILON: f32 = 1e-20;
+
+/// One Sinkhorn site's weights: `function [(2 + S) S, S H]`, `base`,
+/// `scale [3]`, at magnitudes that put every mix at O(1).
+struct Sinkhorn {
+    function: Vec<f32>,
+    base: Vec<f32>,
+    scale: Vec<f32>,
+}
+
+impl Sinkhorn {
+    fn new(h: usize, s: usize, seed: u32) -> Self {
+        let mixes = (2 + s) * s;
+        Self {
+            function: pattern(mixes * s * h, seed, 4.0 / ((s * h) as f32).sqrt()),
+            base: pattern(mixes, seed + 1, 1.0),
+            scale: vec![0.6, 0.9, 1.7],
+        }
+    }
+
+    /// The site of the streams `x [rows, S H]` with the previous site's
+    /// `previous [rows, S]`, by the map's formulas (engine-map §6) in F64:
+    /// the sublayer input `[rows, H]`, pre `[rows, S]` and the join row
+    /// post | comb `[rows, S + S²]`.
+    fn reference(
+        &self,
+        x: &[f64],
+        previous: &[f64],
+        h: usize,
+        s: usize,
+        iterations: usize,
+    ) -> [Vec<f64>; 3] {
+        let (width, mixes) = (s * h, (2 + s) * s);
+        let (epsilon, norm_epsilon) = (f64::from(V41_EPSILON), f64::from(V41_NORM_EPSILON));
+        let sigmoid = |v: f64| 1.0 / (1.0 + (-v).exp());
+        let (mut input, mut pre, mut join) = (Vec::new(), Vec::new(), Vec::new());
+        for (row, x) in x.chunks_exact(width).enumerate() {
+            let rms =
+                1.0 / (x.iter().map(|v| v * v).sum::<f64>() / width as f64 + norm_epsilon).sqrt();
+            let m = (0..mixes)
+                .map(|j| {
+                    let weights = &self.function[j * width..(j + 1) * width];
+                    weights
+                        .iter()
+                        .zip(x)
+                        .map(|(w, v)| f64::from(*w) * v)
+                        .sum::<f64>()
+                        * rms
+                })
+                .collect::<Vec<_>>();
+            let (scale, base) = (
+                |i: usize| f64::from(self.scale[i]),
+                |i: usize| f64::from(self.base[i]),
+            );
+            pre.extend((0..s).map(|i| sigmoid(m[i] * scale(0) + base(i)) + epsilon));
+            join.extend((0..s).map(|i| 2.0 * sigmoid(m[s + i] * scale(1) + base(s + i))));
+            let mut comb = vec![vec![0.0f64; s]; s];
+            for (source, values) in comb.iter_mut().enumerate() {
+                for (target, value) in values.iter_mut().enumerate() {
+                    let at = 2 * s + source * s + target;
+                    *value = m[at] * scale(2) + base(at);
+                }
+                let maximum = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let total: f64 = values.iter().map(|v| (v - maximum).exp()).sum();
+                for value in values.iter_mut() {
+                    *value = (*value - maximum).exp() / total + epsilon;
+                }
+            }
+            let columns = |comb: &mut Vec<Vec<f64>>| {
+                for target in 0..s {
+                    let sum: f64 = comb.iter().map(|values| values[target]).sum();
+                    for values in comb.iter_mut() {
+                        values[target] /= sum + epsilon;
+                    }
+                }
+            };
+            columns(&mut comb);
+            for _ in 1..iterations {
+                for values in comb.iter_mut() {
+                    let sum: f64 = values.iter().sum();
+                    for value in values.iter_mut() {
+                        *value /= sum + epsilon;
+                    }
+                }
+                columns(&mut comb);
+            }
+            join.extend(comb.iter().flatten());
+            let carried = &previous[row * s..(row + 1) * s];
+            input.extend((0..h).map(|column| {
+                (0..s)
+                    .map(|stream| carried[stream] * x[stream * h + column])
+                    .sum::<f64>()
+            }));
+        }
+        [input, pre, join]
+    }
+
+    /// `stream_mix_sinkhorn` on `device`: input, pre and the join row.
+    fn native(
+        &self,
+        device: &seismic::Device,
+        x: &[f32],
+        previous: &[f32],
+        rows: usize,
+        (h, s, n): (usize, usize, usize),
+    ) -> [Vec<f32>; 3] {
+        let mixes = (2 + s) * s;
+        let specialization =
+            seismic::generated::native_implementation::<stream_mix_sinkhorn::Entry>(device)
+                .unwrap()
+                .unwrap()
+                .default_specialization(
+                    &[("H", h), ("S", s)]
+                        .into_iter()
+                        // The CPU's one static is S.
+                        .filter(|(name, _)| {
+                            device.backend() != seismic::BackendName::Cpu || *name != "H"
+                        })
+                        .fold(
+                            seismic::NativeSpecialization::new(),
+                            |spec, (name, value)| spec.with_static(name, value as u64),
+                        ),
+                )
+                .unwrap();
+        let site = stream_mix_sinkhorn::native_for_device(device, &specialization)
+            .unwrap()
+            .call(stream_mix_sinkhorn::Args {
+                hidden: &tensor(device, DType::F32, &[rows, s, h], x),
+                previous: &tensor(device, DType::F32, &[rows, s], previous),
+                function: &tensor(device, DType::F32, &[mixes, s * h], &self.function),
+                base: &tensor(device, DType::F32, &[mixes], &self.base),
+                scale: &tensor(device, DType::F32, &[3], &self.scale),
+                epsilon: V41_EPSILON,
+                norm_epsilon: V41_NORM_EPSILON,
+                iterations: u32::try_from(n).unwrap(),
+            })
+            .unwrap();
+        [
+            read(&site.r0, DType::F32),
+            read(&site.r1, DType::F32),
+            read(&site.r2, DType::F32),
+        ]
+    }
+}
+
+/// The sublayer's projection that the join scatters: `attention_output`'s
+/// gated rows `[rows, Q, W]` and bf16 output weight `[H, Q W]`, with `y`
+/// its F64 product rounded to bf16 as the entry publishes it (A = bf16).
+struct Projection {
+    q: usize,
+    w: usize,
+    gated: Vec<f32>,
+    weight: Vec<f32>,
+}
+
+impl Projection {
+    fn new(h: usize, rows: usize, seed: u32) -> Self {
+        let (q, w) = (2, 64);
+        Self {
+            q,
+            w,
+            gated: bf16(&pattern(rows * q * w, seed, 1.0)),
+            weight: bf16(&pattern(h * q * w, seed + 1, 0.3)),
+        }
+    }
+
+    fn y(&self, h: usize, rows: usize) -> Vec<f64> {
+        let k = self.q * self.w;
+        (0..rows * h)
+            .map(|at| {
+                let (row, column) = (at / h, at % h);
+                let sum: f64 = (0..k)
+                    .map(|i| {
+                        f64::from(self.gated[row * k + i]) * f64::from(self.weight[column * k + i])
+                    })
+                    .sum();
+                f64::from(registry::bf16_round(sum as f32))
+            })
+            .collect()
+    }
+
+    /// The streams `x` joined with `y` through `join` (post | comb):
+    /// `X'[d] = sum_s comb[s, d] X[s] + post[d] y`, in F64.
+    fn reference(x: &[f64], join: &[f64], y: &[f64], h: usize, s: usize) -> Vec<f64> {
+        let (width, row_join) = (s * h, s + s * s);
+        let mut joined = Vec::with_capacity(x.len());
+        for (row, x) in x.chunks_exact(width).enumerate() {
+            let join = &join[row * row_join..(row + 1) * row_join];
+            for target in 0..s {
+                for column in 0..h {
+                    let mixed: f64 = (0..s)
+                        .map(|source| join[s + source * s + target] * x[source * h + column])
+                        .sum();
+                    joined.push(mixed + join[target] * y[row * h + column]);
+                }
+            }
+        }
+        joined
+    }
+
+    /// `attention_output` on `device` joining into the streams `x` with
+    /// the join row `join` (IN = S + S²).
+    fn native(
+        &self,
+        device: &seismic::Device,
+        x: &[f32],
+        join: &[f32],
+        rows: usize,
+        h: usize,
+        s: usize,
+    ) -> Vec<f32> {
+        let statics = [
+            ("D", h as u64),
+            ("SN", s as u64),
+            ("IN", (s + s * s) as u64),
+            ("Q", self.q as u64),
+            ("W", self.w as u64),
+            ("OS", 0),
+            ("OB", 0),
+        ];
+        let statics = statics
+            .iter()
+            .filter(|(name, _)| {
+                device.backend() != seismic::BackendName::Cpu || matches!(*name, "Q" | "W" | "OS")
+            })
+            .fold(
+                seismic::NativeSpecialization::new(),
+                |spec, (name, value)| spec.with_static(*name, *value),
+            );
+        let elements = attention_output::Elements {
+            OW: seismic::Element::bf16(),
+            A: seismic::Element::bf16(),
+        };
+        let specialization =
+            seismic::generated::native_default_specialization::<attention_output::Entry>(
+                device,
+                &statics,
+                &[
+                    ("OW", seismic::Element::bf16()),
+                    ("A", seismic::Element::bf16()),
+                ],
+            )
+            .unwrap()
+            .expect("attention_output joins through the comb on this backend");
+        let joined = attention_output::native_for_device_with(device, elements, &specialization)
+            .unwrap()
+            .call(attention_output::Args {
+                hidden: &tensor(device, DType::F32, &[rows, s * h], x),
+                inject: &tensor(device, DType::F32, &[rows, s + s * s], join),
+                gated: &tensor(device, DType::BF16, &[rows, self.q, self.w], &self.gated),
+                output_weight: &tensor(device, DType::BF16, &[h, self.q * self.w], &self.weight),
+                output_scale: &tensor(device, DType::F32, &[0], &[]),
+                output_bound: &tensor(device, DType::F32, &[0], &[]),
+            })
+            .unwrap();
+        read(&joined.value, DType::F32)
+    }
+}
+
+fn narrow(values: &[f64]) -> Vec<f32> {
+    values.iter().map(|v| *v as f32).collect()
+}
+
+/// The previous site's pre before the first site: one-hot on stream 0.
+fn entry_pre(rows: usize, s: usize) -> Vec<f64> {
+    (0..rows * s)
+        .map(|at| if at % s == 0 { 1.0 } else { 0.0 })
+        .collect()
+}
+
+/// The portable `stream_mix_sinkhorn` gives the formulas' site at a small
+/// geometry over two consecutive sites, the second reading the first's pre.
+#[test]
+fn portable_sinkhorn_site_matches_the_single_pass_formulas() {
+    let module = module();
+    let (h, s, n, rows) = (64, 4, V41.2, 3);
+    let width = s * h;
+    let x = pattern(rows * width, 21, 3.0);
+    let previous = entry_pre(rows, s);
+    let mut carried = narrow(&previous);
+    for seed in [31, 41] {
+        let site = Sinkhorn::new(h, s, seed);
+        let mixes = (2 + s) * s;
+        let elements = ElementBindings::new();
+        let logical = module
+            .entry(
+                module.entry_named("stream_mix_sinkhorn").unwrap(),
+                &elements,
+            )
+            .unwrap();
+        let mut interpreter = Interpreter::new(&logical);
+        let tensors = [
+            (vec![rows, s, h], x.clone()),
+            (vec![rows, s], carried.clone()),
+            (vec![mixes, width], site.function.clone()),
+            (vec![mixes], site.base.clone()),
+            (vec![3], site.scale.clone()),
+        ];
+        let mut arguments = tensors
+            .into_iter()
+            .map(|(shape, values)| {
+                Arg::Tensor(interpreter.add_tensor(TensorData::dense(
+                    DType::F32,
+                    shape,
+                    values.iter().map(|v| f64::from(*v)).collect(),
+                )))
+            })
+            .collect::<Vec<_>>();
+        arguments.push(Arg::Scalar(ReferenceScalar::F32(V41_EPSILON.to_bits())));
+        arguments.push(Arg::Scalar(ReferenceScalar::F32(
+            V41_NORM_EPSILON.to_bits(),
+        )));
+        arguments.push(Arg::Scalar(ReferenceScalar::U32(u32::try_from(n).unwrap())));
+        let outcome = interpreter.run(&arguments).unwrap();
+        if let SourceTermination::Failed(failure) = outcome.termination() {
+            panic!("stream_mix_sinkhorn failed: {failure}");
+        }
+        let portable = outcome
+            .results()
+            .map(|result| {
+                let OutcomeValue::Tensor(tensor) = result.value() else {
+                    panic!("tensor result")
+                };
+                (0..tensor.element_count())
+                    .map(|i| tensor.read(i).unwrap() as f32)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let x64 = x.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
+        let carried64 = carried.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
+        let expected = site.reference(&x64, &carried64, h, s, n);
+        for (name, (actual, expected)) in ["input", "pre", "join"]
+            .into_iter()
+            .zip(portable.iter().zip(&expected))
+        {
+            assert_close(
+                &format!("portable seed {seed} {name}"),
+                actual,
+                expected,
+                1e-6,
+                1e-5,
+            );
+        }
+        carried = portable[1].clone();
+    }
+}
+
+/// The natives at V4.1's geometry, for decode and prefill rows, over two
+/// consecutive sites joined by the comb scatter, the second site reading
+/// the streams and pre the first left: each site's input, pre and join row,
+/// and the joined streams, against the formulas over the natives' inputs.
+#[test]
+fn native_sinkhorn_sites_and_comb_join_match_the_single_pass_formulas() {
+    let (h, s, n) = V41;
+    let width = s * h;
+    let sites = [Sinkhorn::new(h, s, 51), Sinkhorn::new(h, s, 61)];
+    for rows in [1, 2, 7, 20] {
+        let mut x = pattern(rows * width, 71 + rows as u32, 2.0);
+        for (index, value) in x.iter_mut().enumerate() {
+            *value *= 1.0 + (index % width / h) as f32;
+        }
+        let projections = [Projection::new(h, rows, 81), Projection::new(h, rows, 91)];
+        for device in devices() {
+            let label = |stage: &str| format!("{:?} M {rows} {stage}", device.backend());
+            let (mut streams, mut pre) = (x.clone(), narrow(&entry_pre(rows, s)));
+            for (index, (site, projection)) in sites.iter().zip(&projections).enumerate() {
+                let wide =
+                    |values: &[f32]| values.iter().map(|v| f64::from(*v)).collect::<Vec<_>>();
+                let expected = site.reference(&wide(&streams), &wide(&pre), h, s, n);
+                let actual = site.native(&device, &streams, &pre, rows, V41);
+                for (name, (actual, expected)) in ["input", "pre", "join"]
+                    .into_iter()
+                    .zip(actual.iter().zip(&expected))
+                {
+                    assert_close(
+                        &label(&format!("site {index} {name}")),
+                        actual,
+                        expected,
+                        1e-5,
+                        1e-5,
+                    );
+                }
+                let y = projection.y(h, rows);
+                let joined = Projection::reference(&wide(&streams), &expected[2], &y, h, s);
+                let actual_joined = projection.native(&device, &streams, &actual[2], rows, h, s);
+                assert_eq!(actual_joined.len(), joined.len());
+                for (at, (actual, expected)) in actual_joined.iter().zip(&joined).enumerate() {
+                    // The comb's error over the streams, and one bf16
+                    // rounding of y landing on its other side: post (< 2)
+                    // times an ulp of y (at most 2^-7 |y|).
+                    let row = at / width;
+                    let streams = &streams[row * width..(row + 1) * width];
+                    let magnitude: f64 = (0..s)
+                        .map(|source| f64::from(streams[source * h + at % h].abs()))
+                        .sum();
+                    let bound = 1e-5 * magnitude + 2.0 * y[row * h + at % h].abs() * 2f64.powi(-7);
+                    assert!(
+                        (f64::from(*actual) - expected).abs() <= 1e-6 + bound,
+                        "{}[{at}]: native {actual}, expected {expected}, bound {bound}",
+                        label(&format!("site {index} joined"))
+                    );
+                }
+                (streams, pre) = (actual_joined, actual[1].clone());
+            }
+        }
+    }
+}
+
+/// The backends the Sinkhorn streams' entries run on: this host's Metal
+/// device and its CPU. CUDA and Vulkan declare no native of them
+/// ([`sinkhorn_entries_are_declared_on_cpu_and_metal_only`]).
+fn sinkhorn_devices() -> Vec<seismic::Device> {
+    use seismic::BackendName::{Cpu, Metal};
+    seismic_native_tests::first_and_cpu(&[Metal], &[Metal, Cpu])
+}
+
+/// Each value of `actual` against the F64 `expected`: a NaN where it is a
+/// NaN, the same infinity where it is one, else within `bound[i]`.
+fn assert_ieee_close(name: &str, actual: &[f32], expected: &[f64], bound: &[f64]) {
+    assert_eq!(actual.len(), expected.len(), "{name} length");
+    for (index, ((actual, expected), bound)) in actual.iter().zip(expected).zip(bound).enumerate() {
+        let actual = f64::from(*actual);
+        let agrees = if expected.is_nan() {
+            actual.is_nan()
+        } else if expected.is_infinite() {
+            actual == *expected
+        } else {
+            (actual - expected).abs() <= *bound
+        };
+        assert!(agrees, "{name}[{index}]: native {actual}, expected {expected}, bound {bound}");
+    }
+}
+
+/// The relative error bound of an F32 sum of `n` products in any order
+/// (with or without fused multiply-adds), `γ_n = n u / (1 - n u)` with
+/// `u = 2^-24`, of the sum of the terms' magnitudes.
+fn gamma(n: usize) -> f64 {
+    let nu = n as f64 * 2f64.powi(-24);
+    nu / (1.0 - nu)
+}
+
+/// `stream_join`'s formula in F64 (`scatter`): for each stream d of each
+/// row, `X'[d] = (IN > SN: sum_s comb[s, d] X[s], else X[d]) + y (IN = 0)
+/// or y inject[d]`, and its terms' magnitude sum.
+fn join_reference(
+    residual: &[f32],
+    y: &[f32],
+    inject: &[f32],
+    (h, sn, width): (usize, usize, usize),
+) -> (Vec<f64>, Vec<f64>) {
+    let rows = y.len() / h;
+    let (mut joined, mut magnitude) = (Vec::new(), Vec::new());
+    for row in 0..rows {
+        let x = |s: usize, column: usize| f64::from(residual[row * sn * h + s * h + column]);
+        let at = |i: usize| f64::from(inject[row * width + i]);
+        for stream in 0..sn {
+            for column in 0..h {
+                let mut terms = Vec::new();
+                if width > sn {
+                    terms.extend((0..sn).map(|source| at(sn + source * sn + stream) * x(source, column)));
+                } else {
+                    terms.push(x(stream, column));
+                }
+                let value = f64::from(y[row * h + column]);
+                terms.push(if width == 0 { value } else { value * at(stream) });
+                joined.push(terms.iter().sum());
+                magnitude.push(terms.iter().map(|term| term.abs()).sum());
+            }
+        }
+    }
+    (joined, magnitude)
+}
+
+/// `stream_join` on CPU and Metal against its F64 formula, in every join
+/// form (`IN` = 0 of one stream, `IN = SN` and the comb's `IN = SN + SN²`, at
+/// one and four streams) and at decode and prefill rows, over adversarial
+/// values: sums that cancel to near zero (each row's last column is set so
+/// its F64 join is about zero, every term large), NaN and both infinities in
+/// the streams, the output and the inject row (a comb of zero times an
+/// infinite stream gives NaN, as the formula does), and ordinary values.
+/// Finite values agree within the F32 sum's bound ([`gamma`]).
+#[test]
+fn native_stream_join_matches_its_formula_on_adversarial_values() {
+    let h = 256;
+    for (sn, width) in [(1, 0), (1, 1), (1, 2), (4, 4), (4, 20)] {
+        for rows in [1usize, 3, 70] {
+            let mut residual = pattern(rows * sn * h, 101 + sn as u32, 8.0);
+            let mut y = pattern(rows * h, 103 + width as u32, 8.0);
+            let mut inject = pattern(rows * width, 107, 2.0);
+            // The near-zero sums: the last column of each row's stream 0
+            // made to cancel, every term of magnitude near 8.
+            for row in 0..rows {
+                let column = h - 1;
+                let x = |s: usize| f64::from(residual[row * sn * h + s * h + column]);
+                let at = |i: usize| f64::from(inject[row * width + i]);
+                let mixed = if width > sn {
+                    (0..sn).map(|source| at(sn + source * sn) * x(source)).sum::<f64>()
+                } else {
+                    x(0)
+                };
+                let factor = if width == 0 { 1.0 } else { at(0) };
+                if factor.abs() > 1e-3 {
+                    y[row * h + column] = (-mixed / factor) as f32;
+                }
+            }
+            // Non-finite values, in the streams, the output and the inject
+            // row, on separate columns of row 0.
+            residual[3] = f32::NAN;
+            residual[5] = f32::INFINITY;
+            residual[(sn - 1) * h + 7] = f32::NEG_INFINITY;
+            y[9] = f32::INFINITY;
+            y[11] = f32::NAN;
+            if width > 0 {
+                inject[0] = if width > sn { 0.75 } else { f32::INFINITY };
+                inject[width - 1] = f32::NAN;
+            }
+            if width > sn {
+                // A zero comb entry against an infinite stream: NaN.
+                inject[sn] = 0.0;
+            }
+            let (expected, magnitude) = join_reference(&residual, &y, &inject, (h, sn, width));
+            let bound = magnitude.iter().map(|m| gamma(sn + 1) * m).collect::<Vec<_>>();
+            for device in sinkhorn_devices() {
+                let statics = [("H", h as u64), ("SN", sn as u64), ("IN", width as u64)];
+                let joined = at_defaults(
+                    &device,
+                    magnitude_kernels::stream_join::native_entry(),
+                    &statics,
+                )
+                .unwrap()
+                .call(magnitude_kernels::stream_join::Args {
+                    residual: &tensor(&device, DType::F32, &[rows, sn * h], &residual),
+                    y: &tensor(&device, DType::F32, &[rows, h], &y),
+                    inject: &tensor(&device, DType::F32, &[rows, width], &inject),
+                })
+                .unwrap();
+                assert_ieee_close(
+                    &format!("{:?} stream_join SN {sn} IN {width} M {rows}", device.backend()),
+                    &read(&joined.value, DType::F32),
+                    &expected,
+                    &bound,
+                );
+            }
+        }
+    }
+}
+
+/// `stream_collapse` (the exit over Sinkhorn streams) on CPU and Metal
+/// against `sum_s pre[s] X[s]` in F64 at V4.1's width, within the F32 sum's
+/// bound, at decode and prefill rows.
+#[test]
+fn native_stream_collapse_matches_its_formula() {
+    let (h, s) = (V41.0, V41.1);
+    for rows in [1usize, 2, 20] {
+        let x = pattern(rows * s * h, 113 + rows as u32, 4.0);
+        let pre = pattern(rows * s, 127, 1.0).iter().map(|v| v.abs() + 1e-6).collect::<Vec<_>>();
+        let (mut expected, mut bound) = (Vec::new(), Vec::new());
+        for row in 0..rows {
+            for column in 0..h {
+                let terms = (0..s)
+                    .map(|stream| f64::from(pre[row * s + stream]) * f64::from(x[row * s * h + stream * h + column]))
+                    .collect::<Vec<_>>();
+                expected.push(terms.iter().sum::<f64>());
+                bound.push(gamma(s) * terms.iter().map(|term| term.abs()).sum::<f64>());
+            }
+        }
+        for device in sinkhorn_devices() {
+            let collapsed = at_defaults(
+                &device,
+                magnitude_kernels::stream_collapse::native_entry(),
+                &[("H", h as u64), ("S", s as u64)],
+            )
+            .unwrap()
+            .call(magnitude_kernels::stream_collapse::Args {
+                hidden: &tensor(&device, DType::F32, &[rows, s, h], &x),
+                pre: &tensor(&device, DType::F32, &[rows, s], &pre),
+            })
+            .unwrap();
+            assert_ieee_close(
+                &format!("{:?} stream_collapse M {rows}", device.backend()),
+                &read(&collapsed.value, DType::F32),
+                &expected,
+                &bound,
+            );
+        }
+    }
+}
+
+/// The Sinkhorn streams' entries declare natives on CPU and Metal only:
+/// CUDA and Vulkan plans refuse them by their declarations.
+#[test]
+fn sinkhorn_entries_are_declared_on_cpu_and_metal_only() {
+    use seismic::BackendName::{Cpu, Cuda, Metal, Vulkan};
+    fn declared<E: seismic::Entry>(backend: seismic::BackendName) -> bool {
+        seismic::generated::native_implementation_for_backend::<E>(backend)
+            .unwrap()
+            .is_some()
+    }
+    for backend in [Cpu, Metal, Cuda, Vulkan] {
+        let expected = matches!(backend, Cpu | Metal);
+        for (name, actual) in [
+            ("stream_mix_sinkhorn", declared::<stream_mix_sinkhorn::Entry>(backend)),
+            ("stream_collapse", declared::<magnitude_kernels::stream_collapse::Entry>(backend)),
+            ("stream_join", declared::<magnitude_kernels::stream_join::Entry>(backend)),
+        ] {
+            assert_eq!(actual, expected, "{name} on {backend:?}");
         }
     }
 }

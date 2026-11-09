@@ -39,7 +39,7 @@ use super::tuning::{
 use super::*;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
-use crate::operators::streams::SiteEntryBindings;
+use crate::operators::streams::{BlockStreams, SinkhornBinding, SiteEntryBindings};
 use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
 use crate::{
     DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, ShortConvBinding,
@@ -55,7 +55,8 @@ use magnitude_kernels::{
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
     feature_rows, import_dense, moe_tail, ngram_gate, ngram_inject, ngram_rows, packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
-    selection_notice, stored_rows, tap_rows, token_confidence, widen_rows,
+    selection_notice, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
+    token_confidence, widen_rows,
 };
 use seismic::KernelRequest;
 use std::collections::HashSet;
@@ -1166,21 +1167,21 @@ impl<'a> Preparation<'a> {
                 }
             }
         }
-        let sites = target
-            .blocks()
-            .iter()
-            .enumerate()
-            .filter_map(|(index, block)| Some((index, block.streams()?)))
-            .flat_map(|(index, binding)| {
-                binding.entries().scoped([
+        let mut sites = Vec::new();
+        let mut sinkhorn = Vec::new();
+        for (index, block) in target.blocks().iter().enumerate() {
+            match block.block_streams() {
+                None => {}
+                Some(BlockStreams::LowRank(binding)) => sites.extend(binding.entries().scoped([
                     sublayer_scope(index, 0),
                     sublayer_scope(index, 1),
                     WeightScope::Target,
-                ])
-            })
-            .collect::<Vec<_>>();
+                ])),
+                Some(BlockStreams::Sinkhorn(binding)) => sinkhorn.push(binding),
+            }
+        }
         let mut streams = std::mem::take(&mut self.target.streams);
-        self.streams(&mut streams, &sites)?;
+        self.streams(&mut streams, &sites, &sinkhorn)?;
         self.target.streams = streams;
         let b = target.readout();
         let bindings = format!("{b:?}");
@@ -2066,15 +2067,35 @@ impl<'a> Preparation<'a> {
     /// The hyper-connection streams entries of mix sites `sites` (each
     /// site's entry bindings at its scope) that `prepared` lacks: each
     /// distinct `stream_mix_down` and `stream_mix_up` binding prepared once,
-    /// tuned over every site that binds it in site order, and the widening
-    /// of the embedded rows.
+    /// tuned over every site that binds it in site order; the Sinkhorn
+    /// entries of each distinct block binding `sinkhorn`, untuned; and the
+    /// widening of the embedded rows.
     fn streams(
         &mut self,
         prepared: &mut StreamsEntryKernels,
         sites: &[(SiteEntryBindings, WeightScope)],
+        sinkhorn: &[SinkhornBinding],
     ) -> Result<(), CatalogFailure> {
-        if sites.is_empty() {
+        if sites.is_empty() && sinkhorn.is_empty() {
             return Ok(());
+        }
+        for &binding in sinkhorn {
+            if prepared.sinkhorn.contains_key(&binding) {
+                continue;
+            }
+            let SinkhornBinding { hidden, streams, .. } = binding;
+            let label = format!("H={hidden} S={streams}");
+            let spec = &mut self.spec;
+            let site = spec.fixed(&label, &[("H", hidden), ("S", streams)], stream_mix_sinkhorn::native_entry())?;
+            let collapse = spec.fixed(&label, &[("H", hidden), ("S", streams)], stream_collapse::native_entry())?;
+            let join = spec.fixed(
+                &label,
+                &[("H", hidden), ("SN", streams), ("IN", streams + streams * streams)],
+                stream_join::native_entry(),
+            )?;
+            if let (Some(site), Some(collapse), Some(join)) = (site, collapse, join) {
+                prepared.sinkhorn.insert(binding, SinkhornKernels { site, collapse, join });
+            }
         }
         let downs = ordered_layers(sites.iter().map(|(site, scope)| (site.down, *scope)));
         for (binding, scopes) in downs {
@@ -2950,8 +2971,8 @@ impl<'a> Preparation<'a> {
                             head_scope(head_index),
                         ])
                         .collect::<Vec<_>>();
-                    self.streams(&mut prepared, &sites)?;
-                    prepared.kernels(streams)
+                    self.streams(&mut prepared, &sites, &[])?;
+                    prepared.kernels(BlockStreams::LowRank(streams))
                 }
                 None => None,
             };

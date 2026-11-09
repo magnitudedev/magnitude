@@ -34,7 +34,7 @@ use super::AssessmentError;
 use crate::operators::attention::graph::selected_segments;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::{fused_graph::DecodeForm, streamed};
-use crate::operators::streams::{MixSite, StreamsBinding};
+use crate::operators::streams::{BlockStreams, MixSite, SinkhornBinding};
 use crate::operators::{parallel::DenseBesideRouted, InputForm};
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedBinding, MixerProgramSlot, ModelLoadPlan,
@@ -582,16 +582,57 @@ fn mix_site(
     )
 }
 
+/// The bytes of `elements` F32 values.
+fn f32_bytes(elements: u64) -> Result<u64, AssessmentError> {
+    row_bytes(Element::f32(), elements)
+}
+
+/// `operators::streams::graph::sinkhorn_site` in `scope`:
+/// `stream_mix_sinkhorn` reads each row's `[S, H]` streams and projects
+/// them through the site's F32 function weights (`(2+S)·S × S·H`, with its
+/// base and scale), and writes the sublayer's input `[H]`, the site's pre
+/// `[S]` and its join values (post | comb, `[S+S²]`). Beside the
+/// projection, each of its `iterations` Sinkhorn passes normalizes the
+/// comb's rows and then its columns, a sum and a division per element each.
+fn sinkhorn_site(
+    step: &mut Step<'_>,
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    binding: SinkhornBinding,
+) -> Result<(), AssessmentError> {
+    let SinkhornBinding {
+        hidden,
+        streams,
+        mixing,
+    } = binding;
+    let weight = |kind| planned(load, scope, kind, Element::f32());
+    let mut work = projection(&[
+        weight(WeightKind::HyperConnectionFunction)?,
+        weight(WeightKind::HyperConnectionBase)?,
+        weight(WeightKind::HyperConnectionScale)?,
+    ])?;
+    work.row_bytes = f32_bytes(streams * hidden + hidden + streams + streams + streams * streams)?;
+    add(
+        &mut work.row_flops,
+        Flops {
+            format: Element::f32(),
+            flops: u64::from(mixing.iterations) * 2 * 2 * streams * streams,
+        },
+    )?;
+    step.call(Kernel::of::<kernels::stream_mix_sinkhorn::Entry>(), work)
+}
+
 /// The input of the sublayer at `scope` as it runs: the residual under its
-/// RMS input norm, which the consumer entry fuses (bound at `norm`), or the
-/// mix site of a hyper-connection sublayer.
+/// RMS input norm, which the consumer entry fuses (bound at `norm`); the
+/// low-rank mix site of a hyper-connection sublayer; or its Sinkhorn site,
+/// whose input row the consumer entry reads under that norm.
 fn sublayer_input(
     step: &mut Step<'_>,
     load: &ModelLoadPlan,
     definition: &ModelDefinition,
     scope: WeightScope,
     norm: Element,
-    streams: Option<StreamsBinding>,
+    streams: Option<BlockStreams>,
 ) -> Result<(), AssessmentError> {
     let WeightScope::TargetSublayer(index) = scope else {
         return Err(demand_error(format!("{scope:?} is not a target sublayer")));
@@ -604,10 +645,17 @@ fn sublayer_input(
         .ok_or_else(|| demand_error(format!("{scope:?} is not a decoder sublayer")))?;
     match &sublayer.input {
         InputNorm::HyperConnectionMix(_) => {
-            let site = streams
-                .and_then(|streams| streams.sublayer(index.sublayer))
-                .ok_or_else(|| demand_error(format!("{scope:?} mixes without its site")))?;
-            mix_site(step, load, scope, site.site, Some(site.inject))
+            let without = || demand_error(format!("{scope:?} mixes without its site"));
+            match streams.ok_or_else(without)? {
+                BlockStreams::LowRank(streams) => {
+                    let site = streams.sublayer(index.sublayer).ok_or_else(without)?;
+                    mix_site(step, load, scope, site.site, Some(site.inject))
+                }
+                BlockStreams::Sinkhorn(binding) => {
+                    sinkhorn_site(step, load, scope, binding)?;
+                    planned(load, scope, WeightKind::InputNorm, norm).map(|_| ())
+                }
+            }
         }
         _ => planned(load, scope, WeightKind::InputNorm, norm).map(|_| ()),
     }
@@ -1009,7 +1057,7 @@ impl DecodeDemand {
                 u32::try_from(index).map_err(|_| demand_error("block index exceeds u32"))?;
             let [mixer_scope, feed_forward_scope] =
                 crate::programs::native_target_graph::block_scopes(index).map_err(demand_error)?;
-            let streams = block.streams();
+            let streams = block.block_streams();
             // Block 0 widens the embedded row into the streams
             // (`repeat_rows`), which streams no weight.
             if index == 0 && streams.is_some() {
@@ -1342,6 +1390,15 @@ impl DecodeDemand {
                 FeedForwardProgramSlot::GeneralRouted(binding) => {
                     input(&mut step, scope, binding.norm)?;
                     general_routed(&mut step, load, scope, &binding)?;
+                    // Over Sinkhorn streams the routed branch joins the
+                    // streams `[S·H]` through `stream_join`, from its
+                    // branch row `[H]`.
+                    if let Some(BlockStreams::Sinkhorn(SinkhornBinding { hidden, streams, .. })) = streams {
+                        step.call(
+                            Kernel::of::<kernels::stream_join::Entry>(),
+                            rows(f32_bytes(2 * streams * hidden + hidden)?),
+                        )?;
+                    }
                 }
             }
             // `programs::graph::per_layer`: the gate over the layer's slice
@@ -1395,14 +1452,20 @@ impl DecodeDemand {
             }
         }
 
-        // The last block's graph ends with the decoder's exit site, which
-        // injects into nothing.
-        if let Some(exit) = target
-            .blocks()
-            .last()
-            .and_then(|block| block.streams()?.exit)
-        {
-            mix_site(&mut step, load, WeightScope::Target, exit, None)?;
+        // The last block's graph ends with the decoder's exit: a low-rank
+        // exit site, which injects into nothing, or the collapse of Sinkhorn
+        // streams `[S·H]` into one row `[H]` under the last site's pre.
+        match target.blocks().last().and_then(|block| block.block_streams()) {
+            Some(BlockStreams::LowRank(streams)) => {
+                if let Some(exit) = streams.exit {
+                    mix_site(&mut step, load, WeightScope::Target, exit, None)?;
+                }
+            }
+            Some(BlockStreams::Sinkhorn(SinkhornBinding { hidden, streams, .. })) => step.call(
+                Kernel::of::<kernels::stream_collapse::Entry>(),
+                rows(f32_bytes(streams * hidden + hidden)?),
+            )?,
+            None => {}
         }
 
         // The selection readout graph: the features over the final row under
@@ -1677,6 +1740,61 @@ pub(crate) mod tests {
                 + embedding_row
                 + definition.decoder.vocabulary * 4
         );
+    }
+
+    /// Over Sinkhorn streams each sublayer reads through its site
+    /// (`stream_mix_sinkhorn`: its F32 function, base and scale, the
+    /// streams and pre read and the input, pre and join values written, its
+    /// projection's FLOPs and its 20 normalizations' of the comb), the
+    /// general routed branch joins through `stream_join`, and the exit
+    /// collapses the streams (`stream_collapse`). The low-rank decoder's
+    /// demand is unchanged (`a_streams_decode_step_streams_its_mix_sites_and_no_norms`).
+    #[test]
+    fn a_sinkhorn_decode_step_bills_its_sites_joins_and_collapse() {
+        let definition = crate::planning::fixtures::sinkhorn_fixture_definition(2);
+        let manifest = crate::planning::fixtures::fixture_manifest(&definition);
+        let selection = crate::ComponentSelection { head: false, vision: false };
+        let limits = crate::planning::fixtures::LIMITS;
+        let load =
+            ModelLoadPlan::derive(&manifest, &definition, selection, Layout::Rows8, crate::PlannedMethod::Plain, limits)
+                .unwrap();
+        let demand = demand(&definition, &load, KvCodec::Dense).unwrap();
+        let block = [
+            "stream_mix_sinkhorn",
+            "attention_project",
+            "attention_decode",
+            "attention_output",
+            "stream_mix_sinkhorn",
+            "routed_select",
+            "routed_gate_up",
+            "routed_down",
+            "stream_join",
+        ];
+        let expected = ["embedding_rows", "repeat_rows"]
+            .into_iter()
+            .chain(block)
+            .chain(block)
+            .chain(["stream_collapse", "readout_features_rows", "readout_head_rows", "sample_rows"])
+            .collect::<Vec<_>>();
+        let names = demand.calls.iter().map(|call| call.launches.kernel().name()).collect::<Vec<_>>();
+        assert_eq!(names, expected);
+        let (s, h, iterations) = (4, 128, 20);
+        let call = |name| demand.calls.iter().find(|call| call.launches.kernel().name() == name).unwrap();
+        let site = &call("stream_mix_sinkhorn").work;
+        let mixer = WeightScope::TargetSublayer(SublayerIndex { block: 0, sublayer: 0 });
+        let bytes = |kind| {
+            load.target().iter().find(|weight| weight.role.scope == mixer && weight.role.kind == kind).unwrap().resident_bytes
+        };
+        let site_weights = [WeightKind::HyperConnectionFunction, WeightKind::HyperConnectionBase, WeightKind::HyperConnectionScale]
+            .map(bytes)
+            .iter()
+            .sum::<u64>();
+        assert_eq!(site.weights, vec![Bytes { format: Element::f32(), bytes: site_weights }]);
+        assert_eq!(site.row_bytes, 4 * (s * h + h + 2 * s + s * s));
+        let projection = 2 * (2 + s) * s * s * h;
+        assert_eq!(site.row_flops, vec![Flops { format: Element::f32(), flops: projection + iterations * 4 * s * s }]);
+        assert_eq!(call("stream_join").work.row_bytes, 4 * (2 * s * h + h));
+        assert_eq!(call("stream_collapse").work.row_bytes, 4 * (s * h + h));
     }
 
     /// An n-gram input charges its row rule over its token window, its

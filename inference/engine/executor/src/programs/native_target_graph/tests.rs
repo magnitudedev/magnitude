@@ -1036,3 +1036,81 @@ mod resource_template_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sinkhorn_graph_tests {
+    use super::super::block::stage_input;
+    use super::*;
+    use magnitude_family_contracts::ModelDefinition;
+    use crate::operators::streams::ResidualCarry;
+    use crate::planning::fixtures::{fixture_manifest, qwen4exp_fixture_definition, sinkhorn_fixture_definition};
+    use crate::{ComponentSelection, ExecutionPath, PlannedMethod, ResourceCapacity, ResourcePlanner, resident_layout};
+    use magnitude_state::KvCodec;
+
+    const STAGES: [RunStage; 3] = [RunStage::Whole, RunStage::Front, RunStage::Combine];
+
+    /// The carry each block graph reads: a Sinkhorn decoder's carries the
+    /// `[rows, S]` pre beside its streams into every block after the first
+    /// and every back; a low-rank decoder's (qwen4exp's) reads its rows
+    /// alone, the one port it read before. Each carries its own hidden
+    /// width's rows, its `S` streams of them where it reads streams.
+    #[test]
+    fn only_sinkhorn_streams_carry_a_pre() {
+        use crate::planning::fixtures::STREAMS;
+        let (sinkhorn, low_rank) = (sinkhorn_fixture_definition(2), qwen4exp_fixture_definition());
+        for (block, stage) in (0..2).flat_map(|block| STAGES.map(|stage| (block, stage))) {
+            let streams = block > 0 || stage == RunStage::Combine;
+            let rows = |definition: &ModelDefinition| match streams {
+                true => STREAMS * definition.decoder.hidden,
+                false => definition.decoder.hidden,
+            };
+            let input = |definition: &ModelDefinition| stage_input(&definition.decoder, block, Stage::Run(stage)).unwrap();
+            assert_eq!(input(&low_rank), Some(ResidualCarry::rows(rows(&low_rank))), "block {block} {stage:?}");
+            assert_eq!(
+                input(&sinkhorn),
+                Some(ResidualCarry { rows: rows(&sinkhorn), pre: streams.then_some(STREAMS) }),
+                "block {block} {stage:?}"
+            );
+        }
+    }
+
+    /// The Sinkhorn fixture's block graphs check on the CPU and Metal,
+    /// whole at decode and prompt rows and as a split block's front and
+    /// back; CUDA and Vulkan declare no Sinkhorn site, so their plans refuse
+    /// it by declaration.
+    #[test]
+    fn sinkhorn_block_graphs_check_on_cpu_and_metal_only() {
+        let definition = sinkhorn_fixture_definition(2);
+        let manifest = fixture_manifest(&definition);
+        let codec = KvCodec::Dense;
+        let selection = ComponentSelection { head: false, vision: false };
+        let limits = crate::planning::fixtures::LIMITS;
+        for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda, BackendName::Vulkan] {
+            let layout = resident_layout(ExecutionPath::Native, backend);
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, PlannedMethod::Plain, limits).unwrap();
+            let capacity = ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent };
+            let state = ResourcePlanner::state_plan(&definition, &load, PlannedMethod::Plain, codec, limits, capacity).unwrap();
+            let plan = load.program_plan(&definition, codec).unwrap();
+            let classes = [(1, RunStage::Whole), (512, RunStage::Whole), (512, RunStage::Front), (512, RunStage::Combine)];
+            for (index, (rows, stage)) in (0..2).flat_map(|index| classes.map(|class| (index, class))) {
+                let inputs = BlockGraphInputs::of_class(
+                    &load,
+                    &definition.decoder,
+                    &state,
+                    index,
+                    ((rows, 1, 1, 0, 0), Stage::Run(stage)),
+                    rows,
+                );
+                let checked = checked_block_graph_draft(NativeGraphMetadata::new(backend), plan.target().blocks()[index], None, inputs);
+                let label = format!("{backend:?} block {index} {rows} rows {stage:?}");
+                match backend {
+                    BackendName::Cpu | BackendName::Metal => drop(checked.unwrap_or_else(|error| panic!("{label}: {error}"))),
+                    _ => {
+                        let error = checked.err().unwrap_or_else(|| panic!("{label} checks")).to_string();
+                        assert!(error.contains("stream_mix_sinkhorn"), "{label}: {error}");
+                    }
+                }
+            }
+        }
+    }
+}

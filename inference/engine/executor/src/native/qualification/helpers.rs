@@ -35,36 +35,39 @@ pub(super) fn qualification_dynamic(
 pub(super) struct SublayerRows {
     pub form: crate::operators::InputForm,
     pub streams: u64,
-    pub injected: bool,
+    /// The width `IN` of a row of its join values (`operators::Join`).
+    pub width: u64,
 }
 
 impl SublayerRows {
     pub(super) const SINGLE: Self = Self {
         form: crate::operators::InputForm::SINGLE,
         streams: 1,
-        injected: false,
+        width: 0,
     };
 
     /// The rows of a target sublayer of `decoder` reading `source`: a mix
-    /// site's sublayer reads its site's partials and scatters into the
-    /// streams.
+    /// site's sublayer reads its site's partials, or a Sinkhorn site's
+    /// input row, and scatters into the streams.
     pub(super) fn of(
         decoder: &magnitude_family_contracts::Decoder,
         source: Option<crate::operators::SublayerSource<'_>>,
         label: &str,
     ) -> Result<Self, CatalogFailure> {
         match source {
-            Some(source @ crate::operators::SublayerSource::Mix(_)) => {
-                let streams = crate::operators::streams::StreamsGeometry::of(decoder)
+            Some(
+                source @ (crate::operators::SublayerSource::Mix(_)
+                | crate::operators::SublayerSource::Sinkhorn(_)),
+            ) => {
+                let geometry = crate::operators::streams::StreamsGeometry::of(decoder)
                     .map_err(|error| qualification_dynamic("target", label, error))?
                     .ok_or_else(|| {
                         qualification_dynamic("target", label, "a mix site without streams")
-                    })?
-                    .streams;
+                    })?;
                 Ok(Self {
-                    form: source.form(streams),
-                    streams,
-                    injected: true,
+                    form: source.form(geometry.streams),
+                    streams: geometry.streams,
+                    width: geometry.join_width(),
                 })
             }
             _ => Ok(Self::SINGLE),
@@ -114,8 +117,9 @@ impl SublayerRows {
         )
     }
 
-    /// The output entry's inject values of `rows` rows: one per stream (of
-    /// ones), or none.
+    /// The output entry's join values of `rows` rows: one inject value per
+    /// stream (of ones), and of a Sinkhorn site the identity comb after
+    /// them, which leaves each stream its own; or none.
     pub(super) fn inject(
         &self,
         device: &Device,
@@ -123,8 +127,13 @@ impl SublayerRows {
         entry: &'static str,
         label: &str,
     ) -> Result<Tensor, CatalogFailure> {
-        let values = if self.injected { self.streams } else { 0 };
-        semantic_ones(device, Element::f32(), &[rows, values], entry, label)
+        let s = self.streams;
+        let row = (0..self.width).map(|at| match at.checked_sub(s) {
+            None => 1.0,
+            Some(comb) => f32::from(u8::from(comb / s == comb % s)),
+        });
+        let values = (0..rows).flat_map(|_| row.clone()).collect::<Vec<_>>();
+        semantic_dense_values(device, Element::f32(), &[rows, self.width], &values, entry, label)
     }
 }
 

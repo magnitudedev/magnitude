@@ -94,6 +94,7 @@ pub(crate) mod tests {
     use magnitude_family_contracts::{
         ModelDefinition, SublayerIndex, WeightDescriptor, WeightKind, WeightRole, WeightScope,
     };
+    use crate::operators::streams::BlockStreams;
     use magnitude_state::KvCodec;
     use seismic::{DType, Element};
 
@@ -651,7 +652,7 @@ pub(crate) mod tests {
         let mut downs = std::collections::HashSet::new();
         let mut ups = std::collections::HashSet::new();
         for (index, block) in blocks.iter().enumerate() {
-            let streams = block.streams().unwrap();
+            let Some(BlockStreams::LowRank(streams)) = block.block_streams() else { panic!("low-rank streams") };
             assert_eq!(streams.mixer, site);
             assert_eq!(streams.feed_forward, Some(site));
             assert_eq!(streams.exit, (index + 1 == blocks.len()).then_some(exit));
@@ -680,7 +681,10 @@ pub(crate) mod tests {
         let element = |scope, kind| planned_element(load.target(), scope, kind).unwrap();
         let scope = |block, sublayer| WeightScope::TargetSublayer(SublayerIndex { block, sublayer });
         let blocks = plan.target().blocks();
-        let [first, last] = [blocks[0].streams().unwrap(), blocks[1].streams().unwrap()];
+        let [first, last] = [0, 1].map(|block| match blocks[block].block_streams() {
+            Some(BlockStreams::LowRank(streams)) => streams,
+            other => panic!("block {block}'s streams are {other:?}"),
+        });
         let down = |scope| element(scope, WeightKind::HyperConnectionDown);
         assert_ne!(down(scope(1, 1)), down(scope(0, 1)));
         assert_eq!(first.feed_forward.unwrap().site.down, down(scope(0, 1)));

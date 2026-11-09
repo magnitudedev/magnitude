@@ -9,7 +9,7 @@ use crate::operators;
 use crate::{ResidencyStore, ResidentWeight, WeightImportError};
 use magnitude_artifacts::{Package, gguf::GgufArtifact};
 use magnitude_family_contracts::{
-    ActivationDType, ExitNorm, HeadComponent, ModelDefinition, ProgressivePlane, VisionDescription,
+    ActivationDType, ExitNorm, HeadComponent, LayerNorm, RmsNorm, ModelDefinition, ProgressivePlane, VisionDescription,
     WeightKind, WeightRole, WeightScope,
 };
 use seismic::DType;
@@ -311,14 +311,20 @@ pub(crate) fn import_target(
     let activation = activation_dtype(decoder.activation_dtype);
     let target = package.target();
     let embedding = residency.import_gguf(target, &decoder.entry.embedding, activation)?;
-    // A hyper-connection exit site is the last block's mix site: its roles
-    // are resident beside the sublayers'. Any other exit norm is the
-    // readout's.
+    // A low-rank hyper-connection exit site is the last block's mix site:
+    // its roles are resident beside the sublayers'. Every exit norm (a
+    // previous-site exit's among them) is the readout's.
     let (exit_roles, output_norm) = match &decoder.exit.norm {
-        ExitNorm::HyperConnectionHead(_) => (operators::exit_weights(decoder), None),
-        norm => (
+        ExitNorm::HyperConnectionHead(exit) => (
+            operators::exit_weights(decoder)
+                .into_iter()
+                .filter(|(role, _)| role.kind != magnitude_family_contracts::WeightKind::OutputNorm)
+                .collect(),
+            exit.norm.as_ref().map(|norm| residency.import_gguf(target, &norm.weight, activation)).transpose()?,
+        ),
+        ExitNorm::Rms(RmsNorm { weight, .. }) | ExitNorm::Layer(LayerNorm { weight, .. }) => (
             Vec::new(),
-            Some(residency.import_gguf(target, norm.weight(), activation)?),
+            Some(residency.import_gguf(target, weight, activation)?),
         ),
     };
     let sublayers = ResidentRoles::import(

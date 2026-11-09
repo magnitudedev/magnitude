@@ -6,11 +6,11 @@
 
 use super::super::*;
 use super::*;
-use crate::operators::streams::{MixDownBinding, MixUpBinding, StreamsBinding};
+use crate::operators::streams::{BlockStreams, MixDownBinding, MixUpBinding, SinkhornBinding, StreamsBinding};
 use magnitude_family_contracts::{NGramHash, Operator, SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
-    ngram_gate, ngram_inject, ngram_rows, repeat_rows, stored_rows, stream_mix_down,
-    stream_mix_up,
+    ngram_gate, ngram_inject, ngram_rows, repeat_rows, stored_rows, stream_collapse, stream_join,
+    stream_mix_down, stream_mix_sinkhorn, stream_mix_up,
 };
 
 /// Values agree with an expectation within this relative error: an entry
@@ -104,6 +104,7 @@ impl<'a> QualificationView<'a> {
     /// stream.
     pub(super) fn qualify_streams(&self, device: &Device) -> Result<(), CatalogFailure> {
         let mut qualified = QualifiedSites::default();
+        let mut sinkhorn = std::collections::HashSet::new();
         let mut widened = false;
         for (binding, kernels) in self
             .plan
@@ -111,20 +112,30 @@ impl<'a> QualificationView<'a> {
             .blocks()
             .iter()
             .zip(&self.programs.target.blocks)
-            .filter_map(|(slot, block)| slot.streams().zip(block.streams.as_ref()))
+            .filter_map(|(slot, block)| slot.block_streams().zip(block.streams.as_ref()))
         {
-            qualify_stream_binding(device, binding, kernels, &mut qualified, !widened)?;
-            widened = true;
+            let (hidden, streams) = match binding {
+                BlockStreams::LowRank(binding) => {
+                    qualify_stream_binding(device, binding, kernels, &mut qualified)?;
+                    (binding.geometry.hidden, binding.geometry.streams)
+                }
+                BlockStreams::Sinkhorn(binding) => {
+                    if sinkhorn.insert(binding) {
+                        qualify_sinkhorn_binding(device, binding, kernels)?;
+                    }
+                    (binding.hidden, binding.streams)
+                }
+            };
+            if !widened {
+                qualify_widening(device, hidden, streams, kernels, &format!("{binding:?}"))?;
+                widened = true;
+            }
         }
         for block in self.programs.head.iter().flat_map(|head| &head.blocks) {
             if let Some((binding, kernels)) = block.binding.streams.zip(block.streams.as_ref()) {
-                qualify_stream_binding(
-                    device,
-                    binding,
-                    kernels,
-                    &mut QualifiedSites::default(),
-                    true,
-                )?;
+                qualify_stream_binding(device, binding, kernels, &mut QualifiedSites::default())?;
+                let label = format!("{binding:?}");
+                qualify_widening(device, binding.geometry.hidden, binding.geometry.streams, kernels, &label)?;
             }
         }
         Ok(())
@@ -381,15 +392,16 @@ struct QualifiedSites {
     up: std::collections::HashSet<MixUpBinding>,
 }
 
-/// The entries of `binding`'s sites that `qualified` lacks, and the
-/// widening when `widen`.
+/// The entries of `binding`'s low-rank sites that `qualified` lacks.
 fn qualify_stream_binding(
     device: &Device,
     binding: StreamsBinding,
     kernels: &StreamsKernels,
     qualified: &mut QualifiedSites,
-    widen: bool,
 ) -> Result<(), CatalogFailure> {
+    let MixingKernels::LowRank(sites) = &kernels.mixing else {
+        return Err(qualification_dynamic("target_streams", &format!("{binding:?}"), "low-rank sites without their entries"));
+    };
     let label = format!("{binding:?}");
     let geometry = binding.geometry;
     let (h, s, r) = (geometry.hidden, geometry.streams, geometry.rank);
@@ -402,7 +414,7 @@ fn qualify_stream_binding(
     for (site, kernels) in binding
         .entries()
         .present()
-        .zip(kernels.sites.as_ref().present())
+        .zip(sites.as_ref().present())
     {
         let up_pending = qualified.up.insert(site.up);
         if !qualified.down.insert(site.down) && !up_pending {
@@ -455,9 +467,87 @@ fn qualify_stream_binding(
             &label,
         )?;
     }
-    if !widen {
-        return Ok(());
+    Ok(())
+}
+
+/// A Sinkhorn binding's entries, on one row of ones streams `[S, H]` with
+/// the one-hot pre, zero function and base weights and unit scales: every
+/// mix is 0, so the site's input is the first stream's row of ones, its pre
+/// `sigmoid(0) + epsilon`, its post `2 sigmoid(0) = 1`, and its comb the
+/// uniform softmax rows `1/S + epsilon` under the binding's normalizations,
+/// each entry `c / (S c + epsilon)` of the uniform `c` before it. The
+/// collapse of ones streams by unit pre is `S`, and the join of ones streams
+/// and output with unit post and comb `S + 1`.
+fn qualify_sinkhorn_binding(
+    device: &Device,
+    binding: SinkhornBinding,
+    kernels: &StreamsKernels,
+) -> Result<(), CatalogFailure> {
+    let label = format!("{binding:?}");
+    let entry = "target_streams";
+    let MixingKernels::Sinkhorn(sinkhorn) = &kernels.mixing else {
+        return Err(qualification_dynamic(entry, &label, "Sinkhorn streams without their entries"));
+    };
+    let SinkhornBinding { hidden: h, streams: s, mixing } = binding;
+    let ones = |extents: &[u64]| semantic_ones(device, Element::f32(), extents, entry, &label);
+    let zeros = |extents: &[u64]| semantic_zeros(device, Element::f32(), extents, entry, &label);
+    let streams = ones(&[1, s * h])?;
+    let mut one_hot = vec![0.0; s as usize];
+    one_hot[0] = 1.0;
+    let site = sinkhorn
+        .site
+        .call(stream_mix_sinkhorn::Args {
+            hidden: &view(&streams, &[1, s, h], entry, &label)?,
+            previous: &semantic_f32(device, &[1, s], &one_hot, entry, &label)?,
+            function: &zeros(&[(2 + s) * s, s * h])?,
+            base: &zeros(&[(2 + s) * s])?,
+            scale: &ones(&[3])?,
+            epsilon: mixing.epsilon,
+            norm_epsilon: mixing.norm_epsilon,
+            iterations: mixing.iterations,
+        })
+        .map_err(|error| qualification_dynamic("stream_mix_sinkhorn", &label, error))?;
+    let normalize = |comb: f32| comb / (s as f32 * comb + mixing.epsilon);
+    let mut comb = 1.0 / s as f32 + mixing.epsilon;
+    for sweep in 0..mixing.iterations {
+        if sweep > 0 {
+            comb = normalize(comb);
+        }
+        comb = normalize(comb);
     }
+    let join = (0..s + s * s).map(|at| if at < s { 1.0 } else { comb }).collect::<Vec<_>>();
+    require_f32_near(&site.r0, &vec![1.0; h as usize], "stream_mix_sinkhorn", &label)?;
+    require_f32_near(&site.r1, &vec![0.5 + mixing.epsilon; s as usize], "stream_mix_sinkhorn", &label)?;
+    require_f32_near(&site.r2, &join, "stream_mix_sinkhorn", &label)?;
+    let collapsed = sinkhorn
+        .collapse
+        .call(stream_collapse::Args {
+            hidden: &view(&streams, &[1, s, h], entry, &label)?,
+            pre: &ones(&[1, s])?,
+        })
+        .map_err(|error| qualification_dynamic("stream_collapse", &label, error))?
+        .value;
+    require_f32_near(&collapsed, &vec![s as f32; h as usize], "stream_collapse", &label)?;
+    let joined = sinkhorn
+        .join
+        .call(stream_join::Args {
+            residual: &streams,
+            y: &ones(&[1, h])?,
+            inject: &ones(&[1, s + s * s])?,
+        })
+        .map_err(|error| qualification_dynamic("stream_join", &label, error))?
+        .value;
+    require_f32_near(&joined, &vec![s as f32 + 1.0; (s * h) as usize], "stream_join", &label)
+}
+
+/// The widening of embedded rows into `streams` streams of `hidden`.
+fn qualify_widening(
+    device: &Device,
+    h: u64,
+    s: u64,
+    kernels: &StreamsKernels,
+    label: &str,
+) -> Result<(), CatalogFailure> {
     let row_values = (0..h)
         .map(|index| (index % 7) as f32 - 3.0)
         .collect::<Vec<_>>();

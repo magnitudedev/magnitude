@@ -4,23 +4,26 @@
 //! site. The widening (`repeat_rows`) has no tuning parameters.
 
 use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
-use crate::operators::streams::{MixDownBinding, MixUpBinding, StreamsGeometry};
+use crate::operators::streams::{LowRankGeometry, MixDownBinding, MixUpBinding, StreamsGeometry};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{stream_mix_down, stream_mix_up};
 use seismic::{BuildError, Element, Tensor};
 
-/// The streams' geometry of the tuned model.
-fn geometry(inputs: &ModelInputs<'_>) -> Result<StreamsGeometry, String> {
+/// The low-rank streams' geometry of the tuned model, whose mix sites these
+/// cases tune.
+fn geometry(inputs: &ModelInputs<'_>) -> Result<LowRankGeometry, String> {
     StreamsGeometry::of(&inputs.definition.decoder)
         .map_err(|error| error.to_string())?
-        .ok_or_else(|| "the decoder has a single residual stream".into())
+        .ok_or("the decoder has a single residual stream")?
+        .low_rank()
+        .ok_or_else(|| "the decoder's streams mix by Sinkhorn, not by low-rank sites".into())
 }
 
 /// The streams `[rows, S, H]` and a site's norm `[S, H]`.
 fn streams_and_norm(
     inputs: &mut TuningInputs<'_, '_>,
     scope: WeightScope,
-    geometry: StreamsGeometry,
+    geometry: LowRankGeometry,
     rows: u64,
     seed: u64,
 ) -> Result<(Tensor, Tensor), BuildError> {

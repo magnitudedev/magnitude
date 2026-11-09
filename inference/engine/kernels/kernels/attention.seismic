@@ -87,7 +87,7 @@ fn attention_absorb[G, W](qt: &tensor[G, W] A, key: &tensor[W] f32,
 fn attention_output[M, D, SN, IN, Q, W, OS, OB](hidden: &tensor[M, SN * D] f32, inject: &tensor[M, IN] f32,
     gated: &tensor[M, Q, W] A, output_weight: &tensor[D, Q * W] OW, output_scale: &tensor[OS] f32,
     output_bound: &tensor[OB] f32) -> tensor[M, SN * D] f32
-    where OS >= 0 and OS <= 1 and OB >= 0 and (OB == 0 or Q * W % OB == 0) and IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)):
+    where OS >= 0 and OS <= 1 and OB >= 0 and (OB == 0 or Q * W % OB == 0) and IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1) or (IN == SN + SN * SN and SN >= 1)):
     let mut summed = tensor[M, D] f32
     let mut projected = tensor[M, D] A
     let mut result = tensor[M, SN * D] f32
@@ -189,7 +189,7 @@ native attention_output for metal from "metal/attention_output.metal":
 native attention_output for cuda from "cuda/attention_output.cu":
     static (D, SN, IN, Q, W, OS)
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
-    where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(OW, INT8) == 1)
+    where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(OW, INT8) == 1) and IN <= SN
     scratch staged bytes (M * Q * W * max(1 + OPERAND, 2 * operands(OW))) when (M > 1 and operands(OW) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * Q * W / 4) when INT8 == 1 and M > 16
     scratch partials bytes (2 * M * D * 4) when M > 16 and M <= 128
@@ -233,7 +233,7 @@ native attention_output for vulkan from "vulkan/attention_output.comp":
     let GEMV_GROUPS = ceil_div(D, SIMDGROUPS * ROWS * 32 / LANES)
     let GEMV_THREADS = SIMDGROUPS * 32
     let GEMV_SHARED = 256 + 32 * operands(OW) + min(8 * ceil_div(Q * W, 32), 288) * 72
-    where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
+    where Q * W > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N and IN <= SN
     scratch partials bytes (SPLIT * M * D * 4) when M > 8 and SPLIT > 1
     scratch staged bytes (M * Q * W * 2) when M > 8 and operands(OW) == 1
     launch attention_output_stage when M > 8 and operands(OW) == 1:

@@ -24,8 +24,9 @@ use crate::SublayerTail;
 use crate::error::PlanError;
 use magnitude_family_contracts::{
     Attention, Block, BranchOutput, Decoder, DenseFfn, ExitNorm, GatedDelta, Head, HeadBlock,
-    HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, HyperConnectionWeights,
-    InputNorm, KeyValue, ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy,
+    ExitSite, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, HyperConnectionExit,
+    HyperConnectionInput, HyperConnectionWeights, InputNorm, KeyValue, LayerNorm, LowRankGatedSite,
+    ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy,
     ResidualForm, RmsNorm, RoutedFfn, RouterInput, Sublayer, SublayerIndex, VocabularyProjection,
     WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
@@ -33,13 +34,16 @@ use magnitude_family_contracts::{HistoryReads, ShortConv, StateSpace};
 use seismic::Element;
 
 /// How a sublayer's output joins the residual (`scatter`): into `streams`
-/// hyper-connection streams by a mix site's inject values (`[M, streams]`),
-/// or into one stream (`[M, 0]`, no inject).
+/// hyper-connection streams by a mix site's join values (`[M, IN]`: a
+/// low-rank site's inject values, `IN = streams`; a Sinkhorn site's post |
+/// comb, `IN = streams + streams²`), or into one stream (`[M, 0]`, no
+/// inject).
 pub(crate) struct Join {
-    /// The mix site's inject values; none for one stream.
+    /// The mix site's join values; none for one stream.
     pub values: Option<seismic::WorkflowTensor>,
     pub streams: u64,
-    pub injected: bool,
+    /// The width `IN` of a row of the join values.
+    pub width: u64,
     /// The class dimension the joined rows follow in their graph, if any.
     pub class: Option<&'static str>,
 }
@@ -51,7 +55,22 @@ impl Join {
         Self {
             values: None,
             streams: 1,
-            injected: false,
+            width: 0,
+            class,
+        }
+    }
+
+    /// The join into `geometry`'s streams by a site's join `values`, its
+    /// rows following the class dimension `class`.
+    pub(crate) fn streams(
+        geometry: streams::StreamsGeometry,
+        values: seismic::WorkflowTensor,
+        class: Option<&'static str>,
+    ) -> Self {
+        Self {
+            values: Some(values),
+            streams: geometry.streams,
+            width: geometry.join_width(),
             class,
         }
     }
@@ -77,10 +96,7 @@ impl Join {
 
     /// The output entries' join dimensions `SN` and `IN`.
     pub(crate) fn dimensions(&self) -> [(&'static str, u64); 2] {
-        [
-            ("SN", self.streams),
-            ("IN", if self.injected { self.streams } else { 0 }),
-        ]
+        [("SN", self.streams), ("IN", self.width)]
     }
 }
 
@@ -119,12 +135,19 @@ impl InputForm {
         normalized: true,
     };
 
-    /// The decoder readout's input form: the exit site's partial rows, one
-    /// per hyper-connection stream, unnormalized; or the final row under the
-    /// exit norm.
+    /// The decoder readout's input form: a low-rank exit site's partial
+    /// rows, one per hyper-connection stream, unnormalized; or the final row
+    /// under the exit norm (a Sinkhorn exit's collapse of the streams among
+    /// them).
     pub(crate) fn exit(decoder: &Decoder) -> Self {
         match (&decoder.exit.norm, &decoder.residual) {
-            (ExitNorm::HyperConnectionHead(_), ResidualForm::HyperConnections(form)) => Self {
+            (
+                ExitNorm::HyperConnectionHead(HyperConnectionExit {
+                    site: ExitSite::Own(_),
+                    ..
+                }),
+                ResidualForm::HyperConnections(form),
+            ) => Self {
                 parts: form.streams,
                 normalized: false,
             },
@@ -173,15 +196,108 @@ pub(crate) fn tail(
 /// consumes them.
 pub(crate) fn exit_weights(decoder: &Decoder) -> Vec<(WeightRole, &WeightDescriptor)> {
     match &decoder.exit.norm {
-        ExitNorm::HyperConnectionHead(site) => {
+        ExitNorm::HyperConnectionHead(exit) => {
             let mut weights = Vec::new();
-            hyper_connection_weights(site, WeightScope::Target, &mut weights);
+            exit_site_weights(exit, WeightScope::Target, &mut weights);
             weights
         }
-        norm => vec![(
-            role(WeightScope::Target, WeightKind::OutputNorm),
-            norm.weight(),
-        )],
+        ExitNorm::Rms(RmsNorm { weight, .. }) | ExitNorm::Layer(LayerNorm { weight, .. }) => {
+            vec![(role(WeightScope::Target, WeightKind::OutputNorm), weight)]
+        }
+    }
+}
+
+/// A hyper-connection exit's weights in the order its mix consumes them:
+/// its own site's, then its norm's.
+fn exit_site_weights<'a>(
+    exit: &'a HyperConnectionExit,
+    scope: WeightScope,
+    weights: &mut Vec<(WeightRole, &'a WeightDescriptor)>,
+) {
+    if let ExitSite::Own(site) = &exit.site {
+        low_rank_weights(site, scope, weights);
+    }
+    if let Some(norm) = &exit.norm {
+        weights.push((role(scope, WeightKind::OutputNorm), &norm.weight));
+    }
+}
+
+/// What a sublayer reads through its hyper-connection input, in the forms
+/// the block graphs run: a low-rank site, unnormalized after its mix; or a
+/// Sinkhorn site, whose input row the sublayer's norm normalizes.
+fn mix_source(input: &HyperConnectionInput) -> Result<SublayerSource<'_>, PlanError> {
+    match input {
+        HyperConnectionInput {
+            site: HyperConnectionWeights::LowRankGated(site),
+            norm: None,
+        } => Ok(SublayerSource::Mix(site)),
+        HyperConnectionInput {
+            site: HyperConnectionWeights::LowRankGated(_),
+            norm: Some(_),
+        } => Err(PlanError::Unsupported("a normalized low-rank hyper-connection input")),
+        HyperConnectionInput {
+            site: HyperConnectionWeights::Sinkhorn(_),
+            norm: Some(norm),
+        } => Ok(SublayerSource::Sinkhorn(norm)),
+        HyperConnectionInput {
+            site: HyperConnectionWeights::Sinkhorn(_),
+            norm: None,
+        } => Err(PlanError::Unsupported("an unnormalized Sinkhorn hyper-connection input")),
+    }
+}
+
+/// What a mixer or feed-forward sublayer reads through its `input`.
+pub(crate) fn sublayer_source(input: &InputNorm) -> Result<SublayerSource<'_>, PlanError> {
+    match input {
+        InputNorm::Rms(norm) => Ok(SublayerSource::Norm(norm)),
+        InputNorm::HyperConnectionMix(input) => mix_source(input),
+        _ => Err(PlanError::Unsupported("sublayer input normalization")),
+    }
+}
+
+/// A head reading Sinkhorn streams: its graphs carry no `pre` through its
+/// passes.
+pub(crate) const SINKHORN_HEAD: &str = "a draft head over Sinkhorn hyper-connection streams";
+
+/// How the readout reads hyper-connection streams, in the forms it runs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ExitMix<'a> {
+    /// A low-rank site of its own, unnormalized after its mix, whose
+    /// partials the readout sums.
+    Own(&'a LowRankGatedSite),
+    /// The streams collapsed by the last site's pre, which the readout
+    /// normalizes by `norm`.
+    Previous(&'a RmsNorm),
+}
+
+impl ExitMix<'_> {
+    pub(crate) fn of(exit: &HyperConnectionExit) -> Result<ExitMix<'_>, PlanError> {
+        match exit {
+            HyperConnectionExit {
+                site: ExitSite::Own(site),
+                norm: None,
+            } => Ok(ExitMix::Own(site)),
+            HyperConnectionExit {
+                site: ExitSite::Own(_),
+                norm: Some(_),
+            } => Err(PlanError::Unsupported("a normalized low-rank hyper-connection exit")),
+            HyperConnectionExit {
+                site: ExitSite::PreviousSite,
+                norm: Some(norm),
+            } => Ok(ExitMix::Previous(norm)),
+            HyperConnectionExit {
+                site: ExitSite::PreviousSite,
+                norm: None,
+            } => Err(PlanError::Unsupported("an unnormalized previous-site hyper-connection exit")),
+        }
+    }
+
+    /// The epsilon of the exit's norm: its site's, or the readout's.
+    pub(crate) fn epsilon(&self) -> f64 {
+        match self {
+            Self::Own(site) => site.norm.epsilon,
+            Self::Previous(norm) => norm.epsilon,
+        }
     }
 }
 
@@ -269,8 +385,10 @@ pub(crate) fn head_weights(head: &Head) -> Result<Vec<(WeightRole, &WeightDescri
                 .ok_or(PlanError::Arithmetic("head block index"))?;
         }
         match &head_block.output_norm {
-            ExitNorm::HyperConnectionHead(site) => hyper_connection_weights(site, scope, &mut weights),
-            norm => weights.push((role(WeightKind::OutputNorm), norm.weight())),
+            ExitNorm::HyperConnectionHead(exit) => exit_site_weights(exit, scope, &mut weights),
+            ExitNorm::Rms(RmsNorm { weight, .. }) | ExitNorm::Layer(LayerNorm { weight, .. }) => {
+                weights.push((role(WeightKind::OutputNorm), weight))
+            }
         }
         if let Some(table) = head_block.readout.own_table() {
             weights.push((role(WeightKind::Output), table));
@@ -469,7 +587,12 @@ fn input_weights<'a>(
 ) {
     match input {
         InputNorm::Rms(norm) => weights.push((role(scope, WeightKind::InputNorm), &norm.weight)),
-        InputNorm::HyperConnectionMix(site) => hyper_connection_weights(site, scope, weights),
+        InputNorm::HyperConnectionMix(input) => {
+            hyper_connection_weights(&input.site, scope, weights);
+            if let Some(norm) = &input.norm {
+                weights.push((role(scope, WeightKind::InputNorm), &norm.weight));
+            }
+        }
         InputNorm::RmsUnweighted(_) | InputNorm::None => {}
     }
 }
@@ -477,6 +600,22 @@ fn input_weights<'a>(
 /// A hyper-connection site's weights in the order its mix consumes them.
 pub(crate) fn hyper_connection_weights<'a>(
     site: &'a HyperConnectionWeights,
+    scope: WeightScope,
+    weights: &mut Vec<(WeightRole, &'a WeightDescriptor)>,
+) {
+    match site {
+        HyperConnectionWeights::LowRankGated(site) => low_rank_weights(site, scope, weights),
+        HyperConnectionWeights::Sinkhorn(site) => weights.extend([
+            (role(scope, WeightKind::HyperConnectionFunction), &site.function),
+            (role(scope, WeightKind::HyperConnectionBase), &site.base),
+            (role(scope, WeightKind::HyperConnectionScale), &site.scale),
+        ]),
+    }
+}
+
+/// A low-rank site's weights in the order its mix consumes them.
+fn low_rank_weights<'a>(
+    site: &'a LowRankGatedSite,
     scope: WeightScope,
     weights: &mut Vec<(WeightRole, &'a WeightDescriptor)>,
 ) {
@@ -548,6 +687,10 @@ pub(crate) fn is_fixed_dense_role(kind: WeightKind) -> bool {
             | WeightKind::SharedRouter
             | WeightKind::ConvolutionBase
             | WeightKind::AttentionSinks
+            // `stream_mix_sinkhorn` projects and mixes in F32.
+            | WeightKind::HyperConnectionFunction
+            | WeightKind::HyperConnectionBase
+            | WeightKind::HyperConnectionScale
     ) || matches!(kind, WeightKind::Corrector(weight) if draft::corrector_reads_f32(weight))
 }
 
@@ -599,19 +742,22 @@ pub(crate) struct PairedBlock<'a> {
     pub ngram: Option<ngram::NGramSublayer<'a>>,
 }
 
-/// What a sublayer reads: the residual under its RMS input norm, or a
-/// hyper-connection mix site over the residual streams.
+/// What a sublayer reads: the residual under its RMS input norm, a low-rank
+/// hyper-connection mix site's partials over the residual streams, or a
+/// Sinkhorn site's input row under the sublayer's norm (the site's weights
+/// are read by their roles, `stream_mix_sinkhorn`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SublayerSource<'a> {
     Norm(&'a RmsNorm),
-    Mix(&'a HyperConnectionWeights),
+    Mix(&'a LowRankGatedSite),
+    Sinkhorn(&'a RmsNorm),
 }
 
 impl SublayerSource<'_> {
     /// The epsilon of the source's norm.
     pub fn epsilon(&self) -> f64 {
         match self {
-            Self::Norm(norm) => norm.epsilon,
+            Self::Norm(norm) | Self::Sinkhorn(norm) => norm.epsilon,
             Self::Mix(mix) => mix.norm.epsilon,
         }
     }
@@ -631,10 +777,11 @@ impl SublayerSource<'_> {
     }
 
     /// How the sublayer's consumer entry forms its input over `streams`
-    /// residual streams: one normalized row, or the mix site's partials.
+    /// residual streams: one normalized row (the residual's, or a Sinkhorn
+    /// site's input), or a low-rank site's partials.
     pub fn form(&self, streams: u64) -> InputForm {
         match self {
-            Self::Norm(_) => InputForm::SINGLE,
+            Self::Norm(_) | Self::Sinkhorn(_) => InputForm::SINGLE,
             Self::Mix(_) => InputForm {
                 parts: streams,
                 normalized: false,
@@ -763,7 +910,6 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
         return Err(PlanError::Deferred(*form));
     }
     let decoder = &definition.decoder;
-    // Residual streams mix only low rank and gated (`streams`).
     streams::StreamsGeometry::of(decoder)?;
     // `embedding_rows` scales (`embedding_transform`) and normalizes text
     // rows. Media rows enter as their projector leaves them: a family whose
@@ -773,9 +919,9 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     attention::admit_shared(decoder)?;
     // The final norm, or the exit site's (the contract pairs each with its
     // residual form).
-    let exit = match &decoder.exit.norm {
-        ExitNorm::Rms(norm) => norm,
-        ExitNorm::HyperConnectionHead(site) => &site.norm,
+    let exit_epsilon = match &decoder.exit.norm {
+        ExitNorm::Rms(norm) => norm.epsilon,
+        ExitNorm::HyperConnectionHead(exit) => ExitMix::of(exit)?.epsilon(),
         _ => return Err(PlanError::Unsupported("readout normalization")),
     };
     for block in &decoder.blocks {
@@ -785,7 +931,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
                 .epsilons()
                 .iter()
                 .any(|epsilon| *epsilon != paired.epsilon())
-        }) || exit.epsilon != paired.epsilon()
+        }) || exit_epsilon != paired.epsilon()
         {
             return Err(PlanError::Unsupported(
                 "normalization epsilons differing within a decoder",
@@ -797,7 +943,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
         if let HeadForm::Shared(shared) = form {
             admit_shared_head(&shared)?;
             // Its kernels are prepared with the decoder's one epsilon.
-            if shared.output_norm.epsilon != exit.epsilon {
+            if shared.output_norm.epsilon != exit_epsilon {
                 return Err(PlanError::Unsupported(
                     "a draft head normalizing with another epsilon than its target",
                 ));
@@ -809,6 +955,11 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
             .filter(|_| matches!(form, HeadForm::Causal))
         {
             let block = CausalHeadBlock::of(head, head_block)?;
+            if streams::StreamsGeometry::from_residual(decoder.hidden, block.residual)?
+                .is_some_and(|geometry| geometry.sinkhorn().is_some())
+            {
+                return Err(PlanError::Unsupported(SINKHORN_HEAD));
+            }
             let paired = paired_block(block.block)?;
             if !matches!(paired.mixer, Mixer::Attention(_)) {
                 return Err(PlanError::Unsupported("draft head mixer"));
@@ -838,7 +989,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
             }
             let output_epsilon = match &head_block.output_norm {
                 ExitNorm::Rms(output) => output.epsilon,
-                ExitNorm::HyperConnectionHead(site) => site.norm.epsilon,
+                ExitNorm::HyperConnectionHead(exit) => ExitMix::of(exit)?.epsilon(),
                 _ => return Err(PlanError::Unsupported("draft head output normalization")),
             };
             if [
@@ -1087,17 +1238,10 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
         }
         Some(sublayer) => (Some(per_layer::admit(sublayer)?), None),
     };
-    fn source(input: &InputNorm) -> Result<SublayerSource<'_>, PlanError> {
-        match input {
-            InputNorm::Rms(norm) => Ok(SublayerSource::Norm(norm)),
-            InputNorm::HyperConnectionMix(mix) => Ok(SublayerSource::Mix(mix)),
-            _ => Err(PlanError::Unsupported("sublayer input normalization")),
-        }
-    }
     // The residual joins: a residual add (or a post-norm tail), or the
     // scatter of a mix site's sublayer into the streams.
     let joins = |output: &OutputForm| matches!(output, OutputForm::Residual | OutputForm::Scatter);
-    let mixer_input = source(&mixer.input)?;
+    let mixer_input = sublayer_source(&mixer.input)?;
     let mixer_op = match &mixer.op {
         Operator::Attention(operator) => {
             attention::admit(operator, mixer_input.epsilon())?;
@@ -1143,7 +1287,7 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
                     FeedForward::Dense(dense)
                 }
                 Operator::RoutedFfn(routed) => {
-                    routed_feed_forward(routed, source(&feed_forward.input)?.epsilon())?
+                    routed_feed_forward(routed, sublayer_source(&feed_forward.input)?.epsilon())?
                 }
                 op => return Err(unsupported_operator(op, "feed-forward")),
             };
@@ -1153,7 +1297,7 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
                 ));
             }
             Ok(FeedForwardSublayer {
-                input: Some(source(&feed_forward.input)?),
+                input: Some(sublayer_source(&feed_forward.input)?),
                 op,
                 output: &feed_forward.output,
             })

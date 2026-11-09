@@ -26,6 +26,21 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "decode routing that also expands the shared expert, the decode form of the backends that stream decode; the other backends run `routed_route`, then `routed_expand`",
     ),
     (
+        "stream_mix_sinkhorn",
+        &[BackendName::Cpu, BackendName::Metal],
+        "the Sinkhorn mix site (DeepSeek V4.1's single-pass hyper-connections), which no CUDA or Vulkan model runs yet",
+    ),
+    (
+        "stream_collapse",
+        &[BackendName::Cpu, BackendName::Metal],
+        "the exit of Sinkhorn hyper-connection streams, which no CUDA or Vulkan model runs yet",
+    ),
+    (
+        "stream_join",
+        &[BackendName::Cpu, BackendName::Metal],
+        "the streams' join of a general routed feed-forward's branch, which only Sinkhorn streams read and no CUDA or Vulkan model runs yet",
+    ),
+    (
         "gated_delta_project_convolved",
         &[BackendName::Metal],
         "the convolved recurrent decode form's projection, which also convolves and publishes the windows; the other backends run `gated_delta_project`, then `gated_delta_step`, until the form is measured there",

@@ -19,6 +19,7 @@ use crate::device_table::{SelectedRead, SubmittedRead};
 use crate::host_tables::HostTableError;
 use crate::stored_table::{NoticeStep, StepRows, StoredTable};
 use crate::operators::block::{BlockControlPorts, BlockStatePorts};
+use crate::operators::streams::ResidualCarry;
 use crate::experts::StepRoute;
 use crate::operators::routed::split::{RunStage, SplitPorts, SplitValues};
 use crate::{
@@ -616,7 +617,8 @@ struct TargetRun<'l> {
     /// whose fill is not yet queued (`run_sets`).
     unfilled: Option<usize>,
     residual: Option<Tensor>,
-    hidden: Tensor,
+    /// The carry the next block reads (`ResidualCarry`).
+    hidden: ResidualCarry<Tensor>,
     per_layer_rows: Option<Tensor>,
     region: ChainRegion,
     controls: GraphControls,
@@ -789,7 +791,7 @@ impl NativeTargetProgram {
             &run.launch.batch,
             &run.region,
             run.window,
-            &run.hidden,
+            &run.hidden.rows,
             run.residual.as_ref(),
         );
         let actual_outputs = batch.out_rows.len();
@@ -1054,7 +1056,7 @@ impl NativeTargetProgram {
         media_rows: &[std::ops::Range<usize>],
         submitter: &mut StepSubmitter,
     ) -> Result<Option<Tensor>, SubmitError> {
-        let (batch, region, rows, hidden) = (&run.launch.batch, &run.region, run.window.rows, &run.hidden);
+        let (batch, region, rows, hidden) = (&run.launch.batch, &run.region, run.window.rows, &run.hidden.rows);
         let Some(entry) = self.graphs.per_layer_entry(rows) else {
             return Ok(None);
         };
@@ -1666,7 +1668,7 @@ impl NativeTargetProgram {
             back: None,
             unfilled: None,
             residual: None,
-            hidden,
+            hidden: ResidualCarry::rows(hidden),
             per_layer_rows: None,
             region,
             controls,
@@ -1715,7 +1717,7 @@ impl NativeTargetProgram {
                     if let Some(BankRun { bank, sequence, .. }) = &run.bank {
                         bank.window(*sequence, index, run.window.first + tail.first).map_err(invalid)?;
                     }
-                    run.hidden = tail.slice(&run.hidden)?;
+                    run.hidden = run.hidden.as_ref().try_map(|carried| tail.slice(carried))?;
                     run.per_layer_rows = run
                         .per_layer_rows
                         .as_ref()
@@ -2021,7 +2023,12 @@ impl NativeTargetProgram {
                 .transpose()?;
             let mut bindings = bound.bindings();
             let hidden = graph.hidden.as_ref().ok_or_else(|| invalid("a run's graph reads no rows"))?;
-            bindings.set(hidden, &run.hidden).map_err(device)?;
+            bindings.set(&hidden.rows, &run.hidden.rows).map_err(device)?;
+            match (&hidden.pre, &run.hidden.pre) {
+                (Some(port), Some(pre)) => bindings.set(port, pre).map_err(device)?,
+                (None, None) => {}
+                _ => return Err(invalid("a block graph's pre port disagrees with the carry it reads")),
+            }
             // A split block binds its chain place's words of the bank's
             // placed parts and its rows of the crossing buffers; a back after
             // the group's pass the chain's experts' rows and its rows'
@@ -2236,9 +2243,10 @@ impl NativeTargetProgram {
                 run.recurrent_component += ports.len();
             }
             run.residual = graph.residual.as_ref().map(|edge| outputs.exported(edge).ok_or_else(|| invalid("target residual was not exported"))).transpose()?;
-            run.hidden = outputs
-                .exported(&graph.output)
-                .ok_or_else(|| invalid("target block output was not exported"))?;
+            run.hidden = graph
+                .output
+                .as_ref()
+                .try_map(|output| outputs.exported(output).ok_or_else(|| invalid("target block output was not exported")))?;
             rotation.recycle(std::mem::replace(&mut run.output, (next, outputs)))?;
             if let Some(started) = block_started {
                 let kind = match &graph.mixer {

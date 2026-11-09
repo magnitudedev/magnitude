@@ -50,15 +50,28 @@ pub struct HyperConnections {
     pub mixing: HyperConnectionMixing,
 }
 
+/// How every mix site of a decoder forms its coefficients. A site over the
+/// streams `X [S, H]` of a row gives the sublayer the input
+/// `Σ_s A[s] ⊙ X[s]` and joins its output `y` back as
+/// `X'[d] = Σ_s B[s, d]·X[s] + C[d]·y`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HyperConnectionMixing {
     /// Each site's mix passes through a `rank`-wide bottleneck
-    /// ([`HyperConnectionWeights`]).
-    LowRankGated {
-        rank: u64,
-    },
+    /// ([`LowRankGatedSite`]): `A` a per-element gate over the per-stream
+    /// normalized streams, `B = I`, `C` the inject values.
+    LowRankGated { rank: u64 },
+    /// Each site projects the flattened streams once ([`SinkhornSite`]),
+    /// in a single pass: `A` the per-stream scalars `pre` of the *previous*
+    /// site (a `[S]` F32 carry per row from one site to the next, across
+    /// block boundaries; the one-hot `[1, 0, .., 0]` before the first
+    /// site), `B` this site's doubly stochastic `comb` after `iterations`
+    /// normalizations, `C` its `post` values. `epsilon` is added to `pre`,
+    /// to `comb`'s softmax and to every normalization's denominator;
+    /// `norm_epsilon` is the projection's RMS statistic's.
     Sinkhorn {
         iterations: u64,
+        epsilon: f64,
+        norm_epsilon: f64,
     },
 }
 
@@ -125,17 +138,32 @@ pub enum ExitNorm {
     Rms(RmsNorm),
     Layer(LayerNorm),
     /// Collapses hyper-connection streams before readout.
-    HyperConnectionHead(HyperConnectionWeights),
+    HyperConnectionHead(HyperConnectionExit),
 }
 
-impl ExitNorm {
-    pub fn weight(&self) -> &WeightDescriptor {
-        match self {
-            Self::Rms(norm) => &norm.weight,
-            Self::Layer(norm) => &norm.weight,
-            Self::HyperConnectionHead(weights) => &weights.norm.weight,
-        }
-    }
+/// The decoder's exit over hyper-connection streams: the streams mixed by
+/// `site`'s input coefficients, then normalized by `norm` when present.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HyperConnectionExit {
+    pub site: ExitSite,
+    pub norm: Option<RmsNorm>,
+}
+
+/// Whose input coefficients the exit mixes the streams with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ExitSite {
+    /// A low-rank site of its own, without inject weights.
+    Own(LowRankGatedSite),
+    /// The last sublayer site's `pre`, under Sinkhorn mixing.
+    PreviousSite,
+}
+
+/// One hyper-connection mix site's weights, of the decoder's
+/// [`HyperConnectionMixing`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HyperConnectionWeights {
+    LowRankGated(LowRankGatedSite),
+    Sinkhorn(SinkhornSite),
 }
 
 /// One low-rank gated hyper-connection site over `S` streams of `H`, in F32:
@@ -150,7 +178,7 @@ impl ExitNorm {
 /// `y` is the operator's input as it is, not normalized again. A sublayer's
 /// [`OutputForm::Scatter`] adds `out · i[s]` to each stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HyperConnectionWeights {
+pub struct LowRankGatedSite {
     /// `[S·H]`, stream-major.
     pub norm: RmsNorm,
     /// `[rank, S·H]`.
@@ -159,6 +187,41 @@ pub struct HyperConnectionWeights {
     pub up: WeightDescriptor,
     /// `[S, S·H]`; absent at the exit site.
     pub inject: Option<WeightDescriptor>,
+}
+
+/// One Sinkhorn hyper-connection site over `S` streams of `H`, in F32, with
+/// `x` a row's flattened streams `[S·H]` and the mixing's epsilons and
+/// iterations `n`:
+///
+/// ```text
+/// m    = (function · x) · rsqrt(mean(x²) + norm_epsilon)    ([(2+S)·S])
+/// pre  = sigmoid(m[0:S]·scale[0] + base[0:S]) + epsilon
+/// post = 2·sigmoid(m[S:2S]·scale[1] + base[S:2S])
+/// comb = rowsoftmax(m[2S:]·scale[2] + base[2S:]) + epsilon   ([S, S], row s source stream)
+/// comb = comb / (colsum(comb) + epsilon), then n - 1 times
+///        comb / (rowsum(comb) + epsilon), comb / (colsum(comb) + epsilon)
+/// ```
+///
+/// The sublayer input is `Σ_s pre[s]·X[s]` with the previous site's `pre`,
+/// normalized by its input's norm; the
+/// sublayer's [`OutputForm::Scatter`] writes `post[d]·y + Σ_s comb[s, d]·X[s]`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SinkhornSite {
+    /// `[(2+S)·S, S·H]` F32.
+    pub function: WeightDescriptor,
+    /// `[(2+S)·S]` F32.
+    pub base: WeightDescriptor,
+    /// `[3]` F32.
+    pub scale: WeightDescriptor,
+}
+
+/// A sublayer's input through its hyper-connection mix site: the streams
+/// mixed by the site's input coefficients, then normalized by `norm` when
+/// present.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HyperConnectionInput {
+    pub site: HyperConnectionWeights,
+    pub norm: Option<RmsNorm>,
 }
 
 /// One decoder layer: usually `[mixer, feed-forward]`, possibly a lone mixer
@@ -188,7 +251,7 @@ pub enum InputNorm {
     Rms(RmsNorm),
     RmsUnweighted(UnweightedRms),
     /// Mixes hyper-connection streams into the sublayer input.
-    HyperConnectionMix(HyperConnectionWeights),
+    HyperConnectionMix(HyperConnectionInput),
     /// The operator reads the raw residual: every stream, under
     /// hyper-connections.
     None,
@@ -208,8 +271,9 @@ impl InputNorm {
 pub enum OutputForm {
     /// `residual + y`; under hyper-connections `y` has a row per stream.
     Residual,
-    /// `X[s] + y · i[s]` for every hyper-connection stream `s`, with `i` the
-    /// inject values of the sublayer's own mix site.
+    /// `Σ_s B[s, d]·X[s] + C[d]·y` for every hyper-connection stream `d`,
+    /// with `B` and `C` the output coefficients of the sublayer's own mix
+    /// site ([`HyperConnectionMixing`]).
     Scatter,
     /// `residual + RMS(y)·w`.
     PostNorm(RmsNorm),
@@ -1033,7 +1097,16 @@ impl Decoder {
         if let ResidualForm::HyperConnections(form) = &self.residual {
             let invalid = match form.mixing {
                 HyperConnectionMixing::LowRankGated { rank } => rank == 0,
-                HyperConnectionMixing::Sinkhorn { iterations } => iterations == 0,
+                HyperConnectionMixing::Sinkhorn {
+                    iterations,
+                    epsilon,
+                    norm_epsilon,
+                    ..
+                } => {
+                    iterations == 0
+                        || positive_epsilon(epsilon).is_err()
+                        || positive_epsilon(norm_epsilon).is_err()
+                }
             };
             if form.streams < 2 || invalid {
                 return Err(DefinitionError::new("invalid hyper-connection geometry"));
@@ -1291,10 +1364,15 @@ fn validate_residual_use(
     sublayer: &Sublayer,
     residual: &ResidualForm,
 ) -> Result<(), DefinitionError> {
+    // A sublayer's site joins its output into the streams: a low-rank site
+    // with inject weights, or any Sinkhorn site.
     let mixes = matches!(
         &sublayer.input,
-        InputNorm::HyperConnectionMix(HyperConnectionWeights {
-            inject: Some(_),
+        InputNorm::HyperConnectionMix(HyperConnectionInput {
+            site: HyperConnectionWeights::LowRankGated(LowRankGatedSite {
+                inject: Some(_),
+                ..
+            }) | HyperConnectionWeights::Sinkhorn(_),
             ..
         })
     );
@@ -1325,7 +1403,10 @@ fn validate_input(input: &InputNorm, context: &Context, role: &str) -> Result<()
     match input {
         InputNorm::Rms(norm) => validate_rms(norm, context.hidden, role),
         InputNorm::RmsUnweighted(norm) => positive_epsilon(norm.epsilon),
-        InputNorm::HyperConnectionMix(weights) => validate_hyper_connection(weights, context, role),
+        InputNorm::HyperConnectionMix(input) => {
+            validate_hyper_connection(&input.site, context, role)?;
+            validate_mixed_norm(input.norm.as_ref(), context, role)
+        }
         InputNorm::None => Ok(()),
     }
 }
@@ -1341,24 +1422,68 @@ fn hyper_connection_geometry(context: &Context) -> Option<(u64, u64)> {
     }
 }
 
+/// A sublayer site's weights against the decoder's mixing: the variant the
+/// mixing names, at its shapes.
 fn validate_hyper_connection(
     weights: &HyperConnectionWeights,
     context: &Context,
     role: &str,
 ) -> Result<(), DefinitionError> {
-    let (streams, rank) = hyper_connection_geometry(context).ok_or_else(|| {
-        DefinitionError::new(format!(
-            "{role} mixes streams without low-rank hyper-connections"
-        ))
-    })?;
+    let ResidualForm::HyperConnections(form) = context.residual else {
+        return Err(DefinitionError::new(format!(
+            "{role} mixes streams without hyper-connections"
+        )));
+    };
+    let streams = form.streams;
     let wide = checked_product(&[streams, context.hidden])?;
-    validate_rms(&weights.norm, wide, role)?;
-    expect_shape(&weights.down, &[rank, wide], role)?;
-    expect_shape(&weights.up, &[wide, rank], role)?;
-    if let Some(inject) = &weights.inject {
-        expect_shape(inject, &[streams, wide], role)?;
+    match weights {
+        HyperConnectionWeights::LowRankGated(site) => {
+            validate_low_rank(site, context, role)?;
+            // A sublayer's site without inject weights joins nothing, which
+            // its residual use refuses (`validate_residual_use`).
+            site.inject
+                .as_ref()
+                .map_or(Ok(()), |inject| expect_shape(inject, &[streams, wide], role))
+        }
+        HyperConnectionWeights::Sinkhorn(site) => {
+            if !matches!(form.mixing, HyperConnectionMixing::Sinkhorn { .. }) {
+                return Err(disagreement(role));
+            }
+            // pre, post and comb.
+            let mixes = checked_product(&[streams + 2, streams])?;
+            expect_shape(&site.function, &[mixes, wide], role)?;
+            expect_shape(&site.base, &[mixes], role)?;
+            expect_shape(&site.scale, &[3], role)
+        }
     }
-    Ok(())
+}
+
+/// A low-rank site's norm, down and up weights under low-rank mixing.
+fn validate_low_rank(
+    site: &LowRankGatedSite,
+    context: &Context,
+    role: &str,
+) -> Result<(), DefinitionError> {
+    let (streams, rank) = hyper_connection_geometry(context).ok_or_else(|| disagreement(role))?;
+    let wide = checked_product(&[streams, context.hidden])?;
+    validate_rms(&site.norm, wide, role)?;
+    expect_shape(&site.down, &[rank, wide], role)?;
+    expect_shape(&site.up, &[wide, rank], role)
+}
+
+fn disagreement(role: &str) -> DefinitionError {
+    DefinitionError::new(format!(
+        "{role}'s site disagrees with the decoder's hyper-connection mixing"
+    ))
+}
+
+/// The norm of a mixed row, when present, over the hidden width.
+fn validate_mixed_norm(
+    norm: Option<&RmsNorm>,
+    context: &Context,
+    role: &str,
+) -> Result<(), DefinitionError> {
+    norm.map_or(Ok(()), |norm| validate_rms(norm, context.hidden, role))
 }
 
 fn validate_operator(op: &Operator, context: &Context) -> Result<(), DefinitionError> {
@@ -1871,8 +1996,31 @@ pub(crate) fn validate_exit_norm(
             expect_shape(&norm.weight, &[context.hidden], role)?;
             positive_epsilon(norm.epsilon)
         }
-        ExitNorm::HyperConnectionHead(weights) if weights.inject.is_none() => {
-            validate_hyper_connection(weights, context, role)
+        ExitNorm::HyperConnectionHead(exit) if hyper_connections => {
+            match &exit.site {
+                ExitSite::Own(site) => {
+                    validate_low_rank(site, context, role)?;
+                    if site.inject.is_some() {
+                        return Err(DefinitionError::new(format!(
+                            "{role} injects into no stream"
+                        )));
+                    }
+                }
+                ExitSite::PreviousSite => {
+                    if !matches!(
+                        context.residual,
+                        ResidualForm::HyperConnections(HyperConnections {
+                            mixing: HyperConnectionMixing::Sinkhorn { .. },
+                            ..
+                        })
+                    ) {
+                        return Err(DefinitionError::new(format!(
+                            "{role} reads the previous site's coefficients without Sinkhorn mixing"
+                        )));
+                    }
+                }
+            }
+            validate_mixed_norm(exit.norm.as_ref(), context, role)
         }
         _ => Err(DefinitionError::new(format!(
             "{role} disagrees with the residual form"

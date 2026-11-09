@@ -20,9 +20,10 @@ use crate::{
             split::{OnceStage, PassPorts, RunStage, SplitPorts, Stage, StagePorts},
             streamed::{BankGraph, BankGraphEntries, CheckedBankEntries, LayerBank},
         },
+        ExitMix,
         streams::{
-            StreamsGeometry,
-            graph::{CheckedStreamsEntries, StreamsEntries, mix_site, widen},
+            ResidualCarry, StreamsGeometry,
+            graph::{CheckedStreamsEntries, MixingEntries, StreamsEntries, collapse, mix_site, widen},
         },
     },
     programs::{
@@ -42,15 +43,6 @@ use seismic::{
     NativeGraphPlan, NativePort, NativeTimelinePort, WorkflowTensor,
 };
 use std::sync::Arc;
-
-/// The width of the residual a block's mixer leaves: the streams (`S *
-/// H`) of a decoder with residual streams, every block's, the hidden width
-/// otherwise. A block's back reads it.
-fn mixed_width(geometry: &Decoder) -> Result<u64, String> {
-    Ok(StreamsGeometry::of(geometry)
-        .map_err(|error| error.to_string())?
-        .map_or(geometry.hidden, |streams| streams.width()))
-}
 
 /// Whether the prefill graphs of `slot`'s block come in classes that list
 /// their launch's history row tiles: an attention block's that may
@@ -80,8 +72,8 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     pub block: usize,
     pub residual: Option<WorkflowTensor>,
     pub plan: NativeGraphPlan,
-    /// The rows it reads: none of a pass, which reads only crossed rows.
-    pub hidden: Option<NativePort>,
+    /// The carry it reads: none of a pass, which reads only crossed rows.
+    pub hidden: Option<ResidualCarry<NativePort>>,
     pub weights: Vec<(WeightPort, NativePort)>,
     /// The bank ports of a block whose routed layer streams its experts.
     pub banks: Vec<(BankPort, NativePort)>,
@@ -112,9 +104,10 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     /// and a pass to its rows of them, and of the merged values a back
     /// combines from and a pass writes (`StagePorts`).
     pub ports: P,
-    /// The graph's output: the block's new residual rows, or a front's
-    /// residual after its mixer, which its back reads as its `hidden`.
-    pub output: WorkflowTensor,
+    /// The graph's output: the block's new carry (the last block's exit
+    /// row, which carries no pre), or a front's carry after its mixer,
+    /// which its back reads as its `hidden`; a pass's merged rows.
+    pub output: ResidualCarry<WorkflowTensor>,
 }
 
 /// A sealed block graph, by the ports its stage formed: a run's stage's or
@@ -152,8 +145,8 @@ impl SealedBlockGraph {
         let mut graph = device.native_graph_with_layout(layout);
         let mut weights = Vec::new();
         let mut constants = Vec::new();
-        let hidden = stage_input_width(geometry, block_index, stage)?
-            .map(|width| graph.port(Element::f32(), &[rows, width]))
+        let hidden = stage_input(geometry, block_index, stage)?
+            .map(|carry| carry.try_map(|width| graph.port(Element::f32(), &[rows, width])))
             .transpose()
             .map_err(|error| error.to_string())?;
         let mixer = (&handle.mixer).into();
@@ -183,18 +176,19 @@ impl SealedBlockGraph {
             per_layer,
             ngram,
             streams,
-            hidden.as_ref().map(NativePort::tensor),
+            hidden.as_ref().map(|carry| carry.as_ref().map(NativePort::tensor)),
             inputs,
             &mut weights,
             &mut constants,
         )
         .map_err(|error| error.to_string())?;
         // A graph sealed once stores what it computes; a run's exports its
-        // rows.
+        // carry.
         if let Stage::Run(_) = stage {
-            graph
-                .export(&parts.output)
-                .map_err(|error| error.to_string())?;
+            graph.export(&parts.output.rows).map_err(|error| error.to_string())?;
+            if let Some(pre) = &parts.output.pre {
+                graph.export(pre).map_err(|error| error.to_string())?;
+            }
         }
         if let Some(residual) = &parts.residual {
             graph.export(residual).map_err(|error| error.to_string())?;
@@ -330,20 +324,31 @@ fn layer_bank<'p, 'a, G: GraphDraft + 'a>(
     }
 }
 
-/// The width of the rows a graph of block `block_index` of `stage` reads:
-/// its input rows, or a back's, the residual its front's mixer left. The
-/// pass reads only crossed rows.
-fn stage_input_width(geometry: &Decoder, block_index: usize, stage: Stage) -> Result<Option<u64>, String> {
-    match stage {
-        Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::Front) => block_input_width(geometry, block_index).map(Some),
-        Stage::Run(RunStage::Combine) => mixed_width(geometry).map(Some),
-        Stage::Once(_) => Ok(None),
-    }
+/// The widths of the carry a graph of block `block_index` of `stage` reads
+/// (`ResidualCarry`): the embedded rows into block 0, and the streams
+/// (`S * H`) into every later block of a decoder with residual streams and
+/// into every back, which reads the carry its front's mixer left; with the
+/// `[rows, S]` pre of Sinkhorn streams (none into block 0, whose first site
+/// reads the one-hot pre). The pass reads only crossed rows.
+pub(super) fn stage_input(geometry: &Decoder, block_index: usize, stage: Stage) -> Result<Option<ResidualCarry<u64>>, String> {
+    let streams = StreamsGeometry::of(geometry).map_err(|error| error.to_string())?;
+    let carry = |reads_streams: bool| match streams {
+        Some(streams) if reads_streams => ResidualCarry {
+            rows: streams.width(),
+            pre: streams.sinkhorn().map(|_| streams.streams),
+        },
+        _ => ResidualCarry::rows(geometry.hidden),
+    };
+    Ok(match stage {
+        Stage::Run(RunStage::Whole | RunStage::Resident | RunStage::Front) => Some(carry(block_index > 0)),
+        Stage::Run(RunStage::Combine) => Some(carry(true)),
+        Stage::Once(_) => None,
+    })
 }
 
 struct BlockGraphParts {
     residual: Option<WorkflowTensor>,
-    output: WorkflowTensor,
+    output: ResidualCarry<WorkflowTensor>,
     mixer: Option<(BlockStatePorts, BlockControlPorts)>,
     taps: Option<TapPorts>,
     /// The per-layer rows a block with a per-layer input sublayer reads.
@@ -366,18 +371,6 @@ impl BlockGraphParts {
     }
 }
 
-/// The width of block `block_index`'s input rows: the embedded rows into
-/// block 0, the streams (`S * H`) into every later block of a decoder with
-/// residual streams.
-fn block_input_width(geometry: &Decoder, block_index: usize) -> Result<u64, String> {
-    Ok(
-        match StreamsGeometry::of(geometry).map_err(|error| error.to_string())? {
-            Some(streams) if block_index > 0 => streams.width(),
-            _ => geometry.hidden,
-        },
-    )
-}
-
 /// One decoder block's graph fragment:its draft tap when tapped, then its
 /// mixer then its feed-forward over `hidden`. The production graph and the
 /// checked metadata route both build blocks through this one function.
@@ -390,7 +383,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     per_layer_entries: Option<PerLayerParts<'a, G>>,
     ngram_entries: Option<NGramParts<'a, G>>,
     streams_entries: Option<StreamsEntries<'a, G>>,
-    hidden: Option<&WorkflowTensor>,
+    hidden: Option<ResidualCarry<&WorkflowTensor>>,
     inputs: BlockGraphInputs<'_>,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
@@ -451,7 +444,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             };
             return Ok(BlockGraphParts {
                 residual: None,
-                output,
+                output: ResidualCarry::rows(output),
                 mixer: None,
                 taps: None,
                 per_layer: None,
@@ -485,33 +478,28 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     // its merge set's pass, as this graph's ports.
     let mut split = SplitPorts::of(graph, stage, block_routed(geometry, block_index)?, geometry, rows, capacity)?;
     let hidden = hidden.ok_or("a block graph of no input rows")?;
-    // A back reads the residual its front's mixer left.
+    let hidden = ResidualCarry { rows: hidden.rows.clone(), pre: hidden.pre.cloned() };
+    // A back reads the carry its front's mixer left.
     let (mixed, mut mixer) = match stage {
-        RunStage::Combine => (hidden.clone(), None),
+        RunStage::Combine => (hidden, None),
         RunStage::Whole | RunStage::Resident | RunStage::Front => {
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.entry) {
-                taps.ports.entry = Some(taps.tap(graph, hidden)?);
+                taps.ports.entry = Some(taps.tap(graph, &hidden.rows)?);
             }
             // Block 0 widens the embedded rows into the streams.
             let hidden = match (streams, streams_entries) {
                 (Some(streams), Some(entries)) if block_index == 0 => {
-                    widen(graph, entries.repeat, streams, hidden, rows, constants)?
+                    widen(graph, entries.repeat, streams, &hidden.rows, rows, constants)?
                 }
-                _ => hidden.clone(),
+                _ => hidden,
             };
-            let (mixed, state_ports, controls) = sublayers.mixer(
-                graph,
-                mixer_entries,
-                streams_entries.map(|entries| entries.sites.mixer),
-                &hidden,
-                weights,
-                constants,
-            )?;
+            let (mixed, state_ports, controls) =
+                sublayers.mixer(graph, mixer_entries, streams_entries, &hidden, weights, constants)?;
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.middle) {
                 if paired.feed_forward.is_none() {
                     return Err("a draft taps the feed-forward of a lone mixer block".into());
                 }
-                taps.ports.middle = Some(taps.tap(graph, &mixed)?);
+                taps.ports.middle = Some(taps.tap(graph, &mixed.rows)?);
             }
             (mixed, Some((state_ports, controls)))
         }
@@ -519,7 +507,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     let (output, sequence) = sublayers.feed_forward(
         graph,
         feed_forward,
-        streams_entries.and_then(|entries| entries.sites.feed_forward),
+        streams_entries,
         mixed,
         weights,
         constants,
@@ -540,6 +528,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             span: None,
         });
     }
+    let ResidualCarry { rows: output, pre } = output;
     let (output, per_layer) =
         sublayers.per_layer(graph, per_layer_entries, output, weights, constants)?;
     // The n-gram input's windows follow the mixer's bank components; a
@@ -568,30 +557,44 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         }
     };
     let residual = residual.then(|| output.clone());
-    // The block that binds the decoder's exit site (the last) ends with it,
-    // and the readout sums its partials.
-    let exit = streams_entries.and_then(|entries| entries.sites.exit);
-    let output = match (streams, exit, &geometry.exit.norm) {
-        (Some(streams), Some(exit), ExitNorm::HyperConnectionHead(site)) => {
-            mix_site(
-                graph,
-                exit,
-                load,
-                WeightScope::Target,
-                streams,
-                &output,
-                rows,
-                site.norm.epsilon as f32,
-                false,
-                weights,
-            )?
-            .partials
+    // The decoder's last block ends with its exit: a low-rank exit site,
+    // whose partials the readout sums, or the collapse of Sinkhorn streams
+    // by the last site's pre, which the readout normalizes.
+    let last = block_index + 1 == geometry.blocks.len();
+    let carry = ResidualCarry { rows: output, pre };
+    let output = match (streams, streams_entries, &geometry.exit.norm) {
+        (None, _, _) => carry,
+        (Some(streams), Some(entries), ExitNorm::HyperConnectionHead(head)) if last => {
+            let exit = ExitMix::of(head).map_err(|error| error.to_string())?;
+            match (exit, entries.mixing, streams.low_rank()) {
+                (ExitMix::Own(site), MixingEntries::LowRank(sites), Some(low_rank)) => {
+                    let exit = sites.exit.ok_or("low-rank streams without their exit site's entries")?;
+                    let partials = mix_site(
+                        graph,
+                        exit,
+                        load,
+                        WeightScope::Target,
+                        low_rank,
+                        &carry.rows,
+                        rows,
+                        site.norm.epsilon as f32,
+                        false,
+                        weights,
+                    )?
+                    .partials;
+                    ResidualCarry::rows(partials)
+                }
+                (ExitMix::Previous(_), MixingEntries::Sinkhorn(entries), None) => {
+                    ResidualCarry::rows(collapse(graph, entries.collapse, streams, &carry, rows)?)
+                }
+                _ => return Err("the decoder's exit disagrees with its streams' mixing".into()),
+            }
         }
-        (Some(_), _, ExitNorm::HyperConnectionHead(_)) | (None, _, _) => output,
-        (Some(_), _, _) => return Err("residual streams without their exit site".into()),
+        (Some(_), Some(_), ExitNorm::HyperConnectionHead(_)) => carry,
+        _ => return Err("residual streams without their exit".into()),
     };
     if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.output) {
-        taps.ports.output = Some(taps.tap(graph, &output)?);
+        taps.ports.output = Some(taps.tap(graph, &output.rows)?);
     }
     let span = begun.map(|begun| (begun, graph.span_mark()));
     Ok(BlockGraphParts {
@@ -626,10 +629,12 @@ pub(super) fn checked_block_graph_draft(
         width,
         positions,
     });
-    let hidden = stage_input_width(geometry, block_index, stage)?
-        .map(|width| GraphDraft::port_with_class_extent(&mut graph, Element::f32(), &[rows, width], 0, "M"))
+    let hidden = stage_input(geometry, block_index, stage)?
+        .map(|carry| {
+            carry.try_map(|width| GraphDraft::port_with_class_extent(&mut graph, Element::f32(), &[rows, width], 0, "M"))
+        })
         .transpose()?;
-    let checked_streams = slot.streams().map(CheckedStreamsEntries::new);
+    let checked_streams = slot.block_streams().map(CheckedStreamsEntries::new);
     let streams = checked_streams.as_ref().map(CheckedStreamsEntries::entries);
     let checked_mixer = block::CheckedMixerEntries::new(
         slot.mixer(),
@@ -674,13 +679,16 @@ pub(super) fn checked_block_graph_draft(
         per_layer,
         ngram,
         streams,
-        hidden.as_ref().map(NativePort::tensor),
+        hidden.as_ref().map(|carry| carry.as_ref().map(NativePort::tensor)),
         inputs,
         &mut weights,
         &mut constants,
     )?;
     if let Stage::Run(_) = stage {
-        GraphDraft::export(&mut graph, &parts.output)?;
+        GraphDraft::export(&mut graph, &parts.output.rows)?;
+        if let Some(pre) = &parts.output.pre {
+            GraphDraft::export(&mut graph, pre)?;
+        }
     }
     if let Some(residual) = &parts.residual {
         GraphDraft::export(&mut graph, residual)?;

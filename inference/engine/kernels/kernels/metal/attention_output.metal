@@ -46,9 +46,10 @@ typedef projection::operands<NVFP4> Operands;
     projection::Weights<packets::W0> w{output_weight, KERNEL_W0_LAYOUT(k), k}
 
 // The residual join: a plain residual, or the scatter into each
-// hyper-connection stream (`scatter`), after the weight's second-level
-// scale where it has one.
-typedef projection::OutputOf<activation, projection::AllRows, SEISMIC_DIM_SN, SEISMIC_DIM_IN != 0> output_join;
+// hyper-connection stream (`scatter`, with its comb when the inject row
+// carries one), after the weight's second-level scale where it has one.
+typedef projection::OutputOf<activation, projection::AllRows, SEISMIC_DIM_SN, SEISMIC_DIM_IN != 0,
+    (SEISMIC_DIM_IN > SEISMIC_DIM_SN)> output_join;
 #define ATTENTION_OUTPUT_EPILOGUE                                                       \
     const auto out = projection::scaling<(SEISMIC_DIM_OS != 0)>::wrap(                  \
         output_join::make(result, SEISMIC_RESULT_0_STRIDE_0,                            \

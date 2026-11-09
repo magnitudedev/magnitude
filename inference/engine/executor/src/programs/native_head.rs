@@ -17,7 +17,7 @@
 use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::streams::{
-    StreamsGeometry,
+    BlockStreams, StreamsGeometry,
     graph::{CheckedStreamsEntries, StreamsEntries, mix_site},
 };
 use crate::operators::{
@@ -304,7 +304,7 @@ impl CheckedHeadEntries {
     fn new(binding: HeadBinding, backend: BackendName, load: &ModelLoadPlan) -> Result<Self, String> {
         Ok(Self {
             landing: CheckedLandingEntries::of(load, TARGET_TABLE)?,
-            streams: binding.streams.map(CheckedStreamsEntries::new),
+            streams: binding.streams.map(|streams| CheckedStreamsEntries::new(BlockStreams::LowRank(streams))),
             gather: [("A", binding.conditioning)],
             copy: [("A", binding.conditioning)],
             input: [
@@ -495,8 +495,15 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         return Err(format!("head graph class {class:?} is inconsistent").into());
     }
     let hidden = geometry.hidden;
-    let streams =
-        StreamsGeometry::from_residual(hidden, head.residual).map_err(|error| error.to_string())?;
+    // A head's streams are low-rank (`operators::SINKHORN_HEAD`).
+    let streams = StreamsGeometry::from_residual(hidden, head.residual)
+        .map_err(|error| error.to_string())?
+        .map(|streams| streams.low_rank().ok_or(crate::operators::SINKHORN_HEAD))
+        .transpose()?;
+    let sites = entries
+        .streams
+        .map(|entries| entries.low_rank().ok_or(crate::operators::SINKHORN_HEAD))
+        .transpose()?;
     let stream_count = streams.map_or(1, |streams| streams.streams);
     let conditioning_width = hidden * stream_count;
     let residual_chain = matches!(head.chain, magnitude_family_contracts::HeadChain::Residual);
@@ -805,10 +812,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 )?
             }
         };
-        let attention_site = match (streams, entries.streams) {
-            (Some(streams), Some(entries)) => Some(mix_site(
+        let attention_site = match (streams, sites) {
+            (Some(streams), Some(sites)) => Some(mix_site(
                 &mut graph,
-                entries.sites.mixer,
+                sites.mixer,
                 load,
                 attention_scope,
                 streams,
@@ -824,7 +831,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         let join = Join {
             values: attention_site.as_ref().and_then(|site| site.inject.clone()),
             streams: stream_count,
-            injected: streams.is_some(),
+            width: streams.map_or(0, |streams| streams.streams),
             class: (pass == 0).then_some("head_entry_rows"),
         };
         let (attended, state, controls) = attention_graph::attention(
@@ -892,11 +899,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 confidence: None,
             });
         };
-        let feed_forward_site = match (streams, entries.streams) {
-            (Some(streams), Some(entries)) => Some(mix_site(
+        let feed_forward_site = match (streams, sites) {
+            (Some(streams), Some(sites)) => Some(mix_site(
                 &mut graph,
-                entries
-                    .sites
+                sites
                     .feed_forward
                     .ok_or("head streams entries lack the feed-forward site")?,
                 load,
@@ -1000,7 +1006,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         .as_ref()
                         .and_then(|site| site.inject.clone()),
                     streams: stream_count,
-                    injected: streams.is_some(),
+                    width: streams.map_or(0, |streams| streams.streams),
                     class: (pass == 0).then_some("head_entry_rows"),
                 };
                 graph.set_class_scope((pass == 0).then_some("head-entry-routed"));
@@ -1046,12 +1052,11 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         let chained_rows = (pass > 0)
             .then(|| GraphConstant::identity(&mut graph, class.slots))
             .transpose()?;
-        let mixed = match (streams, entries.streams) {
-            (Some(streams), Some(entries)) => {
+        let mixed = match (streams, sites) {
+            (Some(streams), Some(sites)) => {
                 mix_site(
                     &mut graph,
-                    entries
-                        .sites
+                    sites
                         .exit
                         .ok_or("head streams entries lack the exit site")?,
                     load,

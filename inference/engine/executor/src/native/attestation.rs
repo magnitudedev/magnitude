@@ -992,7 +992,7 @@ impl AttestedPrograms {
                     })
                     .transpose()?;
                 let streams = block
-                    .streams()
+                    .block_streams()
                     .map(|binding| {
                         prepared
                             .target
