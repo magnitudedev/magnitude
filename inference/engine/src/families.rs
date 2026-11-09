@@ -6,6 +6,7 @@
 use crate::error::{UnsupportedModel, UnsupportedReason};
 use magnitude_artifacts::gguf::{Directory, Value};
 use magnitude_family_contracts::ModelFamily;
+use magnitude_family_deepseek41::DeepSeek41Family;
 use magnitude_family_gemma4::Gemma4Family;
 use magnitude_family_lfm2::Lfm2Family;
 use magnitude_family_llama::LlamaFamily;
@@ -22,6 +23,7 @@ static FAMILIES: &[&dyn ModelFamily] = &[
     &Lfm2Family,
     &Gemma4Family,
     &MuseGlimmerFamily,
+    &DeepSeek41Family,
 ];
 
 /// The architectures a separate drafter's GGUF may declare: a DFlash-family
@@ -105,6 +107,16 @@ mod tests {
             }],
             tensors: Vec::new(),
         }
+    }
+
+    /// DeepSeek V4.1 (`deepseek41`) has a family; V4 (`deepseek4`) has
+    /// none.
+    #[test]
+    fn deepseek_v41_is_recognized() {
+        let Ok(family) = recognize(&declaring("deepseek41")) else {
+            panic!("a family recognizes deepseek41");
+        };
+        assert_eq!(family.name(), "deepseek41");
     }
 
     #[test]

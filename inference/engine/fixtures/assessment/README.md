@@ -30,6 +30,12 @@ way. The manifest lists Hugging Face
 files only, so such a header serves the service's tests alone; `ollama-qwen3.6-35b-a3b.gguf.gz` is
 `registry.ollama.ai/library/qwen3.6:35b-a3b`, blob
 `sha256:d372de8e934898a59e6ccfabc3368474711384d8f1fd4d22d87a3f0a45400cdc`.
+`DeepSeek-V4.1-Flash-1017-slice-A.gguf.gz` is no repository's file either: it is slice A of
+DeepSeek V4.1 Flash, layer 0 with the embedding and head, as `magnitude-conversion convert
+--part text --layers 0` writes it from deepseek-ai/DeepSeek-V4.1-Flash-1017 at
+`1bae0e1088993b9b82de08f59de5be5a34e42170` (SHA-256
+`9cd50a3d712891dd525bf723369b50f7ad828a760284bd0cba9b17f711830304`, 10,042,454,016 bytes),
+its header trimmed the same way. The family's tests read it (`families/deepseek41`).
 
 ## Weight samples
 

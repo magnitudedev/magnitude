@@ -348,7 +348,9 @@ fn drafts_and_targets_are_recognized_by_disjoint_families() {
             .and_then(Value::string)
             .unwrap()
             .to_owned();
-        // The DeepSeek V4 DSpark uses DS4 blocks (deferred with its target).
+        // DeepSeek V4.1's DSpark drafts with its target's hyper-connection
+        // blocks, which this family does not read yet (the drafter is
+        // deferred; its target is the deepseek41 family's).
         if architecture == "dflash" && file.starts_with("deepseek") {
             assert!(!recognizes(&directory), "{file}");
             continue;

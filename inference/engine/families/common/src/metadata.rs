@@ -219,6 +219,17 @@ impl<'a> Metadata<'a> {
         self.required(key, value)
     }
 
+    /// One finite number per layer, stated as an array.
+    pub fn layer_numbers(&self, key: &str, layers: u64) -> Result<Vec<f64>, HeaderError> {
+        let value = self.array(
+            key,
+            "a per-layer array of finite numbers with one entry per layer",
+            Some(layers),
+            element_number,
+        )?;
+        self.required(key, value)
+    }
+
     /// A nonnegative integer per layer, stated once for all layers or as an
     /// array with one entry per layer.
     pub fn uniform_or_layer_counts(&self, key: &str, layers: u64) -> Result<Vec<u64>, HeaderError> {

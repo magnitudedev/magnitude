@@ -34,7 +34,7 @@ use seismic::BackendName;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const FAMILIES: [&dyn ModelFamily; 7] = [
+const FAMILIES: [&dyn ModelFamily; 8] = [
     &Qwen35Family,
     &LlamaFamily,
     &NemotronHFamily,
@@ -42,6 +42,7 @@ const FAMILIES: [&dyn ModelFamily; 7] = [
     &Gemma4Family,
     &MuseGlimmerFamily,
     &Qwen4ExpFamily,
+    &magnitude_family_deepseek41::DeepSeek41Family,
 ];
 
 /// Catalog models whose target's load must derive whatever their catalog

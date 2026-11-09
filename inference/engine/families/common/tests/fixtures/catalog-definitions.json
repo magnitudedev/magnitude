@@ -3,7 +3,7 @@
     "target": "unrecognized"
   },
   "deepseek-v4.1-flash:gguf:mxfp4": {
-    "target": "unrecognized"
+    "target": "rejected"
   },
   "gemma-4-12b-it-qat:gguf:q4": {
     "target": "90d8a8a01f967bb4935aa293890307978dafaaf43d1f2172a42f38de91d3c871",

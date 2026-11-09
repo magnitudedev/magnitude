@@ -13,6 +13,7 @@
 use magnitude_artifacts::{catalog_headers::ComponentRole, ArtifactIdentity, PackageIdentity};
 use magnitude_family_common::headers;
 use magnitude_family_contracts::ModelFamily;
+use magnitude_family_deepseek41::DeepSeek41Family;
 use magnitude_family_gemma4::Gemma4Family;
 use magnitude_family_lfm2::Lfm2Family;
 use magnitude_family_llama::LlamaFamily;
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::PathBuf};
 
-const FAMILIES: [&dyn ModelFamily; 7] = [
+const FAMILIES: [&dyn ModelFamily; 8] = [
     &Qwen35Family,
     &Qwen4ExpFamily,
     &LlamaFamily,
@@ -32,6 +33,7 @@ const FAMILIES: [&dyn ModelFamily; 7] = [
     &Lfm2Family,
     &Gemma4Family,
     &MuseGlimmerFamily,
+    &DeepSeek41Family,
 ];
 
 fn fixture() -> PathBuf {

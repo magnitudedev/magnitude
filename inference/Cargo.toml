@@ -26,6 +26,7 @@ members = [
   "engine/families/lfm2",
   "engine/families/nemotron_h",
   "engine/families/dflash",
+  "engine/families/deepseek41",
   "engine/templates",
   "engine/serving",
   "engine/cli",

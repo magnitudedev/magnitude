@@ -19,6 +19,7 @@ magnitude-family-common = { path = ".", features = ["catalog-headers"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "=0.11.0"
+magnitude-family-deepseek41 = { path = "../deepseek41" }
 magnitude-family-dflash = { path = "../dflash" }
 magnitude-family-gemma4 = { path = "../gemma4" }
 magnitude-family-lfm2 = { path = "../lfm2" }

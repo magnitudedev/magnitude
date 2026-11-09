@@ -2284,6 +2284,7 @@ dependencies = [
  "magnitude-executor",
  "magnitude-family-common",
  "magnitude-family-contracts",
+ "magnitude-family-deepseek41",
  "magnitude-family-dflash",
  "magnitude-family-gemma4",
  "magnitude-family-lfm2",
@@ -2339,6 +2340,7 @@ dependencies = [
  "magnitude-batching",
  "magnitude-family-common",
  "magnitude-family-contracts",
+ "magnitude-family-deepseek41",
  "magnitude-family-dflash",
  "magnitude-family-gemma4",
  "magnitude-family-lfm2",
@@ -2367,6 +2369,7 @@ dependencies = [
  "magnitude-artifacts",
  "magnitude-family-common",
  "magnitude-family-contracts",
+ "magnitude-family-deepseek41",
  "magnitude-family-dflash",
  "magnitude-family-gemma4",
  "magnitude-family-lfm2",
@@ -2386,6 +2389,18 @@ version = "0.1.0"
 dependencies = [
  "magnitude-artifacts",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "magnitude-family-deepseek41"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
  "serde_json",
  "sha2 0.11.0",
 ]

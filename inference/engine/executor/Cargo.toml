@@ -44,6 +44,7 @@ gimli = { version = "0.32", default-features = false, features = ["read-core"] }
 # The catalog's families and headers, for the assessment terms of every
 # catalog target (`assessment::catalog`).
 magnitude-family-common = { path = "../families/common", features = ["catalog-headers"] }
+magnitude-family-deepseek41 = { path = "../families/deepseek41" }
 magnitude-family-dflash = { path = "../families/dflash" }
 magnitude-family-gemma4 = { path = "../families/gemma4" }
 magnitude-family-lfm2 = { path = "../families/lfm2" }
