@@ -2422,6 +2422,124 @@ mod tests {
         }
     }
 
+    /// Qwen3.6 35B-A3B q4, from its catalog header, on a CUDA RTX 3090 at
+    /// the room its cold load reported (`the load's experts are placed`:
+    /// 24,910,168,064 bytes, its graphs at the cost that load measured), at
+    /// the two workloads it is loaded for.
+    ///
+    /// - The KL harness decodes its eight fixtures of 4,096 tokens together
+    ///   (`--batch 8`), lookahead off: eight conversations at a fit depth of
+    ///   4,097, each its history and its recurrent banks (an accepted bank,
+    ///   three checkpoints the prefix cache retains, and two successor
+    ///   banks), with the seed beside them. Lookahead off still takes two
+    ///   successors: a prompt's chunks chained across the load's places
+    ///   alternate two banks (`OwnedChainedAdvance`), the second written by
+    ///   the chain's second chunk. That is 3,549,751,968 bytes, which no
+    ///   whole plan holds beside the weights, so the experts stream. (The
+    ///   cold load charged 23,520 bytes less in each of its three state
+    ///   terms, so in the startup history slab they share, a limit of the
+    ///   harness's load this plan does not reproduce.)
+    /// - The service loads one conversation (`standard_service_limits`),
+    ///   lookahead on (`ModelPolicy::default`), here at 4,096, and holds the
+    ///   experts whole.
+    #[test]
+    fn qwen36_q4_on_a_cuda_3090_streams_the_kl_harness_load_and_holds_the_served_load_whole() {
+        use magnitude_family_contracts::ModelFamily;
+        const ROOM: u64 = 24_910_168_064;
+        const GRAPHS: seismic::GraphCost = seismic::GraphCost::Pooled { graph: 98_687, launch: 10_144, granule: 2 << 20 };
+        let identity = magnitude_artifacts::PackageIdentity { target: magnitude_artifacts::ArtifactIdentity([7; 32]), projector: None };
+        let target = magnitude_family_common::headers::target("qwen3.6-35b-a3b:gguf:q4");
+        let declared = magnitude_family_qwen35::Qwen35Family.inspect(&target, None, identity).unwrap();
+        let manifest = magnitude_artifacts::PackageManifest {
+            identity,
+            target: magnitude_artifacts::ComponentManifest {
+                files: vec![magnitude_artifacts::ComponentFile {
+                    path: "qwen3.6-35b-a3b-q4.gguf".into(),
+                    size: target.tensors.iter().map(|tensor| tensor.nbytes).sum(),
+                }],
+                identity: identity.target,
+                tensors: target.tensors.clone(),
+            },
+            projector: None,
+            draft: None,
+        };
+        // The limits the engine plans a load of 512 prefill rows with
+        // (`resource_limits`): `decode` rows a decode step, `exported` rows
+        // of logits.
+        let limits = |conversations: usize, decode: usize, exported: usize, lookahead: bool| crate::ResourceLimits {
+            max_launch_rows: 512,
+            max_launch_slots: 512,
+            max_selected_rows: decode,
+            max_drafting_slots: decode,
+            exported_logits_rows: exported,
+            max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+            max_image_cells: 0,
+            lookahead,
+            chain_capacity: NonZeroUsize::MIN,
+            conversations: NonZeroUsize::new(conversations).unwrap(),
+        };
+        let (kl, served) = (limits(8, 8, 512, false), limits(1, 32, 0, true));
+        let prepare = |device: &crate::platform::SelectedDevice, context: u64, limits| {
+            let mut definition = declared.clone();
+            definition.decoder.context_limit = context;
+            let draft = ExecutionPlanner::prepare(
+                device,
+                &manifest,
+                &definition,
+                ComponentSelection { head: false, vision: false },
+                ExecutionPath::Native,
+                PlannedMethod::Plain,
+                KvCodec::AffineK8V4,
+                limits,
+            )
+            .unwrap();
+            (definition, draft)
+        };
+        let granted = |grant| rtx3090_granted(BackendName::Cuda, 64 << 30, GRAPHS, grant);
+        let most = seismic::fixtures::rtx3090_most_granted(BackendName::Cuda);
+        let (_, _, _, card) = granted(most);
+        let (definition, draft) = prepare(&card, 4097, kl);
+        let whole = draft.held_whole(&definition).unwrap();
+        let charge = HeldCharges::<AssessmentMemoryCharge>::default().charge(&definition, &whole).unwrap().charge().clone();
+        assert_eq!(
+            (charge.state_bytes, charge.startup_state_bytes, charge.loaded_state_bytes),
+            (3_549_751_968, 133_653_152, 199_278_624),
+            "the KL load's state at the harness's limits"
+        );
+        // The card at the least grant whose stable room is the cold load's.
+        let room = |grant| {
+            let (topology, status, reserves, device) = granted(grant);
+            StableRoom { topology: &topology, executor: &device.info, status: &status, reserves: &reserves }
+                .fit_whole(&whole, &charge)
+                .unwrap()
+                .room
+                .free
+        };
+        let (mut short, mut held) = (0u64, most);
+        assert!(room(held) >= ROOM, "the card's room at its most grant holds the cold load's");
+        while held - short > 1 {
+            let mid = short + (held - short) / 2;
+            match room(mid) >= ROOM {
+                true => held = mid,
+                false => short = mid,
+            }
+        }
+        let (_, _, _, card) = granted(held);
+        let (definition, draft) = prepare(&card, 4097, kl);
+        assert!(
+            matches!(draft.placed::<AssessmentMemoryCharge>(&definition, None).unwrap(), Placed::Short(_)),
+            "the KL harness's eight conversations stream the experts"
+        );
+        let (definition, draft) = prepare(&card, 4096, served);
+        match draft.placed::<AssessmentMemoryCharge>(&definition, None).unwrap() {
+            Placed::Whole(placed) => assert!(
+                placed.draft.load().expert_bank().is_none_or(|bank| bank.whole()),
+                "the served load holds every expert"
+            ),
+            Placed::Short(_) => panic!("the served load's one conversation holds the experts whole"),
+        }
+    }
+
     /// The draft's experts held as `assess_execution_fit` holds them, prices
     /// pending: from its largest plan (`with_ceiling_bank`), settled into the
     /// stable fit's bound and confirmed by its fit, sized by memory alone.
