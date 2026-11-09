@@ -82,6 +82,13 @@ struct Rows {
         even = float4(v[0], v[2], v[4], v[6]);
         odd = float4(v[1], v[3], v[5], v[7]);
     }
+    // The rows from `row` on, as rows 0, 1, ...
+    Rows from(uint row) const {
+        Rows rows = *this;
+        rows.residual += ulong(row) * residual0;
+        rows.inverses += row;
+        return rows;
+    }
 };
 
 // Logit column first + n of row m, rows `pitch` apart.
@@ -90,6 +97,8 @@ struct Logits {
     ulong pitch;
     ulong first;
     void store(uint m, uint n, float value) const { logits[ulong(m) * pitch + first + n] = value; }
+    // The logits of the rows from `row` on, as rows 0, 1, ...
+    Logits from(uint row) const { return Logits{logits, pitch, first + ulong(row) * pitch}; }
 };
 
 // A dense row packet loaded whole when the GEMV loads it (H % 32 == 0, so
@@ -131,6 +140,25 @@ struct Packets {
 template <typename E>
 struct Packets<packets::Dense<E>> {
     typedef EagerDense<E> type;
+};
+
+// The widest row class of a decoder's GEMV body in `Gemv::columns`, which
+// runs wider decode rows in windows of it. It follows the decoder's register
+// footprint and nothing tunes it: a decoder that defers its loads keeps the
+// projection family's 8; an eager dense packet holds its whole packet (64
+// bytes of BF16, 128 of F32), double-buffered, in registers, and takes 4. On
+// the M4 Pro the eager body at 8 rows costs 2.4-4.5 times its 4-row body
+// (`routed_route_shared` at 8 rows: 119 us a launch, against 55 in two 4-row
+// windows), where every packed decoder's 8-row body costs about twice its
+// 4-row body. A lane's sum depends only on LANES, so a window's rows are
+// bit-identical to one body's.
+template <typename W>
+struct widest_rows {
+    static constant constexpr uint value = 8;
+};
+template <typename E>
+struct widest_rows<EagerDense<E>> {
+    static constant constexpr uint value = 4;
 };
 
 // Logit column `index` of weights `w` in one simdgroup that forms the router
@@ -175,14 +203,36 @@ inline void column(thread const In &in, thread const projection::Weights<W> &w, 
 // input staged once per threadgroup (`shared`: the GEMV's staging memory);
 // F32 activations, which the GEMV does not stage, one simdgroup per column
 // (`column`). Both sum in the same order.
+//
+// The GEMV body runs over windows of its decoder's widest row class
+// (`widest_rows`), one after another.
 template <uint BYTES>
 struct Gemv {
     template <typename W, typename In>
     static void columns(thread const In &in, thread const projection::Weights<W> &w, thread const Logits &out,
         uint rows, uint count, uint group, threadgroup uchar *shared, uint simdgroups, uint simd, uint lane) {
-        PROJECTION_FOR_ROWS(rows,
-            (projection::gemv_runtime<W, 1, MAXM, 32>(in, out, w, rows, count, in.columns, group, shared,
-                simdgroups, simd, lane)));
+        constexpr uint widest = widest_rows<W>::value;
+        static_assert(widest == 4 || widest == 8, "a decoder's widest row class is 4 or 8");
+        for (uint first = 0; first < rows; first += widest) {
+            const uint window = min(rows - first, widest);
+            const In from = in.from(first);
+            const Logits to = out.from(first);
+            if constexpr (widest == 4) {
+                if (window <= 1)
+                    projection::gemv_runtime<W, 1, 1, 32>(from, to, w, window, count, in.columns, group, shared,
+                        simdgroups, simd, lane);
+                else if (window <= 2)
+                    projection::gemv_runtime<W, 1, 2, 32>(from, to, w, window, count, in.columns, group, shared,
+                        simdgroups, simd, lane);
+                else
+                    projection::gemv_runtime<W, 1, 4, 32>(from, to, w, window, count, in.columns, group, shared,
+                        simdgroups, simd, lane);
+            } else {
+                PROJECTION_FOR_ROWS(window,
+                    (projection::gemv_runtime<W, 1, MAXM, 32>(from, to, w, window, count, in.columns, group,
+                        shared, simdgroups, simd, lane)));
+            }
+        }
     }
 };
 template <>
