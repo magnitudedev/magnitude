@@ -636,6 +636,37 @@ mod tests {
         assert_eq!(markers.unobtainable(&key).unwrap(), None);
     }
 
+    /// In-process jobs on the host's CPU executor, their records and their
+    /// model store in `root`, the first job given no time.
+    fn cut_off_jobs(root: &Path) -> InProcessJobs {
+        let topology = Devices::discover(&[]).unwrap().topology();
+        let executor = topology.executors().iter().find(|executor| executor.backend() == seismic::BackendName::Cpu).unwrap().clone();
+        InProcessJobs {
+            request: MeasureRequest {
+                paths: Vec::new(),
+                kernels: root.to_path_buf(),
+                storage: root.to_path_buf(),
+                executor: executor.selector(),
+                job: MeasureJob(0),
+                time: std::time::Duration::ZERO,
+            },
+            topology,
+            executor,
+        }
+    }
+
+    /// A job whose time ends before its first point reads a sample leaves
+    /// every point expired, released uncounted, and reports no failure: its
+    /// time, not the machine, cut it off, so the jobs go on, the next given
+    /// longer, and measure.
+    #[test]
+    fn a_job_cut_off_before_its_first_sample_is_followed_by_a_longer_one() {
+        let root = tempfile::tempdir().unwrap();
+        let mut jobs = cut_off_jobs(root.path());
+        let run = jobs.run().unwrap();
+        assert!(run.progressed, "a measurement job measured nothing of {:?}: {:?}", run.outstanding, run.failures);
+    }
+
     /// Requests and outcomes cross the process encoding.
     #[test]
     fn measurement_messages_round_trip_through_the_worker_encoding() {
