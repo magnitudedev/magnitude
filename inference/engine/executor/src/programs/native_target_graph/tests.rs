@@ -235,6 +235,50 @@ mod shared_graph_tests {
         assert!(home(1).is_some());
     }
 
+    /// Two Full layers of one form (both pools softmax-gated) share one block
+    /// plan, which therefore names neither one's pooled source: each block
+    /// binds its own at run time (`PickedSource::pooled`). A mean pool beside
+    /// a gated one is another form and another plan. These are
+    /// `compressed_layers_decode_equals_prefill`'s shared-plan case and its
+    /// control.
+    #[test]
+    fn two_full_layers_of_one_form_share_one_plan() {
+        use crate::operators::attention::tests::selected::{CompressedForm, compressed};
+        let limits = ResourceLimits {
+            max_launch_rows: 64,
+            max_launch_slots: 64,
+            max_selected_rows: 64,
+            max_drafting_slots: 64,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+            chain_capacity: std::num::NonZeroUsize::MIN,
+            conversations: std::num::NonZeroUsize::MIN,
+        };
+        for (second_gated, shared) in [(true, true), (false, false)] {
+            let (definition, manifest) = compressed(CompressedForm::TwoFull { second_gated });
+            let selection = crate::ComponentSelection { head: false, vision: false };
+            let layout = crate::resident_layout(crate::ExecutionPath::Native, BackendName::Cpu);
+            let load = ModelLoadPlan::derive(&manifest, &definition, selection, layout, crate::PlannedMethod::Plain, limits)
+                .unwrap();
+            let codec = magnitude_state::KvCodec::Dense;
+            let state = crate::ResourcePlanner::state_plan(
+                &definition,
+                &load,
+                crate::PlannedMethod::Plain,
+                codec,
+                limits,
+                crate::ResourceCapacity { domain_bytes: 1 << 30, tensor_operations: crate::TensorOperations::Absent },
+            )
+            .unwrap();
+            let plan = load.program_plan(&definition, codec).unwrap();
+            let (_, tapped) = block_taps(plan.target(), &definition.decoder).unwrap();
+            let shapes = block_graph_shapes(&load, &definition.decoder, &state, &tapped, None).unwrap();
+            assert_eq!(shapes[0] == shapes[1], shared, "second pool gated {second_gated}: the blocks share a plan");
+        }
+    }
+
     /// The Qwen4Exp fixture with four attention blocks of 32 experts, its
     /// experts streamed at the bank's floor on Metal.
     fn streamed_fixture_load() -> (magnitude_family_contracts::ModelDefinition, ModelLoadPlan) {

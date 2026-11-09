@@ -1702,10 +1702,13 @@ const WIDE_POOL: CompressedForm = CompressedForm::Reindexed { blocks: 32, block_
 /// rows, two picks), and slice C's (`slice_c_numerics`: its trained row
 /// roundings, and a top that picks every visible block, as below 1,024
 /// tokens). It holds too for `WIDE_POOL` (a rate-1 source whose indexer
-/// produces a candidate pool, and a Reindex layer restricted to it). The
-/// pair differ only by summation order, so each row's KL stays at float
-/// rounding (`DECODE_KL`). Norm weights are 1, so the rows' attention
-/// moves the logits.
+/// produces a candidate pool, and a Reindex layer restricted to it), and for
+/// two Full layers at one rate sharing its domains: of one form, which share
+/// one block plan (each binding its own pooled planes), and, as the control,
+/// of two forms, a gated and a mean pool
+/// (`two_full_layers_of_one_form_share_one_plan`). The pair differ only by
+/// summation order, so each row's KL stays at float rounding (`DECODE_KL`).
+/// Norm weights are 1, so the rows' attention moves the logits.
 #[test]
 fn compressed_layers_decode_equals_prefill() {
     const DECODE_KL: f64 = 1e-4;
@@ -1713,6 +1716,8 @@ fn compressed_layers_decode_equals_prefill() {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let (definition, manifest) = selected::compressed(CompressedForm::FullAndReuse);
     let (wide, wide_manifest) = selected::compressed(WIDE_POOL);
+    let (two_gated, two_gated_manifest) = selected::compressed(CompressedForm::TwoFull { second_gated: true });
+    let (two_mixed, two_mixed_manifest) = selected::compressed(CompressedForm::TwoFull { second_gated: false });
     let unit = |name: &str| name.ends_with("norm").then_some(1.0);
     let limits = ResourceLimits { conversations: std::num::NonZeroUsize::new(2).unwrap(), ..limits(32, false, 1, 32) };
     let mut differing = Vec::new();
@@ -1721,6 +1726,8 @@ fn compressed_layers_decode_equals_prefill() {
         ("unrounded", definition.clone(), &manifest),
         ("slice-c", slice_c_numerics(definition), &manifest),
         ("wide-pool", wide, &wide_manifest),
+        ("two-full-gated", two_gated, &two_gated_manifest),
+        ("two-full-mixed", two_mixed, &two_mixed_manifest),
     ]
     .map(|(form, definition, manifest)| (form, fixture_stored("decode-equals-prefill", definition, manifest, &unit)));
     // Each backend whole before the next, so a backend that fails leaves the

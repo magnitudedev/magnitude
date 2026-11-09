@@ -1592,6 +1592,15 @@ pub(crate) mod tests {
             /// its own query and head weights, restricted to that pool). Each
             /// picks `top` rows.
             Reindexed { blocks: u64, block_units: u64, top: u64 },
+            /// V4.1's layers 2 and 8: both blocks are Full layers, each
+            /// pooling its own rows per 2 tokens under its own indexer, so the
+            /// two sources share the rate's Window and Block domains. Each
+            /// picks 32 rows, every block of a context of up to 64 tokens, so
+            /// no selection hinges on a near-tie of its scores. Block 0's pool
+            /// is softmax-gated (pending rows of twice the width); block 1's is
+            /// too when `second_gated`, else a mean (pending rows of the
+            /// width): one domain of equal, or of mixed, component widths.
+            TwoFull { second_gated: bool },
         }
 
         /// A Reindexed form whose pool (2 blocks of 2 units) and picks (2)
@@ -1607,6 +1616,7 @@ pub(crate) mod tests {
         pub(crate) fn compressed(form: CompressedForm) -> (ModelDefinition, PackageManifest) {
             let (rate, top, produced) = match form {
                 CompressedForm::FullAndReuse => (2, 2, None),
+                CompressedForm::TwoFull { .. } => (2, 32, None),
                 CompressedForm::Reindexed { blocks, block_units, top } => (
                     1,
                     top,
@@ -1673,14 +1683,15 @@ pub(crate) mod tests {
                         }),
                     },
                 )));
-                let pooled = if index == 0 {
+                let pooled = if index == 0 || matches!(form, CompressedForm::TwoFull { .. }) {
                     HistorySource {
                         rows: HistoryRows::Own(RowProducer::Pooled(PooledRows {
                             rate,
                             projection: tensor(name("compressor.kv"), vec![64, HIDDEN]),
                             pool: match form {
                                 CompressedForm::Reindexed { .. } => Pool::Identity,
-                                CompressedForm::FullAndReuse => Pool::SoftmaxGated {
+                                CompressedForm::TwoFull { second_gated: false } if index == 1 => Pool::Mean,
+                                CompressedForm::FullAndReuse | CompressedForm::TwoFull { .. } => Pool::SoftmaxGated {
                                     gate: tensor(name("compressor.gate"), vec![64, HIDDEN]),
                                 },
                             },
