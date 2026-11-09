@@ -149,44 +149,72 @@ impl<'a> Metadata<'a> {
     /// A positive integer per layer, stated once for all layers or as an
     /// array with one entry per layer.
     pub fn per_layer(&self, key: &str, layers: u64) -> Result<Vec<u64>, HeaderError> {
-        let value = self.typed(key, "a positive integer or one per layer", |value| {
-            match value {
-                Value::Array(values) if values.len() as u64 == layers => values
-                    .iter()
-                    .map(|value| value.unsigned().filter(|value| *value > 0))
-                    .collect(),
-                Value::Array(_) => None,
-                value => value
-                    .unsigned()
-                    .filter(|value| *value > 0)
-                    .map(|value| vec![value; layers as usize]),
-            }
-        })?;
+        let value = self.uniform_or_array(
+            key,
+            "a positive integer or one per layer",
+            layers,
+            |element| element.unsigned().filter(|value| *value > 0),
+        )?;
         self.required(key, value)
+    }
+
+    /// `key`'s value per layer, when present: stated once for all layers
+    /// or as an array with one entry per layer, each read by `read`.
+    fn uniform_or_array<T: Clone>(
+        &self,
+        key: &str,
+        expected: &'static str,
+        layers: u64,
+        read: impl Fn(Element<'a>) -> Option<T>,
+    ) -> Result<Option<Vec<T>>, HeaderError> {
+        match self.value(key) {
+            Some(Value::Array(_)) => self.array(key, expected, Some(layers), read),
+            _ => self.typed(key, expected, |value| match value {
+                Value::Scalar(scalar) => {
+                    read(scalar.element()).map(|value| vec![value; layers as usize])
+                }
+                Value::Array(_) => unreachable!("an array value is read by `array`"),
+            }),
+        }
+    }
+
+    /// `key`'s array, of `length` elements when given, each read by `read`,
+    /// when present: the one reader of array values.
+    fn array<T>(
+        &self,
+        key: &str,
+        expected: &'static str,
+        length: Option<u64>,
+        read: impl Fn(Element<'a>) -> Option<T>,
+    ) -> Result<Option<Vec<T>>, HeaderError> {
+        self.typed(key, expected, |value| match value {
+            Value::Array(values)
+                if length.is_none_or(|length| values.len() as u64 == length) =>
+            {
+                values.iter().map(read).collect()
+            }
+            _ => None,
+        })
     }
 
     /// An array of nonnegative integers.
     pub fn counts(&self, key: &str) -> Result<Vec<u64>, HeaderError> {
-        let value = self.typed(key, "an array of nonnegative integers", |value| {
-            match value {
-                Value::Array(values) => values.iter().map(Element::unsigned).collect(),
-                Value::Scalar(_) => None,
-            }
-        })?;
+        let value = self.array(
+            key,
+            "an array of nonnegative integers",
+            None,
+            Element::unsigned,
+        )?;
         self.required(key, value)
     }
 
     /// One nonnegative integer per layer, stated as an array.
     pub fn layer_counts(&self, key: &str, layers: u64) -> Result<Vec<u64>, HeaderError> {
-        let value = self.typed(
+        let value = self.array(
             key,
             "a per-layer array of nonnegative integers with one entry per layer",
-            |value| match value {
-                Value::Array(values) if values.len() as u64 == layers => {
-                    values.iter().map(Element::unsigned).collect()
-                }
-                _ => None,
-            },
+            Some(layers),
+            Element::unsigned,
         )?;
         self.required(key, value)
     }
@@ -194,30 +222,19 @@ impl<'a> Metadata<'a> {
     /// A nonnegative integer per layer, stated once for all layers or as an
     /// array with one entry per layer.
     pub fn uniform_or_layer_counts(&self, key: &str, layers: u64) -> Result<Vec<u64>, HeaderError> {
-        let value = self.typed(
+        let value = self.uniform_or_array(
             key,
             "a nonnegative integer or one per layer",
-            |value| match value {
-                Value::Array(values) if values.len() as u64 == layers => {
-                    values.iter().map(Element::unsigned).collect()
-                }
-                Value::Array(_) => None,
-                value => value.unsigned().map(|value| vec![value; layers as usize]),
-            },
+            layers,
+            Element::unsigned,
         )?;
         self.required(key, value)
     }
 
     /// One flag per layer.
     pub fn optional_flags(&self, key: &str, layers: u64) -> Result<Option<Vec<bool>>, HeaderError> {
-        self.typed(key, "one flag per layer", |value| match value {
-            Value::Array(values) if values.len() as u64 == layers => values
-                .iter()
-                .map(|value| match value {
-                    Element::Bool(value) => Some(value),
-                    _ => None,
-                })
-                .collect(),
+        self.array(key, "one flag per layer", Some(layers), |element| match element {
+            Element::Bool(value) => Some(value),
             _ => None,
         })
     }
@@ -230,10 +247,18 @@ impl<'a> Metadata<'a> {
 
 fn number(value: &Value) -> Option<f64> {
     match value {
-        Value::Scalar(Scalar::Float(value)) => Some(*value),
-        Value::Scalar(Scalar::Unsigned(value)) => Some(*value as f64),
-        Value::Scalar(Scalar::Signed(value)) => Some(*value as f64),
-        _ => None,
+        Value::Scalar(scalar) => element_number(scalar.element()),
+        Value::Array(_) => None,
+    }
+}
+
+/// A finite number, stored as a float or an integer.
+fn element_number(element: Element) -> Option<f64> {
+    match element {
+        Element::Float(value) => Some(value),
+        Element::Unsigned(value) => Some(value as f64),
+        Element::Signed(value) => Some(value as f64),
+        Element::String(_) | Element::Bool(_) => None,
     }
     .filter(|value| value.is_finite())
 }

@@ -487,7 +487,7 @@ impl StoredHeader {
             match (entry.stored, &entry.metadata.value) {
                 (StoredType::Scalar(stored), Value::Scalar(scalar)) => {
                     out.extend(stored.id().to_le_bytes());
-                    stored.encode(scalar_element(scalar), &mut out)?;
+                    stored.encode(scalar.element(), &mut out)?;
                 }
                 (StoredType::Array(stored), Value::Array(array)) => {
                     out.extend(9u32.to_le_bytes());
@@ -536,13 +536,16 @@ fn alignment(value: &Value) -> Result<u64, Error> {
         .ok_or_else(|| invalid("alignment must be a positive power of two"))
 }
 
-fn scalar_element(scalar: &Scalar) -> Element<'_> {
-    match scalar {
-        Scalar::String(value) => Element::String(value),
-        Scalar::Bool(value) => Element::Bool(*value),
-        Scalar::Unsigned(value) => Element::Unsigned(*value),
-        Scalar::Signed(value) => Element::Signed(*value),
-        Scalar::Float(value) => Element::Float(*value),
+impl Scalar {
+    /// The scalar as an array element holds it.
+    pub fn element(&self) -> Element<'_> {
+        match self {
+            Self::String(value) => Element::String(value),
+            Self::Bool(value) => Element::Bool(*value),
+            Self::Unsigned(value) => Element::Unsigned(*value),
+            Self::Signed(value) => Element::Signed(*value),
+            Self::Float(value) => Element::Float(*value),
+        }
     }
 }
 
