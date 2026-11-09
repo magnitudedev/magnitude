@@ -162,25 +162,25 @@ native routed_route_streamed for cuda from "cuda/routed_route_streamed.cu":
     scratch logits bytes ((M * (E + 1) + AHEAD * M * (EN + 1)) * 4)
     scratch arrivals bytes (4 * (1 + AHEAD)) sync
     launch routed_route_streamed:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
         unless (policy[POLICY_WHOLE])
         unless (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (M * H * 2)
     launch routed_route_streamed_alone:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
         unless (policy[POLICY_WHOLE])
         if (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (M * H * 2)
     launch routed_route_whole:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + AHEAD * ceil_div(EN, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
         if (policy[POLICY_WHOLE])
         unless (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (M * H * 2)
     launch routed_route_whole_alone:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
         if (policy[POLICY_WHOLE])
         if (next_policy[POLICY_RESOLVED])
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)

@@ -4142,7 +4142,7 @@ fn shared_route_mappings(device: &seismic::Device) -> Vec<SharedRouteMappings> {
                 ],
             })
             .into(),
-        // SIMDGROUPS / KSPLIT tile groups a block.
+        // A shared block of SIMDGROUPS warps forms one tile group of KSPLIT.
         seismic::BackendName::Cuda => [1u64, 2, 4]
             .map(|split| SharedRouteMappings {
                 expand: vec![("TPW", 1), ("KSPLIT", split)],

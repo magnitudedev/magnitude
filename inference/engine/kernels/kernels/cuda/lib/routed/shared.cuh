@@ -13,11 +13,13 @@
 // published `normalized` bits; where the shared weights take NVFP4 operands, those
 // rows' operands as `routed_expand`'s stage launch forms them), then runs
 // `routed_expand`'s shared row: the swap-AB paired GEMV over the shared
-// expert's gate and up rows with the SiLU . mul epilogue, SIMDGROUPS /
-// KSPLIT tile groups of TPW tiles a block, KSPLIT splitting K across a
-// group's warps. A row's result depends only on TPW and KSPLIT, never on the
-// warps a block has, so for equal KSPLIT the shared product carries
-// `routed_expand`'s bits.
+// expert's gate and up rows with the SiLU . mul epilogue, one tile group of
+// TPW tiles a block, KSPLIT splitting K across the group's warps: the shared
+// part spreads over as many blocks as it has tile groups, whatever
+// SIMDGROUPS the router blocks take, and a block's other warps stage its
+// rows and run past the segment. A row's result depends only on TPW and
+// KSPLIT, never on the warps a block has or the group that forms it, so for
+// equal KSPLIT the shared product carries `routed_expand`'s bits.
 
 #include "../projection/projection.cuh"
 
@@ -54,11 +56,14 @@ __device__ __forceinline__ void rows(const route::Input &in, const float *invers
 }
 
 // Shared-expert block `block` (counted from the first after the blocks
-// before the shared expert's) over the `gate` and `up` weights into
-// `product`: its rows formed in `memory` (the launch's dynamic shared
-// memory, M x H A elements) from the decode rows `in` once the launch's
-// predecessor completed, through the block's `parts` and `inverses`; the
-// GEMV's first weight loads are issued before. Every thread calls it.
+// before the shared expert's), tile group `block`, over the `gate` and `up`
+// weights into `product`: its rows formed in `memory` (the launch's dynamic
+// shared memory, M x H A elements) from the decode rows `in` once the
+// launch's predecessor completed, through the block's `parts` and
+// `inverses`; the GEMV's first weight loads are issued before. Its first
+// group forms the tile group; the others take one past the segment, so they
+// load and store nothing but reach the block-collective staging. Every
+// thread calls it.
 __device__ __forceinline__ void block(const route::Input &in, const projection::u8 *gate, const projection::u8 *up,
                                       projection::u8 *product, float (*parts)[route::WARPS], float *inverses,
                                       projection::u8 *memory, unsigned block,
@@ -70,8 +75,9 @@ __device__ __forceinline__ void block(const route::Input &in, const projection::
         rows(in, inverses, memory, seismic_words_value);
         return Rows{memory, SEISMIC_DIM_H, projection::AllRows{}};
     };
+    const projection::u64 group = Shape::group() == 0 ? block : projection::gemv_groups<Shape>(SEISMIC_DIM_S);
     projection::gemv_segment_ready<Shape>(gemv, ready, static_cast<unsigned>(SEISMIC_DIM_M), SEISMIC_DIM_H / 64,
-        static_cast<projection::u64>(block) * Shape::GROUPS + Shape::group(), SEISMIC_DIM_S, KERNEL_W1_AT(gate),
+        group, SEISMIC_DIM_S, KERNEL_W1_AT(gate),
         KERNEL_W2_AT(up), projection::SiluMul<projection::Act>{product, SEISMIC_RESULT_2_STRIDE_0});
 }
 

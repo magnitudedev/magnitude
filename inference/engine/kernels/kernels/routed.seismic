@@ -220,9 +220,11 @@ native routed_route_shared for metal from "metal/routed_route_shared.metal":
 # forms them) then runs `routed_expand`'s shared row
 # (`cuda/lib/routed/shared.cuh`): the swap-AB GEMV, TPW tiles per warp
 # group, KSPLIT splitting K across a group's warps (KSPLIT sets the
-# reduction order, so it is arithmetic), SIMDGROUPS / KSPLIT groups a block. For equal KSPLIT, `shared_product` carries
-# `routed_expand`'s bits. The first configuration is `routed_route`'s and
-# `routed_expand`'s, so the decode form keeps their bits at their defaults.
+# reduction order, so it is arithmetic), one tile group a shared block, so
+# the shared part takes a block per tile group whatever SIMDGROUPS the router
+# takes. For equal KSPLIT, `shared_product` carries `routed_expand`'s bits.
+# The first configuration is `routed_route`'s and `routed_expand`'s, so the
+# decode form keeps their bits at their defaults.
 native routed_route_shared for cuda from "cuda/routed_route_shared.cu":
     static (H, PT, NM, E, K, S, ES)
     params (SIMDGROUPS in [8, 4, 2] default 8, TPW in [1, 2] default 1, arithmetic KSPLIT in [1, 2, 4] default 1)
@@ -230,7 +232,7 @@ native routed_route_shared for cuda from "cuda/routed_route_shared.cu":
     scratch logits bytes (M * (E + 1) * 4)
     scratch arrivals bytes (4) sync
     launch routed_route_shared:
-        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(ceil_div(S, 16), TPW), SIMDGROUPS / KSPLIT), 1, 1)
+        threadgroups (ceil_div(E + 1, SIMDGROUPS) + ceil_div(ceil_div(S, 16), TPW), 1, 1)
         threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
         shared_bytes (M * H * 2)
 
