@@ -297,6 +297,66 @@ pub struct MeasureEnd {
     pub held: Option<magnitude_executor::assessment::Held>,
 }
 
+/// Measurement jobs run in this process ([`measure_machine`]), one after
+/// another, on the executor a load of a manifest selects: how a host that
+/// runs no job beside it (a tool, a load in its own process) has what a
+/// load waits on measured.
+pub struct InProcessJobs {
+    request: MeasureRequest,
+    topology: Arc<seismic::DeviceTopology>,
+    executor: seismic::Executor,
+}
+
+/// What one in-process job did.
+pub struct JobRun {
+    /// Whether it recorded a point or left fewer requests outstanding.
+    pub progressed: bool,
+    /// The requests still outstanding after it.
+    pub outstanding: Vec<magnitude_executor::assessment::PointRequest>,
+    pub failures: Vec<MeasureFailure>,
+}
+
+impl InProcessJobs {
+    /// Jobs for `manifest`'s load on the machine `catalog` discovered with
+    /// `paths`, its records in its kernel cache; none without one, where
+    /// nothing measured reaches a load.
+    pub fn of_load(catalog: &Devices, paths: Vec<PathBuf>, manifest: &crate::options::ExecutionManifest) -> Result<Option<Self>, String> {
+        let Some(kernels) = manifest.kernel_cache.clone() else { return Ok(None) };
+        let selected = crate::planning::select_load_device(catalog, manifest).map_err(|error| error.to_string())?;
+        Ok(Some(Self {
+            request: MeasureRequest {
+                paths,
+                kernels,
+                storage: manifest.store().to_path_buf(),
+                executor: selected.info.selector(),
+                job: MeasureJob(0),
+                time: std::time::Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS),
+            },
+            topology: catalog.topology(),
+            executor: selected.info,
+        }))
+    }
+
+    /// The requests a job has points of left to measure, in its order
+    /// ([`PointRequests::outstanding`]).
+    pub fn outstanding(&self) -> Result<Vec<magnitude_executor::assessment::PointRequest>, String> {
+        let records = KernelCache::measurement_records(&self.request.kernels);
+        let costs = ExecutorCosts::stored(&self.topology, &self.executor, &records).ok().and_then(|walked| walked.outstanding());
+        PointRequests::new(&self.request.kernels).outstanding(&self.topology, &self.executor, &self.request.storage, &records, costs)
+    }
+
+    /// Run the next job to its end, releasing what it held.
+    pub fn run(&mut self) -> Result<JobRun, String> {
+        let before = self.outstanding()?;
+        self.request.job = MeasureJob(self.request.job.0 + 1);
+        let mut recorded = false;
+        let end = measure_machine(&self.request, &mut |event| recorded |= matches!(event, MeasureEvent::Recorded(..)));
+        drop(end.held);
+        let outstanding = self.outstanding()?;
+        Ok(JobRun { progressed: recorded || outstanding != before, outstanding, failures: end.failures })
+    }
+}
+
 /// The measurement job's probing of the device alone, as a job probes before
 /// it measures ([`measure_machine`]): executor `executor` of the machine
 /// discovered with `paths` runs each of its probes the kernel cache at

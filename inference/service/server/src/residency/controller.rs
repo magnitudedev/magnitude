@@ -535,14 +535,14 @@ pub(super) async fn preview(
 }
 
 /// `preview`'s outcome once the measurement job has stored the machine's standing figures the
-/// plan is priced on. A load needs the device's share for its lifetime, and the job takes the
-/// device only when nothing holds it: so a preview whose prices are pending defers the load
-/// holding nothing of the device. `defer` asks the job for the figures, the job is told of the
-/// requests, and the preview is taken again after the next hold's end, the job's among them once
-/// it has stored what it measured; a preview still pending then asks again, so a job that ended
-/// without the figures (it failed, or measured another load's) is asked anew, never waited on
-/// forever.
-async fn priced<T, P, D>(
+/// plan is priced on, met as every host meets a pending plan (`magnitude_engine::preview::priced`).
+/// A load needs the device's share for its lifetime, and the job takes the device only when
+/// nothing holds it: so a preview whose prices are pending defers the operation holding nothing
+/// of the device. `defer` asks the job for the figures, the job is told of the requests, and the
+/// preview is taken again after the next hold's end, the job's among them once it has stored what
+/// it measured; a preview still pending then asks again, so a job that ended without the figures
+/// (it failed, or measured another load's) is asked anew, never waited on forever.
+pub(super) async fn priced<T, P, D>(
     device: &DeviceLock,
     mut preview: impl FnMut() -> P,
     mut defer: impl FnMut() -> D,
@@ -551,18 +551,26 @@ where
     P: std::future::Future<Output = Result<T, PreviewError>>,
     D: std::future::Future<Output = Result<(), ModelOperationFailure>>,
 {
-    let mut releases = device.releases();
-    loop {
-        match preview().await {
-            Err(PreviewError::PricesPending { reason }) => {
-                tracing::info!(%reason, "load waits for the machine's standing figures");
-                defer().await?;
-                device.requested();
-                releases.released().await;
-            }
-            previewed => return previewed.map_err(preview_failure),
+    let measured = || {
+        let mut releases = device.releases();
+        device.requested();
+        async move {
+            releases.released().await;
+            Ok(())
         }
-    }
+    };
+    magnitude_engine::preview::priced(&mut preview, &mut defer, measured).await?.map_err(preview_failure)
+}
+
+/// Ask the measurement job for the standing figures `resolved`'s plan is priced on.
+pub(super) async fn request_prices(
+    catalog: &Arc<Devices>,
+    resolved: &Arc<ResolvedConfiguration>,
+) -> Result<(), ModelOperationFailure> {
+    let (catalog, resolved) = (Arc::clone(catalog), Arc::clone(resolved));
+    magnitude_service_utils::blocking::run(move || resolved.manifest.request_prices(&catalog))
+        .await
+        .map_err(|reason| ModelOperationFailure::new("measurement_request_failed", reason, true))
 }
 
 pub(super) fn load_plan(preview: &LoadPreview) -> Result<ModelLoadPlan, ModelOperationFailure> {
@@ -785,11 +793,7 @@ impl EngineResidency {
     ) -> Result<(), ModelOperationFailure> {
         self.progress(instance_id, ModelLoadStage::Queued, None);
         self.demand.lock().expect("device demand").take();
-        let catalog = Arc::clone(&self.environment.catalog);
-        let resolved = Arc::clone(resolved);
-        magnitude_service_utils::blocking::run(move || resolved.manifest.request_prices(&catalog))
-            .await
-            .map_err(|reason| ModelOperationFailure::new("measurement_request_failed", reason, true))
+        request_prices(&self.environment.catalog, resolved).await
     }
 
     async fn load(
@@ -848,7 +852,14 @@ impl EngineResidency {
         }
         let preview = match previewed {
             Some(preview) => preview,
-            None => preview(&environment.catalog, &resolved).await.map_err(preview_failure)?,
+            None => {
+                priced(
+                    &environment.device,
+                    || preview(&environment.catalog, &resolved),
+                    || self.defer_unpriced(instance_id, &resolved),
+                )
+                .await?
+            }
         };
         let plan = load_plan(&preview)?;
         self.progress(instance_id, ModelLoadStage::Preparing, Some(&plan));

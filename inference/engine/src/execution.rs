@@ -1059,6 +1059,31 @@ impl LoadPricing {
     }
 }
 
+/// Store the required figures of `executor` of `topology` in the kernel
+/// cache at `cache` as a machine's measurements, fixed rather than timed,
+/// so what a test asserts of them holds on any host however loaded: each
+/// required point the walk's retrace finds unrecorded stored at 1 ms, the
+/// launch graph's host times 0.15 ms (each run waited for) and 0.05 ms
+/// (queued) past its device time.
+#[cfg(test)]
+pub(crate) fn store_fixed_costs(topology: &seismic::DeviceTopology, executor: &seismic::Executor, cache: &std::path::Path) {
+    use magnitude_executor::assessment::{ExecutorCosts, StoredCosts};
+    use seismic::measure::{Record, RecordStore, Timing};
+    let records = KernelCache::measurement_records(cache);
+    loop {
+        let key = match ExecutorCosts::stored(topology, executor, &records).unwrap() {
+            StoredCosts::Missing(key) => key,
+            StoredCosts::Complete { .. } => return,
+        };
+        let median = match key.point.get("timing") {
+            Some(&1) => 1.15e-3,
+            Some(&2) => 1.05e-3,
+            _ => 1e-3,
+        };
+        RecordStore::store(&records, &key, &Record::Measured(Timing { median, interval: None, samples: 1 })).unwrap();
+    }
+}
+
 impl BankPricing {
     /// What prices `bank`'s experts, measuring nothing: each layer's lines
     /// the bank holds (`lines`, `ExpertBank::lines`), beside what the

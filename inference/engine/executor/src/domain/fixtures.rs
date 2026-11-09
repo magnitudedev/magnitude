@@ -168,7 +168,7 @@ pub fn tiny_definition() -> ModelDefinition {
     definition
 }
 
-fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
+pub fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
     crate::planning::fixtures::fixture_manifest(definition)
 }
 

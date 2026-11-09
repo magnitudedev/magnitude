@@ -21,7 +21,7 @@ use magnitude_service_contracts::models::{
 use magnitude_service_models::{ServableModelBundleKey, servable_model_bundle_key_for_bundle};
 use tokio::sync::watch;
 
-use super::controller::{ResidencyEnvironment, load_plan, preview};
+use super::controller::{ResidencyEnvironment, load_plan, preview, priced, request_prices};
 use super::worker::EngineWorker;
 use super::{ModelOperationFailure, ResidencyWorker as _};
 use crate::device_lock::{DeviceHold, DeviceJob, DeviceLock};
@@ -310,7 +310,13 @@ async fn prepare(
     };
     let resolved = environment.configurations.resolve(&configuration).await?;
     // A model this device cannot load has nothing to tune for.
-    let Ok(preview) = preview(&environment.catalog, &resolved).await else {
+    // Its plan waits for its prices as a load's does, holding nothing of the device.
+    let previewed = priced(
+        &environment.device,
+        || preview(&environment.catalog, &resolved),
+        || request_prices(&environment.catalog, &resolved),
+    );
+    let Ok(preview) = previewed.await else {
         return Ok(Preparation::Skipped("the load preview failed"));
     };
     let device = load_plan(&preview)?.device;

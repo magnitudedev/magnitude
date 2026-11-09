@@ -207,10 +207,10 @@ pub fn probe(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> Res
 /// runs it: its search, in a worker process of this executable, publishing
 /// records to the kernel cache, with nothing imported or loaded here.
 pub fn prepare(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> Result<(), String> {
-    use magnitude_engine::worker::{Preparation, prepare, start_worker_process};
+    use magnitude_engine::worker::Preparation;
     let resolved = configuration(artifacts, options, load)?;
     let command = worker(&options.worker_arguments)?;
-    match prepare(&resolved.manifest, || start_worker_process(command), |_| {})
+    match magnitude_engine::composition::prepare_in_process(&resolved.manifest, command, |_| {})
         .map_err(|error| error.to_string())?
     {
         Preparation::Prepared | Preparation::Unneeded => Ok(()),
@@ -223,57 +223,34 @@ pub fn prepare(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> R
 /// executor's costs and then the points a load of `resolved` waits on are
 /// recorded: no job runs beside the harness, and a cell times what a served
 /// load is once its job has run. The load's points come of its plan, which
-/// prices its holdings on the costs, so the standing requests settle first.
-/// It stops early only where a job leaves them as they were, reporting why,
-/// and the load then serves what is pending as any load does. Nothing to do
-/// without a kernel cache.
+/// prices its holdings on the standing figures, so those settle first, as
+/// every load in its own process settles them (`composition::settle_prices`).
+/// The rest stops early only where a job leaves them as they were,
+/// reporting why, and the load then serves what is pending as any load
+/// does. Nothing to do without a kernel cache.
 fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::composition::ResolvedEngineConfiguration) -> Result<(), String> {
-    use magnitude_engine::worker::measure::{measure_machine, MeasureEvent, MeasureJob, MeasureRequest};
-    use magnitude_executor::assessment::{PointRequests, MEASUREMENT_SECONDS};
+    use magnitude_engine::worker::measure::InProcessJobs;
     let manifest = &resolved.manifest;
     let Some(root) = &manifest.kernel_cache else {
         return Ok(());
     };
-    let (paths, catalog, selected) = selected_machine(artifacts, resolved, root)?;
-    let topology = catalog.topology();
-    let records = magnitude_executor::KernelCache::measurement_records(root);
-    let requests = PointRequests::new(root);
-    let storage = manifest.store().to_path_buf();
-    let outstanding = || {
-        let costs = magnitude_executor::assessment::ExecutorCosts::stored(&topology, &selected.info, &records).ok().and_then(|walked| walked.outstanding());
-        requests.outstanding(&topology, &selected.info, &storage, &records, costs)
-    };
-    let mut job = 0;
-    let mut settle = || -> Result<(), String> {
-        let mut left = outstanding()?;
-        while !left.is_empty() {
-            job += 1;
-            let request = MeasureRequest {
-                paths: paths.clone(),
-                kernels: root.clone(),
-                storage: storage.clone(),
-                executor: selected.info.selector(),
-                job: MeasureJob(job),
-                time: std::time::Duration::from_secs_f64(MEASUREMENT_SECONDS),
-            };
-            let mut recorded = false;
-            let end = measure_machine(&request, &mut |event| recorded |= matches!(event, MeasureEvent::Recorded(..)));
-            drop(end.held);
-            let after = outstanding()?;
-            if !recorded && after == left {
-                for failure in &end.failures {
-                    eprintln!("magnitude-harness: not measured: {failure}");
-                }
-                eprintln!("magnitude-harness: the job left {} requests outstanding: {after:?}", after.len());
-                break;
-            }
-            left = after;
-        }
-        Ok(())
-    };
-    settle()?;
+    magnitude_engine::composition::settle_prices(manifest).map_err(|error| error.to_string())?;
+    let (paths, catalog, _) = selected_machine(artifacts, resolved, root)?;
     magnitude_engine::request_load_points(&catalog, manifest, resolved.host.package()).map_err(|error| error.to_string())?;
-    settle()
+    let mut jobs = InProcessJobs::of_load(&catalog, paths, manifest)?.expect("a load with a kernel cache has jobs");
+    let mut left = jobs.outstanding()?;
+    while !left.is_empty() {
+        let run = jobs.run()?;
+        if !run.progressed {
+            for failure in &run.failures {
+                eprintln!("magnitude-harness: not measured: {failure}");
+            }
+            eprintln!("magnitude-harness: the job left {} requests outstanding: {:?}", run.outstanding.len(), run.outstanding);
+            break;
+        }
+        left = run.outstanding;
+    }
+    Ok(())
 }
 
 pub struct Engine {

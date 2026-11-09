@@ -334,6 +334,8 @@ fn plan(
         standard_service_limits(),
     )
     .map_err(|error| error.to_string())?;
+    // Planned as the load plans, once its prices are measured.
+    magnitude_engine::composition::settle_prices(&manifest).map_err(|error| error.to_string())?;
     let planned = plan_execution(&manifest, &structure.selected).map_err(|error| error.to_string())?;
     Ok(Planned { host, manifest, devices, structure, planned })
 }

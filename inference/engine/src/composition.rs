@@ -7,9 +7,10 @@ use crate::error::{ArtifactError, LoadError, ResolveError, UnsupportedModel};
 use crate::host::HostArtifacts;
 use crate::options::{ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo};
 use crate::execution::LoadAttempt;
+use crate::preview::{now, priced};
 use crate::worker::{
-    connect_worker, load_prepared, protocol::LoadProgress, run_worker, start_worker_process,
-    transport::channel_pair, EngineClient, Preparation, WorkerConnection,
+    connect_worker, load_prepared, measure::InProcessJobs, prepare, protocol::LoadProgress, run_worker,
+    start_worker_process, transport::channel_pair, EngineClient, Preparation, WorkerConnection,
 };
 use magnitude_executor::UnpreparedUnits;
 use magnitude_artifacts::PackageIdentity;
@@ -204,6 +205,56 @@ impl ReadyEngine {
     }
 }
 
+/// Have the standing figures a load of `manifest` plans on measured in this
+/// process before it loads or prepares (`preview::priced`): no job runs
+/// beside a host that loads in its own process, so while they are pending
+/// its own jobs measure them ([`InProcessJobs`]), and the plan is taken
+/// again. A job that measures nothing of what is pending fails the load
+/// with why. A preview that fails otherwise is the load's to report, as it
+/// plans the same. Returns the jobs it ran; none without a kernel cache,
+/// which holds the figures. A load in its own process settles them once an
+/// attempt finds them pending ([`load_in_process`]), so a priced machine's
+/// load plans nothing more.
+pub fn settle_prices(manifest: &ExecutionManifest) -> Result<u64, LoadError> {
+    let internal = |reason: String| LoadError::Internal { reason };
+    let paths = vec![manifest.store().to_path_buf()];
+    let catalog = seismic::Devices::discover(&paths).map_err(|error| internal(error.to_string()))?;
+    let Some(mut jobs) = InProcessJobs::of_load(&catalog, paths, manifest).map_err(internal)? else {
+        return Ok(0);
+    };
+    let mut ran = 0;
+    let mut measured = || {
+        ran += 1;
+        let run = jobs.run().map_err(internal)?;
+        match run.progressed {
+            true => Ok(()),
+            false => Err(internal(format!(
+                "the plan's prices are pending, and a measurement job measured nothing of {:?}: {}",
+                run.outstanding,
+                run.failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
+            ))),
+        }
+    };
+    now(priced(
+        || std::future::ready(manifest.preview(&catalog)),
+        || std::future::ready(manifest.request_prices(&catalog).map_err(internal)),
+        || std::future::ready(measured()),
+    ))?;
+    Ok(ran)
+}
+
+/// The model's Prepare, as a host that loads in its own process runs it
+/// for no load ([`prepare`]): its prices settled first ([`settle_prices`]),
+/// as its search plans the load.
+pub fn prepare_in_process(
+    manifest: &ExecutionManifest,
+    worker: std::process::Command,
+    progress: impl FnMut(LoadProgress),
+) -> Result<Preparation, LoadError> {
+    settle_prices(manifest)?;
+    prepare(manifest, || start_worker_process(worker), progress)
+}
+
 /// [`load_prepared`] for a host that loads in its own process: `load` is its
 /// load, and `worker` starts the host's executable in its worker role
 /// ([`crate::worker::serve_worker`] over its standard streams) for the
@@ -232,7 +283,18 @@ pub fn load_in_process<L>(
                     began.elapsed().as_secs_f64()
                 );
             }
-            load(unprepared)
+            // An attempt whose prices are pending has them measured here and
+            // is made again; one still pending once nothing was left to
+            // measure plans otherwise than its preview, and fails as it is.
+            loop {
+                match load(unprepared) {
+                    Err(error @ LoadError::PricesPending { .. }) => match settle_prices(manifest)? {
+                        0 => return Err(error),
+                        _ => continue,
+                    },
+                    attempt => return attempt,
+                }
+            }
         },
         || {
             tracing::info!("kernel preparation began");

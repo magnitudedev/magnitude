@@ -234,30 +234,6 @@ mod tests {
         now
     }
 
-    /// Store `device`'s required figures in the kernel cache at `cache` as
-    /// a machine's measurements, fixed rather than timed, so what the test
-    /// asserts of them holds on any host however loaded: each required
-    /// point the walk's retrace finds unrecorded stored at 1 ms, the launch
-    /// graph's host times 0.15 ms (each run waited for) and 0.05 ms (queued)
-    /// past its device time.
-    fn store_costs(device: &seismic::Device, cache: &std::path::Path) {
-        use magnitude_executor::assessment::{ExecutorCosts, StoredCosts};
-        use seismic::measure::{Record, RecordStore, Timing};
-        let records = KernelCache::measurement_records(cache);
-        loop {
-            let key = match ExecutorCosts::stored(device.topology(), device.info(), &records).unwrap() {
-                StoredCosts::Missing(key) => key,
-                StoredCosts::Complete { .. } => return,
-            };
-            let median = match key.point.get("timing") {
-                Some(&1) => 1.15e-3,
-                Some(&2) => 1.05e-3,
-                _ => 1e-3,
-            };
-            RecordStore::store(&records, &key, &Record::Measured(Timing { median, interval: None, samples: 1 })).unwrap();
-        }
-    }
-
     /// Store the read line of the volume `cache` lies on as the
     /// measurement job measures it.
     fn store_read_line(device: &seismic::Device, cache: &std::path::Path) {
@@ -294,7 +270,7 @@ mod tests {
         // the executor's required figures, as a load's has once it plans.
         let cache = tempfile::tempdir().unwrap();
         let (pricing, device) = LoadPricing::fixture(magnitude_executor::platform::DeviceRequest::Backend(backend), true, Some(cache.path().to_owned()));
-        store_costs(&device, cache.path());
+        crate::execution::store_fixed_costs(device.topology(), device.info(), cache.path());
         let limits = ServiceLimits {
             prefill_tokens: 2,
             decode_tokens: 2,
@@ -320,7 +296,7 @@ mod tests {
     }
 
     /// A load without a bank chains its prompt as a base load does, priced
-    /// from the executor's costs as stored ([`store_costs`]), through the
+    /// from the executor's costs as stored (`execution::store_fixed_costs`), through the
     /// path a load's worker prices it (`load_measures`): its prompt group
     /// takes its chunks' places, the plan's chain.
     #[test]
@@ -329,7 +305,7 @@ mod tests {
         let (mut domain, mut bindings) = fixtures::chained(DeviceRequest::Automatic);
         let cache = tempfile::tempdir().unwrap();
         let (pricing, device) = LoadPricing::fixture(DeviceRequest::Automatic, false, Some(cache.path().to_owned()));
-        store_costs(&device, cache.path());
+        crate::execution::store_fixed_costs(device.topology(), device.info(), cache.path());
         let measures = load_measures(&pricing).unwrap();
         assert!(measures.experts.is_none(), "a load without a bank prices no experts");
         domain.measure_load(measures, &mut bindings).unwrap();
