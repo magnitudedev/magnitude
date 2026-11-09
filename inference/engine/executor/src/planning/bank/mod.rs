@@ -712,8 +712,9 @@ impl ExpertBankPlan {
         2 * self.selected()
     }
 
-    /// The tier records each group keeps ready or graced, holding no expert
-    /// (`HostRecords::refill`): the reads ahead's, a record for each staging
+    /// The tier records each group keeps holding no expert mapped (ready,
+    /// graced, or taken by a read ahead's landing in flight:
+    /// `HostRecords::reserved`): the reads ahead's, a record for each staging
     /// record beyond demand's ([`Self::hint_records`]), so every read
     /// ahead's landing finds one. A read ahead lands off any park, so it can
     /// take only a record no step reads already; a demand landing, at its

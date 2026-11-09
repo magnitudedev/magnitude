@@ -932,7 +932,7 @@ impl Scratch {
         let grants = match core.extents.placer {
             crate::planning::Placer::Tier => landed
                 .into_iter()
-                .filter_map(|(layer, expert, record)| match core.directory.claim_landing(layer, expert, 0) {
+                .filter_map(|(layer, expert, record)| match core.directory.claim_landing(layer, expert, 0, crate::experts::host_records::Taking::Out) {
                     crate::experts::host_records::Claim::Taken(grant) => Some((layer, expert, record, grant)),
                     _ => None,
                 })
