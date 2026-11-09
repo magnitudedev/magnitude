@@ -698,11 +698,6 @@ impl ExecutionPlanDraft {
         let bank = whole.bank();
         let floor = bank.floor();
         let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
-        let prices = unmeasured.prices(match prices {
-            Priced::Measured(prices) => prices.of_bank(&whole, definition)?,
-            Priced::Pending(reason) => Priced::Pending(reason.clone()),
-            Priced::Unavailable(reason) => Priced::Unavailable(reason.clone()),
-        })?;
         let points = rising(floor, ceiling, &reserved)?;
         let ladder = super::pass_ladder(places);
         // The mandatory part: what the load holds whatever it releases.
@@ -782,6 +777,28 @@ impl ExecutionPlanDraft {
             }
             Ok(reach)
         };
+        // A bank the room holds whole beside the mandatory part is held
+        // whole, whatever the machine's prices or whether they are measured:
+        // every expert resident misses nothing, so no price can make fewer
+        // slots worth their bytes, and growth has nothing left to reach.
+        // Every pass prices alike beside it, so the largest whose prompt
+        // group's class fits beside it is held, the fewest submissions.
+        if fits == bank.slots && ceiling == bank.slots {
+            for &pass in ladder.iter().rev() {
+                let (draft, charge, left) = charged(fits, fits, pass)?;
+                if left.is_err() {
+                    continue;
+                }
+                if let Ok(found) = confirm(&draft, charge.charge())? {
+                    return Ok(Ok(Settled { draft, charge, found, prices: None }));
+                }
+            }
+        }
+        let prices = unmeasured.prices(match prices {
+            Priced::Measured(prices) => prices.of_bank(&whole, definition)?,
+            Priced::Pending(reason) => Priced::Pending(reason.clone()),
+            Priced::Unavailable(reason) => Priced::Unavailable(reason.clone()),
+        })?;
         // Unpriced (an assessment's, `Unmeasured::SizedByMemory`): the
         // largest bank the room admits at the floor pass that `confirm`
         // admits, by memory alone.
@@ -1323,7 +1340,8 @@ struct Settled<C, T> {
     draft: ExecutionPlanDraft,
     charge: C,
     found: T,
-    /// None where an assessment sized it by memory alone.
+    /// None where the bank is whole or an assessment sized it by memory
+    /// alone.
     prices: Option<super::BankPrices>,
 }
 
@@ -1889,6 +1907,48 @@ mod tests {
             "{:?}'s prefill is slower than 512-row passes'",
             bank.pass
         );
+    }
+
+    /// Qwen3.6 35B-A3B q4's routed shape (40 blocks of 256 experts choosing
+    /// 8, hidden 2,048, intermediate 512: about 18.1 GB of Q4_0 expert
+    /// stacks) on the recorded RTX 3090 (24 GB), planned as a load plans it
+    /// (`with_bank`) on a machine with nothing measured: the room holds
+    /// every expert, so the bank is whole without the prices, and the load
+    /// never waits for them or streams.
+    #[test]
+    fn qwen36_q4_on_an_unmeasured_3090_holds_every_expert() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        let (_, _, _, device) = rtx3090(64 << 30);
+        let definition = routed_fixture_definition(RoutedShape { layers: 40, experts: 256, selected: 8, hidden: 2048, intermediate: 512 });
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        // The setup's precondition: the whole model's weights fit the
+        // device with room to spare, as main's resident load of it does.
+        let whole = draft.held_whole(&definition).unwrap();
+        let bytes = weight_bytes(&whole.load).unwrap();
+        assert!(
+            bytes < draft.device().assessment_capacity_bytes() - (2 << 30),
+            "the fixture's {bytes} weight bytes fit the 3090's {} with room",
+            draft.device().assessment_capacity_bytes()
+        );
+        let prices = Priced::Pending("the executor's costs are not measured yet".into());
+        let planned = draft
+            .with_bank::<AssessmentMemoryCharge>(&definition, None, &prices)
+            .unwrap_or_else(|error| panic!("Qwen3.6 35B-A3B q4 is not planned whole on an unmeasured 3090: {error:?}"));
+        let bank = planned.draft().load().expert_bank().expect("a routed load banks its experts");
+        assert_eq!((bank.slots, bank.ceiling), (256, 256), "every expert is held");
+        assert!(bank.whole());
+        assert_eq!(bank.host_slots, 0, "a whole bank holds no host tier");
     }
 
     /// A weight cap bounds every weight byte the load holds, its host tier's
