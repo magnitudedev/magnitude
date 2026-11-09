@@ -823,6 +823,14 @@ fn a_group_claims_its_lent_records_and_returns_them_empty() {
     harness.rounds(&step, 0);
     harness.commit_seeds(&step);
     step.complete().unwrap();
+    // The group returns its lent records once the watcher learns the device
+    // is past it and its conveyor quiet, after its step completes. The tier
+    // is the lent records alone, so a request taken before then finds no
+    // record to land in and reads from the file.
+    eventually("the group never returned its lent records", || {
+        let state = residency::lock(&harness.watcher.state);
+        (0..conveying.lent as u32).all(|record| !state.core.directory.lent_claimed(0, crate::experts::directory::HostRecord(record)))
+    });
     harness.request(&[3]).complete().unwrap();
     // The returned records take a landing, mapped as residency learns it.
     harness.tiering(0, &[3]);

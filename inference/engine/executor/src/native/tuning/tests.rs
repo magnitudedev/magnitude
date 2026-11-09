@@ -2334,19 +2334,13 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     );
     assert_eq!(inactive.formations.get(), 1);
     assert!(inactive.stages.borrow().is_empty());
+    // That record was made without demand: a load that serves the unit
+    // searches it, and replaces it under the same key.
     let mut activated = FakeCase::new(&implementation, &statics, "implementation inactive");
     activated.launches = 7;
-    let (reused, started, progressed) = load_once(&activated, limits);
-    assert_eq!(reused.overall, canonical.overall);
-    assert_eq!(reused.origin, TuningOrigin::Stored);
-    assert!(!started && !progressed);
-    assert!(activated.seen.borrow().is_empty() && activated.stages.borrow().is_empty());
-    assert_eq!(
-        activated.formations.get(),
-        0,
-        "a later load is metadata only"
-    );
-
+    let (searched_active, started, _) = load_once(&activated, limits);
+    assert_eq!(searched_active.origin, TuningOrigin::Searched);
+    assert!(started && !activated.seen.borrow().is_empty(), "a load with demand searches a record made without it");
     assert_eq!(stored_results(), 5);
     // A fresh load searches a unit whose result is stored, and replaces it.
     let fresh = FakeCase::new(&implementation, &statics, "implementation a");
@@ -3212,7 +3206,12 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         tuning_identity: device.tuning_identity(),
         entry: "attention_prefill_k8v4".into(),
         backend: "metal".into(),
-        points: Vec::new(),
+        // The served points it was searched at: a record made with demand,
+        // which a load with demand reads.
+        points: points
+            .iter()
+            .map(|point| seismic::PointRecord { label: point.label.clone(), weight: point.weight, class: point.class.clone() })
+            .collect(),
         requirement: context.numerical_profile.requirement(&case.entry()),
         observations: Vec::new(),
         served: vec![configuration(&defaults)],

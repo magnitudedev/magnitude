@@ -2216,11 +2216,12 @@ mod tests {
     }
 
     /// A shrink's move line is measured at each form's own records and
-    /// moves, on every native backend with an available executor, as the
-    /// measurement job measures a load's request of it with nothing stored: it rises with the records
-    /// moved, its fixed cost the launches', each form its own line, restored
-    /// once measured. Every such backend opens and is measured, and the
-    /// backends measured are printed.
+    /// moves, on every native backend the run selects with an available
+    /// executor, as the measurement job measures a load's request of it with
+    /// nothing stored: it rises with the records moved, its fixed cost the
+    /// launches', each form its own line, restored once measured. Every such
+    /// backend opens and is measured, and the backends measured are printed;
+    /// a run that selects none (the CPU's) has none to measure.
     #[test]
     fn the_move_line_is_measured_at_the_banks_own_form() {
         let devices = seismic::Devices::discover(&[]).unwrap();
@@ -2228,6 +2229,9 @@ mod tests {
             .into_iter()
             .filter(|&backend| crate::test_support::available(&devices, backend))
             .collect::<Vec<_>>();
+        if available.is_empty() {
+            return;
+        }
         let mut measured = Vec::new();
         for &backend in &available {
             let device = crate::test_support::open_backend(&devices, backend)
@@ -2236,7 +2240,6 @@ mod tests {
             measured.push(backend);
         }
         eprintln!("move lines measured on {measured:?}");
-        assert!(!measured.is_empty(), "the host has a native backend to measure on");
     }
 
     fn move_lines_are_measured_at_the_banks_own_form(device: &Device) {

@@ -966,15 +966,15 @@ fn assess_qwen36_35b(
 }
 
 /// Qwen3.6 35B fits the M4 Pro resident, unchanged; with too little room
-/// for its resident plan it fits streamed through the largest expert bank
-/// the room holds, its speed unmeasured; with too little for the bank's
-/// floor it does not fit.
+/// for every expert it fits streamed through the largest expert bank the
+/// room holds, its speed unmeasured; with too little for the bank's floor
+/// it does not fit.
 #[test]
 fn a_model_fits_resident_streamed_or_not_at_all() {
     let scratch = Scratch::new("qwen36-streamed-fit");
     let package = qwen36_35b(&scratch);
 
-    let (_, _, resident) = assess_qwen36_35b(&package, MemoryReserves::of_machine(None));
+    let (_, whole, resident) = assess_qwen36_35b(&package, MemoryReserves::of_machine(None));
     let ModelExecution::Fits {
         fit: ExecutionFit { domains, .. },
         residency:
@@ -991,9 +991,18 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
         .unwrap();
     let (capacity, resident_bytes) = (allocation.capacity_bytes, allocation.required_bytes);
 
-    // Room for all but 4 GB of the resident plan: streamed, through the
-    // holdings the fit's settle grants on the machine's prices.
-    let reserves = host_room(capacity, resident_bytes - 4_000_000_000);
+    // Room for the whole weights, every expert resident, and nothing beside
+    // them: a whole bank charges those weights and the plan's mandatory part
+    // besides at any pass, so none fits, and the load streams through the
+    // holdings the fit's settle grants on the machine's prices. Room short
+    // of the resident plan alone would still hold the bank whole beside a
+    // smaller pass, which misses nothing.
+    let PreparedModelAssessment::Planned { draft: whole, .. } = &whole else {
+        unreachable!("the model was assessed");
+    };
+    let whole_weights = whole.load().clone().unbanked().weight_bytes().unwrap();
+    assert!(whole_weights < resident_bytes);
+    let reserves = host_room(capacity, whole_weights);
     let (setup, prepared, streamed) = assess_qwen36_35b(&package, reserves);
     let ModelExecution::Fits { fit: ExecutionFit { domains, .. }, residency: ModelResidency::Streamed { shares, .. } } = streamed else {
         panic!("Qwen3.6 35B fits streamed: {streamed:?}");
