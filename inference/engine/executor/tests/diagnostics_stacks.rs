@@ -54,6 +54,13 @@ fn child() {
     if std::env::var_os(CHILD).is_none() {
         return;
     }
+    // The setup: the report goes to stderr, which the parent reads. Under
+    // the rig, which names a directory in `STACKS`, it would go to a file
+    // there instead.
+    assert!(
+        std::env::var_os(magnitude_executor::diagnostics::STACKS).is_none(),
+        "the child reports to stderr"
+    );
     magnitude_executor::diagnostics::install();
     let held = std::sync::Arc::new(Mutex::new(()));
     let _guard = held.lock().unwrap();
@@ -111,6 +118,9 @@ fn every_thread_is_reported_while_threads_block_and_one_holds_the_allocator() {
     let mut child = Reaped(Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "child", "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
+        // Its report goes to stderr, read below, wherever this test runs:
+        // the rig's directory for reports would take it to a file.
+        .env_remove(magnitude_executor::diagnostics::STACKS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
