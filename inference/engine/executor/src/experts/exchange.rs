@@ -17,7 +17,7 @@ mod pulse;
 mod watchdog;
 
 pub(crate) use pulse::Pulse;
-pub(in crate::experts) use watchdog::{Bound, Bounds, Kind, Parked, Trip, Watchdog, Watched, Witness, abort};
+pub(in crate::experts) use watchdog::{Bound, Bounds, Kind, Park, Parked, Trip, Watchdog, Watched, Witness, abort};
 
 use super::Words;
 use magnitude_kernels::{SlotTable, constants};

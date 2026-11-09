@@ -482,18 +482,24 @@ impl Parks {
     }
 
     /// The park the device has reached and no answer has released, for the
-    /// exchange's watchdog (`exchange::Parked`): the head once the device
-    /// is parked there (an answer removes it), whoever writes its lane's
-    /// request. None where kernels wait in place, while nothing is reached,
-    /// or while another thread holds the parks (the keeper, briefly).
-    pub(in crate::experts) fn reached(&self) -> Option<crate::experts::exchange::Parked> {
-        let state = self.state.try_lock().ok()?;
-        let head = state.pending.front().filter(|head| self.device_reached(&state, head.value))?;
-        Some(crate::experts::exchange::Parked {
-            value: head.value,
-            step: head.sequence,
-            site: format!("layer {} {:?}", head.site.layer, head.site.kind),
-        })
+    /// exchange's watchdog (`exchange::Park`): the head once the device is
+    /// parked there (an answer removes it), whoever writes its lane's
+    /// request. Clear where kernels wait in place or while nothing is
+    /// reached; unseen while another thread holds the parks, which the
+    /// watchdog never waits on.
+    pub(in crate::experts) fn reached(&self) -> crate::experts::exchange::Park {
+        use crate::experts::exchange::{Park, Parked};
+        let Ok(state) = self.state.try_lock() else {
+            return Park::Unseen;
+        };
+        match state.pending.front().filter(|head| self.device_reached(&state, head.value)) {
+            Some(head) => Park::Reached(Parked {
+                value: head.value,
+                step: head.sequence,
+                site: format!("layer {} {:?}", head.site.layer, head.site.kind),
+            }),
+            None => Park::Clear,
+        }
     }
 
     /// The parks' state, for the exchange's watchdog: the timeline's value,
