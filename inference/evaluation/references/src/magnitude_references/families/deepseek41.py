@@ -34,11 +34,29 @@ check). The forward, with S hyper-connection streams X [S, H] per row:
 Every row is a function of the tokens at or before it, so a prompt computed whole, in chunks, or a
 verify block row by row gives the same rows: there is no batch-level selection anywhere.
 
-The roundings the model was trained with (`Roundings`), each off by default: the window KV to E4M3
+The roundings the model was trained with (`Roundings`), part of its numerics and applied by default,
+as the engine's definition states them (`Roundings()` switches each off): the window KV to E4M3
 with a UE8M0 scale per 32, compressed rows to E2M1 with an E4M3 scale per 16, indexer queries and
-keys to E2M1 with a UE8M0 scale per 32 (`kernel.act_quant`, `kernel.fp4_act_quant`). The E4M3
-activation rounding before the GEMMs (`kernel.act_quant` into `fp8_gemm` / `fp4_gemm`, and before
-wo_a) is not model numerics and is never applied.
+keys to E2M1 with a UE8M0 scale per 32 (`kernel.act_quant`, `kernel.fp4_act_quant`); and the BF16
+holds of the paths whose rows those roundings store (`Roundings.held`), as model.py computes them in
+its BF16 dtype. The compressor reads BF16 `x`, pools its F32 projections (ratio > 1; ratio 1 is a BF16
+projection) and holds the pooled row, its norm and its rotation; the index keys hold `wk`'s output,
+`k_norm` and the rotation, the index queries `wq_b`'s output (over BF16 `qr`) and the rotation, and
+the head weights `weights_proj`'s output over BF16 `x`; the window key holds `wkv`'s output (over
+BF16 `x`), `kv_norm` and the rotation (`_window_kv`, l.706-708) before its E4M3 rounding stores it.
+
+A perturbed reference (`perturbation.py`) moves those stored rows, the window KV, the index keys and the
+compressed rows, as they are formed (`store`): each code and block scale by one step of its stored format,
+by its plane, row and channel. The index queries round the same way but are not stored, so they do not move.
+
+The activation roundings (`definition.md` §8 D3) are not model numerics: `Roundings.activations` is a
+measurement switch, off in `trained()`, which the reference runs as its `activations` variant. It
+applies model.py's BF16 compute-dtype holds elsewhere (the
+streams after each join and the Engram, each collapsed sublayer input, every other RMSNorm and BF16
+GEMM output, the query rotation, the attention output and its grouped wo_a product, the SwiGLU
+product, the MoE sum, the index scores), the E4M3 casts with a UE8M0 scale per 32 of every GEMM input
+whose weight the checkpoint stores in FP8 or FP4 (`linear`'s `act_quant`) and of the context before
+wo_a, and a routed expert's weight on its SwiGLU product before down, as model.py's `Expert` applies it.
 
 The file (`inference/conversion` `deepseek41.py`): llama.cpp `deepseek41` names and metadata,
 checkpoint layout (no row permutations); FP8 weights are E4M3 codes with UE8M0 block exponents,
@@ -46,17 +64,21 @@ dequantized by `Weights`; the Engram gate is the stored product q_weight k_weigh
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import math
 
+from gguf.constants import GGMLQuantizationType as Q
 import torch
 
+from magnitude_references import perturbation as stored
 from magnitude_references.gguf import Package
 from magnitude_references.model import (Reference, Rotary, Weights, attention, default_inv_freq, layer_count, linear,
                                         lower_index_top, mixture, per_layer, rms_norm, route_top_k, silu, softplus,
                                         visibility, yarn_inv_freq)
 
 CODE = ("deepseek-ai/DeepSeek-V4.1-Flash-1017", "1bae0e1088993b9b82de08f59de5be5a34e42170")
+DENSE = (Q.F32, Q.F16, Q.BF16)  # stored unquantized: model.py's BF16 / F32 weights, whose GEMMs take x uncast
 SQRT_SOFTPLUS = 4  # llama.cpp `expert_gating_func`
 ROUTE_EPS = 1e-20  # the routing weights' normaliser (DeepSeek's Gate: not norm_eps)
 ENGRAM_CLAMP = 1e-6
@@ -91,41 +113,52 @@ def power_of_two_ceil(x: torch.Tensor) -> torch.Tensor:
     return torch.ldexp(torch.ones_like(x), exponent - (mantissa == 0.5).to(exponent.dtype))
 
 
-def block_round(x: torch.Tensor, block: int, codes: Codes, scale_of) -> torch.Tensor:
-    """Quantize-dequantize the last axis of x in blocks: code(clamp(x / s)) s, s = scale_of(amax)."""
-    blocks = x.unflatten(-1, (-1, block))
-    scale = scale_of(blocks.abs().amax(-1, keepdim=True))
-    return (round_codes(torch.clamp(blocks / scale, -codes.max, codes.max), codes) * scale).flatten(-2)
+@dataclass(frozen=True)
+class Blocks:
+    """A block rounding of the last axis: `size` values of `codes` per scale, the scale `scale_of` the block's
+    amax; `code` and `scale` are the stored formats of the two planes (`perturbation.py`)."""
+    size: int
+    codes: Codes
+    scale_of: Callable[[torch.Tensor], torch.Tensor]
+    code: stored.Format
+    scale: stored.Format
+
+    def split(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """x [..., D] as code values [..., D / size, size] and their scales [..., D / size, 1]:
+        code(clamp(x / s)), s = scale_of(amax)."""
+        blocks = x.unflatten(-1, (-1, self.size))
+        scale = self.scale_of(blocks.abs().amax(-1, keepdim=True))
+        return round_codes(torch.clamp(blocks / scale, -self.codes.max, self.codes.max), self.codes), scale
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantize-dequantize x: its codes times their scales."""
+        codes, scale = self.split(x)
+        return (codes * scale).flatten(-2)
 
 
-def round_window(x: torch.Tensor) -> torch.Tensor:
-    """`act_quant(x, 32, "ue8m0", inplace=True)`: E4M3 codes, scale 2^ceil(log2(max(amax, 1e-4) * f32(1/448)))."""
-    return block_round(x, 32, E4M3, lambda amax: power_of_two_ceil(
-        torch.maximum(amax, amax.new_tensor(1e-4)) * amax.new_tensor(1 / E4M3.max)))
-
-
-def round_index(x: torch.Tensor) -> torch.Tensor:
-    """`fp4_act_quant(x, 32, inplace=True)`: E2M1 codes, scale 2^ceil(log2(max(amax, 6 2^-126) * f32(1/6)))."""
-    return block_round(x, 32, E2M1, lambda amax: power_of_two_ceil(
-        torch.maximum(amax, amax.new_tensor(6 * 2.0 ** -126)) * amax.new_tensor(1 / E2M1.max)))
-
-
-def round_compressed(x: torch.Tensor) -> torch.Tensor:
-    """`fp4_act_quant(x, 16, inplace=True, scale_dtype=e4m3)`: E2M1 codes, scale E4M3(max(amax, 6 2^-9) / 6)."""
-    return block_round(x, 16, E2M1, lambda amax: round_codes(
-        torch.maximum(amax, amax.new_tensor(6 * 2.0 ** -9)) / E2M1.max, E4M3))
+# `act_quant(x, 32, "ue8m0", inplace=True)`: E4M3 codes, scale 2^ceil(log2(max(amax, 1e-4) * f32(1/448)))
+WINDOW = Blocks(32, E4M3, lambda amax: power_of_two_ceil(
+    torch.maximum(amax, amax.new_tensor(1e-4)) * amax.new_tensor(1 / E4M3.max)), stored.E4M3, stored.E8M0)
+# `fp4_act_quant(x, 32, inplace=True)`: E2M1 codes, scale 2^ceil(log2(max(amax, 6 2^-126) * f32(1/6)))
+INDEX = Blocks(32, E2M1, lambda amax: power_of_two_ceil(
+    torch.maximum(amax, amax.new_tensor(6 * 2.0 ** -126)) * amax.new_tensor(1 / E2M1.max)), stored.E2M1, stored.E8M0)
+# `fp4_act_quant(x, 16, inplace=True, scale_dtype=e4m3)`: E2M1 codes, scale E4M3(max(amax, 6 2^-9) / 6)
+COMPRESSED = Blocks(16, E2M1, lambda amax: round_codes(
+    torch.maximum(amax, amax.new_tensor(6 * 2.0 ** -9)) / E2M1.max, E4M3), stored.E2M1, stored.E4M3)
 
 
 @dataclass(frozen=True)
 class Roundings:
-    """The roundings the model was trained with, each off by default."""
+    """The roundings the model was trained with, each switchable; `trained()` is the model's."""
     window: bool = False
     compressed: bool = False
     index: bool = False
+    held: bool = False  # the BF16 holds of the stored rows' paths: compressed, index and window keys
+    activations: bool = False  # measurement only (D3): the BF16 compute holds, E4M3 GEMM-input casts, route order
 
     @staticmethod
     def trained() -> "Roundings":
-        return Roundings(True, True, True)
+        return Roundings(True, True, True, True)
 
 
 @dataclass
@@ -143,12 +176,17 @@ class DeepSeek41Reference(Reference):
     """`deepseek41`: hyper-connections, compressed and selected attention, Engram, sqrt-softplus MoE."""
 
     tied = False
+    continuous = False  # its default roundings are the trained ones
+    variants = {"activations": {"roundings": Roundings(True, True, True, True, activations=True)}}
 
     def __init__(self, package: Package, weights: Weights, layers: int | None = None,
-                 roundings: Roundings = Roundings()):
+                 roundings: Roundings = Roundings.trained()):
         super().__init__(package, weights, layers)
         key = package.key
         self.roundings = roundings
+        if weights.perturbation is not None and not (roundings.window and roundings.compressed and roundings.index):
+            raise ValueError("a perturbed reference moves the stored rows in their trained formats: it needs every "
+                             f"stored rounding, not {roundings}")
         self.architecture = package.architecture
         if self.architecture != "deepseek41":
             raise ValueError(f"not a deepseek41 package: {self.architecture}")
@@ -243,41 +281,72 @@ class DeepSeek41Reference(Reference):
         return {False: Rotary.build(positions, default_inv_freq(self.rope_base, self.rope_dim)),
                 True: Rotary.build(positions, yarn_inv_freq(self.compress_base, self.rope_dim, *self.yarn)[0])}
 
+    def hold(self, x: torch.Tensor) -> torch.Tensor:
+        """x as model.py holds it in BF16 on a stored row's path (`Roundings.held`), else unchanged."""
+        return x.to(torch.bfloat16).float() if self.roundings.held else x
+
+    def compute(self, x: torch.Tensor) -> torch.Tensor:
+        """x as model.py holds it in its BF16 compute dtype elsewhere (`Roundings.activations`), else unchanged."""
+        return x.to(torch.bfloat16).float() if self.roundings.activations else x
+
+    def store(self, plane: str, x: torch.Tensor, rows: Blocks) -> torch.Tensor:
+        """x [B, R, D] as the model stores it in `rows`' format, R rows of the store `plane`, its codes and scales
+        moved by the reference's perturbation, if any, as they are formed."""
+        codes, scale = rows.split(x)
+        if self.weights.perturbation is not None:
+            codes, scale = self.weights.perturbation.blocks(plane, codes, rows.code, scale, rows.scale)
+        return (codes * scale).flatten(-2)
+
+    def project(self, x: torch.Tensor, name: str, weight: torch.Tensor | None = None) -> torch.Tensor:
+        """`linear` over the stored weight `name` (`weight`: one expert's matrix of it): its input cast to E4M3
+        per 32 (`act_quant`) when the checkpoint stores the weight in FP8 or FP4 (`Roundings.activations`)."""
+        quantized = self.weights.package.info(name).type not in DENSE
+        x = WINDOW(x) if self.roundings.activations and quantized else x
+        return linear(x, self.weights(name) if weight is None else weight)
+
     def latent(self, layer: int, x: torch.Tensor) -> torch.Tensor:
-        """The compressor's complete groups [B, T // ratio, D], before rope."""
+        """The compressor's complete groups [B, T // ratio, D], before rope: `Compressor.forward` over
+        BF16 x, F32 projections pooled (ratio > 1) or one BF16 projection (ratio 1), the row held in
+        BF16 (`kv.to(dtype)`), then its norm, held (`RMSNorm`'s `.to(dtype)`)."""
         w, p, ratio = self.weights, f"blk.{layer}.", self.ratios[layer]
+        x = self.hold(x)
         kv = linear(x, w(p + "attn_compressor_kv.weight"))
         if ratio > 1:
             groups = x.shape[1] // ratio
             gate = linear(x, w(p + "attn_compressor_gate.weight"))[:, :groups * ratio].unflatten(1, (groups, ratio))
             kv = (kv[:, :groups * ratio].unflatten(1, (groups, ratio)) * torch.softmax(gate, dim=2)).sum(2)
-        return rms_norm(kv, w(p + "attn_compressor_norm.weight"), self.eps)
+        return self.hold(rms_norm(self.hold(kv), w(p + "attn_compressor_norm.weight"), self.eps))
 
     def compress(self, layer: int, x: torch.Tensor, rotary: Rotary, shared: Shared) -> None:
-        """A kv source's compressed rows and (if it indexes) index keys, each roped at its group's first row."""
+        """A kv source's compressed rows and (if it indexes) index keys, each roped at its group's first row
+        (model.py rotates its BF16 tensors in place, so each rotation is held)."""
         w, p, ratio = self.weights, f"blk.{layer}.", self.ratios[layer]
         latent = self.latent(layer, x)
         starts = torch.arange(latent.shape[1], device=x.device) * ratio
         at = Rotary(rotary.cos[starts], rotary.sin[starts])
         if layer in self.index_sources:
-            keys = rms_norm(linear(latent, w(p + "indexer.attn_k.weight")), w(p + "indexer.k_norm.weight"), self.eps)
-            keys = self.rope(keys, at)
-            shared.index_keys = round_index(keys) if self.roundings.index else keys
-        rows = self.rope(latent, at)
-        shared.rows = round_compressed(rows) if self.roundings.compressed else rows
+            keys = self.hold(self.project(latent, p + "indexer.attn_k.weight"))
+            keys = self.hold(rms_norm(keys, w(p + "indexer.k_norm.weight"), self.eps))
+            keys = self.hold(self.rope(keys, at))
+            shared.index_keys = self.store(p + "indexer.keys", keys, INDEX) if self.roundings.index else keys
+        rows = self.hold(self.rope(latent, at))
+        shared.rows = self.store(p + "compressor.rows", rows, COMPRESSED) if self.roundings.compressed else rows
 
     def select(self, layer: int, x: torch.Tensor, qr: torch.Tensor, rotary: Rotary, positions: torch.Tensor,
                shared: Shared) -> None:
         """An index source's selection [B, T, N] of compressed rows per query row."""
         w, p, ratio = self.weights, f"blk.{layer}.", self.ratios[layer]
         batch, steps, _ = x.shape
-        q = linear(qr, w(p + "indexer.attn_q_b.weight")).view(batch, steps, self.index_heads, self.index_width)
-        q = self.rope(q.transpose(1, 2), rotary)  # [B, h, T, W]
+        q = self.hold(self.project(self.hold(qr), p + "indexer.attn_q_b.weight"))
+        q = self.hold(self.rope(q.view(batch, steps, self.index_heads, self.index_width).transpose(1, 2), rotary))
         if self.roundings.index:
-            q = round_index(q)
-        head_weights = linear(x, w(p + "indexer.proj.weight")) / math.sqrt(self.index_width * self.index_heads)
+            q = INDEX(q)  # [B, h, T, W]: a query, formed and read once, not stored
+        head_weights = self.hold(self.project(self.hold(x), p + "indexer.proj.weight"))
+        # model.py scales, scores and sums in its BF16 dtype (`Indexer.forward`'s einsum and products)
+        head_weights = self.compute(head_weights / math.sqrt(self.index_width * self.index_heads))
         keys = shared.index_keys
-        scores = (torch.relu(q @ keys[:, None].transpose(-1, -2)) * head_weights.transpose(1, 2)[..., None]).sum(1)
+        scores = torch.relu(self.compute(q @ keys[:, None].transpose(-1, -2)))
+        scores = self.compute(self.compute(scores * head_weights.transpose(1, 2)[..., None]).sum(1))
         counts = (positions + 1) // ratio  # visible rows of each query row
         entries = keys.shape[1]
         visible = torch.arange(entries, device=x.device)[None, :] < counts[:, None]
@@ -305,17 +374,24 @@ class DeepSeek41Reference(Reference):
         keep = torch.zeros_like(best, dtype=torch.bool).scatter_(-1, top, best.gather(-1, top) > float("-inf"))
         return keep.repeat_interleave(block, dim=-1)[..., :entries]
 
+    def window_keys(self, layer: int, x: torch.Tensor, rotary: Rotary) -> torch.Tensor:
+        """The window's key rows [B, T, D] as `_window_kv` stores them: wkv over BF16 x, its output, kv_norm and
+        the rotation held (`Roundings.held`), then the E4M3 rounding (`Roundings.window`)."""
+        w, p = self.weights, f"blk.{layer}."
+        kv = self.hold(self.project(self.hold(x), p + "attn_kv.weight"))
+        kv = self.hold(self.rope(self.hold(rms_norm(kv, w(p + "attn_kv_a_norm.weight"), self.eps)), rotary))
+        return self.store(p + "window", kv, WINDOW) if self.roundings.window else kv
+
     def attention(self, layer: int, x: torch.Tensor, rotaries: dict[bool, Rotary], positions: torch.Tensor,
                   shared: Shared) -> torch.Tensor:
         w, p, ratio = self.weights, f"blk.{layer}.", self.ratios[layer]
         rotary = rotaries[ratio > 0]
         batch, steps, _ = x.shape
-        qr = rms_norm(linear(x, w(p + "attn_q_a.weight")), w(p + "attn_q_a_norm.weight"), self.eps)
-        q = linear(qr, w(p + "attn_q_b.weight")).view(batch, steps, self.head_count, self.head_dim)
-        q = self.rope(q.transpose(1, 2), rotary)  # [B, heads, T, D]
-        kv = self.rope(rms_norm(linear(x, w(p + "attn_kv.weight")), w(p + "attn_kv_a_norm.weight"), self.eps), rotary)
-        if self.roundings.window:
-            kv = round_window(kv)
+        qr = self.compute(self.project(x, p + "attn_q_a.weight"))
+        qr = self.compute(rms_norm(qr, w(p + "attn_q_a_norm.weight"), self.eps))
+        q = self.compute(self.project(qr, p + "attn_q_b.weight")).view(batch, steps, self.head_count, self.head_dim)
+        q = self.compute(self.rope(q.transpose(1, 2), rotary))  # [B, heads, T, D]
+        kv = self.window_keys(layer, x, rotary)
         visible = visibility(positions, positions, window=self.window).expand(batch, steps, steps)
         if ratio:
             if layer in self.kv_sources:
@@ -325,20 +401,30 @@ class DeepSeek41Reference(Reference):
             kv = torch.cat((kv, shared.rows), dim=1)
             visible = torch.cat((visible, shared.selected), dim=2)
         keys = kv[:, None]
-        out = attention(q, keys, keys, visible, self.head_dim ** -0.5, w(p + "attn_sinks.weight"))
+        out = self.compute(attention(q, keys, keys, visible, self.head_dim ** -0.5, w(p + "attn_sinks.weight")))
         out = self.rope(out.view(batch, steps, self.head_count, self.head_dim).transpose(1, 2), rotary, inverse=True)
-        out = out.transpose(1, 2).reshape(batch, steps, self.groups, -1)
+        out = self.compute(out).transpose(1, 2).reshape(batch, steps, self.groups, -1)
+        if self.roundings.activations:  # `act_quant(o, ...)` before wo_a, whose weight is BF16
+            out = WINDOW(out)
         wo_a = w(p + "attn_output_a.weight").view(self.groups, self.output_rank, -1)
-        return linear(torch.einsum("btgd,grd->btgr", out, wo_a).flatten(2), w(p + "attn_output_b.weight"))
+        grouped = self.compute(torch.einsum("btgd,grd->btgr", out, wo_a)).flatten(2)
+        return self.compute(self.project(grouped, p + "attn_output_b.weight"))
 
     # experts -----------------------------------------------------------------------------------
 
-    @staticmethod
-    def swiglu(x: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor, limit: float) -> torch.Tensor:
-        g, u = linear(x, gate), linear(x, up)
+    def swiglu(self, x: torch.Tensor, names: tuple[str, str, str], limit: float, index: int | None = None,
+               weight: torch.Tensor | None = None) -> torch.Tensor:
+        """model.py's `Expert`: gate and up, clamped, their product (scaled by the route `weight` of a weighted
+        routed expert), then down. `names` are the gate, up and down tensors, stacked when `index` is given."""
+        def project(rows: torch.Tensor, name: str) -> torch.Tensor:
+            return self.compute(self.project(rows, name, None if index is None else self.weights.expert(name, index)))
+
+        gate, up, down = names
+        g, u = project(x, gate), project(x, up)
         if limit > 0:
             g, u = g.clamp(max=limit), u.clamp(-limit, limit)
-        return linear(silu(g) * u, down)
+        product = silu(g) * u
+        return project(self.compute(product if weight is None else weight * product), down)
 
     def feed_forward(self, layer: int, x: torch.Tensor) -> torch.Tensor:
         w, p = self.weights, f"blk.{layer}."
@@ -349,16 +435,18 @@ class DeepSeek41Reference(Reference):
         if self.route_norm and self.experts_used > 1:
             weights = weights / (weights.sum(-1, keepdim=True) + ROUTE_EPS)
         weights = weights * self.route_scale
-        limit = self.clamp_routed[layer]
+        routed_names = tuple(p + f"ffn_{part}_exps.weight" for part in ("gate", "up", "down"))
 
-        def expert(index: int, rows: torch.Tensor) -> torch.Tensor:
-            return self.swiglu(rows, w.expert(p + "ffn_gate_exps.weight", index), w.expert(p + "ffn_up_exps.weight", index),
-                               w.expert(p + "ffn_down_exps.weight", index), limit)
+        def expert(index: int, rows: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
+            return self.swiglu(rows, routed_names, self.clamp_routed[layer], index, weight)
 
-        routed = mixture(flat, selected, weights, expert)
-        shared = self.swiglu(flat, w(p + "ffn_gate_shexp.weight"), w(p + "ffn_up_shexp.weight"),
-                             w(p + "ffn_down_shexp.weight"), self.clamp_shared[layer])
-        return (routed + shared).view_as(x)
+        # `mixture` reads the selected experts in ascending order.
+        w.plan_experts(routed_names, torch.unique(selected).tolist())
+        # model.py weights a routed expert inside it, before down (equal in exact arithmetic)
+        routed = mixture(flat, selected, weights, expert, weighted=self.roundings.activations)
+        shared = self.swiglu(flat, tuple(p + f"ffn_{part}_shexp.weight" for part in ("gate", "up", "down")),
+                             self.clamp_shared[layer])
+        return self.compute(routed + shared).view_as(x)
 
     # Engram ------------------------------------------------------------------------------------
 
@@ -378,12 +466,12 @@ class DeepSeek41Reference(Reference):
 
     def engram(self, layer: int, streams: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
         w, p, s, hidden = self.weights, f"blk.{layer}.", self.streams, self.hidden_size
-        kv = linear(w.rows("per_layer_token_embd.weight", rows).flatten(-2), w(p + "engram_kv.weight"))
+        kv = self.compute(self.project(w.rows("per_layer_token_embd.weight", rows).flatten(-2), p + "engram_kv.weight"))
         key, value = kv[..., :s * hidden].unflatten(-1, (s, hidden)), kv[..., s * hidden:]
         scale = torch.rsqrt(streams.square().mean(-1) + self.eps) * torch.rsqrt(key.square().mean(-1) + self.eps)
-        dot = (streams * w(p + "engram_gate.weight") * key).sum(-1) * scale / math.sqrt(hidden)
+        dot = (streams * w(p + "engram_gate.weight") * key).sum(-1) * scale * hidden ** -0.5
         gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(ENGRAM_CLAMP).sqrt(), dot))
-        return streams + gate[..., None] * value[..., None, :]
+        return self.compute(streams + gate[..., None] * value[..., None, :])
 
     # decoder -----------------------------------------------------------------------------------
 
@@ -400,15 +488,23 @@ class DeepSeek41Reference(Reference):
                 streams = self.engram(layer, streams, ngrams[:, :, self.engram_layers.index(layer)])
             if layer in taps:
                 tapped.append(streams.mean(-2))
-            attention_pre, post, comb = self.mixes(streams, p + "hc_attn")
-            h = rms_norm(self.collapse(streams, pre), w(p + "attn_norm.weight"), self.eps)
-            streams = self.expand(self.attention(layer, h, rotaries, positions, shared), streams, post, comb)
-            pre, post, comb = self.mixes(streams, p + "hc_ffn")
-            h = rms_norm(self.collapse(streams, attention_pre), w(p + "ffn_norm.weight"), self.eps)
-            streams = self.expand(self.feed_forward(layer, h), streams, post, comb)
+            streams, pre = self.block(layer, streams, pre, rotaries, positions, shared)
         if self.block_count in taps:
             tapped.append(streams.mean(-2))
-        return rms_norm(self.collapse(streams, pre), w("output_norm.weight"), self.eps), tapped
+        return self.compute(rms_norm(self.compute(self.collapse(streams, pre)), w("output_norm.weight"), self.eps)), tapped
+
+    def block(self, layer: int, streams: torch.Tensor, pre: torch.Tensor | None, rotaries: dict[bool, Rotary],
+              positions: torch.Tensor, shared: Shared) -> tuple[torch.Tensor, torch.Tensor]:
+        """model.py's `Block.forward`: the streams after the layer's attention and FFN, and the FFN site's `pre`
+        for the next. The collapsed input, its norm and each join are its compute holds (`hc_pre`, `RMSNorm`,
+        `hc_post`)."""
+        w, p = self.weights, f"blk.{layer}."
+        attention_pre, post, comb = self.mixes(streams, p + "hc_attn")
+        h = self.compute(rms_norm(self.compute(self.collapse(streams, pre)), w(p + "attn_norm.weight"), self.eps))
+        streams = self.compute(self.expand(self.attention(layer, h, rotaries, positions, shared), streams, post, comb))
+        ffn_pre, post, comb = self.mixes(streams, p + "hc_ffn")
+        h = self.compute(rms_norm(self.compute(self.collapse(streams, attention_pre)), w(p + "ffn_norm.weight"), self.eps))
+        return self.compute(self.expand(self.feed_forward(layer, h), streams, post, comb)), ffn_pre
 
     # DeepSeek's code cross-check (deepseek41_released.py) ----------------------------------------
 

@@ -2,8 +2,11 @@
 contract summary, and the noise-aware judgement of a candidate against a base.
 
 `KL(P || Q)` takes P as the truth: the reference when judging an engine, the base when judging
-the candidate against it. Both outputs must be over the same rendered input with the same rows
-(contract "Logits output").
+the candidate against it. Both outputs must be over the same rendered input, and the tested
+output's rows, matched by fixture and position, must be distinct and among the truth's (contract
+"Logits output"). An output whose header names no `sample` scored every row, so its rows must be
+exactly the truth's; one that names its sample scored the rows that sample chose, which its
+producer, the one owner of the selection rule, lists.
 
 The judgement is paired: the base and the candidate are measured against the same reference at
 the same positions, so the noise of a metric's change is estimated by resampling positions
@@ -16,11 +19,9 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from magnitude_references.contract import read_logits
+from magnitude_references.contract import CHUNK_ROWS, LOGITS, read_logits
 
-LOGITS = "logits"
 TRIM = 0.001  # trimmed KL drops the top 0.1% of positions
-CHUNK_ROWS = 32
 RESAMPLES = 1000
 SEED = 20261009
 WORST = 5
@@ -29,7 +30,7 @@ Verdict = Literal["improved", "regressed", "within noise"]
 
 
 class Incomparable(ValueError):
-    """Two logits outputs are not over the same rendered input and rows."""
+    """Two logits outputs are not over the same rendered input, or their rows do not correspond."""
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,22 @@ class Positions:
     kl: np.ndarray
     agree: np.ndarray
 
+    def at(self, rows: tuple[dict, ...]) -> "Positions":
+        """These values at `rows`, which must all be among this pair's rows."""
+        index = matched(self.rows, rows)
+        return Positions(rows, self.kl[index], self.agree[index])
+
+
+def matched(rows: tuple[dict, ...] | list[dict], subset: tuple[dict, ...] | list[dict]) -> np.ndarray:
+    """The index into `rows` of each row of `subset`, matched by fixture and position."""
+    where = {(row["fixture_id"], row["position"]): index for index, row in enumerate(rows)}
+    missing = [row for row in subset if (row["fixture_id"], row["position"]) not in where]
+    if missing:
+        raise Incomparable(f"{len(missing)} rows are not among the rows compared against: first {missing[0]}")
+    return np.fromiter(
+        (where[row["fixture_id"], row["position"]] for row in subset), dtype=np.intp, count=len(subset)
+    )
+
 
 def _log_softmax(values: np.ndarray) -> np.ndarray:
     peak = values.max(axis=1, keepdims=True)
@@ -47,12 +64,17 @@ def _log_softmax(values: np.ndarray) -> np.ndarray:
     return shifted - np.log(np.exp(shifted).sum(axis=1, keepdims=True))
 
 
-def compare_rows(truth: np.ndarray, test: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """KL(truth || test) and argmax agreement per row of two [rows, vocabulary] logits arrays."""
-    kl = np.empty(truth.shape[0])
-    agree = np.empty(truth.shape[0], dtype=bool)
-    for start in range(0, truth.shape[0], CHUNK_ROWS):
-        p = np.asarray(truth[start : start + CHUNK_ROWS], dtype=np.float64)
+def compare_rows(
+    truth: np.ndarray, test: np.ndarray, truth_rows: np.ndarray | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """KL(truth || test) and argmax agreement per row of `test`, a [rows, vocabulary] logits
+    array, against row `truth_rows[i]` of `truth` (its row `i` when `truth_rows` is None)."""
+    if truth_rows is None:
+        truth_rows = np.arange(test.shape[0])
+    kl = np.empty(test.shape[0])
+    agree = np.empty(test.shape[0], dtype=bool)
+    for start in range(0, test.shape[0], CHUNK_ROWS):
+        p = np.asarray(truth[truth_rows[start : start + CHUNK_ROWS]], dtype=np.float64)
         q = np.asarray(test[start : start + CHUNK_ROWS], dtype=np.float64)
         for side, values in (("truth", p), ("test", q)):
             finite = np.isfinite(values).all(axis=1)
@@ -72,14 +94,28 @@ def compare_outputs(truth: Path, test: Path) -> Positions:
     """Per-position comparison of the logits outputs in two directories (`logits.json/.f32`)."""
     truth_header, truth_values = read_logits(truth, LOGITS)
     test_header, test_values = read_logits(test, LOGITS)
-    for key in ("rendered_digest", "vocabulary", "rows"):
+    for key in ("rendered_digest", "vocabulary"):
         if truth_header[key] != test_header[key]:
             raise Incomparable(
                 f"{truth} ({truth_header['producer']}) and {test} ({test_header['producer']}) "
                 f"differ in {key}"
             )
-    kl, agree = compare_rows(truth_values, test_values)
-    return Positions(tuple(truth_header["rows"]), kl, agree)
+    _distinct(truth, truth_header["rows"])
+    rows = tuple(test_header["rows"])
+    _distinct(test, rows)
+    index = matched(truth_header["rows"], rows)
+    if test_header.get("sample") is None and len(rows) != len(truth_header["rows"]):
+        raise Incomparable(
+            f"{test} names no sample but scores {len(rows)} of the {len(truth_header['rows'])} rows of {truth}"
+        )
+    kl, agree = compare_rows(truth_values, test_values, index)
+    return Positions(rows, kl, agree)
+
+
+def _distinct(directory: Path, rows: tuple[dict, ...] | list[dict]) -> None:
+    keys = {(row["fixture_id"], row["position"]) for row in rows}
+    if len(keys) != len(rows):
+        raise Incomparable(f"{directory} repeats {len(rows) - len(keys)} of its rows")
 
 
 def _sorted_summary(kl_sorted: np.ndarray, agree_mean: float) -> dict:
@@ -145,9 +181,9 @@ class MetricChange:
 
 
 def judge(base: Positions, candidate: Positions, bar: float) -> list[MetricChange]:
-    """Each metric of the candidate against the base, both measured against the same truth."""
-    if base.rows != candidate.rows:
-        raise Incomparable("the base and the candidate were measured at different positions")
+    """Each metric of the candidate against the base, both measured against the same truth, at
+    the candidate's positions (all of which the base must have measured)."""
+    base = base.at(candidate.rows)
     n = len(base.kl)
     base_summary, candidate_summary = (
         summarize(base.kl, base.agree),

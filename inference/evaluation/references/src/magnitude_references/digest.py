@@ -24,12 +24,14 @@ def canonical(value) -> str:
 
 # The numerical implementation: everything that decides a reference's rows and sanity values.
 # Performance options (`performance.py`), the CLI, records and validation tools are outside it.
-NUMERICAL = ("families", "model.py", "gguf.py", "contract.py", "sanity.py", "run.py")
+NUMERICAL = ("families", "model.py", "gguf.py", "perturbation.py", "contract.py", "sanity.py", "run.py")
 
 
-def implementation() -> str:
+def implementation(variant: str | None = None) -> str:
     """The reference implementation's identity: the canonical digest of {relative path: SHA-256} over
-    the Python sources of `NUMERICAL`."""
+    the Python sources of `NUMERICAL`, and of that with the measurement `variant` the reference runs
+    (`Reference.variants`), so no variant shares an identity with the model's numerics."""
     files = sorted(path for name in NUMERICAL
                    for path in ((PACKAGE / name).rglob("*.py") if (PACKAGE / name).is_dir() else [PACKAGE / name]))
-    return canonical({path.relative_to(PACKAGE).as_posix(): sha256_file(path) for path in files})
+    sources = canonical({path.relative_to(PACKAGE).as_posix(): sha256_file(path) for path in files})
+    return sources if variant is None else canonical({"implementation": sources, "variant": variant})

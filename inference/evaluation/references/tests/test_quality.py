@@ -105,30 +105,53 @@ def test_judge_top1_higher_is_better_and_zero_base():
     assert change.verdict == "regressed" and math.isinf(change.relative)
 
 
-def test_judge_requires_the_same_positions():
-    with pytest.raises(quality.Incomparable):
+def test_judge_compares_at_the_candidates_positions_the_base_measured():
+    generator = np.random.default_rng(4)
+    base = positions(generator.exponential(0.01, 3000))
+    sampled = tuple(range(0, 3000, 3))
+    candidate = quality.Positions(
+        tuple(base.rows[index] for index in sampled), base.kl[list(sampled)], base.agree[list(sampled)]
+    )
+    changes = quality.judge(base, candidate, 0.02)
+    assert all(change.delta == 0 for change in changes)
+    assert {change.metric: change.base for change in changes}["mean_kl"] == pytest.approx(candidate.kl.mean())
+    with pytest.raises(quality.Incomparable, match="not among"):
         quality.judge(positions([0.1, 0.2]), positions([0.1, 0.2, 0.3]), 0.02)
 
 
-def test_compare_outputs_requires_the_same_rendered_input_and_rows(tmp_path):
-    rows = [{"fixture_id": "f", "position": position} for position in range(4)]
+def test_compare_outputs_matches_a_named_samples_rows_by_position(tmp_path):
+    rows = [{"fixture_id": fixture, "position": position} for fixture in "fg" for position in range(4)]
     values = logits_fake.truth(rows)
-    for name, digest, written in (
-        ("a", "d1", rows),
-        ("b", "d1", rows),
-        ("c", "d2", rows),
-        ("d", "d1", rows[:3]),
+    sampled = [rows[6], rows[2], rows[1]]
+    foreign = [rows[0], {"fixture_id": "f", "position": 9}]
+    sample = {"windows": 3, "steps": 1}
+    for name, digest, written, chosen in (
+        ("a", "d1", rows, None),
+        ("b", "d1", rows, None),
+        ("c", "d2", rows, None),
+        ("d", "d1", sampled, sample),
+        ("e", "d1", foreign, sample),
+        ("truncated", "d1", rows[:-1], None),
+        ("repeated", "d1", [*sampled, rows[2]], sample),
     ):
         (tmp_path / name).mkdir()
-        logits_fake.write_logits(
-            tmp_path / name, "harness", digest, written, values[: len(written)]
-        )
+        logits_fake.write_logits(tmp_path / name, "harness", digest, written, logits_fake.truth(written), chosen)
     same = quality.compare_outputs(tmp_path / "a", tmp_path / "b")
     assert (same.kl == 0).all() and same.rows == tuple(rows)
+    subset = quality.compare_outputs(tmp_path / "a", tmp_path / "d")
+    assert (subset.kl == 0).all() and subset.agree.all() and subset.rows == tuple(sampled)
+    shifted = quality.compare_rows(values, logits_fake.truth(sampled))
+    assert (shifted[0] > 0).all()  # matched by count instead, the rows would differ
     with pytest.raises(quality.Incomparable, match="rendered_digest"):
         quality.compare_outputs(tmp_path / "a", tmp_path / "c")
-    with pytest.raises(quality.Incomparable, match="rows"):
-        quality.compare_outputs(tmp_path / "a", tmp_path / "d")
+    with pytest.raises(quality.Incomparable, match="not among"):
+        quality.compare_outputs(tmp_path / "a", tmp_path / "e")
+    with pytest.raises(quality.Incomparable, match="not among"):
+        quality.compare_outputs(tmp_path / "d", tmp_path / "a")
+    with pytest.raises(quality.Incomparable, match="names no sample but scores 7 of the 8 rows"):
+        quality.compare_outputs(tmp_path / "a", tmp_path / "truncated")
+    with pytest.raises(quality.Incomparable, match="repeats 1 of its rows"):
+        quality.compare_outputs(tmp_path / "a", tmp_path / "repeated")
 
 
 def test_worst_positions_are_diagnostic():

@@ -60,7 +60,8 @@ def truth(rows: list[dict]) -> np.ndarray:
 
 
 def write_logits(
-    directory: Path, producer: str, rendered_digest: str, rows: list[dict], values: np.ndarray
+    directory: Path, producer: str, rendered_digest: str, rows: list[dict], values: np.ndarray,
+    sample: dict | None = None,
 ) -> None:
     np.ascontiguousarray(values, dtype="<f4").tofile(directory / "logits.f32")
     header = {
@@ -69,5 +70,6 @@ def write_logits(
         "rendered_digest": rendered_digest,
         "vocabulary": VOCABULARY,
         "rows": rows,
+        "sample": sample,
     }
     (directory / "logits.json").write_text(json.dumps(header))

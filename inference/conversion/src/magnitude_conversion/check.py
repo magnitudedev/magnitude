@@ -180,10 +180,30 @@ def _compare(name: str, e: Expected, data: np.ndarray) -> None:
         raise ValueError(f"{name}: {data.size} bytes in the file, {offset} expected")
 
 
+def shard_facts(first_shard: Path) -> list[gguf.GGUFReader]:
+    """Every shard of the file reads on its own: it carries `general.alignment`, its split keys number it within the
+    file, and its tensor data sits at the alignment. Raises naming the shard and the key; returns the readers."""
+    paths = shards(first_shard)
+    readers = [gguf.GGUFReader(path) for path in paths]
+    total = sum(len(reader.tensors) for reader in readers)
+    for i, (path, reader) in enumerate(zip(paths, readers)):
+        if (f := reader.get_field(gguf.Keys.General.ALIGNMENT)) is None or f.contents() != ALIGNMENT:
+            raise ValueError(f"{path.name}: general.alignment is {f and f.contents()}, expected {ALIGNMENT}")
+        if len(paths) > 1:
+            for key, value in ((gguf.Keys.Split.LLM_KV_SPLIT_NO, i), (gguf.Keys.Split.LLM_KV_SPLIT_COUNT, len(paths)),
+                               (gguf.Keys.Split.LLM_KV_SPLIT_TENSORS_COUNT, total)):
+                if (f := reader.get_field(key)) is None or f.contents() != value:
+                    raise ValueError(f"{path.name}: {key} is {f and f.contents()}, expected {value}")
+        for t in reader.tensors:
+            if t.data_offset % ALIGNMENT:
+                raise ValueError(f"{path.name}: {t.name} data at {t.data_offset}, not {ALIGNMENT}-aligned")
+    return readers
+
+
 def check(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision, first_shard: Path) -> dict[str, int]:
     """Raises on the first difference; returns the bytes checked per type."""
     expected = expected_tensors(model)
-    readers = [gguf.GGUFReader(path) for path in shards(first_shard)]
+    readers = shard_facts(first_shard)
     head = readers[0]
 
     def field(key: str):
@@ -192,9 +212,6 @@ def check(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision, first_shar
 
     if field(gguf.Keys.General.SOURCE_REPO_URL) != model._source_repo_url:
         raise ValueError(f"general.source.repo_url is {field(gguf.Keys.General.SOURCE_REPO_URL)!r}")
-    for path, reader in zip(shards(first_shard), readers):
-        if (f := reader.get_field(gguf.Keys.General.ALIGNMENT)) is None or f.contents() != ALIGNMENT:
-            raise ValueError(f"{path.name}: general.alignment is {f and f.contents()}, expected {ALIGNMENT}")
     if not isinstance(model, DeepseekV41Vision):
         if field(SCALE_ENCODING) != UE8M0:
             raise ValueError(f"{SCALE_ENCODING} is {field(SCALE_ENCODING)!r}")
@@ -218,8 +235,6 @@ def check(model: DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision, first_shar
         shape = tuple(int(n) for n in reversed(t.shape))
         if t.tensor_type != e.qtype or shape != e.shape:
             raise ValueError(f"{name}: {t.tensor_type.name} {shape} in the file, {e.qtype.name} {e.shape} expected")
-        if t.data_offset % ALIGNMENT:
-            raise ValueError(f"{name}: data at {t.data_offset}, not {ALIGNMENT}-aligned")
         _compare(name, e, np.asarray(reader.data[t.data_offset:t.data_offset + t.n_bytes]))
         checked[e.qtype.name] = checked.get(e.qtype.name, 0) + t.n_bytes
         if i % 100 == 0:

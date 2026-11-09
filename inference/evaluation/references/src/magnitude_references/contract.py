@@ -128,6 +128,10 @@ def check_match(rendered: RenderedSet, artifacts: Artifacts) -> None:
         raise ContractError("rendered target_sha256 differs from the acquired target's")
 
 
+LOGITS = "logits"  # the stem of a reference's or harness's logits output
+CHUNK_ROWS = 32  # rows of a logits map read at once, bounding the memory a pass over it holds
+
+
 class LogitsWriter:
     """A logits output: `<name>.f32` (little-endian float32 rows of `vocabulary`) and `<name>.json`."""
 

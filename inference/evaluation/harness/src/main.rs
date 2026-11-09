@@ -101,13 +101,13 @@ enum Command {
         #[arg(long, value_delimiter = ',', default_value = "4096,16384")]
         contexts: Vec<usize>,
         /// Sequences prefilled or decoded together.
-        #[arg(long, value_delimiter = ',', default_value = "1,4")]
+        #[arg(long, value_delimiter = ',', default_value = "1,4", value_parser = positive)]
         concurrency: Vec<usize>,
         /// Decode steps before measuring.
         #[arg(long, default_value_t = 16)]
         warm: usize,
-        /// Measured decode steps.
-        #[arg(long, default_value_t = 32)]
+        /// Measured decode steps, at least two.
+        #[arg(long, default_value_t = 32, value_parser = at_least_two)]
         steps: usize,
         /// Decode steps whose device time is attributed by entry, each launch
         /// timed alone (a diagnostic).
@@ -117,8 +117,8 @@ enum Command {
         /// entry, each launch timed alone (a diagnostic).
         #[arg(long)]
         prefill_attribution: bool,
-        /// Prefill samples, the first of them cold.
-        #[arg(long, default_value_t = 4)]
+        /// Prefill samples, the first of them cold and at least one warm.
+        #[arg(long, default_value_t = 4, value_parser = at_least_two)]
         prefill_samples: usize,
         /// Queue each decode step's successor before it completes, as served.
         #[arg(long, default_value = "on", value_parser = on_off, action = clap::ArgAction::Set)]
@@ -220,16 +220,21 @@ enum Command {
         #[arg(long, value_name = "FILE", conflicts_with_all = ["context", "request_options"])]
         rendered: Option<PathBuf>,
         /// Fixtures decoded together.
-        #[arg(long, default_value_t = 8)]
+        #[arg(long, default_value_t = 8, value_parser = positive)]
         batch: usize,
         /// Scored rows per teacher-forced forward; above one they run as one
         /// verification forward.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = positive)]
         verify_width: usize,
         /// Passes over the fixtures on the one load, each past the first
         /// written beside the first's logits as `logits-<pass>.f32`.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = positive)]
         passes: usize,
+        /// Score only WINDOWS runs of STEPS predicting positions per fixture,
+        /// spread evenly over its scored spans, the tokens between them
+        /// prefilled.
+        #[arg(long, value_name = "WINDOWS,STEPS", value_parser = sample)]
+        sample: Option<logits::Sample>,
     },
     /// The model's Prepare alone: its tuning search, nothing imported.
     Prepare {
@@ -323,15 +328,16 @@ struct EngineArgs {
     /// auto, metal, cuda, vulkan, cpu or an exact device selector.
     #[arg(long, default_value = "auto")]
     device: String,
-    /// The target history codec.
-    #[arg(long, default_value = "affine-k8v4")]
-    kv_codec: String,
+    /// The target history codec of unrounded history; the engine's serving
+    /// default when absent.
+    #[arg(long)]
+    kv_codec: Option<String>,
     /// Explicitly approved complete numerical computations (JSON).
     #[arg(long, value_name = "FILE")]
     numerical_profile: Option<PathBuf>,
     /// Seconds the first load of a model spends tuning.
-    #[arg(long, value_name = "SECONDS", default_value_t = STANDARD_TUNING_BUDGET.as_secs_f64())]
-    tuning_budget: f64,
+    #[arg(long, value_name = "SECONDS", default_value_t = Seconds(STANDARD_TUNING_BUDGET), value_parser = positive_seconds)]
+    tuning_budget: Seconds,
     /// Tune the run's first load afresh, ignoring stored tuning results.
     #[arg(long)]
     fresh_tuning: bool,
@@ -364,6 +370,50 @@ fn on_off(value: &str) -> Result<bool, String> {
         "on" => Ok(true),
         "off" => Ok(false),
         other => Err(format!("takes on or off, not {other}")),
+    }
+}
+
+/// A count of at least `least`, refused at parse rather than on the host.
+fn count_of_at_least(value: &str, least: usize) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&count| count >= least)
+        .ok_or_else(|| format!("takes a count of at least {least}, not {value}"))
+}
+
+fn positive(value: &str) -> Result<usize, String> {
+    count_of_at_least(value, 1)
+}
+
+fn at_least_two(value: &str) -> Result<usize, String> {
+    count_of_at_least(value, 2)
+}
+
+/// A positive duration given in seconds.
+#[derive(Clone, Copy, Debug)]
+struct Seconds(Duration);
+
+impl std::fmt::Display for Seconds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.as_secs_f64())
+    }
+}
+
+fn positive_seconds(value: &str) -> Result<Seconds, String> {
+    value
+        .parse::<f64>()
+        .ok()
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        .filter(|budget| !budget.is_zero())
+        .map(Seconds)
+        .ok_or_else(|| format!("takes a positive number of seconds, not {value}"))
+}
+
+fn sample(value: &str) -> Result<logits::Sample, String> {
+    match value.split_once(',').map(|(windows, steps)| (positive(windows), positive(steps))) {
+        Some((Ok(windows), Ok(steps))) => Ok(logits::Sample { windows, steps }),
+        _ => Err(format!("takes two positive counts WINDOWS,STEPS, not {value}")),
     }
 }
 
@@ -455,10 +505,7 @@ fn engine_options(
     engine: &EngineArgs,
     inputs: &Inputs,
 ) -> Result<(EngineOptions, Development), String> {
-    let budget = Duration::try_from_secs_f64(engine.tuning_budget)
-        .ok()
-        .filter(|budget| !budget.is_zero())
-        .ok_or("--tuning-budget takes a positive number of seconds")?;
+    let budget = engine.tuning_budget.0;
     let numerical_profile = engine.numerical_profile.as_deref().map(read_numerical_profile).transpose()?;
     // A survey measures: it is installed in the worker process that runs a
     // model's Prepare, never here, where the model is loaded.
@@ -476,7 +523,9 @@ fn engine_options(
                 .map_err(|error| format!("--device: {error}"))?,
             kv_codec: engine
                 .kv_codec
-                .parse()
+                .as_deref()
+                .map(str::parse)
+                .transpose()
                 .map_err(|error| format!("--kv-codec: {error}"))?,
             numerical_profile,
             weight_bound: engine.weight_bound(),
@@ -560,19 +609,6 @@ fn run(command: Command) -> Result<(), String> {
             resident_decode,
             untimed,
         } => {
-            if contexts.is_empty()
-                || concurrency.is_empty()
-                || concurrency.contains(&0)
-                || steps < 2
-            {
-                return Err(
-                    "time needs contexts, positive concurrency and at least two measured steps"
-                        .into(),
-                );
-            }
-            if prefill_samples < 2 {
-                return Err("--prefill-samples needs a cold and a warm sample".into());
-            }
             let inputs = Inputs::read(&run, "harness.time")?;
             let (options, development) = engine_options(&engine, &inputs)?;
             let host = host(&inputs.artifacts)?;
@@ -650,10 +686,8 @@ fn run(command: Command) -> Result<(), String> {
             batch,
             verify_width,
             passes,
+            sample,
         } => {
-            if batch == 0 || verify_width == 0 || passes == 0 {
-                return Err("--batch, --verify-width and --passes must be positive".into());
-            }
             let inputs = Inputs::read(&run, "harness.logits")?;
             let (rendered, digest) = match rendered {
                 Some(path) => {
@@ -683,6 +717,7 @@ fn run(command: Command) -> Result<(), String> {
                     batch,
                     verify_width,
                     passes,
+                    sample,
                 },
                 &rendered,
                 &digest,

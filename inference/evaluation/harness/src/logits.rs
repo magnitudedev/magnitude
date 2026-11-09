@@ -8,6 +8,10 @@
 //! at most `PREFILL_ROWS` rows, packed across the fixtures decoded together;
 //! each predicting position is then fed as a decode (or, with a verify width
 //! above one, as rows of one verification forward).
+//!
+//! With a sample, only runs of a few predicting positions spread evenly over
+//! each fixture's are scored, the tokens between them prefilled: decode steps
+//! from many depths of every fixture at a fraction of the rows.
 
 use crate::artifacts::Artifacts;
 use crate::engine::{self, Engine, EngineOptions, Load, PREFILL_ROWS, Sequence};
@@ -27,14 +31,25 @@ pub struct LogitsOptions {
     pub verify_width: usize,
     /// Passes over the fixtures on the one load.
     pub passes: usize,
+    /// Score only a sample of each fixture's predicting positions.
+    pub sample: Option<Sample>,
 }
 
-/// One fixture's walk through its tokens: its sequence, its tokens, its
-/// scored spans and where its rows go in the output.
-struct Walk<'a> {
+/// `windows` runs of `steps` predicting positions, spread evenly over a
+/// fixture's predicting positions.
+#[derive(Clone, Copy)]
+pub struct Sample {
+    pub windows: usize,
+    pub steps: usize,
+}
+
+/// One fixture's walk through its tokens: its sequence, its tokens, the
+/// positions it scores and where its rows go in the output.
+struct Walk {
     sequence: Sequence,
-    rendered: &'a Rendered,
     tokens: Vec<TokenId>,
+    /// The ascending, disjoint, nonempty runs of predicting positions scored.
+    scored: Vec<Range<usize>>,
     /// The first output row of this fixture.
     base: usize,
 }
@@ -44,27 +59,64 @@ fn predicting(span: &Range<usize>) -> Range<usize> {
     span.start - 1..span.end - 1
 }
 
-impl Walk<'_> {
-    /// The predicting positions holding the next position, or the next ones:
+/// The runs of predicting positions scored for scored spans `spans`: all of
+/// them, or `sample`'s windows. The `i`th window starts at the `i`th of
+/// `windows` evenly spaced indices into the positions and ends after `steps`
+/// positions or at its span's end; with no more positions than the windows
+/// would take, all are scored.
+fn scored_rows(spans: &[Range<usize>], sample: Option<Sample>) -> Vec<Range<usize>> {
+    let all = spans
+        .iter()
+        .map(predicting)
+        .filter(|rows| !rows.is_empty())
+        .collect::<Vec<_>>();
+    let Some(Sample { windows, steps }) = sample else {
+        return all;
+    };
+    let total = all.iter().map(ExactSizeIterator::len).sum::<usize>();
+    if total <= windows * steps {
+        return all;
+    }
+    // Consecutive starts lie at least `total / windows >= steps` positions apart.
+    (0..windows)
+        .map(|window| {
+            let mut index = window * total / windows;
+            let rows = all
+                .iter()
+                .find(|rows| {
+                    let holds = index < rows.len();
+                    if !holds {
+                        index -= rows.len();
+                    }
+                    holds
+                })
+                .expect("an index below the total lies in a span");
+            let start = rows.start + index;
+            start..(start + steps).min(rows.end)
+        })
+        .collect()
+}
+
+impl Walk {
+    /// The scored positions holding the next position, or the next ones:
     /// `None` when no row remains.
     fn next_rows(&self) -> Option<Range<usize>> {
-        self.rendered
-            .scored_spans
+        self.scored
             .iter()
-            .map(predicting)
-            .find(|rows| rows.end > self.sequence.position && !rows.is_empty())
+            .find(|rows| rows.end > self.sequence.position)
+            .cloned()
     }
 
     /// Output row of position `position`.
     fn row(&self, position: usize) -> usize {
         let mut row = self.base;
-        for rows in self.rendered.scored_spans.iter().map(predicting) {
+        for rows in &self.scored {
             if rows.contains(&position) {
                 return row + position - rows.start;
             }
             row += rows.len();
         }
-        unreachable!("a predicting position lies before a span")
+        unreachable!("a predicting position lies before a scored run")
     }
 }
 
@@ -102,22 +154,28 @@ pub fn run(
     )?;
     let vocabulary = engine.vocabulary;
     let mut rows = Vec::new();
-    let mut bases = Vec::with_capacity(rendered.len());
+    let mut scored = Vec::with_capacity(rendered.len());
     for fixture in rendered {
-        bases.push(rows.len());
-        for span in &fixture.scored_spans {
-            if span.start == 0 || span.end > fixture.tokens.len() {
-                return Err(format!(
-                    "fixture {}: a scored span must follow its first token and lie within its tokens",
-                    fixture.fixture_id
-                ));
-            }
+        if fixture
+            .scored_spans
+            .iter()
+            .any(|span| span.start == 0 || span.end > fixture.tokens.len())
+        {
+            return Err(format!(
+                "fixture {}: a scored span must follow its first token and lie within its tokens",
+                fixture.fixture_id
+            ));
+        }
+        let runs = scored_rows(&fixture.scored_spans, logits.sample);
+        let base = rows.len();
+        for window in &runs {
             rows.extend(
-                predicting(span).map(
+                window.clone().map(
                     |position| json!({ "fixture_id": fixture.fixture_id, "position": position }),
                 ),
             );
         }
+        scored.push((base, runs));
     }
     let indices = (0..rendered.len()).collect::<Vec<_>>();
     // Each pass over the fixtures runs on the one load, in the state the last left its bank.
@@ -137,11 +195,12 @@ pub fn run(
                 // Every row is teacher-forced: the whole sequence is known,
                 // as a prompt is when its request is admitted.
                 engine.prefetch(&sequence, &tokens)?;
+                let (base, runs) = &scored[index];
                 walks.push(Walk {
                     sequence,
-                    rendered: &rendered[index],
                     tokens,
-                    base: bases[index],
+                    scored: runs.clone(),
+                    base: *base,
                 });
             }
             score(
@@ -199,6 +258,8 @@ pub fn run(
         "rendered_digest": rendered_digest,
         "vocabulary": vocabulary,
         "rows": rows,
+        // The sample that chose `rows`; none scores every predicting position.
+        "sample": logits.sample.map(|Sample { windows, steps }| json!({ "windows": windows, "steps": steps })),
         "experts": experts,
         "stored_tables": tables,
     });
@@ -216,7 +277,7 @@ pub fn run(
 /// one teacher-forced step of every walk among them.
 fn score(
     engine: &mut Engine,
-    walks: &mut [Walk<'_>],
+    walks: &mut [Walk],
     width: usize,
     vocabulary: usize,
     file: &mut File,
@@ -329,5 +390,23 @@ fn scored(sequence: &Sequence, forced: Vec<TokenId>) -> Operation {
         committed: forced.len(),
         tokens: forced,
         prime: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_sample_spreads_disjoint_windows_within_the_spans() {
+        // Predicting positions 9..29 and 39..59: forty in all.
+        let spans = [10..30, 40..60];
+        let sample = |windows, steps| scored_rows(&spans, Some(Sample { windows, steps }));
+        assert_eq!(scored_rows(&spans, None), [9..29, 39..59]);
+        assert_eq!(sample(4, 3), [9..12, 19..22, 39..42, 49..52]);
+        // A window starting near a span's end ends with it.
+        assert_eq!(sample(3, 8), [9..17, 22..29, 45..53]);
+        // No more positions than the windows would take: all of them.
+        assert_eq!(sample(5, 8), [9..29, 39..59]);
     }
 }

@@ -3,6 +3,7 @@ the trained roundings against torch's own E4M3 cast and the E2M1 grid, the row-b
 DeepSeek's released code (network: the pinned `inference/` files)."""
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from magnitude_references.families.deepseek41 import (E2M1, E4M3, DeepSeek41Refe
                                                       round_codes)
 from magnitude_references.gguf import Package, Value, Writer, quantize
 from magnitude_references.model import SCALE_ENCODING, Weights
+from magnitude_references.perturbation import Perturbation
 
 CPU = torch.device("cpu")
 VOCAB, HIDDEN, HEADS, DIM, ROPE, Q_RANK, GROUPS, O_RANK = 64, 64, 2, 64, 16, 32, 2, 32
@@ -151,9 +153,10 @@ def tiny(tmp_path_factory) -> Path:
     return path
 
 
-def reference(path: Path, roundings: Roundings = Roundings()) -> DeepSeek41Reference:
+def reference(path: Path, roundings: Roundings = Roundings(), perturbation: Perturbation | None = None,
+              cache: bool = True) -> DeepSeek41Reference:
     package = Package.local(path)
-    return DeepSeek41Reference(package, Weights(package, CPU, True), None, roundings)
+    return DeepSeek41Reference(package, Weights(package, CPU, cache, perturbation), None, roundings)
 
 
 def test_fp8_block_scales_are_exact(tiny: Path) -> None:
@@ -188,10 +191,13 @@ def test_roundings_match_the_formats() -> None:
     assert torch.equal(power_of_two_ceil(samples), torch.exp2(torch.ceil(torch.log2(samples))))
 
 
-@pytest.mark.parametrize("roundings", [Roundings(), Roundings.trained()], ids=["exact", "trained"])
-def test_every_row_depends_only_on_its_prefix(tiny: Path, roundings: Roundings) -> None:
-    """Chunked prefill and verify compute the same rows as a whole prompt: row t of any prefix equals row t."""
-    model = reference(tiny, roundings)
+@pytest.mark.parametrize("roundings, perturbation", [(Roundings(), None), (Roundings.trained(), None),
+                                                      (Roundings.trained(), Perturbation(3))],
+                         ids=["exact", "trained", "perturbed"])
+def test_every_row_depends_only_on_its_prefix(tiny: Path, roundings: Roundings, perturbation: Perturbation | None) -> None:
+    """Chunked prefill and verify compute the same rows as a whole prompt: row t of any prefix equals row t. Perturbed,
+    so a stored row moves by its own identity alone, however many rows the store holds when it is formed."""
+    model = reference(tiny, roundings, perturbation)
     tokens = torch.from_numpy(np.random.default_rng(1).integers(0, VOCAB, (2, 24)))
     with torch.no_grad():
         whole = model.forward(tokens)
@@ -199,10 +205,189 @@ def test_every_row_depends_only_on_its_prefix(tiny: Path, roundings: Roundings) 
             torch.testing.assert_close(model.forward(tokens[:, :length]), whole[:, :length], rtol=1e-5, atol=1e-5)
 
 
-@pytest.mark.parametrize("roundings", [Roundings(), Roundings.trained()], ids=["exact", "trained"])
+# DeepSeek's code runs widened to F32 here, where its BF16 holds (`.to(dtype)`) are identities.
+@pytest.mark.parametrize("roundings", [Roundings(), replace(Roundings.trained(), held=False)],
+                         ids=["exact", "trained-unheld"])
 def test_matches_deepseek_code(tiny: Path, roundings: Roundings) -> None:
     report = check_hf(reference(tiny, roundings), 2, 24, 20261106)
     assert report["pass"], report
+
+
+def test_holds_match_deepseek_code_in_its_dtypes(tiny: Path) -> None:
+    """`Roundings.held` against DeepSeek's code in its own dtypes (BF16 activations, F32 where model.py says). At
+    every layer, fed its BF16 input as model.py computed it, the reference's window keys are the rows model.py's
+    window stores, exactly. At each layer that compresses and indexes its own rows, fed also its low-rank query,
+    the reference's compressed rows and index keys are model.py's codes and its selection is model.py's top-k,
+    exactly."""
+    from magnitude_references import deepseek41_released as released
+    from magnitude_references.families.deepseek41 import Shared
+    model = reference(tiny, Roundings.trained())
+    tokens = torch.from_numpy(np.random.default_rng(2).integers(0, VOCAB, (1, 24)))
+    module, transformer = released.build(model, tokens, native=True)
+    seen, windows = {}, {}
+    forward, window = module.Indexer.forward, module.Attention._window_kv
+
+    def indexer_forward(self, x, qr, latent, start_pos, offset):
+        idxs = forward(self, x, qr, latent, start_pos, offset)
+        if self.owns_k:  # `latent` is rotated and rounded in place after this returns
+            seen[self] = (x.float(), qr.float(), latent, self.k_cache, idxs, offset)
+        return idxs
+
+    def window_kv(self, x, freqs_cis, start_pos):
+        kv, idxs = window(self, x, freqs_cis, start_pos)
+        windows[self.layer_id] = (x.float(), kv.float())
+        return kv, idxs
+
+    module.Indexer.forward, module.Attention._window_kv = indexer_forward, window_kv
+    with torch.no_grad():
+        transformer(tokens, 0)
+    positions = torch.arange(tokens.shape[1])
+    rotaries = model.rotaries(positions)
+    for layer, (x, kv) in windows.items():
+        with torch.no_grad():
+            assert torch.equal(model.window_keys(layer, x, rotaries[model.ratios[layer] > 0]), kv), layer
+    assert len(windows) == model.block_count
+    rotary = rotaries[True]
+    checked = 0
+    for layer, block in enumerate(transformer.layers):
+        indexer = block.attn.indexer
+        if indexer not in seen:
+            continue
+        x, qr, rows, keys, idxs, offset = seen[indexer]
+        shared = Shared()
+        with torch.no_grad():
+            model.compress(layer, x, rotary, shared)
+            model.select(layer, x, qr, rotary, positions, shared)
+        assert torch.equal(shared.rows, rows.float()), layer
+        assert torch.equal(shared.index_keys, keys[:, :rows.shape[1]].float()), layer
+        if not 0 <= model.candidate < layer:  # a candidate reader's selection depends on an earlier layer's
+            picked = [sorted(int(i) - offset for i in row if i >= 0) for row in idxs[0]]
+            assert picked == [row.nonzero().flatten().tolist() for row in shared.selected[0]], layer
+        checked += 1
+    assert checked > 0
+
+
+def test_activations_match_deepseek_code_in_its_dtypes(tiny: Path) -> None:
+    """`Roundings.activations` (a measurement switch) against DeepSeek's code in its own dtypes, its FP8 / FP4 GEMMs
+    over their cast inputs: every block and Engram layer, fed its BF16 streams as model.py computed them, gives
+    model.py's streams, exactly."""
+    from magnitude_references import deepseek41_released as released
+    from magnitude_references.families.deepseek41 import Shared
+    model = reference(tiny, replace(Roundings.trained(), activations=True))
+    tokens = torch.from_numpy(np.random.default_rng(3).integers(0, VOCAB, (1, 24)))
+    module, transformer = released.build(model, tokens, native=True)
+    blocks, engrams = {}, {}
+    block_forward, engram_forward = module.Block.forward, module.Engram.forward
+
+    def block(self, x, start_pos, pre_mix, image_mask, *rest):
+        out, pre = block_forward(self, x, start_pos, pre_mix, image_mask, *rest)
+        blocks[self.layer_id] = (x.float(), pre_mix, out.float(), pre)
+        return out, pre
+
+    def engram(self, x, hash_ids, token_mask=None):
+        out = engram_forward(self, x, hash_ids, token_mask)
+        engrams[self.layer_id] = (x.float(), out.float())
+        return out
+
+    module.Block.forward, module.Engram.forward = block, engram
+    with torch.no_grad():
+        transformer(tokens, 0)
+    positions = torch.arange(tokens.shape[1])
+    rotaries, shared, rows = model.rotaries(positions), Shared(), model.ngram_rows(tokens)
+    with torch.no_grad():
+        for layer, (x, out) in engrams.items():
+            assert torch.equal(model.engram(layer, x, rows[:, :, model.engram_layers.index(layer)]), out), layer
+        for layer in range(model.block_count):
+            x, pre_mix, out, pre = blocks[layer]
+            streams, ours = model.block(layer, x, pre_mix, rotaries, positions, shared)
+            assert torch.equal(ours, pre), layer
+            assert torch.equal(streams, out), layer
+    assert engrams and len(blocks) == model.block_count
+
+
+def test_activations_variant_has_its_own_identity(tiny: Path) -> None:
+    """The `activations` variant opens the trained roundings with the switch on, under an implementation identity
+    (the reference cache's key) of its own; an unknown variant is refused."""
+    from magnitude_references import digest
+    from magnitude_references.families import open_reference
+    assert open_reference(tiny, CPU, True, variant="activations").roundings == replace(Roundings.trained(), activations=True)
+    assert open_reference(tiny, CPU, True).roundings == Roundings.trained()
+    assert digest.implementation("activations") != digest.implementation()
+    assert len({digest.implementation(), digest.implementation("perturbed:1"), digest.implementation("perturbed:2")}) == 3
+    perturbed = open_reference(tiny, CPU, True, variant="perturbed:1")
+    assert perturbed.weights.perturbation == Perturbation(1) and perturbed.roundings == Roundings.trained()
+    with pytest.raises(ValueError, match="no reference variant"):
+        open_reference(tiny, CPU, True, variant="unknown")
+
+
+def test_a_perturbed_value_moves_once_however_it_is_read(tiny: Path) -> None:
+    """A stored value moves by one draw, the same in every read of it: a whole tensor, one expert's matrix of it,
+    table rows and their tile scales, a second streamed read. About 1 in 12 stored codes moves, each to an
+    adjacent code."""
+    package = Package.local(tiny)
+    plain, moved = Weights(package, CPU, False), Weights(package, CPU, False, Perturbation(11))
+    name = "blk.0.ffn_up_exps.weight"
+    assert all(torch.equal(moved(name)[index], moved.expert(name, index)) for index in range(EXPERTS))
+    rows = torch.tensor([[5, 0], [5, 40]])
+    table = "per_layer_token_embd.weight"
+    assert torch.equal(moved.rows(table, rows), moved(table)[rows])
+    for tensor in (name, table, "blk.0.attn_q_b.weight", "token_embd.weight"):
+        assert torch.equal(moved(tensor), moved(tensor)), tensor
+        assert not torch.equal(moved(tensor), plain(tensor)), tensor
+    def ordinals(codes: np.ndarray) -> np.ndarray:  # BF16 codes in value order
+        codes = codes.reshape(-1).view(np.uint16).astype(np.int64)
+        return np.where(codes & 0x8000, -(codes & 0x7FFF), codes)
+
+    before, after = ordinals(np.array(package.raw("token_embd.weight"))), ordinals(moved.stored("token_embd.weight"))
+    assert 0.06 < np.count_nonzero(after != before) / before.size < 0.11
+    assert np.abs(after - before).max() == 1
+
+
+def test_a_perturbed_reference_moves_stored_values_only(tiny: Path, monkeypatch) -> None:
+    """Every plane the perturbation draws for is a stored one: a tensor of the file (an I8 tensor only as a weight's
+    scale) or a store of trained-rounding rows. The n-gram table rows, an index computed from the token ids, are the
+    unperturbed model's."""
+    planes: set[str] = set()
+    steps = Perturbation.steps
+
+    def recorded(self, plane, index):
+        planes.add(plane)
+        return steps(self, plane, index)
+
+    monkeypatch.setattr(Perturbation, "steps", recorded)
+    model = reference(tiny, Roundings.trained(), Perturbation(2))
+    tokens = torch.from_numpy(np.random.default_rng(4).integers(0, VOCAB, (1, 16)))
+    with torch.no_grad():
+        model.forward(tokens)
+    assert torch.equal(model.ngram_rows(tokens), reference(tiny, Roundings.trained()).ngram_rows(tokens))
+    package, stores = model.package, set()
+    for plane in planes:
+        name = plane.removesuffix("/scales")
+        if package.has(name):
+            assert package.info(name).type != Q.I8 or name.endswith(".scale"), plane
+        else:
+            layer, _, store = name.removeprefix("blk.").partition(".")
+            assert layer.isdecimal(), plane
+            stores.add(store)
+    assert stores == {"window", "indexer.keys", "compressor.rows"}
+    assert planes >= {"blk.0.ffn_up_exps.weight", "blk.0.ffn_up_exps.weight/scales", "blk.0.attn_q_b.scale",
+                      "blk.2.window/scales", "blk.2.compressor.rows/scales"}
+
+
+def test_a_perturbed_reference_built_twice_is_the_same(tiny: Path) -> None:
+    """One seed's reference is one function of the file: two streamed builds give the same bytes, which differ from
+    the unperturbed reference's and from another seed's."""
+    tokens = torch.from_numpy(np.random.default_rng(5).integers(0, VOCAB, (2, 20)))
+    with torch.no_grad():
+        first, second, other, plain = (reference(tiny, Roundings.trained(), perturbation, cache=False).forward(tokens)
+                                       for perturbation in (Perturbation(9), Perturbation(9), Perturbation(10), None))
+    assert first.numpy().tobytes() == second.numpy().tobytes()
+    assert not torch.equal(first, plain) and not torch.equal(first, other)
+
+
+def test_a_perturbed_reference_needs_the_stored_roundings(tiny: Path) -> None:
+    with pytest.raises(ValueError, match="needs every stored rounding"):
+        reference(tiny, Roundings(), Perturbation(1))
 
 
 def test_hash_constants_are_deepseeks(tiny: Path) -> None:

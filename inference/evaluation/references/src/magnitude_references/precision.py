@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from magnitude_references import digest, record
-from magnitude_references.contract import check_match, read_artifacts, read_logits, read_rendered
+from magnitude_references.contract import LOGITS, check_match, read_artifacts, read_logits, read_rendered
 from magnitude_references.families import family_of, open_reference
 from magnitude_references.sanity import Bounds, Gate
 
@@ -316,7 +316,7 @@ def inject(reference, unit, callback):
 
 def checked_reference(path, rendered, vocabulary):
     record_value = json.loads((path / "reference.json").read_text())
-    header, values = read_logits(path, "logits")
+    header, values = read_logits(path, LOGITS)
     if (record_value.get("model") != rendered.model or record_value.get("rendered_digest") != rendered.digest
             or not record_value.get("implementation_digest") or not record_value.get("sanity", {}).get("passed")
             or header.get("model") != rendered.model or header.get("rendered_digest") != rendered.digest

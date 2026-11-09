@@ -33,7 +33,8 @@ pub const PREFILL_ROWS: usize = 512;
 pub struct EngineOptions {
     pub cache_dir: Option<PathBuf>,
     pub device: DeviceRequest,
-    pub kv_codec: KvCodec,
+    /// The host's KV policy, when named (`ModelPolicy::kv_codec`).
+    pub kv_codec: Option<KvCodec>,
     pub numerical_profile: Option<NumericalProfile>,
     /// The bound on each load's weights: a cap on every weight byte, or the
     /// device's room alone (`ModelPolicy::weight_bound`).

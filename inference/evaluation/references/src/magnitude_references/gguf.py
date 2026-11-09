@@ -5,6 +5,8 @@ tensor bytes from either, exact dequantization to float32, and a streaming write
 metadata value's GGUF type. Dequantization uses the NumPy decoders of gguf-py at llama.cpp v0.9.0
 (`cd959bae99ff`, pinned by the workspace, the converter's revision); the quantized formats are
 defined by ggml, so this is the format's own decoder and is independent of the engine under test.
+MXFP4 decodes through tables built from that decoder's own definitions (`dequantize_mxfp4`), equal to it
+bit for bit (tests/test_gguf.py).
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ import urllib.request
 
 import numpy as np
 from gguf.constants import GGML_QUANT_SIZES, GGMLQuantizationType, GGUFValueType
-from gguf.quants import dequantize as ggml_dequantize
+from gguf.quants import MXFP4, dequantize as ggml_dequantize
 
 RETRIES = 6  # transient network failures on long range reads (backoff 1, 2, 4, 8, 16 s)
 ALIGNMENT_KEY = "general.alignment"
@@ -299,12 +301,38 @@ class Package:
         return list(self.location)
 
 
+def _mxfp4_tables() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """gguf-py's MXFP4 decoder as tables over a byte: a block's scale by its E8M0 byte, and an element
+    pair's low and high nibble values by their byte."""
+    codes = np.arange(256, dtype=np.uint8)
+    values = np.array(MXFP4.kvalues, dtype=np.int8).astype(np.float32)
+    return MXFP4.e8m0_to_fp32_half(codes), values[codes & 0x0F], values[codes >> 4]
+
+
+MXFP4_SCALES, MXFP4_LOW, MXFP4_HIGH = _mxfp4_tables()
+
+
+def dequantize_mxfp4(blocks: np.ndarray) -> np.ndarray:
+    """MXFP4 blocks [n, 17] (E8M0 scale byte, 16 bytes of nibble pairs) as float32 [n, 32]: gguf-py's
+    `MXFP4.dequantize_blocks`, the same products of the same float32 factors, by table lookup (NumPy
+    releases the GIL in both steps, so expert matrices decode in parallel)."""
+    values = np.empty((len(blocks), MXFP4.block_size), dtype=np.float32)
+    pairs = blocks[:, 1:]
+    np.take(MXFP4_LOW, pairs, out=values[:, :MXFP4.block_size // 2], mode="wrap")
+    np.take(MXFP4_HIGH, pairs, out=values[:, MXFP4.block_size // 2:], mode="wrap")
+    values *= np.take(MXFP4_SCALES, blocks[:, 0])[:, None]
+    return values
+
+
 def dequantize(info: TensorInfo, raw: np.ndarray) -> np.ndarray:
     if len(raw) != info.nbytes:
         raise ValueError(f"{info.name}: {len(raw)} bytes, expected {info.nbytes}")
     block, size = GGML_QUANT_SIZES[info.type]
     rows = np.asarray(raw, dtype=np.uint8).reshape(-1, info.shape[0] // block * size)
-    values = ggml_dequantize(rows, info.type)
+    if info.type == GGMLQuantizationType.MXFP4:
+        values = dequantize_mxfp4(rows.reshape(-1, size))
+    else:
+        values = ggml_dequantize(rows, info.type)
     # F32 rows come back as a read-only view of the file; the references need owned arrays.
     return np.require(np.asarray(values, dtype=np.float32).reshape(info.array_shape), requirements="W")
 

@@ -22,24 +22,24 @@ import torch
 
 from magnitude_references import digest, record
 from magnitude_rig import store
-from magnitude_references.contract import (LogitsWriter, RenderedFixture, check_match, read_artifacts,
+from magnitude_references.contract import (LOGITS, LogitsWriter, RenderedFixture, check_match, read_artifacts,
                                            read_rendered)
-from magnitude_references.families import family_of, open_reference
+from magnitude_references.checks import device_of
+from magnitude_references.families import REFERENCES, family_of, open_reference
 from magnitude_references.gguf import Package
 from magnitude_references.model import F32, Reference
 from magnitude_references.performance import BATCH_TOKENS, HEAD_ROWS
 from magnitude_references.sanity import Bounds, Gate
 
-LOGITS = "logits"
-
 
 @dataclass(frozen=True)
 class Options:
-    device: torch.device
+    device: torch.device | None  # None: `build_device`
     bounds: Bounds = Bounds()
     batch_tokens: int = BATCH_TOKENS
     cache_weights: bool = False
     build: dict | None = None  # the contract `build` object, recorded verbatim; None: the local tree's (record.build)
+    variant: str | None = None  # a measurement variant (`Reference.variants`); None: the model's numerics
 
 
 def batches(fixtures: tuple[RenderedFixture, ...], budget: int) -> list[list[RenderedFixture]]:
@@ -75,6 +75,12 @@ def run_batch(reference: Reference, group: list[RenderedFixture], writer: Logits
             sanity.add(fixture.fixture_id, logits, torch.tensor(fixture.targets(), dtype=torch.int64))
 
 
+def build_device(package: Package) -> torch.device:
+    """The device a reference of `package` builds on by default: the host's default, or the CPU for
+    a family whose reference rounds to trained codes (`Reference.continuous`)."""
+    return device_of("auto" if REFERENCES[package.architecture][1].continuous else "cpu")
+
+
 def build_reference(rendered_path: Path, artifacts_path: Path, output: Path, options: Options) -> dict:
     """Write the reference for a rendered fixture set into `output`; returns the reference record.
     The record's `sanity.passed` says whether the reference may be used."""
@@ -84,7 +90,10 @@ def build_reference(rendered_path: Path, artifacts_path: Path, output: Path, opt
     check_match(rendered, artifacts)
     package = Package.local(artifacts.target)
     family = family_of(package)
-    reference = open_reference(package, options.device, options.cache_weights)
+    device = options.device or build_device(package)
+    if not REFERENCES[package.architecture][1].continuous and device.type != "cpu":
+        raise ValueError(f"the {family} reference rounds to trained codes, so it builds on the CPU alone, not {device}")
+    reference = open_reference(package, device, options.cache_weights, variant=options.variant)
     for fixture in rendered.fixtures:
         if max(fixture.tokens) >= reference.vocab_size:
             raise ValueError(f"{fixture.fixture_id}: token beyond the model's {reference.vocab_size} vocabulary")
@@ -98,14 +107,14 @@ def build_reference(rendered_path: Path, artifacts_path: Path, output: Path, opt
     writer.close()
     reference_record = {
         "model": artifacts.model, "rendered_digest": rendered.digest, "family": family,
-        "implementation_digest": digest.implementation(), "dtype": "float32", "sanity": sanity.result(options.bounds),
+        "implementation_digest": digest.implementation(options.variant), "dtype": "float32", "sanity": sanity.result(options.bounds),
     }
     (output / "reference.json").write_text(json.dumps(reference_record, indent=1) + "\n")
     result = {
         "schema": "evaluation-result/1", "tool": "reference", "started_at": started, "finished_at": record.utc_now(),
         "build": options.build if options.build is not None else record.build(), "model": artifacts.model, "artifacts": artifacts.record,
         "fixture_set": {"path": None, "digest": rendered.fixture_set_digest}, "rendered_digest": rendered.digest,
-        "host": record.host(options.device), "command": sys.argv, "measurements": {}, "traces": {},
+        "host": record.host(device), "command": sys.argv, "measurements": {}, "traces": {},
     }
     (output / "result.json").write_text(json.dumps(result, indent=1) + "\n")
     return reference_record

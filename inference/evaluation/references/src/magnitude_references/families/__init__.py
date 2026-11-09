@@ -16,6 +16,7 @@ from magnitude_references.families.qwen35 import Qwen35Reference
 from magnitude_references.families.qwen4exp import Qwen4ExpReference
 from magnitude_references.gguf import Package
 from magnitude_references.model import Reference, Weights
+from magnitude_references.perturbation import Perturbation
 
 # GGUF `general.architecture` -> (family name, reference). The family name is the record's `family`
 # and the logits producer `reference:<family>`.
@@ -40,9 +41,18 @@ def family_of(package: Package) -> str:
     return REFERENCES[package.architecture][0]
 
 
-def open_reference(model: Path | Package, device: torch.device, cache: bool, layers: int | None = None) -> Reference:
-    """The family reference of a GGUF. `cache=False` streams: every layer's weights are dequantized
-    when the layer runs and dropped after."""
+def open_reference(model: Path | Package, device: torch.device, cache: bool, layers: int | None = None,
+                   variant: str | None = None) -> Reference:
+    """The family reference of a GGUF, in its model numerics, the named measurement `variant`
+    (`Reference.variants`), or its numerics over storage-resolution-perturbed stored values (`perturbed:<seed>`,
+    `perturbation.py`). `cache=False` streams: every layer's weights are dequantized when the layer runs and
+    dropped after."""
     package = model if isinstance(model, Package) else Package.local(Path(model))
     family_of(package)
-    return REFERENCES[package.architecture][1](package, Weights(package, device, cache), layers)
+    family = REFERENCES[package.architecture][1]
+    perturbation = Perturbation.of(variant)
+    if variant is not None and perturbation is None and variant not in family.variants:
+        raise ValueError(f"{package.architecture} has no reference variant {variant!r}: "
+                         f"{sorted(family.variants)} or perturbed:<seed>")
+    options = family.variants[variant] if variant in family.variants else {}
+    return family(package, Weights(package, device, cache, perturbation), layers, **options)

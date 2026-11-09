@@ -17,6 +17,7 @@ config value remapped, so a slice converts like any model.
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -57,7 +58,28 @@ def check_ue8m0(name: str, scales: np.ndarray) -> None:
 
 class AlignedShardsWriter(gguf.GGUFWriter):
     """gguf-py pads every shard's data to `general.alignment` but writes the key into the first shard only, so a
-    reader of any later shard falls back to the default 32 and misplaces every tensor. Each shard carries it here."""
+    reader of any later shard falls back to the default 32 and misplaces every tensor. Each shard carries it here.
+
+    With `shards`, only those shards (numbered from 1) are written, and the others' tensors are never read: a change
+    to one shard's metadata rewrites that shard alone. The split is planned from every tensor as before, so a written
+    shard is the one a whole conversion writes."""
+
+    shards: frozenset[int] | None
+
+    def format_shard_names(self, path: Path) -> list[Path]:
+        names = super().format_shard_names(path)
+        if self.shards is None:
+            return names
+        if not self.shards <= set(range(1, len(names) + 1)):
+            raise ValueError(f"shards {sorted(self.shards)}: the file has {len(names)}")
+        return [name if i in self.shards else Path(os.devnull) for i, name in enumerate(names, 1)]
+
+    def write_ti_data_to_file(self) -> None:
+        super().write_ti_data_to_file()
+        if self.shards is not None:
+            for i, tensors in enumerate(self.tensors, 1):
+                if i not in self.shards:
+                    tensors.clear()
 
     def add_shard_kv_data(self) -> None:
         super().add_shard_kv_data()
@@ -66,8 +88,9 @@ class AlignedShardsWriter(gguf.GGUFWriter):
             kv_data[key] = self.kv_data[0][key]
 
 
-def _add_file_metadata(writer: gguf.GGUFWriter, source_repo_url: str) -> None:
+def _add_file_metadata(writer: gguf.GGUFWriter, source_repo_url: str, shards: frozenset[int] | None) -> None:
     writer.__class__ = AlignedShardsWriter  # the writer is made by ModelBase; only its sharding differs
+    cast(AlignedShardsWriter, writer).shards = shards
     writer.add_custom_alignment(ALIGNMENT)
     writer.add_key_value(gguf.Keys.General.SOURCE_REPO_URL, source_repo_url, gguf.GGUFValueType.STRING)
 
@@ -110,14 +133,15 @@ class _NativeFp8(_KeepBf16):
     _fp8_e4m3_preserved: set[str]
     _ENGRAM_EMBED_RE: Any
 
-    def __init__(self, *args, source_repo_url: str, **kwargs):
+    def __init__(self, *args, source_repo_url: str, shards: frozenset[int] | None = None, **kwargs):
         self._fp8_scales: dict[str, Callable[[], torch.Tensor]] = {}
         self._source_repo_url = source_repo_url
+        self._shards = shards
         super().__init__(*args, **kwargs)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        _add_file_metadata(self.gguf_writer, self._source_repo_url)
+        _add_file_metadata(self.gguf_writer, self._source_repo_url, self._shards)
         self.gguf_writer.add_key_value(SCALE_ENCODING, UE8M0, gguf.GGUFValueType.STRING)
 
     def dequant_model(self):
@@ -336,23 +360,42 @@ class DeepseekV41Vision(_KeepBf16, DeepseekV41VisionModel):
 
     model_arch = gguf.MODEL_ARCH.MMPROJ
 
-    def __init__(self, *args, source_repo_url: str, **kwargs):
+    def __init__(self, *args, source_repo_url: str, shards: frozenset[int] | None = None, **kwargs):
         self._source_repo_url = source_repo_url
+        self._shards = shards
         super().__init__(*args, **kwargs)
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        _add_file_metadata(self.gguf_writer, self._source_repo_url)
+        _add_file_metadata(self.gguf_writer, self._source_repo_url, self._shards)
 
 
 PARTS = ("text", "dspark", "vision")
 
 
+def small_pool(text_config: dict[str, Any], blocks: int, block_rows: int, top_k: int) -> dict[str, Any]:
+    """The text config with its indexer's candidate pool of `blocks` blocks of `block_rows` rows and its `top_k`:
+    a test definition whose pool binds over short prompts. The engine and the reference read these keys alone."""
+    if not (blocks > 0 and blocks % 8 == 0 and 0 < block_rows <= 16 and 0 < top_k <= blocks * block_rows):
+        raise ValueError(f"a candidate pool takes a multiple of 8 blocks of at most 16 rows holding at least top_k "
+                         f"rows: {blocks} blocks of {block_rows}, top_k {top_k}")
+    return {**text_config, "candidate_topk_blocks": blocks, "candidate_block_size": block_rows, "index_topk": top_k}
+
+
 def build(part: str, checkpoint: Path, out: Path, *, source_repo_url: str, layers: list[int] | None = None,
-          split_max_size: int = 0) -> DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision:
-    """The converter for one file of the model: the text model (or a slice of it), the drafter or the projector."""
+          pool: tuple[int, int, int] | None = None,
+          split_max_size: int = 0, shards: frozenset[int] | None = None
+          ) -> DeepseekV41 | DeepseekV41DSpark | DeepseekV41Vision:
+    """The converter for one file of the model: the text model (or a slice of it, or with a small candidate pool),
+    the drafter or the projector. `shards` limits writing to those shards of the split file (see
+    `AlignedShardsWriter`)."""
     hparams = ModelBase.load_hparams(checkpoint, False)
-    common: dict[str, Any] = {"hparams": hparams, "split_max_size": split_max_size, "source_repo_url": source_repo_url}
+    if pool is not None:
+        if part != "text":
+            raise ValueError("only the text model has a candidate pool")
+        hparams["text_config"] = small_pool(hparams["text_config"], *pool)
+    common: dict[str, Any] = {"hparams": hparams, "split_max_size": split_max_size, "source_repo_url": source_repo_url,
+                              "shards": shards}
     # BF16 is the type of every tensor nothing else claims; FP8 and MXFP4 tensors are claimed explicitly
     args = (checkpoint, gguf.LlamaFileType.MOSTLY_BF16, out)
     if part == "text":
