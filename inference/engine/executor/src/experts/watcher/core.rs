@@ -1,7 +1,8 @@
 //! What every part of serving reads: the load's layers and groups, the
 //! directory, the source, and how far the device is retired.
 
-use super::{Step, Steps, low_word};
+use super::{Steps, low_word};
+use super::steps::Owned;
 use crate::experts::{ExchangeTable, Words};
 use crate::experts::conveyor::Conveyor;
 use crate::experts::directory::{Directory, Point};
@@ -93,38 +94,61 @@ impl Layer {
     }
 }
 
-/// One step's routing record at a streamed layer (`routed_route_streamed`):
-/// the one reader of its words.
-pub(super) struct RoutingRecord<'a> {
-    words: &'a Words,
-    shape: RegionWords,
-    base: usize,
-    count: usize,
+/// One step's routing record at a streamed layer (`routed_route_streamed`),
+/// as the step's route wrote it: the one reader of its words.
+pub(super) struct RoutingRecord {
+    /// Each choice's expert and the source its route resolved it to.
+    choices: Vec<(i32, i32)>,
     /// Whether its route wrote it: a whole layer's writes none.
     written: bool,
 }
 
-impl<'a> RoutingRecord<'a> {
-    /// Step `sequence`'s record at `layer` among `words`, of records shaped
-    /// by `shape`. The route publishes it before anything reads it, and it
-    /// holds until the step ends: a record of another step, or of a count
-    /// that is none of its choices, is the device's broken invariant.
-    pub(super) fn read(words: &'a Words, shape: RegionWords, sequence: Step, layer: usize) -> Self {
+/// A routing record's words as they were while its step held its slot
+/// ([`RoutingRecord::copy`]), not yet checked: a check that fails panics,
+/// which must not happen under the steps' lock.
+pub(super) struct CopiedRecord {
+    sequence: super::Step,
+    written: i32,
+    count: i32,
+    /// Every choice's words the record has room for.
+    choices: Vec<(i32, i32)>,
+}
+
+impl RoutingRecord {
+    /// The words of the record of the step `owned` holds among `words`, of
+    /// records shaped by `shape`, copied whole while it holds it: no later
+    /// step of its slot begins meanwhile, so the device writes none of them
+    /// (`Steps::while_owned`).
+    pub(super) fn copy(owned: &Owned, words: &Words, shape: RegionWords) -> CopiedRecord {
+        let sequence = owned.sequence();
         let base = (sequence % shape.flight) as usize * shape.routing_words() as usize;
-        let written = words.load(base + constants::RING_SEQUENCE as usize);
+        let word = |at: u64| words.load(base + at as usize);
+        CopiedRecord {
+            sequence,
+            written: word(constants::RING_SEQUENCE),
+            count: word(constants::RING_COUNT),
+            choices: (0..shape.choices).map(|choice| (word(shape.routing_expert(choice)), word(shape.routing_source(choice)))).collect(),
+        }
+    }
+
+    /// The record `copied` holds at `layer`, of records shaped by `shape`.
+    /// The route publishes it before anything reads it: a record of another
+    /// step, or of a count that is none of its choices, is the device's
+    /// broken invariant.
+    pub(super) fn read(copied: CopiedRecord, shape: RegionWords, layer: usize) -> Self {
+        let CopiedRecord { sequence, written, count, mut choices } = copied;
         assert_eq!(written, low_word(sequence), "step {sequence}'s routing record at layer {layer} is another step's ({written})");
-        let count = words.load(base + constants::RING_COUNT as usize);
         let count = usize::try_from(count)
             .ok()
             .filter(|&count| count as u64 <= shape.choices)
             .unwrap_or_else(|| panic!("step {sequence}'s routing record at layer {layer} counts {count} of {} choices", shape.choices));
-        Self { words, shape, base, count, written: true }
+        choices.truncate(count);
+        Self { choices, written: true }
     }
 
-    /// A whole layer's, of records shaped by `shape`: its route writes none,
-    /// so it holds no choice.
-    pub(super) fn unwritten(words: &'a Words, shape: RegionWords) -> Self {
-        Self { words, shape, base: 0, count: 0, written: false }
+    /// A whole layer's: its route writes none, so it holds no choice.
+    pub(super) fn unwritten() -> Self {
+        Self { choices: Vec::new(), written: false }
     }
 
     /// Whether its route wrote it ([`Self::unwritten`] is a whole layer's).
@@ -134,13 +158,12 @@ impl<'a> RoutingRecord<'a> {
 
     /// The choices it holds.
     pub(super) fn count(&self) -> usize {
-        self.count
+        self.choices.len()
     }
 
     /// Each choice's expert and the source its route resolved it to.
     pub(super) fn choices(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
-        let word = move |at: u64| self.words.load(self.base + at as usize);
-        (0..self.count as u64).map(move |choice| (word(self.shape.routing_expert(choice)), word(self.shape.routing_source(choice))))
+        self.choices.iter().copied()
     }
 }
 

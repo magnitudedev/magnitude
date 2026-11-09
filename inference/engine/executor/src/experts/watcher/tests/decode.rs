@@ -219,12 +219,39 @@ fn a_parked_routing_record_of_a_broken_count_panics() {
     for broken in [-1, WORDS.choices as i32 + 1] {
         harness.layers[0].4.store(count, broken);
         let held = residency::lock(&harness.watcher.state);
-        let parked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::super::decode::parked_reads(&held.core, 0, sequence)));
+        let parked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| super::super::decode::parked_reads(&held.core, harness.watcher.shared(), 0, sequence)));
         drop(held);
         assert!(parked.is_err(), "a count of {broken}");
     }
     harness.layers[0].4.store(count, 0);
     step.complete().unwrap();
+}
+
+/// A park read after its step ended reads no routing record: the step's
+/// slot is free, and a later step of it may be rewriting the record, as the
+/// device writes its choices before its sequence word. Here the step of the
+/// slot after it has written one choice's source of its own when residency
+/// reads the stale park: the record read is the parked step's whole, or
+/// none, never a mix of both steps'.
+#[test]
+fn a_park_read_after_its_step_ended_reads_no_later_steps_record() {
+    let harness = hosted("lapped", 4, STAGING);
+    let step = harness.step();
+    let sequence = step.sequence();
+    harness.route_sourced(&step, 0, &[0, 1], &[-2, -3]);
+    drop(step);
+    for _ in 1..WORDS.flight {
+        drop(harness.step());
+    }
+    let lapping = harness.step();
+    assert_eq!(lapping.sequence(), sequence + WORDS.flight, "the step of the slot after");
+    let base = (sequence % WORDS.flight) as usize * WORDS.routing_words() as usize;
+    harness.layers[0].4.store(base + WORDS.routing_source(0) as usize, -2 - 3);
+    let held = residency::lock(&harness.watcher.state);
+    let parked = super::super::decode::parked_reads(&held.core, harness.watcher.shared(), 0, sequence);
+    drop(held);
+    assert!(parked.as_deref().is_none_or(|read| read == [(0, 0), (0, 1)]), "a torn record: {parked:?}");
+    drop(lapping);
 }
 
 /// Where the host places (the one store), a parked step's route resolves

@@ -254,11 +254,7 @@ fn end_converted(
     let pairs = landed.iter().map(|(named, ..)| (named.staged as i32, named.landing.record() as i32)).collect::<Vec<_>>();
     #[cfg(test)]
     std::thread::sleep(std::time::Duration::from_millis(shared.landings.held_ms.load(std::sync::atomic::Ordering::Relaxed)));
-    let mut published = false;
-    shared.steps.while_owned(naming.sequence, || {
-        words.publish(naming.sequence, &pairs);
-        published = true;
-    });
+    let published = shared.steps.while_owned(naming.sequence, |_| words.publish(naming.sequence, &pairs)).is_some();
     for (named, device, ended) in landed {
         let (record, answer) = (named.landing.record(), named.answer);
         match published {

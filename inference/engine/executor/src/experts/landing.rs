@@ -547,7 +547,7 @@ impl Answer {
     pub fn publish(&self, record: Option<u32>) {
         let source = record.map_or(-1, |record| host_source(self.placer, record as usize));
         let sequence = self.sequence;
-        self.steps.while_owned(sequence, || {
+        self.steps.while_owned(sequence, |_| {
             for &choice in &self.choices {
                 self.file.store(sequence, 0, SlotTable::file_entry(choice as u64) + constants::FILE_RECORD, source);
             }

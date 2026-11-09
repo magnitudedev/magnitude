@@ -5,7 +5,7 @@
 
 use crate::operation::LaunchWork;
 use super::core::{Extents, Layer, RoutingRecord};
-use super::steps::{CompletedRoute, CompletedStep, Decoded, EndedReads, Recording, Step};
+use super::steps::{CompletedRoute, CompletedStep, Decoded, EndedReads, Recording, Step, Steps};
 use crate::assessment::{
     ExpertLines, ExpertPass, FileLine, GroupLayerTerms, GroupUnion, LayerStep, Notice, ReadLine,
     ReadLineError, RequestReads, Stages,
@@ -1089,7 +1089,7 @@ impl Telemetry {
 
     /// Completed step `sequence`'s sampled blocks, sampled by `lines`: each
     /// one's device time, and what each layer read.
-    fn sampled_blocks(&self, sequence: Step, lines: Arc<[ExpertLines]>) -> Result<SampledBlocks, CompletionError> {
+    fn sampled_blocks(&self, sequence: Step, lines: Arc<[ExpertLines]>, records: &[RoutingRecord]) -> Result<SampledBlocks, CompletionError> {
         let runs = {
             let mut sampled = self.sampled.lock().expect("the sampled blocks");
             let mut runs = sampled.split_off(&(sequence, 0));
@@ -1104,16 +1104,17 @@ impl Telemetry {
                 spans.seconds(from, to).map(|seconds| (layer, seconds)).map_err(|error| CompletionError::Stamps { layer, error: error.to_string() })
             })
             .collect::<Result<_, _>>()?;
-        Ok(SampledBlocks { lines, seconds, rows: self.read_rows(sequence) })
+        Ok(SampledBlocks { lines, seconds, rows: self.read_rows(records) })
     }
 
-    /// What each streamed layer's routing record of step `sequence` read
+    /// What each streamed layer's routing record of `records` read
     /// ([`ReadRows`]); none of a whole layer, whose route writes no record
     /// of the experts its block ran.
-    fn read_rows(&self, sequence: Step) -> Vec<Option<ReadRows>> {
+    fn read_rows(&self, records: &[RoutingRecord]) -> Vec<Option<ReadRows>> {
         let placer = self.routing.placer;
-        self.records(sequence)
-            .map(|(_, record)| {
+        records
+            .iter()
+            .map(|record| {
                 record.written().then(|| {
                     let [mut hits, mut tiered, mut absent] = [(); 3].map(|_| BTreeMap::new());
                     for (expert, source) in record.choices() {
@@ -1331,6 +1332,7 @@ impl Telemetry {
     /// reads make no read line.
     pub(super) fn complete_step(
         &self,
+        steps: &Steps,
         sequence: Step,
         completion: CompletedStep,
         sited: &dyn Fn(usize) -> (u64, u64, Duration),
@@ -1342,15 +1344,17 @@ impl Telemetry {
         let decoded = match route {
             CompletedRoute::Grouped => None,
             CompletedRoute::Decode(mut decoded) => {
+                // The step completes, so it holds its records until it ends.
+                let records = self.records(steps, sequence);
                 if seismic_io::timeline::recording() {
-                    for (layer, record) in self.records(sequence) {
+                    for (layer, record) in records.iter().enumerate() {
                         for (expert, source) in record.choices() {
                             seismic_io::timeline::note(seismic_io::timeline::Kind::Noted("route"), sequence, (layer as i64, expert as i64, source as i64));
                         }
                     }
                 }
-                let blocks = decoded.sampled.take().map(|lines| self.sampled_blocks(sequence, lines)).transpose()?;
-                Some((decoded, self.routed(sequence), self.tiered(sequence), self.sourced(sequence), self.absent(sequence), blocks))
+                let blocks = decoded.sampled.take().map(|lines| self.sampled_blocks(sequence, lines, &records)).transpose()?;
+                Some((decoded, self.routed(sequence, &records), Self::tiered(&records), self.sourced(&records), Self::absent(&records), blocks))
             }
         };
         let mut recorded = self.lock();
@@ -1578,22 +1582,34 @@ impl Telemetry {
         self.lock().ranked.live.clone()
     }
 
-    /// Step `sequence`'s routing record at each streamed layer, each layer's
-    /// of `sequence` mod the steps in flight. No later step rewrites one
-    /// before the step ends (`Shared::begin` begins none beyond them).
-    fn records(&self, sequence: Step) -> impl Iterator<Item = (usize, RoutingRecord<'_>)> {
+    /// Step `sequence`'s routing record at each streamed layer, by layer:
+    /// each copied while the step holds them ([`RoutingRecord::copy`]),
+    /// none of a whole layer, then read.
+    fn records(&self, steps: &Steps, sequence: Step) -> Vec<RoutingRecord> {
         let Routing { records, words, .. } = &self.routing;
-        records.iter().enumerate().map(move |(layer, record)| {
-            let whole = self.whole[layer].load(Ordering::Acquire);
-            (layer, if whole { RoutingRecord::unwritten(record, *words) } else { RoutingRecord::read(record, *words, sequence, layer) })
-        })
+        let copied = steps
+            .while_owned(sequence, |owned| {
+                records
+                    .iter()
+                    .enumerate()
+                    .map(|(layer, record)| (!self.whole[layer].load(Ordering::Acquire)).then(|| RoutingRecord::copy(owned, record, *words)))
+                    .collect::<Vec<_>>()
+            })
+            .expect("a completing step owns its routing records");
+        copied
+            .into_iter()
+            .enumerate()
+            .map(|(layer, copied)| copied.map_or_else(RoutingRecord::unwritten, |copied| RoutingRecord::read(copied, *words, layer)))
+            .collect()
     }
 
     /// What completed decode step `sequence` routed to at each streamed
-    /// layer, ascending: a choice of no expert is the device's broken
-    /// invariant.
-    fn routed(&self, sequence: Step) -> Vec<RoutedRead> {
-        self.records(sequence)
+    /// layer, by its `records`, ascending: a choice of no expert is the
+    /// device's broken invariant.
+    fn routed(&self, sequence: Step, records: &[RoutingRecord]) -> Vec<RoutedRead> {
+        records
+            .iter()
+            .enumerate()
             .map(|(layer, record)| {
                 let mut routed = record
                     .choices()
@@ -1611,12 +1627,13 @@ impl Telemetry {
             .collect()
     }
 
-    /// The experts each streamed layer's routing record of step `sequence`
+    /// The experts each streamed layer's routing record of `records`
     /// resolved absent (`routed.seismic`'s `resolve`: the file's), each
     /// once: misses landed into the tier during the step.
-    fn absent(&self, sequence: Step) -> Vec<u64> {
-        self.records(sequence)
-            .map(|(_, record)| {
+    fn absent(records: &[RoutingRecord]) -> Vec<u64> {
+        records
+            .iter()
+            .map(|record| {
                 let mut absent = record.choices().filter(|&(_, source)| source == -1).map(|(expert, _)| expert).collect::<Vec<_>>();
                 absent.sort_unstable();
                 absent.dedup();
@@ -1625,12 +1642,13 @@ impl Telemetry {
             .collect()
     }
 
-    /// The experts each streamed layer's routing record of step `sequence`
+    /// The experts each streamed layer's routing record of `records`
     /// names served from the host tier (a source the route resolved to a
     /// tier record, `routed.seismic`'s `resolve`), each once.
-    fn tiered(&self, sequence: Step) -> Vec<Vec<usize>> {
-        self.records(sequence)
-            .map(|(_, record)| {
+    fn tiered(records: &[RoutingRecord]) -> Vec<Vec<usize>> {
+        records
+            .iter()
+            .map(|record| {
                 let mut served = record.choices().filter(|&(_, source)| source <= -2).map(|(expert, _)| expert as usize).collect::<Vec<_>>();
                 served.sort_unstable();
                 served.dedup();
@@ -1639,13 +1657,15 @@ impl Telemetry {
             .collect()
     }
 
-    /// Each choice of each streamed layer's routing record of step
-    /// `sequence`, (layer, expert, use), by the source the route resolved
+    /// Each choice of each streamed layer's routing record of `records`,
+    /// (layer, expert, use), by the source the route resolved
     /// it to (`routed.seismic`'s `resolve`): a bank record no landing writes
     /// served it, a record misses land into, or none (absent: the file's).
-    fn sourced(&self, sequence: Step) -> Vec<(usize, usize, Use)> {
+    fn sourced(&self, records: &[RoutingRecord]) -> Vec<(usize, usize, Use)> {
         let placer = self.routing.placer;
-        self.records(sequence)
+        records
+            .iter()
+            .enumerate()
             .flat_map(|(layer, record)| record.choices().map(|(expert, source)| (layer, expert as usize, Use::of(source, placer))).collect::<Vec<_>>())
             .collect()
     }

@@ -180,6 +180,19 @@ pub(super) struct EndedReads {
     pub prompt: bool,
 }
 
+/// A step's hold of its slot while [`Steps::while_owned`] runs, the one
+/// way to name it: no later step of the slot begins meanwhile.
+pub(in crate::experts) struct Owned {
+    sequence: Step,
+}
+
+impl Owned {
+    /// The step that owns the slot.
+    pub(in crate::experts) fn sequence(&self) -> Step {
+        self.sequence
+    }
+}
+
 /// The steps' state, under one lock.
 struct State {
     /// The last sequence begun, and the steps begun and not yet ended.
@@ -697,16 +710,16 @@ impl Steps {
         self.lock().running
     }
 
-    /// Run `answer`, a write of step `sequence`'s slot of a layer's answers,
-    /// while the step owns its routing record, under the lock its begin and
-    /// end take: the slot is the step's alone until it ends, and the next
-    /// step of the slot begins only after, so no other step's answer is
-    /// written while it reads its own. Nothing runs once the step ended.
-    pub(in crate::experts) fn while_owned(&self, sequence: Step, answer: impl FnOnce()) {
+    /// Run `work` on step `sequence`'s slot (its routing records, its
+    /// slot of a layer's answers) while the step owns it, under the lock
+    /// its begin and end take: the slot is the step's alone until it ends,
+    /// and the next step of the slot begins only after, so neither the
+    /// device (whose route of a step runs only once it began) nor an answer
+    /// writes another step's words there while `work` runs. What `work`
+    /// returned, or none, running nothing, once the step ended.
+    pub(in crate::experts) fn while_owned<T>(&self, sequence: Step, work: impl FnOnce(&Owned) -> T) -> Option<T> {
         let state = self.lock();
-        if state.slots[self.slot(sequence)].map(NonZeroU64::get) == Some(sequence) {
-            answer();
-        }
+        (state.slots[self.slot(sequence)].map(NonZeroU64::get) == Some(sequence)).then(|| work(&Owned { sequence }))
     }
 
     pub(super) fn fail(&self, sequence: Step, reason: String) {
@@ -1145,6 +1158,7 @@ impl ExpertStep {
         let completion = CompletedStep { work: self.work, begun, route };
         let sequence = self.sequence;
         if let Err(error) = shared.telemetry.complete_step(
+            &shared.steps,
             sequence,
             completion,
             &|layer| shared.compute.sited(layer, sequence),
