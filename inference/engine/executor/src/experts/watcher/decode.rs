@@ -509,9 +509,9 @@ impl Decode {
             let (layer, expert) = (waits.at.point.layer, waits.expert);
             let staged = (layer, expert);
             match core.directory.located(layer, expert) {
-                // Kept already (landed meanwhile by its read ahead):
-                // answered with its record.
-                Located::Kept(tier) => {
+                // Kept already (landed meanwhile by its read ahead), or
+                // graced, taken back as it was: answered with its record.
+                Located::Kept(tier) | Located::Graced(tier) => {
                     core.directory.answer(layer, HostRecord(tier), waits.at.point);
                     waiting.remove(index).answer.publish(Some(tier));
                     progressed = true;
@@ -645,10 +645,11 @@ impl Decode {
                 true => (Plan::Posted, Some(Anticipation::Demand)),
                 false => match core.directory.located(layer, expert) {
                     // Kept already: landed after the route resolved it (a
-                    // read ahead's that ended and settled since), answered
-                    // with its record, an outstanding answer from now,
-                    // which no claim of the request's other misses takes.
-                    Located::Kept(tier) => {
+                    // read ahead's that ended and settled since), or graced
+                    // since and taken back as it was ([`HostRecords::answer`]):
+                    // answered with its record, an outstanding answer from
+                    // now, which no claim of the request's other misses takes.
+                    Located::Kept(tier) | Located::Graced(tier) => {
                         core.directory.answer(layer, HostRecord(tier), point);
                         (Plan::Unread(Unread::Kept(tier)), None)
                     }

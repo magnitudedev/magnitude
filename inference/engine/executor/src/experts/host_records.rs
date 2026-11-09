@@ -168,6 +168,11 @@ pub(super) enum Resolution {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Located {
     Kept(u32),
+    /// Its record graced ([`Host::Graced`]): whole, unmapped from a step
+    /// on, still named for the steps before it that may resolve it. No
+    /// landing takes the expert anew, which would map it past them; a
+    /// request's demand takes the record back ([`HostRecords::answer`]).
+    Graced(u32),
     Landing,
     Lacked,
 }
@@ -264,21 +269,24 @@ enum Host {
     /// takes it until then; the reserve may unmap it, graced with its
     /// answer.
     Answering(Whole, Point),
-    /// Unmapped from step `until` on, the expert it held still named by
-    /// the steps from `from` before it that may resolve it until each is
-    /// past its layer or ended, and read as the outstanding answer of the
-    /// request at `answer`, if it was one, until the device is past there:
-    /// no park before frees it.
-    Graced { staged: Staged, from: Step, until: Step, answer: Option<Point> },
+    /// Unmapped from step `until` on, the expert it held whole (`whole`)
+    /// still named by the steps from `whole.from` before it that may
+    /// resolve it until each is past its layer or ended, and read as the
+    /// outstanding answer of the request at `answer`, if it was one, until
+    /// the device is past there: no park before frees it. It still holds
+    /// its expert ([`Host::present`]): no other record lands it meanwhile,
+    /// and a request's demand takes it back as it was.
+    Graced { whole: Whole, until: Step, answer: Option<Point> },
     /// A prompt group's, for its life.
     Claimed,
 }
 
 impl Host {
-    /// The expert it keeps or lands: one no other record keeps or lands.
+    /// The expert it keeps, lands or graces: one no other record keeps,
+    /// lands or graces.
     fn present(self) -> Option<Staged> {
         match self {
-            Self::Landing { staged, .. } | Self::Kept(Whole { staged, .. }) | Self::Answering(Whole { staged, .. }, _) => Some(staged),
+            Self::Landing { staged, .. } | Self::Kept(Whole { staged, .. }) | Self::Answering(Whole { staged, .. }, _) | Self::Graced { whole: Whole { staged, .. }, .. } => Some(staged),
             _ => None,
         }
     }
@@ -538,23 +546,6 @@ impl HostRecords {
         self.graced.len()
     }
 
-    /// Whether a graced record keeps `staged`: a step begun before it was
-    /// unmapped may still resolve it there (a running prompt group's steps
-    /// plan their hits on it as each opens), so no landing off a park
-    /// takes the expert until the grace retires; one would map it anew and
-    /// leave those resolutions unmapped.
-    pub fn graces(&self, staged: Staged) -> bool {
-        self.graced_experts().any(|graced| graced == staged)
-    }
-
-    /// The experts graced records keep ([`Self::graces`]).
-    fn graced_experts(&self) -> impl Iterator<Item = Staged> + '_ {
-        self.graced.iter().map(|&record| match self.records[record as usize] {
-            Host::Graced { staged, .. } => staged,
-            other => panic!("graced record {record} is {other:?}"),
-        })
-    }
-
     /// The record keeping `staged` whole, if one does.
     pub fn kept_record(&self, staged: Staged) -> Option<u32> {
         self.kept.get(&staged).copied()
@@ -583,18 +574,26 @@ impl HostRecords {
         match (self.kept.get(&staged), self.landing.get(&staged)) {
             (Some(&record), _) => self.records[record as usize].whole().is_some_and(|whole| whole.from <= last),
             (None, Some(&record)) => matches!(self.records[record as usize], Host::Landing { from, .. } if from <= last),
-            (None, None) => self.inbound.claimed(staged),
+            (None, None) => self.inbound.claimed(staged) && self.graced_record(staged).is_none(),
         }
     }
 
-    /// Where `staged` is: kept, landing (a record taken for its landing, or
-    /// its word claimed by a posted read, [`InboundTable`]) or lacked.
+    /// Where `staged` is: kept, graced, landing (a record taken for its
+    /// landing, or its word claimed by a posted read, [`InboundTable`]) or
+    /// lacked.
     pub fn located(&self, staged: Staged) -> Located {
         match self.kept.get(&staged) {
             Some(&record) => Located::Kept(record),
-            None if self.inbound.claimed(staged) => Located::Landing,
+            // A graced record holds its word too ([`Host::present`]).
+            None if self.inbound.claimed(staged) => self.graced_record(staged).map_or(Located::Landing, Located::Graced),
             None => Located::Lacked,
         }
+    }
+
+    /// The graced record that holds `staged`, if one does: at most one
+    /// ([`Host::present`]).
+    fn graced_record(&self, staged: Staged) -> Option<u32> {
+        self.graced.iter().copied().find(|&record| self.records[record as usize].present() == Some(staged))
     }
 
     /// The posted read of `staged` that no record took ended unlanded, or
@@ -728,14 +727,23 @@ impl HostRecords {
         self.set(record, content.with(Whole { holds, ..whole }));
     }
 
-    /// Kept record `record` is the answer of the request at `past` (its
-    /// tier wait), published now: an outstanding answer until the device is
-    /// past there ([`Self::retire`]), the latest of its requests'.
+    /// Kept or graced record `record` is the answer of the request at
+    /// `past` (its tier wait), published now: an outstanding answer until
+    /// the device is past there ([`Self::retire`]), the latest of its
+    /// requests'. A graced one is taken back as it was: its entry mapped
+    /// again from its `from`, so every step that named it still does and
+    /// those after it resolve it too, and no landing reads it anew.
     pub fn answer(&mut self, record: u32, past: Point) {
         let content = self.records[record as usize];
         let (whole, past) = match content {
             Host::Kept(whole) => (whole, past),
             Host::Answering(whole, answering) => (whole, answering.max(past)),
+            Host::Graced { whole, answer, .. } => {
+                if let Some(map) = &self.maps[whole.staged.0] {
+                    map.map_from(whole.staged.1, record, Some(whole.from));
+                }
+                (whole, answer.map_or(past, |answer| answer.max(past)))
+            }
             other => panic!("host record {record} answers a request, holding {other:?}"),
         };
         self.set(record, self.answering(whole, Some(past)));
@@ -768,11 +776,10 @@ impl HostRecords {
     /// reuse at `rank` (the directory's one fill order,
     /// `Directory::fill_order`), with its key.
     pub fn lacking<R: Ord + Copy, K: Ord>(&self, rank: impl Rank<R>, count: usize, skip: impl Fn(Staged) -> bool, order: impl Fn(R, Staged) -> K) -> Vec<(K, Staged)> {
-        let graced = self.graced_experts().collect::<std::collections::HashSet<_>>();
         let mut lacked = self
             .lacking
             .iter()
-            .filter(|&&staged| !skip(staged) && !graced.contains(&staged))
+            .filter(|&&staged| !skip(staged))
             .map(|&staged| (order(rank(staged, None), staged), staged))
             .collect::<Vec<_>>();
         if count < lacked.len() {
@@ -783,10 +790,12 @@ impl HostRecords {
         lacked
     }
 
-    /// Whether every expert of the group is kept: no miss of it reads the
-    /// file until a record gives one up.
+    /// Whether every expert of the group is kept, mapped for every step
+    /// from now: none lacked, landing, or graced (unmapped from a step on,
+    /// though its record holds it). No miss of it reads the file until a
+    /// record gives one up.
     pub fn complete(&self) -> bool {
-        self.lacking.is_empty() && self.landing.is_empty()
+        self.lacking.is_empty() && self.landing.is_empty() && self.graced.is_empty()
     }
 
     /// Whether every expert of the group is kept where no flight takes it,
@@ -806,7 +815,8 @@ impl HostRecords {
     /// lands it, claims it here, so no two land it at once.
     pub fn claim(&mut self, staged: Staged, keep: usize) -> Claim {
         match self.located(staged) {
-            Located::Kept(record) => Claim::Kept(record),
+            // Whole in its record already: nothing to land.
+            Located::Kept(record) | Located::Graced(record) => Claim::Kept(record),
             Located::Landing => Claim::Landing,
             Located::Lacked if self.takes(keep) => match self.inbound.claim(staged) {
                 true => Claim::Taken(self.take_lacked(staged, None)),
@@ -956,15 +966,18 @@ impl HostRecords {
             if !lent && record < self.lent {
                 continue;
             }
-            let (staged, from, answer) = match self.records[record as usize] {
-                Host::Answering(Whole { staged, from, .. }, past) => (staged, from, Some(past)),
-                Host::Kept(Whole { from, .. }) => (self.unkeep(record), from, None),
+            let (whole, answer) = match self.records[record as usize] {
+                Host::Answering(whole, past) => (whole, Some(past)),
+                Host::Kept(whole) => {
+                    self.unkeep(record);
+                    (whole, None)
+                }
                 other => unreachable!("victim record {record} holds {other:?}"),
             };
-            if let Some(map) = &self.maps[staged.0] {
-                map.store_unbegun(staged.1, None, Some(at));
+            if let Some(map) = &self.maps[whole.staged.0] {
+                map.store_unbegun(whole.staged.1, None, Some(at));
             }
-            self.set(record, Host::Graced { staged, from, until: at.next(), answer });
+            self.set(record, Host::Graced { whole, until: at.next(), answer });
         }
         // A displaced record unmapped, or changed since its seed chose it,
         // is displaced no more.
@@ -1044,6 +1057,7 @@ impl HostRecords {
             (Demand::Lacked, Located::Kept(record)) => Some(Claim::Kept(record)),
             (Demand::Lacked, Located::Landing) => Some(Claim::Landing),
             (Demand::Lacked, Located::Lacked) => None,
+            (Demand::Lacked, Located::Graced(record)) => panic!("a demand of {staged:?} finds it graced in record {record}: its request is answered from the record first (`Directory::answer`)"),
             (Demand::Posted, Located::Landing) if !self.landing.contains_key(&staged) => None,
             (Demand::Posted, located) => panic!("a posted read of {staged:?} claims a record, located {located:?}"),
         }
@@ -1176,7 +1190,7 @@ impl HostRecords {
             .clone()
             .into_iter()
             .filter(|&record| {
-                let Host::Graced { staged, from, until, answer } = self.records[record as usize] else {
+                let Host::Graced { whole: Whole { staged, from, .. }, until, answer } = self.records[record as usize] else {
                     unreachable!("a graced record is listed graced");
                 };
                 past(self, record, staged, (from, until), answer)
@@ -1346,7 +1360,7 @@ impl HostRecords {
         for record in records..count {
             match self.records[record as usize] {
                 Host::Ready => {}
-                Host::Kept(Whole { staged, holds: 0, .. }) | Host::Graced { staged, answer: None, .. } => {
+                Host::Kept(Whole { staged, holds: 0, .. }) | Host::Graced { whole: Whole { staged, .. }, answer: None, .. } => {
                     self.unmap_from(staged, record, until(staged));
                     self.set(record, Host::Ready);
                 }
@@ -1680,7 +1694,7 @@ mod tests {
             let (mut tier, maps) = landed_tier(resolution);
             refill(&mut tier, 1, &rank, &Unbegun::at(13));
             let [record] = tier.graced[..] else { panic!("one record graced") };
-            let Host::Graced { staged, from, until, .. } = tier.records[record as usize] else { panic!("record {record} is graced") };
+            let Host::Graced { whole: Whole { staged, from, .. }, until, .. } = tier.records[record as usize] else { panic!("record {record} is graced") };
             assert_eq!((from, until), (0, 13), "graced for every step begun");
             (tier, maps, record, staged)
         };
@@ -2111,6 +2125,38 @@ mod tests {
         tier.retire(steps.after(decode), &steps);
         assert!(graced(&tier), "the chain's passes at layers 2 and 3 still run");
         assert!(tier.retire(steps.after(1), &steps) && !graced(&tier), "past the chain");
+    }
+
+    /// A decode step cut in that demands an expert the reserve graced
+    /// while a chain may still resolve it takes the graced record back as
+    /// it was, mapped again from its own `from`: the chain's planned hits
+    /// on it still resolve, and the decode steps after the cut-in resolve
+    /// it too. Landing it anew would map it from the cut-in's park on and
+    /// cut those hits off.
+    #[test]
+    fn a_cut_ins_demand_of_a_graced_expert_keeps_the_chains_planned_hits() {
+        let steps = Arc::new(Steps::new(crate::planning::FlightDepth::SERIAL, 4, crate::experts::exchange::Pulse::new()));
+        let decode = cut_in(&steps, 2);
+        let graced = (3, 1);
+        let (mut tier, maps) = chain_tier(&steps, 6, &[(2, 1), graced]);
+        let record = tier.kept_record(graced).expect("kept");
+        assert!((1..=2).all(|step| maps.resolve(graced, step) == Some(record)), "the chain plans its hits at layer 3 on it");
+        let ranked = [((2, 1), 9), (graced, 1)];
+        let rank = reads(&ranked);
+        assert!(steps.unbegun(|at| refill(&mut tier, 5, &rank, at)));
+        let park = parked_at(&steps, decode, 3);
+        let answered = if tier.located(graced) == Located::Lacked {
+            let Claim::Taken(grant) = tier.claim_demand(graced, Demand::Lacked, &rank, |_| false, &park) else { panic!("a record for the cut-in's demand") };
+            grant.map();
+            tier.landed(grant.record(), graced, Some(decode), Kept::Alone);
+            grant.record()
+        } else {
+            let Claim::Kept(kept) = tier.claim(graced, 0) else { panic!("its graced record holds it whole") };
+            tier.answer(kept, park.point);
+            kept
+        };
+        assert!((1..=2).all(|step| maps.resolve(graced, step) == Some(record)), "the chain's planned hits at layer 3 still resolve");
+        assert_eq!(maps.resolve(graced, decode + 1), Some(answered), "the decode steps after the cut-in resolve it");
     }
 
     /// A decode step cut in never waits on its own pool: with every record

@@ -852,12 +852,9 @@ fn the_store_a_prompt_leaves_misses_decode_far_less_than_an_index_ordered_one() 
     assert!(by_use * 2 < by_index, "the prompt's store misses {by_use}, the index-ordered one {by_index}");
 }
 
-/// A one-store directory as [`one_store`], its maps' steps begun through
-/// `begun` so a landing maps from the step after it, and the views a
-/// running group's steps resolve through.
-fn one_store_begun(records: u32, layers: usize, experts: u64, begun: Step) -> (Directory, Vec<crate::experts::map::MapView>) {
-    let steps = std::sync::Arc::new(steps());
-    steps.begin_through(begun);
+/// A one-store directory as [`one_store`] on `steps`, none begun yet, and
+/// the views its steps resolve through.
+fn one_store_on(steps: &std::sync::Arc<Steps>, records: u32, layers: usize, experts: u64) -> (Directory, Vec<crate::experts::map::MapView>) {
     let maps = (0..layers)
         .map(|_| std::sync::Arc::new(StampedMap::new(cpu_words(&[experts, magnitude_kernels::constants::MAP_WORDS], 0))))
         .collect::<Vec<_>>();
@@ -870,42 +867,55 @@ fn one_store_begun(records: u32, layers: usize, experts: u64, begun: Step) -> (D
     (directory, views)
 }
 
+/// Land `experts` of layer 0 into `directory` before any step begins:
+/// mapped from step 1, so every step resolves them. Each one's record.
+fn landed_before(directory: &mut Directory, experts: &[usize]) -> Vec<u32> {
+    experts
+        .iter()
+        .map(|&expert| {
+            let Claim::Taken(grant) = directory.claim_landing(0, expert, 0) else { panic!("a ready record for {expert}") };
+            grant.map();
+            directory.landed(0, HostRecord(grant.record()), expert, None);
+            grant.record()
+        })
+        .collect()
+}
+
 /// A running prompt group's planned hits keep their records: its step 500
 /// plans hits on the store's experts 0, 1 and 3, the group having read
 /// only 0; a seed of 2 displaces 1, the least ranked, and the reserve
-/// refills while the group still holds the lent records; a step begun
-/// after it reads whatever the store no longer keeps cold, which seeds it
-/// again in place of 3, which the group has not read either.
-/// Step 500's planned hits still resolve to records: the invariant a
-/// prompt round's rounds rest on (`Scratch::fix_rounds`), where a hit with
-/// neither a record nor a scratch slot would read a slot no round filled.
+/// refills while the group still holds the lent records, gracing 1's
+/// record, which still holds it, so a step begun after it that resolves 1
+/// absent seeds nothing anew. Step 500's planned hits still resolve to
+/// their records: the invariant a prompt group's rounds rest on
+/// (`Scratch::fix_rounds`), where a hit with neither a record nor a
+/// scratch slot would read a slot no round filled.
 #[test]
 fn a_running_groups_planned_hits_keep_their_records_through_its_seeds_and_refills() {
-    let (mut directory, views) = one_store_begun(6, 1, 16, 1000);
-    // Landed before the group: mapped for its steps.
-    for expert in [0, 1, 3] {
-        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0) else { panic!("a ready record for {expert}") };
-        grant.map(Some(0));
-        directory.landed(0, HostRecord(grant.record()), expert, None);
-    }
+    let steps = std::sync::Arc::new(steps());
+    let (mut directory, views) = one_store_on(&steps, 6, 1, 16);
+    landed_before(&mut directory, &[0, 1, 3]);
+    steps.begin_through(1000);
     let planned = [0, 1, 3].map(|expert| (expert, views[0].resolve(expert, 500).expect("a hit the group's step plans")));
     directory.read_pending(0, 0, 500, 3);
     directory.read_pending(0, 2, 500, 5);
     let seed = |directory: &mut Directory, expert: usize| {
-        for (expert, grant) in directory.seed_store(0, &[(expert, 1001)]) {
-            grant.map(None);
-            directory.landed(0, HostRecord(grant.record()), expert, None);
+        let seeds = directory.seed_store(0, &[(expert, 1001)]);
+        for (expert, grant) in &seeds {
+            grant.map();
+            directory.landed(0, HostRecord(grant.record()), *expert, None);
         }
+        seeds.len()
     };
-    seed(&mut directory, 2);
+    assert_eq!(seed(&mut directory, 2), 1, "2 seeds in place of 1");
     let at = Unbegun::at(1001);
     let victims = directory.refill_victims(2, false);
     directory.refill(victims, false, &at);
-    // Step 1001 reads cold what the store no longer keeps, and seeds it.
+    // Step 1001 reads cold what the store no longer maps for it.
     for expert in [0, 1, 3] {
         if views[0].resolve(expert, 1001).is_none() {
             directory.read_pending(0, expert, 1001, 1);
-            seed(&mut directory, expert);
+            assert_eq!(seed(&mut directory, expert), 0, "{expert} graced is never landed anew");
         }
     }
     for (expert, record) in planned {

@@ -595,8 +595,7 @@ impl Directory {
 
     /// Seed the one store with `layer`'s experts a prompt group read into
     /// its conveyor, `read` (each expert with the step that reads it): the
-    /// most ranked first, each it lacks and no graced record keeps
-    /// ([`HostRecords::graces`]) lands into a ready record
+    /// most ranked first, each it lacks lands into a ready record
     /// ([`Self::claim_landing`], leaving no reserve) in place of the least
     /// ranked expert the layer keeps, while the seed outranks it. That
     /// record is displaced: the reserve unmaps it before any other
@@ -613,7 +612,7 @@ impl Directory {
             let tier = &self.host[group];
             let seeds = read
                 .iter()
-                .filter(|&&(expert, _)| matches!(tier.located((layer, expert)), Located::Lacked) && !tier.graces((layer, expert)))
+                .filter(|&&(expert, _)| matches!(tier.located((layer, expert)), Located::Lacked))
                 .map(|&(expert, step)| {
                     let kept = match self.bank.held(layer, expert) {
                         Some(_) => Kept::Banked,
@@ -813,12 +812,6 @@ impl Directory {
     /// ([`HostRecords::owed`]): whether a refill may unmap anything.
     pub fn refill_short(&self, reserve: usize) -> bool {
         self.host.iter().any(|records| records.short_of(reserve, 0) || !records.owed().is_empty())
-    }
-
-    /// Whether a graced record keeps `layer`'s `expert`
-    /// ([`HostRecords::graces`]): no landing off a park takes it yet.
-    pub fn graces(&self, layer: usize, expert: usize) -> bool {
-        self.host(self.bank.group(layer)).graces((layer, expert))
     }
 
     /// Each group's records its reserve of `reserve` tier records unmaps

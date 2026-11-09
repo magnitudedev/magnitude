@@ -678,12 +678,11 @@ impl Prefetch {
     }
 
     /// Whether `staged` is a hint's candidate: an expert that lives only in
-    /// the file (the bank lacks it, its host tier holds none of it), nothing
-    /// lands (whatever lands it took its tier record, `Directory::lands`),
-    /// and no graced record keeps (`Directory::graces`).
+    /// the file: the bank lacks it, and its host tier keeps, graces and
+    /// lands none of it (`Directory::located`).
     fn candidate(core: &Core, staged: Staged) -> bool {
         let (layer, expert) = staged;
-        !(core.directory.lands(layer, expert) || core.directory.held(layer, expert).is_some() || core.directory.in_tier(layer, expert) || core.directory.graces(layer, expert))
+        core.directory.held(layer, expert).is_none() && core.directory.located(layer, expert) == crate::experts::host_records::Located::Lacked
     }
 
     /// Admit the hints `hinted` (each expert with the rank of the choice it
