@@ -34,7 +34,7 @@
 //! read this session ([`LiveDecode`]), at its decode's rows and context.
 //! Nothing it counts is stored.
 //!
-use super::cost::{BankLines, CpuLines, ExpertLines, HostLines, HostLinesError, LineError};
+use super::cost::{BankLines, CpuLines, ExpertLines, HostLines, HostLinesError};
 use super::estimate::ExpertPass;
 use super::executor_costs::ExecutorCosts;
 use super::miss_model::MissModel;
@@ -140,12 +140,10 @@ impl RecordStore<PointKey> for Reading<'_> {
     }
 }
 
-/// Why a streamed plan's layers cannot be priced.
+/// Why a streamed plan's layers have no prices: their host lines' or their
+/// passes' figures, which no measurement brings.
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamedError {
-    /// The executor's costs give no line over host storage's route.
-    UnreadLink,
-    Line(LineError),
     Host(HostLinesError),
     Costs(String),
     /// A landing's line from the convert's figure.
@@ -155,8 +153,6 @@ pub enum StreamedError {
 impl fmt::Display for StreamedError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnreadLink => write!(formatter, "the executor's costs read no host storage route"),
-            Self::Line(error) => error.fmt(formatter),
             Self::Host(error) => error.fmt(formatter),
             Self::Costs(error) => write!(formatter, "the streamed layers' passes: {error}"),
             Self::Landing(error) => write!(formatter, "a landing's line: {error}"),
@@ -270,25 +266,32 @@ pub struct StreamedLayers {
 
 impl StreamedLayers {
     /// `bank`'s layers on the executor `costs` price, a host tier's record
-    /// read at `figures`' memory line.
-    pub fn of_bank(bank: &ExpertBankPlan, costs: &ExecutorCosts, figures: &StreamedFigures) -> Result<Self, StreamedError> {
-        let pass = ExpertPass::of_bank(bank, costs.clone()).map_err(|error| StreamedError::Costs(error.to_string()))?;
-        let byte_seconds = bank.tier_reservation().and(figures.memory);
-        let host = HostLines::of_bank(bank, &BankLines::of_bank(bank).map_err(StreamedError::Host)?, byte_seconds).map_err(StreamedError::Host)?;
-        let lines = host
-            .iter()
-            .enumerate()
-            .map(|(layer, &host)| {
-                let gpu = pass.lines(layer).ok_or(StreamedError::UnreadLink)?.map_err(StreamedError::Line)?;
-                let cpu = match figures.site.filter(|_| bank.sited(layer)) {
-                    Some((form, lines)) => Some(form.lines_of(lines, host.record_bytes).map_err(|error| StreamedError::Costs(error.to_string()))?),
-                    None => None,
-                };
-                let file = landing(&host, figures.convert).map_err(StreamedError::Landing)?;
-                Ok(ExpertLines { host: HostLines { cpu, file, ..host }, gpu })
-            })
-            .collect::<Result<Vec<_>, StreamedError>>()?;
-        Ok(Self::new(bank.layers().iter().map(|layer| layer.experts).collect(), bank.selected(), lines.into()))
+    /// read at `figures`' memory line: pending while the costs have not read
+    /// host storage's routes, the link line's (`ExpertLines::priced`).
+    pub fn of_bank(bank: &ExpertBankPlan, costs: &ExecutorCosts, figures: &StreamedFigures) -> Priced<Self> {
+        let parts = || -> Result<(ExpertPass, Vec<HostLines>), StreamedError> {
+            let pass = ExpertPass::of_bank(bank, costs.clone()).map_err(|error| StreamedError::Costs(error.to_string()))?;
+            let byte_seconds = bank.tier_reservation().and(figures.memory);
+            let host = HostLines::of_bank(bank, &BankLines::of_bank(bank).map_err(StreamedError::Host)?, byte_seconds).map_err(StreamedError::Host)?;
+            let host = host
+                .iter()
+                .enumerate()
+                .map(|(layer, &host)| {
+                    let cpu = match figures.site.filter(|_| bank.sited(layer)) {
+                        Some((form, lines)) => Some(form.lines_of(lines, host.record_bytes).map_err(|error| StreamedError::Costs(error.to_string()))?),
+                        None => None,
+                    };
+                    let file = landing(&host, figures.convert).map_err(StreamedError::Landing)?;
+                    Ok(HostLines { cpu, file, ..host })
+                })
+                .collect::<Result<Vec<_>, StreamedError>>()?;
+            Ok((pass, host))
+        };
+        match parts() {
+            Ok((pass, host)) => ExpertLines::priced(&host, &pass)
+                .and_then(|lines| Priced::Measured(Self::new(bank.layers().iter().map(|layer| layer.experts).collect(), bank.selected(), lines))),
+            Err(error) => Priced::Unavailable(error.to_string()),
+        }
     }
 
     /// Layers of `experts` experts each, routing `choices` a row, each

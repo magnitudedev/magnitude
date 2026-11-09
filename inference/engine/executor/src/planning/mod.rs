@@ -13,7 +13,7 @@ pub(crate) use imports::{ImportBacking, ImportPlan};
 mod programs;
 mod prices;
 pub use prices::{PlanPrices, PlanSteps};
-pub(crate) use prices::{BankPrices, Prior};
+pub(crate) use prices::{BankPrices, Prior, measured};
 mod prompt_room;
 pub(crate) use prompt_room::{grouped, pass_ladder, pass_rows_curve, places_curve, routed_group_seconds, routed_prompt_seconds};
 mod resources;

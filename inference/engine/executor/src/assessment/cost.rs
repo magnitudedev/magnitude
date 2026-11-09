@@ -55,6 +55,7 @@
 //! reference body against [`ExpertLines::serve`].
 
 use super::estimate::ExpertPass;
+use super::priced::Priced;
 use super::streaming_costs::{FileLine, ReadLine, RecordLine};
 use crate::planning::ExpertBankPlan;
 use magnitude_kernels::constants;
@@ -518,36 +519,24 @@ impl ServedMisses {
     }
 }
 
-/// Why the lines of a load's layers could not be priced.
-#[derive(Clone, Debug, PartialEq)]
-pub enum PricingError {
-    /// The executor's costs have not read host storage's routes, whose rate
-    /// the link line is: nothing else stands in for it.
-    UnreadLink,
-    /// A GPU line past a policy word.
-    Line(LineError),
-}
-
-impl fmt::Display for PricingError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnreadLink => formatter.write_str("the executor's costs have not read host storage, the link line's"),
-            Self::Line(error) => write!(formatter, "a GPU line: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for PricingError {}
-
 impl ExpertLines {
     /// Each streamed layer's lines: the host's the load measured (`host`,
-    /// in decoder order) and the GPU's its kernels' costs price (`pass`),
-    /// once they read every line.
-    pub fn priced(host: &[HostLines], pass: &ExpertPass) -> Result<Arc<[Self]>, PricingError> {
-        host.iter()
+    /// in decoder order) and the GPU's its kernels' costs price (`pass`).
+    /// A host tier's link line is host storage's routes of the costs, which
+    /// nothing else stands in for: pending until the job reads them (a
+    /// standing request, `CostWalk::Whole`), and unavailable where a GPU
+    /// line is past a policy word.
+    pub fn priced(host: &[HostLines], pass: &ExpertPass) -> Priced<Arc<[Self]>> {
+        let lines = host
+            .iter()
             .enumerate()
-            .map(|(layer, &host)| Ok(Self { host, gpu: pass.lines(layer).ok_or(PricingError::UnreadLink)?.map_err(PricingError::Line)? }))
-            .collect()
+            .map(|(layer, &host)| pass.lines(layer).map(|gpu| gpu.map(|gpu| Self { host, gpu })))
+            .collect::<Option<Result<Arc<[Self]>, LineError>>>();
+        match lines {
+            None => Priced::Pending("the executor's costs have not read host storage, the link line's".into()),
+            Some(Ok(lines)) => Priced::Measured(lines),
+            Some(Err(error)) => Priced::Unavailable(format!("a GPU line: {error}")),
+        }
     }
 
     /// The reads a promotion must save to earn its copy: what its copy

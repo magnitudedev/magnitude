@@ -1153,7 +1153,7 @@ fn expert_measures(
     costs_outstanding: Option<magnitude_executor::assessment::CostWalk>,
 ) -> magnitude_executor::ExpertMeasures {
     use magnitude_executor::assessment::{
-        BankLines, CeilingError, ConvertCosts, ExpertLines, ExpertPass, HostLines, MemoryCosts, MemoryError, MoveCosts, MoveError, PricingError,
+        BankLines, CeilingError, ConvertCosts, ExpertLines, ExpertPass, HostLines, MemoryCosts, MemoryError, MoveCosts, MoveError,
         Priced, StorageCosts, StorageError, TierCopyCosts, TierCopyError,
     };
     let (topology, info) = (load.device.topology(), load.device.info());
@@ -1192,15 +1192,7 @@ fn expert_measures(
         Ok(bank_lines) => memory.derive(|byte_seconds| HostLines::of_bank(bank, &bank_lines, byte_seconds)),
         Err(reason) => Priced::Unavailable(reason),
     };
-    // A host tier's link line is host storage's routes of the costs, which
-    // the load requested: pending until the job reads them.
-    let lines = host.and_then(|host| {
-        pass.as_ref().and_then(|pass| match ExpertLines::priced(&host, pass) {
-            Ok(lines) => Priced::Measured(lines),
-            Err(PricingError::UnreadLink) => Priced::Pending(PricingError::UnreadLink.to_string()),
-            Err(error) => Priced::Unavailable(error.to_string()),
-        })
-    });
+    let lines = host.and_then(|host| pass.as_ref().and_then(|pass| ExpertLines::priced(&host, pass)));
     let moves = match MoveCosts::of_bank(topology, info, bank, &records) {
         Ok(moves) => Priced::Measured(moves),
         Err(error @ MoveError::Unrecorded { .. }) => Priced::Pending(error.to_string()),

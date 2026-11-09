@@ -683,11 +683,7 @@ impl ExecutionPlanDraft {
         let bank = whole.bank();
         let floor = bank.floor();
         let reserved = |slots| bank.resident_charge(slots).map_err(PlanError::ResourcePlanning);
-        let prices = match prices {
-            Priced::Measured(prices) => prices.of_bank(&whole, definition)?,
-            Priced::Pending(reason) => return Err(PlanError::Unpriced { pending: true, reason: reason.clone() }.into()),
-            Priced::Unavailable(reason) => return Err(PlanError::Unpriced { pending: false, reason: reason.clone() }.into()),
-        };
+        let prices = super::measured(prices.as_ref())?.of_bank(&whole, definition)?;
         let points = rising(floor, ceiling, &reserved)?;
         let ladder = super::pass_ladder(places);
         // The mandatory part: what the load holds whatever it releases.
@@ -2043,6 +2039,29 @@ mod tests {
         );
         assert!(uncapped.ceiling < uncapped.widest().get() && grown <= FAR_ROOM, "{found}");
         assert!(uncapped.pass > PassLaunches::FLOOR, "{found}");
+    }
+
+    /// A host tier's link line is host storage's routes of the executor's
+    /// costs, a standing request of the job: a bank on the recorded RTX
+    /// 3090 whose costs have not read them yet plans pending, waiting for
+    /// the job as the load does, and prices once they are read.
+    #[test]
+    fn a_bank_plans_pending_until_its_costs_read_host_storage() {
+        use crate::assessment::executor_costs::{Placement, RouteCosts};
+        use crate::assessment::synthetic::{costs, kind, plan_prices_on};
+        let (_, _, _, device) = rtx3090(64 << 30);
+        let (definition, draft, _) = far_larger(device);
+        let along_host = |activation| {
+            let mut costs = costs();
+            costs.placements.host = Placement::along(kind(1));
+            costs.routes.push(RouteCosts { route: kind(1), activation, formats: Vec::new() });
+            Priced::Measured(plan_prices_on(costs))
+        };
+        let unread = draft.clone().with_bank::<AssessmentMemoryCharge>(&definition, None, &along_host(None)).err();
+        assert!(matches!(unread, Some(PlanError::Unpriced { pending: true, .. })), "{unread:?}");
+        let read = draft.with_bank::<AssessmentMemoryCharge>(&definition, None, &along_host(Some(costs().first.activation)));
+        let loaded = read.unwrap_or_else(|error| panic!("a bank prices once its costs read host storage: {error}")).into_draft();
+        assert!(loaded.load().expert_bank().is_some());
     }
 
     /// Planned as a load is, uncapped on the machine's own room (the

@@ -53,7 +53,7 @@ pub use executor_costs::{
 pub use launches::{Declarations, Kernel, Launches, Words};
 pub use cost::{
     BankLines, CpuLines, CpuLinesError, StoredCpuSite, ExpertLines, Exposed, GpuLines, Hits, HostLines, HostLinesError, LineError, Miss, Nanoseconds, Pass,
-    PassLine, PricingError, RowCost, RowLine, Sample, ServedMisses, Site, SiteLines,
+    PassLine, RowCost, RowLine, Sample, ServedMisses, Site, SiteLines,
 };
 pub use priced::Priced;
 pub(crate) use streaming_costs::CpuForm;

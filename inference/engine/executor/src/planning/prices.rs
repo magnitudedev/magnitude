@@ -10,7 +10,7 @@
 //! workload prior's ([`WorkloadRates::prior`]).
 
 use super::{ExecutionPlanDraft, PassLaunches, ResourceLimits};
-use crate::assessment::{AssessmentError, ExecutorCosts, ExpertPass, FormSeconds, HeldSlots, StreamedFigures, StreamedLayers};
+use crate::assessment::{AssessmentError, ExecutorCosts, ExpertPass, FormSeconds, HeldSlots, Priced, StreamedFigures, StreamedLayers};
 use crate::error::PlanError;
 use crate::workload::WorkloadRates;
 use magnitude_family_contracts::ModelDefinition;
@@ -56,7 +56,7 @@ impl PlanPrices {
         let compute = step(1, prior.decode_depth)?;
         let rates = prior.rates(compute.resident, |rows, depth| step(rows, depth).map(|step| step.resident))?;
         Ok(BankPrices {
-            layers: StreamedLayers::of_bank(bank, &self.costs, &self.figures).map_err(|error| priced(error.to_string()))?,
+            layers: measured(StreamedLayers::of_bank(bank, &self.costs, &self.figures))?,
             pass: ExpertPass::of_bank(bank, self.costs.clone()).map_err(|error| priced(error.to_string()))?,
             routed: bank.layers().iter().map(|layer| (layer.experts, bank.selected())).collect(),
             read: self.figures.read,
@@ -69,6 +69,17 @@ impl PlanPrices {
             // longer prompts into more passes, each reading its misses again.
             prompt_rows: definition.decoder.context_limit,
         })
+    }
+}
+
+/// What a plan takes of an input it prices with: a pending input waits for
+/// the job, as the load does (`PlanError::Unpriced`, retried once the job
+/// stores its points); an unavailable one leaves the plan unpriced.
+pub(crate) fn measured<T>(input: Priced<T>) -> Result<T, PlanError> {
+    match input {
+        Priced::Measured(input) => Ok(input),
+        Priced::Pending(reason) => Err(PlanError::Unpriced { pending: true, reason }),
+        Priced::Unavailable(reason) => Err(PlanError::Unpriced { pending: false, reason }),
     }
 }
 

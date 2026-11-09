@@ -142,11 +142,17 @@ pub fn streamed_figures() -> super::StreamedFigures {
 /// form's what the banked plan's streamed form adds to its experts held
 /// whole on [`costs`] (`assessment::decode_step`).
 pub fn plan_prices() -> crate::PlanPrices {
+    plan_prices_on(costs())
+}
+
+/// [`plan_prices`] on the executor costs `costs`.
+pub fn plan_prices_on(costs: super::ExecutorCosts) -> crate::PlanPrices {
+    let steps = costs.clone();
     crate::PlanPrices::new(
-        costs(),
+        costs,
         streamed_figures(),
-        Box::new(|definition, banked| {
-            let forms = super::decode_step(definition, &banked.held_whole(definition)?, banked, costs())?;
+        Box::new(move |definition, banked| {
+            let forms = super::decode_step(definition, &banked.held_whole(definition)?, banked, steps.clone())?;
             Ok(Box::new(move |rows, depth| {
                 let forms = forms(rows, depth)?;
                 let resident = 10e-3 + f64::from(rows) * 100e-6 + f64::from(depth) * 10e-9;

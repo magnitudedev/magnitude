@@ -746,8 +746,9 @@ pub fn streamed_estimate(
     held: magnitude_executor::assessment::HeldSlots,
 ) -> Result<Performance, ModelAssessmentError> {
     let layers = match StreamedLayers::of_bank(bank, costs, figures) {
-        Ok(layers) => layers,
-        Err(reason) => return Ok(Performance::Unavailable { reason: format!("the streamed layers: {reason}") }),
+        Priced::Measured(layers) => layers,
+        Priced::Pending(_) => return Ok(Performance::Pending),
+        Priced::Unavailable(reason) => return Ok(Performance::Unavailable { reason: format!("the streamed layers: {reason}") }),
     };
     let pricing = decode_pricing(draft, costs);
     let mut estimates = Vec::new();
