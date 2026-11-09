@@ -3215,6 +3215,18 @@ impl NativeImplementation {
         bounds
     }
 
+    /// Whether the `where` condition can hold at some configuration of the
+    /// parameter domains with each static dimension within the inclusive
+    /// bounds `statics` supplies: false only where it is false throughout
+    /// ([`NativeCondition::may_hold`]).
+    pub fn may_admit(&self, statics: &impl Fn(&str) -> Option<(u64, u64)>) -> bool {
+        let Some(constraint) = &self.constraint else {
+            return true;
+        };
+        let bounds = self.parameter_bounds();
+        constraint.may_hold(statics, &|name| bounds.get(name).copied().flatten())
+    }
+
     /// Whether the `where` condition evaluates without failing at `statics`
     /// under every configuration of the parameter domains. A walk at such
     /// statics never fails: it visits exactly the configurations of the
