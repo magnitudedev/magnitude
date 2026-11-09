@@ -1045,19 +1045,49 @@ fn cuda_matrix_configurations(
         .collect()
 }
 
+/// The head groups Metal's decode declares at `form`'s query group: the
+/// smallest declared HEADS holding the whole group, and for the matrix form,
+/// where no form holds the whole group (its prepared queries, G * W * 2
+/// bytes, over 32768), each smaller one of at least 8 dividing it.
+fn metal_decode_heads(form: Form) -> (u64, Vec<u64>) {
+    let (g, w) = (form.g as u64, form.w() as u64);
+    let declared = [1u64, 2, 4, 8, 16, 32, 64, 128];
+    let whole = *declared.iter().find(|&&heads| heads >= g).unwrap();
+    let split = declared
+        .into_iter()
+        .filter(|&heads| heads >= 8 && heads < g && g % heads == 0 && g * w * 2 > 32768)
+        .collect();
+    (whole, split)
+}
+
+/// Whether Metal's vector decode form fits `form`'s query group at `simds`
+/// simdgroups and `slices` slices: its states, and the larger of its merge
+/// columns and its prepared queries, within the declaration's threadgroup
+/// bytes.
+fn metal_vector_fits(form: Form, simds: u64, slices: u64) -> bool {
+    let (g, w) = (form.g as u64, (2 * form.p + form.s) as u64);
+    simds * (g / slices) * 8 + (simds * w * 4).max(g * w * 2) <= 32768
+}
+
 /// Metal's grouped-query matrix decode configurations admissible at `form`,
-/// from (span, parts, simds, keys): a simdgroup's outputs cover at most 128
-/// columns of every 8-row block, teams of whole column slices, within the
-/// declaration's threadgroup bytes.
+/// from (span, parts, simds, keys), at each declared head group: a
+/// simdgroup's outputs cover at most 128 columns of every 8-row block of the
+/// group's rows, teams of whole column slices, within the declaration's
+/// threadgroup bytes.
 fn metal_matrix_configurations(
     form: Form,
     configs: &[(u64, u64, u64, u64)],
 ) -> Vec<Vec<(&'static str, u64)>> {
     let w = (2 * form.p + form.s) as u64;
+    let g = form.g as u64;
+    let (whole, split) = metal_decode_heads(form);
     let mut admitted: Vec<Vec<(&'static str, u64)>> = Vec::new();
     // One row and four rows per threadgroup (verification rows).
-    for tokens in [1u64, 4] {
-        let rows = (tokens * form.g as u64).div_ceil(8) * 8;
+    for (tokens, heads) in [1u64, 4]
+        .into_iter()
+        .flat_map(|tokens| std::iter::once(whole).chain(split.clone()).map(move |heads| (tokens, heads)))
+    {
+        let rows = (tokens * heads.min(g)).div_ceil(8) * 8;
         let cols = (rows / 8 * w / 128).max(1);
         let wc = w / cols;
         for &(span, parts, simds, keys) in configs {
@@ -1078,6 +1108,7 @@ fn metal_matrix_configurations(
                 ("MATRIX", 1),
                 ("KEYS", keys),
                 ("TOKENS", tokens),
+                ("HEADS", heads),
             ];
             if w % cols == 0
                 && wc % 32 == 0
@@ -1102,7 +1133,10 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
                 .into_iter()
                 .find(|s| form.g as u64 % s == 0)
                 .unwrap();
-            let mut configurations = vec![
+            // The vector form holds the whole group in one threadgroup.
+            let (whole, _) = metal_decode_heads(form);
+            // The vector form's configurations that fit the group.
+            let mut configurations: Vec<Vec<(&'static str, u64)>> = vec![
                 vec![
                     ("SPAN", 32),
                     ("PARTS", 16),
@@ -1111,6 +1145,7 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
                     ("MATRIX", 0),
                     ("KEYS", 16),
                     ("TOKENS", 1),
+                    ("HEADS", whole),
                 ],
                 vec![
                     ("SPAN", 64),
@@ -1120,8 +1155,15 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
                     ("MATRIX", 0),
                     ("KEYS", 16),
                     ("TOKENS", 1),
+                    ("HEADS", whole),
                 ],
-            ];
+            ]
+            .into_iter()
+            .filter(|config| {
+                let param = |name| config.iter().find(|(n, _)| *n == name).unwrap().1;
+                metal_vector_fits(form, param("SIMDS"), param("SLICES"))
+            })
+            .collect();
             configurations.extend(metal_matrix_configurations(
                 form,
                 &[(32, 16, 4, 16), (64, 8, 2, 8)],
@@ -1258,11 +1300,17 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
 }
 
 /// [`configurations`] that can hold `case`: an index-list source runs in
-/// Metal's fragment prefill form alone (its declaration refuses DIRECT).
+/// Metal's fragment prefill form alone (its declaration refuses DIRECT), and
+/// in Metal's matrix decode form at one row a threadgroup.
 fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&'static str, u64)>> {
+    let metal_decode = decode && device.backend() == BackendName::Metal;
     configurations(device, decode, case.form)
         .into_iter()
-        .filter(|config| case.picks == 0 || !config.contains(&("DIRECT", 1)))
+        .filter(|config| {
+            case.picks == 0
+                || !(config.contains(&("DIRECT", 1))
+                    || (metal_decode && !(config.contains(&("MATRIX", 1)) && config.contains(&("TOKENS", 1)))))
+        })
         .collect()
 }
 
@@ -2270,6 +2318,56 @@ const V41: Form = Form {
     ..SMALL_V41
 };
 
+/// Metal's matrix decode splits a query group into head groups only where
+/// no form holds the group whole: V4.1's G = 64 at W = 512 admits HEADS 8,
+/// and the group-16 layers that decoded whole before the split existed
+/// (Muse, Nemotron's Bolt draft, the G16 forms at W = 128 and 512) admit
+/// none, so their grid and tuning space stay one group a kv head.
+#[test]
+fn metal_decode_splits_only_groups_it_cannot_hold_whole() {
+    let entry =
+        attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() });
+    for device in devices()
+        .into_iter()
+        .filter(|device| device.backend() == BackendName::Metal)
+    {
+        for (name, form, split) in [
+            ("v41", V41, true),
+            ("muse", MUSE, false),
+            ("bolt draft", BOLT_DRAFT, false),
+            ("column sigmoid", COLUMN_SIGMOID, false),
+            ("wide g16", WIDE_G16, false),
+        ] {
+            // The matrix form at the tests' first configuration.
+            let matrix = [
+                ("SPAN", 32),
+                ("PARTS", 16),
+                ("SIMDS", 4),
+                ("SLICES", 1),
+                ("MATRIX", 1),
+                ("KEYS", 16),
+                ("TOKENS", 1),
+            ]
+            .into_iter()
+            .fold(
+                statics(&device, form, 0).with_static("KR", 0).with_static("KS", 0),
+                |s, (n, v)| s.with_param(n, v),
+            );
+            let valid = |heads| {
+                entry
+                    .specialization_valid(&device, &matrix.clone().with_param("HEADS", heads))
+                    .unwrap()
+            };
+            assert_eq!(valid(8), split, "{name}: HEADS 8");
+            assert_eq!(
+                metal_decode_heads(form).1.contains(&8),
+                split,
+                "{name}: the test's head groups"
+            );
+        }
+    }
+}
+
 impl Case {
     /// This case's rotary table as V4.1's window layers derive it: pair i at
     /// frequency θ^(-2i / 2P) on the position, amplitude 1.
@@ -2414,18 +2512,16 @@ fn v41_host_model_matches_reference() {
 }
 
 /// At V4.1's shapes the CPU and Metal natives equal the F32 reference: the
-/// decode entry on CPU, and the prefill entry at the decode rows on Metal,
-/// whose decode declaration does not hold G = 64 at W = 512 (the executor
-/// routes those classes through its prefill); prefill rows on both, and on
-/// CUDA, whose decode declaration refuses the forms as Vulkan's do.
+/// decode entry on both (Metal's matrix form in head groups of 8), prefill
+/// rows on both, and on CUDA, whose decode declaration refuses the forms as
+/// Vulkan's do.
 #[test]
 fn v41_natives_match_reference() {
     for (name, decode, case) in v41_cases() {
         let host = case.expected();
         let expected = (case.v41_reference(), host.1, host.2);
         if decode {
-            let refusals = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
-            check_natives_against(name, true, &case, &refusals, true, &expected);
+            check_natives_against(name, true, &case, DECODE_REFUSALS, true, &expected);
         }
         check_natives_against(name, false, &case, PREFILL_REFUSALS, true, &expected);
     }
@@ -2548,14 +2644,6 @@ fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
 
-/// Whether `backend` may refuse `case`'s form by declaration: Vulkan holds
-/// no stored-key values, nor CUDA's decode entry, and Metal's decode entry
-/// no head group of V4.1's width.
-fn may_refuse(backend: BackendName, decode: bool, case: &Case) -> bool {
-    new_form_refusals(decode).contains(&backend)
-        || (backend == BackendName::Metal && decode && case.form.g == 64)
-}
-
 /// Attention over the one key plane equals the same inputs over two planes
 /// whose values are the prepared keys, bit for bit, on every configuration
 /// of the CPU and Metal entries and CUDA's prefill entry: the result, and
@@ -2580,7 +2668,7 @@ fn stored_key_attention_equals_key_valued_planes() {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let stored = match run(&device, decode, &specialization(case.form), &case) {
                         Err(error) if error.contains("violates the native `where` condition") => {
-                            assert!(may_refuse(backend, decode, &case), "{label}: {error}");
+                            assert!(new_form_refusals(decode).contains(&backend), "{label}: {error}");
                             return;
                         }
                         Err(error) => panic!("{label}: {error}"),
@@ -2766,16 +2854,6 @@ fn small_two_source_cases() -> Vec<(&'static str, bool, Case)> {
     ]
 }
 
-/// The backends whose declarations refuse an index-list source or a key
-/// rounding: Vulkan everywhere, the CUDA and Metal decode entries too.
-fn two_source_refusals(decode: bool) -> &'static [BackendName] {
-    if decode {
-        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
-    } else {
-        PREFILL_REFUSALS
-    }
-}
-
 /// The portable bodies of the two-source form equal the host model, which
 /// reads each pick (none for -1) as key and value after the row's fresh
 /// span.
@@ -2799,23 +2877,23 @@ fn two_source_host_model_matches_reference() {
 
 /// The CPU and Metal natives of the two-source form equal the host model at
 /// the small shapes and the F32 reference at V4.1's: the decode entry on
-/// CPU, the prefill entry (decode rows too) on CPU and Metal; the other
-/// declarations refuse it.
+/// CPU and Metal (its matrix form), the prefill entry (decode rows too) on
+/// both; the other declarations refuse it.
 #[test]
 fn two_source_natives_match_reference() {
     for (name, decode, case) in small_two_source_cases() {
         if decode {
-            check_natives_against(name, true, &case, two_source_refusals(true), true, &case.expected());
+            check_natives_against(name, true, &case, new_form_refusals(true), true, &case.expected());
         }
-        check_natives_against(name, false, &case, two_source_refusals(false), true, &case.expected());
+        check_natives_against(name, false, &case, new_form_refusals(false), true, &case.expected());
     }
     for (name, decode, case) in two_source_cases() {
         let host = case.expected();
         let expected = (case.v41_reference(), host.1, host.2);
         if decode {
-            check_natives_against(name, true, &case, two_source_refusals(true), true, &expected);
+            check_natives_against(name, true, &case, new_form_refusals(true), true, &expected);
         }
-        check_natives_against(name, false, &case, two_source_refusals(false), true, &expected);
+        check_natives_against(name, false, &case, new_form_refusals(false), true, &expected);
     }
 }
 
@@ -2842,10 +2920,9 @@ fn two_source_without_picks_equals_one_source() {
             if !matches!(backend, BackendName::Cpu | BackendName::Metal) {
                 continue;
             }
-            // The decode rows through both entries; Metal's decode entry
-            // holds neither form at V4.1's group.
+            // The decode rows through both entries.
             let entries = if decode { vec![true, false] } else { vec![false] };
-            for decode in entries.into_iter().filter(|d| !(*d && backend == BackendName::Metal)) {
+            for decode in entries {
                 for config in case_configurations(&device, decode, &empty) {
                     let specialization = config
                         .iter()
@@ -2932,7 +3009,7 @@ fn key_rounding_matches_portable_body() {
         moved += case.unheld_keys().iter().zip(&keys).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
         for device in devices() {
             let backend = device.backend();
-            let refused = two_source_refusals(decode).contains(&backend);
+            let refused = new_form_refusals(decode).contains(&backend);
             for config in case_configurations(&device, decode, &case) {
                 let specialization = config
                     .iter()
@@ -3015,7 +3092,7 @@ fn v41_compressed_natives_round_and_attend() {
         for device in devices() {
             let backend = device.backend();
             for decode in if decode { vec![true, false] } else { vec![false] } {
-                let refused = two_source_refusals(decode).contains(&backend);
+                let refused = new_form_refusals(decode).contains(&backend);
                 for config in case_configurations(&device, decode, &case) {
                     let specialization = config
                         .iter()

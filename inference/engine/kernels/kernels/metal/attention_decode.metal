@@ -14,8 +14,10 @@
 // registers next to the queries and outputs).
 #define DECODE_BATCH (ATTENTION_E >= 16 ? 2 : 4)
 
-// L1: threadgroup (kv head, partition, row). With MATRIX, the grouped-query
-// matrix form (attention::decode_matrix). Otherwise: a row's visible keys,
+// L1: threadgroup (kv head and head group, partition, row). With MATRIX, the
+// grouped-query matrix form (attention::decode_matrix) over a head group of
+// min(HEADS, G) query heads, whose key sequence ends in the row's KS picks.
+// Otherwise (one head group, no picks): a row's visible keys,
 // in order (spans, then its fresh span), split into equal partitions of
 // attention::partition_span keys. The G query heads split into SLICES slices
 // of H = G / SLICES heads (so wide heads keep their queries and outputs in
@@ -25,8 +27,9 @@
 // into the query). The key groups' states merge in fixed order into one
 // partial per (row, query head, partition): the unnormalized output relative
 // to the partition maximum, and (maximum, denominator). Partition 0 of a
-// layer with fresh rows also appends the row's key and value at its
-// destination.
+// layer with fresh rows (its first head group's) also appends the row's key,
+// rounded by the trained key rounding (KR = 1), and value at its
+// destination; a fresh key is attended as it is appended.
 kernel void attention_decode_partial(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *key [[buffer(SEISMIC_BUFFER_KEY)]],
@@ -43,6 +46,8 @@ kernel void attention_decode_partial(
     device const int *destinations [[buffer(SEISMIC_BUFFER_DESTINATIONS)]],
     device const ulong *history_key [[buffer(SEISMIC_BUFFER_HISTORY_KEY)]],
     device const ulong *history_value [[buffer(SEISMIC_BUFFER_HISTORY_VALUE)]],
+    device const int *selected_rows [[buffer(SEISMIC_BUFFER_SELECTED_ROWS)]],
+    device const ulong *selected [[buffer(SEISMIC_BUFFER_SELECTED)]],
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -63,17 +68,27 @@ kernel void attention_decode_partial(
     // Rows per threadgroup: TOKENS decode rows packed into the matrix form's
     // rows; one row otherwise.
     constexpr uint TOKENS = SEISMIC_TUNE_TOKENS;
-    const uint kv_head = group.x;
+    // The kv head's head groups of GROUP query heads (one unless the matrix
+    // form splits G).
+    constexpr uint HEADS = SEISMIC_TUNE_HEADS;
+    constexpr uint GROUP = HEADS < G ? HEADS : G;
+    constexpr uint HEAD_GROUPS = G / GROUP;
+    const uint kv_head = group.x / HEAD_GROUPS;
+    const uint head_base = group.x % HEAD_GROUPS * GROUP;
     const uint partition = group.y;
     const ulong row0 = group.z * TOKENS;
     const ulong row = row0;
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
     device const int *row_coordinates = coordinates + row * 4;
+    const rounding::Rounding key_rounding = attention::key_rounding(SEISMIC_DIM_KR != 0,
+        uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT), uint(SEISMIC_PARAM_KEY_SCALE),
+        uint(SEISMIC_PARAM_KEY_AMAX_FLOOR));
 
-    // Partition 0 appends the rows' keys and values, a simdgroup per (row,
-    // key or value); stored-key values are the key plane.
-    if (ATTENTION_FRESH && partition == 0) {
+    // Partition 0 of the first head group appends the rows' keys and values,
+    // a simdgroup per (row, key or value); stored-key values are the key
+    // plane.
+    if (ATTENTION_FRESH && partition == 0 && head_base == 0) {
         for (uint item = simd; item < 2 * TOKENS; item += SIMDS) {
             const ulong appended = row0 + item / 2;
             if (appended >= SEISMIC_DIM_M)
@@ -84,8 +99,8 @@ kernel void attention_decode_partial(
             const ulong source = (appended * KV + kv_head) * W;
             float x[E];
             if (item % 2 == 0)
-                attention::head_rotary<ATTENTION_NORM>(key + source, key_norm, coordinates + appended * 4,
-                    rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, x);
+                attention::rounded_head_rotary<ATTENTION_NORM>(key + source, key_norm, coordinates + appended * 4,
+                    rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, key_rounding, lane, x);
             else
                 attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, x);
             attention::append(slab::row<attention::Scalar>(item % 2 == 0 ? history_key : history_value,
@@ -96,12 +111,16 @@ kernel void attention_decode_partial(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
 #if SEISMIC_TUNE_MATRIX
-    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS>(attention::dense_history{history_key,
-        attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)}, query, key, value, query_norm, key_norm, value_norm, rotary_components,
-        rotary_frequencies, rotary_amplitudes, coordinates, visible, fresh, partials, statistics,
-        reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon, scale * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN,
-        kv_head, partition, group.z, thread_index, simd, lane);
+    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS, 0, HEADS, SEISMIC_DIM_KS>(
+        attention::dense_history{history_key, attention::values_plane(history_key, history_value),
+            ulong(SEISMIC_PARAM_SLAB_ROWS)},
+        query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
+        rotary_amplitudes, coordinates, visible, fresh, partials, statistics,
+        reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon, scale * ATTENTION_LOG2E,
+        SEISMIC_TUNE_SPAN, kv_head, partition, group.z, thread_index, simd, lane, head_base,
+        attention::decode_picks{selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS)}, key_rounding);
 #else
+    static_assert(GROUP == G && SEISMIC_DIM_KS == 0, "the vector form holds a whole query group and no picks");
     const uint total = attention::form_total(visible, fresh, row, R, lane);
     const uint span_keys = attention::partition_span(total, SEISMIC_TUNE_SPAN, PARTS);
     const uint partition_lo = partition * span_keys;
@@ -199,8 +218,8 @@ kernel void attention_decode_partial(
             float k[1][E];
             float v[1][E];
             const ulong at = (token * KV + kv_head) * W;
-            attention::head_rotary<ATTENTION_NORM>(key + at, key_norm, coordinates + token * 4,
-                rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, k[0]);
+            attention::rounded_head_rotary<ATTENTION_NORM>(key + at, key_norm, coordinates + token * 4,
+                rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, key_rounding, lane, k[0]);
             if (!ATTENTION_STORED_KEY)
                 attention::head_norm<ATTENTION_VALUE_NORM>(value + at, value_norm, epsilon, lane, v[0]);
             ATTENTION_UNROLL
@@ -220,8 +239,8 @@ kernel void attention_decode_partial(
 }
 
 // L2: threadgroup (query head, row), one thread per column: the fixed-order
-// merge of the row's partitions (with the head's sink when SK = 1) and the
-// output gate.
+// merge of the row's partitions (of its visible keys and KS picks; with the
+// head's sink when SK = 1) and the output gate.
 kernel void attention_decode_merge(
     device const attention::Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
     device const attention::Scalar *gate [[buffer(SEISMIC_BUFFER_GATE)]],
@@ -237,7 +256,7 @@ kernel void attention_decode_merge(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     threadgroup float weights[2 * SEISMIC_TUNE_PARTS];
-    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS>(query, gate, visible, fresh, result,
+    attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS, SEISMIC_DIM_KS>(query, gate, visible, fresh, result,
         partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y, group.z * 32 + lane, lane,
         SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
 }

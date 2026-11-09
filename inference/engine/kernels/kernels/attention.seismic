@@ -893,19 +893,36 @@ fn attention_decode[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, SK, RA, RT, RO, VK
 # holds the G / SLICES query heads of its slice, W / 32 columns per lane.
 # (CUDA: equal partitions.) MATRIX selects the grouped-query matrix form, as
 # `attention_decode_k8v4`'s: keys enter the score product in the activation
-# dtype, values the output product as F16.
+# dtype, values the output product as F16. Its kv head's G query heads split
+# into head groups of min(HEADS, G), each its own threadgroup, so the query
+# tile and the score exchange follow the group, not G: HEADS of at least G
+# is one group (only the smallest such value is admitted, and is the
+# default), and a smaller HEADS of at least 8 that divides G splits it into
+# groups that fill whole 8-row blocks. A split is admitted only where no
+# form can hold the group whole: its prepared queries alone, G * W * 2
+# bytes, exceed the 32768 threadgroup bytes, a lower bound of both forms'
+# footprints (V4.1's G = 64 at W = 512: 65536). Every group either form
+# holds whole thus keeps exactly its one-group grid and tuning space, where
+# a split has no measurement that it wins (G = 16: 4096 at W = 128, Muse and
+# Nemotron; 16384 at W = 512). The vector form holds one group. A
+# row's KS index-list picks (the matrix form, one row a threadgroup) follow
+# its visible keys in the sequence the partitions split; each partition's
+# picks are read from `selected` in windows of KEYS, those naming a row
+# gathered into one tile, so picks add no launch. Fresh keys are rounded
+# (KR = 1) as they are appended and attended.
 native attention_decode for metal from "metal/attention_decode.metal":
     static (KV, G, P, S, I, U, F, NQ, N, NV, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic SPAN in [32, 64, 128, 256] default 32, arithmetic PARTS in [16, 8, 32, 64, 128, 256, 512] default 16,
         arithmetic SIMDS in [4, 8, 2, 16] default 4, arithmetic SLICES in [1, 2, 4, 8] default 1,
-        arithmetic form MATRIX in [0, 1] default 0, arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1)
-    where KR == 0 and KS == 0 and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) == 0 and ceil_div(TOKENS * G, 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * G, 8) * 8 * KEYS * 4, ceil_div(TOKENS * G, 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * ceil_div(TOKENS * G, 8) * 8 * 8 <= 32768))
+        arithmetic form MATRIX in [0, 1] default 0, arithmetic KEYS in [16, 8, 32] default 16, arithmetic TOKENS in [1, 2, 4, 8] default 1,
+        arithmetic HEADS in [1, 2, 4, 8, 16, 32, 64, 128] default least where HEADS >= G)
+    where KR <= 1 and (KS == 0 or (MATRIX == 1 and TOKENS == 1)) and ((HEADS >= G and HEADS / 2 < G) or (MATRIX == 1 and HEADS >= 8 and HEADS < G and G % HEADS == 0 and G * (2 * P + S) * 2 > 32768)) and NQ <= 1 and RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and G % SLICES == 0 and SIMDS % SLICES == 0 and (MATRIX == 1 or (KEYS == 16 and TOKENS == 1)) and (MATRIX == 1 or SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2) <= 32768) and (MATRIX == 0 or SLICES == 1) and (MATRIX == 0 or ((2 * P + S) % max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) == 0 and ((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) % 32 == 0 and SIMDS % max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) == 0 and ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * KEYS * 4, ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * 8 <= 32768))
     scratch partials bytes (M * KV * G * PARTS * (2 * P + S) * 4)
     scratch statistics bytes (M * KV * G * PARTS * 8)
     launch attention_decode_partial:
-        threadgroups (KV, PARTS, ceil_div(M, TOKENS))
+        threadgroups (KV * ceil_div(G, HEADS), PARTS, ceil_div(M, TOKENS))
         threads_per_threadgroup (SIMDS * 32, 1, 1)
-        shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2)) + MATRIX * (ceil_div(TOKENS * G, 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * G, 8) * 8 * KEYS * 4, ceil_div(TOKENS * G, 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * G, 8) * (2 * P + S) / 128) * ceil_div(TOKENS * G, 8) * 8 * 8))
+        shared_bytes ((1 - MATRIX) * (SIMDS * (G / SLICES) * 8 + max(SIMDS * (2 * P + S) * 4, G * (2 * P + S) * 2)) + MATRIX * (ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 2 + max(SIMDS * KEYS * (((2 * P + S) / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128)) + 8) * 2 + min(1, max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) - 1) * 2 * SIMDS * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * KEYS * 4, ceil_div(TOKENS * min(HEADS, G), 8) * 8 * (2 * P + S) * 4) + SIMDS / max(1, ceil_div(TOKENS * min(HEADS, G), 8) * (2 * P + S) / 128) * ceil_div(TOKENS * min(HEADS, G), 8) * 8 * 8))
     launch attention_decode_merge:
         threadgroups (KV * G, M, (2 * P + S) / 32)
         threads_per_threadgroup (32, 1, 1)

@@ -158,12 +158,10 @@ impl<'a, G: GraphDraft + 'a> Clone for DenseDecodeEntries<'a, G> {
 
 /// Whether a dense history's decode row classes attend with the decode
 /// entry on `backend`. Where its declaration holds no form of the binding's
-/// shape (Metal's, whose G = 64 query heads at W = 512 exceed threadgroup
-/// memory in every form; and its rounded keys or index-list picks, which
-/// Metal's decode declares only at `KR = KS = 0`), the prefill entry, tuned
-/// on those classes, attends them. A selected read's decode rows read the
-/// indexer's segments, which only the decode entry takes, so its refusal
-/// stands.
+/// shape (CUDA's and Vulkan's, which declare neither rounded keys nor
+/// index-list picks: only `KR = KS = 0`), the prefill entry, tuned on those
+/// classes, attends them. A selected read's decode rows read the indexer's
+/// segments, which only the decode entry takes, so its refusal stands.
 pub(crate) fn dense_decodes(
     backend: seismic::BackendName,
     binding: AttentionBinding,
@@ -2455,12 +2453,12 @@ mod tests {
     }
 
     /// DeepSeek V4.1's window attention (64 query heads over one 512-wide
-    /// head, adjacent trailing pairs turned back) decodes through Metal's
-    /// prefill entry, whose decode entry holds no form of it, and through
-    /// the decode entry on CPU; a Qwen-shaped layer keeps Metal's decode
-    /// entry.
+    /// head, adjacent trailing pairs turned back) decodes through the decode
+    /// entry on Metal (its matrix form, in head groups of 8) and on CPU, as
+    /// a Qwen-shaped layer does on Metal; CUDA's and Vulkan's entries each
+    /// hold the new forms in both entries or neither.
     #[test]
-    fn decode_classes_attend_with_the_prefill_where_the_decode_entry_holds_none() {
+    fn decode_classes_attend_with_the_decode_entry_where_it_holds_them() {
         use seismic::{BackendName, DType};
         let binding = |shape| AttentionBinding {
             shape,
@@ -2520,7 +2518,7 @@ mod tests {
             ..v41
         };
         let decodes = |backend, shape| dense_decodes(backend, binding(shape)).unwrap();
-        assert!(!decodes(BackendName::Metal, v41));
+        assert!(decodes(BackendName::Metal, v41));
         assert!(decodes(BackendName::Cpu, v41));
         assert!(decodes(BackendName::Metal, qwen));
         // CUDA's and Vulkan's mix entries declare none of the new forms, each

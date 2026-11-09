@@ -3803,6 +3803,137 @@ fn dense_output_matches_its_portable_body_and_the_host_reference_on(device: &Dev
     }
 }
 
+/// DeepSeek V4.1's gated pooled projection at its geometry (D 5120; 512
+/// pooled and 512 gate rows of BF16, published in F32, so no rounding to A
+/// hides a different summation order) on Metal. Under the decode mapping and
+/// under BATCH_FROM 9, every GEMV class (M below BATCH_FROM) reproduces each
+/// row's M = 1 result bit for bit, as plain decode computes it. The batched
+/// class (BATCH_FROM to 16 rows, where a prefill-shaped verify's 8 rows fall
+/// by default) sums in its own order, still in F32 over the same rounded
+/// operands, and is not required to: the test prints how many of its results
+/// differ from M = 1, and the relative gaps of those above the median
+/// magnitude, which cancellation does not inflate.
+#[test]
+fn metal_gated_pooled_projection_reproduces_single_rows_below_batch_from() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let (d, segment) = (5120usize, 512usize);
+    let projection = weight(Repr::Bf16, segment, d, 81, 1.0);
+    let gate = weight(Repr::Bf16, segment, d, 82, 1.0);
+    let norm = norm_values(d, 83);
+    let rows_max = 8usize;
+    let mut rng = Rng::new(84);
+    let hidden = (0..rows_max * d)
+        .map(|_| rng.symmetric() * 3.0)
+        .collect::<Vec<_>>();
+    let element = Repr::Bf16.resident(&device);
+    let empty = Tensor::from_host(&device, element, &[0, d as u64], &[]).unwrap();
+    // The pooled and gate results of the rows `input`, `[rows, 512]` each.
+    let project = |input: &[f32], mapping: Mapping| -> [Vec<f32>; 2] {
+        let rows = input.len() / d;
+        let out = attention_project::native_for_device_with(
+            &device,
+            attention_project::Elements {
+                NW: Element::bf16(),
+                QW: element,
+                GW: element,
+                KW: element,
+                VW: element,
+                A: act.element(),
+                Y: Element::f32(),
+            },
+            &attention_project_specialization_on(
+                &device,
+                &[("D", d), ("Q", segment), ("GR", segment), ("K", 0), ("V", 0)],
+                mapping,
+            ),
+        )
+        .unwrap()
+        .call(attention_project::Args {
+            hidden: &f32_tensor(&device, &[rows, d], input),
+            input_norm: &bf16_norm(&device, &norm),
+            query_weight: &projection.tensor(&device),
+            gate_weight: &gate.tensor(&device),
+            key_weight: &empty,
+            value_weight: &empty,
+            epsilon: 1e-6,
+            project_mode: 0,
+            query_scale: &no_scale(&device),
+            gate_scale: &no_scale(&device),
+            key_scale: &no_scale(&device),
+            value_scale: &no_scale(&device),
+            query_bound: &absent_bound(&device),
+            gate_bound: &absent_bound(&device),
+            key_bound: &absent_bound(&device),
+            value_bound: &absent_bound(&device),
+        })
+        .unwrap();
+        [read_f32(&out.r0), read_f32(&out.r1)]
+    };
+    let decode = gemm_mapping(64, 64, 1);
+    let widest = Mapping {
+        batch_from: 9,
+        ..decode
+    };
+    // M = 1 runs the one-row GEMV, whatever BATCH_FROM.
+    let single = (0..rows_max)
+        .map(|row| project(&hidden[row * d..(row + 1) * d], decode))
+        .collect::<Vec<_>>();
+    for mapping in [decode, widest] {
+        for rows in 2..=rows_max {
+            let out = project(&hidden[..rows * d], mapping);
+            for (name, index) in [("pooled", 0), ("gate", 1)] {
+                // Each result's magnitude alone and its gap from M = 1, relative.
+                let mut gaps = (0..rows)
+                    .flat_map(|row| {
+                        let ours = &out[index][row * segment..(row + 1) * segment];
+                        ours.iter().zip(&single[row][index]).map(|(value, alone)| {
+                            let gap = match value.to_bits() == alone.to_bits() {
+                                true => 0.0,
+                                false => (value - alone).abs() / alone.abs().max(f32::MIN_POSITIVE),
+                            };
+                            (alone.abs(), gap)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let differing = gaps.iter().filter(|(_, gap)| *gap != 0.0).count();
+                if (rows as u64) < mapping.batch_from {
+                    assert_eq!(
+                        differing, 0,
+                        "{name} M {rows} BATCH_FROM {} differs from M = 1 in {differing} results",
+                        mapping.batch_from
+                    );
+                    continue;
+                }
+                let worst = gaps.iter().map(|(_, gap)| *gap).fold(0.0, f32::max);
+                // The relative gaps of the results above the median magnitude,
+                // where cancellation does not inflate them.
+                gaps.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let mut upper = gaps[gaps.len() / 2..].iter().map(|(_, gap)| *gap).collect::<Vec<_>>();
+                upper.sort_by(f32::total_cmp);
+                let quantile = |q: f64| upper[((upper.len() - 1) as f64 * q) as usize];
+                eprintln!(
+                    "batched {name} M {rows} BATCH_FROM {}: {differing} of {} results differ from M = 1, \
+                     by up to {worst:.3e} relative; above the median magnitude {:.3e}, relative gaps \
+                     p50 {:.3e} p90 {:.3e} p99 {:.3e} max {:.3e}",
+                    mapping.batch_from,
+                    rows * segment,
+                    gaps[gaps.len() / 2].0,
+                    quantile(0.5),
+                    quantile(0.9),
+                    quantile(0.99),
+                    quantile(1.0),
+                );
+            }
+        }
+    }
+}
+
 /// The decode and verify row classes at the pinned Qwen3.5 4B geometry
 /// (H 2560, F 9216) with the decode mapping: every M from 1 to 16 and the
 /// first GEMM class 17, against the host reference. The GEMV class (M below
