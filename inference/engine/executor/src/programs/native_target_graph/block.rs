@@ -11,8 +11,7 @@ use crate::{
     operators::{
         block,
         block::{
-            BlockControlPorts, BlockStatePorts, FeedForwardGraph, MixerEntries, NGramParts,
-            PerLayerParts,
+            BlockState, FeedForwardGraph, MixerEntries, NGramParts, PerLayerParts,
         },
         ngram::graph::{CheckedNGramEntries, NGramStepPorts},
         paired_block,
@@ -87,9 +86,9 @@ pub(crate) struct PreparedTargetBlockGraph<P = Option<SplitPorts>> {
     /// The span marks at its ends where it is a whole block whose routed
     /// layer streams (`BlockGraphParts::span`).
     pub span: Option<(usize, usize)>,
-    /// The mixer's state and control ports, of a graph that mixes (a
-    /// block's back does not).
-    pub mixer: Option<(BlockStatePorts, BlockControlPorts)>,
+    /// The block's state and control ports: its mixer's history or bank,
+    /// and its n-gram input's bank (a block's back keeps only the latter).
+    pub state: BlockState,
     /// The draft taps of a tapped block that this graph writes.
     pub taps: Option<TapPorts>,
     /// The per-layer rows port of a block with a per-layer input sublayer.
@@ -200,14 +199,12 @@ impl SealedBlockGraph {
         for constant in &mut constants {
             family.share(constant);
         }
-        let mut mixer = parts.mixer;
+        let mut state = parts.state;
         weights.shrink_to_fit();
         banks.shrink_to_fit();
         parks.shrink_to_fit();
         constants.shrink_to_fit();
-        if let Some((state, _)) = &mut mixer {
-            state.shrink_to_fit();
-        }
+        state.shrink_to_fit();
         // The graph, of the ports its stage formed.
         macro_rules! graph {
             ($ports:expr) => {
@@ -220,7 +217,7 @@ impl SealedBlockGraph {
                     parks,
                     constants,
                     span: parts.span,
-                    mixer,
+                    state,
                     taps: parts.taps,
                     per_layer: parts.per_layer,
                     ngram: parts.ngram,
@@ -248,7 +245,7 @@ impl<P> PreparedTargetBlockGraph<P> {
             self.banks.capacity(),
             self.parks.capacity(),
             self.constants.capacity(),
-            self.mixer.as_ref().map_or(0, |(state, _)| state.ports().capacity()),
+            self.state.capacities(),
         )
     }
 }
@@ -349,7 +346,7 @@ pub(super) fn stage_input(geometry: &Decoder, block_index: usize, stage: Stage) 
 struct BlockGraphParts {
     residual: Option<WorkflowTensor>,
     output: ResidualCarry<WorkflowTensor>,
-    mixer: Option<(BlockStatePorts, BlockControlPorts)>,
+    state: BlockState,
     taps: Option<TapPorts>,
     /// The per-layer rows a block with a per-layer input sublayer reads.
     per_layer: Option<NativePort>,
@@ -366,8 +363,11 @@ struct BlockGraphParts {
 
 impl BlockGraphParts {
     /// The state ports the graph holds.
-    fn state_ports(&self) -> usize {
-        self.mixer.as_ref().map_or(0, |(state, _)| state.ports().len())
+    fn state_ports(&self) -> [usize; 2] {
+        [
+            self.state.history.as_ref().map_or(0, |history| history.planes.len()),
+            self.state.bank.as_ref().map_or(0, |bank| bank.components.len()),
+        ]
     }
 }
 
@@ -445,7 +445,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
             return Ok(BlockGraphParts {
                 residual: None,
                 output: ResidualCarry::rows(output),
-                mixer: None,
+                state: BlockState::default(),
                 taps: None,
                 per_layer: None,
                 ngram: None,
@@ -480,8 +480,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     let hidden = hidden.ok_or("a block graph of no input rows")?;
     let hidden = ResidualCarry { rows: hidden.rows.clone(), pre: hidden.pre.cloned() };
     // A back reads the carry its front's mixer left.
-    let (mixed, mut mixer) = match stage {
-        RunStage::Combine => (hidden, None),
+    let (mixed, mut state_ports) = match stage {
+        RunStage::Combine => (hidden, BlockState::default()),
         RunStage::Whole | RunStage::Resident | RunStage::Front => {
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.entry) {
                 taps.ports.entry = Some(taps.tap(graph, &hidden.rows)?);
@@ -493,7 +493,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
                 }
                 _ => hidden,
             };
-            let (mixed, state_ports, controls) =
+            let (mixed, state_ports) =
                 sublayers.mixer(graph, mixer_entries, streams_entries, &hidden, weights, constants)?;
             if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.middle) {
                 if paired.feed_forward.is_none() {
@@ -501,7 +501,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
                 }
                 taps.ports.middle = Some(taps.tap(graph, &mixed.rows)?);
             }
-            (mixed, Some((state_ports, controls)))
+            (mixed, state_ports)
         }
     };
     let (output, sequence) = sublayers.feed_forward(
@@ -519,7 +519,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         return Ok(BlockGraphParts {
             residual: None,
             output,
-            mixer,
+            state: state_ports,
             taps: taps.map(|taps| taps.ports),
             per_layer: None,
             ngram: None,
@@ -531,31 +531,10 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     let ResidualCarry { rows: output, pre } = output;
     let (output, per_layer) =
         sublayers.per_layer(graph, per_layer_entries, output, weights, constants)?;
-    // The n-gram input's windows follow the mixer's bank components; a
-    // back's are its own state, over the slot tables it takes as inputs.
-    let controls = mixer.as_ref().map(|(_, controls)| controls);
+    // The n-gram input's windows follow the mixer's bank components, or are
+    // the block's bank, over the slot tables it takes as inputs.
     let (output, ngram) =
-        sublayers.ngram(graph, ngram_entries, controls, output, weights, constants)?;
-    let ngram = match ngram {
-        None => None,
-        Some(ports) => {
-            let windows = [ports.window, ports.token_window];
-            match (&mut mixer, ports.controls) {
-                (Some((BlockStatePorts::Recurrent(bank), _)), None) => bank.extend(windows),
-                (None, Some(controls)) => {
-                    mixer = Some((
-                        BlockStatePorts::Recurrent(windows.into()),
-                        BlockControlPorts::Recurrent(controls),
-                    ));
-                }
-                (Some((BlockStatePorts::Attention(..), _)), _) => {
-                    return Err("an n-gram input in an attention block".into());
-                }
-                _ => return Err("an n-gram input's slot tables disagree with its block".into()),
-            }
-            Some(ports.step)
-        }
-    };
+        sublayers.ngram(graph, ngram_entries, &mut state_ports, output, weights, constants)?;
     let residual = residual.then(|| output.clone());
     // The decoder's last block ends with its exit: a low-rank exit site,
     // whose partials the readout sums, or the collapse of Sinkhorn streams
@@ -600,7 +579,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     Ok(BlockGraphParts {
         residual,
         output,
-        mixer,
+        state: state_ports,
         taps: taps.map(|taps| taps.ports),
         per_layer,
         ngram,

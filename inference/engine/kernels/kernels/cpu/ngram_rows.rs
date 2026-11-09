@@ -56,22 +56,34 @@ fn ngram_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], 
         return;
     };
     let local = item - slot.lo;
-    let reset = cx.arg_reset();
-    let reset_stored = reset.wrapping_add(1) as u32;
+    let map = cx.arg_map();
+    let mapped = cx.dim_v() > 0;
+    let hashed = |token: u32| match mapped {
+        true => u64::from(map.get([token as usize])),
+        false => u64::from(token),
+    };
+    // The boundary as the window stores it; 0 (no token) when there is none,
+    // which cuts already.
+    let boundary = match cx.dim_nb() {
+        0 => 0,
+        _ => cx.arg_boundary().get([0]).wrapping_add(1) as u32,
+    };
+    let fill = i64::from(cx.arg_fill()) as u64;
     let status = tokens.get([item, 1]);
-    let mut mixed = (i64::from(tokens.get([item, 0])) as u64).wrapping_mul(multipliers.get([0]));
+    let token = tokens.get([item, 0]);
+    let first = match mapped {
+        true => u64::from(map.get([token as usize])),
+        false => i64::from(token) as u64,
+    };
+    let mut mixed = first.wrapping_mul(multipliers.get([0]));
     let mut cut = false;
     for distance in 1..=context {
         let value = match local.checked_sub(distance) {
             Some(_) => stored(item - distance),
             None => window.row([slot.source, slot.taped + context + local - distance, 0])[0],
         };
-        cut |= value == 0 || value == reset_stored;
-        let token = if cut {
-            i64::from(reset) as u64
-        } else {
-            u64::from(value - 1)
-        };
+        cut |= value == 0 || value == boundary;
+        let token = if cut { fill } else { hashed(value - 1) };
         mixed ^= token.wrapping_mul(multipliers.get([distance]));
         for p in 0..heads_per_order {
             let head = (distance - 1) * heads_per_order + p;

@@ -129,7 +129,7 @@ pub use planning::{
     ChargedDraft, EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, DraftedCharge, HeldBound, HeldCharge, HeldCharges, Placed, Unplaced, WeightBound,
     FeedForwardProgramSlot, FlightDepth, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     HostTablePlan, ImportProgramSlot, LowRankQueryBinding, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,
-    MixerProgramSlot, ModelLoadPlan, NGramBinding, NoBank, PlanRoom, SettleRoom, StableRoom, WholeFit, NativeGraphCharge, ParallelBinding,
+    MixerProgramSlot, ModelLoadPlan, NGramBinding, NGramGateForm, NGramTaps, NoBank, PlanRoom, SettleRoom, StableRoom, WholeFit, NativeGraphCharge, ParallelBinding,
     PassLaunches, PlanPrices, PlanSteps, Unmeasured, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
     ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding, ResolvedPolicy,
     ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding,

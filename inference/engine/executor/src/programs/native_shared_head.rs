@@ -20,8 +20,8 @@ use super::native_draft::widen;
 use super::{DeviceSubmission, HeadOutput, HeadProgram, HeadSelections};
 use crate::device_table::SelectedRead;
 use crate::operators::block::{
-    BlockControlPorts, BlockLane, BlockStatePorts, BlockSublayers, CheckedFeedForwardEntries,
-    CheckedMixerEntries, FeedForwardEntries, MixerEntries,
+    BlockLane, BlockState, BlockSublayers, CheckedFeedForwardEntries, CheckedMixerEntries,
+    FeedForwardEntries, HistoryPorts, MixerEntries,
 };
 use crate::operators::streams::ResidualCarry;
 use crate::operators::{InputForm, SharedHead, paired_block};
@@ -502,7 +502,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 scored: false,
                 output_scales: (entries.scales)(index)?,
             };
-            let (mixed, state, controls) = sublayers.mixer(
+            let (mixed, state) = sublayers.mixer(
                 &mut graph,
                 (entries.mixer)(index)?,
                 None,
@@ -510,17 +510,20 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 &mut weights,
                 &mut constants,
             )?;
-            let (
-                BlockStatePorts::Attention(planes, None),
-                BlockControlPorts::Attention {
-                    coordinates,
-                    visible,
-                    fresh,
-                    destinations,
-                    history_tiles: None,
-                    indexer: None,
-                },
-            ) = (state, controls)
+            let BlockState {
+                history:
+                    Some(HistoryPorts {
+                        planes,
+                        indexer_planes: None,
+                        coordinates,
+                        visible,
+                        fresh,
+                        destinations,
+                        history_tiles: None,
+                        indexer: None,
+                    }),
+                bank: None,
+            } = state
             else {
                 return Err("a head block other than unlisted attention".into());
             };

@@ -14,7 +14,9 @@ use super::gated_delta::graph::{
     CheckedRecurrentEntries, RecurrentBlock, RecurrentControlPorts, RecurrentGraphEntries,
     RecurrentStatePorts, recurrent,
 };
-use super::ngram::graph::{NGramBlock, NGramEntries, NGramPorts, ngram as ngram_graph};
+use super::ngram::graph::{
+    NGramBlock, NGramEntries, NGramPorts, NGramStepPorts, ngram as ngram_graph,
+};
 use super::parallel::DenseBesideRouted;
 use super::parallel::graph::{CheckedParallelEntries, ParallelGraphEntries, parallel};
 use super::per_layer::graph::{
@@ -65,54 +67,98 @@ use seismic::{
     WorkflowTensor,
 };
 
-/// A block's state ports, by the state its mixer keeps.
-#[derive(Clone)]
-pub(crate) enum BlockStatePorts {
-    /// The layer's history planes in the codec's plane-descriptor order,
-    /// and a selected read's indexer planes.
-    Attention(Vec<NativePort>, Option<IndexerStatePorts>),
-    /// The layer's recurrent bank components, consecutive in the store's
-    /// component order (`operators::Mixer::bank_components`).
-    Recurrent(Vec<NativePort>),
+/// A block's state ports and their per-launch controls: its attention
+/// mixer's history, and the recurrent bank its mixer or its n-gram input
+/// keeps (an n-gram input's windows join a recurrent mixer's bank, or are
+/// the block's bank beside an attention history).
+#[derive(Clone, Default)]
+pub(crate) struct BlockState {
+    pub history: Option<HistoryPorts>,
+    pub bank: Option<BankPorts>,
 }
 
-impl BlockStatePorts {
-    /// The ports of the layer's history or bank, whichever state they are
-    /// of.
-    pub(crate) fn ports(&self) -> &Vec<NativePort> {
-        match self {
-            Self::Attention(ports, _) | Self::Recurrent(ports) => ports,
+/// An attention layer's history planes and its launch's controls.
+#[derive(Clone)]
+pub(crate) struct HistoryPorts {
+    /// The planes in the codec's plane-descriptor order.
+    pub planes: Vec<NativePort>,
+    /// A selected read's indexer planes.
+    pub indexer_planes: Option<IndexerStatePorts>,
+    pub coordinates: NativePort,
+    pub visible: NativePort,
+    pub fresh: NativePort,
+    pub destinations: NativePort,
+    pub history_tiles: Option<HistoryTilesPort>,
+    /// A selected read's indexer tables.
+    pub indexer: Option<IndexerControlPorts>,
+}
+
+/// A block's recurrent bank: its components, consecutive in the store's
+/// component order (`operators::PairedBlock::bank_components`), and its
+/// launch's slot tables.
+#[derive(Clone)]
+pub(crate) struct BankPorts {
+    pub components: Vec<NativePort>,
+    pub controls: RecurrentControlPorts,
+}
+
+impl BlockState {
+    fn bank(components: Vec<NativePort>, controls: RecurrentControlPorts) -> Self {
+        Self {
+            history: None,
+            bank: Some(BankPorts { components, controls }),
         }
     }
 
-    /// Leave the ports' vector holding exactly them, so a prepared graph's
+    /// The capacities of its history planes' and bank components' vectors.
+    pub(crate) fn capacities(&self) -> [usize; 2] {
+        [
+            self.history.as_ref().map_or(0, |history| history.planes.capacity()),
+            self.bank.as_ref().map_or(0, |bank| bank.components.capacity()),
+        ]
+    }
+
+    /// Leave each vector holding exactly its ports, so a prepared graph's
     /// host heap follows from its topology.
     pub(crate) fn shrink_to_fit(&mut self) {
-        match self {
-            Self::Attention(ports, _) | Self::Recurrent(ports) => ports.shrink_to_fit(),
+        if let Some(history) = &mut self.history {
+            history.planes.shrink_to_fit();
+        }
+        if let Some(bank) = &mut self.bank {
+            bank.components.shrink_to_fit();
         }
     }
-}
 
-impl From<RecurrentStatePorts> for BlockStatePorts {
-    fn from(ports: RecurrentStatePorts) -> Self {
-        Self::Recurrent(vec![ports.window, ports.delta, ports.tape])
+    /// Its kind, as a block's timing names it.
+    pub(crate) fn kind(&self) -> &'static str {
+        match (&self.history, &self.bank) {
+            (Some(_), _) => "attention",
+            (None, Some(_)) => "recurrent",
+            (None, None) => "back",
+        }
+    }
+
+    /// Join an n-gram input's bank components to the block's: its mixer's
+    /// bank, under its controls, or the block's own under the slot tables
+    /// the input took (`controls`), beside a history or alone (a back).
+    fn join_ngram(
+        &mut self,
+        components: Vec<NativePort>,
+        controls: Option<RecurrentControlPorts>,
+    ) -> Result<(), GraphError> {
+        match (&mut self.bank, controls) {
+            (Some(bank), None) => bank.components.extend(components),
+            (None, Some(controls)) => self.bank = Some(BankPorts { components, controls }),
+            _ => return Err("an n-gram input's slot tables disagree with its block".into()),
+        }
+        Ok(())
     }
 }
 
-/// A block's per-launch control ports, by the state its mixer keeps.
-#[derive(Clone)]
-pub(crate) enum BlockControlPorts {
-    Attention {
-        coordinates: NativePort,
-        visible: NativePort,
-        fresh: NativePort,
-        destinations: NativePort,
-        history_tiles: Option<HistoryTilesPort>,
-        /// A selected read's indexer tables.
-        indexer: Option<IndexerControlPorts>,
-    },
-    Recurrent(RecurrentControlPorts),
+impl From<(RecurrentStatePorts, RecurrentControlPorts)> for BlockState {
+    fn from((ports, controls): (RecurrentStatePorts, RecurrentControlPorts)) -> Self {
+        Self::bank(vec![ports.window, ports.delta, ports.tape], controls)
+    }
 }
 
 /// The kernel entries of a block's mixer: prepared kernels or checked
@@ -438,7 +484,7 @@ impl BlockSublayers<'_> {
         carry: &ResidualCarry<WorkflowTensor>,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<(ResidualCarry<WorkflowTensor>, BlockStatePorts, BlockControlPorts), GraphError> {
+    ) -> Result<(ResidualCarry<WorkflowTensor>, BlockState), GraphError> {
         let Self {
             paired,
             load,
@@ -464,7 +510,7 @@ impl BlockSublayers<'_> {
             rows: &input_rows,
             form,
         };
-        let (mixed, state_ports, controls) = match (paired.mixer, entries) {
+        let (mixed, block_state) = match (paired.mixer, entries) {
             (Mixer::Attention(operator), MixerEntries::Attention(entries)) => {
                 let shape = attention_operator::shape(geometry.hidden, operator)
                     .map_err(|error| error.to_string())?;
@@ -545,14 +591,18 @@ impl BlockSublayers<'_> {
                 )?;
                 (
                     mixed,
-                    BlockStatePorts::Attention(ports.planes, ports.indexer),
-                    BlockControlPorts::Attention {
-                        coordinates: controls.coordinates,
-                        visible: controls.visible.ok_or("attention visibility is absent")?,
-                        fresh: controls.fresh.ok_or("attention fresh rows are absent")?,
-                        destinations: controls.destinations,
-                        history_tiles: controls.history_tiles,
-                        indexer: controls.indexer,
+                    BlockState {
+                        history: Some(HistoryPorts {
+                            planes: ports.planes,
+                            indexer_planes: ports.indexer,
+                            coordinates: controls.coordinates,
+                            visible: controls.visible.ok_or("attention visibility is absent")?,
+                            fresh: controls.fresh.ok_or("attention fresh rows are absent")?,
+                            destinations: controls.destinations,
+                            history_tiles: controls.history_tiles,
+                            indexer: controls.indexer,
+                        }),
+                        bank: None,
                     },
                 )
             }
@@ -584,7 +634,7 @@ impl BlockSublayers<'_> {
                         controls: self.controls(),
                     },
                 )?;
-                (mixed, ports.into(), BlockControlPorts::Recurrent(controls))
+                (mixed, (ports, controls).into())
             }
             (Mixer::StateSpace(operator), MixerEntries::StateSpace(entries)) => {
                 single_stream(input.form)?;
@@ -610,7 +660,7 @@ impl BlockSublayers<'_> {
                         controls: self.controls(),
                     },
                 )?;
-                (mixed, ports.into(), BlockControlPorts::Recurrent(controls))
+                (mixed, (ports, controls).into())
             }
             (Mixer::ShortConv(operator), MixerEntries::ShortConv(entries)) => {
                 single_stream(input.form)?;
@@ -638,15 +688,11 @@ impl BlockSublayers<'_> {
                         controls: self.controls(),
                     },
                 )?;
-                (
-                    mixed,
-                    BlockStatePorts::Recurrent(vec![window]),
-                    BlockControlPorts::Recurrent(controls),
-                )
+                (mixed, BlockState::bank(vec![window], controls))
             }
             _ => return Err("target block mixer and its kernel entries disagree".into()),
         };
-        Ok((ResidualCarry { rows: mixed, pre }, state_ports, controls))
+        Ok((ResidualCarry { rows: mixed, pre }, block_state))
     }
 
     /// A scratch-served step's fill of the block's streamed routed layer
@@ -967,17 +1013,19 @@ impl BlockSublayers<'_> {
     }
 
     /// The block's n-gram input over the streams `residual`, after its
-    /// mixer's bank components and under its recurrent `controls`: the new
-    /// streams, its windows, its token rows and its table read's ports.
+    /// mixer's bank components: the new streams and what each step binds.
+    /// Its windows join `block`'s bank under its controls, or, in a block
+    /// whose mixer keeps none (an attention block, or a scratch-served
+    /// block's back), are the block's bank under the slot tables it takes.
     pub(crate) fn ngram<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
         parts: Option<NGramParts<'e, G>>,
-        controls: Option<&BlockControlPorts>,
+        block: &mut BlockState,
         residual: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<(WorkflowTensor, Option<NGramPorts>), GraphError> {
+    ) -> Result<(WorkflowTensor, Option<NGramStepPorts>), GraphError> {
         let Self {
             paired,
             load,
@@ -993,13 +1041,6 @@ impl BlockSublayers<'_> {
             (Some(sublayer), Some(parts)) => (sublayer, parts),
             _ => return Err("target block n-gram input and its kernel entries disagree".into()),
         };
-        // Without the block's mixer (a scratch-served block's back), it takes
-        // the slot tables as its own inputs.
-        let controls = match controls {
-            None => None,
-            Some(BlockControlPorts::Recurrent(controls)) => Some(controls),
-            Some(_) => return Err("an n-gram input in a block without recurrent controls".into()),
-        };
         let component_index = bank_component_index(&geometry.blocks, block_index)
             .map_err(|error| error.to_string())?
             + paired.mixer.bank_components();
@@ -1012,19 +1053,21 @@ impl BlockSublayers<'_> {
             weights,
             constants,
             &residual,
-            controls,
+            block.bank.as_ref().map(|bank| &bank.controls),
             NGramBlock {
                 rows,
                 slots,
                 slab_banks: state.target_state().bank_slab_banks()?,
                 binding,
                 hash: &sublayer.op.hash,
-                epsilon: sublayer.op.key_norm.epsilon as f32,
+                epsilon: sublayer.op.epsilon as f32,
                 component_index,
                 controls: self.controls(),
             },
         )?;
-        Ok((streams, Some(ports)))
+        let NGramPorts { bank, step, controls } = ports;
+        block.join_ngram(bank, controls)?;
+        Ok((streams, Some(step)))
     }
 }
 

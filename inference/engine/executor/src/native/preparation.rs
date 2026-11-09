@@ -53,7 +53,8 @@ use magnitude_kernels::{
     corrector_factors, corrector_features, corrector_nodes, corrector_path, corrector_rows,
     draft_convolve_input,
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
-    feature_rows, import_dense, moe_tail, ngram_gate, ngram_inject, ngram_rows, packing_bound,
+    feature_rows, import_dense, moe_tail, ngram_add, ngram_gate, ngram_inject, ngram_rows,
+    packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
     selection_notice, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
     token_confidence, widen_rows,
@@ -2039,27 +2040,44 @@ impl<'a> Preparation<'a> {
         let norm = format!("NW={}", binding.norm.name());
         let gate = self.spec.fixed(
             &norm,
-            &[("H", binding.hidden), ("S", binding.streams)],
-            ngram_gate::native_entry_with(ngram_gate::Elements { NW: binding.norm }),
-        )?;
-        let inject = self.spec.fixed(
-            &norm,
             &[
                 ("H", binding.hidden),
                 ("S", binding.streams),
-                ("K", binding.kernel),
+                ("PR", binding.gate.product()),
             ],
-            ngram_inject::native_entry_with(ngram_inject::Elements { NW: binding.norm }),
+            ngram_gate::native_entry_with(ngram_gate::Elements { NW: binding.norm }),
         )?;
-        Ok(match (rows, stored, key, value, gate, inject) {
-            (Some(rows), Some(stored), Some(key), Some(value), Some(gate), Some(inject)) => {
+        let output = match binding.convolution {
+            None => self
+                .spec
+                .fixed(
+                    "fixed",
+                    &[("H", binding.hidden), ("S", binding.streams)],
+                    ngram_add::native_entry(),
+                )?
+                .map(NGramOutputKernel::Add),
+            Some(taps) => self
+                .spec
+                .fixed(
+                    &norm,
+                    &[
+                        ("H", binding.hidden),
+                        ("S", binding.streams),
+                        ("K", taps.kernel),
+                    ],
+                    ngram_inject::native_entry_with(ngram_inject::Elements { NW: binding.norm }),
+                )?
+                .map(NGramOutputKernel::Inject),
+        };
+        Ok(match (rows, stored, key, value, gate, output) {
+            (Some(rows), Some(stored), Some(key), Some(value), Some(gate), Some(output)) => {
                 Some(NGramKernels {
                     rows,
                     stored,
                     key,
                     value,
                     gate,
-                    inject,
+                    output,
                 })
             }
             _ => None,

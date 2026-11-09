@@ -21,6 +21,11 @@ uint64_t ngram_u64_at(uint64_t base, uint64_t index) {
     return element_u64_at(base + index * 8ul);
 }
 
+// The hashed id of raw token `token` (a map is present: V > 0).
+uint ngram_mapped(uint token) {
+    return element_u32_at(SEISMIC_PTR(SEISMIC_BUFFER_MAP) + uint64_t(token) * SEISMIC_MAP_STRIDE_0 * 4ul);
+}
+
 void ngram_put(uint64_t entry, int row, int status) {
     const uint64_t at = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + entry * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
     element_i32_put(at, row);
@@ -61,21 +66,28 @@ void ngram_rows() {
     const versions_slot slot = versions_slot_of(slot_index);
     const uint64_t source = versions_bank(window, slot.source, bank_bytes);
     const int local = row - slot.lo;
-    const int reset = int(uint(SEISMIC_PARAM_RESET));
-    const uint reset_stored = uint(reset + 1);
+    const uint64_t fill = uint64_t(int64_t(int(uint(SEISMIC_PARAM_FILL))));
+    // The boundary as the window stores it; 0 (no token) without one, which
+    // cuts already.
+    const uint boundary_stored = SEISMIC_DIM_NB == 0
+        ? 0u : uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BOUNDARY)) + 1);
     const uint64_t tokens = SEISMIC_PTR(SEISMIC_BUFFER_TOKENS) + uint64_t(row) * SEISMIC_TOKENS_STRIDE_0 * 4ul;
     const int status = element_i32_at(tokens + SEISMIC_TOKENS_STRIDE_1 * 4ul);
     const uint64_t multipliers = SEISMIC_PTR(SEISMIC_BUFFER_MULTIPLIERS);
     const uint64_t sizes = SEISMIC_PTR(SEISMIC_BUFFER_SIZES);
     const uint64_t offsets = SEISMIC_PTR(SEISMIC_BUFFER_OFFSETS);
-    uint64_t mixed = uint64_t(int64_t(element_i32_at(tokens))) * ngram_u64_at(multipliers, 0ul);
+    const int token = element_i32_at(tokens);
+    const uint64_t hashed = SEISMIC_DIM_V > 0 ? uint64_t(ngram_mapped(uint(token))) : uint64_t(int64_t(token));
+    uint64_t mixed = hashed * ngram_u64_at(multipliers, 0ul);
     bool cut = false;
     for (int distance = 1; distance <= context; ++distance) {
         const uint stored = local >= distance ? ngram_stored_token(row - distance)
                                               : ngram_window_at(source, slot.taped + context + local - distance);
-        cut = cut || stored == 0u || stored == reset_stored;
-        const uint64_t token = cut ? uint64_t(int64_t(reset)) : uint64_t(stored - 1u);
-        mixed ^= token * ngram_u64_at(multipliers, uint64_t(distance) * SEISMIC_MULTIPLIERS_STRIDE_0);
+        cut = cut || stored == 0u || stored == boundary_stored;
+        // A cut slot reads no map entry: its stored token may be none.
+        const uint64_t value = cut ? fill
+            : SEISMIC_DIM_V > 0 ? uint64_t(ngram_mapped(stored - 1u)) : uint64_t(stored - 1u);
+        mixed ^= value * ngram_u64_at(multipliers, uint64_t(distance) * SEISMIC_MULTIPLIERS_STRIDE_0);
         for (uint64_t p = 0ul; p < heads_per_order; ++p) {
             const uint64_t head = uint64_t(distance - 1) * heads_per_order + p;
             const uint64_t table_row = ngram_u64_at(offsets, head * SEISMIC_OFFSETS_STRIDE_0)

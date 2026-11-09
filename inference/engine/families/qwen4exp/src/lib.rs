@@ -20,7 +20,8 @@ use magnitude_family_contracts::{
     ActivationDType, Block, Decoder, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
     ExitSite, GateFunction, HeadComponent, HistoryReads, HyperConnectionExit, HyperConnectionInput,
     HyperConnectionMixing, HyperConnectionWeights, HyperConnections, Indexer, InputNorm,
-    LowRankGatedSite, InputSemantics, ModelDefinition, NGramHash, NGramInput,
+    LowRankGatedSite, InputSemantics, ModelDefinition, NGramConvolution, NGramGate, NGramHash,
+    NGramInput, NGramMedia,
     Operator, OutputForm, ResidualForm, Sublayer, WeightDescriptor,
 };
 use magnitude_family_qwen::{
@@ -135,16 +136,22 @@ impl Extensions {
         if ngram_size < 2 {
             return Err(invalid("qwen4exp n-grams span at least two tokens"));
         }
+        let eos = m
+            .value("ple.eos_token_id")?
+            .unsigned()
+            .ok_or_else(|| m.malformed("ple.eos_token_id", "an integer"))?;
         let hash = NGramHash {
             context: ngram_size - 1,
             heads_per_order: m.integer("ple.heads_per_ngram")?,
             multipliers: m.integers("ple.layer_multipliers")?,
             sizes: m.integers("ple.head_vocab_sizes")?,
             offsets: m.integers("ple.head_offsets")?,
-            reset: m
-                .value("ple.eos_token_id")?
-                .unsigned()
-                .ok_or_else(|| m.malformed("ple.eos_token_id", "an integer"))?,
+            // Raw ids hash as themselves; the end of a sequence cuts the
+            // lookback and is what a cut predecessor reads.
+            token_map: None,
+            fill: eos,
+            boundary: Some(eos),
+            media: NGramMedia::Hashed,
         };
         // Media rows hash the token that stands in their place, which this
         // key names.
@@ -234,12 +241,17 @@ impl Extensions {
                 table: table.clone(),
                 key: weight("ple_key.weight", &[wide, embedding])?,
                 value: weight("ple_value.weight", &[hidden, embedding])?,
-                key_norm: geometry.rms(weight("ple_norm_key.weight", &[wide])?),
-                query_norm: geometry.rms(weight("ple_norm_query.weight", &[wide])?),
-                convolution_norm: geometry.rms(weight("ple_norm_conv.weight", &[wide])?),
-                convolution: weight("ple_conv1d.weight", &[wide, site.kernel])?,
-                kernel: site.kernel,
-                dilation: site.dilation,
+                gate: NGramGate::Norms {
+                    key: weight("ple_norm_key.weight", &[wide])?,
+                    query: weight("ple_norm_query.weight", &[wide])?,
+                },
+                epsilon: geometry.epsilon,
+                mixing: Some(NGramConvolution {
+                    norm: weight("ple_norm_conv.weight", &[wide])?,
+                    taps: weight("ple_conv1d.weight", &[wide, site.kernel])?,
+                    kernel: site.kernel,
+                    dilation: site.dilation,
+                }),
             })),
             output: OutputForm::Residual,
         })

@@ -1,25 +1,29 @@
-# The n-gram input (qwen4exp's per-layer embedding): rows of a hashed n-gram
-# table, gathered per position, gated into each hyper-connection stream and
-# convolved. With e the position's gathered rows (one row of heads * width):
-#   k[s]  = rms(key(e)[s]) * key_norm[s]            (key(e): [S * H])
-#   q[s]  = rms(X[s]) * query_norm[s]
-#   g[s]  = <k[s], q[s]> / sqrt(H), then sign(g) sqrt(max(|g|, 1e-6))
+# The n-gram input (Qwen4's per-layer input, DeepSeek V4.1's Engram): rows
+# of a hashed n-gram table, gathered per position, gated into each
+# hyper-connection stream and, under a convolution, convolved. With e the
+# position's gathered rows (one row of heads * width):
+#   k[s]  = rms(key(e)[s])                         (key(e): [S * H])
+#   q[s]  = rms(X[s])
+#   g[s]  = sum_c k[s, c] q[s, c] w[s, c] / sqrt(H), then sign(g) sqrt(max(|g|, 1e-6))
 #   v[s]  = sigmoid(g[s]) * value(e)               (value(e): [H])
+# w is key_norm * query_norm, or one stored product (`NGramGate`). Without a
+# convolution `X += v` (`ngram_add`); with one
 #   u     = rms(v[s]) * conv_norm[s], over S * H channels
-#   X    += v + silu(conv(u))
+#   X    += v + silu(conv(u))                      (`ngram_inject`)
 # conv is depthwise and causal with taps K and dilation D:
 #   conv(u)[t, c] = sum_k w[c, k] u[t - D (K - 1 - k), c]
 # The table rows of each position are `ngram_rows`; the gathered rows, their
 # key and value projections are `embedding_rows` and `project_rows`; the
-# gate is `ngram_gate` and the row op `ngram_inject`, whose window is the
-# layer's bank.
+# gate is `ngram_gate`; `ngram_inject`'s window is the layer's bank.
 
 # The table rows of each launch row (`NGramHash::rows`, the host's form of
-# the same rule). With c[0] the row's token and c[d] its d-th predecessor,
-# a predecessor at or before the latest reset token preceding the row, or
-# before the sequence, reads as `reset`. Order o = d + 1 (d in 1..=C) hashes
-# m[o] = XOR_{e <= d} u64(c[e]) * multipliers[e] (wrapping in u64), and its
-# P heads h = (d - 1) P + p read row offsets[h] + m[o] mod sizes[h].
+# the same rule). A token t hashes as map[t], or as t when V = 0. With c[0]
+# the row's hashed token and c[d] its d-th predecessor's, a predecessor
+# before the sequence, or at or before the latest boundary token (NB = 1:
+# `boundary[0]`) preceding the row, reads as `fill`. Order o = d + 1 (d in
+# 1..=C) hashes m[o] = XOR_{e <= d} u64(c[e]) * multipliers[e] (wrapping in
+# u64), and its P heads h = (d - 1) P + p read row
+# offsets[h] + m[o] mod sizes[h].
 #
 # Token contract: `tokens` has the `sample_rows` result layout (token,
 # status), so a step reads host tokens or the previous step's selection.
@@ -27,26 +31,26 @@
 # layout `gathered_row` reads. Rows outside every slot are (-1, 0): they name
 # no table row, and read zeros.
 #
-# State contract: the token window `window[N, C + T, 1] u32` holds token + 1,
-# 0 for no token (the zero seed: no token precedes a new sequence), under the
-# short-convolution contract (short_conv.seismic) with C rows before a bank's
-# state: slot `b` reads version (`previous_bank[b]`, `previous_tape[b]`)
-# and publishes to bank `following_bank[b]` the C tokens before its first
-# `stop[b]` rows' end, then the tokens of the next t = min(T, rows - stop)
-# rows.
-fn ngram_rows[M, B, N, C, P, T](tokens: &tensor[M, 2] i32,
+# State contract: the token window `window[N, C + T, 1] u32` holds raw
+# token + 1, 0 for no token (the zero seed: no token precedes a new
+# sequence), under the short-convolution contract (short_conv.seismic) with
+# C rows before a bank's state: slot `b` reads version (`previous_bank[b]`,
+# `previous_tape[b]`) and publishes to bank `following_bank[b]` the C tokens
+# before its first `stop[b]` rows' end, then the tokens of the next
+# t = min(T, rows - stop) rows.
+fn ngram_rows[M, B, N, C, P, T, V, NB](tokens: &tensor[M, 2] i32,
     multipliers: &tensor[C + 1] u64, sizes: &tensor[C * P] u64, offsets: &tensor[C * P] u64,
+    map: &tensor[V] u32, boundary: &tensor[NB] i32,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
     window: &mut tensor[N, C + T, 1] u32,
-    reset: i32, slab_banks: u32) -> tensor[M * C * P, 2] i32 where C >= 1 and P >= 1 and T >= 0:
+    fill: i32, slab_banks: u32) -> tensor[M * C * P, 2] i32 where C >= 1 and P >= 1 and T >= 0 and V >= 0 and NB >= 0 and NB <= 1:
     let mut rows = tensor[M * C * P, 2] i32
     for row in 0..M:
         for head in 0..C * P:
             rows[row * C * P + head, 0] = -1
             rows[row * C * P + head, 1] = 0
     let absent = u32(0)
-    let reset_stored = u32(reset + 1)
     for slot in 0..B:
         let lo = segments[slot, 0]
         let hi = segments[slot, 1]
@@ -57,7 +61,10 @@ fn ngram_rows[M, B, N, C, P, T](tokens: &tensor[M, 2] i32,
         for row in 0..M:
             if row >= lo and row < hi:
                 let local = row - lo
-                let mut mixed = u64(tokens[row, 0]) * multipliers[0]
+                let mut hashed = u64(tokens[row, 0])
+                if V > 0:
+                    hashed = u64(map[tokens[row, 0]])
+                let mut mixed = hashed * multipliers[0]
                 let mut cut = false
                 for distance in 1..C + 1:
                     let mut stored = absent
@@ -67,11 +74,16 @@ fn ngram_rows[M, B, N, C, P, T](tokens: &tensor[M, 2] i32,
                         stored = u32(tokens[row - distance, 0] + 1)
                     else:
                         stored = window[source, taped + C + local - distance, 0]
-                    if stored == absent or stored == reset_stored:
+                    if stored == absent:
                         cut = true
-                    let mut token = u64(reset)
+                    if NB == 1:
+                        if stored == u32(boundary[0] + 1):
+                            cut = true
+                    let mut token = u64(fill)
                     if not cut:
                         token = u64(stored - u32(1))
+                        if V > 0:
+                            token = u64(map[i32(stored - u32(1))])
                     mixed = mixed ^ (token * multipliers[distance])
                     for p in 0..P:
                         let head = (distance - 1) * P + p
@@ -86,10 +98,12 @@ fn ngram_rows[M, B, N, C, P, T](tokens: &tensor[M, 2] i32,
     return rows
 
 # Each row's per-stream gate sigmoid(g[s]) and the inverse of the RMS of
-# v[s] = sigmoid(g[s]) * value: `scales[m] = gates | inverses`, F32.
-fn ngram_gate[M, H, S](hidden: &tensor[M, S, H] f32, key: &tensor[M, S, H] f32,
-    value: &tensor[M, H] f32, key_norm: &tensor[S, H] NW, query_norm: &tensor[S, H] NW,
-    epsilon: f32) -> tensor[M, 2 * S] f32 where S >= 1:
+# v[s] = sigmoid(g[s]) * value: `scales[m] = gates | inverses`, F32. The
+# gate's weight is key_norm * query_norm (PR = 0), or key_norm alone, the
+# stored product (PR = 1: `query_norm` has no rows). The form carries PR.
+fn ngram_gate[M, H, S, PR](hidden: &tensor[M, S, H] f32, key: &tensor[M, S, H] f32,
+    value: &tensor[M, H] f32, key_norm: &tensor[S, H] NW, query_norm: &tensor[S * (1 - PR), H] NW,
+    form: &tensor[0, PR] i32, epsilon: f32) -> tensor[M, 2 * S] f32 where S >= 1 and PR >= 0 and PR <= 1:
     let mut scales = tensor[M, 2 * S] f32
     parallel for row in 0..M:
         let v = value[row]
@@ -103,7 +117,10 @@ fn ngram_gate[M, H, S](hidden: &tensor[M, S, H] f32, key: &tensor[M, S, H] f32,
                 let x = hidden[row, stream, column]
                 keys = keys + k * k
                 queries = queries + x * x
-                dot = dot + k * f32(key_norm[stream, column]) * x * f32(query_norm[stream, column])
+                let mut term = k * f32(key_norm[stream, column]) * x
+                if PR == 0:
+                    term = term * f32(query_norm[stream, column])
+                dot = dot + term
             let key_inverse = rsqrt(keys / f32(H) + epsilon)
             let query_inverse = rsqrt(queries / f32(H) + epsilon)
             let g = dot * key_inverse * query_inverse / sqrt(f32(H))
@@ -117,6 +134,19 @@ fn ngram_gate[M, H, S](hidden: &tensor[M, S, H] f32, key: &tensor[M, S, H] f32,
             scales[row, stream] = gate
             scales[row, S + stream] = rsqrt(gate * gate * values + epsilon)
     return scales
+
+# Output contract: `result[m, s * H + c] = hidden[m, s * H + c] +
+# scales[m, s] * value[m, c]`, in F32: the gated value added to each stream,
+# with no convolution.
+fn ngram_add[M, S, H](hidden: &tensor[M, S * H] f32, scales: &tensor[M, 2 * S] f32,
+    value: &tensor[M, H] f32) -> tensor[M, S * H] f32 where S >= 1:
+    let mut result = tensor[M, S * H] f32
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            parallel for column in 0..H:
+                let channel = stream * H + column
+                result[row, channel] = hidden[row, channel] + scales[row, stream] * value[row, column]
+    return result
 
 # State contract: the layer owns one arena, `window[N, R, S * H] f32` of u
 # rows, R = D (K - 1) + T (T >= 0, the planned speculative width; the
@@ -207,19 +237,22 @@ native ngram_rows for cpu from "cpu/ngram_rows.rs":
 # Metal: a threadgroup per (stream, row) reduces the stream's three sums and
 # the value row's square sum.
 native ngram_gate for metal from "metal/ngram_gate.metal":
-    static (H, S)
+    static (H, S, PR)
     launch ngram_gate:
         threadgroups (S, M, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# CUDA and Vulkan: the Metal items over the two norms only (PR = 0).
 native ngram_gate for cuda from "cuda/ngram_gate.cu":
-    static (H, S)
+    static (H, S, PR)
+    where PR == 0
     launch ngram_gate:
         threadgroups (S, min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 
 native ngram_gate for vulkan from "vulkan/ngram_gate.comp":
-    static (H, S)
+    static (H, S, PR)
+    where PR == 0
     launch ngram_gate:
         threadgroups (S, min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -263,3 +296,30 @@ native ngram_inject for cpu from "cpu/ngram_inject.rs":
         threadgroups (M + B, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (S * H * 4)
+
+# Metal: a thread per (channel, row).
+native ngram_add for metal from "metal/ngram_add.metal":
+    static (H, S)
+    launch ngram_add:
+        threadgroups (ceil_div(S * H, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CUDA and Vulkan: the Metal threads, visiting the rows by a grid-stride
+# loop over y because both cap the y grid at 65535 groups.
+native ngram_add for cuda from "cuda/ngram_add.cu":
+    static (H, S)
+    launch ngram_add:
+        threadgroups (ceil_div(S * H, 256), min(M, 65535), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native ngram_add for vulkan from "vulkan/ngram_add.comp":
+    static (H, S)
+    launch ngram_add:
+        threadgroups (ceil_div(S * H, 256), min(M, 65535), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row.
+native ngram_add for cpu from "cpu/ngram_add.rs":
+    launch ngram_add:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

@@ -32,6 +32,8 @@ extern "C" __global__ void ngram_rows(SEISMIC_KERNEL_PARAMS) {
     const u64 *multipliers = reinterpret_cast<const u64 *>(SEISMIC_PTR(SEISMIC_BUFFER_MULTIPLIERS));
     const u64 *sizes = reinterpret_cast<const u64 *>(SEISMIC_PTR(SEISMIC_BUFFER_SIZES));
     const u64 *offsets = reinterpret_cast<const u64 *>(SEISMIC_PTR(SEISMIC_BUFFER_OFFSETS));
+    const u32 *map = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_MAP));
+    const int *boundary = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BOUNDARY));
     const u32 *window = reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW));
     int *rows = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
     const versions::Slots slots = VERSIONS_SLOTS();
@@ -67,20 +69,27 @@ extern "C" __global__ void ngram_rows(SEISMIC_KERNEL_PARAMS) {
     const u32 *source =
         reinterpret_cast<const u32 *>(versions::bank(window, slot.source, bank_bytes, seismic_words_value));
     const int local = row - slot.lo;
-    const int reset = static_cast<int>(static_cast<u32>(SEISMIC_PARAM_RESET));
-    const u32 reset_stored = static_cast<u32>(reset + 1);
+    const u64 fill = static_cast<u64>(static_cast<long long>(static_cast<int>(static_cast<u32>(SEISMIC_PARAM_FILL))));
+    // The boundary as the window stores it; 0 (no token) without one, which
+    // cuts already.
+    const u32 boundary_stored = SEISMIC_DIM_NB == 0 ? 0u : static_cast<u32>(boundary[0] + 1);
     const int status = tokens[static_cast<u64>(row) * SEISMIC_TOKENS_STRIDE_0 + SEISMIC_TOKENS_STRIDE_1];
-    u64 mixed = static_cast<u64>(static_cast<long long>(tokens[static_cast<u64>(row) * SEISMIC_TOKENS_STRIDE_0])) *
-                multipliers[0];
+    const int token = tokens[static_cast<u64>(row) * SEISMIC_TOKENS_STRIDE_0];
+    const u64 hashed = SEISMIC_DIM_V > 0 ? static_cast<u64>(map[static_cast<u64>(token) * SEISMIC_MAP_STRIDE_0])
+                                         : static_cast<u64>(static_cast<long long>(token));
+    u64 mixed = hashed * multipliers[0];
     bool cut = false;
     for (int distance = 1; distance <= context; ++distance) {
         const u32 stored =
             local >= distance
                 ? stored_token(tokens, row - distance, seismic_words_value)
                 : source[static_cast<u64>(slot.taped + context + local - distance) * SEISMIC_WINDOW_STRIDE_1];
-        cut = cut || stored == 0u || stored == reset_stored;
-        const u64 token = cut ? static_cast<u64>(static_cast<long long>(reset)) : static_cast<u64>(stored - 1u);
-        mixed ^= token * multipliers[static_cast<u64>(distance) * SEISMIC_MULTIPLIERS_STRIDE_0];
+        cut = cut || stored == 0u || stored == boundary_stored;
+        // A cut slot reads no map entry: its stored token may be none.
+        const u64 value = cut                 ? fill
+                          : SEISMIC_DIM_V > 0 ? static_cast<u64>(map[static_cast<u64>(stored - 1u) * SEISMIC_MAP_STRIDE_0])
+                                              : static_cast<u64>(stored - 1u);
+        mixed ^= value * multipliers[static_cast<u64>(distance) * SEISMIC_MULTIPLIERS_STRIDE_0];
         for (u64 p = 0; p < heads_per_order; ++p) {
             const u64 head = static_cast<u64>(distance - 1) * heads_per_order + p;
             const u64 table_row =

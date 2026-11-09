@@ -285,7 +285,15 @@ pub struct NGramKernels {
     pub key: NativeKernel<project_rows::Entry>,
     pub value: NativeKernel<project_rows::Entry>,
     pub gate: NativeKernel<magnitude_kernels::ngram_gate::Entry>,
-    pub inject: NativeKernel<magnitude_kernels::ngram_inject::Entry>,
+    pub output: NGramOutputKernel,
+}
+
+/// An n-gram input's row op: the gated value added into the streams, or
+/// added with its convolution over the window.
+#[derive(Clone, Debug)]
+pub enum NGramOutputKernel {
+    Add(NativeKernel<magnitude_kernels::ngram_add::Entry>),
+    Inject(NativeKernel<magnitude_kernels::ngram_inject::Entry>),
 }
 
 /// A mix site's entries (`operators::streams`): its first stage (`down`,

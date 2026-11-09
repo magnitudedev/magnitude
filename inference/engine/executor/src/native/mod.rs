@@ -39,7 +39,7 @@ pub(crate) use target::{
     AttentionHistoryKernels, AttentionKernels, BankCombine, DenseDecodeKernels, BankMoves, BankRouteForm, BankRouteKernels, DevicePlacement,
     BankSite, SiteAdmission, SiteForm,
     DenseExpansionKernel, DenseKernels, ExpertBankKernels, ExpertKernels, LEADS,
-    GeneralRoutedKernels, NGramKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,
+    GeneralRoutedKernels, NGramKernels, NGramOutputKernel, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,
     PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
     RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
     LowRankQueryKernels, SelectedPrefillKernel, SelectionKernels,

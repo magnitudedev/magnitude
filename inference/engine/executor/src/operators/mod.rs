@@ -30,7 +30,7 @@ use magnitude_family_contracts::{
     ResidualForm, RmsNorm, RoutedFfn, RouterInput, Sublayer, SublayerIndex, VocabularyProjection,
     WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
-use magnitude_family_contracts::{HistoryReads, ShortConv, StateSpace};
+use magnitude_family_contracts::{HistoryReads, NGramGate, ShortConv, StateSpace};
 use seismic::Element;
 
 /// How a sublayer's output joins the residual (`scatter`): into `streams`
@@ -664,13 +664,17 @@ fn operator_weights<'a>(
             push(WeightKind::NGramTable, &operator.table);
             push(WeightKind::NGramKey, &operator.key);
             push(WeightKind::NGramValue, &operator.value);
-            push(WeightKind::NGramKeyNorm, &operator.key_norm.weight);
-            push(WeightKind::NGramQueryNorm, &operator.query_norm.weight);
-            push(
-                WeightKind::NGramConvolutionNorm,
-                &operator.convolution_norm.weight,
-            );
-            push(WeightKind::NGramConvolution, &operator.convolution);
+            match &operator.gate {
+                NGramGate::Norms { key, query } => {
+                    push(WeightKind::NGramKeyNorm, key);
+                    push(WeightKind::NGramQueryNorm, query);
+                }
+                NGramGate::Product(weight) => push(WeightKind::NGramGate, weight),
+            }
+            if let Some(mixing) = &operator.mixing {
+                push(WeightKind::NGramConvolutionNorm, &mixing.norm);
+                push(WeightKind::NGramConvolution, &mixing.taps);
+            }
         }
         Operator::Parallel(_) => {}
     }
@@ -929,6 +933,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     // projector (Muse's `perception_emb_norm`).
     attention::admit_media(decoder, definition.vision.is_some())?;
     routed::admit_media(decoder, definition.vision.is_some())?;
+    ngram::admit_media(decoder, definition.vision.is_some())?;
     attention::admit_shared(decoder)?;
     // The final norm, or the exit site's (the contract pairs each with its
     // residual form).

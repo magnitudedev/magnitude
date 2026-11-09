@@ -1,7 +1,7 @@
 //! The hyper-connection streams' entries (`stream_mix_down`, its exit form,
 //! `stream_mix_up`, `repeat_rows`) and the n-gram input's (`ngram_rows`,
-//! `stored_rows`, its key and value projections, `ngram_gate`,
-//! `ngram_inject`), each run once at the model's geometry on one row with
+//! `stored_rows`, its key and value projections, `ngram_gate`, and
+//! `ngram_add` or `ngram_inject`), each run once at the model's geometry on one row with
 //! weights chosen so the result is known.
 
 use super::super::*;
@@ -9,7 +9,7 @@ use super::*;
 use crate::operators::streams::{BlockStreams, MixDownBinding, MixUpBinding, SinkhornBinding, StreamsBinding};
 use magnitude_family_contracts::{NGramHash, Operator, SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{
-    ngram_gate, ngram_inject, ngram_rows, repeat_rows, stored_rows, stream_collapse, stream_join,
+    ngram_add, ngram_gate, ngram_inject, ngram_rows, repeat_rows, stored_rows, stream_collapse, stream_join,
     stream_mix_down, stream_mix_sinkhorn, stream_mix_up,
 };
 
@@ -57,6 +57,20 @@ fn u64_tensor(
         .flat_map(|value| value.to_le_bytes())
         .collect::<Vec<_>>();
     Tensor::from_host(device, Element::u64(), &[values.len() as u64], &bytes)
+        .map_err(|error| qualification_dynamic(entry, bindings, error))
+}
+
+fn u32_tensor(
+    device: &Device,
+    values: &[u32],
+    entry: &'static str,
+    bindings: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    Tensor::from_host(device, Element::u32(), &[values.len() as u64], &bytes)
         .map_err(|error| qualification_dynamic(entry, bindings, error))
 }
 
@@ -146,8 +160,8 @@ impl<'a> QualificationView<'a> {
     /// host's rule (`NGramHash::rows`) names; `stored_rows` decodes a zero
     /// slot to zeros, which project to zero keys and values; the gate of a
     /// zero key is `sigmoid(0) = 1/2` with a zero value's inverse
-    /// `rsqrt(epsilon)`; and `ngram_inject` of a zero value through zero
-    /// taps leaves the streams unchanged.
+    /// `rsqrt(epsilon)`; and `ngram_add` of a zero value, or `ngram_inject`
+    /// of one through zero taps, leaves the streams unchanged.
     pub(super) fn qualify_ngram(&self, device: &Device) -> Result<(), CatalogFailure> {
         let mut qualified = std::collections::HashSet::new();
         for ((index, slot), (attested, block)) in
@@ -209,24 +223,22 @@ impl<'a> QualificationView<'a> {
         let zeros =
             |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, label);
         let controls = SlotControls::new(device, entry, label)?;
-        // One tape row, the least a bank holds, in each window.
-        let reach = binding.dilation * (binding.kernel - 1);
-        let mut banks = seismic::SlabTensor::new(
-            device,
-            2,
-            2,
-            vec![
-                seismic::SlabRegion {
-                    element: Element::f32(),
-                    row_shape: vec![reach + 1, s * h],
-                },
-                seismic::SlabRegion {
-                    element: Element::u32(),
-                    row_shape: vec![binding.context + 1, 1],
-                },
-            ],
-        )
-        .map_err(|error| qualification_dynamic(entry, label, error))?;
+        // One tape row, the least a bank holds, in each window: a
+        // convolution's window, then the token window.
+        let window_region = binding.convolution.map(|taps| seismic::SlabRegion {
+            element: Element::f32(),
+            row_shape: vec![taps.reach() + 1, s * h],
+        });
+        let regions = window_region
+            .into_iter()
+            .chain([seismic::SlabRegion {
+                element: Element::u32(),
+                row_shape: vec![binding.context + 1, 1],
+            }])
+            .collect::<Vec<_>>();
+        let token_region = regions.len() - 1;
+        let mut banks = seismic::SlabTensor::new(device, 2, 2, regions)
+            .map_err(|error| qualification_dynamic(entry, label, error))?;
         banks
             .add_slab()
             .map_err(|error| qualification_dynamic(entry, label, error))?;
@@ -235,13 +247,25 @@ impl<'a> QualificationView<'a> {
                 .logical_region(index)
                 .map_err(|error| qualification_dynamic(entry, label, error))
         };
-        let (mut window, mut token_window) = (region(0)?, region(1)?);
+        let mut token_window = region(token_region)?;
+        let mut window = binding.convolution.map(|_| region(0)).transpose()?;
 
-        // A fresh sequence's first token: every predecessor reads as reset.
+        // A fresh sequence's first token: every predecessor reads as the
+        // fill.
         const TOKEN: i32 = 5;
         let tokens = semantic_i32(device, &[1, 2], &[TOKEN, 0], "ngram_rows", label)?;
-        let reset = i32::try_from(hash.reset)
-            .map_err(|_| qualification_dynamic("ngram_rows", label, "reset token exceeds i32"))?;
+        let word = |value: u64, what: &str| {
+            i32::try_from(value)
+                .map_err(|_| qualification_dynamic("ngram_rows", label, format!("{what} exceeds i32")))
+        };
+        let fill = word(hash.fill, "the fill")?;
+        let boundary = hash
+            .boundary
+            .map(|boundary| word(boundary, "the boundary"))
+            .transpose()?
+            .into_iter()
+            .collect::<Vec<_>>();
+        let map = hash.token_map.as_deref().unwrap_or(&[]);
         let rows = kernels
             .rows
             .call(ngram_rows::Args {
@@ -249,13 +273,15 @@ impl<'a> QualificationView<'a> {
                 multipliers: &u64_tensor(device, &hash.multipliers, "ngram_rows", label)?,
                 sizes: &u64_tensor(device, &hash.sizes, "ngram_rows", label)?,
                 offsets: &u64_tensor(device, &hash.offsets, "ngram_rows", label)?,
+                map: &u32_tensor(device, map, "ngram_rows", label)?,
+                boundary: &semantic_i32(device, &[boundary.len() as u64], &boundary, "ngram_rows", label)?,
                 segments: &controls.segments,
                 stop: &controls.stop,
                 previous_bank: &controls.previous_bank,
                 previous_tape: &controls.previous_tape,
                 following_bank: &controls.following_bank,
                 window: &mut token_window,
-                reset,
+                fill,
                 slab_banks: 2,
             })
             .map_err(|error| qualification_dynamic("ngram_rows", label, error))?
@@ -343,6 +369,7 @@ impl<'a> QualificationView<'a> {
         let streams_values = vec![1.0_f32; (s * h) as usize];
         let streams = semantic_f32(device, &[1, s * h], &streams_values, entry, label)?;
         let norm = semantic_ones(device, binding.norm, &[s, h], entry, label)?;
+        let product = binding.gate.product();
         let scales = kernels
             .gate
             .call(ngram_gate::Args {
@@ -350,7 +377,8 @@ impl<'a> QualificationView<'a> {
                 key: &view(&key, &[1, s, h], "ngram_gate", label)?,
                 value: &value,
                 key_norm: &norm,
-                query_norm: &norm,
+                query_norm: &zeros(binding.norm, &[s * (1 - product), h])?,
+                form: &zeros(Element::i32(), &[0, product])?,
                 epsilon: EPSILON,
             })
             .map_err(|error| qualification_dynamic("ngram_gate", label, error))?
@@ -359,28 +387,49 @@ impl<'a> QualificationView<'a> {
             .chain(std::iter::repeat_n(1.0 / EPSILON.sqrt(), s as usize))
             .collect::<Vec<_>>();
         require_f32_near(&scales, &gates, "ngram_gate", label)?;
-        let injected = kernels
-            .inject
-            .call(ngram_inject::Args {
-                hidden: &streams,
-                scales: &scales,
-                value: &value,
-                norm: &norm,
-                convolution: &zeros(Element::f32(), &[s * h, binding.kernel])?,
-                segments: &controls.segments,
-                stop: &controls.stop,
-                previous_bank: &controls.previous_bank,
-                previous_tape: &controls.previous_tape,
-                following_bank: &controls.following_bank,
-                window: &mut window,
-                dilation: i32::try_from(binding.dilation).map_err(|_| {
-                    qualification_dynamic("ngram_inject", label, "dilation exceeds i32")
-                })?,
-                slab_banks: 2,
-            })
-            .map_err(|error| qualification_dynamic("ngram_inject", label, error))?
-            .value;
-        require_f32_values(&injected, &streams_values, "ngram_inject", label)?;
+        // A zero value adds nothing, through zero taps under a convolution.
+        let (injected, name) = match (&kernels.output, binding.convolution, window.as_mut()) {
+            (NGramOutputKernel::Add(kernel), None, None) => (
+                kernel
+                    .call(ngram_add::Args {
+                        hidden: &streams,
+                        scales: &scales,
+                        value: &value,
+                    })
+                    .map_err(|error| qualification_dynamic("ngram_add", label, error))?
+                    .value,
+                "ngram_add",
+            ),
+            (NGramOutputKernel::Inject(kernel), Some(taps), Some(window)) => (
+                kernel
+                    .call(ngram_inject::Args {
+                        hidden: &streams,
+                        scales: &scales,
+                        value: &value,
+                        norm: &norm,
+                        convolution: &zeros(Element::f32(), &[s * h, taps.kernel])?,
+                        segments: &controls.segments,
+                        stop: &controls.stop,
+                        previous_bank: &controls.previous_bank,
+                        previous_tape: &controls.previous_tape,
+                        following_bank: &controls.following_bank,
+                        window,
+                        dilation: i32::try_from(taps.dilation).map_err(|_| {
+                            qualification_dynamic("ngram_inject", label, "dilation exceeds i32")
+                        })?,
+                        slab_banks: 2,
+                    })
+                    .map_err(|error| qualification_dynamic("ngram_inject", label, error))?
+                    .value,
+                "ngram_inject",
+            ),
+            (_, convolution, window) => unreachable!(
+                "preparation gives the n-gram row op of the binding's convolution, and the \
+                 qualification its window: {convolution:?} with window {}",
+                window.is_some()
+            ),
+        };
+        require_f32_values(&injected, &streams_values, name, label)?;
         Ok(())
     }
 }
@@ -400,7 +449,7 @@ fn qualify_stream_binding(
     qualified: &mut QualifiedSites,
 ) -> Result<(), CatalogFailure> {
     let MixingKernels::LowRank(sites) = &kernels.mixing else {
-        return Err(qualification_dynamic("target_streams", &format!("{binding:?}"), "low-rank sites without their entries"));
+        unreachable!("preparation gives low-rank sites their entries: {binding:?}")
     };
     let label = format!("{binding:?}");
     let geometry = binding.geometry;
@@ -486,7 +535,7 @@ fn qualify_sinkhorn_binding(
     let label = format!("{binding:?}");
     let entry = "target_streams";
     let MixingKernels::Sinkhorn(sinkhorn) = &kernels.mixing else {
-        return Err(qualification_dynamic(entry, &label, "Sinkhorn streams without their entries"));
+        unreachable!("preparation gives Sinkhorn streams their entries: {label}")
     };
     let SinkhornBinding { hidden: h, streams: s, mixing } = binding;
     let ones = |extents: &[u64]| semantic_ones(device, Element::f32(), extents, entry, &label);

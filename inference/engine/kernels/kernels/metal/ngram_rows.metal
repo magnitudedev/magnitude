@@ -18,6 +18,8 @@ kernel void ngram_rows(
     device const ulong *multipliers [[buffer(SEISMIC_BUFFER_MULTIPLIERS)]],
     device const ulong *sizes [[buffer(SEISMIC_BUFFER_SIZES)]],
     device const ulong *offsets [[buffer(SEISMIC_BUFFER_OFFSETS)]],
+    device const uint *map [[buffer(SEISMIC_BUFFER_MAP)]],
+    device const int *boundary [[buffer(SEISMIC_BUFFER_BOUNDARY)]],
     device const int *segments [[buffer(SEISMIC_BUFFER_SEGMENTS)]],
     device const int *stop [[buffer(SEISMIC_BUFFER_STOP)]],
     device const int *previous_bank [[buffer(SEISMIC_BUFFER_PREVIOUS_BANK)]],
@@ -60,18 +62,24 @@ kernel void ngram_rows(
     const versions::Slot slot = versions::slot_of(slots, slot_index, seismic_words);
     device const uint *source = versions::bank<uint>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     const long local = row - slot.lo;
-    const int reset = int(uint(SEISMIC_PARAM_RESET));
-    const uint reset_stored = uint(reset + 1);
+    const ulong fill = ulong(long(int(uint(SEISMIC_PARAM_FILL))));
+    // The boundary as the window stores it; 0 (no token) without one, which
+    // cuts already.
+    const uint boundary_stored = SEISMIC_DIM_NB == 0 ? 0u : uint(boundary[0] + 1);
     const int status = tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0 + SEISMIC_TOKENS_STRIDE_1];
-    ulong mixed = ulong(long(tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0])) * multipliers[0];
+    const int token = tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0];
+    const ulong hashed = SEISMIC_DIM_V > 0 ? ulong(map[ulong(token) * SEISMIC_MAP_STRIDE_0]) : ulong(long(token));
+    ulong mixed = hashed * multipliers[0];
     bool cut = false;
     for (long distance = 1; distance <= context; ++distance) {
         const uint stored = local >= distance
             ? stored_token(tokens, row - distance, seismic_words)
             : source[ulong(slot.taped + context + local - distance) * SEISMIC_WINDOW_STRIDE_1];
-        cut = cut || stored == 0u || stored == reset_stored;
-        const ulong token = cut ? ulong(long(reset)) : ulong(stored - 1u);
-        mixed ^= token * multipliers[ulong(distance) * SEISMIC_MULTIPLIERS_STRIDE_0];
+        cut = cut || stored == 0u || stored == boundary_stored;
+        // A cut slot reads no map entry: its stored token may be none.
+        const ulong value = cut ? fill
+            : SEISMIC_DIM_V > 0 ? ulong(map[ulong(stored - 1u) * SEISMIC_MAP_STRIDE_0]) : ulong(stored - 1u);
+        mixed ^= value * multipliers[ulong(distance) * SEISMIC_MULTIPLIERS_STRIDE_0];
         for (ulong p = 0; p < heads_per_order; ++p) {
             const ulong head = ulong(distance - 1) * heads_per_order + p;
             const ulong table_row = offsets[head * SEISMIC_OFFSETS_STRIDE_0] + mixed % sizes[head * SEISMIC_SIZES_STRIDE_0];

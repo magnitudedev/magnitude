@@ -38,7 +38,7 @@ use crate::operators::streams::{BlockStreams, MixSite, SinkhornBinding};
 use crate::operators::{parallel::DenseBesideRouted, InputForm};
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedBinding, MixerProgramSlot, ModelLoadPlan,
-    PerLayerEntryBinding, ReadoutHead, SublayerTail, WeightPlan,
+    NGramGateForm, PerLayerEntryBinding, ReadoutHead, SublayerTail, WeightPlan,
 };
 use magnitude_family_contracts::{
     InputNorm, ModelDefinition, SublayerIndex, WeightKind, WeightScope,
@@ -661,13 +661,14 @@ fn sublayer_input(
     }
 }
 
-/// `operators::ngram` in `scope`, whose bank components (its window, then
-/// its token window) start at `component`: the row rule over the token
-/// window (`ngram_rows`), the read of its heads' stored rows from the
-/// table's slots (`stored_rows`), the key and value projections
-/// (`project_rows`), the gate over the key and query norms (`ngram_gate`),
-/// and the row op over the convolution norm, the taps and the window
-/// (`ngram_inject`).
+/// `operators::ngram` in `scope`, whose bank components (under a
+/// convolution its window, then its token window) start at `component`:
+/// the row rule over the token window (`ngram_rows`), the read of its
+/// heads' stored rows from the table's slots (`stored_rows`), the key and
+/// value projections (`project_rows`), the gate over its weights, the key
+/// and query norms or their stored product (`ngram_gate`), and the row op:
+/// the gated value's sum (`ngram_add`), or under a convolution the op over
+/// its norm, its taps and its window (`ngram_inject`).
 fn ngram(
     step: &mut Step<'_>,
     load: &ModelLoadPlan,
@@ -678,9 +679,10 @@ fn ngram(
     index: usize,
 ) -> Result<(), AssessmentError> {
     let weight = |kind, bound| planned(load, scope, kind, bound);
+    let token_window = component + binding.bank_components() - 1;
     step.call(
         Kernel::of::<kernels::ngram_rows::Entry>(),
-        sequences(bank_bytes(layout, component + 1, 1, index)?),
+        sequences(bank_bytes(layout, token_window, 1, index)?),
     )?;
     let table = weight(WeightKind::NGramTable, binding.table)?;
     let row = table
@@ -703,24 +705,41 @@ fn ngram(
         project,
         projection(&[weight(WeightKind::NGramValue, binding.value)?])?,
     )?;
-    step.call(
-        Kernel::of::<kernels::ngram_gate::Entry>(),
-        weights(&[
+    let gate = match binding.gate {
+        NGramGateForm::Norms => vec![
             weight(WeightKind::NGramKeyNorm, binding.norm)?,
             weight(WeightKind::NGramQueryNorm, binding.norm)?,
-        ])?,
-    )?;
-    step.call(
-        Kernel::of::<kernels::ngram_inject::Entry>(),
-        Work {
-            weights: weight_bytes(&[
-                weight(WeightKind::NGramConvolutionNorm, binding.norm)?,
-                weight(WeightKind::NGramConvolution, Element::f32())?,
-            ])?,
-            sequence_bytes: bank_bytes(layout, component, 1, index)?,
-            ..Work::default()
-        },
-    )
+        ],
+        NGramGateForm::Product => vec![weight(WeightKind::NGramGate, binding.norm)?],
+    };
+    step.call(Kernel::of::<kernels::ngram_gate::Entry>(), weights(&gate)?)?;
+    let row_bytes = ngram_output_row_bytes(&binding)?;
+    match binding.convolution {
+        None => step.call(Kernel::of::<kernels::ngram_add::Entry>(), rows(row_bytes)),
+        Some(_) => step.call(
+            Kernel::of::<kernels::ngram_inject::Entry>(),
+            Work {
+                weights: weight_bytes(&[
+                    weight(WeightKind::NGramConvolutionNorm, binding.norm)?,
+                    weight(WeightKind::NGramConvolution, Element::f32())?,
+                ])?,
+                row_bytes,
+                sequence_bytes: bank_bytes(layout, component, 1, index)?,
+                ..Work::default()
+            },
+        ),
+    }
+}
+
+/// The device bytes each row of an n-gram input's output op (`ngram_add`,
+/// or `ngram_inject` under a convolution) reads and writes: it reads the
+/// row's `[S, H]` streams, its gates and its gated value `[H]`, and writes
+/// its `[S, H]` streams. Its gates are the `S` gate values, and under a
+/// convolution also the `S` inverse key norms the convolution's input is
+/// formed with (`ngram_gate`'s `[2S]` scales).
+fn ngram_output_row_bytes(binding: &crate::NGramBinding) -> Result<u64, AssessmentError> {
+    let gates = binding.streams * (1 + u64::from(binding.convolution.is_some()));
+    f32_bytes(2 * binding.streams * binding.hidden + gates + binding.hidden)
 }
 
 /// The decode entries' `XS` of the routed layer of `scope`, as its graph
@@ -1448,7 +1467,7 @@ impl DecodeDemand {
                     recurrent_component,
                     index,
                 )?;
-                recurrent_component += 2;
+                recurrent_component += binding.bank_components();
             }
         }
 
@@ -1862,7 +1881,16 @@ pub(crate) mod tests {
             .map(|kind| bytes(*kind).resident_bytes)
             .sum::<u64>()
             + windows;
-        assert_eq!(streamed(&with), streamed(&without) + ngram);
+        // `ngram_inject`'s row reads its streams, its 2S scales and its
+        // value row, and writes its streams, all F32.
+        let magnitude_family_contracts::ResidualForm::HyperConnections(residual) =
+            &definition.decoder.residual
+        else {
+            panic!("the qwen4exp fixture keeps hyper-connection streams");
+        };
+        let (s, h) = (residual.streams, definition.decoder.hidden);
+        let inject_rows = 4 * (2 * s * h + 2 * s + h);
+        assert_eq!(streamed(&with), streamed(&without) + ngram + inject_rows);
     }
 
     #[test]

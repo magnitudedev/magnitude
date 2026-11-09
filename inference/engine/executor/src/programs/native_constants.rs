@@ -214,6 +214,19 @@ impl GraphConstant {
         )
     }
 
+    /// A rank-1 `u32` constant.
+    pub(crate) fn u32<G: GraphDraft>(graph: &mut G, values: &[u32]) -> Result<Self, GraphError> {
+        Self::rank1(
+            graph,
+            Element::u32(),
+            values.len(),
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        )
+    }
+
     /// A rank-1 `u64` constant.
     pub(crate) fn u64<G: GraphDraft>(graph: &mut G, values: &[u64]) -> Result<Self, GraphError> {
         Self::rank1(

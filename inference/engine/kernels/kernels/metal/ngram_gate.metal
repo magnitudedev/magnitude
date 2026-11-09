@@ -1,7 +1,9 @@
 // ngram_gate (contract and portable body in ngram.seismic): each row's
 // per-stream gate sigmoid(g) and the inverse RMS of the gated value. One
 // threadgroup per (stream, row) reduces the stream's key and query square
-// sums, their normalized product, and the value row's square sum.
+// sums, their normalized product, and the value row's square sum. Under the
+// stored product (PR = 1) the query weight is one, which leaves each term's
+// bits as the body's.
 #include "lib/core/activation.h"
 #include "lib/core/reduce.h"
 
@@ -38,8 +40,10 @@ kernel void ngram_gate(
         const float vv = v[i * SEISMIC_VALUE_STRIDE_1];
         keys = metal::fma(kv, kv, keys);
         queries = metal::fma(xv, xv, queries);
+        const float qn = SEISMIC_DIM_PR == 1 ? 1.0f
+            : element::at<QueryNorm>(query_norm, stream * SEISMIC_QUERY_NORM_STRIDE_0 + i * SEISMIC_QUERY_NORM_STRIDE_1);
         dot += kv * element::at<KeyNorm>(key_norm, stream * SEISMIC_KEY_NORM_STRIDE_0 + i * SEISMIC_KEY_NORM_STRIDE_1)
-            * xv * element::at<QueryNorm>(query_norm, stream * SEISMIC_QUERY_NORM_STRIDE_0 + i * SEISMIC_QUERY_NORM_STRIDE_1);
+            * xv * qn;
         values = metal::fma(vv, vv, values);
     }
     keys = reduce::group_sum<8>(keys, partials, sg, lane);

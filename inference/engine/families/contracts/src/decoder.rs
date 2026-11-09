@@ -297,7 +297,9 @@ pub enum Operator {
     DenseFfn(Box<DenseFfn>),
     RoutedFfn(Box<RoutedFfn>),
     PerLayerInput(Box<PerLayerInput>),
-    /// Deferred (§9): hashed n-gram rows gated into hyper-connection streams.
+    /// Hashed n-gram rows gated into hyper-connection streams. The main
+    /// decoder's n-gram input runs (`Decoder::deferred_forms` filters it
+    /// out); in a draft head it is still deferred (§9).
     NGramInput(Box<NGramInput>),
     /// Independent branches over the same residual input whose outputs sum.
     Parallel(Vec<Branch>),
@@ -999,18 +1001,20 @@ pub struct PerLayerInput {
 }
 
 /// Hashed n-gram rows gated into each of `S` hyper-connection streams of
-/// `H` (Qwen4 per-layer input). It reads the raw streams `X` and adds its
-/// `[S, H]` output to them, in F32:
+/// `H` (Qwen4's per-layer input, DeepSeek V4.1's Engram). It reads the raw
+/// streams `X` and adds its `[S, H]` output to them, in F32:
 ///
 /// ```text
 /// e    = concat_h(table[row_h(t)])                        ([heads·width])
-/// k[s] = RMS(key·e)[s] · key_norm[s]
-/// g[s] = (k[s] · RMS(X[s])·query_norm[s]) / sqrt(H);  g = sign(g)·sqrt(max(|g|, 1e-6))
+/// k[s] = RMS(key·e)[s];  q[s] = RMS(X[s])
+/// g[s] = Σ_c k[s,c]·q[s,c]·w[s,c] / sqrt(H);  g = sign(g)·sqrt(max(|g|, 1e-6))
 /// v[s] = sigmoid(g[s]) · (value·e)
-/// y    = v + silu(conv(RMS(v)·convolution_norm))
+/// y    = v                                    (no mixing)
+/// y    = v + silu(conv(RMS(v)·norm))          (a convolution)
 /// ```
 ///
-/// `conv` is depthwise and causal over each stream channel:
+/// `w` is the gate's weight (`NGramGate`). `conv` is depthwise and causal
+/// over each stream channel:
 /// `conv(x)[t] = Σ_j taps[j]·x[t − dilation·(kernel − 1 − j)]`, rows before
 /// the sequence reading zero.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1024,23 +1028,44 @@ pub struct NGramInput {
     pub key: WeightDescriptor,
     /// `[H, heads·width]`.
     pub value: WeightDescriptor,
-    /// `[S·H]` each, applied per stream.
-    pub key_norm: RmsNorm,
-    pub query_norm: RmsNorm,
-    pub convolution_norm: RmsNorm,
+    pub gate: NGramGate,
+    /// The epsilon of every RMS the input takes.
+    pub epsilon: f64,
+    /// The convolution of the gated value, when the input mixes it.
+    pub mixing: Option<NGramConvolution>,
+}
+
+/// The gate's per-column weight `w` (`[S·H]`, applied per stream).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum NGramGate {
+    /// The key's and the query's RMS norm weights: `w = key·query`.
+    Norms {
+        key: WeightDescriptor,
+        query: WeightDescriptor,
+    },
+    /// The product itself, stored as one weight.
+    Product(WeightDescriptor),
+}
+
+/// The convolution an n-gram input mixes its gated value with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NGramConvolution {
+    /// `[S·H]`, the RMS norm weight of `v`.
+    pub norm: WeightDescriptor,
     /// `[S·H, kernel]`.
-    pub convolution: WeightDescriptor,
+    pub taps: WeightDescriptor,
     pub kernel: u64,
     pub dilation: u64,
 }
 
-/// The table rows of position `t`. With `c[0] = token(t)` and `c[d]` its
-/// `d`-th predecessor, a predecessor that is missing or at or before the
-/// latest `reset` token preceding `t` reads as `reset` (a `reset` at `t`
+/// The table rows of position `t`. A token hashes as `token_map[token]`, or
+/// as itself without a map. With `c[0]` the hashed `token(t)` and `c[d]` its
+/// `d`-th predecessor's, a predecessor that is missing or at or before the
+/// latest `boundary` token preceding `t` reads as `fill` (a boundary at `t`
 /// itself still reads its own predecessors). Order `n` (`2..=context + 1`)
 /// hashes `m = XOR_{d < n} c[d]·multipliers[d]`, exact in `u64`; its
 /// `heads_per_order` heads `h` read row `offsets[h] + m mod sizes[h]`.
-/// Media rows hash the token that stands in their place.
+/// Media rows hash as `media` states.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NGramHash {
     /// Predecessors read.
@@ -1051,12 +1076,36 @@ pub struct NGramHash {
     /// `[heads]` each, order-major.
     pub sizes: Vec<u64>,
     pub offsets: Vec<u64>,
-    pub reset: u64,
+    /// `[vocabulary]`: the hashed id of each raw token.
+    pub token_map: Option<Vec<u32>>,
+    /// The hashed id a missing or cut predecessor reads.
+    pub fill: u64,
+    /// The raw token that cuts the lookback of the positions after it.
+    pub boundary: Option<u64>,
+    pub media: NGramMedia,
+}
+
+/// How a media row (a vision row in place of its token) hashes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NGramMedia {
+    /// As the token that stands in its place.
+    Hashed,
+    /// As `fill`, with every older predecessor read as `fill` and the row's
+    /// gate 0.
+    Blocking,
 }
 
 impl NGramHash {
     pub fn heads(&self) -> Result<u64, DefinitionError> {
         checked_product(&[self.context, self.heads_per_order])
+    }
+
+    /// The ids tokens hash as: the map's, or a decoder `vocabulary`'s.
+    pub fn hashed_vocabulary(&self, vocabulary: u64) -> u64 {
+        match &self.token_map {
+            Some(map) => map.iter().max().map_or(0, |id| u64::from(*id) + 1),
+            None => vocabulary,
+        }
     }
 
     /// The table rows of every position of `tokens`, `heads()` per position
@@ -1068,19 +1117,27 @@ impl NGramHash {
         let heads_per_order = self.heads_per_order as usize;
         let preceding = &preceding[preceding.len().saturating_sub(context)..];
         let history = preceding.iter().chain(tokens).copied().collect::<Vec<_>>();
+        let hashed = |token: u64| match &self.token_map {
+            Some(map) => u64::from(map[token as usize]),
+            None => token,
+        };
         let mut rows = Vec::with_capacity(tokens.len() * context * heads_per_order);
-        // The latest reset strictly before the position.
-        let mut latest = preceding.iter().rposition(|token| *token == self.reset);
+        // The latest boundary strictly before the position.
+        let mut latest = self
+            .boundary
+            .and_then(|boundary| preceding.iter().rposition(|token| *token == boundary));
         let mut c = vec![0u64; context + 1];
         for at in preceding.len()..history.len() {
-            if at > preceding.len() && history[at - 1] == self.reset {
+            if at > preceding.len() && Some(history[at - 1]) == self.boundary {
                 latest = Some(at - 1);
             }
-            c[0] = history[at];
+            c[0] = hashed(history[at]);
             for distance in 1..=context {
                 c[distance] = match at.checked_sub(distance) {
-                    Some(source) if latest.is_none_or(|reset| source > reset) => history[source],
-                    _ => self.reset,
+                    Some(source) if latest.is_none_or(|cut| source > cut) => {
+                        hashed(history[source])
+                    }
+                    _ => self.fill,
                 };
             }
             for order in 2..=context + 1 {
@@ -1848,45 +1905,63 @@ fn validate_indexer(
 }
 
 fn validate_ngram(input: &NGramInput, context: &Context) -> Result<(), DefinitionError> {
-    let (streams, _) = hyper_connection_geometry(context)
-        .ok_or_else(|| DefinitionError::new("n-gram input without low-rank hyper-connections"))?;
+    let ResidualForm::HyperConnections(HyperConnections { streams, .. }) = context.residual else {
+        return Err(DefinitionError::new("n-gram input without hyper-connections"));
+    };
     let hash = &input.hash;
     let heads = hash.heads()?;
     let rows = input.table.shape.first().copied().unwrap_or(0);
     let heads_in_table = hash.sizes.iter().zip(&hash.offsets).all(|(size, offset)| {
         *size > 0 && offset.checked_add(*size).is_some_and(|end| end <= rows)
     });
-    // Every product `token · multiplier` is exact in u64.
+    let mapped = hash
+        .token_map
+        .as_ref()
+        .is_none_or(|map| map.len() as u64 == context.vocabulary);
+    let hashed = hash.hashed_vocabulary(context.vocabulary);
+    // Every product `id · multiplier` of a hashed id is exact in u64.
     let exact = hash
         .multipliers
         .iter()
-        .all(|multiplier| *multiplier > 0 && multiplier.checked_mul(context.vocabulary).is_some());
+        .all(|multiplier| *multiplier > 0 && multiplier.checked_mul(hashed).is_some());
+    let mixing = input
+        .mixing
+        .as_ref()
+        .is_none_or(|mixing| mixing.kernel >= 2 && mixing.dilation > 0);
     if heads == 0
         || input.width == 0
-        || input.kernel < 2
-        || input.dilation == 0
         || hash.multipliers.len() as u64 != hash.context + 1
         || hash.sizes.len() as u64 != heads
         || hash.offsets.len() as u64 != heads
         || !heads_in_table
+        || !mapped
         || !exact
-        || hash.reset >= context.vocabulary
+        || hash.fill >= hashed
+        || hash.boundary.is_some_and(|boundary| boundary >= context.vocabulary)
+        || !mixing
     {
         return Err(DefinitionError::new("invalid n-gram input geometry"));
     }
+    positive_epsilon(input.epsilon)?;
     let embedding = checked_product(&[heads, input.width])?;
-    let wide = checked_product(&[streams, context.hidden])?;
+    let wide = checked_product(&[*streams, context.hidden])?;
     expect_shape(&input.table, &[rows, input.width], "n-gram table")?;
     expect_shape(&input.key, &[wide, embedding], "n-gram key")?;
     expect_shape(&input.value, &[context.hidden, embedding], "n-gram value")?;
-    validate_rms(&input.key_norm, wide, "n-gram key norm")?;
-    validate_rms(&input.query_norm, wide, "n-gram query norm")?;
-    validate_rms(&input.convolution_norm, wide, "n-gram convolution norm")?;
-    expect_shape(
-        &input.convolution,
-        &[wide, input.kernel],
-        "n-gram convolution",
-    )
+    match &input.gate {
+        NGramGate::Norms { key, query } => {
+            expect_shape(key, &[wide], "n-gram key norm")?;
+            expect_shape(query, &[wide], "n-gram query norm")?;
+        }
+        NGramGate::Product(weight) => expect_shape(weight, &[wide], "n-gram gate")?,
+    }
+    match &input.mixing {
+        None => Ok(()),
+        Some(mixing) => {
+            expect_shape(&mixing.norm, &[wide], "n-gram convolution norm")?;
+            expect_shape(&mixing.taps, &[wide, mixing.kernel], "n-gram convolution")
+        }
+    }
 }
 
 fn validate_gated_delta(delta: &GatedDelta, hidden: u64) -> Result<(), DefinitionError> {

@@ -1881,7 +1881,8 @@ pub struct PerLayerEntryBinding {
 /// An n-gram input sublayer (`operators::ngram`): its rows per position
 /// (`ngram_rows`), read from its stored table's slots, resident as `table`
 /// (`stored_rows`), projected to the key and value rows, gated into the
-/// streams (`ngram_gate`) and convolved over its window (`ngram_inject`).
+/// streams (`ngram_gate`), then added (`ngram_add`) or convolved over its
+/// window (`ngram_inject`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NGramBinding {
     pub hidden: u64,
@@ -1891,14 +1892,47 @@ pub struct NGramBinding {
     /// Rows gathered per order (P), each `width` wide.
     pub heads_per_order: u64,
     pub width: u64,
-    pub kernel: u64,
-    pub dilation: u64,
+    pub gate: NGramGateForm,
+    /// The convolution's, when the input mixes its gated value.
+    pub convolution: Option<NGramTaps>,
     pub table: Element,
     pub key: Element,
     pub value: Element,
-    /// The key, query and convolution norms'.
+    /// The gate's weights' and the convolution norm's.
     pub norm: Element,
     pub activation: Element,
+}
+
+/// The weights `ngram_gate` weighs its product by: the key and query norms,
+/// or their stored product alone (its `PR` form).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NGramGateForm {
+    Norms,
+    Product,
+}
+
+impl NGramGateForm {
+    /// `ngram_gate`'s `PR`.
+    pub fn product(self) -> u64 {
+        match self {
+            Self::Norms => 0,
+            Self::Product => 1,
+        }
+    }
+}
+
+/// An n-gram convolution's taps (K) and their dilation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NGramTaps {
+    pub kernel: u64,
+    pub dilation: u64,
+}
+
+impl NGramTaps {
+    /// The window rows before a state: `dilation (kernel - 1)`.
+    pub fn reach(self) -> u64 {
+        self.dilation * (self.kernel - 1)
+    }
 }
 
 impl NGramBinding {
@@ -1915,6 +1949,12 @@ impl NGramBinding {
     /// The streams' channels, `S * H`.
     pub fn channels(&self) -> u64 {
         self.streams * self.hidden
+    }
+
+    /// Its bank components: under a convolution its window, then its token
+    /// window.
+    pub fn bank_components(&self) -> usize {
+        1 + usize::from(self.convolution.is_some())
     }
 }
 

@@ -1,6 +1,7 @@
 // ngram_gate on CPU (contract and portable body in ngram.seismic): one work
 // item per row, which publishes each stream's gate sigmoid(g) and the
-// inverse RMS of its gated value row.
+// inverse RMS of its gated value row. Under the stored product (PR = 1) the
+// query weight is one, which leaves each term's bits as the body's.
 
 use lib::core::{activation, reduce};
 
@@ -12,8 +13,12 @@ fn ngram_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], 
     for stream in 0..s {
         cx.arg_key_norm()
             .decode_row(stream, &mut key_norm[stream * h..(stream + 1) * h]);
-        cx.arg_query_norm()
-            .decode_row(stream, &mut query_norm[stream * h..(stream + 1) * h]);
+        match cx.dim_pr() {
+            0 => cx
+                .arg_query_norm()
+                .decode_row(stream, &mut query_norm[stream * h..(stream + 1) * h]),
+            _ => query_norm[stream * h..(stream + 1) * h].fill(1.0),
+        }
     }
     let epsilon = cx.arg_epsilon();
     let values = reduce::sum_squares(&cx.arg_value().row([row, 0])[..h]) / h as f32;

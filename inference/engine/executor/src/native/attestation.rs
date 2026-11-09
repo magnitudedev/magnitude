@@ -1009,7 +1009,7 @@ impl AttestedPrograms {
                             .ngram
                             .get(&binding)
                             .cloned()
-                            .ok_or_else(|| missing("ngram_inject", binding))
+                            .ok_or_else(|| missing("ngram_gate", binding))
                     })
                     .transpose()?;
                 // Only the target's routed layers stream: a draft head reading

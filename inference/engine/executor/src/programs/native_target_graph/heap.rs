@@ -95,14 +95,17 @@ impl PlannedSealedGraphs {
 /// publication nodes, `constants` constants and `state` state ports. What
 /// the planner counts from a block's template and what
 /// `PreparedTargetBlockGraph::prepare` leaves a graph holding.
-pub(super) fn owned_vectors_heap(weights: usize, banks: usize, parks: usize, constants: usize, state: usize) -> HostHeap {
+pub(super) fn owned_vectors_heap(weights: usize, banks: usize, parks: usize, constants: usize, state: [usize; 2]) -> HostHeap {
     use std::mem::size_of;
     let mut heap = HostHeap::default();
     heap.hold(weights, size_of::<(WeightPort, NativePort)>());
     heap.hold(banks, size_of::<(BankPort, NativePort)>());
     heap.hold(parks, size_of::<(GraphTimeline, NativeTimelinePort<seismic::timeline::Parks>)>());
     heap.hold(constants, size_of::<GraphConstant>());
-    heap.hold(state, size_of::<NativePort>());
+    // A block's history planes and its bank components.
+    for ports in state {
+        heap.hold(ports, size_of::<NativePort>());
+    }
     heap
 }
 

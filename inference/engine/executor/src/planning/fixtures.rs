@@ -524,7 +524,8 @@ pub fn qwen4exp_fixture_definition() -> ModelDefinition {
 /// `ExpertBankPlan::hints`).
 pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> ModelDefinition {
     use magnitude_family_contracts::{
-        ExpertSelection, GatedDelta, NGramHash, NGramInput, RecurrentHeadMapping,
+        ExpertSelection, GatedDelta, NGramConvolution, NGramGate, NGramHash, NGramInput,
+        NGramMedia, RecurrentHeadMapping,
         RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
         SharedExpertGate,
     };
@@ -616,18 +617,26 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
             multipliers: vec![1, 7, 13],
             sizes: vec![NGRAM_ROWS / heads; heads as usize],
             offsets: (0..heads).map(|head| head * NGRAM_ROWS / heads).collect(),
-            reset: 1,
+            token_map: None,
+            fill: 1,
+            boundary: Some(1),
+            media: NGramMedia::Hashed,
         },
         width: NGRAM_WIDTH,
         table: descriptor("per_layer_token_embd.weight", &[NGRAM_ROWS, NGRAM_WIDTH]),
         key: descriptor("blk.0.ngram_k", &[wide, heads * NGRAM_WIDTH]),
         value: descriptor("blk.0.ngram_v", &[hidden, heads * NGRAM_WIDTH]),
-        key_norm: rms("blk.0.ngram_k_norm", wide),
-        query_norm: rms("blk.0.ngram_q_norm", wide),
-        convolution_norm: rms("blk.0.ngram_conv_norm", wide),
-        convolution: descriptor("blk.0.ngram_conv", &[wide, 4]),
-        kernel: 4,
-        dilation: 1,
+        gate: NGramGate::Norms {
+            key: descriptor("blk.0.ngram_k_norm", &[wide]),
+            query: descriptor("blk.0.ngram_q_norm", &[wide]),
+        },
+        epsilon: 1e-6,
+        mixing: Some(NGramConvolution {
+            norm: descriptor("blk.0.ngram_conv_norm", &[wide]),
+            taps: descriptor("blk.0.ngram_conv", &[wide, 4]),
+            kernel: 4,
+            dilation: 1,
+        }),
     }));
     let attention = decoder.blocks[0].sublayers[0].op.clone();
     decoder.blocks = vec![
@@ -653,6 +662,53 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
     }));
     definition
 }
+
+/// A DeepSeek V4.1-shaped decoder: the Sinkhorn fixture's two attention
+/// blocks, block 0 ending with an Engram input (the trailing sublayer of
+/// the block before its layer) that hashes mapped ids with a fill and no
+/// boundary, gated by one stored product weight and added without a
+/// convolution. The value projection is `ENGRAM_VALUE`.
+pub fn engram_fixture_definition() -> ModelDefinition {
+    use magnitude_family_contracts::{NGramGate, NGramHash, NGramInput, NGramMedia};
+    const WIDTH: u64 = 32;
+    const ROWS: u64 = 96;
+    let mut definition = sinkhorn_fixture_definition(2);
+    let decoder = &mut definition.decoder;
+    let (hidden, wide) = (decoder.hidden, STREAMS * decoder.hidden);
+    let (context, heads_per_order) = (3, 2);
+    let heads = context * heads_per_order;
+    // Raw ids sharing hashed ids, as a compressed vocabulary's do.
+    let token_map = (0..decoder.vocabulary as u32).map(|token| (token * 7 + 2) % 61).collect();
+    let ngram = Operator::NGramInput(Box::new(NGramInput {
+        hash: NGramHash {
+            context,
+            heads_per_order,
+            multipliers: vec![(1 << 40) + 3, 1_000_003, (1 << 41) + 17, 999_983],
+            sizes: vec![ROWS / heads; heads as usize],
+            offsets: (0..heads).map(|head| head * ROWS / heads).collect(),
+            token_map: Some(token_map),
+            fill: 2,
+            boundary: None,
+            media: NGramMedia::Blocking,
+        },
+        width: WIDTH,
+        table: descriptor("per_layer_token_embd.weight", &[ROWS, WIDTH]),
+        key: descriptor("blk.1.engram_k", &[wide, heads * WIDTH]),
+        value: descriptor(ENGRAM_VALUE, &[hidden, heads * WIDTH]),
+        gate: NGramGate::Product(descriptor("blk.1.engram_gate", &[wide])),
+        epsilon: 1e-6,
+        mixing: None,
+    }));
+    decoder.blocks[0].sublayers.push(Sublayer {
+        input: InputNorm::None,
+        op: ngram,
+        output: OutputForm::Residual,
+    });
+    definition
+}
+
+/// The value projection of [`engram_fixture_definition`]'s Engram input.
+pub const ENGRAM_VALUE: &str = "blk.1.engram_v";
 
 /// The fixture manifest of `definition`, its n-gram tables stored as
 /// IQ4_NL blocks (the stored form a streamed table reads).

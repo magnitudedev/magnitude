@@ -423,26 +423,27 @@ fn delta_bank(recurrent: &GatedDelta, activation: DType) -> Result<[BankComponen
 }
 
 /// The n-gram input's bank components, in the order its entries take them:
-/// its window of u rows (`ngram_inject`), F32, over the decoder's S * H
-/// stream channels, `dilation (kernel - 1)` rows before the state (a dense
-/// window of that reach plus one); then its token window (`ngram_rows`),
-/// the sequence's `context` tokens before the state, each stored as
-/// token + 1 in one U32 channel so the zero seed holds no token.
-fn ngram_bank(decoder: &Decoder, input: &NGramInput) -> Result<[BankComponent; 2], String> {
+/// with a convolution, its window of u rows (`ngram_inject`), F32, over the
+/// decoder's S * H stream channels, `dilation (kernel - 1)` rows before the
+/// state (a dense window of that reach plus one); then its token window
+/// (`ngram_rows`), the sequence's `context` tokens before the state, each
+/// stored as token + 1 in one U32 channel so the zero seed holds no token.
+fn ngram_bank(decoder: &Decoder, input: &NGramInput) -> Result<Vec<BankComponent>, String> {
     let ResidualForm::HyperConnections(streams) = &decoder.residual else {
         return Err("an n-gram input without residual streams".into());
     };
-    let reach = input
-        .dilation
-        .checked_mul(
-            input
-                .kernel
-                .checked_sub(1)
-                .ok_or("n-gram kernel must be positive")?,
-        )
-        .ok_or("n-gram reach overflows")?;
-    Ok([
-        BankComponent::ConvWindow {
+    let mut bank = Vec::with_capacity(2);
+    if let Some(mixing) = &input.mixing {
+        let reach = mixing
+            .dilation
+            .checked_mul(
+                mixing
+                    .kernel
+                    .checked_sub(1)
+                    .ok_or("n-gram kernel must be positive")?,
+            )
+            .ok_or("n-gram reach overflows")?;
+        bank.push(BankComponent::ConvWindow {
             width: host(reach + 1, "n-gram convolution reach")?,
             channels: host(
                 streams
@@ -452,20 +453,21 @@ fn ngram_bank(decoder: &Decoder, input: &NGramInput) -> Result<[BankComponent; 2
                 "n-gram channels",
             )?,
             dtype: DType::F32,
-        },
-        BankComponent::ConvWindow {
-            width: host(
-                input
-                    .hash
-                    .context
-                    .checked_add(1)
-                    .ok_or("n-gram context overflows")?,
-                "n-gram context",
-            )?,
-            channels: 1,
-            dtype: DType::U32,
-        },
-    ])
+        });
+    }
+    bank.push(BankComponent::ConvWindow {
+        width: host(
+            input
+                .hash
+                .context
+                .checked_add(1)
+                .ok_or("n-gram context overflows")?,
+            "n-gram context",
+        )?,
+        channels: 1,
+        dtype: DType::U32,
+    });
+    Ok(bank)
 }
 
 /// A short convolution's bank: its window of `u = B⊙X` rows, stored F32 so
@@ -807,18 +809,26 @@ mod tests {
                 multipliers: vec![3, 5, 7],
                 sizes: vec![5, 7],
                 offsets: vec![0, 5],
-                reset: 7,
+                token_map: None,
+                fill: 7,
+                boundary: Some(7),
+                media: magnitude_family_contracts::NGramMedia::Hashed,
             },
             width: 2,
             table: weight(&[12, 2]),
             key: weight(&[128, 4]),
             value: weight(&[32, 4]),
-            key_norm: norm(128),
-            query_norm: norm(128),
-            convolution_norm: norm(128),
-            convolution: weight(&[128, 4]),
-            kernel: 4,
-            dilation: 3,
+            gate: magnitude_family_contracts::NGramGate::Norms {
+                key: weight(&[128]),
+                query: weight(&[128]),
+            },
+            epsilon: 1e-6,
+            mixing: Some(magnitude_family_contracts::NGramConvolution {
+                norm: weight(&[128]),
+                taps: weight(&[128, 4]),
+                kernel: 4,
+                dilation: 3,
+            }),
         };
         let mut decoder = decoder(
             ActivationDType::BF16,
@@ -868,6 +878,14 @@ mod tests {
         assert_eq!(layout.target_recurrent[1].shape, [9 + 2, 128]);
         assert_eq!(layout.target_recurrent[2].shape, [2 + 2, 1]);
         assert_eq!(layout.target_recurrent[2].dtype, DType::U32);
+        // Without a convolution, its token window alone.
+        let Operator::NGramInput(input) = &mut decoder.blocks[0].sublayers[1].op else {
+            unreachable!()
+        };
+        input.mixing = None;
+        let layout = ModelStateLayout::derive(&decoder, &[], KvCodec::Dense, 2).unwrap();
+        assert_eq!(layout.target_banks.len(), 2);
+        assert_eq!(layout.target_recurrent[1].shape, [2 + 2, 1]);
     }
 
     #[test]

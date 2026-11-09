@@ -288,19 +288,19 @@
     "draft": "9e1f09d3d06bd60fc3e4484a8ba163967c59f5848e09215d3c83dc3e7984482e"
   },
   "qwen3.8-flash-next:gguf:nvfp4": {
-    "target": "fa5c1e68538e71790c52450f51b56972180cee4527102d345b40835cbcb152e0",
+    "target": "7fe43c88b1c5ee77a20640d4b928790eacb16e6b3ab2b4dcae046a804356427f",
     "draft": "rejected"
   },
   "qwen3.8-flash-next:gguf:q4": {
-    "target": "ea3955f32402bc9182711c9a50614ae1fa731e0568b62a07d4e2ed6e225de8c3",
+    "target": "aabaeded3b50401b689c8fac2e63377d69a7fe28db8669e7409e234028ec72f1",
     "draft": "rejected"
   },
   "qwen3.8-flash-next:gguf:q6": {
-    "target": "ea3955f32402bc9182711c9a50614ae1fa731e0568b62a07d4e2ed6e225de8c3",
+    "target": "aabaeded3b50401b689c8fac2e63377d69a7fe28db8669e7409e234028ec72f1",
     "draft": "rejected"
   },
   "qwen3.8-flash-next:gguf:q8": {
-    "target": "ea3955f32402bc9182711c9a50614ae1fa731e0568b62a07d4e2ed6e225de8c3",
+    "target": "aabaeded3b50401b689c8fac2e63377d69a7fe28db8669e7409e234028ec72f1",
     "draft": "rejected"
   }
 }

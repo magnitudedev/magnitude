@@ -3076,19 +3076,31 @@ fn a_forward_replaces_the_tokens_at_and_after_its_position() {
 /// history) equal the rows the device's `ngram_rows` names from the step's
 /// tokens and the bank's token window: through a prefill chunk, a
 /// verification of which only some rows are accepted, and the decode that
-/// continues from the tape version.
+/// continues from the tape version. Both rules: raw ids cut at a boundary
+/// (qwen4exp's), and mapped ids with a fill and no boundary (DeepSeek
+/// V4.1's).
 #[test]
 fn host_rows_from_the_token_history_equal_the_device_rows() {
-    use magnitude_family_contracts::NGramHash;
+    use magnitude_family_contracts::{NGramHash, NGramMedia};
     use magnitude_kernels::ngram_rows;
     use seismic::{BackendName, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
-    let hash = NGramHash {
+    let raw = NGramHash {
         context: 2,
         heads_per_order: 8,
         multipliers: vec![(i64::MAX as u64 / 248_320) | 1, 1_000_003, (1 << 41) + 17],
         sizes: (0..16).map(|head| 20_000_003 + 2 * head).collect(),
         offsets: (0..16).map(|head| head * 20_000_040).collect(),
-        reset: 7,
+        token_map: None,
+        fill: 7,
+        boundary: Some(7),
+        media: NGramMedia::Hashed,
+    };
+    let mapped = NGramHash {
+        token_map: Some((0..64u32).map(|token| (token * 5 + 3) % 41).collect()),
+        fill: 3,
+        boundary: None,
+        media: NGramMedia::Blocking,
+        ..raw.clone()
     };
     let (context, heads) = (2u64, 16usize);
     let tape = 3u64;
@@ -3128,7 +3140,7 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
         (9, vec![22, 7, 31, 5], (1, 0), 1, 2, 2),
         (11, vec![17], (2, 1), 1, 3, 1),
     ];
-    for device in devices {
+    for (device, hash) in devices.iter().flat_map(|device| [(device, &raw), (device, &mapped)]) {
         let backend = device.backend().as_str();
         let mut slabs = SlabTensor::new(
             &device,
@@ -3163,6 +3175,8 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
             &implementation.default_specialization(&statics).unwrap(),
         )
         .unwrap();
+        let map = hash.token_map.as_deref().unwrap_or(&[]);
+        let boundary = hash.boundary.map(|token| token as i32).into_iter().collect::<Vec<_>>();
         let mut history = super::input::TokenHistory::default();
         for (position, fed, (source, taped), stop, target, accepted) in &steps {
             let fed = tokens(fed);
@@ -3187,13 +3201,21 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
                     multipliers: &words(&device, &hash.multipliers),
                     sizes: &words(&device, &hash.sizes),
                     offsets: &words(&device, &hash.offsets),
+                    map: &Tensor::from_host(
+                        &device,
+                        Element::u32(),
+                        &[map.len() as u64],
+                        &map.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
+                    boundary: &ints(&device, &[boundary.len() as u64], &boundary),
                     segments: &ints(&device, &[2, 2], &[0, rows as i32, rows as i32, rows as i32]),
                     stop: &ints(&device, &[1], &[*stop]),
                     previous_bank: &ints(&device, &[1], &[*source]),
                     previous_tape: &ints(&device, &[1], &[*taped]),
                     following_bank: &ints(&device, &[1], &[*target]),
                     window: &mut window,
-                    reset: hash.reset as i32,
+                    fill: hash.fill as i32,
                     slab_banks: slab_banks as u32,
                 })
                 .unwrap()

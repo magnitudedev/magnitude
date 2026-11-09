@@ -1567,6 +1567,40 @@ fn a_chain_of_prompt_chunks_equals_its_chunks_one_step_at_a_time() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
+/// On Metal and on the CPU: an Engram input (DeepSeek V4.1's form: mapped
+/// ids, a fill and no boundary, the stored product gate, no convolution)
+/// ending an attention block over Sinkhorn streams adds `gate · value`, so
+/// at a zero value projection it adds exactly nothing. Two prompt chunks,
+/// whose second reads the first's token window, then equal bit for bit
+/// those of the decoder without it: the Sinkhorn `pre` the block carries
+/// passes through the input unchanged, and the input's bank binds beside
+/// the attention history under its own slot tables.
+#[test]
+fn a_zero_valued_engram_input_leaves_its_attention_decoder_unchanged() {
+    use crate::planning::fixtures::{ENGRAM_VALUE, engram_fixture_definition};
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let zero = |name: &str| (name == ENGRAM_VALUE).then_some(0.0);
+    let (directory, with, package) =
+        fixture_valued("engram-zero", engram_fixture_definition(), stored_table_manifest, &zero);
+    // The same file, its Engram tensors unread.
+    let mut without = (*with).clone();
+    without.decoder.blocks[0].sublayers.truncate(2);
+    let without = Rc::new(without);
+    let prompts = Prompts {
+        requests: 1,
+        chunks: 2,
+        rows: CHUNK_ROWS,
+    };
+    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
+    for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
+        let (added, _) = chained_prompts(&catalog, &with, &package, backend, prompts, 1, Banked::Resident);
+        let (plain, _) = chained_prompts(&catalog, &without, &package, backend, prompts, 1, Banked::Resident);
+        assert_steps_equal(&plain, &added, prompts, &format!("{backend:?}: with a zero-valued Engram input"));
+    }
+    std::fs::remove_dir_all(&directory).ok();
+}
+
 /// Rows of one prompt chunk of the split-pass test: Metal's admitted launch
 /// bound, a prompt class, so every routed layer's backs merge into the
 /// group's pass.

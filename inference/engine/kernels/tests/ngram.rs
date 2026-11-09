@@ -1,5 +1,5 @@
-// `ngram_rows`, `ngram_gate` and `ngram_inject` against their portable
-// bodies, on every backend this host opens.
+// `ngram_rows`, `ngram_gate`, `ngram_add` and `ngram_inject` against their
+// portable bodies, on every backend this host opens.
 //
 // `ngram_rows` is exact: its rows and token windows equal the body's and an
 // independent statement of the row rule, across chunk boundaries and tape
@@ -13,7 +13,7 @@ mod common;
 mod declared;
 mod versions_common;
 
-use magnitude_kernels::{ngram_gate, ngram_inject, ngram_rows};
+use magnitude_kernels::{ngram_add, ngram_gate, ngram_inject, ngram_rows};
 use seismic::{Device, Element, Tensor};
 use versions_common::*;
 
@@ -77,6 +77,7 @@ fn values(random: &mut Random, count: usize, scale: f32) -> Vec<f32> {
 fn interpret(
     source: &str,
     entry: &str,
+    norms: bool,
     tensors: Vec<seismic_lang::interp::TensorData>,
     scalars: Vec<seismic_lang::reference_math::ReferenceScalar>,
     mutable: Option<usize>,
@@ -95,7 +96,10 @@ fn interpret(
         text: source.into(),
     });
     let module = crate::common::check(sources);
-    let elements = ElementBindings::new().bind("NW", registry::dense(DType::F32));
+    let elements = match norms {
+        true => ElementBindings::new().bind("NW", registry::dense(DType::F32)),
+        false => ElementBindings::new(),
+    };
     let logical = module
         .entry(module.entry_named(entry).unwrap(), &elements)
         .unwrap();
@@ -158,6 +162,8 @@ struct GateCase {
     rows: usize,
     streams: usize,
     hidden: usize,
+    /// The stored product (`key_norm` alone, PR = 1).
+    product: bool,
     x: Vec<f32>,
     key: Vec<f32>,
     value: Vec<f32>,
@@ -166,19 +172,27 @@ struct GateCase {
 }
 
 impl GateCase {
-    fn new(rows: usize, streams: usize, hidden: usize, seed: u64) -> Self {
+    fn new(rows: usize, streams: usize, hidden: usize, product: bool, seed: u64) -> Self {
         let mut random = Random(seed);
         let wide = rows * streams * hidden;
         Self {
             rows,
             streams,
             hidden,
+            product,
             x: values(&mut random, wide, 3.0),
             key: values(&mut random, wide, 2.0),
             value: values(&mut random, rows * hidden, 1.5),
             key_norm: values(&mut random, streams * hidden, 1.0),
-            query_norm: values(&mut random, streams * hidden, 1.0),
+            query_norm: match product {
+                true => Vec::new(),
+                false => values(&mut random, streams * hidden, 1.0),
+            },
         }
+    }
+
+    fn form(&self) -> usize {
+        usize::from(self.product)
     }
 
     fn oracle(&self) -> Vec<f32> {
@@ -186,12 +200,14 @@ impl GateCase {
         interpret(
             include_str!("../kernels/ngram.seismic"),
             "ngram_gate",
+            true,
             vec![
                 floats(vec![m, s, h], &self.x),
                 floats(vec![m, s, h], &self.key),
                 floats(vec![m, h], &self.value),
                 floats(vec![s, h], &self.key_norm),
-                floats(vec![s, h], &self.query_norm),
+                floats(vec![s * (1 - self.form()), h], &self.query_norm),
+                integers(vec![0, self.form()], Vec::new()),
             ],
             vec![seismic_lang::reference_math::ReferenceScalar::F32(
                 EPSILON.to_bits(),
@@ -203,10 +219,11 @@ impl GateCase {
 
     fn native(&self, device: &Device) -> Vec<f32> {
         let (m, s, h) = (self.rows as u64, self.streams as u64, self.hidden as u64);
+        let pr = self.form() as u64;
         let kernel = at_defaults(
             device,
             ngram_gate::native_entry_with(ngram_gate::Elements { NW: Element::f32() }),
-            &[("H", h), ("S", s)],
+            &[("H", h), ("S", s), ("PR", pr)],
         )
         .unwrap();
         let result = kernel
@@ -215,7 +232,8 @@ impl GateCase {
                 key: &tensor(device, Element::f32(), &[m, s, h], &self.key),
                 value: &tensor(device, Element::f32(), &[m, h], &self.value),
                 key_norm: &tensor(device, Element::f32(), &[s, h], &self.key_norm),
-                query_norm: &tensor(device, Element::f32(), &[s, h], &self.query_norm),
+                query_norm: &tensor(device, Element::f32(), &[s * (1 - pr), h], &self.query_norm),
+                form: &ints(device, &[0, pr], &[]),
                 epsilon: EPSILON,
             })
             .unwrap()
@@ -226,19 +244,148 @@ impl GateCase {
 
 #[test]
 fn gate_natives_match_the_portable_body() {
-    for (rows, streams, hidden, seed) in [(1, 4, 64, 1), (5, 4, 160, 2), (17, 2, 300, 3)] {
-        let case = GateCase::new(rows, streams, hidden, seed);
+    let cases = [(1, 4, 64, false, 1), (5, 4, 160, false, 2), (17, 2, 300, false, 3)]
+        // The stored product, at V4.1's streams (CPU and Metal).
+        .into_iter()
+        .chain([(1, 4, 64, true, 4), (9, 4, 160, true, 5)]);
+    for (rows, streams, hidden, product, seed) in cases {
+        let case = GateCase::new(rows, streams, hidden, product, seed);
         let oracle = case.oracle();
         for device in devices() {
+            if product && !matches!(device.backend().as_str(), "cpu" | "metal") {
+                continue;
+            }
             check_close(
                 &format!(
-                    "{} gate {rows}x{streams}x{hidden}",
+                    "{} gate {rows}x{streams}x{hidden} (product {product})",
                     device.backend().as_str()
                 ),
                 &case.native(&device),
                 &oracle,
             );
         }
+    }
+}
+
+/// `ngram_add`: each stream's gate times the value row, added to the
+/// streams.
+#[test]
+fn add_natives_match_the_portable_body() {
+    for (rows, streams, hidden, seed) in [(1, 4, 64, 1), (7, 4, 160, 2), (3, 2, 300, 3)] {
+        let mut random = Random(seed);
+        let x = values(&mut random, rows * streams * hidden, 3.0);
+        let scales = values(&mut random, rows * 2 * streams, 1.0);
+        let value = values(&mut random, rows * hidden, 1.5);
+        let (oracle, _) = interpret(
+            include_str!("../kernels/ngram.seismic"),
+            "ngram_add",
+            false,
+            vec![
+                floats(vec![rows, streams * hidden], &x),
+                floats(vec![rows, 2 * streams], &scales),
+                floats(vec![rows, hidden], &value),
+            ],
+            Vec::new(),
+            None,
+        );
+        let (m, s, h) = (rows as u64, streams as u64, hidden as u64);
+        for device in devices() {
+            let backend = device.backend().as_str();
+            let kernel = at_defaults(&device, ngram_add::native_entry(), &[("H", h), ("S", s)]).unwrap();
+            let result = kernel
+                .call(ngram_add::Args {
+                    hidden: &tensor(&device, Element::f32(), &[m, s * h], &x),
+                    scales: &tensor(&device, Element::f32(), &[m, 2 * s], &scales),
+                    value: &tensor(&device, Element::f32(), &[m, h], &value),
+                })
+                .unwrap()
+                .value;
+            check_close(&format!("{backend} add {rows}x{streams}x{hidden}"), &read(&result), &oracle);
+        }
+    }
+}
+
+/// DeepSeek V4.1's Engram output at its shape (S 4, H 5120): `ngram_gate`
+/// under the stored product, then `ngram_add`, equal the reference's
+/// `engram` (`families/deepseek41.py`, unfused) evaluated in f64 from the same key,
+/// value and streams:
+/// `streams + sigmoid(copysign(sqrt(max(|dot|, 1e-6)), dot)) · value`,
+/// `dot = Σ streams·w·key · rsqrt(mean streams² + ε) · rsqrt(mean key² + ε) / sqrt(H)`.
+#[test]
+fn product_gate_then_add_equal_the_reference_engram_at_v41s_shape() {
+    const ENGRAM_CLAMP: f64 = 1e-6;
+    let (rows, streams, hidden) = (3usize, 4usize, 5120usize);
+    let epsilon = 1e-20f32;
+    let mut random = Random(41);
+    let x = values(&mut random, rows * streams * hidden, 3.0);
+    let key = values(&mut random, rows * streams * hidden, 2.0);
+    let value = values(&mut random, rows * hidden, 1.5);
+    let weight = values(&mut random, streams * hidden, 1.0);
+    let mut expected = vec![0f32; rows * streams * hidden];
+    let mut gates = Vec::new();
+    for row in 0..rows {
+        for stream in 0..streams {
+            let at = |column: usize| (row * streams + stream) * hidden + column;
+            let mean = |of: &[f32]| {
+                (0..hidden).map(|column| f64::from(of[at(column)]).powi(2)).sum::<f64>() / hidden as f64
+            };
+            let scale = 1.0 / (mean(&x) + f64::from(epsilon)).sqrt() / (mean(&key) + f64::from(epsilon)).sqrt();
+            let dot = (0..hidden)
+                .map(|column| {
+                    f64::from(x[at(column)]) * f64::from(weight[stream * hidden + column]) * f64::from(key[at(column)])
+                })
+                .sum::<f64>()
+                * scale
+                / (hidden as f64).sqrt();
+            let gate = 1.0 / (1.0 + (-dot.abs().max(ENGRAM_CLAMP).sqrt().copysign(dot)).exp());
+            gates.push(gate as f32);
+            for column in 0..hidden {
+                expected[at(column)] =
+                    (f64::from(x[at(column)]) + gate * f64::from(value[row * hidden + column])) as f32;
+            }
+        }
+    }
+    let (m, s, h) = (rows as u64, streams as u64, hidden as u64);
+    for device in devices() {
+        let backend = device.backend().as_str();
+        if !matches!(backend, "cpu" | "metal") {
+            continue;
+        }
+        let gate = at_defaults(
+            &device,
+            ngram_gate::native_entry_with(ngram_gate::Elements { NW: Element::f32() }),
+            &[("H", h), ("S", s), ("PR", 1)],
+        )
+        .unwrap();
+        let hidden_rows = tensor(&device, Element::f32(), &[m, s, h], &x);
+        let value_rows = tensor(&device, Element::f32(), &[m, h], &value);
+        let scales = gate
+            .call(ngram_gate::Args {
+                hidden: &hidden_rows,
+                key: &tensor(&device, Element::f32(), &[m, s, h], &key),
+                value: &value_rows,
+                key_norm: &tensor(&device, Element::f32(), &[s, h], &weight),
+                query_norm: &tensor(&device, Element::f32(), &[0, h], &[]),
+                form: &ints(&device, &[0, 1], &[]),
+                epsilon,
+            })
+            .unwrap()
+            .value;
+        let natives = read(&scales)
+            .chunks_exact(2 * streams)
+            .flat_map(|row| row[..streams].to_vec())
+            .collect::<Vec<_>>();
+        check_close(&format!("{backend} engram gates at V4.1's shape"), &natives, &gates);
+        let add = at_defaults(&device, ngram_add::native_entry(), &[("H", h), ("S", s)]).unwrap();
+        let result = add
+            .call(ngram_add::Args {
+                hidden: &tensor(&device, Element::f32(), &[m, s * h], &x),
+                scales: &scales,
+                value: &value_rows,
+            })
+            .unwrap()
+            .value;
+        check_close(&format!("{backend} engram at V4.1's shape"), &read(&result), &expected);
     }
 }
 
@@ -334,6 +481,7 @@ impl Case {
         let (result, window) = interpret(
             include_str!("../kernels/ngram.seismic"),
             "ngram_inject",
+            true,
             vec![
                 floats(vec![self.rows, ch], &self.hidden),
                 floats(vec![self.rows, 2 * s], &self.scales),
@@ -619,10 +767,14 @@ struct RowRule {
     multipliers: Vec<u64>,
     sizes: Vec<u64>,
     offsets: Vec<u64>,
-    reset: i32,
+    /// The hashed id of each raw token; empty hashes raw ids.
+    map: Vec<u32>,
+    fill: i32,
+    boundary: Option<i32>,
 }
 
 impl RowRule {
+    /// Qwen4's form: raw ids, token 7 both the boundary and the fill.
     fn sample() -> Self {
         let sizes = vec![101, 103, 1_000_003, 107, 109, 50_000_017];
         let offsets = sizes
@@ -639,7 +791,20 @@ impl RowRule {
             multipliers: vec![(1 << 40) + 3, (1 << 41) + 17, 999_983 << 20],
             sizes,
             offsets,
-            reset: 7,
+            map: Vec::new(),
+            fill: 7,
+            boundary: Some(7),
+        }
+    }
+
+    /// DeepSeek V4.1's form: mapped ids (several raw ids sharing one), the
+    /// mapped pad as the fill, and no boundary.
+    fn mapped() -> Self {
+        Self {
+            map: (0..64u32).map(|token| (token * 5 + 3) % 41).collect(),
+            fill: 3,
+            boundary: None,
+            ..Self::sample()
         }
     }
 
@@ -647,25 +812,29 @@ impl RowRule {
         self.context * self.per_order
     }
 
+    fn hashed(&self, token: i32) -> u64 {
+        match self.map.is_empty() {
+            true => token as u64,
+            false => u64::from(self.map[token as usize]),
+        }
+    }
+
     /// The rows of every position of `tokens`, the sequence's first: the
-    /// rule stated as the reference states it (after `context` reset tokens,
-    /// a shift valid while the position's segment since the latest reset
-    /// strictly before it reaches back that far).
+    /// rule stated as the reference states it (each shift valid while the
+    /// position's segment since the latest boundary strictly before it
+    /// reaches back that far, the fill read otherwise).
     fn reference(&self, tokens: &[i32]) -> Vec<i32> {
-        let history = std::iter::repeat_n(self.reset, self.context)
-            .chain(tokens.iter().copied())
-            .collect::<Vec<_>>();
         let mut rows = Vec::new();
-        for at in self.context..history.len() {
-            let previous = history[..at]
+        for at in 0..tokens.len() {
+            let previous = tokens[..at]
                 .iter()
-                .rposition(|token| *token == self.reset)
+                .rposition(|token| Some(*token) == self.boundary)
                 .map_or(-1, |index| index as i64);
             let in_segment = at as i64 - (previous + 1);
             let shifted = (0..=self.context)
                 .map(|shift| match in_segment >= shift as i64 {
-                    true => history[at - shift] as u64,
-                    false => self.reset as u64,
+                    true => self.hashed(tokens[at - shift]),
+                    false => self.fill as u64,
                 })
                 .collect::<Vec<_>>();
             for order in 2..=self.context + 1 {
@@ -735,10 +904,10 @@ impl RowsCase {
             if slot.previous != 0 {
                 for value in &mut window[slot.previous * window_rows..][..window_rows] {
                     state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                    // Stored tokens, the reset's among them, and no token.
+                    // Stored tokens, the boundary's among them, and no token.
                     *value = match (state >> 33) % 6 {
                         0 => 0,
-                        1 => rule.reset as u32 + 1,
+                        1 => rule.boundary.unwrap_or(7) as u32 + 1,
                         _ => ((state >> 40) % 50) as u32 + 1,
                     };
                 }
@@ -799,11 +968,19 @@ impl RowsCase {
                 .collect::<Vec<_>>()
         };
         let count = self.slots.len();
+        let boundary = self.rule.boundary.into_iter().collect::<Vec<_>>();
         let tensors = vec![
             integers(vec![self.rows(), 2], self.tokens.clone()),
             words(&self.rule.multipliers),
             words(&self.rule.sizes),
             words(&self.rule.offsets),
+            TensorData::dense_from_bytes(
+                DType::U32,
+                vec![self.rule.map.len()],
+                self.rule.map.iter().flat_map(|id| id.to_le_bytes()).collect(),
+            )
+            .unwrap(),
+            integers(vec![boundary.len()], boundary),
             integers(vec![count + 1, 2], segments(&self.slots, self.rows())),
             integers(vec![count], each(|slot| slot.stop)),
             integers(vec![count], each(|slot| slot.previous)),
@@ -820,7 +997,7 @@ impl RowsCase {
             .into_iter()
             .map(|tensor| Arg::Tensor(interpreter.add_tensor(tensor)))
             .collect::<Vec<_>>();
-        arguments.push(Arg::Scalar(ReferenceScalar::I32(self.rule.reset)));
+        arguments.push(Arg::Scalar(ReferenceScalar::I32(self.rule.fill)));
         arguments.push(Arg::Scalar(ReferenceScalar::U32(self.slab_banks as u32)));
         let outcome = interpreter.run_bounded(&arguments, u64::MAX).unwrap();
         if let SourceTermination::Failed(failure) = outcome.termination() {
@@ -837,7 +1014,7 @@ impl RowsCase {
         };
         let window = outcome
             .inputs()
-            .find(|input| input.ordinal() == 9)
+            .find(|input| input.ordinal() == 11)
             .map(|input| read(input.tensor()))
             .expect("the window is a mutable input");
         RowsOutcome {
@@ -875,6 +1052,14 @@ impl RowsCase {
         );
         let mut window = arenas.remove(0);
         let slots = SlotTensors::new(device, &self.slots, self.rows());
+        let map = Tensor::from_host(
+            device,
+            Element::u32(),
+            &[self.rule.map.len() as u64],
+            &self.rule.map.iter().flat_map(|id| id.to_le_bytes()).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let boundary = self.rule.boundary.into_iter().collect::<Vec<_>>();
         let kernel = at_defaults(
             device,
             ngram_rows::native_entry(),
@@ -890,13 +1075,15 @@ impl RowsCase {
                 multipliers: &words(&self.rule.multipliers),
                 sizes: &words(&self.rule.sizes),
                 offsets: &words(&self.rule.offsets),
+                map: &map,
+                boundary: &ints(device, &[boundary.len() as u64], &boundary),
                 segments: &slots.segments,
                 stop: &slots.stop,
                 previous_bank: &slots.previous,
                 previous_tape: &slots.previous_tape,
                 following_bank: &slots.following,
                 window: &mut window,
-                reset: self.rule.reset,
+                fill: self.rule.fill,
                 slab_banks: self.slab_banks as u32,
             })
             .unwrap()
@@ -921,8 +1108,18 @@ fn row_ids(outcome: &RowsOutcome) -> Vec<i32> {
     outcome.rows.chunks_exact(2).map(|pair| pair[0]).collect()
 }
 
-fn rows_cases() -> Vec<(&'static str, RowsCase)> {
-    let rule = RowRule::sample();
+fn rows_cases() -> Vec<(String, RowsCase)> {
+    [("raw", RowRule::sample()), ("mapped", RowRule::mapped())]
+        .into_iter()
+        .flat_map(|(form, rule)| {
+            rule_cases(rule)
+                .into_iter()
+                .map(move |(label, case)| (format!("{form} {label}"), case))
+        })
+        .collect()
+}
+
+fn rule_cases(rule: RowRule) -> Vec<(&'static str, RowsCase)> {
     let tokens = |length, seed| sequence(length, &[3, 4, 11], seed);
     vec![
         (
@@ -991,8 +1188,13 @@ fn rows_natives_match_the_portable_body() {
 /// backend and in the portable body.
 #[test]
 fn rows_follow_the_rule_across_chunks() {
-    let rule = RowRule::sample();
-    // Resets at the start, adjacent and mid-sequence.
+    for rule in [RowRule::sample(), RowRule::mapped()] {
+        rows_follow_one_rule_across_chunks(rule);
+    }
+}
+
+fn rows_follow_one_rule_across_chunks(rule: RowRule) {
+    // Boundary tokens at the start, adjacent and mid-sequence.
     let tokens = sequence(64, &[0, 9, 10, 33], 11);
     let expected = rule.reference(&tokens);
     let chunks = [(0usize, 1usize), (1, 8), (9, 1), (10, 1), (11, 23), (34, 30)];
@@ -1024,7 +1226,12 @@ fn rows_follow_the_rule_across_chunks() {
 /// those j rows: the next launch from it names the rule's rows.
 #[test]
 fn rows_continue_tape_versions() {
-    let rule = RowRule::sample();
+    for rule in [RowRule::sample(), RowRule::mapped()] {
+        rows_continue_one_rule_from_tape_versions(rule);
+    }
+}
+
+fn rows_continue_one_rule_from_tape_versions(rule: RowRule) {
     let prefix = sequence(6, &[2], 21);
     let verify = [7, 13, 21, 7, 9];
     let next = [4, 7, 8];

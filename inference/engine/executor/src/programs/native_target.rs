@@ -18,7 +18,7 @@ use super::{
 use crate::device_table::{SelectedRead, SubmittedRead};
 use crate::host_tables::HostTableError;
 use crate::stored_table::{NoticeStep, StepRows, StoredTable};
-use crate::operators::block::{BlockControlPorts, BlockStatePorts};
+use crate::operators::block::{BankPorts, HistoryPorts};
 use crate::operators::streams::ResidualCarry;
 use crate::experts::StepRoute;
 use crate::operators::routed::split::{RunStage, SplitPorts, SplitValues};
@@ -2112,120 +2112,117 @@ impl NativeTargetProgram {
                     }
                 }
             }
-            // A graph that mixes binds the mixer's state and controls.
-            match &graph.mixer {
-                None => {}
-                Some((
-                    BlockStatePorts::Attention(ports, indexer_planes),
-                    BlockControlPorts::Attention {
-                        coordinates,
-                        visible,
-                        fresh,
-                        destinations,
-                        history_tiles,
-                        indexer,
-                    },
-                )) => {
-                    // A selected read's indexer: its planes, and its rows'
-                    // spans and destinations in its two histories, written
-                    // as the block's own read is.
-                    match (indexer_planes, indexer) {
-                        (Some(planes), Some(tables)) => {
-                            let [(window_read, window), (block_read, blocks)] =
-                                state.indexer(index as u32)?;
-                            let [window_keys, window_coordinates] = window.as_slice() else {
-                                return Err(invalid("an indexer's raw-key planes are not two"));
-                            };
-                            let [block_keys] = blocks.as_slice() else {
-                                return Err(invalid("an indexer's block-key planes are not one"));
-                            };
-                            for (port, plane) in [
-                                (&planes.window_keys, window_keys),
-                                (&planes.window_coordinates, window_coordinates),
-                                (&planes.block_keys, block_keys),
-                            ] {
-                                bindings.set(port, plane).map_err(device)?;
-                            }
-                            for (read, visible, destinations) in [
-                                (
-                                    window_read,
-                                    &tables.window_visible,
-                                    &tables.window_destinations,
-                                ),
-                                (block_read, &tables.block_visible, &tables.block_destinations),
-                            ] {
-                                bindings
-                                    .set(visible, controls.bound(LaunchControl::Visible { read })?)
-                                    .map_err(device)?;
-                                bindings
-                                    .set(
-                                        destinations,
-                                        controls.bound(LaunchControl::Destinations { read })?,
-                                    )
-                                    .map_err(device)?;
-                            }
+            // A graph binds its block's history and bank, and their
+            // controls.
+            if let Some(HistoryPorts {
+                planes: ports,
+                indexer_planes,
+                coordinates,
+                visible,
+                fresh,
+                destinations,
+                history_tiles,
+                indexer,
+            }) = &graph.state.history
+            {
+                // A selected read's indexer: its planes, and its rows'
+                // spans and destinations in its two histories, written
+                // as the block's own read is.
+                match (indexer_planes, indexer) {
+                    (Some(planes), Some(tables)) => {
+                        let [(window_read, window), (block_read, blocks)] =
+                            state.indexer(index as u32)?;
+                        let [window_keys, window_coordinates] = window.as_slice() else {
+                            return Err(invalid("an indexer's raw-key planes are not two"));
+                        };
+                        let [block_keys] = blocks.as_slice() else {
+                            return Err(invalid("an indexer's block-key planes are not one"));
+                        };
+                        for (port, plane) in [
+                            (&planes.window_keys, window_keys),
+                            (&planes.window_coordinates, window_coordinates),
+                            (&planes.block_keys, block_keys),
+                        ] {
+                            bindings.set(port, plane).map_err(device)?;
                         }
-                        (None, None) => {}
-                        _ => return Err(invalid("an indexer's planes and tables disagree")),
+                        for (read, visible, destinations) in [
+                            (
+                                window_read,
+                                &tables.window_visible,
+                                &tables.window_destinations,
+                            ),
+                            (block_read, &tables.block_visible, &tables.block_destinations),
+                        ] {
+                            bindings
+                                .set(visible, controls.bound(LaunchControl::Visible { read })?)
+                                .map_err(device)?;
+                            bindings
+                                .set(
+                                    destinations,
+                                    controls.bound(LaunchControl::Destinations { read })?,
+                                )
+                                .map_err(device)?;
+                        }
                     }
-                    let (read, history) = state.history(LayerRef::Target(index as u32))?;
-                    if history.len() != ports.len() {
+                    (None, None) => {}
+                    _ => return Err(invalid("an indexer's planes and tables disagree")),
+                }
+                let (read, history) = state.history(LayerRef::Target(index as u32))?;
+                if history.len() != ports.len() {
+                    return Err(invalid(
+                        "the layer's history planes disagree with its attention entry",
+                    ));
+                }
+                for (port, plane) in ports.iter().zip(history) {
+                    bindings.set(port, plane).map_err(device)?;
+                }
+                // A listing class sealed for more segments than the
+                // launch has reads its spans padded.
+                let spans = match block_segments == segments {
+                    true => LaunchControl::Visible { read },
+                    false => LaunchControl::Padded { read },
+                };
+                for (port, control) in [
+                    (coordinates, LaunchControl::Coordinates),
+                    (visible, spans),
+                    (fresh, LaunchControl::Fresh { read }),
+                    (destinations, LaunchControl::Destinations { read }),
+                ] {
+                    bindings.set(port, controls.bound(control)?).map_err(device)?;
+                }
+                match (history_tiles, &listed_tiles) {
+                    (Some(tiles), Some((_, bytes))) => {
+                        active.write_input(&tiles.port, bytes).map_err(device)?
+                    }
+                    (None, None) => {}
+                    _ => {
                         return Err(invalid(
-                            "the layer's history planes disagree with its attention entry",
+                            "the block's graph class and its history tile list disagree",
                         ));
                     }
-                    for (port, plane) in ports.iter().zip(history) {
-                        bindings.set(port, plane).map_err(device)?;
-                    }
-                    // A listing class sealed for more segments than the
-                    // launch has reads its spans padded.
-                    let spans = match block_segments == segments {
-                        true => LaunchControl::Visible { read },
-                        false => LaunchControl::Padded { read },
-                    };
-                    for (port, control) in [
-                        (coordinates, LaunchControl::Coordinates),
-                        (visible, spans),
-                        (fresh, LaunchControl::Fresh { read }),
-                        (destinations, LaunchControl::Destinations { read }),
-                    ] {
-                        bindings.set(port, controls.bound(control)?).map_err(device)?;
-                    }
-                    match (history_tiles, &listed_tiles) {
-                        (Some(tiles), Some((_, bytes))) => {
-                            active.write_input(&tiles.port, bytes).map_err(device)?
-                        }
-                        (None, None) => {}
-                        _ => {
-                            return Err(invalid(
-                                "the block's graph class and its history tile list disagree",
-                            ));
-                        }
-                    }
                 }
-                Some((BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent))) => {
-                    let arenas = state.recurrent_arenas()?;
-                    for (offset, port) in ports.iter().enumerate() {
-                        bindings
-                            .set(
-                                port,
-                                arenas
-                                    .get(run.recurrent_component + offset)
-                                    .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
-                            )
-                            .map_err(device)?;
-                    }
-                    for (port, control) in [
-                        (&recurrent.segments, LaunchControl::Segments),
-                        (&recurrent.stop, LaunchControl::Stop),
-                        (&recurrent.previous_bank, LaunchControl::PreviousBank),
-                        (&recurrent.previous_tape, LaunchControl::PreviousTape),
-                        (&recurrent.following_bank, LaunchControl::FollowingBank),
-                    ] {
-                        bindings.set(port, controls.bound(control)?).map_err(device)?;
-                    }
+            }
+            if let Some(BankPorts { components, controls: recurrent }) = &graph.state.bank {
+                let arenas = state.recurrent_arenas()?;
+                for (offset, port) in components.iter().enumerate() {
+                    bindings
+                        .set(
+                            port,
+                            arenas
+                                .get(run.recurrent_component + offset)
+                                .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
+                        )
+                        .map_err(device)?;
                 }
-                _ => return Err(invalid("sealed graph block state and controls disagree")),
+                for (port, control) in [
+                    (&recurrent.segments, LaunchControl::Segments),
+                    (&recurrent.stop, LaunchControl::Stop),
+                    (&recurrent.previous_bank, LaunchControl::PreviousBank),
+                    (&recurrent.previous_tape, LaunchControl::PreviousTape),
+                    (&recurrent.following_bank, LaunchControl::FollowingBank),
+                ] {
+                    bindings.set(port, controls.bound(control)?).map_err(device)?;
+                }
             }
             let (next, outputs) = rotation.activate(&graph.plan)?;
             let ready = active.attach(bindings, outputs).map_err(device)?;
@@ -2239,8 +2236,8 @@ impl NativeTargetProgram {
             if let (Some(bank), Some(spans)) = (bank, spans) {
                 bank.block_sampled(graph, index, spans).map_err(invalid)?;
             }
-            if let Some((BlockStatePorts::Recurrent(ports), _)) = &graph.mixer {
-                run.recurrent_component += ports.len();
+            if let Some(bank) = &graph.state.bank {
+                run.recurrent_component += bank.components.len();
             }
             run.residual = graph.residual.as_ref().map(|edge| outputs.exported(edge).ok_or_else(|| invalid("target residual was not exported"))).transpose()?;
             run.hidden = graph
@@ -2249,11 +2246,7 @@ impl NativeTargetProgram {
                 .try_map(|output| outputs.exported(output).ok_or_else(|| invalid("target block output was not exported")))?;
             rotation.recycle(std::mem::replace(&mut run.output, (next, outputs)))?;
             if let Some(started) = block_started {
-                let kind = match &graph.mixer {
-                    Some((BlockStatePorts::Attention(..), _)) => "attention",
-                    Some((BlockStatePorts::Recurrent(_), _)) => "recurrent",
-                    None => "back",
-                };
+                let kind = graph.state.kind();
                 eprintln!(
                     "target block {index} {kind} rows {rows} lists {} history tiles {:.3}s",
                     listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),

@@ -26,7 +26,7 @@ pub use decoder::{
     HistoryReads, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
     HyperConnectionWeights, HyperConnections, LowRankGatedSite,
     Indexer, InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention,
-    NGramHash, NGramInput, Operator, OutputForm, OutputProjection, OutputRotary, PerLayerEntry,
+    NGramConvolution, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection, OutputRotary, PerLayerEntry,
     PerLayerInput, QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
     RotaryDivisors, RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement,
     RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
@@ -584,6 +584,8 @@ pub enum WeightKind {
     NGramValue,
     NGramKeyNorm,
     NGramQueryNorm,
+    /// The n-gram gate's product weight (`NGramGate::Product`).
+    NGramGate,
     NGramConvolutionNorm,
     NGramConvolution,
     RotaryDivisors,
@@ -1405,18 +1407,26 @@ mod tests {
                     multipliers: vec![3, 5, 7],
                     sizes: vec![5, 7],
                     offsets: vec![0, 5],
-                    reset: 7,
+                    token_map: None,
+                    fill: 7,
+                    boundary: Some(7),
+                    media: NGramMedia::Hashed,
                 },
                 width: 2,
                 table: weight("ple.table", &[12, 2]),
                 key: weight("ple.key", &[8, 4]),
                 value: weight("ple.value", &[4, 4]),
-                key_norm: rms("ple.norm_key", 8),
-                query_norm: rms("ple.norm_query", 8),
-                convolution_norm: rms("ple.norm_conv", 8),
-                convolution: weight("ple.conv", &[8, 4]),
-                kernel: 4,
-                dilation: 3,
+                gate: NGramGate::Norms {
+                    key: weight("ple.norm_key", &[8]),
+                    query: weight("ple.norm_query", &[8]),
+                },
+                epsilon: 1e-6,
+                mixing: Some(NGramConvolution {
+                    norm: weight("ple.norm_conv", &[8]),
+                    taps: weight("ple.conv", &[8, 4]),
+                    kernel: 4,
+                    dilation: 3,
+                }),
             })),
             output: OutputForm::Residual,
         }
@@ -1575,7 +1585,7 @@ mod tests {
     /// while the position's segment since the latest reset strictly before
     /// it reaches back that far.
     fn reference_rows(hash: &NGramHash, tokens: &[u64]) -> Vec<u64> {
-        let previous = vec![hash.reset; hash.context as usize];
+        let previous = vec![hash.fill; hash.context as usize];
         reference_rows_after(hash, &previous, tokens)
     }
 
@@ -1587,13 +1597,13 @@ mod tests {
         for at in context..history.len() {
             let previous = history[..at]
                 .iter()
-                .rposition(|token| *token == hash.reset)
+                .rposition(|token| Some(*token) == hash.boundary)
                 .map_or(-1, |index| index as i64);
             let in_segment = at as i64 - (previous + 1);
             let shifted = (0..=context)
                 .map(|shift| match in_segment >= shift as i64 {
                     true => history[at - shift],
-                    false => hash.reset,
+                    false => hash.fill,
                 })
                 .collect::<Vec<_>>();
             for order in 2..=context + 1 {
@@ -1617,7 +1627,10 @@ mod tests {
             multipliers: vec![1_000_003, 999_983, 1_000_033],
             sizes: vec![101, 103, 107, 109],
             offsets: vec![0, 101, 204, 311],
-            reset: 7,
+            token_map: None,
+            fill: 7,
+            boundary: Some(7),
+            media: NGramMedia::Hashed,
         };
         // Resets at the start, adjacent and mid-sequence.
         let mut state = 11u64;
@@ -1656,7 +1669,10 @@ mod tests {
             ],
             sizes: (0..16).map(|head| 20_000_003 + 2 * head).collect(),
             offsets: (0..16).map(|head| head * 20_000_040).collect(),
-            reset: 2,
+            token_map: None,
+            fill: 2,
+            boundary: Some(2),
+            media: NGramMedia::Hashed,
         };
         for length in [1usize, 2, 19, 512] {
             let mut state = length as u64;
@@ -1677,6 +1693,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// DeepSeek V4.1's rule, over compressed token ids: every token hashes as its mapped id, a
+    /// predecessor before the sequence reads the fill, and no token cuts.
+    #[test]
+    fn mapped_rows_read_the_fill_before_the_sequence_and_never_cut() {
+        let map = (0..40u32).map(|token| (token * 7) % 13).collect::<Vec<_>>();
+        let hash = NGramHash {
+            context: 3,
+            heads_per_order: 2,
+            multipliers: vec![1_000_003, 999_983, 1_000_033, 1_000_037],
+            sizes: (0..6).map(|head| 101 + 2 * head).collect(),
+            offsets: (0..6).map(|head| head * 120).collect(),
+            token_map: Some(map.clone()),
+            fill: 2,
+            boundary: None,
+            media: NGramMedia::Hashed,
+        };
+        let mut state = 5u64;
+        let tokens = (0..40)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                (state >> 33) % 40
+            })
+            .collect::<Vec<_>>();
+        let compressed = tokens.iter().map(|token| u64::from(map[*token as usize]));
+        let shifted = std::iter::repeat_n(hash.fill, 3).chain(compressed).collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        for at in 3..shifted.len() {
+            for order in 2..=4 {
+                let mixed = (0..order).fold(0, |mixed, distance| {
+                    mixed ^ shifted[at - distance] * hash.multipliers[distance]
+                });
+                for head in (order - 2) * 2..(order - 1) * 2 {
+                    expected.push(hash.offsets[head] + mixed % hash.sizes[head]);
+                }
+            }
+        }
+        let whole = hash.rows(&[], &tokens);
+        assert_eq!(whole, expected);
+        for split in [1, 2, 3, 4, 17] {
+            let mut chunked = hash.rows(&[], &tokens[..split]);
+            chunked.extend(hash.rows(&tokens[..split], &tokens[split..]));
+            assert_eq!(chunked, whole, "split at {split}");
+        }
+    }
+
+    /// A map covers the decoder's vocabulary, and the fill and every
+    /// product are of its hashed ids.
+    #[test]
+    fn a_token_map_bounds_the_hashed_ids() {
+        let model = |edit: &dyn Fn(&mut NGramInput)| {
+            let mut sublayer = ngram();
+            let Operator::NGramInput(input) = &mut sublayer.op else {
+                unreachable!()
+            };
+            edit(input);
+            hyper_connected(vec![sublayer]).validate()
+        };
+        let vocabulary = definition(vec![]).decoder.vocabulary as usize;
+        let mapped = |input: &mut NGramInput| {
+            input.hash.token_map = Some(vec![3; vocabulary]);
+            input.hash.boundary = None;
+            input.hash.fill = 3;
+        };
+        model(&mapped).unwrap();
+        for (label, edit) in [
+            ("short map", &(|input: &mut NGramInput| {
+                mapped(input);
+                input.hash.token_map = Some(vec![3; vocabulary - 1]);
+            }) as &dyn Fn(&mut NGramInput)),
+            ("fill past the hashed ids", &|input| {
+                mapped(input);
+                input.hash.fill = 4;
+            }),
+            ("inexact products", &|input| {
+                mapped(input);
+                input.hash.multipliers[1] = u64::MAX / 3;
+            }),
+        ] {
+            assert!(model(edit).is_err(), "{label}");
+        }
+        // Without a convolution, under one product weight.
+        model(&|input| {
+            input.mixing = None;
+            input.gate = NGramGate::Product(weight("ple.gate", &[8]));
+        })
+        .unwrap();
     }
 
     #[test]

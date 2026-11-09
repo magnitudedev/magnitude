@@ -1673,6 +1673,14 @@ fn warm_up(
     domain
         .open_state(&mut bindings, request, None)
         .map_err(|error| failed(error.to_string()))?;
+    // Its token is host-known, as an admitted prompt's are: its table rows
+    // are prefetched before its step is queued, so it waits on none.
+    for prefetched in domain
+        .prefetch_prompt(request, 0, &[TokenId(0)])
+        .map_err(failed)?
+    {
+        prefetched.wait();
+    }
     let operations = [Operation::Forward {
         request,
         kind: if primes_drafter {
