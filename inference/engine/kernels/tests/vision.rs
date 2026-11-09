@@ -170,6 +170,7 @@ fn module() -> CheckedModule {
             "functions.seismic",
             include_str!("../kernels/functions.seismic"),
         ),
+        ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
     ] {
         sources.push(SourceFile {
             path: path.into(),

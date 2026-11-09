@@ -50,7 +50,7 @@ fn each_run_reconciles_at_most_one_cpu_flight() {
             draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: 0,
             numerical_profile: None,

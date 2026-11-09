@@ -152,8 +152,13 @@ pub(crate) struct NGramStepPorts {
     pub table: StoredReadPorts,
 }
 
+/// The class scope of an n-gram input's nodes, whose `B` is its bank's
+/// request slots: in an attention block, the class's slots, beside the
+/// attention kernels' own static `B`.
+pub(crate) const NGRAM_SLOTS: &str = "ngram_slots";
+
 /// The n-gram input over the `[rows, S * H]` streams `residual`: the new
-/// streams and its ports.
+/// streams and its ports, its nodes in [`NGRAM_SLOTS`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -167,13 +172,14 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
     controls: Option<&RecurrentControlPorts>,
     block: NGramBlock<'_>,
 ) -> Result<(WorkflowTensor, NGramPorts), GraphError> {
+    graph.set_class_scope(Some(NGRAM_SLOTS));
     let binding = block.binding;
     let rows = block.rows;
     let (s, h) = (binding.streams, binding.hidden);
     let heads = binding.heads();
     let embedding = binding.embedding();
     let hash = block.hash;
-    if hash.context != binding.context || hash.heads_per_order != binding.heads_per_order {
+    if crate::planning::NGramRowRule::of(hash) != binding.rule {
         return Err("the n-gram row rule disagrees with its binding".into());
     }
     let banks = bank_count(state)?;
@@ -186,7 +192,7 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
         return Err("the n-gram token window does not hold u32 tokens".into());
     }
     let tape = token_rows
-        .checked_sub(binding.context)
+        .checked_sub(binding.rule.context)
         .ok_or("the n-gram token window is shorter than its context")?;
     // A convolution's window records the token window's tape rows.
     let mut window = match binding.convolution {
@@ -225,12 +231,11 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
         ("M", rows),
         ("B", block.slots),
         ("N", banks),
-        ("C", binding.context),
-        ("P", binding.heads_per_order),
         ("T", tape),
-        ("V", map.len() as u64),
-        ("NB", boundary.iter().count() as u64),
-    ];
+    ]
+    .into_iter()
+    .chain(binding.rule.statics())
+    .collect::<Vec<_>>();
     let mut made = None;
     let controls = match controls {
         Some(controls) => controls,
@@ -405,6 +410,7 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
         .into_iter()
         .chain([token_window_port])
         .collect();
+    graph.set_class_scope(None);
     Ok((
         streams,
         NGramPorts {

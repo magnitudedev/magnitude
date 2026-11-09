@@ -1396,6 +1396,7 @@ fn module() -> CheckedModule {
             "functions.seismic",
             include_str!("../kernels/functions.seismic"),
         ),
+        ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
         ("import.seismic", include_str!("../kernels/import.seismic")),
     ] {
         sources.push(SourceFile {
@@ -2172,6 +2173,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
                     KW: reprs[1].resident(&device),
                     VW: reprs[2].resident(&device),
                     A: act.element(),
+                    Y: act.element(),
                 },
                 &attention_project_specialization_on(
                     &device,
@@ -3064,6 +3066,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
                     KW: project_reprs[1].resident(&device),
                     VW: project_reprs[2].resident(&device),
                     A: act.element(),
+                    Y: act.element(),
                 },
                 &match pack {
                     Some(pack) => with_pack(specialization, ATTENTION_PROJECT_PACKED_LAUNCH, pack),
@@ -4373,6 +4376,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     KW: reprs[1].resident(&device),
                     VW: reprs[2].resident(&device),
                     A: act.element(),
+                    Y: act.element(),
                 },
                 &attention_project_specialization_on(
                     device,
@@ -4444,6 +4448,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                     ("KW", reprs[1].storage()),
                     ("VW", reprs[2].storage()),
                     ("A", registry::dense(DType::BF16)),
+                    ("Y", registry::dense(DType::BF16)),
                 ],
                 vec![
                     floats(&[rows, d], &hidden),
@@ -4703,6 +4708,7 @@ fn scaled_projections_on(device: &Device) {
                     KW: repr.resident(device),
                     VW: repr.resident(device),
                     A: act.element(),
+                    Y: act.element(),
                 },
                 &match pack {
                     Some(pack) => with_pack(specialization, ATTENTION_PROJECT_PACKED_LAUNCH, pack),
@@ -4824,6 +4830,7 @@ fn scaled_projections_on(device: &Device) {
                 ("KW", repr.storage()),
                 ("VW", repr.storage()),
                 ("A", registry::dense(DType::BF16)),
+                ("Y", registry::dense(DType::BF16)),
             ],
             [
                 floats(&[rows, d], &hidden),
@@ -5755,6 +5762,7 @@ fn query_key_project(
             KW: element,
             VW: element,
             A: act.element(),
+            Y: act.element(),
         },
         &attention_project_specialization_on(
             device,
@@ -6329,6 +6337,7 @@ fn metal_absent_query_projection_preserves_key_value() {
                     KW: Element::bf16(),
                     VW: Element::bf16(),
                     A: Element::bf16(),
+                    Y: Element::bf16(),
                 },
                 &spec,
             )

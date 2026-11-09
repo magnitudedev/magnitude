@@ -9,9 +9,10 @@ use magnitude_artifacts::{
 use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
     EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, HeadNorm,
-    HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue, MediaRowAttention,
-    ModelDefinition, Operator, OutputForm, OutputProjection, QueryProjection,
-    ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
+    HistoryRows, HistorySource, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
+    Operator, OutputForm, OutputProjection, ProjectedRows, QueryProjection, ResidualForm,
+    RmsNorm, Rotary, RowProducer, RowRounding, Sublayer, TokenDomain, ValueNorm, ValueSource,
+    WeightDescriptor,
 };
 
 /// The limits the fixture's loads plan with.
@@ -62,20 +63,23 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
             function: GateFunction::Sigmoid,
         },
         query_norm: HeadNorm::Rms(rms("qn", WIDTH)),
-        key_value: KeyValue::Owned {
-            key: descriptor("k", &[WIDTH, hidden]),
-            value: ValueSource::Projected(descriptor("v", &[WIDTH, hidden])),
-            key_norm: HeadNorm::Rms(rms("kn", WIDTH)),
-            value_norm: ValueNorm::None,
-            domain: HistoryDomain::Token,
-        },
+        history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+            ProjectedRows {
+                key: descriptor("k", &[WIDTH, hidden]),
+                value: ValueSource::Projected(descriptor("v", &[WIDTH, hidden])),
+                key_norm: HeadNorm::Rms(rms("kn", WIDTH)),
+                value_norm: ValueNorm::None,
+                domain: TokenDomain::Token,
+                rounding: RowRounding::None,
+            },
+        )))],
         rotary: Rotary::Interleaved {
             width: WIDTH / 2,
             base: 10_000.0,
             sections: vec![WIDTH / 4],
             axis_pattern: vec![0],
-        },        scale: 1.0 / (WIDTH as f64).sqrt(),
-        reads: HistoryReads::Visible,
+        },
+        scale: 1.0 / (WIDTH as f64).sqrt(),
         media_rows: MediaRowAttention::Causal,
         sinks: None,
         output: OutputProjection::Full(descriptor("o", &[hidden, 2 * WIDTH])),
@@ -169,12 +173,12 @@ pub(crate) fn with_mtp_head(mut definition: ModelDefinition) -> ModelDefinition 
                 if let HeadNorm::Rms(norm) = &mut attention.query_norm {
                     rename(&mut norm.weight);
                 }
-                if let KeyValue::Owned {
+                if let HistoryRows::Own(RowProducer::Projected(ProjectedRows {
                     key,
                     value: ValueSource::Projected(value),
                     key_norm: HeadNorm::Rms(key_norm),
                     ..
-                } = &mut attention.key_value
+                })) = &mut attention.history[0].rows
                 {
                     rename(key);
                     rename(value);
@@ -822,22 +826,22 @@ pub fn routed_fixture_definition(shape: RoutedShape) -> ModelDefinition {
             heads: HEADS,
             kv_heads: KV_HEADS,
             width: WIDTH,
-            query: descriptor(&name("attn_qg"), &[2 * HEADS * WIDTH, hidden]),
+            query: QueryProjection::Full(descriptor(&name("attn_qg"), &[2 * HEADS * WIDTH, hidden])),
             gate: AttentionGate::Interleaved { function: GateFunction::Sigmoid },
             query_norm: HeadNorm::Rms(rms(name("attn_q_norm"), WIDTH)),
-            key_value: KeyValue::Owned {
+            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(ProjectedRows {
                 key: descriptor(&name("attn_k"), &[KV_HEADS * WIDTH, hidden]),
                 value: ValueSource::Projected(descriptor(&name("attn_v"), &[KV_HEADS * WIDTH, hidden])),
                 key_norm: HeadNorm::Rms(rms(name("attn_k_norm"), WIDTH)),
                 value_norm: ValueNorm::None,
-                domain: HistoryDomain::Token,
-            },
+                domain: TokenDomain::Token,
+                rounding: RowRounding::None,
+            })))],
             rotary: Rotary::Interleaved { width: WIDTH / 2, base: 10_000.0, sections: vec![WIDTH / 4], axis_pattern: vec![0] },
             scale: 1.0 / (WIDTH as f64).sqrt(),
-            reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
-            output: descriptor(&name("attn_output"), &[hidden, HEADS * WIDTH]),
+            output: OutputProjection::Full(descriptor(&name("attn_output"), &[hidden, HEADS * WIDTH])),
         };
         let routed = RoutedFfn {
             experts,

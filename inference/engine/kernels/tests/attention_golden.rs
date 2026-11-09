@@ -483,14 +483,18 @@ fn run_family(
     let selection = Tensor::from_host(device, Element::u32(), &[rows, 0], &[]).unwrap();
     let every_key = block_slots(device, 1);
     {
-        // Half-split leading rotary pairs, no output rotary.
+        // Half-split leading rotary pairs, no output rotary (the dense
+        // entries' with no key rounding).
         let layout = half_split_layout(device);
+        let dense_form = dense_layout(device);
+        let (selected_rows, selected) =
+            no_picks(device, rows as usize, case.geometry.kv, case.geometry.w());
         macro_rules! dense {
             ($module:ident $(, $extra:ident: $value:expr)*) => {{
                 let kernel = $module::native_for_device_with(
                     device,
                     $module::Elements { A: elements },
-                    &specialization.clone().with_static("SK", 0),
+                    &dense_statics(specialization.clone().with_static("SK", 0)),
                 )
                 .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
                 let [history_key, history_value] = &mut *history else {
@@ -514,13 +518,20 @@ fn run_family(
                         fresh: &inputs.fresh,
                         destinations: &inputs.destinations,
                         $($extra: $value,)*
+                        selected_rows: &selected_rows,
+                        selected: &selected,
                         history_key,
                         history_value,
-                        form: &layout,
+                        form: &dense_form,
                         epsilon: case.epsilon,
                         scale: case.scale,
                         gate_function: 0,
                         slab_rows,
+                        selected_slab_rows: 1,
+                        key_block: 0,
+                        key_element: 0,
+                        key_scale: 0,
+                        key_amax_floor: 0.0,
                     })
                     .unwrap()
                     .value

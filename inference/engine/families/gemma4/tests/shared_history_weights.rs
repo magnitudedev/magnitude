@@ -6,7 +6,7 @@
 
 use magnitude_artifacts::{gguf::Directory, ArtifactIdentity, PackageIdentity, UnsupportedReason};
 use magnitude_family_common::headers::{self, add_tensor, artifact};
-use magnitude_family_contracts::{KeyValue, ModelDefinition, Operator};
+use magnitude_family_contracts::{HistoryRows, ModelDefinition, Operator};
 use magnitude_family_gemma4::{inspect_components, Error};
 
 fn identity() -> PackageIdentity {
@@ -33,7 +33,7 @@ fn sharing_layers(definition: &ModelDefinition) -> Vec<(usize, u64, u64)> {
         .enumerate()
         .filter_map(|(layer, block)| match &block.sublayers[0].op {
             Operator::Attention(attention)
-                if matches!(attention.key_value, KeyValue::Shared { .. }) =>
+                if matches!(attention.fresh().rows, HistoryRows::Shared { .. }) =>
             {
                 Some((layer, attention.kv_heads * attention.width, attention.width))
             }

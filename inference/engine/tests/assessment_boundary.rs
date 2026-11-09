@@ -890,7 +890,7 @@ fn a_form_the_backend_does_not_execute_names_the_backend() {
     let scratch = Scratch::new("backend");
     let target = llama().write(&scratch.file("target.gguf"));
     let rotated = ModelPolicy {
-        kv_codec: magnitude_state::KvCodec::RotatedK4V4,
+        kv_codec: Some(magnitude_state::KvCodec::RotatedK4V4),
         ..ModelPolicy::default()
     };
     assert_eq!(

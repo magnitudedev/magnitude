@@ -9,8 +9,8 @@ use magnitude_artifacts::{
 use magnitude_family_common::{headers, TextInput};
 use magnitude_family_contracts::{
     ActivationFunction, AttentionGate, ExitNorm, ExpertSelection, FeedForwardUp, HeadNorm,
-    ImportTransform, InputNorm, InputPreparationError, KeyValue, ModelDefinition,
-    ModelInputAdapter, Operator, Rotary, ScoreFunction, SharedExpertGate, TokenPlan,
+    HistoryRows, HistorySource, ImportTransform, InputNorm, InputPreparationError,
+    ModelDefinition, ModelInputAdapter, Operator, ProjectedRows, RowProducer, Rotary, ScoreFunction, SharedExpertGate, TokenPlan,
     WeightDescriptor,
 };
 use magnitude_family_nemotron_h::{inspect_components, recognize, Error};
@@ -141,11 +141,14 @@ fn check(definition: &ModelDefinition, expected: &Expected) {
                 assert_eq!(attention.rotary, Rotary::None);
                 assert!((attention.scale - 1.0 / 128f64.sqrt()).abs() < 1e-15);
                 assert!(matches!(
-                    attention.key_value,
-                    KeyValue::Owned {
-                        key_norm: HeadNorm::None,
+                    &attention.history[..],
+                    [HistorySource {
+                        rows: HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                            key_norm: HeadNorm::None,
+                            ..
+                        })),
                         ..
-                    }
+                    }]
                 ));
             }
             Operator::StateSpace(space) => {

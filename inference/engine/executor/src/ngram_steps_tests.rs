@@ -17,6 +17,7 @@ use crate::{
     platform,
     test_support::available,
 };
+use crate::operators::attention::tests::selected::{self, CompressedForm};
 use magnitude_artifacts::{Package, gguf::Encoding};
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::KvCodec;
@@ -25,8 +26,8 @@ use std::sync::Arc;
 
 /// A GGUF of every tensor `manifest` names (its n-gram tables IQ4_NL
 /// blocks, a streamed load's expert stacks Q8_0 or Q4_0 blocks, everything else
-/// F16), with small deterministic values: each F16 tensor `constant` names
-/// holds its value throughout.
+/// F16, BF16 or F32 as it lays them out), with small deterministic values:
+/// each float tensor `constant` names holds its value throughout.
 fn write_gguf(
     manifest: &magnitude_artifacts::PackageManifest,
     path: &std::path::Path,
@@ -77,19 +78,24 @@ fn write_gguf(
                     }
                 }
             }
-            Encoding::F16 => {
+            Encoding::F16 | Encoding::BF16 | Encoding::F32 => {
                 // A gated delta decay rate (`ssm_a`, -exp(A_log)) is negative,
                 // as every model's is, so the recurrent state decays: a
                 // positive one grows it exponentially along the prompt.
                 let decay_rate = tensor.name.ends_with(".ssm_a");
                 let constant = constant(&tensor.name);
                 for _ in 0..values {
-                    // Within ±1/16: a small F16.
+                    // Within ±1/16: a small value of the tensor's element.
                     let value = constant.unwrap_or_else(|| {
                         let value = ((next() % 2001) as f32 - 1000.0) / 16_000.0;
                         if decay_rate { -value.abs() } else { value }
                     });
-                    payload.extend_from_slice(&half_bits(value).to_le_bytes());
+                    match tensor.encoding {
+                        Encoding::F16 => payload.extend_from_slice(&half_bits(value).to_le_bytes()),
+                        // Its F32 bits' upper half.
+                        Encoding::BF16 => payload.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes()),
+                        _ => payload.extend_from_slice(&value.to_le_bytes()),
+                    }
                 }
             }
             other => panic!("the fixture stores no {other:?} tensor"),
@@ -1325,8 +1331,19 @@ fn fixture_with(
 /// [`fixture_with`], each tensor `constant` names holding its value.
 fn fixture_valued(
     test: &str,
-    mut definition: ModelDefinition,
+    definition: ModelDefinition,
     manifest: fn(&ModelDefinition) -> magnitude_artifacts::PackageManifest,
+    constant: &dyn Fn(&str) -> Option<f32>,
+) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
+    let manifest = manifest(&definition);
+    fixture_stored(test, definition, &manifest, constant)
+}
+
+/// [`fixture_valued`] of the tensors `manifest` names.
+fn fixture_stored(
+    test: &str,
+    mut definition: ModelDefinition,
+    manifest: &magnitude_artifacts::PackageManifest,
     constant: &dyn Fn(&str) -> Option<f32>,
 ) -> (std::path::PathBuf, Rc<ModelDefinition>, Arc<Package>) {
     let directory = std::env::temp_dir().join(format!(
@@ -1339,7 +1356,7 @@ fn fixture_valued(
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join("qwen4exp-fixture.gguf");
-    write_gguf(&manifest(&definition), &path, constant);
+    write_gguf(manifest, &path, constant);
     let package = Package::open_without_projector(&path).unwrap();
     definition.artifact_identity = package.manifest().identity;
     (directory, Rc::new(definition), Arc::new(package))
@@ -1601,6 +1618,234 @@ fn a_zero_valued_engram_input_leaves_its_attention_decoder_unchanged() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
+/// On Metal and on the CPU: two requests decode through an Engram input
+/// ending an attention block in one launch of two slots, as each decodes
+/// alone. The input's bank keeps a token window per request slot under
+/// exact slot tables, so the block's graphs are classed by request slots
+/// as well as history segments (`BlockKeeps::HistoryAndBank`): the
+/// launch's two slots' tables bind a graph sealed for two. Each request's
+/// two decode steps hash its own prompt's token window, so its logits stay
+/// within float rounding of its decode alone (`TOGETHER_KL`: the two
+/// launches' row classes differ).
+#[test]
+fn engram_requests_decode_together_as_each_alone() {
+    use crate::planning::fixtures::engram_fixture_definition;
+    const TOGETHER_KL: f64 = 1e-4;
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (directory, definition, package) =
+        fixture_valued("engram-slots", engram_fixture_definition(), stored_table_manifest, &|_: &str| None);
+    let requests = [RequestId(1), RequestId(2)];
+    // Each request's logits at its two decode steps, the requests decoding
+    // `together` in one launch or each alone.
+    let decoded = |backend: seismic::BackendName, together: bool| {
+        let limits = limits(CHUNK_ROWS, false, 1, CHUNK_ROWS);
+        let (mut domain, mut bindings, _, _) = load(&catalog, &definition, &package, backend, limits, Banked::Resident);
+        for &request in &requests {
+            domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+            domain.open_state(&mut bindings, request, None).unwrap();
+            bindings = run(&mut domain, bindings, prompt_chunk(request, 0, 1, CHUNK_ROWS), false, backend).1;
+        }
+        let mut logits = Vec::new();
+        for offset in 0..2 {
+            let decode = |request: RequestId| {
+                let token = (offset * 13 + request.0 as usize * 29) as u32 % 256;
+                scored(forward(request, WorkKind::Decode, &[token], CHUNK_ROWS + offset, false))
+            };
+            let launches = match together {
+                true => vec![requests.map(decode).to_vec()],
+                false => requests.map(|request| vec![decode(request)]).to_vec(),
+            };
+            for operations in launches {
+                let (outcomes, returned, _) = steps(&mut domain, bindings, operations, backend);
+                bindings = returned;
+                logits.extend(outcomes.iter().map(|outcome| {
+                    let Outcome::Forward { rows } = outcome else {
+                        panic!("{backend:?}: a forward has a forward outcome: {outcome:?}");
+                    };
+                    rows[0].logits.as_ref().expect("a scored row has logits").read_to_host().unwrap()
+                }));
+            }
+        }
+        logits
+    };
+    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
+    for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
+        let (together, alone) = (decoded(backend, true), decoded(backend, false));
+        assert_eq!(together.len(), 4);
+        for (at, (together, alone)) in together.iter().zip(&alone).enumerate() {
+            let kl = kl_of(alone, together);
+            assert!(kl <= TOGETHER_KL, "{backend:?}: decode {} of request {}: KL {kl:.3e}", at / 2, at % 2 + 1);
+        }
+    }
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+/// A Reindexed form whose pool (32 blocks of 2 units) and picks (64) hold
+/// every row of `compressed_layers_decode_equals_prefill`'s contexts (at
+/// most 46), so no selection there hinges on a near-tie of its scores.
+const WIDE_POOL: CompressedForm = CompressedForm::Reindexed { blocks: 32, block_units: 2, top: 64 };
+
+/// Decode equals prefill, on Metal and on the CPU: slice C's layer forms
+/// (a window, a pooled source of rate 2 with its own indexer, and a layer
+/// reusing that source and its picks) give each of the 8 rows after a
+/// prompt the same distribution whether they run one row a forward after
+/// the prompt, or in one forward with the prompt's rows after its last whole
+/// 16-row chunk, as slice C's verdict scores a prompt and its rows together.
+/// - Prompt 15 runs whole in that forward, as the verdict's short fixture
+///   does (prompt 15, rows 15–22).
+/// - Prompts 5, 6, 37 and 38 end on either side of a group boundary; 37
+///   and 38's forward opens at 32, a member of the group its second row
+///   completes, as slice C's 613 split's verify opens at 612.
+///
+/// It holds in two numerics: the test's own (unrounded pooled and index
+/// rows, two picks), and slice C's (`slice_c_numerics`: its trained row
+/// roundings, and a top that picks every visible block, as below 1,024
+/// tokens). It holds too for `WIDE_POOL` (a rate-1 source whose indexer
+/// produces a candidate pool, and a Reindex layer restricted to it). The
+/// pair differ only by summation order, so each row's KL stays at float
+/// rounding (`DECODE_KL`). Norm weights are 1, so the rows' attention
+/// moves the logits.
+#[test]
+fn compressed_layers_decode_equals_prefill() {
+    const DECODE_KL: f64 = 1e-4;
+    let _placement = crate::test_support::process_placement();
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    let (definition, manifest) = selected::compressed(CompressedForm::FullAndReuse);
+    let (wide, wide_manifest) = selected::compressed(WIDE_POOL);
+    let unit = |name: &str| name.ends_with("norm").then_some(1.0);
+    let limits = ResourceLimits { conversations: std::num::NonZeroUsize::new(2).unwrap(), ..limits(32, false, 1, 32) };
+    let mut differing = Vec::new();
+    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
+    let forms = [
+        ("unrounded", definition.clone(), &manifest),
+        ("slice-c", slice_c_numerics(definition), &manifest),
+        ("wide-pool", wide, &wide_manifest),
+    ]
+    .map(|(form, definition, manifest)| (form, fixture_stored("decode-equals-prefill", definition, manifest, &unit)));
+    // Each backend whole before the next, so a backend that fails leaves the
+    // ones before it reported.
+    for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
+        for (form, (_, definition, package)) in &forms {
+            for prompt in [15, 5, 6, 37, 38] {
+                let case = format!("{form} {backend:?} prompt {prompt}");
+                eprintln!("decode against prefill: {case}: loading");
+                let (mut domain, bindings, _, _) = load(&catalog, definition, package, backend, limits, Banked::Resident);
+                let (stepped, bindings) = decode_logits(&mut domain, bindings, RequestId(1), prompt, true, backend);
+                let (batched, _) = decode_logits(&mut domain, bindings, RequestId(2), prompt, false, backend);
+                for (position, (stepped, batched)) in (prompt..).zip(stepped.iter().zip(&batched)) {
+                    let kl = kl_of(stepped, batched);
+                    let row = format!("{case} position {position}: KL {kl:.3e}");
+                    // As it goes, so a later failure still shows what passed.
+                    eprintln!("decode against prefill: {row}");
+                    if kl > DECODE_KL {
+                        differing.push(row);
+                    }
+                }
+            }
+        }
+    }
+    for (_, (directory, ..)) in &forms {
+        std::fs::remove_dir_all(directory).ok();
+    }
+    assert!(differing.is_empty(), "decode differs from prefill:\n{}", differing.join("\n"));
+}
+
+/// `definition` (`compressed`'s full-and-reuse forms) in slice C's numerics: its window
+/// rows E4M3 per 32 (UE8M0, floor 1e-4), its pooled rows E2M1 per 16 (an
+/// E4M3 scale, floor 6·2⁻⁹), its index query and keys E2M1 per 32 (UE8M0,
+/// floor 6·2⁻¹²⁶), as V4.1's family states them, and a top of 512, which
+/// picks every block of the test's contexts.
+fn slice_c_numerics(mut definition: ModelDefinition) -> ModelDefinition {
+    use magnitude_family_contracts::{
+        BlockElement, BlockRounding, BlockScale, HistoryReads, HistoryRows, IndexerKeys, Operator, RowProducer,
+        RowRounding, Selection,
+    };
+    let rounding = |element, block, scale, amax_floor| RowRounding::Block(BlockRounding { element, block, scale, amax_floor });
+    let index = rounding(BlockElement::E2M1, 32, BlockScale::Ue8m0, 6.0 * f32::MIN_POSITIVE as f64);
+    for block in &mut definition.decoder.blocks {
+        let Operator::Attention(attention) = &mut block.sublayers[0].op else {
+            unreachable!("each block opens with attention")
+        };
+        for source in &mut attention.history {
+            match &mut source.rows {
+                HistoryRows::Own(RowProducer::Projected(rows)) => {
+                    rows.rounding = rounding(BlockElement::E4M3, 32, BlockScale::Ue8m0, 1e-4);
+                }
+                HistoryRows::Own(RowProducer::Pooled(rows)) => {
+                    rows.rounding = rounding(BlockElement::E2M1, 16, BlockScale::E4M3, 6.0 / 512.0);
+                }
+                HistoryRows::Shared { .. } => {}
+            }
+            if let HistoryReads::Selected(Selection::Own(indexer)) = &mut source.reads {
+                indexer.query.rounding = index;
+                let IndexerKeys::Latent { rounding, .. } = &mut indexer.keys else {
+                    unreachable!("full-and-reuse indexer keys are latent")
+                };
+                *rounding = index;
+                indexer.top = 512;
+            }
+        }
+    }
+    definition.validate().unwrap();
+    definition
+}
+
+/// The logits of the 8 rows after `request`'s `prompt`-row prompt.
+/// `stepped`: the prompt in 16-row chunks, then one row a forward.
+/// Otherwise the prompt's whole 16-row chunks, then one forward of its
+/// remaining rows and the 8, each row's logits demanded.
+fn decode_logits(
+    domain: &mut ExecutorDomain,
+    mut bindings: crate::StateBindings,
+    request: RequestId,
+    prompt: usize,
+    stepped: bool,
+    backend: seismic::BackendName,
+) -> (Vec<Vec<f32>>, crate::StateBindings) {
+    let token = |position: usize| (position * 37 + 11) as u32 % 256;
+    domain.install_input(request, PreparedModelInput::continuation_only()).unwrap();
+    domain.open_state(&mut bindings, request, None).unwrap();
+    let chunked = if stepped { prompt } else { prompt / 16 * 16 };
+    for start in (0..chunked).step_by(16) {
+        let tokens = (start..chunked.min(start + 16)).map(token).collect::<Vec<_>>();
+        bindings = run(domain, bindings, forward(request, WorkKind::Prefill, &tokens, start, false), false, backend).1;
+    }
+    let forwards = if stepped { (prompt..prompt + 8).map(|start| start..start + 1).collect() } else { vec![chunked..prompt + 8] };
+    let mut logits = Vec::new();
+    for rows in forwards {
+        let tokens = rows.clone().map(token).collect::<Vec<_>>();
+        // Every row's logits; no selection.
+        let operation = scored(forward(request, WorkKind::Decode, &tokens, rows.start, false));
+        let (outcome, returned) = run(domain, bindings, operation, false, backend);
+        bindings = returned;
+        let Outcome::Forward { rows: results } = outcome else {
+            panic!("{backend:?}: a forward has a forward outcome: {outcome:?}");
+        };
+        // The scored rows: those from the prompt's end.
+        let kept = results.iter().zip(rows).filter(|(_, position)| *position >= prompt);
+        logits.extend(kept.map(|(row, _)| {
+            row.logits
+                .as_ref()
+                .unwrap_or_else(|| panic!("{backend:?}: a row demanding logits has them"))
+                .read_to_host()
+                .unwrap()
+        }));
+    }
+    (logits, bindings)
+}
+
+/// KL(p || q) of the softmax distributions of logits `p` and `q`.
+fn kl_of(p: &[f32], q: &[f32]) -> f64 {
+    let log_softmax = |logits: &[f32]| {
+        let top = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+        let total = logits.iter().map(|&value| (value as f64 - top).exp()).sum::<f64>().ln();
+        logits.iter().map(|&value| value as f64 - top - total).collect::<Vec<_>>()
+    };
+    let (p, q) = (log_softmax(p), log_softmax(q));
+    p.iter().zip(&q).map(|(p, q)| p.exp() * (p - q)).sum()
+}
+
 /// Rows of one prompt chunk of the split-pass test: Metal's admitted launch
 /// bound, a prompt class, so every routed layer's backs merge into the
 /// group's pass.
@@ -1670,12 +1915,23 @@ fn run(
 /// step.
 fn step(
     domain: &mut ExecutorDomain,
-    mut bindings: crate::StateBindings,
+    bindings: crate::StateBindings,
     operation: Operation,
     backend: seismic::BackendName,
 ) -> (Outcome, crate::StateBindings, bool) {
-    let operations = [operation];
-    let rows = operations[0].row_count();
+    let (mut outcomes, bindings, claimed) = steps(domain, bindings, vec![operation], backend);
+    (outcomes.pop().expect("one operation"), bindings, claimed)
+}
+
+/// One launch of `operations`, one request's each, whichever way it
+/// reserves: their outcomes in order, and whether it claimed the queued
+/// step.
+fn steps(
+    domain: &mut ExecutorDomain,
+    mut bindings: crate::StateBindings,
+    operations: Vec<Operation>,
+    backend: seismic::BackendName,
+) -> (Vec<Outcome>, crate::StateBindings, bool) {
     let reserved = domain
         .reserve(&mut bindings, &operations)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"))
@@ -1687,19 +1943,23 @@ fn step(
     let flight = domain
         .submit_target(bindings, &operations, reservation)
         .unwrap_or_else(|failure| panic!("{backend:?}: {}", failure.error()));
-    let (mut pending, bindings) = domain
+    let (pending, bindings) = domain
         .finish_target(flight)
         .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    let pending = pending.pop().expect("one operation");
-    let outcome = pending.outcome().clone();
-    assert!(
-        !matches!(outcome, Outcome::WeightReadFailed(_)),
-        "{backend:?}: {outcome:?}"
-    );
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: rows })
-        .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
-    (outcome, bindings, claimed)
+    assert_eq!(pending.len(), operations.len(), "{backend:?}: an outcome per operation");
+    let mut outcomes = Vec::new();
+    for (pending, operation) in pending.into_iter().zip(&operations) {
+        let outcome = pending.outcome().clone();
+        assert!(
+            !matches!(outcome, Outcome::WeightReadFailed(_)),
+            "{backend:?}: {outcome:?}"
+        );
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: operation.row_count() })
+            .unwrap_or_else(|error| panic!("{backend:?}: {error}"));
+        outcomes.push(outcome);
+    }
+    (outcomes, bindings, claimed)
 }
 
 /// Launches of `rows` rows, `lookahead` or not, in chains of up to

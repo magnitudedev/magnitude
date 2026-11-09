@@ -40,7 +40,7 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             draft_policy: None,
             method: ModelMethod::Mtp,
             mtp_proposals: Some(PROPOSALS),
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: 64,
             numerical_profile: None,

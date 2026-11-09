@@ -554,7 +554,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     let hidden_norm = weight!(head, WeightKind::HeadHiddenNorm);
     let combine = weight!(head, WeightKind::HeadCombine);
     let attention_shape =
-        operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
+        operators::attention::shape(hidden, attention, None).map_err(|error| error.to_string())?;
     let head_epsilon = operators::attention::head_norm_epsilon(attention, paired.epsilon())
         .map_err(|error| error.to_string())? as f32;
     // A causal-only transaction only publishes its entry rows' K/V history:
@@ -871,6 +871,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 inject_only,
                 causal_cache: false,
                 selection: None,
+                picked: None,
                 controls: crate::programs::graph::draft::ControlSource::Uploaded,
             },
         )?;

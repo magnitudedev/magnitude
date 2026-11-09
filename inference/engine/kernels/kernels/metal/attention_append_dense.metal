@@ -41,8 +41,13 @@ kernel void attention_append_dense(
     const ulong slab_rows = ulong(SEISMIC_PARAM_SLAB_ROWS);
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     float k[E], v[E];
-    attention::head_rotary<ATTENTION_NORM>(key + source, key_norm, coordinates + row * 4,
-        rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, k);
+    // The stored key prepared and rounded as the attention entries do.
+    const attention::rotary_table table(coordinates + row * 4, rotary_components, rotary_frequencies,
+        rotary_amplitudes, lane);
+    attention::rounded_head_rotary<ATTENTION_NORM>(key + source, key_norm, table, epsilon,
+        attention::key_rounding(SEISMIC_DIM_KR != 0, uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT),
+            uint(SEISMIC_PARAM_KEY_SCALE), uint(SEISMIC_PARAM_KEY_AMAX_FLOOR)),
+        lane, k);
     attention::append(slab::row<attention::Scalar>(history_key, destination, slab_rows, KV * W),
         0, kv_head, lane, k);
     // Stored-key values are the key plane.

@@ -25,7 +25,7 @@ use crate::error::PlanError;
 use magnitude_family_contracts::{
     Attention, Block, BranchOutput, Decoder, DenseFfn, ExitNorm, GatedDelta, Head, HeadBlock,
     ExitSite, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, HyperConnectionExit,
-    HyperConnectionInput, HyperConnectionWeights, InputNorm, KeyValue, LayerNorm, LowRankGatedSite,
+    HyperConnectionInput, HyperConnectionWeights, InputNorm, LayerNorm, LowRankGatedSite,
     ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy,
     ResidualForm, RmsNorm, RoutedFfn, RouterInput, Sublayer, SublayerIndex, VocabularyProjection,
     WeightDescriptor, WeightKind, WeightRole, WeightScope,
@@ -145,6 +145,12 @@ impl InputForm {
     pub(crate) const SINGLE: Self = Self {
         parts: 1,
         normalized: true,
+    };
+
+    /// One row read as it is, under no norm.
+    pub(crate) const PLAIN: Self = Self {
+        parts: 1,
+        normalized: false,
     };
 
     /// The decoder readout's input form: a low-rank exit site's partial
@@ -493,9 +499,9 @@ impl SharedHead<'_> {
             .get(index)
             .ok_or(PlanError::Topology("draft head block index"))?;
         match &paired_block(block)?.mixer {
-            Mixer::Attention(attention) => match &attention.key_value {
-                KeyValue::Shared { source } => Ok(*source),
-                KeyValue::Owned { .. } => Err(PlanError::Topology(
+            Mixer::Attention(attention) => match self::attention::fresh_rows(attention) {
+                self::attention::FreshRows::Shared(source) => Ok(source),
+                self::attention::FreshRows::Own(_) => Err(PlanError::Topology(
                     "a head reading target history owns none",
                 )),
             },
@@ -691,6 +697,9 @@ pub(crate) fn is_fixed_dense_role(kind: WeightKind) -> bool {
             | WeightKind::KeyNorm
             | WeightKind::IndexerQueryNorm
             | WeightKind::IndexerKeyNorm
+            // `pool_rows` normalizes the pooled rows in F32 (at rate 1,
+            // `attention_append_dense` and the index keys' projection).
+            | WeightKind::PooledNorm
             | WeightKind::RecurrentConvolution
             | WeightKind::RecurrentConvolutionBias
             | WeightKind::NGramConvolution
@@ -828,23 +837,32 @@ impl FeedForwardSublayer<'_> {
     }
 }
 
-/// Which state a mixer keeps, which decides the launch class axis of its
-/// block's graphs: history segments for attention, request slots for a
-/// recurrent bank.
+/// The state a block keeps, which decides the launch class axes of its
+/// graphs: history segments for an attention mixer's history, request slots
+/// for a recurrent bank (a recurrent mixer's windows, and an n-gram input's,
+/// whose slot tables are exact per request slot). An attention block with an
+/// n-gram input keeps both.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MixerKind {
-    Attention,
-    Recurrent,
+pub(crate) enum BlockKeeps {
+    History,
+    Bank,
+    HistoryAndBank,
+}
+
+impl BlockKeeps {
+    /// Whether the block reads a history, its graphs classed by segments.
+    pub fn history(self) -> bool {
+        matches!(self, Self::History | Self::HistoryAndBank)
+    }
+
+    /// Whether the block keeps a recurrent bank, its graphs classed by
+    /// request slots.
+    pub fn bank(self) -> bool {
+        matches!(self, Self::Bank | Self::HistoryAndBank)
+    }
 }
 
 impl Mixer<'_> {
-    pub fn kind(&self) -> MixerKind {
-        match self {
-            Self::Attention(_) => MixerKind::Attention,
-            Self::GatedDelta(_) | Self::StateSpace(_) | Self::ShortConv(_) => MixerKind::Recurrent,
-        }
-    }
-
     /// The components the mixer keeps in the state store's recurrent bank,
     /// consecutive in model order.
     pub fn bank_components(&self) -> usize {
@@ -867,6 +885,16 @@ pub(crate) fn bank_component_index(blocks: &[Block], index: usize) -> Result<usi
 }
 
 impl PairedBlock<'_> {
+    /// The state the block keeps: its mixer's history or bank, and its
+    /// n-gram input's bank.
+    pub fn keeps(&self) -> BlockKeeps {
+        match (&self.mixer, &self.ngram) {
+            (Mixer::Attention(_), None) => BlockKeeps::History,
+            (Mixer::Attention(_), Some(_)) => BlockKeeps::HistoryAndBank,
+            (Mixer::GatedDelta(_) | Mixer::StateSpace(_) | Mixer::ShortConv(_), _) => BlockKeeps::Bank,
+        }
+    }
+
     /// The components the block keeps in the state store's recurrent bank,
     /// consecutive in model order: its mixer's, then its n-gram input's.
     pub fn bank_components(&self) -> usize {
@@ -878,11 +906,12 @@ impl PairedBlock<'_> {
         self.mixer_input.epsilon()
     }
 
-    /// Every numerical parameter of the block apart from its weights. Blocks
-    /// with equal keys and equal resident weight shapes seal equal graphs.
-    pub fn shape_key(&self) -> Result<String, PlanError> {
+    /// Every numerical parameter of the block apart from its weights, its
+    /// attention's index-list source resolved at `site`. Blocks with equal
+    /// keys and equal resident weight shapes seal equal graphs.
+    pub fn shape_key(&self, site: Option<attention::DecoderSite<'_>>) -> Result<String, PlanError> {
         let mixer = match self.mixer {
-            Mixer::Attention(operator) => attention::shape_key(operator, self.epsilon())?,
+            Mixer::Attention(operator) => attention::shape_key(operator, self.epsilon(), site)?,
             Mixer::GatedDelta(operator) => gated_delta::shape_key(operator),
             Mixer::StateSpace(operator) => state_space::shape_key(operator),
             Mixer::ShortConv(operator) => short_conv::shape_key(operator),
@@ -1073,7 +1102,7 @@ pub(crate) fn attention_slot(
             "a draft block mixer other than attention",
         ));
     };
-    if !matches!(operator.reads, HistoryReads::Visible) {
+    if operator.history.len() > 1 || !matches!(operator.fresh().reads, HistoryReads::Visible) {
         return Err(PlanError::Unsupported("a draft block's selected attention"));
     }
     let lookup = |kind| paired.mixer_input.lookup(kind, &lookup);
@@ -1086,6 +1115,7 @@ pub(crate) fn attention_slot(
         scalable,
         activation,
         history,
+        None,
     )
 }
 
@@ -1141,7 +1171,8 @@ pub(crate) fn slot_matches(paired: &PairedBlock, slot: &crate::TargetBlockProgra
 /// The program slot of a paired block's mixer in a decoder serving
 /// `context` tokens; `lookup` resolves the planned element of a role in the
 /// mixer sublayer's scope, `scalable` that of a projection bound with an
-/// accumulator-scale port.
+/// accumulator-scale port. `site` places a target block's mixer in its
+/// decoder, whose other layers its index-list source resolves.
 pub(crate) fn mixer_slot(
     paired: &PairedBlock,
     hidden: u64,
@@ -1150,6 +1181,7 @@ pub(crate) fn mixer_slot(
     scalable: impl Fn(WeightKind) -> Result<crate::ScalableWeight, PlanError>,
     activation: Element,
     history: magnitude_state::KvCodec,
+    site: Option<attention::DecoderSite<'_>>,
 ) -> Result<crate::MixerProgramSlot, PlanError> {
     use crate::MixerProgramSlot as Slot;
     let lookup = |kind| paired.mixer_input.lookup(kind, &lookup);
@@ -1163,6 +1195,7 @@ pub(crate) fn mixer_slot(
             &scalable,
             activation,
             history,
+            site,
         )?),
         Mixer::GatedDelta(operator) => {
             Slot::Recurrent(gated_delta::binding(operator, lookup, &scalable, activation)?)

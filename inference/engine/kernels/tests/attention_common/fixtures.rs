@@ -410,6 +410,37 @@ fn half_split_append_layout(device: &Device) -> Tensor {
     Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0], &[]).unwrap()
 }
 
+/// The dense entries' `form` (`RA`, `RT`, `RO`, `VK`, `KR`): half-split
+/// leading, no output rotary, values of their own, no key rounding.
+#[allow(dead_code)]
+fn dense_layout(device: &Device) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0, 0], &[]).unwrap()
+}
+
+/// The dense append's `form` (`RA`, `RT`, `VK`, `KR`): half-split leading,
+/// values of their own, no key rounding.
+#[allow(dead_code)]
+fn dense_append_layout(device: &Device) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap()
+}
+
+/// The dense mix entries' statics `specialization` with no key rounding
+/// (`KR`) and no index-list source (`KS`).
+#[allow(dead_code)]
+fn dense_statics(specialization: NativeSpecialization) -> NativeSpecialization {
+    specialization.with_static("KR", 0).with_static("KS", 0)
+}
+
+/// A dense entry's absent index-list source: `rows` rows of no picks
+/// (`KS` = 0) over an empty plane of `kv` heads of width `w` (`TS` = 0).
+#[allow(dead_code)]
+fn no_picks(device: &Device, rows: usize, kv: usize, w: usize) -> (Tensor, Tensor) {
+    (
+        Tensor::from_host(device, Element::i32(), &[rows as u64, 0], &[]).unwrap(),
+        Tensor::from_host(device, Element::bf16(), &[0, kv as u64, w as u64], &[]).unwrap(),
+    )
+}
+
 fn statics(geometry: Geometry) -> NativeSpecialization {
     NativeSpecialization::new()
         .with_static("KV", geometry.kv as u64)

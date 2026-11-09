@@ -14,7 +14,7 @@
 
 use crate::decoder::{self, Context};
 use crate::{
-    Block, Decoder, DefinitionError, KeyValue, Operator, ResidualForm, RmsNorm, SublayerIndex,
+    Block, Decoder, DefinitionError, HistoryRows, Operator, ResidualForm, RmsNorm, SublayerIndex,
     TokenId, WeightDescriptor, WeightKind, WeightRole, WeightScope, checked_product,
     expect_shape,
 };
@@ -695,7 +695,11 @@ impl DraftDefinition {
         for block in &self.blocks {
             for sublayer in &block.sublayers {
                 if let Operator::Attention(attention) = &sublayer.op {
-                    if !matches!(attention.key_value, KeyValue::Owned { .. }) {
+                    if attention
+                        .history
+                        .iter()
+                        .any(|source| !matches!(source.rows, HistoryRows::Own(_)))
+                    {
                         return Err(DefinitionError::new(
                             "draft attention layers own their key and value history",
                         ));

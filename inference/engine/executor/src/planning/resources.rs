@@ -814,7 +814,7 @@ impl StateStorePlan {
             store
                 .components
                 .iter()
-                .find(|component| component.layer == owner)
+                .find(|component| component.layer == owner && component.attended())
                 .map(|component| LayerHistory {
                     domain: HistoryDomainId(index),
                     store,
@@ -831,20 +831,47 @@ impl StateStorePlan {
     }
 
     /// The raw keys' (Window) and block keys' (Block) domains of target
-    /// block `block`'s indexer (`LayerRef::Indexer`). `None` for a block
+    /// block `block`'s indexer over its token rows
+    /// (`LayerRef::IndexKeys { block, part: 0 }`). `None` for a block
     /// without one.
     pub fn indexer_history(&self, block: u32) -> Option<(&HistoryStorePlan, &HistoryStorePlan)> {
-        let layer = LayerRef::Indexer(block);
-        let find = |blocks: bool| {
-            self.domains.iter().find(|store| {
-                matches!(store.kind, HistoryDomainKind::Block { .. }) == blocks
-                    && store
-                        .components
-                        .iter()
-                        .any(|component| component.layer == layer)
-            })
-        };
+        let layer = LayerRef::IndexKeys { block, part: 0 };
+        let find = |blocks: bool| self.produced_domain(layer, blocks).map(|(_, store)| store);
         Some((find(false)?, find(true)?))
+    }
+
+    /// The domains of target block `block`'s pooled source `part`
+    /// (`LayerRef::Pooled`), as `StateStore::pooled_domains` binds them: the
+    /// Window of its incomplete group (none at rate 1) and the Block of its
+    /// rows, whose index keys (`LayerRef::IndexKeys`) share it. `None` for a
+    /// source the block does not own.
+    pub fn pooled_history(
+        &self,
+        block: u32,
+        part: u32,
+    ) -> Option<(Option<&HistoryStorePlan>, &HistoryStorePlan)> {
+        let layer = LayerRef::Pooled { block, part };
+        let find = |blocks: bool| self.produced_domain(layer, blocks).map(|(_, store)| store);
+        Some((find(false), find(true)?))
+    }
+
+    /// The history read of target block `block`'s pooled source `part`'s
+    /// Block domain: a stored domain's read is its index
+    /// (`magnitude_state::HistoryReads`).
+    pub fn pooled_read(&self, block: u32, part: u32) -> Option<usize> {
+        self.produced_domain(LayerRef::Pooled { block, part }, true).map(|(read, _)| read)
+    }
+
+    /// The Block (`blocks`) or Window domain holding `layer`'s produced rows,
+    /// with its read index.
+    fn produced_domain(&self, layer: LayerRef, blocks: bool) -> Option<(usize, &HistoryStorePlan)> {
+        self.domains.iter().enumerate().find(|(_, store)| {
+            matches!(store.kind, HistoryDomainKind::Block { .. }) == blocks
+                && store
+                    .components
+                    .iter()
+                    .any(|component| component.layer == layer)
+        })
     }
 
     /// The store's one history domain, for a store whose history the

@@ -25,9 +25,10 @@ use crate::operators::attention::graph::{
     rotary_amplitudes, rotary_components, rotary_frequencies, selected_segments,
 };
 use crate::programs::invocation_demand::Launch;
+use crate::operators::attention::{FreshRows, PickedSource, fresh_rows, picked_source, shared_rows};
 use crate::{AttentionBinding, AttentionShape, LowRankQueryBinding, SelectionBinding};
 use magnitude_family_contracts::{
-    Attention, HeadHistory, HistoryDomain, KeyValue, Operator, WeightKind, WeightScope,
+    Attention, HeadHistory, HistoryDomain, Operator, WeightKind, WeightScope,
 };
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
@@ -357,6 +358,7 @@ impl AttentionProjectTuning {
             KW: b.key,
             VW: b.value,
             A: b.activation,
+            Y: b.activation,
         }
     }
 }
@@ -541,6 +543,7 @@ impl IndexerProjectTuning {
             KW: selection.key,
             VW: selection.query,
             A: self.binding.activation,
+            Y: self.binding.activation,
         }
     }
 }
@@ -662,6 +665,7 @@ impl LowRankQueryProjectTuning {
             KW: query,
             VW: query,
             A: self.binding.activation,
+            Y: self.binding.activation,
         }
     }
 }
@@ -742,6 +746,208 @@ impl EntryTuning for LowRankQueryProjectTuning {
                     epsilon: epsilon as f32,
                     scales: segment_scales(inputs, scope, Self::operand_kinds(query_kind))?,
                     bounds: segment_bounds(inputs, scope, Self::operand_kinds(query_kind))?,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> attention_project::Args<'a> {
+        AttentionProjectTuning::args(case)
+    }
+
+    generated_entry!(attention_project, this => this.elements());
+}
+
+/// What one of an own index-list source's projections reads
+/// (`operators::attention::pooled`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PooledProjectInput {
+    /// The layer's input `x`, in the sublayer's input form under its input
+    /// norm (the `u | g` and head-weight projections).
+    Hidden { hidden: u64 },
+    /// The low-rank query's F32 `qr` rows under their norm (the indexer's
+    /// query).
+    QueryRank { rank: u64 },
+    /// F32 rows of `width` under no norm (the indexer's keys, over the
+    /// pooled latent).
+    Plain { width: u64 },
+    /// The tokens' F32 `u` rows of `width` under the pooled rows' norm (the
+    /// indexer's keys at rate 1, whose latent is that normed row).
+    Tokens { width: u64 },
+}
+
+/// `attention_project` as one of an indexing index-list source's
+/// projections: `segments`, a query segment and (for `u | g`) a gate
+/// segment, over `input`, at the elements
+/// `operators::attention::pooled::PickedElements` assigns.
+#[derive(Clone)]
+pub(crate) struct PooledProjectTuning {
+    pub elements: [(&'static str, Element); 7],
+    pub segments: [Option<WeightKind>; 2],
+    pub input: PooledProjectInput,
+    pub scopes: Vec<WeightScope>,
+    /// The input norm's epsilon, for an `x` input.
+    pub epsilon: f32,
+}
+
+impl PooledProjectTuning {
+    fn operand_kinds(&self) -> [Option<WeightKind>; 4] {
+        [self.segments[0], self.segments[1], None, None]
+    }
+
+    fn element(&self, name: &str) -> Element {
+        self.elements
+            .iter()
+            .find(|(element, _)| *element == name)
+            .map(|(_, element)| *element)
+            .expect("an attention_project element assignment names every element")
+    }
+
+    fn elements(&self) -> attention_project::Elements {
+        attention_project::Elements {
+            NW: self.element("NW"),
+            QW: self.element("QW"),
+            GW: self.element("GW"),
+            KW: self.element("KW"),
+            VW: self.element("VW"),
+            A: self.element("A"),
+            Y: self.element("Y"),
+        }
+    }
+
+    /// The input's width, parts and norm extent (`D`, `PT`, `NM`).
+    fn form(&self, inputs: &ModelInputs<'_>) -> Result<(u64, u64, u64), String> {
+        Ok(match self.input {
+            PooledProjectInput::Hidden { hidden } => {
+                let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
+                (hidden, parts, norm)
+            }
+            PooledProjectInput::QueryRank { rank } => (rank, 1, rank),
+            PooledProjectInput::Plain { width } => (width, 1, 0),
+            PooledProjectInput::Tokens { width } => (width, 1, width),
+        })
+    }
+
+    /// The input norm's weight and epsilon.
+    fn norm(&self, inputs: &ModelInputs<'_>) -> Result<(WeightKind, f32), String> {
+        Ok(match self.input {
+            PooledProjectInput::Hidden { .. } => (WeightKind::InputNorm, self.epsilon),
+            PooledProjectInput::QueryRank { .. } => {
+                let (_, epsilon) = operators::attention::low_rank_query(operator(inputs, &self.scopes)?)
+                    .ok_or("an indexer over the low-rank query of a full query")?;
+                (WeightKind::QueryDownNorm, epsilon as f32)
+            }
+            // Zero rows: no kind is read.
+            PooledProjectInput::Plain { .. } => (WeightKind::IndexerKeyNorm, 0.0),
+            PooledProjectInput::Tokens { .. } => {
+                let Ok(Some(operators::attention::PickedSource::Own { rows, .. })) =
+                    operators::attention::picked_source(operator(inputs, &self.scopes)?)
+                else {
+                    return Err("a rate-1 key projection of a layer without its own pooled rows".into());
+                };
+                (WeightKind::PooledNorm, rows.norm.epsilon as f32)
+            }
+        })
+    }
+
+    /// The segments' rows (`Q`, `GR`), each checked against the input.
+    fn rows(&self, inputs: &ModelInputs<'_>, width: u64) -> Result<[u64; 2], String> {
+        let mut rows = [0; 2];
+        for (rows, kind) in rows.iter_mut().zip(self.segments) {
+            if let Some(kind) = kind {
+                let (out, columns) = projection_shape(inputs, &self.scopes, kind)?;
+                if columns != width {
+                    return Err(format!("{kind:?} disagrees with its projection's input"));
+                }
+                *rows = out;
+            }
+        }
+        Ok(rows)
+    }
+}
+
+impl EntryTuning for PooledProjectTuning {
+    type Entry = attention_project::Entry;
+    type Case = AttentionProjectCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
+    fn bindings(&self) -> String {
+        format!(
+            "NW={},QW={},GW={},A={};pooled {:?}",
+            self.element("NW").name(),
+            self.element("QW").name(),
+            self.element("GW").name(),
+            self.element("A").name(),
+            self.segments,
+        )
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let (width, parts, norm) = self.form(inputs)?;
+        let [query_rows, gate_rows] = self.rows(inputs, width)?;
+        let mut statics = vec![
+            ("D", width),
+            ("PT", parts),
+            ("NM", norm),
+            ("Q", query_rows),
+            ("GR", gate_rows),
+            ("K", 0),
+            ("V", 0),
+        ];
+        let [query, gate, key, value] = self.operand_kinds();
+        statics.extend(scale_statics(
+            inputs,
+            &self.scopes,
+            &[("QS", query), ("GS", gate), ("KS", key), ("VS", value)],
+        )?);
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("QB", query), ("GB", gate), ("KB", key), ("VB", value)],
+        )?);
+        Ok(statics)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        let (width, parts, norm_extent) = self.form(inputs)?;
+        let (norm, epsilon) = self.norm(inputs)?;
+        let [query_kind, gate_kind] = self.segments;
+        let query_kind = query_kind.ok_or("a pooled projection without its query segment")?;
+        let norm_element = self.element("NW");
+        TuningInputs::rotation_scopes(&self.scopes, point)
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                let query = inputs.weight(scope, query_kind)?;
+                let empty = query.slice_leading(0, 0).map_err(|error| error.to_string())?;
+                Ok(AttentionProjectCase {
+                    gate: match gate_kind {
+                        Some(kind) => inputs.weight(scope, kind)?,
+                        None => empty.clone(),
+                    },
+                    key: empty.clone(),
+                    value: empty,
+                    hidden: inputs.activation(
+                        Element::f32(),
+                        &[point.rows, parts * width],
+                        index as u64 + 1,
+                    )?,
+                    input_norm: inputs.input_norm(scope, norm, norm_element, norm_extent)?,
+                    query,
+                    epsilon,
+                    scales: segment_scales(inputs, scope, self.operand_kinds())?,
+                    bounds: segment_bounds(inputs, scope, self.operand_kinds())?,
                 })
             })
             .collect()
@@ -896,6 +1102,9 @@ pub(crate) struct AttentionMix {
     /// A selected read's indexer: the prefill then reads through its
     /// WorkList bitmap (`B` words, static), tuned with every block read.
     pub selection: Option<SelectionBinding>,
+    /// The index-list source the layers' picks read ([`picked_rows`]):
+    /// present exactly when the shape picks rows (`KS > 0`).
+    pub picked: Option<PickedRows>,
 }
 
 impl AttentionMix {
@@ -960,9 +1169,9 @@ pub(crate) fn history_window(
 ) -> Result<Option<u64>, String> {
     let mut windows = Vec::with_capacity(scopes.len());
     for scope in scopes {
-        let domain = match &operator(inputs, &[*scope])?.key_value {
-            KeyValue::Owned { domain, .. } => *domain,
-            KeyValue::Shared { source } => {
+        let domain = match fresh_rows(operator(inputs, &[*scope])?) {
+            FreshRows::Own(rows) => HistoryDomain::from(rows.domain),
+            FreshRows::Shared(source) => {
                 let target_read = matches!(scope, WeightScope::HeadSublayer(_))
                     && inputs
                         .definition
@@ -974,18 +1183,18 @@ pub(crate) fn history_window(
                     inputs
                         .definition
                         .decoder
-                        .history_domain(*source)
+                        .history_domain(source)
                         .ok_or_else(|| format!("{scope:?} reads no target history"))?
                 } else {
                     let owner = match scope {
-                        WeightScope::TargetSublayer(_) => WeightScope::TargetSublayer(*source),
-                        WeightScope::HeadSublayer(_) => WeightScope::HeadSublayer(*source),
-                        WeightScope::DraftSublayer(_) => WeightScope::DraftSublayer(*source),
+                        WeightScope::TargetSublayer(_) => WeightScope::TargetSublayer(source),
+                        WeightScope::HeadSublayer(_) => WeightScope::HeadSublayer(source),
+                        WeightScope::DraftSublayer(_) => WeightScope::DraftSublayer(source),
                         other => return Err(format!("{other:?} names no sublayer")),
                     };
-                    match &operator(inputs, &[owner])?.key_value {
-                        KeyValue::Owned { domain, .. } => *domain,
-                        KeyValue::Shared { .. } => {
+                    match fresh_rows(operator(inputs, &[owner])?) {
+                        FreshRows::Own(rows) => HistoryDomain::from(rows.domain),
+                        FreshRows::Shared(_) => {
                             return Err(format!("{owner:?} owns no history for {scope:?} to read"));
                         }
                     }
@@ -1002,6 +1211,82 @@ pub(crate) fn history_window(
         .max()
         .map(Some)
         .ok_or_else(|| "a tuning case needs at least one layer".to_owned())
+}
+
+/// The pooled rows an index-list source holds, as a unit's picks read them:
+/// one row per `rate` tokens, up to the `context` limit, whatever window
+/// the layers' first source keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PickedRows {
+    pub rate: u64,
+    pub context: u64,
+}
+
+impl PickedRows {
+    /// The position the first row of a point with `context` history rows
+    /// of layers keeping at most `window` stands for: `context`, but the
+    /// longest history of a window shorter than the context limit stands
+    /// for every longer prompt ([`with_contexts`]), whose pooled rows grow
+    /// to the limit.
+    fn reach(&self, window: Option<u64>, context: u64) -> u64 {
+        match window {
+            Some(window) if window < self.context && context >= window => self.context,
+            _ => context,
+        }
+    }
+
+    /// The pooled rows a row at `position` lists (within the context
+    /// limit): the groups complete through it, as the store's Block domain
+    /// holds them ([`magnitude_state::HistoryDomainKind::checkpoint_rows`],
+    /// `(t + 1) / rate`).
+    fn held(&self, position: u64) -> u64 {
+        let through = (position + 1).min(self.context) as usize;
+        magnitude_state::HistoryDomainKind::Block { rate: self.rate as usize }
+            .checkpoint_rows(through)
+            .expect("a Block domain references its complete groups") as u64
+    }
+
+    /// Pick `pick` of the `picks` of a row of sequence `sequence` of
+    /// `sequences` whose source holds `held` rows: each held row while they
+    /// are no more than the picks, then none (-1, as an indexer fills a
+    /// short list), or else the picks spread evenly over them, the
+    /// sequences' interleaved so that, where the rows allow, each reads
+    /// rows of its own.
+    fn pick(pick: u64, picks: u64, sequence: u64, sequences: u64, held: u64) -> i32 {
+        let row = match held <= picks {
+            true if pick < held => pick,
+            true => return -1,
+            false => (pick * sequences + sequence) * held / (picks * sequences),
+        };
+        i32::try_from(row).expect("a tuning plane's rows fit i32")
+    }
+}
+
+/// The index-list source the layers at `scopes` read, up to the load's
+/// context: the pooled rows of the fewest tokens per row among theirs,
+/// which a step holds the most of (as [`history_window`] keeps the longest
+/// window); none for layers reading one source.
+pub(crate) fn picked_rows(
+    inputs: &ModelInputs<'_>,
+    scopes: &[WeightScope],
+) -> Result<Option<PickedRows>, String> {
+    let decoder = &inputs.definition.decoder;
+    let mut rates = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let rows = match picked_source(operator(inputs, &[*scope])?).map_err(|e| e.to_string())? {
+            None => continue,
+            Some(PickedSource::Own { rows, .. }) => rows,
+            Some(
+                PickedSource::Reindex { source, part, .. }
+                | PickedSource::Reused { source, part, .. },
+            ) => shared_rows(decoder, source, part).map_err(|e| e.to_string())?,
+        };
+        rates.push(rows.rate);
+    }
+    Ok(rates.into_iter().min().map(|rate| PickedRows {
+        rate,
+        context: inputs.limits.context_tokens,
+    }))
 }
 
 /// `attention_decode`, for row classes up to [`DECODE_ROWS`].
@@ -1047,8 +1332,14 @@ pub(crate) struct AttentionMixCase<H> {
     /// Visible form).
     selection: Tensor,
     block_slots: Tensor,
-    /// The rotary layout, output rotary and stored-key values
-    /// (`[0, RA, RT, RO, VK]`, no values).
+    /// The dense entries' index-list source: each row's picks (`[rows,
+    /// KS]`) of the rows its source holds, in a plane of the most any row
+    /// holds (`[TS, KV, W]`), and source 0's key rounding.
+    selected_rows: Tensor,
+    selected: Tensor,
+    key_rounding: crate::RoundingArgs,
+    /// The rotary layout, output rotary, stored-key values and, for the
+    /// dense entries, key rounding (`[0, RA, RT, RO, VK(, KR)]`, no values).
     form: Tensor,
     history: H,
     slab_rows: u32,
@@ -1272,6 +1563,61 @@ impl MixHistory for AffineMixHistory {
 }
 
 impl AttentionMix {
+    /// The index-list source the layers' picks read; none without picks.
+    fn index_list(&self) -> Option<PickedRows> {
+        match (self.shape.picks, self.picked) {
+            (0, None) => None,
+            (picks, Some(picked)) if picks > 0 => Some(picked),
+            _ => unreachable!("a unit's layers pick rows exactly when they read an index-list source"),
+        }
+    }
+
+    /// The rows `TS` of the index-list source's plane a case of `point`
+    /// binds: what the source holds at the furthest row any of its
+    /// sequences reaches; none without picks.
+    fn picked_plane_rows(&self, point: &PointShape) -> u64 {
+        self.index_list().map_or(0, |picked| {
+            let reach = picked.reach(self.window, point.context.unwrap_or(0));
+            picked.held(reach + point.rows - 1)
+        })
+    }
+
+    /// The picks (`[rows, KS]`) of the rows of `point` at `coordinates`, of
+    /// the sequences `row_slots`: each row's from the pooled rows its
+    /// sequence holds at the position it stands for.
+    fn picks(&self, point: &PointShape, coordinates: &[[i32; 4]], row_slots: &[i32]) -> Vec<i32> {
+        let Some(picked) = self.index_list() else {
+            return Vec::new();
+        };
+        let context = point.context.unwrap_or(0);
+        let reach = picked.reach(self.window, context);
+        let picks = self.shape.picks;
+        coordinates
+            .iter()
+            .zip(row_slots)
+            .flat_map(|(coordinates, &sequence)| {
+                let held = picked.held(reach + coordinates[0] as u64 - context);
+                (0..picks).map(move |pick| {
+                    PickedRows::pick(pick, picks, sequence as u64, point.sequences, held)
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the mix is a dense history's, whose entries also take source
+    /// 0's key rounding and an index-list source.
+    fn dense(&self) -> bool {
+        self.codec.encoding() == magnitude_state::HistoryEncoding::Dense
+    }
+
+    /// The dense entries' `KR` and `KS` statics; none for the affine ones.
+    fn dense_statics(&self) -> Vec<(&'static str, u64)> {
+        match self.dense() {
+            true => vec![("KR", self.shape.rounds_keys()), ("KS", self.shape.picks)],
+            false => Vec::new(),
+        }
+    }
+
     /// The dimensions of the unit's calls at `shapes` over every history
     /// segment class a store seals graphs for: a tuning point's rows see one
     /// span, a served launch's up to the class of
@@ -1319,6 +1665,10 @@ impl AttentionMix {
                                     Vec::new()
                                 },
                             )
+                            // A case's picks read the rows its source
+                            // holds.
+                            .chain(self.dense_statics())
+                            .chain(self.dense().then(|| ("TS", self.picked_plane_rows(point))))
                             .map(|(name, value)| (name.to_owned(), value))
                             .collect(),
                     )
@@ -1349,18 +1699,10 @@ impl AttentionMix {
     }
 
     fn statics(&self) -> Vec<(&'static str, u64)> {
-        self.shape
-            .mix_statics()
+        crate::operators::attention::graph::form_statics(&self.shape, self.codec)
+            .expect("a mix's codec is validated")
             .into_iter()
             .chain([("L", u64::from(self.listing.lists()))])
-            .chain(
-                if self.codec.encoding() == magnitude_state::HistoryEncoding::Affine {
-                    crate::operators::attention::graph::affine_dimensions(self.codec)
-                        .expect("validated affine descriptor")
-                } else {
-                    Vec::new()
-                },
-            )
             .collect()
     }
 
@@ -1436,6 +1778,12 @@ impl AttentionMix {
             .collect::<Vec<_>>();
         let (heads, width) = (shape.heads(), shape.width);
         let fresh_rows = [shape.fresh, rows, shape.kv_heads * width];
+        let selected_rows = self.picks(
+            point,
+            &tables.coordinates[..rows as usize],
+            &tables.row_slots[..rows as usize],
+        );
+        let plane_rows = self.picked_plane_rows(point);
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -1523,6 +1871,13 @@ impl AttentionMix {
                         &vec![u32::MAX; (rows * self.words()) as usize],
                     )?,
                     block_slots: inputs.i32s(&[0, self.block_keys()], &[])?,
+                    selected_rows: inputs.i32s(&[rows, shape.picks], &selected_rows)?,
+                    selected: inputs.activation(
+                        self.activation,
+                        &[plane_rows, shape.kv_heads, shape.width],
+                        0x77,
+                    )?,
+                    key_rounding: shape.key_rounding,
                     form: inputs.i32s(
                         &[
                             0,
@@ -1530,7 +1885,10 @@ impl AttentionMix {
                             shape.rotary_trailing,
                             shape.output_rotary,
                             shape.stored_key(),
-                        ],
+                        ]
+                        .into_iter()
+                        .chain(self.dense().then_some(shape.rounds_keys()))
+                        .collect::<Vec<_>>(),
                         &[],
                     )?,
                     history: history.share(),
@@ -1706,6 +2064,13 @@ mix_entry!(
     |_: &AttentionMix, rows| rows <= DECODE_ROWS,
     statics |_mix| [],
     |case| {
+        selected_rows: &case.selected_rows,
+        selected: &case.selected,
+        selected_slab_rows: 1,
+        key_block: case.key_rounding.block,
+        key_element: case.key_rounding.element,
+        key_scale: case.key_rounding.scale,
+        key_amax_floor: case.key_rounding.amax_floor(),
         history_key: case.history.key.tensor_mut(),
         history_value: case.history.value.tensor_mut(),
     },
@@ -1720,6 +2085,13 @@ mix_entry!(
     |case| {
         selection: &case.selection,
         block_slots: &case.block_slots,
+        selected_rows: &case.selected_rows,
+        selected: &case.selected,
+        selected_slab_rows: 1,
+        key_block: case.key_rounding.block,
+        key_element: case.key_rounding.element,
+        key_scale: case.key_rounding.scale,
+        key_amax_floor: case.key_rounding.amax_floor(),
         history_key: case.history.key.tensor_mut(),
         history_value: case.history.value.tensor_mut(),
     }
@@ -1792,7 +2164,9 @@ mod tests {
 
     #[test]
     fn metal_verification_exposes_legal_scalar_group_split() {
-        for implementation in [
+        // Each entry's own history codec: the dense entry's dense, the
+        // affine entry's K8/V4.
+        for (implementation, codec) in [
             seismic::generated::native_implementation_for_backend::<attention_decode::Entry>(
                 seismic::BackendName::Metal,
             )
@@ -1809,14 +2183,13 @@ mod tests {
             .device_independent()
             .expect("the declaration reads no device property")
             .owned(),
-        ] {
+        ]
+        .into_iter()
+        .zip([magnitude_state::KvCodec::Dense, magnitude_state::KvCodec::AffineK8V4])
+        {
             for group in [1, 2, 3, 4, 8] {
                 let mut mix = AttentionMix {
-                    codec: magnitude_state::KvCodec::AffineK8V4.spec(
-                        seismic::DType::BF16,
-                        256,
-                        256,
-                    ),
+                    codec: codec.spec(seismic::DType::BF16, 256, 256),
                     listing: PrefillListing::Every,
                     activation: Element::bf16(),
                     shape: AttentionShape {
@@ -1836,12 +2209,15 @@ mod tests {
                         rotary_adjacent: 0,
                         rotary_trailing: 0,
                         output_rotary: 0,
+                        key_rounding: crate::RoundingArgs::NONE,
+                        picks: 0,
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
                     decode_rows: Some(2..DECODE_ROWS + 1),
                     window: None,
                     selection: None,
+                    picked: None,
                 };
                 let limits = TuningLimits {
                     max_rows: 8,
@@ -1942,12 +2318,15 @@ mod tests {
                     rotary_adjacent: 0,
                     rotary_trailing: 0,
                     output_rotary: 0,
+                    key_rounding: crate::RoundingArgs::NONE,
+                    picks: 0,
                 },
                 scopes: Vec::new(),
                 epsilon: 1.0e-6,
                 decode_rows: Some(rows),
                 window: None,
                 selection: None,
+                picked: None,
             };
             let statics = mix
                 .statics()
@@ -2003,7 +2382,10 @@ mod tests {
             .expect("the declaration reads no device property")
             .owned(),
         ];
-        for implementation in implementations {
+        // Each entry's own history codec: the dense entry's dense, the affine
+        // entry's K8/V4.
+        let codecs = [magnitude_state::KvCodec::Dense, magnitude_state::KvCodec::AffineK8V4];
+        for (implementation, codec) in implementations.into_iter().zip(codecs) {
             // The affine entry's default SLICES: the fewest that hold a lane
             // to 32 elements, or the most the group splits into.
             for (group, width, max_rows, expected_warps, affine_slices) in [
@@ -2014,11 +2396,7 @@ mod tests {
                 (6, 256, 4, 2, 2),
             ] {
                 let mut mix = AttentionMix {
-                    codec: magnitude_state::KvCodec::AffineK8V4.spec(
-                        seismic::DType::BF16,
-                        width as usize,
-                        width as usize,
-                    ),
+                    codec: codec.spec(seismic::DType::BF16, width as usize, width as usize),
                     listing: PrefillListing::Every,
                     activation: Element::bf16(),
                     shape: AttentionShape {
@@ -2038,12 +2416,15 @@ mod tests {
                         rotary_adjacent: 0,
                         rotary_trailing: 0,
                         output_rotary: 0,
+                        key_rounding: crate::RoundingArgs::NONE,
+                        picks: 0,
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
                     decode_rows: Some(2..DECODE_ROWS + 1),
                     window: None,
                     selection: None,
+                    picked: None,
                 };
                 let limits = TuningLimits {
                     max_rows,
@@ -2157,12 +2538,15 @@ mod tests {
                 rotary_adjacent: 0,
                 rotary_trailing: 0,
                 output_rotary: 0,
+                key_rounding: crate::RoundingArgs::NONE,
+                picks: 0,
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
             decode_rows: Some(1..2),
             window: None,
             selection: None,
+            picked: None,
         };
         let single = AttentionDecodeK8V4Tuning(mix);
         let limits = TuningLimits {
@@ -2258,6 +2642,108 @@ mod tests {
         assert_eq!(owned, (1..DECODE_ROWS + 1).collect::<Vec<_>>());
     }
 
+    /// A case's picks name rows its index-list source holds at the position
+    /// the point stands for, in a plane (`TS`) of those rows, as a served
+    /// step's do: the longest history of a window shorter than the context
+    /// stands for every longer prompt, whose pooled rows fill every pick.
+    #[test]
+    fn a_cases_picks_read_the_rows_its_source_holds() {
+        let picks = 512;
+        let picked = PickedRows {
+            rate: 4,
+            context: 32768,
+        };
+        let mix = AttentionMix {
+            codec: magnitude_state::KvCodec::Dense.spec(seismic::DType::BF16, 512, 512),
+            listing: PrefillListing::Every,
+            activation: Element::bf16(),
+            shape: AttentionShape {
+                hidden: 4096,
+                kv_heads: 1,
+                group: 64,
+                rotary_pairs: 32,
+                width: 512,
+                interleaved_gate: 0,
+                separate_gate: 0,
+                fresh: 1,
+                query_norm: 0,
+                key_norm: 1,
+                value_norm: 0,
+                values: crate::AttentionValues::Projected,
+                sinks: 0,
+                rotary_adjacent: 0,
+                rotary_trailing: 0,
+                output_rotary: 0,
+                key_rounding: crate::RoundingArgs::NONE,
+                picks,
+            },
+            scopes: Vec::new(),
+            epsilon: 1.0e-5,
+            decode_rows: None,
+            window: Some(128),
+            selection: None,
+            picked: Some(picked),
+        };
+        let tuning = AttentionDecodeTuning(mix.clone());
+        let limits = TuningLimits {
+            max_rows: 512,
+            max_projected_rows: 512,
+            context_tokens: picked.context,
+        };
+        let points = tuning.points(limits);
+        let served = tuning.served_dimensions(&points);
+        let point = |rows: u64, sequences: u64, context: u64| {
+            points
+                .iter()
+                .find(|point| {
+                    (point.rows, point.sequences, point.context) == (rows, sequences, Some(context))
+                })
+                .unwrap_or_else(|| panic!("no point m{rows}s{sequences}-c{context}"))
+        };
+        let plane_rows = |point: &PointShape| {
+            let rows = served
+                .iter()
+                .filter(|dimensions| {
+                    dimensions["M"] == point.rows
+                        && dimensions["T"] == point.context.unwrap() + point.rows
+                })
+                .map(|dimensions| dimensions["TS"])
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(rows.len(), 1, "{}: {rows:?}", point.label);
+            rows.into_iter().next().unwrap()
+        };
+        // The window's longest history stands for a step at the context
+        // limit, whose source holds every complete group.
+        let long = point(1, 1, 128);
+        assert_eq!(plane_rows(long), 32768 / 4);
+        let one = mix.picks(long, &[[128, 128, 128, 0]], &[0]);
+        assert_eq!(one.len(), picks as usize);
+        assert!(one.iter().all(|row| (0..32768 / 4).contains(row)), "{one:?}");
+        assert_eq!(
+            one.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            picks as usize
+        );
+        // Sequences decoding together each read rows of their own.
+        let pair = point(2, 2, 128);
+        let two = mix.picks(pair, &[[128, 128, 128, 0]; 2], &[0, 1]);
+        assert_eq!(
+            two.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            2 * picks as usize
+        );
+        // A step that has completed no group picks none, of no rows.
+        let fresh = point(1, 1, 0);
+        assert_eq!(plane_rows(fresh), 0);
+        assert!(mix.picks(fresh, &[[0, 0, 0, 0]], &[0]).iter().all(|row| *row == -1));
+        // A step holding fewer groups than picks reads each of them.
+        let short = PointShape {
+            context: Some(64),
+            ..fresh.clone()
+        };
+        let held = mix.picks(&short, &[[64, 64, 64, 0]], &[0]);
+        assert_eq!(&held[..16], (0..16).collect::<Vec<_>>());
+        assert!(held[16..].iter().all(|row| *row == -1));
+    }
+
     /// A tuning point's rows see one history span; the unit names each of
     /// its points' calls at every span class a store seals graphs for, so a
     /// candidate is checked at the largest before it is chosen.
@@ -2284,12 +2770,15 @@ mod tests {
                 rotary_adjacent: 0,
                 rotary_trailing: 0,
                 output_rotary: 0,
+                key_rounding: crate::RoundingArgs::NONE,
+                picks: 0,
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
             decode_rows: None,
             window: None,
             selection: None,
+            picked: None,
         };
         let tuning = AttentionPrefillK8V4Tuning(mix);
         let limits = TuningLimits {

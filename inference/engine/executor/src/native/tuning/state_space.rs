@@ -63,6 +63,7 @@ impl StateSpaceProjectTuning {
             KW: b.projection,
             VW: b.projection,
             A: b.activation,
+            Y: b.activation,
         }
     }
 }

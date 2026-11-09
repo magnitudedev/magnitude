@@ -28,6 +28,7 @@ fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
         cx.dim_ro(),
         cx.dim_vk(),
     )
+    .with_key_rounding(cx.dim_kr(), cx.arg_key_block(), cx.arg_key_element(), cx.arg_key_scale(), cx.arg_key_amax_floor())
 }
 
 fn attention_decode_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
@@ -137,6 +138,20 @@ fn attention_decode_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
         |token, out| out.copy_from_slice(&keys[(token * kv + kv_head) * w..][..w]),
         |token, out| out.copy_from_slice(&values[(token * kv + kv_head) * w..][..w]),
     );
+    // The index-list source's picks join the row's last partition.
+    let picks = cx.dim_ks() as usize;
+    if picks > 0 && part + 1 == parts {
+        let selected = SlabTensor::from_bound(cx.arg_selected(), cx.arg_selected_slab_rows() as usize);
+        attention::attend_picks(
+            &mut state,
+            queries,
+            cx.arg_scale(),
+            scores,
+            key_row,
+            cx.arg_selected_rows().row([row, 0]),
+            |pick, out| activation::widen::<E::A>(selected.row([pick, kv_head, 0]), out),
+        );
+    }
 }
 
 fn attention_decode_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {

@@ -26,6 +26,11 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "decode routing that also expands the shared expert, the decode form of the backends that stream decode; the other backends run `routed_route`, then `routed_expand`",
     ),
     (
+        "pool_rows",
+        &[BackendName::Cpu, BackendName::Metal],
+        "pooled history rows (DeepSeek V4.1's compressed history), which no CUDA or Vulkan model runs yet",
+    ),
+    (
         "stream_mix_sinkhorn",
         &[BackendName::Cpu, BackendName::Metal],
         "the Sinkhorn mix site (DeepSeek V4.1's single-pass hyper-connections), which no CUDA or Vulkan model runs yet",
@@ -221,8 +226,8 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/core/rotary",
-        &[BackendName::Vulkan],
-        "rotary sin/cos shared by attention and vision; inside `attention.h` / `attention.cuh` elsewhere",
+        &[BackendName::Metal, BackendName::Vulkan],
+        "rotary sin/cos and the lane rotation shared by attention, vision and (Metal) the pooled rows and indexers; inside `attention.cuh` on CUDA",
     ),
     (
         "lib/recurrent/convolution",

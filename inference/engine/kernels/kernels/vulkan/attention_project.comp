@@ -17,6 +17,15 @@
 #else
 #error "attention_project requires a bf16 or f16 activation"
 #endif
+#if defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F32)
+#define PROJECT_PUBLISHED ELEMENT_F32
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_BF16)
+#define PROJECT_PUBLISHED ELEMENT_BF16
+#elif defined(SEISMIC_ELEMENT_Y_REPRESENTATION_F16)
+#define PROJECT_PUBLISHED ELEMENT_F16
+#else
+#error "attention_project requires a dense published element"
+#endif
 #if defined(SEISMIC_INPUT_NORM_REPRESENTATION_F32)
 #define PROJECT_NORM ELEMENT_F32
 #elif defined(SEISMIC_INPUT_NORM_REPRESENTATION_F16)
@@ -69,22 +78,22 @@ projection_weights attention_project_value() {
 // Each segment's result, after its weight's second-level scale where it has
 // one (an absent port's factor is 1).
 projection_epilogue attention_project_query_out() {
-    return projection_scaled(projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
+    return projection_scaled(projection_store(PROJECT_PUBLISHED, SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER),
         SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0ul),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_SCALE), SEISMIC_DIM_QS, 0ul, 0ul), 1.0);
 }
 projection_epilogue attention_project_gate_out() {
-    return projection_scaled(projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER),
+    return projection_scaled(projection_store(PROJECT_PUBLISHED, SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER),
         SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, 0ul),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_GATE_SCALE), SEISMIC_DIM_GS, 0ul, 0ul), 1.0);
 }
 projection_epilogue attention_project_key_out() {
-    return projection_scaled(projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER),
+    return projection_scaled(projection_store(PROJECT_PUBLISHED, SEISMIC_PTR(SEISMIC_RESULT_2_BUFFER),
         SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, 0ul),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_KEY_SCALE), SEISMIC_DIM_KS, 0ul, 0ul), 1.0);
 }
 projection_epilogue attention_project_value_out() {
-    return projection_scaled(projection_store(PROJECT_ACT, SEISMIC_PTR(SEISMIC_RESULT_3_BUFFER),
+    return projection_scaled(projection_store(PROJECT_PUBLISHED, SEISMIC_PTR(SEISMIC_RESULT_3_BUFFER),
         SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0ul),
         projection_scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_SCALE), SEISMIC_DIM_VS, 0ul, 0ul), 1.0);
 }

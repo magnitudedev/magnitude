@@ -144,9 +144,7 @@ fn indexer_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
     }
     // The row's complete blocks in block order, scored.
     let spans = cx.arg_block_visible();
-    let own = cx.arg_block_destinations().get([row]);
     let physical = span_rows(&|span, bound| spans.get([row, span, bound]), r)
-        .chain((own >= 0).then_some(own))
         .take(nb)
         .collect::<Vec<_>>();
     let complete = physical.len();

@@ -157,6 +157,16 @@ impl HistoryDomainLayout {
     }
 }
 
+/// Whether a domain of `kind` holding `components` holds produced rows:
+/// every Block domain (pooled rows and their indexer keys), and a Window of
+/// produced components (a pooled source's incomplete groups, an indexer's
+/// raw keys). A launch's rows read such a domain's rows of their own launch
+/// as stored, after they are written, rather than fresh.
+pub fn produced_domain(kind: HistoryDomainKind, components: &[ComponentDescriptor]) -> bool {
+    matches!(kind, HistoryDomainKind::Block { .. })
+        || components.iter().any(|component| !component.attended())
+}
+
 /// Rows within an advance read through stored history by Shared layers,
 /// compressed causal target attention or an indexer. Each requires room for
 /// its prepared destination spans beside the already accepted spans.
@@ -166,8 +176,8 @@ fn prepared_appended_rows(
     domains: &[HistoryDomainLayout],
     max_advance: usize,
 ) -> usize {
-    // An indexer reads the raw keys and scores the blocks of its launch's
-    // earlier rows beside the accepted ones.
+    // A producer reads the pending projections and an indexer scores the
+    // rows and keys of its launch's earlier rows beside the accepted ones.
     if let HistoryDomainKind::Block { rate } = kind {
         return max_advance.div_ceil(rate);
     }
@@ -228,8 +238,9 @@ pub struct HistoryReads {
     stored: usize,
     /// The stored domains Shared layers read, ascending.
     sources: Vec<HistoryDomainId>,
-    /// Each layer with history and its read: a stored layer's first domain
-    /// holding it, a Shared layer's source domain's shared read.
+    /// Each layer with attended history and its read: a stored layer's
+    /// domain holding its attended rows, a Shared layer's source domain's
+    /// shared read.
     layers: Vec<(LayerRef, usize)>,
 }
 
@@ -246,7 +257,7 @@ impl HistoryReads {
     pub(crate) fn new(stored: &[StoredDomain], shared: &[(LayerRef, HistorySource)]) -> Self {
         let mut layers = Vec::new();
         for (domain, plan) in stored.iter().enumerate() {
-            for component in &plan.components {
+            for component in plan.components.iter().filter(|component| component.attended()) {
                 if !layers.iter().any(|(layer, _)| *layer == component.layer) {
                     layers.push((component.layer, domain));
                 }
@@ -306,8 +317,8 @@ pub(crate) fn validate_domains(
     max_advance: usize,
 ) -> Result<(Vec<StoredDomain>, Vec<(LayerRef, HistorySource)>), Error> {
     let mut stored = Vec::new();
-    // Each layer has one history, but an indexer two: its raw keys and its
-    // block keys (a Block domain's).
+    // A layer has one component per domain kind: a produced layer may hold
+    // a Window's (its pending projections) and a Block's (its rows or keys).
     let mut layers = BTreeSet::new();
     let mut shared = Vec::new();
     let layouts = plans
@@ -340,18 +351,28 @@ pub(crate) fn validate_domains(
                 {
                     return Err(LayoutError::ZeroWindow.into());
                 }
-                // An indexer's domain holds indexer keys alone, after every
-                // domain attention reads; a Block domain is an indexer's.
-                let attended = components.iter().filter(|component| component.attended()).count();
-                if (attended != 0 && attended != components.len())
-                    || (attended != 0 && matches!(kind, HistoryDomainKind::Block { .. }))
-                    || (attended != 0
+                // Per-token attended rows (a Token or Window domain of them)
+                // and produced rows keep apart: a produced domain holds a
+                // pooled source's incomplete groups or an indexer's raw keys
+                // (Window), or pooled rows and keys (Block), and follows
+                // every per-token one, whose rows a launch reads causally.
+                let produced = produced_domain(kind, &components);
+                let attended = components.iter().filter(|component| component.attended());
+                let mixed = match kind {
+                    // A Block domain's attended rows are pooled sources'.
+                    HistoryDomainKind::Block { .. } => attended
+                        .clone()
+                        .any(|component| !matches!(component.layer, LayerRef::Pooled { .. })),
+                    _ => produced && attended.clone().next().is_some(),
+                };
+                if mixed
+                    || (!produced
                         && stored.iter().any(|domain: &StoredDomain| {
-                            !domain.components.iter().all(ComponentDescriptor::attended)
+                            produced_domain(domain.kind, &domain.components)
                         }))
                 {
                     return Err(LayoutError::WrongRepresentation(
-                        "indexer keys in their own domains after the attended ones",
+                        "produced rows in their own domains after the per-token ones",
                     )
                     .into());
                 }
@@ -398,13 +419,15 @@ pub(crate) fn validate_domains(
     }
     let mut bindings = Vec::new();
     for (source, readers) in shared {
+        // A Shared layer reads its source's attended rows (a pooled
+        // source's Block rows, not its incomplete groups).
         let domain = stored
             .iter()
             .position(|domain| {
                 domain
                     .components
                     .iter()
-                    .any(|component| component.layer == source)
+                    .any(|component| component.layer == source && component.attended())
             })
             .ok_or(LayoutError::UnknownSharedSource(source))?;
         for layer in readers {

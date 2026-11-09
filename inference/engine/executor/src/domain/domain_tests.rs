@@ -8,6 +8,7 @@ use crate::{
     platform,
     programs::{CompletedHeadWork, CompletedVisionWork},
 };
+use crate::operators::attention::tests::selected::{self, CompressedForm};
 use magnitude_state::ShrinkPolicy;
 use std::sync::{
     Arc,
@@ -3164,12 +3165,14 @@ fn host_rows_from_the_token_history_equal_the_device_rows() {
         let implementation = seismic::generated::native_implementation::<ngram_rows::Entry>(&device)
             .unwrap()
             .unwrap();
-        let statics = match backend {
-            "cpu" => NativeSpecialization::new(),
-            _ => NativeSpecialization::new()
-                .with_static("C", context)
-                .with_static("P", 8),
-        };
+        // The statics the backend declares, of the rule's one owner.
+        let statics = crate::planning::NGramRowRule::of(hash)
+            .statics()
+            .into_iter()
+            .filter(|(name, _)| implementation.statics.iter().any(|declared| declared == name))
+            .fold(NativeSpecialization::new(), |statics, (name, value)| {
+                statics.with_static(name, value)
+            });
         let kernel = ngram_rows::native_for_device(
             &device,
             &implementation.default_specialization(&statics).unwrap(),
@@ -3388,7 +3391,8 @@ fn an_expert_read_failure_fails_only_its_steps_sequences() {
 /// context.
 fn selected_definition() -> ModelDefinition {
     use magnitude_family_contracts::{
-        HistoryReads, Indexer, Operator, RmsNorm, WeightDescriptor,
+        HeadNorm, HeadWeights, HistoryReads, Indexer, IndexerInput, IndexerKeys, IndexerQuery,
+        Operator, Pool, PooledRows, RmsNorm, RowRounding, Selection, WeightDescriptor,
     };
     let mut definition = tiny_definition();
     definition.decoder.context_limit = 64;
@@ -3400,18 +3404,27 @@ fn selected_definition() -> ModelDefinition {
         weight: WeightDescriptor::stored(name, vec![64]),
         epsilon: 1e-6,
     };
-    attention.reads = HistoryReads::Selected {
-        block: 4,
-        blocks: 1,
-        indexer: Indexer {
-            heads: 2,
-            width: 64,
-            query: WeightDescriptor::stored("indexer_q", vec![128, hidden]),
-            key: WeightDescriptor::stored("indexer_k", vec![64, hidden]),
-            query_norm: norm("indexer_q_norm"),
-            key_norm: norm("indexer_k_norm"),
+    attention.history[0].reads = HistoryReads::Selected(Selection::Own(Box::new(Indexer {
+        heads: 2,
+        width: 64,
+        query: IndexerQuery {
+            input: IndexerInput::Hidden,
+            projection: WeightDescriptor::stored("indexer_q", vec![128, hidden]),
+            norm: HeadNorm::Rms(norm("indexer_q_norm")),
+            rounding: RowRounding::None,
         },
-    };
+        keys: IndexerKeys::Pooled(PooledRows {
+            rate: 4,
+            projection: WeightDescriptor::stored("indexer_k", vec![64, hidden]),
+            pool: Pool::Mean,
+            norm: norm("indexer_k_norm"),
+            rounding: RowRounding::None,
+        }),
+        head_weights: HeadWeights::Uniform,
+        scale: 0.125,
+        top: 1,
+        candidates: magnitude_family_contracts::Candidates::All,
+    })));
     definition
 }
 
@@ -3568,4 +3581,65 @@ fn causal_heads_launch_apart_from_chained_drafts() {
     assert_ne!(domain.group_key(&head(1, 0)), domain.group_key(&head(2, 2)));
     assert_eq!(domain.group_key(&head(1, 0)), domain.group_key(&head(2, 0)));
     assert_eq!(domain.group_key(&head(1, 1)), domain.group_key(&head(2, 3)));
+}
+
+/// V4.1's compressed layer forms (`attention::tests::selected::compressed`:
+/// a Full layer with its rounded window, ratio-2 pooled source and indexer,
+/// and a Reuse layer; or a ratio-1 Full layer whose indexer produces a
+/// candidate pool, and a Reindex layer restricted to it) run on each
+/// available backend that implements pooled history (`pool_rows`'s entry
+/// exception: CPU and Metal): every graph binds every state plane and
+/// control it declares, through a prompt ending in a pending row, an
+/// advance from it completing groups, and a decode completing a group from
+/// its pending row. (A Plain load plans no draft rows, so it verifies no
+/// rejected tail; that rollback is the state crate's
+/// `a_rejected_verify_keeps_the_accepted_prefix_partial_group`.)
+#[test]
+fn compressed_layers_bind_their_state_on_the_device() {
+    let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
+    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cpu]
+        .into_iter()
+        .filter(|&backend| crate::test_support::available(&catalog, backend))
+    {
+        for form in [CompressedForm::FullAndReuse, selected::SMALL_POOL] {
+            compressed_layers_bind_their_state_on(backend, form);
+        }
+    }
+}
+
+fn compressed_layers_bind_their_state_on(backend: seismic::BackendName, form: CompressedForm) {
+    let (definition, manifest) = selected::compressed(form);
+    let (mut domain, mut bindings) = fixture_over(
+        definition,
+        manifest,
+        limits(16, 1, false),
+        None,
+        false,
+        platform::DeviceRequest::Backend(backend),
+    );
+    let source = RequestId(93);
+    open(&mut domain, &mut bindings, source);
+    // The group counts below are rate 2's; at rate 1 every row is complete,
+    // and from 5 rows on the pool of 2 blocks of 2 units excludes some.
+    // Five prompt rows: groups 0 and 1 complete, position 4 pending.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &[1, 2, 3, 4, 5])]);
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 5 })
+        .unwrap();
+    // Two rows from 5 complete group 2 (position 5) from the pending row
+    // and leave position 6 pending.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 5, &[6, 7])]);
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .unwrap();
+    assert_eq!(domain.resume_state(source).unwrap().position(), 7);
+    // A decode at 7 completes group 3 from the pending row.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 7, &[9])]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert_eq!(domain.resume_state(source).unwrap().position(), 8);
 }

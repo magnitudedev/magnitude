@@ -67,7 +67,7 @@ pub use ownership::OpenRequirements;
 pub use state::{MeasurementRoom, MemoryChargeReconciliation, MemoryMoment, SlotRelease, StateShrink, StoreAllocation};
 pub use target::TargetHostTiming;
 pub(crate) use target::{
-    AppendedRuns, accepted_history, cached_causal_domain, indexer_domain, indexer_history,
+    AppendedRuns, accepted_history, cached_causal_domain, indexer_history,
 };
 
 use std::{

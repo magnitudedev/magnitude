@@ -9,6 +9,10 @@ use super::attention::graph::{
     HistoryTilesPort, IndexerControlPorts, IndexerStatePorts, SelectionBlock, attention,
     attention_weights,
 };
+use super::attention::pooled::{
+    IndexBlock, OwnBlock, PickedBlock, PickedPlane, PickedPorts, PooledLayer, PooledWindow,
+};
+use super::attention::PickedSource;
 use super::dense_ffn::graph::{CheckedDenseEntries, DenseGraphEntries, dense};
 use super::gated_delta::graph::{
     CheckedRecurrentEntries, RecurrentBlock, RecurrentControlPorts, RecurrentGraphEntries,
@@ -59,7 +63,7 @@ use crate::{
     PerLayerBinding, ShortConvShape, StateResourcePlan, StateSpaceShape,
 };
 use magnitude_family_contracts::{
-    Decoder, RecurrentHeadMapping, SublayerIndex, WeightKind, WeightScope,
+    Attention, Decoder, RecurrentHeadMapping, SublayerIndex, WeightKind, WeightScope,
 };
 use magnitude_state::LayerRef;
 use seismic::{
@@ -91,6 +95,8 @@ pub(crate) struct HistoryPorts {
     pub history_tiles: Option<HistoryTilesPort>,
     /// A selected read's indexer tables.
     pub indexer: Option<IndexerControlPorts>,
+    /// An index-list source's planes and tables.
+    pub picked: Option<PickedPorts>,
 }
 
 /// A block's recurrent bank: its components, consecutive in the store's
@@ -375,6 +381,93 @@ impl BlockSublayers<'_> {
         })
     }
 
+    /// The decoder site of the block's attention, whose other layers its
+    /// index-list source resolves: a target block's, in the target decoder
+    /// (a draft head's blocks read no index-list source).
+    fn site(&self) -> Result<Option<attention_operator::DecoderSite<'_>>, String> {
+        Ok(match self.lane {
+            BlockLane::Target => Some(attention_operator::DecoderSite {
+                decoder: self.geometry,
+                index: self.index(0)?,
+            }),
+            BlockLane::Head { .. } => None,
+        })
+    }
+
+    /// The rows of the index-list source `operator` reads at this class: an
+    /// indexing source's indexer over its Block read, with an own source's
+    /// domains (no Window at rate 1), or a reused source's plane. Each list
+    /// and window read takes the class's `segments` spans.
+    fn picked<'o>(
+        &self,
+        operator: &'o Attention,
+        segments: u64,
+    ) -> Result<Option<PickedBlock<'o>>, GraphError> {
+        let rows = |rows: usize| u64::try_from(rows).map_err(|_| "pooled rows exceed u64");
+        let state = self.state.target_state();
+        let missing = "an index-list source has no pooled history";
+        let plane = |block: u32, part: u32| {
+            let (window, plane) = state.pooled_history(block, part).ok_or(missing)?;
+            Ok::<_, GraphError>((
+                window,
+                PickedPlane {
+                    source: PooledLayer { block, part },
+                    rows: rows(plane.rows)?,
+                    slab_rows: plane.slab_rows,
+                },
+            ))
+        };
+        let plan = |error: crate::PlanError| GraphError::from(error.to_string());
+        // An indexer's list over the Block read: its spans, the rows it lists
+        // at the store's served context and the candidates it scores.
+        let index = |part: u32, indexer: &'o magnitude_family_contracts::Indexer, rate: u64| {
+            let (query_rounding, key_rounding) = attention_operator::indexer_roundings(indexer);
+            Ok::<_, GraphError>(IndexBlock {
+                indexer,
+                spans: segments,
+                scores: attention_operator::list_scores(rows(state.context_rows)?, rate),
+                candidates: attention_operator::candidates(self.site()?, u64::from(part), indexer)
+                    .map_err(plan)?,
+                query_rounding,
+                key_rounding,
+            })
+        };
+        match attention_operator::picked_source(operator).map_err(plan)? {
+            None => Ok(None),
+            Some(PickedSource::Reused { source, part, .. }) => Ok(Some(PickedBlock::Reused {
+                plane: plane(source.block, part)?.1,
+            })),
+            Some(PickedSource::Reindex { source, part, indexer }) => {
+                let rate = attention_operator::shared_rows(self.geometry, source, part)
+                    .map_err(plan)?
+                    .rate;
+                Ok(Some(PickedBlock::Indexed {
+                    plane: plane(source.block, part)?.1,
+                    index: index(part, indexer, rate)?,
+                    own: None,
+                }))
+            }
+            Some(PickedSource::Own { part, rows: source, indexer }) => {
+                let (window, plane) = plane(self.index(0)?.block, part)?;
+                // The incomplete group's tokens wait in the Window domain:
+                // none at rate 1.
+                let window = window
+                    .map(|window| {
+                        Ok::<_, GraphError>(PooledWindow {
+                            rows: rows(window.rows)?,
+                            slab_rows: window.slab_rows,
+                        })
+                    })
+                    .transpose()?;
+                Ok(Some(PickedBlock::Indexed {
+                    plane,
+                    index: index(part, indexer, source.rate)?,
+                    own: Some(OwnBlock { rows: source, window }),
+                }))
+            }
+        }
+    }
+
     /// The target layer whose history the block's attention reads.
     fn history_layer(&self) -> Result<LayerRef, String> {
         Ok(LayerRef::Target(match self.lane {
@@ -512,7 +605,7 @@ impl BlockSublayers<'_> {
         };
         let (mixed, block_state) = match (paired.mixer, entries) {
             (Mixer::Attention(operator), MixerEntries::Attention(entries)) => {
-                let shape = attention_operator::shape(geometry.hidden, operator)
+                let shape = attention_operator::shape(geometry.hidden, operator, self.site()?)
                     .map_err(|error| error.to_string())?;
                 let post_norm_epsilon = post_norm_epsilon(paired.mixer_output);
                 let operands = AttentionOperands::planned(
@@ -566,7 +659,7 @@ impl BlockSublayers<'_> {
                         // nowhere.
                         causal_cache: self.lane == BlockLane::Target,
                         selection: attention_operator::selection_shape(
-                            &operator.reads,
+                            operator,
                             geometry.context_limit,
                         )
                         .map(|shape| {
@@ -586,6 +679,7 @@ impl BlockSublayers<'_> {
                             })
                         })
                         .transpose()?,
+                        picked: self.picked(operator, segments)?,
                         controls: self.controls(),
                     },
                 )?;
@@ -601,6 +695,7 @@ impl BlockSublayers<'_> {
                             destinations: controls.destinations,
                             history_tiles: controls.history_tiles,
                             indexer: controls.indexer,
+                            picked: ports.picked,
                         }),
                         bank: None,
                     },

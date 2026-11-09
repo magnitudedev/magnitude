@@ -136,8 +136,12 @@ pub struct ModelPolicy {
     /// and sampled requests. When absent, the width is the widest the drafter
     /// has: all a separate draft's block holds, or all a head chains.
     pub mtp_proposals: Option<u8>,
-    #[serde(with = "KvCodecEncoding")]
-    pub kv_codec: KvCodec,
+    /// The host's KV policy for unrounded per-token history, when named;
+    /// the serving default otherwise. The model's rounded rows keep their
+    /// own store, and a lossy policy named for them is refused
+    /// (`magnitude_state::kv_codec_policy`).
+    #[serde(serialize_with = "optional_kv_codec")]
+    pub kv_codec: Option<KvCodec>,
     /// Queue each plain decode step's successor on the device before the
     /// step completes (cross-step pipelining).
     pub lookahead: bool,
@@ -163,7 +167,7 @@ impl Default for ModelPolicy {
             method: ModelMethod::Auto,
             draft_policy: None,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: None,
             lookahead: true,
             exported_logits_rows: 0,
             numerical_profile: None,
@@ -388,7 +392,7 @@ impl ModelPolicy {
                 self.draft_policy
             },
             method,
-            kv_codec: self.kv_codec,
+            kv_codec: magnitude_state::kv_codec_policy(&definition.decoder, self.kv_codec)?,
             // A per-layer entry gathers host-table rows by host tokens, so
             // its steps cannot chain on device-selected tokens.
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
@@ -518,6 +522,16 @@ enum KvCodecEncoding {
     Dense,
     AffineK8V4,
     RotatedK4V4,
+}
+
+/// A named KV policy in [`KvCodecEncoding`], or none.
+fn optional_kv_codec<S: serde::Serializer>(
+    codec: &Option<KvCodec>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Named(#[serde(with = "KvCodecEncoding")] KvCodec);
+    codec.map(Named).serialize(serializer)
 }
 
 impl ExecutionManifest {
@@ -663,9 +677,10 @@ pub(crate) mod tests {
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, Head,
         HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm, HeadReadout,
-        HistoryDomain, HistoryReads, InputNorm, KeyValue, MediaRowAttention, Operator, OutputForm,
-        OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, VocabularyProjection,
-        WeightDescriptor,
+        HistoryRows, HistorySource, InputNorm, MediaRowAttention, Operator, OutputForm,
+        OutputProjection, ProjectedRows, QueryProjection, ResidualForm, RmsNorm, Rotary,
+        RowProducer, RowRounding, Sublayer, TokenDomain, ValueNorm, ValueSource,
+        VocabularyProjection, WeightDescriptor,
     };
 
     fn weight(name: &str, shape: &[u64]) -> WeightDescriptor {
@@ -690,20 +705,23 @@ pub(crate) mod tests {
                 function: GateFunction::Sigmoid,
             },
             query_norm: HeadNorm::Rms(rms(&format!("{p}qn"))),
-            key_value: KeyValue::Owned {
-                key: weight(&format!("{p}k"), &[2, 2]),
-                value: ValueSource::Projected(weight(&format!("{p}v"), &[2, 2])),
-                key_norm: HeadNorm::Rms(rms(&format!("{p}kn"))),
-                value_norm: ValueNorm::None,
-                domain: HistoryDomain::Token,
-            },
+            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                ProjectedRows {
+                    key: weight(&format!("{p}k"), &[2, 2]),
+                    value: ValueSource::Projected(weight(&format!("{p}v"), &[2, 2])),
+                    key_norm: HeadNorm::Rms(rms(&format!("{p}kn"))),
+                    value_norm: ValueNorm::None,
+                    domain: TokenDomain::Token,
+                    rounding: RowRounding::None,
+                },
+            )))],
             rotary: Rotary::Interleaved {
                 width: 2,
                 base: 10_000.0,
                 sections: vec![1],
                 axis_pattern: vec![0],
-            },            scale: 1.0 / 2f64.sqrt(),
-            reads: HistoryReads::Visible,
+            },
+            scale: 1.0 / 2f64.sqrt(),
             media_rows: MediaRowAttention::Causal,
             sinks: None,
             output: OutputProjection::Full(weight(&format!("{p}o"), &[2, 2])),

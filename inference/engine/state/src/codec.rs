@@ -28,9 +28,28 @@ impl fmt::Display for CodecIdentity {
 pub enum LayerRef {
     Target(u32),
     Head(u32),
-    /// The selected-attention indexer of target block `n`: its keys, which
-    /// no attention reads as history.
-    Indexer(u32),
+    /// Pooled history source `part` of target block `block`
+    /// (`RowProducer::Pooled`): its rows, a Block domain's, which attention
+    /// reads, and at rate > 1 its incomplete group's projections, a Window
+    /// domain's, which only the producer reads.
+    Pooled { block: u32, part: u32 },
+    /// The keys of the indexer selecting source `part` of target block
+    /// `block`, which no attention reads as history.
+    IndexKeys { block: u32, part: u32 },
+}
+
+/// What reads a component's rows, and whose codec they take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ComponentRole {
+    /// Attention history in the host's KV policy (`KvCodec`).
+    History,
+    /// Attention history in the model's own store, whatever the host
+    /// policy: rows the model rounds (`RowRounding`), held exactly, and a
+    /// pooled source's rows.
+    ModelHistory,
+    /// Rows only a producer reads: a pooled source's incomplete group, an
+    /// indexer's keys.
+    Produced,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -138,17 +157,6 @@ impl KvCodec {
                 codec: value,
                 width: value_width,
             },
-            packing: 1,
-        }
-    }
-
-    /// A history whose values are its stored keys (`HistoryValue::Key`):
-    /// one key vector of `width` values per head, in the policy's key codec.
-    pub const fn stored_key(self, dense_dtype: DType, width: usize) -> CodecSpec {
-        CodecSpec {
-            key: self.codecs(dense_dtype).0,
-            key_width: width,
-            value: HistoryValue::Key,
             packing: 1,
         }
     }
@@ -303,6 +311,18 @@ impl CodecSpec {
         KvCodec::Dense.spec(dtype, key_width, value_width)
     }
 
+    /// A history whose values are its stored keys (`HistoryValue::Key`):
+    /// one dense key vector of `width` values per head. Stored keys are
+    /// dense only: no lossy encoding reads a key plane as the value.
+    pub const fn stored_key(dtype: DType, width: usize) -> Self {
+        Self {
+            key: Codec::Dense { dtype },
+            key_width: width,
+            value: HistoryValue::Key,
+            packing: 1,
+        }
+    }
+
     pub fn validate(self) -> Result<Self, LayoutError> {
         self.planes()?;
         Ok(self)
@@ -327,6 +347,7 @@ pub struct ComponentDescriptor {
     pub layer: LayerRef,
     pub codec: CodecSpec,
     pub heads: usize,
+    pub role: ComponentRole,
     planes: Vec<PlaneDescriptor>,
 }
 
@@ -342,7 +363,34 @@ impl ComponentDescriptor {
                 .any(|(_, codec, _)| matches!(codec, Codec::Affine { .. }))
     }
 
+    /// Attention history in the host's KV policy ([`ComponentRole::History`]):
+    /// a key and its own value vector. Stored keys are dense only, so they
+    /// are the model's own store ([`Self::model_history`]).
     pub fn new(layer: LayerRef, codec: CodecSpec, heads: usize) -> Result<Self, LayoutError> {
+        if !matches!(codec.value, HistoryValue::Own { .. }) {
+            return Err(LayoutError::WrongRepresentation(
+                "host-policy attention history without its own values",
+            ));
+        }
+        Self::history(layer, codec, heads, ComponentRole::History)
+    }
+
+    /// Attention history in the model's own store
+    /// ([`ComponentRole::ModelHistory`]): a rounded source's rows, or a
+    /// pooled source's (`LayerRef::Pooled`, one head).
+    pub fn model_history(layer: LayerRef, codec: CodecSpec, heads: usize) -> Result<Self, LayoutError> {
+        Self::history(layer, codec, heads, ComponentRole::ModelHistory)
+    }
+
+    fn history(
+        layer: LayerRef,
+        codec: CodecSpec,
+        heads: usize,
+        role: ComponentRole,
+    ) -> Result<Self, LayoutError> {
+        if matches!(layer, LayerRef::IndexKeys { .. }) {
+            return Err(LayoutError::WrongRepresentation("indexer keys as attention history"));
+        }
         if heads == 0 {
             return Err(LayoutError::ZeroHeads);
         }
@@ -362,23 +410,28 @@ impl ComponentDescriptor {
             layer,
             codec,
             heads,
+            role,
             planes,
         })
     }
 
-    /// A selected-attention indexer's component: one dense key vector of
-    /// `width` `dtype` values per row and, with `coordinates`, the row's four
-    /// rotary coordinates (`i32`) in the value plane: a raw key's, whose
-    /// block is rotated at its first row's coordinates.
-    pub fn indexer(
+    /// A produced component ([`ComponentRole::Produced`]): one dense vector
+    /// of `width` `dtype` values per row and, with `coordinates`, the row's
+    /// four rotary coordinates (`i32`) in the value plane. An indexer's keys
+    /// (`LayerRef::IndexKeys`): its pooled keys' raw projections with their
+    /// coordinates (a group is rotated at its first row's), or its finished
+    /// keys. A pooled source's incomplete group (`LayerRef::Pooled`): each
+    /// pending token's F32 projection (and gate scores) with its
+    /// coordinates.
+    pub fn produced(
         layer: LayerRef,
         dtype: DType,
         width: usize,
         coordinates: bool,
     ) -> Result<Self, LayoutError> {
-        if !matches!(layer, LayerRef::Indexer(_)) {
+        if !matches!(layer, LayerRef::IndexKeys { .. } | LayerRef::Pooled { .. }) {
             return Err(LayoutError::WrongRepresentation(
-                "indexer history of an attention layer",
+                "produced rows of an attention layer",
             ));
         }
         let mut planes = planes_for(VectorKind::Key, Codec::Dense { dtype }, width)?;
@@ -402,14 +455,15 @@ impl ComponentDescriptor {
                 packing: 1,
             },
             heads: 1,
+            role: ComponentRole::Produced,
             planes,
         })
     }
 
-    /// Whether attention reads this component as history (an indexer's
-    /// keys are not).
+    /// Whether attention reads this component as history (produced rows
+    /// are not).
     pub fn attended(&self) -> bool {
-        !matches!(self.layer, LayerRef::Indexer(_))
+        self.role != ComponentRole::Produced
     }
 
     pub fn planes(&self) -> &[PlaneDescriptor] {
@@ -726,9 +780,9 @@ mod tests {
     /// stored key row. One key plane, half the bytes of K + V.
     #[test]
     fn stored_key_history_holds_the_key_plane_alone() {
-        let stored = ComponentDescriptor::new(
+        let stored = ComponentDescriptor::model_history(
             LayerRef::Target(0),
-            KvCodec::Dense.stored_key(DType::BF16, 512),
+            CodecSpec::stored_key(DType::BF16, 512),
             1,
         )
         .unwrap();
@@ -750,13 +804,14 @@ mod tests {
         assert_eq!(stored.codec.encoding(), HistoryEncoding::Dense);
         assert_eq!(stored.codec.value_width(), Some(512));
         assert_eq!(stored.codec.codec(VectorKind::Value), None);
-        // A K8/V4 history has no stored-key entry.
-        assert_eq!(
-            KvCodec::AffineK8V4.stored_key(DType::BF16, 512).encoding(),
-            HistoryEncoding::Unsupported
-        );
         // An indexer without coordinates holds no value, which is not the key.
-        let keys = ComponentDescriptor::indexer(LayerRef::Indexer(0), DType::F32, 64, false).unwrap();
+        let keys = ComponentDescriptor::produced(
+            LayerRef::IndexKeys { block: 0, part: 0 },
+            DType::F32,
+            64,
+            false,
+        )
+        .unwrap();
         assert_eq!(keys.codec.value, HistoryValue::None);
         assert_eq!(keys.codec.value_width(), None);
         assert_eq!(keys.planes().len(), 1);

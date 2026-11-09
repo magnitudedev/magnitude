@@ -135,19 +135,15 @@ int indexer_span_row(uint64_t spans, uint64_t count, inout indexer_cursor cursor
     return cursor.span < count ? cursor.lo + int(ordinal - cursor.first) : own;
 }
 
-// Row `row`'s block spans, and its own block (or -1).
+// Row `row`'s block spans.
 uint64_t indexer_block_spans(uint64_t row) {
     return SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_VISIBLE) + row * SEISMIC_DIM_R * 8ul;
 }
 
-int indexer_own_block(uint64_t row) {
-    return element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_DESTINATIONS) + row * 4ul);
-}
-
-// Row `row`'s complete blocks: those of its block spans, then its own. The
-// whole subgroup calls it.
+// Row `row`'s complete blocks: those of its block spans, its own among them.
+// The whole subgroup calls it.
 uint indexer_complete(uint64_t row) {
-    return indexer_span_rows(indexer_block_spans(row), SEISMIC_DIM_R) + (indexer_own_block(row) >= 0 ? 1u : 0u);
+    return indexer_span_rows(indexer_block_spans(row), SEISMIC_DIM_R);
 }
 
 // Row `row`'s visible spans.
@@ -243,12 +239,11 @@ void indexer_select_score() {
         return;
     // The subgroup's blocks from the block span holding its first.
     const uint64_t spans = indexer_block_spans(row);
-    const int own = indexer_own_block(row);
     indexer_cursor cursor = indexer_locate(spans, SEISMIC_DIM_R, begin);
     float kx[INDEXER_BATCH][INDEXER_E];
     [[unroll]] for (uint j = 0u; j < INDEXER_BATCH; ++j) {
         // A block past the row's last repeats the last: its score is not stored.
-        const int at = indexer_span_row(spans, SEISMIC_DIM_R, cursor, min(begin + j, end - 1u), own);
+        const int at = indexer_span_row(spans, SEISMIC_DIM_R, cursor, min(begin + j, end - 1u), -1);
         const uint64_t k = slab_row(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_KEYS), uint(at),
             uint(SEISMIC_PARAM_BLOCK_SLAB_ROWS), INDEXER_KEY_BYTES);
         [[unroll]] for (uint i = 0u; i < INDEXER_E; ++i)

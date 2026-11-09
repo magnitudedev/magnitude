@@ -2504,8 +2504,14 @@ struct AttendCase {
     /// No sinks (`SK = 0`).
     sinks: Tensor,
     /// Half-split leading rotary pairs, no output rotary, own values
-    /// (`RA = RT = RO = VK = 0`).
+    /// (`RA = RT = RO = VK = 0`), and for the dense entry no key rounding
+    /// (`KR = 0`, `dense_form`).
     form: Tensor,
+    dense_form: Tensor,
+    /// The dense entry's index-list source: no picks (`[1, 0]`) of no plane
+    /// rows (`[0, KV, W]`).
+    selected_rows: Tensor,
+    selected: Tensor,
     rotary_components: Tensor,
     rotary_frequencies: Tensor,
     rotary_amplitudes: Tensor,
@@ -2722,6 +2728,9 @@ impl AttendCase {
         let norms = zeros(Element::f32(), &[0, HEAD_WIDTH])?;
         let sinks = zeros(Element::f32(), &[0, heads])?;
         let form = zeros(Element::i32(), &[0, 0, 0, 0, 0])?;
+        let dense_form = zeros(Element::i32(), &[0, 0, 0, 0, 0, 0])?;
+        let selected_rows = zeros(Element::i32(), &[1, 0])?;
+        let selected = zeros(Element::bf16(), &[0, KV_HEADS, HEAD_WIDTH])?;
         let rotary_components = host(Element::i32(), &[ROTARY_PAIRS], words(&components))?;
         let rotary_frequencies = host(
             Element::f32(),
@@ -2782,6 +2791,9 @@ impl AttendCase {
                     norms: norms.clone(),
                     sinks: sinks.clone(),
                     form: form.clone(),
+                    dense_form: dense_form.clone(),
+                    selected_rows: selected_rows.clone(),
+                    selected: selected.clone(),
                     rotary_components: rotary_components.clone(),
                     rotary_frequencies: rotary_frequencies.clone(),
                     rotary_amplitudes: rotary_amplitudes.clone(),
@@ -2817,13 +2829,20 @@ impl AttendCase {
             visible: &self.visible,
             fresh: &self.fresh,
             destinations: &self.destinations,
+            selected_rows: &self.selected_rows,
+            selected: &self.selected,
             history_key: key,
             history_value: value,
-            form: &self.form,
+            form: &self.dense_form,
             epsilon: 1e-6,
             scale: 1.0 / (HEAD_WIDTH as f32).sqrt(),
             gate_function: 0,
             slab_rows: self.slab_rows,
+            selected_slab_rows: 1,
+            key_block: 0,
+            key_element: 0,
+            key_scale: 0,
+            key_amax_floor: 0.0,
         }
     }
 
@@ -2881,14 +2900,16 @@ fn attention_values(layout: KvCodec) -> Result<Vec<(&'static str, u64)>, Executo
         ("RO", 0),
         ("VK", 0),
     ];
-    // An affine layout's statics are its planes' widths.
-    if let [key_codes, key_coefficients, value_codes, value_coefficients] = planes(layout)?[..] {
-        values.extend([
+    // An affine layout's statics are its planes' widths; the dense entry's
+    // also its key rounding and picks (none).
+    match planes(layout)?[..] {
+        [key_codes, key_coefficients, value_codes, value_coefficients] => values.extend([
             ("KC", key_codes.1),
             ("KP", key_coefficients.1),
             ("VC", value_codes.1),
             ("VP", value_coefficients.1),
-        ]);
+        ]),
+        _ => values.extend([("KR", 0), ("KS", 0)]),
     }
     Ok(values)
 }
@@ -3167,7 +3188,9 @@ fn composition_chain(
     let value = bind(&mut graph, &attend.value)?;
     let norms = bind(&mut graph, &attend.norms)?;
     let sinks = bind(&mut graph, &attend.sinks)?;
-    let form = bind(&mut graph, &attend.form)?;
+    let form = bind(&mut graph, &attend.dense_form)?;
+    let selected_rows = bind(&mut graph, &attend.selected_rows)?;
+    let selected = bind(&mut graph, &attend.selected)?;
     let components = bind(&mut graph, &attend.rotary_components)?;
     let frequencies = bind(&mut graph, &attend.rotary_frequencies)?;
     let amplitudes = bind(&mut graph, &attend.rotary_amplitudes)?;
@@ -3237,6 +3260,8 @@ fn composition_chain(
                     visible: visible.tensor().into(),
                     fresh: fresh.tensor().into(),
                     destinations: destinations.tensor().into(),
+                    selected_rows: selected_rows.tensor().into(),
+                    selected: selected.tensor().into(),
                     history_key: history_key.tensor_mut().into(),
                     history_value: history_value.tensor_mut().into(),
                     form: form.tensor().into(),
@@ -3244,6 +3269,11 @@ fn composition_chain(
                     scale: 1.0 / (HEAD_WIDTH as f32).sqrt(),
                     gate_function: 0,
                     slab_rows: attend.slab_rows,
+                    selected_slab_rows: 1,
+                    key_block: 0,
+                    key_element: 0,
+                    key_scale: 0,
+                    key_amax_floor: 0.0,
                 },
             )
             .map_err(|cause| error(&cause))?;

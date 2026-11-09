@@ -5,8 +5,9 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::headers::{self, add_tensor, set as set_metadata};
 use magnitude_family_contracts::{
-    ActivationFunction, AttentionGate, FeedForwardUp, HeadNorm, HistoryDomain, ImportTransform,
-    InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator, OutputForm, OutputProjection,
+    ActivationFunction, AttentionGate, FeedForwardUp, HeadNorm, HistoryReads, HistoryRows,
+    HistorySource, ImportTransform, InputNorm, ModelDefinition, ProjectedRows, RowProducer,
+    TokenDomain, ModelFamily, Operator, OutputForm, OutputProjection,
     QueryProjection, Rotary,
 };
 use magnitude_artifacts::UnsupportedReason;
@@ -69,17 +70,21 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
         assert_eq!(attention.gate, AttentionGate::None);
         assert_eq!(attention.query_norm, HeadNorm::None);
         assert_eq!(attention.scale, 1.0 / 128f64.sqrt());
-        let KeyValue::Owned {
-            key,
-            key_norm,
-            domain,
-            ..
-        } = &attention.key_value
+        let [HistorySource {
+            rows:
+                HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                    key,
+                    key_norm,
+                    domain,
+                    ..
+                })),
+            reads: HistoryReads::Visible,
+        }] = &attention.history[..]
         else {
             panic!("every layer owns its history");
         };
         assert_eq!(*key_norm, HeadNorm::None);
-        assert_eq!(*domain, HistoryDomain::Token);
+        assert_eq!(*domain, TokenDomain::Token);
         assert_eq!(key.shape, [256, 2048]);
         let QueryProjection::Full(query) = &attention.query else {
             panic!("the query is projected whole");

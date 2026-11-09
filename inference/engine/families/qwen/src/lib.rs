@@ -17,8 +17,8 @@ use magnitude_artifacts::{
 use magnitude_family_common::architecture_keys;
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
-    GateFunction, GatedDelta, HeadNorm, HistoryDomain, HistoryReads, KeyValue, MediaRowAttention,
-    Operator, OutputProjection, QueryProjection, RecurrentHeadMapping, RmsNorm,
+    GateFunction, GatedDelta, HeadNorm, HistoryRows, HistorySource, MediaRowAttention,
+    Operator, ProjectedRows, RowProducer, RowRounding, TokenDomain, OutputProjection, QueryProjection, RecurrentHeadMapping, RmsNorm,
     Rotary, RouteNormalization, RoutedFfn, Router,
     RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, ValueNorm, ValueSource,
     WeightDescriptor, checked_product,
@@ -409,18 +409,21 @@ impl Geometry {
                 function: GateFunction::Sigmoid,
             },
             query_norm: HeadNorm::Rms(self.rms(weight("attn_q_norm.weight", &[width])?)),
-            key_value: KeyValue::Owned {
-                key: weight("attn_k.weight", &[product(&[kv_heads, width])?, hidden])?,
-                value: ValueSource::Projected(weight(
-                    "attn_v.weight",
-                    &[product(&[kv_heads, width])?, hidden],
-                )?),
-                key_norm: HeadNorm::Rms(self.rms(weight("attn_k_norm.weight", &[width])?)),
-                value_norm: ValueNorm::None,
-                domain: HistoryDomain::Token,
-            },
-            rotary: self.rotary.clone(),            scale: 1.0 / (width as f64).sqrt(),
-            reads: HistoryReads::Visible,
+            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                ProjectedRows {
+                    key: weight("attn_k.weight", &[product(&[kv_heads, width])?, hidden])?,
+                    value: ValueSource::Projected(weight(
+                        "attn_v.weight",
+                        &[product(&[kv_heads, width])?, hidden],
+                    )?),
+                    key_norm: HeadNorm::Rms(self.rms(weight("attn_k_norm.weight", &[width])?)),
+                    value_norm: ValueNorm::None,
+                    domain: TokenDomain::Token,
+                    rounding: RowRounding::None,
+                },
+            )))],
+            rotary: self.rotary.clone(),
+            scale: 1.0 / (width as f64).sqrt(),
             media_rows: MediaRowAttention::Causal,
             sinks: None,
             output: OutputProjection::Full(weight(

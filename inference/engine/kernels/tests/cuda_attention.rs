@@ -19,7 +19,7 @@ fn cuda_decode(
     attention_decode::native_for_device_with(
         device,
         attention_decode::Elements { A: Element::bf16() },
-        &qwen_form(statics(geometry), geometry)
+        &dense_statics(qwen_form(statics(geometry), geometry))
             .with_static("SK", 0)
             .with_param("PARTS", parts)
             .with_param("WARPS", warps)
@@ -40,7 +40,7 @@ fn cuda_prefill(
     attention_prefill::native_for_device_with(
         device,
         attention_prefill::Elements { A: Element::bf16() },
-        &visible_prefill(device, qwen_form(statics(geometry), geometry))
+        &visible_prefill(device, dense_statics(qwen_form(statics(geometry), geometry)))
             .with_static("SK", 0)
             .with_param("WARPS", warps)
             .with_param("SPLIT_GROUPS", split_groups)

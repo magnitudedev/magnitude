@@ -5,7 +5,7 @@ use crate::{
     ModelLoadPlan, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot, TargetProgramPlan,
     native::OutputScales,
     operators::{
-        MixerKind, PairedBlock, block, paired_block,
+        BlockKeeps, PairedBlock, block, paired_block,
         routed::{
             split::{Extents, OnceStage, RunStage, SplitValues, Stage},
             streamed,
@@ -204,6 +204,19 @@ pub(crate) enum LaunchControl {
     Padded { read: usize },
     Fresh { read: usize },
     Destinations { read: usize },
+    /// A picked pooled source's Block read: each row's complete groups
+    /// (`[rows]`, the rows its visible spans list, `(t + 1) / rate`).
+    Complete { read: usize },
+    /// A picked pooled source's Block read: the launch's picks table
+    /// (`[rows, top]`, uploaded -1), which its own layer's graph stores, a
+    /// later Reindex layer's graph stores over, and the Reuse layers' graphs
+    /// after each read (`operators::attention::pooled`).
+    Picks { read: usize },
+    /// A picked pooled source's Block read whose own indexer produces a
+    /// candidate pool: the launch's pool table (`[rows, blocks + segments,
+    /// 2]` spans, uploaded -1), which that layer's graph stores and the
+    /// restricted indexers' graphs read.
+    Pool { read: usize },
     /// The slots' `[B + 1, 2]` row segments and `[B]` recurrent words.
     Segments,
     Stop,
@@ -223,8 +236,20 @@ impl LaunchControl {
                 | Self::Padded { .. }
                 | Self::Fresh { .. }
                 | Self::Destinations { .. }
+                | Self::Complete { .. }
+                | Self::Picks { .. }
+                | Self::Pool { .. }
         )
     }
+}
+
+/// The index lists over a picked pooled source's Block read: the picks
+/// per row of every indexer over it (`top`), and the blocks of the
+/// candidate pool its own indexer produces, if it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PickedRead {
+    pub top: u64,
+    pub pool_blocks: Option<u64>,
 }
 
 /// The I32 controls of a target's launches, in the order a launch uploads
@@ -235,6 +260,10 @@ pub(crate) struct LaunchControlLayout {
     /// its prefill rows' history tiles in classes sealed for the most
     /// segments alone (`BlockListings::segments`).
     pub(super) padded: Vec<bool>,
+    /// Per history read, the index lists over it: a picked pooled source's
+    /// Block read takes its rows' complete groups, the launch's picks table
+    /// and, when its own indexer produces one, its candidate pool table.
+    pub(super) picked: Vec<Option<PickedRead>>,
     pub(super) max_segments: u64,
     /// The upload region that holds any launch's controls.
     pub(super) region_bytes: u64,
@@ -247,10 +276,15 @@ impl LaunchControlLayout {
     pub(super) fn of(
         reads: &magnitude_state::HistoryReads,
         listings: &[BlockListings],
+        picked: &[(usize, PickedRead)],
         rows: u64,
         max_segments: u64,
         slots: u64,
     ) -> Result<Self, String> {
+        let mut picks = vec![None; reads.len()];
+        for &(read, lists) in picked {
+            *picks.get_mut(read).ok_or("a picked source's read is not the store's")? = Some(lists);
+        }
         let mut padded = vec![false; reads.len()];
         for (index, listings) in listings.iter().enumerate() {
             if listings.tiles.is_empty() || listings.every_segment_count {
@@ -263,6 +297,7 @@ impl LaunchControlLayout {
         }
         let mut layout = Self {
             padded,
+            picked: picks,
             max_segments,
             region_bytes: 0,
         };
@@ -297,17 +332,25 @@ impl LaunchControlLayout {
     ) -> Vec<(LaunchControl, Vec<u64>)> {
         let pads =
             segments < self.max_segments && !crate::operators::attention::graph::decodes(rows);
-        let per_read = self.padded.iter().enumerate().flat_map(|(read, &padded)| {
-            [
-                Some((LaunchControl::Visible { read }, vec![rows, segments, 2])),
-                (padded && pads)
-                    .then(|| (LaunchControl::Padded { read }, vec![rows, self.max_segments, 2])),
-                Some((LaunchControl::Fresh { read }, vec![rows, 2])),
-                Some((LaunchControl::Destinations { read }, vec![rows])),
-            ]
-            .into_iter()
-            .flatten()
-        });
+        let per_read = self.padded.iter().zip(&self.picked).enumerate().flat_map(
+            |(read, (&padded, &picks))| {
+                [
+                    Some((LaunchControl::Visible { read }, vec![rows, segments, 2])),
+                    (padded && pads).then(|| {
+                        (LaunchControl::Padded { read }, vec![rows, self.max_segments, 2])
+                    }),
+                    Some((LaunchControl::Fresh { read }, vec![rows, 2])),
+                    Some((LaunchControl::Destinations { read }, vec![rows])),
+                    picks.map(|_| (LaunchControl::Complete { read }, vec![rows])),
+                    picks.map(|lists| (LaunchControl::Picks { read }, vec![rows, lists.top])),
+                    picks.and_then(|lists| lists.pool_blocks).map(|blocks| {
+                        (LaunchControl::Pool { read }, vec![rows, blocks + segments, 2])
+                    }),
+                ]
+                .into_iter()
+                .flatten()
+            },
+        );
         std::iter::once((LaunchControl::Coordinates, vec![rows, 4]))
             .chain(per_read)
             .chain([
@@ -524,63 +567,80 @@ pub(super) fn block_listings(
     })
 }
 
-/// The classes a block's sealed graph distinguishes for one row class. An
-/// attention block reads history segments and is independent of request
-/// slots; each segment count has a class per `listed` tile count and one
-/// that lists none. A recurrent block
-/// binds exact per-slot bank tables (every slot count a launch of `rows`
-/// rows can serve, up to the launch slot bound) and is independent of
-/// segments. Everything else is per row. A block that `scores` a selected
-/// read has, per segment count, a class that scores (and lists none).
+/// The classes a block's sealed graph distinguishes for one row class, by
+/// the state it `keeps`. A block reading a history is classed by its
+/// history segments: each segment count has a class per `listed` tile count
+/// and one that lists none, and, of a block that `scores` a selected read,
+/// one that scores (and lists none). A block keeping a recurrent bank binds
+/// exact per-slot bank tables, so it is classed by every slot count a launch
+/// of `rows` rows can serve, up to the launch slot bound. A block keeping
+/// both has a class of each slot count for each of those. Everything else
+/// is per row.
 pub(super) fn block_classes(
-    mixer: MixerKind,
+    keeps: BlockKeeps,
     rows: u64,
     max_slots: u64,
     max_segments: u64,
     listings: &BlockListings,
     scores: bool,
 ) -> Vec<BlockClass> {
-    match mixer {
-        MixerKind::Attention => segment_classes(max_segments).flat_map(|segments| {
-            let listed = listings
-                .tiles
-                .iter()
-                .copied()
-                .filter(move |_| listings.segments(segments, max_segments) == segments);
-            std::iter::once(0)
-                .chain(listed)
-                .map(move |listed| (rows, segments, 1, listed, 0))
-                .chain(scores.then_some((rows, segments, 1, 0, 1)))
-        })
-        .collect(),
-        MixerKind::Recurrent => (1..=rows.min(max_slots))
-            .map(|slots| (rows, 1, slots, 0, 0))
+    let slots = match keeps.bank() {
+        true => 1..=rows.min(max_slots),
+        false => 1..=1,
+    };
+    let topologies: Vec<(u64, u64, u64)> = match keeps.history() {
+        true => segment_classes(max_segments)
+            .flat_map(|segments| {
+                let listed = listings
+                    .tiles
+                    .iter()
+                    .copied()
+                    .filter(move |_| listings.segments(segments, max_segments) == segments);
+                std::iter::once(0)
+                    .chain(listed)
+                    .map(move |listed| (segments, listed, 0))
+                    .chain(scores.then_some((segments, 0, 1)))
+            })
             .collect(),
-    }
+        false => vec![(1, 0, 0)],
+    };
+    topologies
+        .into_iter()
+        .flat_map(|(segments, listed, scored)| {
+            slots.clone().map(move |slots| (rows, segments, slots, listed, scored))
+        })
+        .collect()
 }
 
 /// The class of a block's graph serving a launch of `rows` rows over
 /// `segments` history segments and `slots` requests, listing `listed` of the
-/// launch's history row tiles, scoring a selected read when `scored`.
+/// launch's history row tiles, scoring a selected read when `scored`: the
+/// axes of the state the block `keeps` (`block_classes`).
 pub(super) fn block_class(
-    mixer: MixerKind,
+    keeps: BlockKeeps,
     rows: u64,
     segments: u64,
     slots: u64,
     listed: u64,
     scored: bool,
 ) -> BlockClass {
-    match mixer {
-        MixerKind::Attention => (rows, segments, 1, listed, u64::from(scored)),
-        MixerKind::Recurrent => (rows, 1, slots, 0, 0),
-    }
+    let (history, bank) = (keeps.history(), keeps.bank());
+    (
+        rows,
+        if history { segments } else { 1 },
+        if bank { slots } else { 1 },
+        if history { listed } else { 0 },
+        u64::from(history && scored),
+    )
 }
 
 /// The admitted classes of one block for a `rows`-row launch, as one slice:
 /// the row count, and every history segment count (attention) or request
 /// slot count (recurrent) that launch can serve. A routed feed-forward's
 /// grouped entries size their tile table from the rows they group,
-/// `grouped_rows` (`block::feed_forward_class_slice`).
+/// `grouped_rows` (`block::feed_forward_class_slice`). A candidate pool's
+/// lists over the `picked` source take its blocks beside each segment count
+/// (`pooled::candidate_class_segments`).
 pub(super) fn block_class_slice(
     block: &PairedBlock,
     rows: u64,
@@ -589,11 +649,12 @@ pub(super) fn block_class_slice(
     max_segments: u64,
     listed: &[u64],
     scored: bool,
+    picked: Option<crate::PickedBinding>,
 ) -> Result<NativeGraphClassSlice, String> {
-    let mixer = block.mixer.kind();
+    let keeps = block.keeps();
     // The segment and slot counts are those of every listing class.
     let classes = block_classes(
-        mixer,
+        keeps,
         rows,
         max_slots,
         max_segments,
@@ -603,21 +664,32 @@ pub(super) fn block_class_slice(
     let slice = NativeGraphClassSlice::new()
         .dimension("M", [rows])
         .dimension("O", [rows]);
-    let slice = match mixer {
-        MixerKind::Attention if !listed.is_empty() => slice
+    let slice = match (keeps.history(), listed.is_empty()) {
+        (false, _) => slice,
+        (true, true) => slice.dimension("R", classes.iter().map(|&(_, segments, ..)| segments)),
+        (true, false) => slice
             .dimension("R", classes.iter().map(|&(_, segments, ..)| segments))
             .dimension("HT", listed.iter().copied()),
-        MixerKind::Attention => {
-            slice.dimension("R", classes.iter().map(|&(_, segments, ..)| segments))
-        }
-        MixerKind::Recurrent => slice.dimension("B", classes.iter().map(|&(_, _, slots, ..)| slots)),
+    };
+    // A recurrent mixer's slots are its whole block's `B`; an attention
+    // block's are its n-gram input's alone (`NGRAM_SLOTS`).
+    let slots = classes.iter().map(|&(_, _, slots, ..)| slots);
+    let slice = match keeps {
+        BlockKeeps::History => slice,
+        BlockKeeps::Bank => slice.dimension("B", slots),
+        BlockKeeps::HistoryAndBank => slice.scoped(crate::operators::ngram::graph::NGRAM_SLOTS, "B", slots),
     };
     let slice = match block.mixer {
         crate::operators::Mixer::Attention(operator) if scored => {
-            crate::operators::attention::graph::decode_class_segments(slice, &operator.reads)
+            crate::operators::attention::graph::decode_class_segments(slice, operator)
         }
         _ => slice,
     };
+    let slice = crate::operators::attention::pooled::candidate_class_segments(
+        slice,
+        picked,
+        classes.iter().map(|&(_, segments, ..)| segments),
+    );
     // An n-gram input reads its table's rows for each batch row's heads.
     let slice = match block.ngram {
         Some(ngram) => slice.scoped(
@@ -710,9 +782,10 @@ pub(super) struct FamilyOutline {
     pub(super) max_slots: u64,
     /// The most history segments a launch has.
     pub(super) max_segments: u64,
-    /// Per block, its mixer (`block_mixers`), its tap indices and its graph
-    /// shape, with the width of the taps of a target that has them.
-    pub(super) mixers: Vec<MixerKind>,
+    /// Per block, the state it keeps (`block_keeps`), its tap indices and
+    /// its graph shape, with the width of the taps of a target that has
+    /// them.
+    pub(super) keeps: Vec<BlockKeeps>,
     pub(super) tapped: Vec<BlockTaps>,
     pub(super) shapes: Vec<BlockGraphShape>,
     /// Per block, the first block of its shape ([`Self::first_of_shape`]).
@@ -768,7 +841,7 @@ impl FamilyOutline {
                     .ok_or("target segment class overflows")?,
             )
             .map_err(|_| "target segment class exceeds u64")?,
-            mixers: block_mixers(geometry)?,
+            keeps: block_keeps(geometry)?,
             tapped,
             firsts: firsts(&shapes),
             shapes,
@@ -849,7 +922,7 @@ pub(super) fn enumerate_block_graphs(
     plan: &TargetProgramPlan,
     scales: BlockOutputScales<'_>,
 ) -> Result<BlockGraphEnumeration, String> {
-    let FamilyOutline { backend, ref row_classes, max_slots, max_segments, ref mixers, ref shapes, .. } = *outline;
+    let FamilyOutline { backend, ref row_classes, max_slots, max_segments, ref keeps, ref shapes, .. } = *outline;
     let blocks = plan.blocks();
     let unit = |index: usize| {
         !crate::native::output_tails(blocks[index])
@@ -916,12 +989,56 @@ pub(super) fn enumerate_block_graphs(
             }
         }
     }
+    // Each picked pooled source's Block read, the picks per row of every
+    // indexer over it (each storing to one picks table, so all alike) and
+    // the blocks of the candidate pool its own indexer produces.
+    let mut picked: Vec<(usize, PickedRead)> = Vec::new();
+    for (index, slot) in blocks.iter().enumerate() {
+        let crate::MixerProgramSlot::Attention(crate::AttentionBinding { picked: Some(binding), .. }) =
+            slot.mixer()
+        else {
+            continue;
+        };
+        let (block, part, indexer) = match binding {
+            crate::PickedBinding::Own(pooled) => (
+                u32::try_from(index).map_err(|_| "block index exceeds u32")?,
+                pooled.part,
+                pooled.indexer,
+            ),
+            crate::PickedBinding::Reindex { source, part, indexer } => (source, part, indexer),
+            crate::PickedBinding::Reused => continue,
+        };
+        let read = state
+            .target_state()
+            .pooled_read(block, part)
+            .ok_or("a picked pooled source has no Block domain")?;
+        let pool_blocks = match indexer.candidates {
+            crate::CandidatesBinding::Produce(pool) => Some(pool.blocks),
+            crate::CandidatesBinding::All | crate::CandidatesBinding::Restrict(_) => None,
+        };
+        match picked.iter().find(|(other, _)| *other == read) {
+            None => picked.push((read, PickedRead { top: indexer.top, pool_blocks })),
+            Some((_, lists)) if lists.top != indexer.top => {
+                return Err(format!(
+                    "indexers over one pooled read picking {} and {} rows",
+                    lists.top, indexer.top
+                ));
+            }
+            // The rows' own indexer, the one that produces a pool, comes
+            // first.
+            Some(_) if pool_blocks.is_some() => {
+                return Err("a candidate pool produced by an indexer after another over its rows".into());
+            }
+            Some(_) => {}
+        }
+    }
     let mut enumeration = BlockGraphEnumeration {
         sealing: Vec::new(),
         sharing: Vec::new(),
         controls: LaunchControlLayout::of(
             &state.target_state().history_reads()?,
             &block_listed,
+            &picked,
             outline.largest_rows,
             max_segments,
             max_slots,
@@ -935,7 +1052,7 @@ pub(super) fn enumerate_block_graphs(
     for (&rows, listings) in row_classes.iter().zip(&listings_at) {
         for (index, &slot) in blocks.iter().enumerate() {
             for class in block_classes(
-                mixers[index],
+                keeps[index],
                 rows,
                 max_slots,
                 max_segments,
@@ -976,14 +1093,14 @@ pub(super) fn enumerate_block_graphs(
     Ok(enumeration)
 }
 
-/// The mixer kind of each decoder block, which decides its graph classes.
-fn block_mixers(geometry: &Decoder) -> Result<Vec<MixerKind>, String> {
+/// The state each decoder block keeps, which decides its graph classes.
+fn block_keeps(geometry: &Decoder) -> Result<Vec<BlockKeeps>, String> {
     geometry
         .blocks
         .iter()
         .map(|block| {
             paired_block(block)
-                .map(|paired| paired.mixer.kind())
+                .map(|paired| paired.keeps())
                 .map_err(|error| error.to_string())
         })
         .collect()

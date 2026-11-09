@@ -27,8 +27,9 @@ use magnitude_artifacts::{
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block,
     Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId, FeedForwardUp,
-    GateFunction, GateGranularity, HeadNorm, HistoryDomain, HistoryReads, ImportTransform,
-    InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
+    GateFunction, GateGranularity, HeadNorm, HistoryRows, HistorySource, ImportTransform,
+    InputNorm, InputSemantics, MediaRowAttention, ProjectedRows, RowProducer, RowRounding,
+    TokenDomain, ModelDefinition, Operator, OutputForm,
     OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, Sublayer,
     UnweightedRms, ValueNorm,
     ValueSource, WeightDescriptor,
@@ -217,23 +218,25 @@ pub fn inspect_components(
                 granularity: GateGranularity::Element,
             },
             query_norm: HeadNorm::Rms(rms(paired("attn_q_norm.weight", &[width])?)),
-            key_value: KeyValue::Owned {
-                key: paired("attn_k.weight", &[key_rows, hidden])?,
-                value: ValueSource::Projected(value),
-                key_norm: HeadNorm::Rms(rms(paired("attn_k_norm.weight", &[width])?)),
-                value_norm: ValueNorm::None,
-                domain: if windowed {
-                    HistoryDomain::Window { tokens: window }
-                } else {
-                    HistoryDomain::Token
+            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                ProjectedRows {
+                    key: paired("attn_k.weight", &[key_rows, hidden])?,
+                    value: ValueSource::Projected(value),
+                    key_norm: HeadNorm::Rms(rms(paired("attn_k_norm.weight", &[width])?)),
+                    value_norm: ValueNorm::None,
+                    domain: if windowed {
+                        TokenDomain::Window { tokens: window }
+                    } else {
+                        TokenDomain::Token
+                    },
+                    rounding: RowRounding::None,
                 },
-            },
+            )))],
             rotary: if windowed {
                 rotary.clone()
             } else {
                 Rotary::None
             },            scale: 1.0 / (width as f64).sqrt(),
-            reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
             output: OutputProjection::Full(output),

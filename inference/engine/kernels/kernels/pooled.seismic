@@ -1,0 +1,170 @@
+# Pooled history rows (`RowProducer::Pooled`, `PooledRows`): one row per
+# complete group of RATE tokens [b RATE, (b + 1) RATE), from the F32
+# per-token projections u (and, softmax-gated, the gate scores g):
+#
+#   pooled[c] = sum_i u_i[c] / RATE                         (GT = 0: Mean)
+#             = sum_i softmax_i(g[c])_i u_i[c]              (GT = 1: SoftmaxGated)
+#   latent    = rms(pooled) * norm
+#   row       = block_round(rotate_pairs(latent, coordinates of the group's first token))
+#
+# with W = 2P + S, the softmax over the group's tokens per channel
+# (m = max_i g_i[c], e_i = exp(g_i[c] - m), p_i = e_i / sum_i e_i, then
+# sum_i p_i u_i[c]), and the rotary the reading attention's key rotary in its
+# layout (`form`'s RA, RT; `rotate_pairs`). `form` also carries RATE and GT,
+# which no tensor extent determines alone. The rounding is the four scalars
+# of `rounding.seismic` (`block` 0 rounds nothing). Everything is F32 until
+# the row is stored in the activation element A, which holds every rounded
+# value exactly (BF16), except that a rounded row (`block` > 0) is rounded
+# from the values the model holds in A: the pooled row, the latent and the
+# rotated row are each held in A (DeepSeek V4.1's `Compressor.forward`
+# `kv.to(dtype)`, its norm's `.to(dtype)` and its in-place rotation), so the
+# latent published is held too.
+#
+# RATE is at least 2. At rate 1 each token is its own row and has no window:
+# `attention_append_dense` stores it as a window history stores its keys.
+#
+# State contract. The incomplete group's tokens are producer state: each
+# row's u (then g) and its rotary coordinates, in a Window(RATE - 1) history
+# domain (`window_rows` [TW, (1 + GT) W] F32, `window_coordinates` [TW, 4]
+# i32). Every row appends at `window_destinations[row]`
+# (-1 none). A row that completes a group (block_destinations[row] >= 0)
+# reads its group's earlier RATE - 1 tokens as the last RATE - 1 rows of its
+# window spans `window_visible[row]` (this launch's appended first), then its
+# own u and g; it writes the group's row at `block_destinations[row]` of the
+# Block(RATE) domain's plane `block_rows`. Rollback, fork and checkpoints are
+# the window's and the block domain's own.
+#
+# Results: `latent` [M, W], each completing row's latent (before the rotary
+# and the rounding: what an indexer's latent keys project, `IndexerKeys::Latent`),
+# zero for the others; `latent_rows` [M], the block row it wrote, -1 for the
+# others; `latent_coordinates` [M, 4], the coordinates of its group's first
+# token (the row's rotary origin), zeros for the others. All are indexed by
+# the launch row.
+fn pool_rows[M, TW, TB, P, S, GT, R, RA, RT, RATE](
+    u: &tensor[M, 2 * P + S] f32, g: &tensor[M, GT * (2 * P + S)] f32,
+    norm: &tensor[1, 2 * P + S] f32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
+    window_visible: &tensor[M, R, 2] i32, window_destinations: &tensor[M] i32,
+    block_destinations: &tensor[M] i32,
+    window_rows: &mut tensor[TW, (1 + GT) * (2 * P + S)] f32,
+    window_coordinates: &mut tensor[TW, 4] i32,
+    block_rows: &mut tensor[TB, 2 * P + S] A, form: &host tensor[0, RA, RT, RATE, GT] i32,
+    epsilon: f32, window_slab_rows: u32, block_slab_rows: u32,
+    block: i32, element: i32, scale: i32, amax_floor: f32)
+    -> (tensor[M, 2 * P + S] f32, tensor[M] i32, tensor[M, 4] i32)
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and GT >= 0 and GT <= 1 and RATE >= 2 and R >= 0 and TW >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1:
+    let layout = tensor[0, RA, RT, 0] i32
+    # Pending rows first: a completing row reads the pending rows of this
+    # launch's earlier rows.
+    for row in 0..M:
+        if window_destinations[row] >= 0:
+            for column in 0..2 * P + S:
+                window_rows[window_destinations[row], column] = u[row, column]
+            for column in 0..GT * (2 * P + S):
+                window_rows[window_destinations[row], 2 * P + S + column] = g[row, column]
+            window_coordinates[window_destinations[row]] = coordinates[row]
+    let mut latent = tensor[M, 2 * P + S] f32
+    let mut latent_rows = tensor[M] i32
+    let mut latent_coordinates = tensor[M, 4] i32
+    for row in 0..M:
+        latent_rows[row] = -1
+        for axis in 0..4:
+            latent_coordinates[row, axis] = 0
+        for column in 0..2 * P + S:
+            latent[row, column] = 0.0
+        if block_destinations[row] >= 0:
+            # The group's earlier tokens: the last RATE - 1 rows of the
+            # window spans, in order.
+            let mut members = tensor[RATE] i32
+            for member in 0..RATE:
+                members[member] = -1
+            let mut earlier = 0
+            for span in 0..R:
+                if window_visible[row, span, 1] > window_visible[row, span, 0]:
+                    earlier = earlier + window_visible[row, span, 1] - window_visible[row, span, 0]
+            let mut ordinal = 0
+            for span in 0..R:
+                let first = window_visible[row, span, 0]
+                let last = window_visible[row, span, 1]
+                if first >= 0 and last >= first:
+                    for window_row in first..last:
+                        let member = ordinal - (earlier - (RATE - 1))
+                        if member >= 0 and member < RATE - 1:
+                            members[member] = i32(window_row)
+                        ordinal = ordinal + 1
+            let mut values = tensor[RATE, 2 * P + S] f32
+            let mut gates = tensor[RATE, GT * (2 * P + S)] f32
+            for member in 0..RATE - 1:
+                for column in 0..2 * P + S:
+                    values[member, column] = window_rows[members[member], column]
+                for column in 0..GT * (2 * P + S):
+                    gates[member, column] = window_rows[members[member], 2 * P + S + column]
+            for column in 0..2 * P + S:
+                values[RATE - 1, column] = u[row, column]
+            for column in 0..GT * (2 * P + S):
+                gates[RATE - 1, column] = g[row, column]
+            let mut origin = tensor[4] i32
+            origin[:] = window_coordinates[members[0]]
+            let mut pooled = tensor[2 * P + S] f32
+            for column in 0..2 * P + S:
+                if GT == 1:
+                    let mut top = -inf
+                    for member in 0..RATE:
+                        top = max(top, gates[member, column])
+                    let mut total = 0.0
+                    for member in 0..RATE:
+                        total = total + exp(gates[member, column] - top)
+                    let mut sum = 0.0
+                    for member in 0..RATE:
+                        sum = sum + exp(gates[member, column] - top) / total * values[member, column]
+                    pooled[column] = sum
+                else:
+                    let mut sum = 0.0
+                    for member in 0..RATE:
+                        sum = sum + values[member, column]
+                    pooled[column] = sum / f32(RATE)
+            let mut held = tensor[2 * P + S] A
+            if block > 0:
+                pooled[:] = held_in_activation(pooled, held)
+            latent[row] = head_norm(pooled, norm, epsilon)
+            if block > 0:
+                latent[row] = held_in_activation(latent[row], held)
+            let mut rotated = tensor[2 * P + S] f32
+            rotated[:] = rotate_pairs(latent[row], origin, rotary_components, rotary_frequencies,
+                rotary_amplitudes, layout, 1.0)
+            if block > 0:
+                rotated[:] = held_in_activation(rotated, held)
+            block_rows[block_destinations[row]] = block_round(rotated, block, element, scale, amax_floor)
+            latent_rows[row] = block_destinations[row]
+            latent_coordinates[row] = origin
+    return (latent, latent_rows, latent_coordinates)
+
+# Metal: `append` per row (its u, g and coordinates into the window planes),
+# then `complete` per completing row, one simdgroup, lane l holding columns
+# [l E, (l + 1) E), E = W / 32: the group's members gathered, pooled, normed
+# (a simdgroup sum of squares), rotated (`rotary::layout::rotate`, whose
+# rotated columns are whole lanes), rounded (`rounding::round_lanes`),
+# stored, with the latent and its row published.
+native pool_rows for metal from "metal/pool_rows.metal":
+    static (P, S, GT, RA, RT, RATE)
+    where RA <= 1 and RT <= 1 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32) and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and RATE <= 16
+    launch pool_rows_append:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch pool_rows_complete:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# CPU: `append` per row, then `complete` per row (the portable math in F32,
+# its rotation `attention::prepare_rounded_head`'s).
+native pool_rows for cpu from "cpu/pool_rows.rs":
+    static (P, S, GT, RA, RT, RATE)
+    where RATE <= 64
+    launch pool_rows_append:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch pool_rows_complete:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * P + 2 * P + S) * 4)

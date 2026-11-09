@@ -46,10 +46,13 @@ kernel void indexer_keys(
     float x[KEYS_E];
     for (uint i = 0; i < KEYS_E; ++i)
         x[i] = float(key[row * KEYS_W + lane * KEYS_E + i]);
-    key_lanes::normalize(x, key_norm, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
-    key_lanes::rotate(x, coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes, lane);
+    // A rounded key is rounded from its norm and rotation held in A.
     const rounding::Rounding trained = {int(uint(SEISMIC_PARAM_BLOCK)), int(uint(SEISMIC_PARAM_ELEMENT)),
         int(uint(SEISMIC_PARAM_SCALE)), as_type<float>(uint(SEISMIC_PARAM_AMAX_FLOOR))};
+    key_lanes::normalize(x, key_norm, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
+    rounding::hold_lanes<element::Act>(x, trained);
+    key_lanes::rotate(x, coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes, lane);
+    rounding::hold_lanes<element::Act>(x, trained);
     rounding::round_lanes<KEYS_E>(x, trained);
     device float *target = slab::row<float>(keys, ulong(destination), ulong(SEISMIC_PARAM_SLAB_ROWS), KEYS_W);
     for (uint i = 0; i < KEYS_E; ++i)

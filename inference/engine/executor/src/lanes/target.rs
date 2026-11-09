@@ -232,7 +232,7 @@ impl TargetLaunchInputs {
                     .history(domain.0)
                     .ok_or_else(|| invalid(format!("slot {index} lacks a history domain")))?;
                 // An indexer's rows read as `indexer_history` forms them.
-                if crate::domain::indexer_domain(store, domain) {
+                if store.is_produced_domain(domain) {
                     let appended = crate::domain::AppendedRuns::of(store, advance, domain);
                     for (row, (destination, visible)) in
                         packed.destinations.iter().zip(packed.visible).enumerate()

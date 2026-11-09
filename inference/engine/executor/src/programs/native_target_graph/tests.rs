@@ -19,7 +19,7 @@ use super::{
 use crate::{
     ModelLoadPlan, ResourceLimits,
     operators::{
-        MixerKind, paired_block,
+        BlockKeeps, paired_block,
         routed::split::{OnceStage, RunStage, Stage},
     },
     programs::native_constants::{CheckedGraphFamilyResources, FamilyConstants},
@@ -102,6 +102,7 @@ mod upload_region_tests {
         let reads = magnitude_state::HistoryReads::of(&[], 1, 1).unwrap();
         let layout = LaunchControlLayout {
             padded: vec![false, true],
+            picked: vec![None, None],
             max_segments: 4,
             region_bytes: 0,
         };
@@ -134,8 +135,39 @@ mod upload_region_tests {
         }
         // Without history reads: coordinates and the slot controls, each
         // at a 256-byte boundary; the last, one slot's word.
-        let plain = LaunchControlLayout::of(&reads, &[], 16, 4, 1).unwrap();
+        let plain = LaunchControlLayout::of(&reads, &[], &[], 16, 4, 1).unwrap();
         assert_eq!(plain.region_bytes(), 5 * 256 + 4);
+    }
+
+    /// A picked Block read takes its rows' complete units and the picks
+    /// table; one whose own indexer produces a candidate pool also the pool
+    /// table, of the pool's blocks and the launch's segments a row.
+    #[test]
+    fn launch_controls_hold_a_pool_table_only_for_a_producing_read() {
+        use crate::programs::native_target_graph::classes::PickedRead;
+        use super::{LaunchControl, LaunchControlLayout};
+        let layout = LaunchControlLayout {
+            padded: vec![false, false],
+            picked: vec![
+                Some(PickedRead { top: 2, pool_blocks: Some(8) }),
+                Some(PickedRead { top: 3, pool_blocks: None }),
+            ],
+            max_segments: 4,
+            region_bytes: 0,
+        };
+        let controls = layout.controls(16, 2, 1);
+        let at = |control| {
+            controls
+                .iter()
+                .find(|(of, _)| *of == control)
+                .map(|(_, extents)| extents.clone())
+        };
+        assert_eq!(at(LaunchControl::Complete { read: 0 }), Some(vec![16]));
+        assert_eq!(at(LaunchControl::Picks { read: 0 }), Some(vec![16, 2]));
+        assert_eq!(at(LaunchControl::Pool { read: 0 }), Some(vec![16, 8 + 2, 2]));
+        assert_eq!(at(LaunchControl::Picks { read: 1 }), Some(vec![16, 3]));
+        assert_eq!(at(LaunchControl::Pool { read: 1 }), None);
+        assert!(LaunchControl::Pool { read: 0 }.per_row());
     }
 }
 
@@ -566,7 +598,7 @@ mod resource_template_tests {
             listings.tiles.is_empty(),
             !(tensor_operations || matches!(head_width, 128 | 256 | 512))
         );
-        for class in block_classes(MixerKind::Attention, 512, 512, max_segments, &listings, false)
+        for class in block_classes(BlockKeeps::History, 512, 512, max_segments, &listings, false)
         {
             let (graph, _, _) = checked_block_graph_draft(
                 NativeGraphMetadata::new(backend),
@@ -975,7 +1007,7 @@ mod resource_template_tests {
                     }
                     for (index, block) in geometry.blocks.iter().enumerate() {
                         for class in block_classes(
-                            paired_block(block).unwrap().mixer.kind(),
+                            paired_block(block).unwrap().keeps(),
                             rows,
                             limits.max_launch_slots as u64,
                             max_segments,

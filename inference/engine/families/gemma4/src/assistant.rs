@@ -185,7 +185,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
         let source_domain = u32::try_from(source)
             .ok()
             .and_then(|block| decoder.history_domain(SublayerIndex { block, sublayer: 0 }));
-        if source_domain != Some(geometry.domain) {
+        if source_domain != Some(geometry.domain.into()) {
             return Err(mismatch(format!(
                 "Gemma assistant layer {layer} reads target layer {source}, whose history is {source_domain:?}, as {:?}",
                 geometry.domain

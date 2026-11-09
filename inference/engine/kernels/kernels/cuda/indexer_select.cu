@@ -135,7 +135,7 @@ struct Cursor {
     }
 };
 
-// Row `row`'s complete blocks: its block spans, then its own block.
+// Row `row`'s complete blocks: its block spans, its own block among them.
 __device__ __forceinline__ Spans block_spans(const int *block_visible, u64 row,
                                              const seismic_words_t &seismic_words_value) {
     return Spans{block_visible + row * SEISMIC_BLOCK_VISIBLE_STRIDE_0, SEISMIC_DIM_R,
@@ -447,9 +447,7 @@ extern "C" __global__ void indexer_select_score(SEISMIC_KERNEL_PARAMS) {
     const int lane = threadIdx.x % 32;
     const Spans blocks =
         block_spans(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_VISIBLE)), row, seismic_words_value);
-    const int own = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_DESTINATIONS))
-        [row * SEISMIC_BLOCK_DESTINATIONS_STRIDE_0];
-    const u32 complete = blocks.rows(lane) + (own >= 0 ? 1u : 0u);
+    const u32 complete = blocks.rows(lane);
     const u32 first = blockIdx.x * (8u * kScoreBatch);
     if (first >= complete) return;
     const Storage *query = reinterpret_cast<const Storage *>(SEISMIC_PTR(SEISMIC_BUFFER_QUERY));
@@ -486,7 +484,7 @@ extern "C" __global__ void indexer_select_score(SEISMIC_KERNEL_PARAMS) {
 #pragma unroll
     for (u32 j = 0; j < kScoreBatch; ++j) {
         // A block past the row's last repeats the last: its score is not stored.
-        const int at = cursor.row(min(begin + j, end - 1u), own);
+        const int at = cursor.row(min(begin + j, end - 1u), -1);
         const float *k = reinterpret_cast<const float *>(
             slab::row(block_keys, static_cast<u64>(at), SEISMIC_PARAM_BLOCK_SLAB_ROWS, W * sizeof(float)));
 #pragma unroll
@@ -519,9 +517,7 @@ extern "C" __global__ void indexer_select_select(SEISMIC_KERNEL_PARAMS) {
     const int lane = static_cast<int>(threadIdx.x % 32);
     const Spans blocks =
         block_spans(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_VISIBLE)), row, seismic_words_value);
-    const int own = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCK_DESTINATIONS))
-        [row * SEISMIC_BLOCK_DESTINATIONS_STRIDE_0];
-    const u32 complete = blocks.rows(lane) + (own >= 0 ? 1u : 0u);
+    const u32 complete = blocks.rows(lane);
     const u32 words = bitmap_words(seismic_words_value);
     u32 *bitmap = reinterpret_cast<u32 *>(SEISMIC_PTR(SEISMIC_RESULT_1_BUFFER)) + row * SEISMIC_RESULT_1_STRIDE_0;
     const int requested = static_cast<int>(static_cast<u32>(SEISMIC_PARAM_SELECTED));

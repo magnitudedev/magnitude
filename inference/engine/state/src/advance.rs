@@ -2,6 +2,7 @@
 
 use super::{
     append_ranges, install_commit, ranges_from, BankHandle, Claims, Codec, ComponentDescriptor,
+    ComponentRole,
     Error, HistoryDomainId, HistoryValue, KvCodec, LayerRef, PlaneBuffer, SequenceState, StateStore, StoreCopy,
     Tail, Transaction, VectorKind,
 };
@@ -324,21 +325,21 @@ impl OwnedCodecAdvance {
 
 fn identify_codec(components: &[ComponentDescriptor]) -> Result<KvCodec, Error> {
     for candidate in [KvCodec::Dense, KvCodec::AffineK8V4, KvCodec::RotatedK4V4] {
-        // An indexer's keys are dense whatever the attention codec.
-        if components.iter().filter(|component| component.attended()).all(|component| {
+        // Produced rows and the model's own stores keep their codec whatever
+        // the host policy; a host-policy history holds its own value vector
+        // (stored keys are the model's own store, valueless rows produced).
+        if components
+            .iter()
+            .filter(|component| component.role == ComponentRole::History)
+            .all(|component| {
             let dense_dtype = match component.codec.key {
                 Codec::Dense { dtype } => dtype,
                 _ => seismic::DType::F16,
             };
-            let width = component.codec.key_width;
-            let expected = match component.codec.value {
-                HistoryValue::Own { width: values, .. } => {
-                    Some(candidate.spec(dense_dtype, width, values))
-                }
-                HistoryValue::Key => Some(candidate.stored_key(dense_dtype, width)),
-                HistoryValue::None => None,
+            let HistoryValue::Own { width: values, .. } = component.codec.value else {
+                panic!("a host-policy history component without its own values: {component:?}");
             };
-            expected == Some(component.codec)
+            candidate.spec(dense_dtype, component.codec.key_width, values) == component.codec
         }) {
             return Ok(candidate);
         }

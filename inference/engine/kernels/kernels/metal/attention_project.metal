@@ -12,6 +12,8 @@
 #endif
 
 typedef element::Act activation;
+// The results' element Y (A, or F32 for a pooled source's projections).
+typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) published;
 typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
 // The rows every weight takes (the normalized rows, or NVFP4 operands): the
 // GEMV and batched row classes form them while staging, the stage launches
@@ -62,13 +64,13 @@ typedef projection::operands<NVFP4> Operands;
     projection::Weights<packets::W2> key_w{key_weight, KERNEL_W2_LAYOUT(k), k};         \
     projection::Weights<packets::W3> value_w{value_weight, KERNEL_W3_LAYOUT(k), k};     \
     const auto query_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_QS, query_scale,        \
-        (projection::Store<activation>{query, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0})); \
+        (projection::Store<published>{query, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0})); \
     const auto gate_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_GS, gate_scale,          \
-        (projection::Store<activation>{gate, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, 0})); \
+        (projection::Store<published>{gate, SEISMIC_RESULT_1_STRIDE_0, SEISMIC_RESULT_1_STRIDE_1, 0})); \
     const auto key_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_KS, key_scale,            \
-        (projection::Store<activation>{key, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, 0})); \
+        (projection::Store<published>{key, SEISMIC_RESULT_2_STRIDE_0, SEISMIC_RESULT_2_STRIDE_1, 0})); \
     const auto value_out = ATTENTION_PROJECT_SCALED(SEISMIC_DIM_VS, value_scale,        \
-        (projection::Store<activation>{value, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0}))
+        (projection::Store<published>{value, SEISMIC_RESULT_3_STRIDE_0, SEISMIC_RESULT_3_STRIDE_1, 0}))
 
 // A segment's result after its weight's second-level scale, where the
 // segment's scale port (static extent EXTENT) is present.

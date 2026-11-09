@@ -232,7 +232,6 @@ kernel void indexer_select_score(
     device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
     device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
     device const int *block_visible [[buffer(SEISMIC_BUFFER_BLOCK_VISIBLE)]],
-    device const int *block_destinations [[buffer(SEISMIC_BUFFER_BLOCK_DESTINATIONS)]],
     device const ulong *block_keys [[buffer(SEISMIC_BUFFER_BLOCK_KEYS)]],
     device float *scores [[buffer(SEISMIC_BUFFER_SCRATCH_SCORES)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -244,8 +243,7 @@ kernel void indexer_select_score(
     const uint spans = uint(SEISMIC_DIM_R);
     const ulong nb = 32 * ulong(SEISMIC_DIM_B);
     device const int *row_spans = block_visible + row * spans * 2;
-    const int own = block_destinations[row];
-    const uint complete = indexer::simd_span_rows(row_spans, spans, lane) + (own >= 0 ? 1u : 0u);
+    const uint complete = indexer::simd_span_rows(row_spans, spans, lane);
     const uint first = group.x * (8 * INDEXER_BATCH);
     if (first >= complete)
         return;
@@ -280,7 +278,7 @@ kernel void indexer_select_score(
     INDEXER_UNROLL
     for (uint j = 0; j < INDEXER_BATCH; ++j) {
         // A block past the row's last repeats the last: its score is not stored.
-        const int at = cursor.row(row_spans, spans, metal::min(begin + j, end - 1), own);
+        const int at = cursor.row(row_spans, spans, metal::min(begin + j, end - 1), -1);
         device const float *k = slab::row<float>(block_keys, ulong(at), slab_rows, INDEXER_W);
         INDEXER_UNROLL
         for (uint i = 0; i < INDEXER_E; ++i)
@@ -304,7 +302,6 @@ kernel void indexer_select_score(
 
 kernel void indexer_select_select(
     device const int *block_visible [[buffer(SEISMIC_BUFFER_BLOCK_VISIBLE)]],
-    device const int *block_destinations [[buffer(SEISMIC_BUFFER_BLOCK_DESTINATIONS)]],
     device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
     device int *segments [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device uint *selection [[buffer(SEISMIC_RESULT_1_BUFFER)]],
@@ -323,8 +320,7 @@ kernel void indexer_select_select(
     const ulong nb = 32 * ulong(written);
     device uint *bitmap = selection + row * written;
     const uint selected = uint(metal::max(int(uint(SEISMIC_PARAM_SELECTED)), 0));
-    const uint complete = indexer::simd_span_rows(block_visible + row * spans * 2, spans, lane)
-        + (block_destinations[row] >= 0 ? 1u : 0u);
+    const uint complete = indexer::simd_span_rows(block_visible + row * spans * 2, spans, lane);
     device const uint *bits = reinterpret_cast<device const uint *>(scores + row * nb);
     threadgroup uint *bins = shared;                 // [256]
     threadgroup uint *totals = shared + 256;         // [8]: the scans' simdgroup sums

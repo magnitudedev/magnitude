@@ -19,6 +19,15 @@
 // The worklist scratch: the query tiles' (span, first) lists, their counts,
 // then the rows' span ordinals.
 #define PREFILL_LIST_TILES uint((SEISMIC_DIM_M + SEISMIC_TUNE_QT - 1) / SEISMIC_TUNE_QT)
+// The attend grid's key partitions (its z extent, attention.seismic). An
+// index-list source's state (KS > 0) is the partition after them: the
+// partials and statistics scratch hold one more partition's records there.
+#define PREFILL_PARTS_DIVISOR                                                                              \
+    (PREFILL_LIST_TILES * uint(SEISMIC_DIM_KV) * ((ATTENTION_QUERY_GROUP + SEISMIC_TUNE_HEADS - 1) / SEISMIC_TUNE_HEADS))
+#define PREFILL_PARTS                                                                                      \
+    metal::max(1u, uint((uint(SEISMIC_TUNE_SPLIT_GROUPS) + PREFILL_PARTS_DIVISOR - 1) / PREFILL_PARTS_DIVISOR))
+#define PREFILL_PICKED(records, width)                                                                     \
+    ((records) + ulong(PREFILL_PARTS) * SEISMIC_DIM_M * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP * (width))
 #define PREFILL_WORKLIST(selection, worklist)                                                              \
     attention::prefill_selection{selection,                                                                \
         (worklist) + ulong(PREFILL_LIST_TILES) * PREFILL_LIST_CAPACITY * 2 + PREFILL_LIST_TILES,          \
@@ -59,7 +68,8 @@ kernel void attention_prefill_prepare(
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, destinations, queries, keys, values, SEISMIC_DIM_M,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1,
-        group, simd, lane);
+        group, simd, lane, attention::key_rounding(SEISMIC_DIM_KR != 0, uint(SEISMIC_PARAM_KEY_BLOCK), uint(SEISMIC_PARAM_KEY_ELEMENT),
+        uint(SEISMIC_PARAM_KEY_SCALE), uint(SEISMIC_PARAM_KEY_AMAX_FLOOR)));
 }
 
 kernel void attention_prefill_attend(
@@ -94,7 +104,7 @@ kernel void attention_prefill_attend(
         query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
         SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
-        PREFILL_WORKLIST(selection, worklist), sinks);
+        PREFILL_WORKLIST(selection, worklist), sinks, SEISMIC_DIM_KS != 0);
 }
 
 kernel void attention_prefill_merge(
@@ -111,7 +121,27 @@ kernel void attention_prefill_merge(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, result, partials, statistics, counts,
-        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
+        SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0, sinks,
+        SEISMIC_DIM_KS != 0, PREFILL_PICKED(partials, ATTENTION_W), PREFILL_PICKED(statistics, 2));
+}
+
+// The index-list source (KS > 0, `attention::prefill_picked`): threadgroup
+// (row, query head), one simdgroup, after L1 prepared the queries; its state
+// is the partition after the key partitions' (`PREFILL_PICKED`).
+kernel void attention_prefill_picks(
+    device const int *selected_rows [[buffer(SEISMIC_BUFFER_SELECTED_ROWS)]],
+    device const ulong *selected [[buffer(SEISMIC_BUFFER_SELECTED)]],
+    device const attention::Scalar *queries [[buffer(SEISMIC_BUFFER_SCRATCH_QUERIES)]],
+    device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
+    device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    attention::prefill_picked(queries, selected_rows, selected, ulong(SEISMIC_PARAM_SELECTED_SLAB_ROWS),
+        PREFILL_PICKED(partials, ATTENTION_W), PREFILL_PICKED(statistics, 2), SEISMIC_DIM_KS,
+        as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E, group.x, group.y, lane);
 }
 
 // The WorkList's list launch (B > 0): each query tile's read key tiles

@@ -218,6 +218,32 @@ pub(super) fn qualify_attention(
         ENTRY,
         label,
     )?;
+    // The dense entries' form also carries the key rounding (`KR`), which
+    // the check runs at the layers' own rounding, and their index-list
+    // source takes no picks (`[1, KS]`, each -1) of no plane rows.
+    let rounding = shape.key_rounding;
+    let dense_form = semantic_i32(
+        device,
+        &[
+            0,
+            shape.rotary_adjacent,
+            shape.rotary_trailing,
+            shape.output_rotary,
+            shape.stored_key(),
+            shape.rounds_keys(),
+        ],
+        &[],
+        ENTRY,
+        label,
+    )?;
+    let selected_rows = semantic_i32(
+        device,
+        &[1, shape.picks],
+        &vec![-1; shape.picks as usize],
+        ENTRY,
+        label,
+    )?;
+    let selected = zeros(binding.activation, &[0, shape.kv_heads, shape.width])?;
     let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
     let scale = |name| unit_scale(device, &kernels.project, name, ENTRY, label);
@@ -284,13 +310,11 @@ pub(super) fn qualify_attention(
                 .map_err(|e| qualification_dynamic("attention_project", label, e))?
                 .r0
         }
-        _ => {
-            return Err(qualification_dynamic(
-                "attention_project",
-                label,
-                "the low-rank query's kernels disagree with the binding",
-            ));
-        }
+        (low_rank, low_rank_kernels) => unreachable!(
+            "preparation gives a low-rank query, and only one, its kernels: {low_rank:?} with \
+             kernels {}",
+            low_rank_kernels.is_some()
+        ),
     };
     let mixed_query = per_head(&query_rows, &[1, heads, width + shape.interleaved_gate])?;
     let mixed_gate = per_head(&projected.r1, &[1, heads, shape.separate_gate])?;
@@ -308,7 +332,7 @@ pub(super) fn qualify_attention(
     let value_rows = if shape.stored_key() == 1 { 0 } else { 2 };
     macro_rules! mix {
         ($kernel:expr, $module:ident, $($plane:ident: $element:expr, $elements:expr, $rows:expr),*) => {
-            mix!(@call $kernel, $module, {}, $($plane: $element, $elements, $rows),*)
+            mix!(@call $kernel, $module, {form: &form}, $($plane: $element, $elements, $rows),*)
         };
         (@call $kernel:expr, $module:ident, {$($extra:ident: $value:expr),*},
             $($plane:ident: $element:expr, $elements:expr, $rows:expr),*) => {{
@@ -353,7 +377,6 @@ pub(super) fn qualify_attention(
                     slab_rows: 2,
                     $($extra: $value,)*
                     $($plane: &mut $plane,)*
-                    form: &form,
                     epsilon: 1.0e-5,
                     scale: 1.0 / (width as f32).sqrt(),
                     gate_function: 0,
@@ -370,19 +393,30 @@ pub(super) fn qualify_attention(
             match decode {
                 DenseDecodeKernels::Decode { single, .. } => (
                     "attention_decode",
-                    mix!(single, attention_decode,
-                        history_key: activation, width, 2, history_value: activation, width, value_rows),
+                    mix!(@call single, attention_decode, {
+                        form: &dense_form, selected_rows: &selected_rows, selected: &selected,
+                        selected_slab_rows: 1, key_block: rounding.block, key_element: rounding.element,
+                        key_scale: rounding.scale, key_amax_floor: rounding.amax_floor()
+                    }, history_key: activation, width, 2, history_value: activation, width, value_rows),
                 ),
                 DenseDecodeKernels::Prefill(kernel) => (
                     "attention_prefill",
-                    mix!(@call kernel, attention_prefill, {selection: &selection, block_slots: &block_slots},
-                        history_key: activation, width, 2, history_value: activation, width, value_rows),
+                    mix!(@call kernel, attention_prefill, {
+                        selection: &selection, block_slots: &block_slots,
+                        form: &dense_form, selected_rows: &selected_rows, selected: &selected,
+                        selected_slab_rows: 1, key_block: rounding.block, key_element: rounding.element,
+                        key_scale: rounding.scale, key_amax_floor: rounding.amax_floor()
+                    }, history_key: activation, width, 2, history_value: activation, width, value_rows),
                 ),
             },
             (
                 "attention_prefill",
-                mix!(@call prefill, attention_prefill, {selection: &selection, block_slots: &block_slots},
-                    history_key: activation, width, 2, history_value: activation, width, value_rows),
+                mix!(@call prefill, attention_prefill, {
+                    selection: &selection, block_slots: &block_slots,
+                    form: &dense_form, selected_rows: &selected_rows, selected: &selected,
+                    selected_slab_rows: 1, key_block: rounding.block, key_element: rounding.element,
+                    key_scale: rounding.scale, key_amax_floor: rounding.amax_floor()
+                }, history_key: activation, width, 2, history_value: activation, width, value_rows),
             ),
         ],
         AttentionHistoryKernels::AffineK8V4 {
@@ -404,7 +438,7 @@ pub(super) fn qualify_attention(
                 (
                     "attention_prefill_k8v4",
                     mix!(@call prefill, attention_prefill_k8v4,
-                        {selection: &selection, block_slots: &block_slots, history_tiles: &history_tiles},
+                        {selection: &selection, block_slots: &block_slots, history_tiles: &history_tiles, form: &form},
                         history_key_codes: Element::u32(), geometry.key_codes as u64, 2,
                         history_key_coefficients: Element::f16(), geometry.key_coefficients as u64, 2,
                         history_value_codes: Element::u32(), geometry.value_codes as u64, 2,
@@ -433,13 +467,12 @@ pub(super) fn qualify_attention(
                     .reshape(&[1, output_q, output_w])
                     .map_err(|e| qualification_dynamic("project_rows", label, e))?,
             ),
-            _ => {
-                return Err(qualification_dynamic(
-                    "project_rows",
-                    label,
-                    "grouped output kernels disagree with the binding",
-                ));
-            }
+            (kernel, weight) => unreachable!(
+                "preparation gives a grouped output, and only one, its kernels: kernels {} with \
+                 weight {}",
+                kernel.is_some(),
+                weight.is_some()
+            ),
         };
         let gated = products.as_ref().unwrap_or(gated);
         let result = match (&kernels.output, binding.tail) {

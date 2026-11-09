@@ -78,7 +78,7 @@ fn attention_project_rows<L: Isa, E: Elements>(
         let zero = vec![0.0f32; rows.len()];
         for row in 0..m {
             // SAFETY: this work item owns these columns of this segment's result.
-            activation::store::<E::A>(&zero, unsafe {
+            activation::store::<E::Y>(&zero, unsafe {
                 result.span_mut([row, rows.start], rows.len())
             });
         }
@@ -103,7 +103,7 @@ fn attention_project_rows<L: Isa, E: Elements>(
                 *target = scale * value;
             }
             // SAFETY: each work item writes its own columns of every row of its segment's result.
-            activation::store::<E::A>(scaled, unsafe {
+            activation::store::<E::Y>(scaled, unsafe {
                 result.span_mut([row, rows.start], rows.len())
             });
         },

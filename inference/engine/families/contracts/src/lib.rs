@@ -23,9 +23,11 @@ pub use decoder::{
     ActivationFunction, Attention, AttentionGate, Block, Branch, BranchOutput, Decoder,
     DeferredForm, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
     ExitSite, FeedForwardUp, GateFunction, GluLimit, GateGranularity, GatedDelta, HeadNorm, HistoryDomain,
-    HistoryReads, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
-    HyperConnectionWeights, HyperConnections, LowRankGatedSite,
-    Indexer, InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention,
+    BlockElement, BlockRounding, BlockScale, Candidates, HeadWeights, HistoryReads, HistoryRows,
+    HistorySource, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
+    HyperConnectionWeights, HyperConnections, LowRankGatedSite, Indexer, IndexerInput,
+    IndexerKeys, IndexerQuery, InputNorm, LatentAttention, Pool, PooledRows, ProjectedRows,
+    RowProducer, RowRounding, Selection, TokenDomain, LatentExperts, LayerNorm, MediaRowAttention,
     NGramConvolution, NGramGate, NGramHash, NGramInput, NGramMedia, Operator, OutputForm, OutputProjection, OutputRotary, PerLayerEntry,
     PerLayerInput, QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
     RotaryDivisors, RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement,
@@ -539,10 +541,21 @@ pub enum WeightKind {
     AttentionOutputGrouped,
     /// An attention's per-head sink logits (`Attention::sinks`).
     AttentionSinks,
+    /// A pooled history source's per-token projection, gate and norm
+    /// (`PooledRows`).
+    PooledProjection,
+    PooledGate,
+    PooledNorm,
     IndexerQuery,
+    /// An indexer's key projection: its pooled keys' projection, or its
+    /// latent keys' (`IndexerKeys`).
     IndexerKey,
+    /// The gate of an indexer's softmax-gated pooled keys.
+    IndexerKeyGate,
     IndexerQueryNorm,
     IndexerKeyNorm,
+    /// An indexer's projected per-head score weights (`HeadWeights`).
+    IndexerHeadWeights,
     RecurrentQueryKeyValue,
     RecurrentGate,
     RecurrentAlpha,
@@ -741,8 +754,8 @@ pub enum HeadHistory {
     /// The head stores its own rows: every committed row enters it, and its
     /// blocks' attention owns or shares history among themselves.
     Own,
-    /// The head stores nothing. Every attention sublayer is
-    /// `KeyValue::Shared` with a source naming a sublayer of the *target*
+    /// The head stores nothing. Every attention source is
+    /// `HistoryRows::Shared` with a source naming a sublayer of the *target*
     /// decoder, whose accepted history it reads; a draft is one row per step
     /// at the anchor's position.
     Target,
@@ -1098,7 +1111,7 @@ mod tests {
         }
     }
 
-    fn attention(name: &str, key_value: KeyValue) -> Sublayer {
+    fn attention(name: &str, history: Vec<HistorySource>) -> Sublayer {
         Sublayer {
             input: InputNorm::Rms(rms(&format!("{name}.norm"), 4)),
             op: Operator::Attention(Box::new(Attention {
@@ -1108,7 +1121,7 @@ mod tests {
                 query: QueryProjection::Full(weight(&format!("{name}.q"), &[4, 4])),
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::None,
-                key_value,
+                history,
                 rotary: Rotary::Table {
                     pairs: vec![RotaryPair {
                         frequency: 1.0,
@@ -1119,7 +1132,6 @@ mod tests {
                     output: OutputRotary::None,
                 },
                 scale: 0.5,
-                reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
                 sinks: None,
                 output: OutputProjection::Full(weight(&format!("{name}.o"), &[4, 4])),
@@ -1128,14 +1140,35 @@ mod tests {
         }
     }
 
-    fn owned(name: &str, domain: HistoryDomain) -> KeyValue {
-        KeyValue::Owned {
+    fn projected(name: &str, domain: TokenDomain) -> ProjectedRows {
+        ProjectedRows {
             key: weight(&format!("{name}.k"), &[2, 4]),
             value: ValueSource::Projected(weight(&format!("{name}.v"), &[2, 4])),
             key_norm: HeadNorm::None,
             value_norm: ValueNorm::None,
             domain,
+            rounding: RowRounding::None,
         }
+    }
+
+    /// One owned projected source read whole.
+    fn owned(name: &str, domain: TokenDomain) -> Vec<HistorySource> {
+        vec![HistorySource::visible(HistoryRows::Own(
+            RowProducer::Projected(projected(name, domain)),
+        ))]
+    }
+
+    /// The first source of sublayer `source`, read whole.
+    fn shared(source: SublayerIndex) -> Vec<HistorySource> {
+        vec![HistorySource::visible(HistoryRows::Shared { source, part: 0 })]
+    }
+
+    fn attention_of(model: &mut ModelDefinition, block: usize) -> &mut Attention {
+        let Operator::Attention(attention) = &mut model.decoder.blocks[block].sublayers[0].op
+        else {
+            unreachable!()
+        };
+        attention
     }
 
     fn definition(sublayers: Vec<Sublayer>) -> ModelDefinition {
@@ -1178,7 +1211,7 @@ mod tests {
 
     #[test]
     fn operators_bind_weights_of_their_own_geometry() {
-        let mut model = definition(vec![attention("a", owned("a", HistoryDomain::Token))]);
+        let mut model = definition(vec![attention("a", owned("a", TokenDomain::Token))]);
         assert!(model.validate().is_ok());
         let Operator::Attention(attention) = &mut model.decoder.blocks[0].sublayers[0].op else {
             unreachable!()
@@ -1200,13 +1233,9 @@ mod tests {
     fn low_rank_stored_key_trailing_adjacent_grouped_attention_validates() {
         let mut model = definition(vec![attention(
             "a",
-            KeyValue::Owned {
-                key: weight("a.kv", &[2, 4]),
-                value: ValueSource::StoredKey,
-                key_norm: HeadNorm::Rms(rms("a.kv_norm", 2)),
-                value_norm: ValueNorm::None,
-                domain: HistoryDomain::Window { tokens: 4 },
-            },
+            vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                stored_key_window("a"),
+            )))],
         )]);
         let Operator::Attention(attention) = &mut model.decoder.blocks[0].sublayers[0].op else {
             unreachable!()
@@ -1244,10 +1273,12 @@ mod tests {
         };
         invalid(
             &|attention| {
-                let KeyValue::Owned { value_norm, .. } = &mut attention.key_value else {
+                let HistoryRows::Own(RowProducer::Projected(rows)) =
+                    &mut attention.history[0].rows
+                else {
                     unreachable!()
                 };
-                *value_norm = ValueNorm::RmsUnweighted(UnweightedRms { epsilon: 1e-6 });
+                rows.value_norm = ValueNorm::RmsUnweighted(UnweightedRms { epsilon: 1e-6 });
             },
             "stored-key values with a value norm",
         );
@@ -1278,21 +1309,19 @@ mod tests {
             sublayer: 0,
         };
         let model = definition(vec![
-            attention("a", owned("a", HistoryDomain::Window { tokens: 4 })),
-            attention("b", KeyValue::Shared { source }),
+            attention("a", owned("a", TokenDomain::Window { tokens: 4 })),
+            attention("b", shared(source)),
         ]);
         assert!(model.validate().is_ok());
         let backwards = definition(vec![
             attention(
                 "a",
-                KeyValue::Shared {
-                    source: SublayerIndex {
-                        block: 1,
-                        sublayer: 0,
-                    },
-                },
+                shared(SublayerIndex {
+                    block: 1,
+                    sublayer: 0,
+                }),
             ),
-            attention("b", owned("b", HistoryDomain::Token)),
+            attention("b", owned("b", TokenDomain::Token)),
         ]);
         assert_eq!(
             backwards.validate().unwrap_err().to_string(),
@@ -1306,7 +1335,7 @@ mod tests {
             block: 0,
             sublayer: 0,
         };
-        let head = |key_value, history| Head {
+        let head = |sources, history| Head {
             blocks: vec![HeadBlock {
                 residual: ResidualForm::Single,
                 input: HeadInput::Projected {
@@ -1314,7 +1343,7 @@ mod tests {
                     embedding_scale: EmbeddingScale::Unit,
                 },
                 blocks: vec![Block {
-                    sublayers: vec![attention("h", key_value)],
+                    sublayers: vec![attention("h", sources)],
                 }],
                 output_norm: ExitNorm::Rms(rms("head_norm", 4)),
                 readout: HeadReadout::full(VocabularyProjection::Own {
@@ -1327,26 +1356,19 @@ mod tests {
             history,
             component: HeadComponent::Draft,
         };
-        let mut model = definition(vec![attention("a", owned("a", HistoryDomain::Token))]);
-        model.head = Some(head(
-            KeyValue::Shared {
-                source: target_layer,
-            },
-            HeadHistory::Target,
-        ));
+        let mut model = definition(vec![attention("a", owned("a", TokenDomain::Token))]);
+        model.head = Some(head(shared(target_layer), HeadHistory::Target));
         assert!(model.validate().is_ok());
-        model.head = Some(head(owned("h", HistoryDomain::Token), HeadHistory::Target));
+        model.head = Some(head(owned("h", TokenDomain::Token), HeadHistory::Target));
         assert_eq!(
             model.validate().unwrap_err().to_string(),
             "attention reading target history owns its own"
         );
         model.head = Some(head(
-            KeyValue::Shared {
-                source: SublayerIndex {
-                    block: 1,
-                    sublayer: 0,
-                },
-            },
+            shared(SublayerIndex {
+                block: 1,
+                sublayer: 0,
+            }),
             HeadHistory::Target,
         ));
         assert_eq!(
@@ -1354,26 +1376,232 @@ mod tests {
             "shared attention history names no target attention sublayer"
         );
         // The same source names the head's own layers when it keeps its own.
-        model.head = Some(head(
-            KeyValue::Shared {
-                source: target_layer,
-            },
-            HeadHistory::Own,
-        ));
+        model.head = Some(head(shared(target_layer), HeadHistory::Own));
         assert_eq!(
             model.validate().unwrap_err().to_string(),
             "shared attention history names no earlier attention sublayer"
         );
     }
 
+    /// V4.1's window rows: the stored key, normed, rounded to E4M3 per 2.
+    fn stored_key_window(name: &str) -> ProjectedRows {
+        ProjectedRows {
+            key: weight(&format!("{name}.kv"), &[2, 4]),
+            value: ValueSource::StoredKey,
+            key_norm: HeadNorm::Rms(rms(&format!("{name}.kv_norm"), 2)),
+            value_norm: ValueNorm::None,
+            domain: TokenDomain::Window { tokens: 4 },
+            rounding: RowRounding::Block(BlockRounding {
+                element: BlockElement::E4M3,
+                block: 2,
+                scale: BlockScale::Ue8m0,
+                amax_floor: 1e-4,
+            }),
+        }
+    }
+
+    fn window_source(name: &str) -> HistorySource {
+        HistorySource::visible(HistoryRows::Own(RowProducer::Projected(stored_key_window(
+            name,
+        ))))
+    }
+
+    /// A V4.1 Full layer: its window, then rows pooled per 2 tokens by a
+    /// softmax gate and selected by its own indexer over their latents.
+    fn compressing(name: &str) -> Sublayer {
+        let indexer = Indexer {
+            heads: 2,
+            width: 2,
+            query: IndexerQuery {
+                input: IndexerInput::QueryRank,
+                projection: weight(&format!("{name}.indexer.q_b"), &[4, 3]),
+                norm: HeadNorm::None,
+                rounding: RowRounding::None,
+            },
+            keys: IndexerKeys::Latent {
+                projection: weight(&format!("{name}.indexer.k"), &[2, 2]),
+                norm: rms(&format!("{name}.indexer.k_norm"), 2),
+                rounding: RowRounding::None,
+            },
+            head_weights: HeadWeights::Projected(weight(&format!("{name}.indexer.w"), &[2, 4])),
+            scale: 0.5,
+            top: 512,
+            candidates: crate::Candidates::All,
+        };
+        let pooled = HistorySource {
+            rows: HistoryRows::Own(RowProducer::Pooled(PooledRows {
+                rate: 2,
+                projection: weight(&format!("{name}.compressor.kv"), &[2, 4]),
+                pool: Pool::SoftmaxGated {
+                    gate: weight(&format!("{name}.compressor.gate"), &[2, 4]),
+                },
+                norm: rms(&format!("{name}.compressor.norm"), 2),
+                rounding: RowRounding::Block(BlockRounding {
+                    element: BlockElement::E2M1,
+                    block: 2,
+                    scale: BlockScale::E4M3,
+                    amax_floor: 6.0 * 2f64.powi(-9),
+                }),
+            })),
+            reads: HistoryReads::Selected(Selection::Own(Box::new(indexer))),
+        };
+        low_rank_query(attention(name, vec![window_source(name), pooled]), name)
+    }
+
+    /// A V4.1 Reuse layer of block 0's pooled rows and picks.
+    fn reusing(name: &str) -> Sublayer {
+        let source = SublayerIndex {
+            block: 0,
+            sublayer: 0,
+        };
+        let pooled = HistorySource {
+            rows: HistoryRows::Shared { source, part: 1 },
+            reads: HistoryReads::Selected(Selection::Reuse { source, part: 1 }),
+        };
+        low_rank_query(attention(name, vec![window_source(name), pooled]), name)
+    }
+
+    fn low_rank_query(mut sublayer: Sublayer, name: &str) -> Sublayer {
+        let Operator::Attention(attention) = &mut sublayer.op else {
+            unreachable!()
+        };
+        attention.query = QueryProjection::LowRank {
+            down: weight(&format!("{name}.q_a"), &[3, 4]),
+            norm: rms(&format!("{name}.q_a_norm"), 3),
+            up: weight(&format!("{name}.q_b"), &[4, 3]),
+        };
+        sublayer
+    }
+
     #[test]
-    fn deferred_forms_are_named_not_rejected_by_the_contract() {
-        let model = definition(vec![attention(
-            "a",
-            owned("a", HistoryDomain::Block { rate: 4 }),
-        )]);
-        assert!(model.validate().is_ok());
-        assert_eq!(model.deferred_forms(), [DeferredForm::BlockHistory]);
+    fn compressed_full_and_reuse_layers_validate() {
+        let model = definition(vec![compressing("a"), reusing("b")]);
+        model.validate().unwrap();
+        assert_eq!(model.deferred_forms(), []);
+        let invalid = |change: &dyn Fn(&mut ModelDefinition), error: &str| {
+            let mut model = model.clone();
+            change(&mut model);
+            assert_eq!(model.validate().unwrap_err().to_string(), error);
+        };
+        invalid(
+            &|model| attention_of(model, 0).history.swap(0, 1),
+            "a pooled first history source",
+        );
+        invalid(
+            &|model| {
+                let window = attention_of(model, 0).history[0].clone();
+                attention_of(model, 0).history[1] = window;
+            },
+            "a projected history source after the first",
+        );
+        invalid(
+            &|model| {
+                let HistoryRows::Own(RowProducer::Pooled(rows)) =
+                    &mut attention_of(model, 0).history[1].rows
+                else {
+                    unreachable!()
+                };
+                rows.rate = 1;
+            },
+            "attention pooled rows: pool and rate disagree",
+        );
+        invalid(
+            &|model| {
+                let HistoryRows::Own(RowProducer::Projected(rows)) =
+                    &mut attention_of(model, 0).history[0].rows
+                else {
+                    unreachable!()
+                };
+                rows.value = ValueSource::RawKey;
+            },
+            "a rounded history row whose value is not its key",
+        );
+        invalid(
+            &|model| {
+                attention_of(model, 1).history[1].reads =
+                    HistoryReads::Selected(Selection::Reuse {
+                        source: SublayerIndex {
+                            block: 0,
+                            sublayer: 0,
+                        },
+                        part: 0,
+                    });
+            },
+            "reused selection names no earlier indexer over the same rows",
+        );
+        invalid(
+            &|model| attention_of(model, 0).query = QueryProjection::Full(weight("a.q", &[4, 4])),
+            "indexer reading the query rank of a full-rank query",
+        );
+    }
+
+    /// A V4.1 Reindex layer: block 0's pooled rows and index keys, its own
+    /// query and head weights, restricted to block 0's candidate pool.
+    fn reindexing(name: &str) -> Sublayer {
+        let source = SublayerIndex {
+            block: 0,
+            sublayer: 0,
+        };
+        let mut sublayer = compressing(name);
+        let Operator::Attention(attention) = &mut sublayer.op else {
+            unreachable!()
+        };
+        let HistoryReads::Selected(Selection::Own(indexer)) = &mut attention.history[1].reads else {
+            unreachable!()
+        };
+        indexer.keys = IndexerKeys::Shared { source, part: 1 };
+        indexer.candidates = crate::Candidates::Restrict { source, part: 1 };
+        attention.history[1].rows = HistoryRows::Shared { source, part: 1 };
+        sublayer
+    }
+
+    fn indexer_of(model: &mut ModelDefinition, block: usize) -> &mut Indexer {
+        match &mut attention_of(model, block).history[1].reads {
+            HistoryReads::Selected(Selection::Own(indexer)) => indexer,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn identity_rows_reindex_layers_and_candidate_pools_validate() {
+        let mut model = definition(vec![compressing("a"), reusing("b"), reindexing("c")]);
+        // Ratio 1: the rows are the tokens' own.
+        let HistoryRows::Own(RowProducer::Pooled(rows)) = &mut attention_of(&mut model, 0).history[1].rows else {
+            unreachable!()
+        };
+        (rows.rate, rows.pool) = (1, Pool::Identity);
+        // A pool of exactly the restricted top's 512 units.
+        indexer_of(&mut model, 0).candidates = crate::Candidates::Produce { blocks: 8, block_units: 64 };
+        model.validate().unwrap();
+        let invalid = |change: &dyn Fn(&mut ModelDefinition), error: &str| {
+            let mut model = model.clone();
+            change(&mut model);
+            assert_eq!(model.validate().unwrap_err().to_string(), error);
+        };
+        let earlier = SublayerIndex {
+            block: 1,
+            sublayer: 0,
+        };
+        invalid(
+            &|model| indexer_of(model, 0).candidates = crate::Candidates::Produce { blocks: 4, block_units: 64 },
+            "a candidate pool of 256 units is smaller than its restricted indexer's top 512",
+        );
+        invalid(
+            &|model| indexer_of(model, 0).candidates = crate::Candidates::All,
+            "a restricted indexer names no earlier candidate pool over the same rows",
+        );
+        invalid(
+            &|model| indexer_of(model, 2).candidates = crate::Candidates::Restrict { source: earlier, part: 1 },
+            "a restricted indexer names no earlier candidate pool over the same rows",
+        );
+        invalid(
+            &|model| indexer_of(model, 2).keys = IndexerKeys::Shared { source: earlier, part: 1 },
+            "shared indexer keys name no earlier indexer keeping its own over the same rows",
+        );
+        invalid(
+            &|model| indexer_of(model, 2).candidates = crate::Candidates::Produce { blocks: 8, block_units: 64 },
+            "a candidate pool is produced over its own pooled rows and keys, in blocks of units",
+        );
     }
 
     /// A two-stream, rank-3 site over hidden 4.
@@ -1453,22 +1681,33 @@ mod tests {
 
     #[test]
     fn hyper_connections_with_selected_history_and_ngram_input_validate() {
-        let mut selected = attention("a", owned("a", HistoryDomain::Token));
+        let mut selected = attention("a", owned("a", TokenDomain::Token));
         let Operator::Attention(operator) = &mut selected.op else {
             unreachable!()
         };
-        operator.reads = HistoryReads::Selected {
-            block: 4,
-            blocks: 2,
-            indexer: Indexer {
-                heads: 2,
-                width: 2,
-                query: weight("a.indexer.q", &[4, 4]),
-                key: weight("a.indexer.k", &[2, 4]),
-                query_norm: rms("a.indexer.q_norm", 2),
-                key_norm: rms("a.indexer.k_norm", 2),
+        // Qwen4exp's form: mean-pooled keys over blocks of 4 tokens, the two
+        // best blocks.
+        operator.history[0].reads = HistoryReads::Selected(Selection::Own(Box::new(Indexer {
+            heads: 2,
+            width: 2,
+            query: IndexerQuery {
+                input: IndexerInput::Hidden,
+                projection: weight("a.indexer.q", &[4, 4]),
+                norm: HeadNorm::Rms(rms("a.indexer.q_norm", 2)),
+                rounding: RowRounding::None,
             },
-        };
+            keys: IndexerKeys::Pooled(PooledRows {
+                rate: 4,
+                projection: weight("a.indexer.k", &[2, 4]),
+                pool: Pool::Mean,
+                norm: rms("a.indexer.k_norm", 2),
+                rounding: RowRounding::None,
+            }),
+            head_weights: HeadWeights::Uniform,
+            scale: 2f64.powf(-0.5),
+            top: 2,
+            candidates: crate::Candidates::All,
+        })));
         let model = hyper_connected(vec![ngram(), mixed(selected, "a")]);
         model.validate().unwrap();
         assert_eq!(model.deferred_forms(), []);
@@ -1476,7 +1715,7 @@ mod tests {
 
     #[test]
     fn sublayers_must_match_the_residual_form() {
-        let plain = attention("a", owned("a", HistoryDomain::Token));
+        let plain = attention("a", owned("a", TokenDomain::Token));
         let rejects = |model: ModelDefinition| model.validate().unwrap_err().to_string();
         assert_eq!(
             rejects(hyper_connected(vec![plain.clone()])),
@@ -1533,7 +1772,7 @@ mod tests {
 
     #[test]
     fn single_pass_sinkhorn_sites_validate_against_their_mixing() {
-        let plain = attention("a", owned("a", HistoryDomain::Token));
+        let plain = attention("a", owned("a", TokenDomain::Token));
         let rejects = |model: ModelDefinition| model.validate().unwrap_err().to_string();
         let model = sinkhorn(vec![sinkhorn_mixed(plain.clone(), "a")]);
         model.validate().unwrap();

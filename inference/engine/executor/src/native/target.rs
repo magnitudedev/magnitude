@@ -20,6 +20,9 @@ use magnitude_kernels::{
     widen_rows,
 };
 use magnitude_kernels::{short_conv_project, short_conv_rows};
+use magnitude_kernels::{
+    candidate_blocks, candidate_rows, indexer_keys, indexer_score, pool_rows, rows_topk,
+};
 use seismic::NativeKernel;
 use std::collections::HashMap;
 
@@ -495,6 +498,59 @@ pub struct AttentionKernels {
     /// A low-rank query's up projection
     /// (`AttentionBinding::low_rank_query`).
     pub low_rank_query: Option<LowRankQueryKernels>,
+    /// An indexing index-list source's rows and indexer
+    /// (`AttentionBinding::picked`, `PickedBinding::Own` or `Reindex`).
+    pub picked: Option<PickedKernels>,
+}
+
+/// An indexing index-list source's entries (`operators::attention::pooled`):
+/// an own source's rows' (none for a Reindex source), and its indexer's.
+#[derive(Clone, Debug)]
+pub struct PickedKernels {
+    pub rows: Option<PooledKernels>,
+    pub indexer: IndexerKernels,
+}
+
+/// An own source's rows' entries: the tokens' `u` and `g` projections
+/// (`attention_project`'s query and gate segments) in F32 (published so
+/// when softmax-gated, else widened), its pooling, and its index keys'
+/// projection and write.
+#[derive(Clone, Debug)]
+pub struct PooledKernels {
+    pub project: NativeKernel<attention_project::Entry>,
+    pub widen: NativeKernel<widen_rows::Entry>,
+    pub pool: PoolKernel,
+    pub key_project: NativeKernel<attention_project::Entry>,
+    pub keys: NativeKernel<indexer_keys::Entry>,
+}
+
+/// An own source's pooling: `pool_rows` over its groups and their Window
+/// domain, or at rate 1, whose tokens are their own rows and which has no
+/// Window, `attention_append_dense` storing each as a window history stores
+/// its keys.
+#[derive(Clone, Debug)]
+pub enum PoolKernel {
+    Grouped(NativeKernel<pool_rows::Entry>),
+    Identity(NativeKernel<attention_append_dense::Entry>),
+}
+
+/// An indexer's entries (`operators::attention::selection`): its query and
+/// (projected) head-weight projections, scores and picks, and a producing
+/// indexer's candidate pool's block scores and rows.
+#[derive(Clone, Debug)]
+pub struct IndexerKernels {
+    pub query_project: NativeKernel<attention_project::Entry>,
+    pub weights_project: Option<NativeKernel<attention_project::Entry>>,
+    pub score: NativeKernel<indexer_score::Entry>,
+    pub topk: NativeKernel<rows_topk::Entry>,
+    pub candidates: Option<CandidateKernels>,
+}
+
+/// A candidate pool's entries.
+#[derive(Clone, Debug)]
+pub struct CandidateKernels {
+    pub blocks: NativeKernel<candidate_blocks::Entry>,
+    pub rows: NativeKernel<candidate_rows::Entry>,
 }
 
 /// A low-rank query's entries after the attention projection: its `qr`

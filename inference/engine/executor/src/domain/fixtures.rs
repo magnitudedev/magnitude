@@ -268,6 +268,19 @@ pub fn fixture_of(
     head: bool,
     device_request: platform::DeviceRequest,
 ) -> Fixture {
+    let manifest = tiny_manifest(&definition);
+    fixture_over(definition, manifest, limits, control, head, device_request)
+}
+
+/// [`fixture_of`] over `manifest`'s stored weights.
+pub fn fixture_over(
+    definition: ModelDefinition,
+    manifest: PackageManifest,
+    limits: ResourceLimits,
+    control: Option<PendingControl>,
+    head: bool,
+    device_request: platform::DeviceRequest,
+) -> Fixture {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
     let reserves = platform::MemoryReserves::of_machine(None);
     let selected = platform::select_device(&catalog, ExecutionPath::Native, device_request, &reserves)
@@ -277,7 +290,6 @@ pub fn fixture_of(
             .unwrap_or_else(|error| panic!("the selected device opens: {error}")),
     );
     let definition = Rc::new(definition);
-    let manifest = tiny_manifest(&definition);
     let capacity_bytes = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
         tensor_operations: crate::TensorOperations::of(selected.info.forms_tensor_operations()),
@@ -1323,6 +1335,16 @@ impl ProgramFamily for TestFamily {
         _pressure: &dyn Fn(&dyn ElasticBank) -> Option<crate::domain::RunningPressure>,
     ) -> Result<Chain<Self::TargetSubmission>, crate::programs::ChainRefusal>
     {
+        // The fixture runs no kernels, so it plans no readout: a launch
+        // with rows demanding logits, features or a selection is refused
+        // here, before it runs, rather than finishing without them.
+        if chain.iter().any(|launch| !launch.batch().upload().out_rows.is_empty()) {
+            let error = crate::SubmitError::Invariant(crate::InvariantError {
+                context: "controlled fixture",
+                detail: "the fixture plans no readout for a launch demanding outputs".into(),
+            });
+            return Err(crate::programs::ChainRefusal { error, chain });
+        }
         if REJECTED.with(|rejected| rejected.get()) == Some(0) {
             REJECTED.with(|rejected| rejected.set(Some(chain.len())));
             let error = crate::DeviceError::Execution("the fixture rejects the chain".into());

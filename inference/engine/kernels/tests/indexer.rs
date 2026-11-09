@@ -186,7 +186,7 @@ impl Case {
 
     /// Per-row controls: the window destinations and spans (the window rows
     /// of the SB - 1 positions before each row, in runs), the block spans
-    /// (the blocks complete before each row, in runs), the block
+    /// (the blocks complete through each row, in runs), the block
     /// destinations and the rows' coordinates.
     /// Per row, its window runs and its block runs.
     fn read_runs(&self) -> (Vec<Vec<[i32; 2]>>, Vec<Vec<[i32; 2]>>) {
@@ -206,7 +206,7 @@ impl Case {
                 .clone()
                 .map(|position| runs(&self.window_of[position.saturating_sub(SB - 1)..position]))
                 .collect(),
-            positions.map(|position| runs(&self.block_of[..position / SB])).collect(),
+            positions.map(|position| runs(&self.block_of[..(position + 1) / SB])).collect(),
         )
     }
 
@@ -400,6 +400,7 @@ fn portable(case: &Case) -> Outcome {
         ("indexer.seismic", include_str!("../kernels/indexer.seismic")),
         ("attention.seismic", include_str!("../kernels/attention.seismic")),
         ("functions.seismic", include_str!("../kernels/functions.seismic")),
+        ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
     ] {
         sources.push(SourceFile { path: path.into(), text: text.into() });
     }

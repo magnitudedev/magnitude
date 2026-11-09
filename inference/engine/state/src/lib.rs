@@ -16,17 +16,17 @@ pub use advance::{
 pub use bank::{BankComponent, recurrent_bank_bytes};
 pub use domain::{
     HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistoryReads,
-    HistorySource,
+    HistorySource, produced_domain,
 };
 
 pub use codec::{
     AFFINE_GROUP, AffineGeometry, Codec, CodecIdentity, CodecSpec, ComponentDescriptor,
-    HistoryEncoding, HistoryValue, KvCodec, LayerRef, LayoutError, PlaneDescriptor, PlaneName,
+    ComponentRole, HistoryEncoding, HistoryValue, KvCodec, LayerRef, LayoutError, PlaneDescriptor, PlaneName,
     VectorKind,
 };
 pub use layout::{
     HistoryGeometry, MAX_HISTORY_SPANS, ModelStateLayout, SLAB_BYTE_TARGET, SLAB_ROW_TILE,
-    banks_per_slab, history_codec, history_geometry,
+    banks_per_slab, history_codec, history_geometry, kv_codec_policy,
 };
 
 use placement::{Generation, LogicalId, Placement, PlacementError};
@@ -2008,9 +2008,10 @@ impl StateStore {
     pub fn history_domain_kind(&self, domain: HistoryDomainId) -> HistoryDomainKind {
         self.domains[domain.0].kind
     }
-    /// Where `layer`'s history lives: its own stored domain, or the source
-    /// layer and domain a Shared domain binds. `None` for a layer without
-    /// history in this store.
+    /// Where `layer`'s attended history lives: its own stored domain (a
+    /// pooled source's Block rows), or the source layer and domain a Shared
+    /// domain binds. `None` for a layer without attended history in this
+    /// store.
     pub fn history_source(&self, layer: LayerRef) -> Option<HistorySource> {
         self.domains
             .iter()
@@ -2018,7 +2019,7 @@ impl StateStore {
                 domain
                     .components
                     .iter()
-                    .any(|component| component.layer == layer)
+                    .any(|component| component.layer == layer && component.attended())
             })
             .map(|domain| HistorySource {
                 domain: HistoryDomainId(domain),
@@ -2031,11 +2032,33 @@ impl StateStore {
                     .map(|(_, source)| *source)
             })
     }
-    /// The stored domains of block `block`'s indexer (`LayerRef::Indexer`):
-    /// its raw keys' Window domain and its block keys' Block domain, each
-    /// one history read of a launch row (`history_reads`).
-    pub fn indexer_domains(&self, block: u32) -> Option<(HistoryDomainId, HistoryDomainId)> {
-        let layer = LayerRef::Indexer(block);
+    /// The stored domains of target block `block`'s source `part`'s indexer
+    /// keys (`LayerRef::IndexKeys`): the Window of its pooled keys' raw
+    /// projections (none for keys of a pooled source's rows), and the Block
+    /// of its keys, each one history read of a launch row
+    /// (`history_reads`). `None` for a source without an own indexer.
+    pub fn index_key_domains(
+        &self,
+        block: u32,
+        part: u32,
+    ) -> Option<(Option<HistoryDomainId>, HistoryDomainId)> {
+        self.produced_domains(LayerRef::IndexKeys { block, part })
+    }
+    /// The stored domains of target block `block`'s pooled source `part`
+    /// (`LayerRef::Pooled`): the Window of its incomplete group (none at
+    /// rate 1), and the Block of its rows. `None` for a source the block
+    /// does not own.
+    pub fn pooled_domains(
+        &self,
+        block: u32,
+        part: u32,
+    ) -> Option<(Option<HistoryDomainId>, HistoryDomainId)> {
+        self.produced_domains(LayerRef::Pooled { block, part })
+    }
+    fn produced_domains(
+        &self,
+        layer: LayerRef,
+    ) -> Option<(Option<HistoryDomainId>, HistoryDomainId)> {
         let find = |block: bool| {
             self.domains
                 .iter()
@@ -2045,7 +2068,13 @@ impl StateStore {
                 })
                 .map(HistoryDomainId)
         };
-        Some((find(false)?, find(true)?))
+        Some((find(false), find(true)?))
+    }
+    /// Whether `domain` holds produced rows ([`produced_domain`]), which a
+    /// launch's rows read as stored once written.
+    pub fn is_produced_domain(&self, domain: HistoryDomainId) -> bool {
+        let domain = &self.domains[domain.0];
+        produced_domain(domain.kind, &domain.components)
     }
     /// The history reads of a launch row.
     pub fn history_reads(&self) -> &HistoryReads {

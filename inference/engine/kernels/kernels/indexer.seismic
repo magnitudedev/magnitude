@@ -30,9 +30,9 @@
 # coordinates stored with the block's first raw key.
 #
 # A row's complete blocks are the block rows of its spans
-# `block_visible[row]`, in block order, then its own block when it completes
-# one: block b is the b-th of them (blocks completed by this launch's rows
-# are read after they are appended).
+# `block_visible[row]`, in block order, its own block among them when it
+# completes one: block b is the b-th of them (blocks completed by this
+# launch's rows are read after they are appended).
 # A row's keys are the rows of its attention spans `visible[row]`, then its
 # fresh rows (which attention reads itself), in position order: key o is at
 # position o, so block b holds keys [b SB, (b + 1) SB).
@@ -145,10 +145,6 @@ fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
                         if ordinal >= 0 and ordinal < 32 * B:
                             physical[ordinal] = i32(block_row)
                         ordinal = ordinal + 1
-            if block_destinations[row] >= 0:
-                if complete >= 0 and complete < 32 * B:
-                    physical[complete] = block_destinations[row]
-                complete = complete + 1
             for block in 0..32 * B:
                 scores[block] = 0.0
                 if block < complete:
@@ -322,11 +318,10 @@ native indexer_select for cpu from "cpu/indexer_select.rs":
 #   s[t, j] = scale * sum_h relu(q[h] . K[row j]) * w[h], heads ascending
 # with w[h] = head_weights[t, h] (HW = H) or 1 (HW = 0, Uniform), each dot an
 # ascending F32 FMA chain. Everything from the projections on is F32; the
-# rounding is the indexer's trained one (rounding.seismic's four scalars).
+# rounding is the indexer's trained one (rounding.seismic's four scalars),
+# from the norm and rotation held in A where it rounds (`rounded_head_rotary`).
 # The key plane holds F32 keys: an unrounded indexer's keys (Qwen4's) are
-# its F32 reference's, and a rounded one's codes are exact in it. (A plane
-# read by `indexer_score` alone cannot take a generic dense element: an
-# element only read is a weight operand's.)
+# its F32 reference's, and a rounded one's codes are exact in it.
 
 # The key of each row that completes a unit (`latent_rows[row] >= 0`, the
 # key-plane row written: the pooled source's row, whose Block domain the key
@@ -344,9 +339,10 @@ fn indexer_keys[M, TB, P, S, RA, RT](key: &tensor[M, 2 * P + S] A,
     for row in 0..M:
         if latent_rows[row] >= 0:
             let mut prepared = tensor[2 * P + S] f32
-            prepared[:] = block_round(head_rotary(key[row], key_norm, coordinates[row],
-                rotary_components, rotary_frequencies, rotary_amplitudes, layout, epsilon),
-                block, element, scale, amax_floor)
+            let mut held = tensor[2 * P + S] A
+            prepared[:] = rounded_head_rotary(key[row], key_norm, coordinates[row],
+                rotary_components, rotary_frequencies, rotary_amplitudes, layout, epsilon,
+                block, element, scale, amax_floor, held)
             keys[latent_rows[row]] = prepared
 
 # Each row's scores over its row list: score j is the j-th key-plane row of
@@ -369,10 +365,11 @@ fn indexer_score[M, H, P, S, NQ, HW, TB, R, N, RA, RT](query: &tensor[M, H, 2 * 
         for j in 0..N:
             scores[row, j] = -inf
         let mut prepared = tensor[H, 2 * P + S] f32
+        let mut held = tensor[2 * P + S] A
         for head in 0..H:
-            prepared[head] = block_round(head_rotary(query[row, head], query_norm, coordinates[row],
-                rotary_components, rotary_frequencies, rotary_amplitudes, layout, epsilon),
-                block, element, rounding_scale, amax_floor)
+            prepared[head] = rounded_head_rotary(query[row, head], query_norm, coordinates[row],
+                rotary_components, rotary_frequencies, rotary_amplitudes, layout, epsilon,
+                block, element, rounding_scale, amax_floor, held)
         let mut ordinal = 0
         for span in 0..R:
             let first = spans[row, span, 0]

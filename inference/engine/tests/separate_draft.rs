@@ -50,7 +50,7 @@ fn method() -> ModelMethod {
 fn policy() -> ModelPolicy {
     ModelPolicy {
         kv_codec: if std::env::var("MAGNITUDE_TEST_DRAFT_DENSE_KV").as_deref() == Ok("1") {
-            magnitude_state::KvCodec::Dense
+            Some(magnitude_state::KvCodec::Dense)
         } else {
             ModelPolicy::default().kv_codec
         },

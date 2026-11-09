@@ -16,8 +16,8 @@ using Pro = projection::Operands<
     Raw>;
 using Source = projection::GemvSource<Pro>;
 // A segment's result, after its weight's second-level scale where any
-// segment has a scale port (an absent port's factor is 1).
-using Store = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_A)>;
+// segment has a scale port (an absent port's factor is 1), published in Y.
+using Store = projection::Store<ELEMENT_OF(SEISMIC_ELEMENT_Y)>;
 using Scaling = projection::scaling<(SEISMIC_DIM_QS != 0 || SEISMIC_DIM_GS != 0 || SEISMIC_DIM_KS != 0 ||
                                      SEISMIC_DIM_VS != 0)>;
 using Out = Scaling::type<Store>;

@@ -50,8 +50,15 @@ pub fn coordinates(position: usize) -> [i32; 4] {
 }
 
 /// One head row in F32: RMS-normed with `norm` (when given), its pairs
-/// rotated at `coordinates` (axis 0), then rounded.
+/// rotated at `coordinates` (axis 0), then rounded; a rounded row from its
+/// norm and rotation each held in the BF16 activation element (DeepSeek
+/// V4.1's `k_norm` output and in-place rotations).
 pub fn prepare(x: &[f32], norm: Option<&[f32]>, position: usize, layout: Layout, rounding: Rounding) -> Vec<f32> {
+    let hold = |y: &mut [f32]| {
+        if rounding.block != 0 {
+            y.iter_mut().for_each(|v| *v = bf16_round(*v));
+        }
+    };
     let mut y = x.to_vec();
     if let Some(norm) = norm {
         let squares = y.iter().map(|v| v * v).sum::<f32>();
@@ -59,6 +66,7 @@ pub fn prepare(x: &[f32], norm: Option<&[f32]>, position: usize, layout: Layout,
         for (v, n) in y.iter_mut().zip(norm) {
             *v = *v * inverse * n;
         }
+        hold(&mut y);
     }
     let first = if layout.rt == 1 { S } else { 0 };
     for (pair, frequency) in frequencies().iter().enumerate() {
@@ -68,6 +76,7 @@ pub fn prepare(x: &[f32], norm: Option<&[f32]>, position: usize, layout: Layout,
         y[lo] = low * cos - high * sin;
         y[hi] = high * cos + low * sin;
     }
+    hold(&mut y);
     rounding_model::round(rounding, &y)
 }
 

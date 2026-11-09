@@ -43,6 +43,7 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
     for (path, text) in [
         ("attention.seismic", include_str!("../kernels/attention.seismic")),
         ("functions.seismic", include_str!("../kernels/functions.seismic")),
+        ("rounding.seismic", include_str!("../kernels/rounding.seismic")),
     ] {
         sources.push(SourceFile { path: path.into(), text: text.into() });
     }
@@ -79,14 +80,23 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
         tensor(DType::I32, vec![m], ints(&case.destinations)),
         tensor(DType::U32, vec![m, words], bits.iter().map(|word| f64::from(*word)).collect()),
         tensor(DType::I32, vec![0, BLOCK_ROWS], Vec::new()),
+        // No index-list source.
+        tensor(DType::I32, vec![m, 0], Vec::new()),
+        tensor(DType::BF16, vec![0, kv, w], Vec::new()),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_key)),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
-        // Half-split leading rotary pairs, no output rotary, own values.
-        tensor(DType::I32, vec![0, 0, 0, 0, 0], Vec::new()),
+        // Half-split leading rotary pairs, no output rotary, own values, no
+        // key rounding.
+        tensor(DType::I32, vec![0, 0, 0, 0, 0, 0], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
+        Arg::Scalar(ReferenceScalar::U32(1)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::F32(0.0f32.to_bits())),
     ];
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
@@ -103,9 +113,10 @@ fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, b
     let kernel = attention_prefill::native_for_device_with(
         device,
         attention_prefill::Elements { A: Element::bf16() },
-        &specialization.clone().with_static("SK", 0),
+        &dense_statics(specialization.clone().with_static("SK", 0)),
     )
     .unwrap();
+    let (selected_rows, selected) = no_picks(device, m, kv, w);
     let plane = |values: &[f32]| {
         let mut slabs = SlabTensor::new(
             device,
@@ -151,13 +162,20 @@ fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, b
             destinations: &i32_tensor(device, &[m], &case.destinations),
             selection: &selection,
             block_slots: &block_slots(device, BLOCK_ROWS),
+            selected_rows: &selected_rows,
+            selected: &selected,
             history_key: &mut history_key,
             history_value: &mut history_value,
-            form: &half_split_layout(device),
+            form: &dense_layout(device),
             epsilon: case.epsilon,
             scale: case.scale,
             gate_function: 0,
             slab_rows: t as u32,
+            selected_slab_rows: 1,
+            key_block: 0,
+            key_element: 0,
+            key_scale: 0,
+            key_amax_floor: 0.0,
         })
         .unwrap()
         .value;

@@ -46,7 +46,7 @@ struct Options {
     method: ModelMethod,
     mtp_proposals: Option<u8>,
     draft_policy: Option<DraftPolicy>,
-    kv_codec: KvCodec,
+    kv_codec: Option<KvCodec>,
     numerical_profile: Option<magnitude_executor::NumericalProfile>,
     lookahead: bool,
     weight_bound: Option<WeightBound>,
@@ -154,7 +154,7 @@ fn parse() -> Result<Options, String> {
                     )
                 });
             }
-            "--kv-codec" => kv_codec = value(&flag, &mut args)?.parse()?,
+            "--kv-codec" => kv_codec = Some(value(&flag, &mut args)?.parse()?),
             "--numerical-profile" => {
                 let path = value(&flag, &mut args)?;
                 let bytes = std::fs::read(&path)

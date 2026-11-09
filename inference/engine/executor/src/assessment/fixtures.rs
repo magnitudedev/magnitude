@@ -176,8 +176,8 @@ use magnitude_artifacts::{
 use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
     EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp, GateFunction,
-    GatedDelta, HeadNorm, HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue,
-    MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
+    GatedDelta, HeadNorm, HistoryRows, HistorySource, InputNorm, InputSemantics,
+    MediaRowAttention, ProjectedRows, RowProducer, RowRounding, TokenDomain, ModelDefinition, Operator, OutputForm, OutputProjection,
     QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
     SharedExpert, SharedExpertGate, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
 };
@@ -251,25 +251,28 @@ pub(crate) fn declared_model(
                 gate: AttentionGate::Interleaved {
                     function: GateFunction::Sigmoid,
                 },
-                key_value: KeyValue::Owned {
-                    key: tensor(
-                        name("attn_k"),
-                        vec![c.kv_heads * c.head_width, c.hidden],
-                        true,
-                    ),
-                    value: ValueSource::Projected(tensor(
-                        name("attn_v"),
-                        vec![c.kv_heads * c.head_width, c.hidden],
-                        true,
-                    )),
-                    key_norm: HeadNorm::Rms(rms(tensor(
-                        name("attn_k_norm"),
-                        vec![c.head_width],
-                        false,
-                    ))),
-                    value_norm: ValueNorm::None,
-                    domain: HistoryDomain::Token,
-                },
+                history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                    ProjectedRows {
+                        key: tensor(
+                            name("attn_k"),
+                            vec![c.kv_heads * c.head_width, c.hidden],
+                            true,
+                        ),
+                        value: ValueSource::Projected(tensor(
+                            name("attn_v"),
+                            vec![c.kv_heads * c.head_width, c.hidden],
+                            true,
+                        )),
+                        key_norm: HeadNorm::Rms(rms(tensor(
+                            name("attn_k_norm"),
+                            vec![c.head_width],
+                            false,
+                        ))),
+                        value_norm: ValueNorm::None,
+                        domain: TokenDomain::Token,
+                        rounding: RowRounding::None,
+                    },
+                )))],
                 query_norm: HeadNorm::Rms(rms(tensor(
                     name("attn_q_norm"),
                     vec![c.head_width],
@@ -280,8 +283,8 @@ pub(crate) fn declared_model(
                     base: 10_000_000.0,
                     sections: vec![c.rotary_width / 2],
                     axis_pattern: vec![0],
-                },                scale: 1.0 / (c.head_width as f64).sqrt(),
-                reads: HistoryReads::Visible,
+                },
+                scale: 1.0 / (c.head_width as f64).sqrt(),
                 media_rows: MediaRowAttention::Causal,
                 sinks: None,
                 output: OutputProjection::Full(tensor(

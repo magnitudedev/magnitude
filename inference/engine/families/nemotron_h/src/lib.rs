@@ -31,8 +31,8 @@ use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DefinitionError,
     DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
     FeedForwardUp, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm,
-    HeadReadout, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics, KeyValue,
-    LatentExperts, LayerNorm, MediaRowAttention, ModelDefinition, Operator, OutputForm,
+    HeadReadout, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
+    LatentExperts, ProjectedRows, RowProducer, RowRounding, TokenDomain, LayerNorm, MediaRowAttention, ModelDefinition, Operator, OutputForm,
     OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
     ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, ValueNorm, ValueSource,
     VocabularyProjection, WeightDescriptor, FamilyError, checked_product,
@@ -293,17 +293,19 @@ impl Geometry {
             ),
             gate: AttentionGate::None,
             query_norm: HeadNorm::None,
-            key_value: KeyValue::Owned {
-                key: binder.bind(&format!("{prefix}attn_k.weight"), &[key_rows, hidden])?,
-                value: ValueSource::Projected(
-                    binder.bind(&format!("{prefix}attn_v.weight"), &[key_rows, hidden])?,
-                ),
-                key_norm: HeadNorm::None,
-                value_norm: ValueNorm::None,
-                domain: HistoryDomain::Token,
-            },
+            history: vec![HistorySource::visible(HistoryRows::Own(RowProducer::Projected(
+                ProjectedRows {
+                    key: binder.bind(&format!("{prefix}attn_k.weight"), &[key_rows, hidden])?,
+                    value: ValueSource::Projected(
+                        binder.bind(&format!("{prefix}attn_v.weight"), &[key_rows, hidden])?,
+                    ),
+                    key_norm: HeadNorm::None,
+                    value_norm: ValueNorm::None,
+                    domain: TokenDomain::Token,
+                    rounding: RowRounding::None,
+                },
+            )))],
             rotary: Rotary::None,            scale: 1.0 / (width as f64).sqrt(),
-            reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
             output: OutputProjection::Full(binder.bind(

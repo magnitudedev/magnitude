@@ -626,6 +626,7 @@ fn attention_project(ctx: &Ctx) -> Vec<Variant> {
                     ("KW", element(kf)),
                     ("VW", element(vf)),
                     ("A", a),
+                    ("Y", a),
                 ],
                 statics: vec![
                     ("D", HIDDEN as u64),

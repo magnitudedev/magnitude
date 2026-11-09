@@ -550,12 +550,12 @@ impl BoundTargetGraphs {
         stage: RunStage,
         tapped: bool,
     ) -> Result<(&PreparedTargetBlockGraph, &BoundNativeGraphPlan), String> {
-        let mixer = *self
+        let keeps = *self
             .prepared
-            .mixers
+            .keeps
             .get(index)
             .ok_or_else(|| format!("target block {index} does not exist"))?;
-        let key = (block_class(mixer, rows, segments, slots, listed, scored), Stage::Run(stage));
+        let key = (block_class(keeps, rows, segments, slots, listed, scored), Stage::Run(stage));
         match tapped || !self.prepared.block_taps(index).positions().any() {
             true => self.staged(index, key),
             false => sealed_and_bound(&self.prepared.blocks_by_class[index].untapped, &self.bound[index].untapped, index, key),

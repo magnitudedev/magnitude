@@ -104,6 +104,13 @@ pub fn devices() -> Vec<Device> {
     devices
 }
 
+/// Every backend this host can open whose declaration offers `entry` at its
+/// bound elements: the entry's declaration, not the test, decides where it
+/// runs.
+pub fn offering<E: seismic::Entry>(entry: &seismic::BoundEntry<E>) -> Vec<Device> {
+    devices().into_iter().filter(|device| entry.offered(device).unwrap().is_some()).collect()
+}
+
 pub fn is_cpu(device: &Device) -> bool {
     device.backend() == BackendName::Cpu
 }

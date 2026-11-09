@@ -14,8 +14,10 @@
 #![allow(dead_code)]
 
 mod common;
+mod rounding_model;
 
 use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill};
+use rounding_model::Rounding;
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
@@ -173,6 +175,14 @@ struct Case {
     history_value: Vec<f32>,
     epsilon: f32,
     scale: f32,
+    /// The index-list source (`KS` picks a row, -1 none) over its plane of
+    /// `selected_rows_total` rows (`TS`), slabs of `selected_slab_rows`.
+    picks: usize,
+    selected_rows: Vec<i32>,
+    selected: Vec<f32>,
+    selected_slab_rows: usize,
+    /// The trained rounding of the prepared key (`KR = 1`), or none.
+    key_rounding: Option<Rounding>,
 }
 
 /// Splits each span at slab edges: a history span never crosses one.
@@ -273,7 +283,71 @@ impl Case {
             history_value,
             epsilon: 1.0e-6,
             scale,
+            picks: 0,
+            selected_rows: Vec::new(),
+            selected: Vec::new(),
+            selected_slab_rows: 1,
+            key_rounding: None,
         }
+    }
+
+    /// This case with an index-list source: `picks` picks a row over a
+    /// plane of `rows` rows in slabs of `slab_rows`. Every seventh pick is -1
+    /// (none), and the picks of a row repeat no plane row (17 is coprime to
+    /// `rows`).
+    fn with_picks(mut self, picks: usize, rows: usize, slab_rows: usize, seed: u64) -> Self {
+        assert!(picks <= rows && rows % 17 != 0);
+        let mut noise = Noise(seed);
+        let width = self.form.kv * self.form.w();
+        self.selected = (0..rows * width).map(|_| bf16(noise.next() * 3.0)).collect();
+        self.selected_rows = (0..self.rows)
+            .flat_map(|row| {
+                (0..picks).map(move |pick| {
+                    if (row + pick) % 7 == 3 {
+                        -1
+                    } else {
+                        ((row * 131 + pick * 17) % rows) as i32
+                    }
+                })
+            })
+            .collect();
+        self.picks = picks;
+        self.selected_slab_rows = slab_rows;
+        self
+    }
+
+    /// This case with its prepared keys rounded by `rounding` (`KR = 1`).
+    fn with_key_rounding(mut self, rounding: Rounding) -> Self {
+        assert!(self.form.stored_key, "key rounding is stored-key only");
+        self.key_rounding = Some(rounding);
+        self
+    }
+
+    /// The index-list plane's rows (`TS`).
+    fn selected_plane_rows(&self) -> usize {
+        self.selected.len() / (self.form.kv * self.form.w())
+    }
+
+    /// The extents of the entries' empty `form` table: the layer form's,
+    /// then KR.
+    fn extents(&self) -> [usize; 6] {
+        let [zero, ra, rt, ro, vk] = self.form.extents();
+        [zero, ra, rt, ro, vk, usize::from(self.key_rounding.is_some())]
+    }
+
+    /// The key-rounding scalars (block 0 rounds nothing).
+    fn rounding_scalars(&self) -> Rounding {
+        self.key_rounding.unwrap_or(rounding_model::NONE)
+    }
+
+    /// The picks of `row` that name a plane row, each as that row's
+    /// `kv_head` head.
+    fn picked(&self, row: usize, kv_head: usize) -> impl Iterator<Item = &[f32]> {
+        let (kv, w) = (self.form.kv, self.form.w());
+        self.selected_rows[row * self.picks..][..self.picks]
+            .iter()
+            .filter(|pick| **pick >= 0)
+            .map(move |pick| &self.selected[(*pick as usize * kv + kv_head) * w..][..w])
     }
 
     /// This case with one sink logit per query head: from well below to well
@@ -294,7 +368,22 @@ impl Case {
     /// The portable `head_rotary` (or `head_norm` with `rotate` false) of one
     /// head row, rounded to bf16.
     fn prepare(&self, raw: &[f32], norm: Option<&[f32]>, rotate: bool, row: usize) -> Vec<f32> {
+        self.prepare_rounded(raw, norm, rotate, row, rounding_model::NONE)
+    }
+
+    /// [`Self::prepare`] with the rotated F32 row rounded by `rounding`
+    /// before it is published (the portable `rounded_head_rotary` of the
+    /// key): a rounded row is held in BF16 after its norm and after its
+    /// rotation, as the trained model holds it before its rounding.
+    fn prepare_rounded(&self, raw: &[f32], norm: Option<&[f32]>, rotate: bool, row: usize, rounding: Rounding) -> Vec<f32> {
+        self.prepare_held(raw, norm, rotate, row, rounding, rounding.block > 0)
+    }
+
+    /// [`Self::prepare_rounded`] with the holds `hold` says, whether or not
+    /// the row rounds (unheld rounded keys: what the holds move).
+    fn prepare_held(&self, raw: &[f32], norm: Option<&[f32]>, rotate: bool, row: usize, rounding: Rounding, hold: bool) -> Vec<f32> {
         let (p, w) = (if rotate { self.form.p } else { 0 }, self.form.w());
+        let held = |x: Vec<f32>| if hold { x.into_iter().map(bf16).collect() } else { x };
         let normalized = match norm {
             Some(norm) => {
                 let squares = raw.iter().fold(0.0f32, |sum, x| x.mul_add(*x, sum));
@@ -306,7 +395,8 @@ impl Case {
             }
             None => raw.to_vec(),
         };
-        self.turn(normalized, row, p, 1.0).into_iter().map(bf16).collect()
+        let rotated = held(self.turn(held(normalized), row, p, 1.0));
+        rounding_model::round(rounding, &rotated).into_iter().map(bf16).collect()
     }
 
     /// `row`'s first `p` rotary pairs of `x` turned by their angles times
@@ -330,6 +420,14 @@ impl Case {
 
     /// The portable body's result and final histories, computed on the host.
     fn expected(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        self.expected_with(None)
+    }
+
+    /// [`Self::expected`] with the rows' prepared keys `keys` (`[M, KV * W]`)
+    /// in place of the host model's: a native's own rounded keys, which an
+    /// F32 input on the other side of a rounding boundary may move by one
+    /// code.
+    fn expected_with(&self, keys: Option<&[f32]>) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let form = self.form;
         let (kv, g, w, i) = (form.kv, form.g, form.w(), form.i());
         fn norm(form: Form, weights: &[f32]) -> Option<&[f32]> {
@@ -339,13 +437,15 @@ impl Case {
         let fresh_keys = (0..if form.fresh { self.rows } else { 0 })
             .map(|row| {
                 (0..kv)
-                    .map(|head| {
-                        self.prepare(
+                    .map(|head| match keys {
+                        Some(keys) => keys[(row * kv + head) * w..][..w].to_vec(),
+                        None => self.prepare_rounded(
                             &self.key[(row * kv + head) * w..][..w],
                             norm(&self.key_norm),
                             true,
                             row,
-                        )
+                            self.rounding_scalars(),
+                        ),
                     })
                     .collect::<Vec<_>>()
             })
@@ -402,6 +502,8 @@ impl Case {
                         ));
                     }
                 }
+                // The index-list source's rows, each read as key and value.
+                entries.extend(self.picked(row, kv_head).map(|picked| (picked, picked)));
                 let scores = entries
                     .iter()
                     .map(|(key, _)| {
@@ -485,6 +587,30 @@ impl Case {
 
 /// Checks the host model against the portable body of `entry`.
 fn check_host_model(entry: &str, case: &Case) {
+    let form = case.form;
+    let (result, history_key, history_value) = portable(entry, case);
+    let expected = case.expected();
+    for (index, (a, e)) in result.iter().zip(&expected.0).enumerate() {
+        assert!(
+            (a - e).abs() <= 1.0e-3 + 8.0e-3 * e.abs(),
+            "{entry} {form:?}: portable result[{index}] {a}, host model {e}"
+        );
+    }
+    for (actual, expected, name) in [
+        (&history_key, &expected.1, "history_key"),
+        (&history_value, &expected.2, "history_value"),
+    ] {
+        for (index, (a, e)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a - e).abs() <= 8.0e-3 * e.abs().max(1.0),
+                "{entry} {form:?}: portable {name}[{index}] {a}, host model {e}"
+            );
+        }
+    }
+}
+
+/// The portable body of `entry` on `case`: its result and final histories.
+fn portable(entry: &str, case: &Case) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     use seismic_lang::{
         checked::{SourceFile},
         entry::ElementBindings,
@@ -502,6 +628,10 @@ fn check_host_model(entry: &str, case: &Case) {
     sources.push(SourceFile {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "rounding.seismic".into(),
+        text: include_str!("../kernels/rounding.seismic").into(),
     });
     let module = crate::common::check(sources);
     let logical = module
@@ -562,13 +692,20 @@ fn check_host_model(entry: &str, case: &Case) {
         tensor(DType::I32, vec![m, case.spans, 2], ints(&case.visible)),
         tensor(DType::I32, vec![m, 2], ints(&case.fresh)),
         tensor(DType::I32, vec![m], ints(&case.destinations)),
+        tensor(DType::I32, vec![m, case.picks], ints(&case.selected_rows)),
+        tensor(DType::BF16, vec![case.selected_plane_rows(), kv, w], floats(&case.selected)),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_key)),
         tensor(DType::BF16, vec![form.value_rows(t), kv, w], floats(&case.history_value)),
-        tensor(DType::I32, form.extents().to_vec(), Vec::new()),
+        tensor(DType::I32, case.extents().to_vec(), Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(i32::from(form.softplus))),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
+        Arg::Scalar(ReferenceScalar::U32(case.selected_slab_rows as u32)),
+        Arg::Scalar(ReferenceScalar::I32(case.rounding_scalars().block)),
+        Arg::Scalar(ReferenceScalar::I32(case.rounding_scalars().element)),
+        Arg::Scalar(ReferenceScalar::I32(case.rounding_scalars().scale)),
+        Arg::Scalar(ReferenceScalar::F32(case.rounding_scalars().amax_floor.to_bits())),
     ];
     // The prefill takes its WorkList bitmap (none: B = 0) and block keys
     // (BR = 1) after the destinations.
@@ -577,41 +714,23 @@ fn check_host_model(entry: &str, case: &Case) {
         args.insert(15, tensor(DType::I32, vec![0, 1], Vec::new()));
         args.insert(15, tensor(DType::U32, vec![m, 0], Vec::new()));
     }
-    let planes = if prefill { 17 } else { 15 };
+    // The history planes' ordinals, after the index-list source.
+    let planes = if prefill { 19 } else { 17 };
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{entry} portable body failed: {failure}");
     }
-    let expected = case.expected();
     let result = outcome.results().next().unwrap();
     let OutcomeValue::Tensor(tensor) = result.value() else {
         panic!("{entry} returns a tensor")
     };
-    for (index, e) in expected.0.iter().enumerate() {
-        let a = tensor.read(index).unwrap() as f32;
-        assert!(
-            (a - e).abs() <= 1.0e-3 + 8.0e-3 * e.abs(),
-            "{entry} {form:?}: portable result[{index}] {a}, host model {e}"
-        );
-    }
+    let result = (0..tensor.element_count()).map(|index| tensor.read(index).unwrap() as f32).collect();
     let inputs = outcome.inputs().collect::<Vec<_>>();
-    for (ordinal, expected, name) in [
-        (planes, &expected.1, "history_key"),
-        (planes + 1, &expected.2, "history_value"),
-    ] {
-        let input = inputs
-            .iter()
-            .find(|input| input.ordinal() == ordinal)
-            .unwrap();
-        let tensor = input.tensor();
-        for (index, e) in expected.iter().enumerate() {
-            let a = tensor.read(index).unwrap() as f32;
-            assert!(
-                (a - e).abs() <= 8.0e-3 * e.abs().max(1.0),
-                "{entry} {form:?}: portable {name}[{index}] {a}, host model {e}"
-            );
-        }
-    }
+    let plane = |ordinal: usize| {
+        let tensor = inputs.iter().find(|input| input.ordinal() == ordinal).unwrap().tensor();
+        (0..tensor.element_count()).map(|index| tensor.read(index).unwrap() as f32).collect::<Vec<_>>()
+    };
+    (result, plane(planes), plane(planes + 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +820,10 @@ struct Bound {
     selection: Tensor,
     /// Its blocks' keys (`[0, 1]`: every key read).
     block_slots: Tensor,
+    /// The index-list source: its picks and its slab-stored plane.
+    selected_rows: Tensor,
+    selected: Tensor,
+    _selected_slabs: Option<SlabTensor>,
     form: Tensor,
     _slabs: SlabTensor,
     history_key: Tensor,
@@ -767,6 +890,27 @@ impl Bound {
                     .collect::<Vec<_>>(),
             )
         };
+        // The index-list plane in slabs of its own, which its picks cross.
+        let selected_rows_total = case.selected_plane_rows() as u64;
+        let (selected_slabs, selected) = if selected_rows_total == 0 {
+            (None, bf16_tensor(device, &[0, kv, w], &[]))
+        } else {
+            let per = case.selected_slab_rows as u64;
+            let mut slabs = SlabTensor::new(device, per, selected_rows_total, vec![region()]).unwrap();
+            let bytes = case.selected.iter().flat_map(|v| bf16_bits(*v).to_le_bytes()).collect::<Vec<_>>();
+            for index in 0..selected_rows_total.div_ceil(per) {
+                slabs.add_slab().unwrap();
+                let start = index * per;
+                let count = per.min(selected_rows_total - start);
+                slabs
+                    .region_rows(0, start, count)
+                    .unwrap()
+                    .write_from_host(&bytes[start as usize * row_bytes..(start + count) as usize * row_bytes])
+                    .unwrap();
+            }
+            let logical = slabs.logical_region(0).unwrap();
+            (Some(slabs), logical)
+        };
         Self {
             query: bf16_tensor(device, &[m, heads, w + form.i()], &case.query),
             gate: bf16_tensor(device, &[m, heads, form.separate], &case.gate),
@@ -785,10 +929,13 @@ impl Bound {
             destinations: i32_tensor(device, &[m], &case.destinations),
             selection: Tensor::from_host(device, Element::u32(), &[m as u64, 0], &[]).unwrap(),
             block_slots: Tensor::from_host(device, Element::i32(), &[0, 1], &[]).unwrap(),
+            selected_rows: i32_tensor(device, &[m, case.picks], &case.selected_rows),
+            selected,
+            _selected_slabs: selected_slabs,
             form: Tensor::from_host(
                 device,
                 Element::i32(),
-                &case.form.extents().map(|extent| extent as u64),
+                &case.extents().map(|extent| extent as u64),
                 &[],
             )
             .unwrap(),
@@ -1106,6 +1253,15 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
     }
 }
 
+/// [`configurations`] that can hold `case`: an index-list source runs in
+/// Metal's fragment prefill form alone (its declaration refuses DIRECT).
+fn case_configurations(device: &Device, decode: bool, case: &Case) -> Vec<Vec<(&'static str, u64)>> {
+    configurations(device, decode, case.form)
+        .into_iter()
+        .filter(|config| case.picks == 0 || !config.contains(&("DIRECT", 1)))
+        .collect()
+}
+
 /// Runs the decode or prefill entry of `case` with `specialization`; the
 /// result and final histories, or the preparation error.
 fn run(
@@ -1121,7 +1277,11 @@ fn run(
         specialization.clone()
     } else {
         specialization.clone().with_static("B", 0)
-    };
+    }
+    // The case's key rounding and index-list source.
+    .with_static("KR", u64::from(case.key_rounding.is_some()))
+    .with_static("KS", case.picks as u64);
+    let rounding = case.rounding_scalars();
     macro_rules! call {
         ($module:ident $(, $extra:ident: $value:expr)*) => {{
             let kernel = $module::native_for_device_with(
@@ -1148,6 +1308,8 @@ fn run(
                     visible: &bound.visible,
                     fresh: &bound.fresh,
                     destinations: &bound.destinations,
+                    selected_rows: &bound.selected_rows,
+                    selected: &bound.selected,
                     history_key: &mut bound.history_key,
                     history_value: &mut bound.history_value,
                     form: &bound.form,
@@ -1155,6 +1317,11 @@ fn run(
                     scale: case.scale,
                     gate_function: i32::from(case.form.softplus),
                     slab_rows: case.slab_rows as u32,
+                    selected_slab_rows: case.selected_slab_rows as u32,
+                    key_block: rounding.block,
+                    key_element: rounding.element,
+                    key_scale: rounding.scale,
+                    key_amax_floor: rounding.amax_floor,
                 })
                 .map_err(|error| format!("{error:?}"))?
                 .value
@@ -1309,7 +1476,7 @@ fn check_natives_against(
 ) {
     let mut failures = Vec::new();
     for device in devices() {
-        for config in configurations(&device, decode, case.form) {
+        for config in case_configurations(&device, decode, case) {
             let specialization = config
                 .iter()
                 .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| {
@@ -2157,6 +2324,14 @@ impl Case {
                 let kv = &keys[token as usize][..];
                 visible.push((kv, kv));
             }
+            // The compressed rows the row's indexer picked (-1 none), each
+            // read as key and value after the window's.
+            for &pick in &self.selected_rows[row * self.picks..][..self.picks] {
+                if pick >= 0 {
+                    let kv = &self.selected[pick as usize * w..][..w];
+                    visible.push((kv, kv));
+                }
+            }
             for head in 0..g {
                 let mut q = self.query[(row * g + head) * w..][..w].to_vec();
                 twist(&mut q, position(row), 1.0);
@@ -2289,6 +2464,26 @@ impl Case {
             })
             .collect()
     }
+
+    /// Every row's prepared key rounded without its holds, in
+    /// [`Self::prepared_keys`]'s order.
+    fn unheld_keys(&self) -> Vec<f32> {
+        let (kv, w) = (self.form.kv, self.form.w());
+        (0..self.rows)
+            .flat_map(|row| {
+                (0..kv).flat_map(move |head| {
+                    self.prepare_held(
+                        &self.key[(row * kv + head) * w..][..w],
+                        self.form.norm.then_some(&self.key_norm[..]),
+                        true,
+                        row,
+                        self.rounding_scalars(),
+                        false,
+                    )
+                })
+            })
+            .collect()
+    }
 }
 
 /// Stored-key layers at V4.1's shapes and a small one of its form (decode
@@ -2400,22 +2595,25 @@ fn stored_key_attention_equals_key_valued_planes() {
 fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), String> {
     let mut bound = Bound::new(device, case);
     let form = case.form;
-    let [_, ra, rt, _, vk] = form.extents();
+    let [_, ra, rt, _, vk, kr] = case.extents();
     let append_form = Tensor::from_host(
         device,
         Element::i32(),
-        &[0, ra as u64, rt as u64, vk as u64],
+        &[0, ra as u64, rt as u64, vk as u64, kr as u64],
         &[],
     )
     .unwrap();
-    // The appends read no query-head, gate, sink or output-rotary axis.
+    // The appends read no query-head, gate, sink, output-rotary or
+    // index-list axis.
     let specialization = statics(device, form, 0)
         .statics()
         .iter()
         .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "NQ" | "RO" | "SK"))
         .fold(NativeSpecialization::new(), |s, (name, value)| {
             s.with_static(name, *value)
-        });
+        })
+        .with_static("KR", kr as u64);
+    let rounding = case.rounding_scalars();
     let kernel = attention_append_dense::native_for_device_with(
         device,
         attention_append_dense::Elements { A: Element::bf16() },
@@ -2438,6 +2636,10 @@ fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), Stri
             form: &append_form,
             epsilon: case.epsilon,
             slab_rows: case.slab_rows as u32,
+            key_block: rounding.block,
+            key_element: rounding.element,
+            key_scale: rounding.scale,
+            key_amax_floor: rounding.amax_floor,
         })
         .map_err(|error| format!("{error:?}"))?;
     Ok((bf16_values(&bound.history_key), bf16_values(&bound.history_value)))
@@ -2510,4 +2712,320 @@ fn stored_key_host_model_matches_portable_body() {
         check_host_model(entry, &case);
         eprintln!("{name}: host model agrees with the portable body");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The index-list source (`KS`, `selected_rows` over `selected`) and the
+// trained key rounding (`KR`).
+
+/// V4.1's compressed-attention layers: the window's rows and KS = 512
+/// compressed rows a row (every seventh -1) of a 1000-row plane in slabs of
+/// 256, which the picks cross, read as key and value in the same softmax;
+/// at a decode step and over window prefill rows.
+fn two_source_cases() -> Vec<(&'static str, bool, Case)> {
+    let mut cases = v41_cases().into_iter();
+    let (_, _, decode) = cases.next().unwrap();
+    let (_, _, prefill) = cases.next().unwrap();
+    vec![
+        ("v41 two-source decode", true, decode.with_picks(512, 1000, 256, 94)),
+        ("v41 two-source window prefill", false, prefill.with_picks(512, 1000, 256, 95)),
+    ]
+}
+
+/// The two-source form at the interpreter's shapes: SMALL_V41 with 24 picks
+/// a row of a 40-row plane in slabs of 16.
+fn small_two_source_cases() -> Vec<(&'static str, bool, Case)> {
+    vec![
+        (
+            "small v41 two-source decode",
+            true,
+            Case::new(SMALL_V41, 64, decode_rows(5), 16, 1.0, 0.125, 70)
+                .with_sinks(80)
+                .with_picks(24, 40, 16, 96),
+        ),
+        (
+            "small v41 two-source window prefill",
+            false,
+            Case::new(SMALL_V41, 160, window_rows(20, 30, 8), 16, 1.0, 0.125, 71)
+                .with_sinks(81)
+                .with_picks(24, 40, 16, 97),
+        ),
+    ]
+}
+
+/// The backends whose declarations refuse an index-list source or a key
+/// rounding: CUDA and Vulkan everywhere, Metal's decode entry too.
+fn two_source_refusals(decode: bool) -> &'static [BackendName] {
+    if decode {
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
+    } else {
+        NEW_FORM_REFUSALS
+    }
+}
+
+/// The portable bodies of the two-source form equal the host model, which
+/// reads each pick (none for -1) as key and value after the row's fresh
+/// span.
+#[test]
+fn two_source_host_model_matches_portable_body() {
+    for (name, decode, case) in small_two_source_cases() {
+        check_host_model(if decode { "attention_decode" } else { "attention_prefill" }, &case);
+        eprintln!("{name}: host model agrees with the portable body");
+    }
+}
+
+/// At V4.1's shapes the host model of the two-source form equals the F32
+/// reference, which reads the picked compressed rows after the window's.
+#[test]
+fn two_source_host_model_matches_reference() {
+    for (name, _, case) in two_source_cases() {
+        let expected = case.expected();
+        check(name, &(case.v41_reference(), expected.1.clone(), expected.2.clone()), &expected, &case);
+    }
+}
+
+/// The CPU and Metal natives of the two-source form equal the host model at
+/// the small shapes and the F32 reference at V4.1's: the decode entry on
+/// CPU, the prefill entry (decode rows too) on CPU and Metal; the other
+/// declarations refuse it.
+#[test]
+fn two_source_natives_match_reference() {
+    for (name, decode, case) in small_two_source_cases() {
+        if decode {
+            check_natives_against(name, true, &case, two_source_refusals(true), true, &case.expected());
+        }
+        check_natives_against(name, false, &case, two_source_refusals(false), true, &case.expected());
+    }
+    for (name, decode, case) in two_source_cases() {
+        let host = case.expected();
+        let expected = (case.v41_reference(), host.1, host.2);
+        if decode {
+            check_natives_against(name, true, &case, two_source_refusals(true), true, &expected);
+        }
+        check_natives_against(name, false, &case, two_source_refusals(false), true, &expected);
+    }
+}
+
+/// A two-source row whose picks are all -1 reads the window alone: its
+/// natives' results and histories are held, within the precision bar, to
+/// the host model of the one-source run (KS = 0, the entries' form before
+/// the source).
+#[test]
+fn two_source_without_picks_equals_one_source() {
+    let mut failures = Vec::new();
+    for (name, decode, case) in two_source_cases() {
+        let mut empty = case.clone();
+        empty.selected_rows.fill(-1);
+        let one_source = Case {
+            picks: 0,
+            selected_rows: Vec::new(),
+            selected: Vec::new(),
+            selected_slab_rows: 1,
+            ..case.clone()
+        };
+        let expected = one_source.expected();
+        for device in devices() {
+            let backend = device.backend();
+            if !matches!(backend, BackendName::Cpu | BackendName::Metal) {
+                continue;
+            }
+            // The decode rows through both entries; Metal's decode entry
+            // holds neither form at V4.1's group.
+            let entries = if decode { vec![true, false] } else { vec![false] };
+            for decode in entries.into_iter().filter(|d| !(*d && backend == BackendName::Metal)) {
+                for config in case_configurations(&device, decode, &empty) {
+                    let specialization = config
+                        .iter()
+                        .fold(statics(&device, empty.form, empty.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
+                    let label = format!("{name} {backend:?} decode {decode} {config:?}");
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let picked = run(&device, decode, &specialization, &empty)
+                            .unwrap_or_else(|error| panic!("{label}: {error}"));
+                        check(&label, &picked, &expected, &one_source);
+                    }));
+                    if outcome.is_err() {
+                        failures.push(label);
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// V4.1's window-key rounding: E4M3 elements in runs of 32 with UE8M0
+/// (power-of-two) scales, which leaves every rounded value at most three
+/// explicit mantissa bits.
+const KEY_ROUNDING: Rounding = rounding_model::WINDOW;
+
+/// Whether every value of `keys` has at most three explicit mantissa bits
+/// (an E4M3 code times a power of two), and some is nonzero: the BF16 keys
+/// before rounding carry seven.
+fn on_rounding_grid(keys: &[f32]) -> bool {
+    keys.iter().all(|key| key.to_bits() & 0x000f_ffff == 0) && keys.iter().any(|key| *key != 0.0)
+}
+
+/// Rounded keys `actual` agree with `expected`: identical but for at most
+/// one in 1024, which may sit one E4M3 step away (an F32 input on the other
+/// side of a rounding boundary).
+fn rounded_keys_agree(label: &str, actual: &[f32], expected: &[f32]) {
+    assert_eq!(actual.len(), expected.len(), "{label}: key count");
+    let differing = actual
+        .iter()
+        .zip(expected)
+        .filter(|(a, e)| a.to_bits() != e.to_bits())
+        .inspect(|(a, e)| {
+            assert!((*a - *e).abs() <= 0.25 * a.abs().max(e.abs()), "{label}: rounded key {a} vs {e}");
+        })
+        .count();
+    assert!(differing * 1024 <= actual.len(), "{label}: {differing} of {} rounded keys differ", actual.len());
+}
+
+/// The key-rounding form at the interpreter's shapes: every row appends.
+fn small_key_rounding_cases() -> Vec<(&'static str, bool, Case)> {
+    vec![
+        (
+            "small v41 rounded decode",
+            true,
+            Case::new(SMALL_V41, 64, appending(decode_rows(5), 47), 16, 1.0, 0.125, 72)
+                .with_sinks(82)
+                .with_key_rounding(KEY_ROUNDING),
+        ),
+        (
+            "small v41 rounded window prefill",
+            false,
+            Case::new(SMALL_V41, 160, window_rows(20, 30, 8), 16, 1.0, 0.125, 73)
+                .with_sinks(83)
+                .with_key_rounding(KEY_ROUNDING),
+        ),
+    ]
+}
+
+/// The rounded portable bodies equal the host model, which holds each
+/// prepared key in BF16 after its norm and after its rotation and rounds it
+/// with the independent rounding model, and their appended keys lie on the
+/// rounding's grid; the holds move some rounded key. The CPU and Metal
+/// natives (and the dense append) store the host model's rounded keys, and
+/// their results are the host model's over the keys they stored; the other
+/// declarations refuse the form.
+#[test]
+fn key_rounding_matches_portable_body() {
+    let (mut failures, mut moved) = (Vec::new(), 0);
+    for (name, decode, case) in small_key_rounding_cases() {
+        let entry = if decode { "attention_decode" } else { "attention_prefill" };
+        check_host_model(entry, &case);
+        let keys = case.prepared_keys(&case.expected().1);
+        assert!(on_rounding_grid(&keys), "{name}: rounded keys off the rounding grid");
+        moved += case.unheld_keys().iter().zip(&keys).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        for device in devices() {
+            let backend = device.backend();
+            let refused = two_source_refusals(decode).contains(&backend);
+            for config in case_configurations(&device, decode, &case) {
+                let specialization = config
+                    .iter()
+                    .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
+                let label = format!("{name} {backend:?} {config:?}");
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match run(&device, decode, &specialization, &case) {
+                        Err(error) if error.contains("violates the native `where` condition") => {
+                            assert!(refused, "{label}: {error}");
+                        }
+                        Err(error) => panic!("{label}: {error}"),
+                        Ok(_) if refused => panic!("{label}: admitted a key rounding"),
+                        Ok(actual) => {
+                            let own = case.prepared_keys(&actual.1);
+                            rounded_keys_agree(&label, &own, &keys);
+                            check(&label, &actual, &case.expected_with(Some(&own)), &case);
+                        }
+                    }
+                }));
+                if outcome.is_err() {
+                    failures.push(label);
+                }
+            }
+            let label = format!("{name} append {backend:?}");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match run_append(&device, &case) {
+                    Err(error) if error.contains("violates the native `where` condition") => {
+                        assert!(NEW_FORM_REFUSALS.contains(&backend), "{label}: {error}");
+                    }
+                    Err(error) => panic!("{label}: {error}"),
+                    Ok(appended) => rounded_keys_agree(&label, &case.prepared_keys(&appended.0), &keys),
+                }
+            }));
+            if outcome.is_err() {
+                failures.push(label);
+            }
+        }
+    }
+    assert!(moved > 0, "the holds move no rounded key");
+    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// V4.1's compressed-attention layers whole: the window's keys rounded
+/// (every row appends) and the index-list source.
+fn v41_compressed_cases() -> Vec<(&'static str, bool, Case)> {
+    let scale = 1.0 / (512f32).sqrt();
+    vec![
+        (
+            "v41 compressed decode",
+            true,
+            Case::new(V41, 320, appending(decode_rows(260), 302), 128, 1.0, scale, 90)
+                .with_theta(1.0e4)
+                .with_sinks(91)
+                .with_picks(512, 1000, 256, 98)
+                .with_key_rounding(KEY_ROUNDING),
+        ),
+        (
+            "v41 compressed window prefill",
+            false,
+            Case::new(V41, 256, window_rows(24, 100, 128), 64, 1.0, scale, 92)
+                .with_theta(1.0e4)
+                .with_sinks(93)
+                .with_picks(512, 1000, 256, 99)
+                .with_key_rounding(KEY_ROUNDING),
+        ),
+    ]
+}
+
+/// At V4.1's shapes each CPU and Metal native stores the host model's
+/// rounded keys (on the rounding's grid), and its result is the host
+/// model's over the keys it stored and its picks.
+#[test]
+fn v41_compressed_natives_round_and_attend() {
+    let mut failures = Vec::new();
+    for (name, decode, case) in v41_compressed_cases() {
+        let rounded = case.prepared_keys(&case.expected().1);
+        assert!(on_rounding_grid(&rounded), "{name}: rounded keys off the rounding grid");
+        for device in devices() {
+            let backend = device.backend();
+            for decode in if decode { vec![true, false] } else { vec![false] } {
+                let refused = two_source_refusals(decode).contains(&backend);
+                for config in case_configurations(&device, decode, &case) {
+                    let specialization = config
+                        .iter()
+                        .fold(statics(&device, case.form, case.sink_rows()), |s, (n, v)| s.with_param(*n, *v));
+                    let label = format!("{name} {backend:?} decode {decode} {config:?}");
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match run(&device, decode, &specialization, &case) {
+                            Err(error) if error.contains("violates the native `where` condition") => {
+                                assert!(refused, "{label}: {error}");
+                            }
+                            Err(error) => panic!("{label}: {error}"),
+                            Ok(_) if refused => panic!("{label}: admitted the compressed form"),
+                            Ok(actual) => {
+                                let own = case.prepared_keys(&actual.1);
+                                rounded_keys_agree(&label, &own, &rounded);
+                                check(&label, &actual, &case.expected_with(Some(&own)), &case);
+                            }
+                        }
+                    }));
+                    if outcome.is_err() {
+                        failures.push(label);
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
 }

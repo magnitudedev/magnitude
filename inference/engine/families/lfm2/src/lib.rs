@@ -23,8 +23,9 @@ use magnitude_family_common::{rotary, Metadata, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
     DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
-    FeedForwardUp, GateFunction, GateGranularity, HeadNorm, HistoryDomain, HistoryReads,
-    ImportTransform, InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition,
+    FeedForwardUp, GateFunction, GateGranularity, HeadNorm, HistoryRows, HistorySource,
+    ImportTransform, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
+    ProjectedRows, RowProducer, RowRounding, TokenDomain,
     Operator, OutputForm, OutputProjection, QueryProjection, ResidualForm, RmsNorm,
     Rotary, RouteNormalization, RoutedFfn, Router,
     RouterInput, RowRange, ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
@@ -138,7 +139,7 @@ enum Mixer {
     ShortConv,
     Attention {
         kv_heads: u64,
-        domain: HistoryDomain,
+        domain: TokenDomain,
         rotary: Rotary,
     },
 }
@@ -309,7 +310,7 @@ pub fn inspect_components(
     // the full base.
     let (full, windows) = match architecture {
         Architecture::Dense | Architecture::Routed => (
-            (HistoryDomain::Token, rotary::table(width, width, base)?),
+            (TokenDomain::Token, rotary::table(width, width, base)?),
             vec![None; kv_heads.len()],
         ),
         Architecture::Lfm3 => {
@@ -321,7 +322,7 @@ pub fn inspect_components(
                 divisors,
             )?;
             let window = (
-                HistoryDomain::Window {
+                TokenDomain::Window {
                     tokens: m.integer("attention.sliding_window")?,
                 },
                 rotary::table(width, width, m.positive_number("rope.freq_base_swa")?)?,
@@ -331,7 +332,7 @@ pub fn inspect_components(
                 .into_iter()
                 .map(|windowed| windowed.then(|| window.clone()))
                 .collect();
-            ((HistoryDomain::Token, full_rotary), windows)
+            ((TokenDomain::Token, full_rotary), windows)
         }
     };
     let mixers = kv_heads
@@ -386,15 +387,20 @@ pub fn inspect_components(
                         },
                     },
                     query_norm: HeadNorm::Rms(rms(weight("attn_q_norm.weight", &[width])?)),
-                    key_value: KeyValue::Owned {
-                        key: weight("attn_k.weight", &[kv_rows, hidden])?,
-                        value: ValueSource::Projected(weight("attn_v.weight", &[kv_rows, hidden])?),
-                        key_norm: HeadNorm::Rms(rms(weight("attn_k_norm.weight", &[width])?)),
-                        value_norm: ValueNorm::None,
-                        domain: domain.clone(),
-                    },
-                    rotary: rotary.clone(),                    scale: 1.0 / (width as f64).sqrt(),
-                    reads: HistoryReads::Visible,
+                    history: vec![HistorySource::visible(HistoryRows::Own(
+                        RowProducer::Projected(ProjectedRows {
+                            key: weight("attn_k.weight", &[kv_rows, hidden])?,
+                            value: ValueSource::Projected(
+                                weight("attn_v.weight", &[kv_rows, hidden])?,
+                            ),
+                            key_norm: HeadNorm::Rms(rms(weight("attn_k_norm.weight", &[width])?)),
+                            value_norm: ValueNorm::None,
+                            domain: *domain,
+                            rounding: RowRounding::None,
+                        }),
+                    ))],
+                    rotary: rotary.clone(),
+                    scale: 1.0 / (width as f64).sqrt(),
                     media_rows: MediaRowAttention::Causal,
                     sinks: None,
                     output: OutputProjection::Full(weight(

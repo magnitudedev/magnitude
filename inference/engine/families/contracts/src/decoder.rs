@@ -9,8 +9,8 @@
 //! different operator.
 //!
 //! Some forms exist only as interface points for deferred families (plan §9):
-//! hyper-connection residuals, latent attention, block-rate and gathered
-//! history. They are legal descriptions;
+//! hyper-connection mixing inside parallel branches, latent attention, and an
+//! n-gram input outside the decoder. They are legal descriptions;
 //! [`ModelDefinition::deferred_forms`](crate::ModelDefinition::deferred_forms)
 //! names them so an executor rejects them with a typed error.
 
@@ -349,11 +349,15 @@ pub struct Attention {
     pub query: QueryProjection,
     pub gate: AttentionGate,
     pub query_norm: HeadNorm,
-    pub key_value: KeyValue,
+    /// The history sources one softmax reads, never empty. The first is the
+    /// one this layer's fresh rows join: a projected source (its own or a
+    /// shared one). Every later source is read as an index list into its
+    /// rows: key `o` of the softmax is row `o` of source 0's visible rows,
+    /// then the selected rows of each later source in source order.
+    pub history: Vec<HistorySource>,
     pub rotary: Rotary,
-    /// Multiplier on `q·k` before the softmax.
+    /// Multiplier on `q·k` before the softmax, the same for every source.
     pub scale: f64,
-    pub reads: HistoryReads,
     /// Whether media rows of one span see each other.
     pub media_rows: MediaRowAttention,
     /// Per-head attention sinks `[heads]`: query head `h`'s softmax gains
@@ -456,21 +460,173 @@ pub enum ValueNorm {
     RmsUnweighted(UnweightedRms),
 }
 
-/// Where a layer's keys and values come from.
+/// One source of rows an attention softmax reads, and which of them a query
+/// reads.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum KeyValue {
-    /// The layer projects and stores its own rows in `domain`.
-    Owned {
-        /// `[kv_heads·W, hidden]`.
-        key: WeightDescriptor,
-        value: ValueSource,
-        key_norm: HeadNorm,
-        value_norm: ValueNorm,
-        domain: HistoryDomain,
-    },
-    /// The layer stores nothing and reads the rows of an earlier attention
-    /// sublayer with equal `kv_heads`, `W` and key rotary ([`Rotary::of_keys`]).
-    Shared { source: SublayerIndex },
+pub struct HistorySource {
+    pub rows: HistoryRows,
+    pub reads: HistoryReads,
+}
+
+impl HistorySource {
+    /// Every visible row of `rows`.
+    pub fn visible(rows: HistoryRows) -> Self {
+        Self {
+            rows,
+            reads: HistoryReads::Visible,
+        }
+    }
+}
+
+/// Where a source's rows come from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HistoryRows {
+    /// The layer produces and stores the rows itself.
+    Own(RowProducer),
+    /// The layer stores nothing for this source and reads source `part` of
+    /// an earlier attention sublayer `source` (a target's, for a head
+    /// reading target history), which owns it, with equal row geometry and
+    /// key rotary ([`Rotary::of_keys`]).
+    Shared { source: SublayerIndex, part: u64 },
+}
+
+/// How a source's rows are made from the layer's normed input `x`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RowProducer {
+    /// One row of `kv_heads` keys (and values) per token.
+    Projected(ProjectedRows),
+    /// One row of one `W`-wide head per `rate` tokens, read as both key and
+    /// value.
+    Pooled(PooledRows),
+}
+
+impl RowProducer {
+    /// The domain of the rows it produces.
+    pub fn domain(&self) -> HistoryDomain {
+        match self {
+            Self::Projected(rows) => rows.domain.into(),
+            Self::Pooled(rows) => HistoryDomain::Block { rate: rows.rate },
+        }
+    }
+}
+
+impl Attention {
+    /// The source this layer's fresh rows join: its first.
+    pub fn fresh(&self) -> &HistorySource {
+        &self.history[0]
+    }
+}
+
+/// Per-token keys and values: key `rotary(key_norm(key·x))`, then
+/// `rounding`; the value by `value`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProjectedRows {
+    /// `[kv_heads·W, hidden]`.
+    pub key: WeightDescriptor,
+    pub value: ValueSource,
+    pub key_norm: HeadNorm,
+    pub value_norm: ValueNorm,
+    pub domain: TokenDomain,
+    /// The trained rounding of each stored row, after norm and rotary:
+    /// the row attention reads, fresh or from history.
+    pub rounding: RowRounding,
+}
+
+/// The token-rate domains a projected source keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TokenDomain {
+    /// One row per token for the whole context.
+    Token,
+    /// One row per token, keeping only the last `tokens` rows.
+    Window { tokens: u64 },
+}
+
+impl From<TokenDomain> for HistoryDomain {
+    fn from(domain: TokenDomain) -> Self {
+        match domain {
+            TokenDomain::Token => Self::Token,
+            TokenDomain::Window { tokens } => Self::Window { tokens },
+        }
+    }
+}
+
+/// One row per complete group of `rate` tokens, `[t·rate, (t+1)·rate)`:
+///
+/// ```text
+/// u_i     = projection·x_i                       (F32, per token i of the group)
+/// pooled  = pool(u)                              (per channel)
+/// latent  = RMS(pooled)·norm
+/// row     = rounding(rotary(latent, coordinates(first token of the group)))
+/// ```
+///
+/// The rotary is the reading attention's key rotary in its layout over `W`.
+/// A group's row exists once its last token has been seen, so a query at `t`
+/// reads rows `b < (t + 1) / rate`. The tokens of the incomplete group are
+/// producer state: their F32 projections (and gate scores) in a
+/// `Window(rate − 1)` domain, which rollback, fork and checkpoints treat as
+/// any window.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PooledRows {
+    pub rate: u64,
+    /// `[W, hidden]`.
+    pub projection: WeightDescriptor,
+    pub pool: Pool,
+    /// `[W]`.
+    pub norm: RmsNorm,
+    pub rounding: RowRounding,
+}
+
+/// How a group's per-token projections become one row, per channel `d`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Pool {
+    /// `rate == 1`: the token's projection itself.
+    Identity,
+    /// `rate >= 2`: `Σ_i u_i[d] / rate`.
+    Mean,
+    /// `rate >= 2`: `Σ_i softmax_i(g[d])·u_i[d]`, with `g_i = gate·x_i`
+    /// (`gate` `[W, hidden]`, F32) and the softmax over the group's tokens.
+    SoftmaxGated { gate: WeightDescriptor },
+}
+
+/// A trained rounding of a row's values, part of the model's numerics: the
+/// row is computed, then rounded, and every reader sees the rounded values.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum RowRounding {
+    None,
+    Block(BlockRounding),
+}
+
+/// Each run of `block` consecutive values `x` is rounded to
+/// `element(clamp(x / s, ±m)) · s`, `element` rounding to the nearest code,
+/// ties to even, `m` the element's largest finite value, with one scale per
+/// run, computed in F32 from `a = max(max|x|, amax_floor)`:
+/// - [`BlockScale::Ue8m0`]: `s = 2^ceil(log2(a · f32(1/m)))`;
+/// - [`BlockScale::E4M3`]: `s = e4m3(a / m)`, to the nearest code.
+///
+/// `amax_floor` is the model's own (it keeps an all-zero run's scale
+/// finite). Every value it yields is exact in BF16.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BlockRounding {
+    pub element: BlockElement,
+    pub block: u64,
+    pub scale: BlockScale,
+    pub amax_floor: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlockElement {
+    /// FP8 E4M3 (`m = 448`).
+    E4M3,
+    /// FP4 E2M1 (`m = 6`).
+    E2M1,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlockScale {
+    /// A power of two.
+    Ue8m0,
+    /// An FP8 E4M3 value.
+    E4M3,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -491,48 +647,135 @@ pub enum HistoryDomain {
     Token,
     /// One row per token, keeping only the last `tokens` rows.
     Window { tokens: u64 },
-    /// One row per `rate` tokens, committed at block boundaries. An
-    /// attention history in it is deferred (§9); a selected read's indexer
-    /// keeps its block keys in one.
+    /// One row per `rate` tokens, committed at block boundaries: a pooled
+    /// source's rows, and the keys of an indexer over them.
     Block { rate: u64 },
 }
 
-/// Which history rows a query reads.
+/// Which rows of a source a query reads.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HistoryReads {
-    /// Every visible row of the layer's domain.
+    /// Every visible row of the source.
     Visible,
-    /// The rows of the `blocks` best-scoring complete `block`-row blocks and
-    /// the row's own incomplete block, once a row has more than `blocks`
-    /// complete blocks; every visible row before. Ties select the lower
-    /// block.
-    Selected {
-        block: u64,
-        blocks: u64,
-        indexer: Indexer,
-    },
+    /// The rows a selection picks.
+    Selected(Selection),
 }
 
-/// Scores history blocks for [`HistoryReads::Selected`], in F32:
+/// Where a selected read's picks come from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Selection {
+    /// The layer's own indexer.
+    Own(Box<Indexer>),
+    /// The picks of source `part`'s own indexer in the earlier attention
+    /// sublayer `source`, over the same rows (the latest index source a
+    /// Reuse layer follows): read by reference, computed once.
+    Reuse { source: SublayerIndex, part: u64 },
+}
+
+/// Scores the units of a source's rows and selects the best, in F32:
 ///
 /// ```text
-/// q[h] = rotary(RMS(query·x)[h] · query_norm, coordinates(t))
-/// K[b] = rotary(RMS(mean(key·x over block b)) · key_norm, coordinates(first row of b))
-/// s[t, b] = Σ_h relu(q[h] · K[b]) / sqrt(width)
+/// q[h]    = rounding(rotary(norm(query·input)[h], coordinates(t)))
+/// K[u]    = the keys' row u                               (one per unit)
+/// s[t, u] = scale · Σ_h relu(q[h] · K[u]) · w[h]
 /// ```
 ///
-/// The rotary is the attention's own, in its layout over each `width`.
+/// with `w[h] = 1` ([`HeadWeights::Uniform`]) or `(weight·x)[h]`. The
+/// rotary is the attention's own, in its layout over each `width`.
+///
+/// A unit is the run of the read source's rows one key covers: key `u`
+/// covers rows `[u·n, (u + 1)·n)`, `n` the keys' rate over the source's
+/// (a pooled key over a token source: its group of tokens; a key per row
+/// of a pooled source: that row). A row at `t` has `c` complete units.
+/// While `c <= top` it reads every visible row of the source; past it, the
+/// rows of its `top` best-scoring complete units (ties select the lower
+/// unit) and the visible rows no complete unit covers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Indexer {
     pub heads: u64,
     pub width: u64,
-    /// `[heads·width, hidden]`.
-    pub query: WeightDescriptor,
-    /// `[width, hidden]`.
-    pub key: WeightDescriptor,
-    /// `[width]` each.
-    pub query_norm: RmsNorm,
-    pub key_norm: RmsNorm,
+    pub query: IndexerQuery,
+    pub keys: IndexerKeys,
+    pub head_weights: HeadWeights,
+    /// Multiplier on the summed head scores.
+    pub scale: f64,
+    pub top: u64,
+    pub candidates: Candidates,
+}
+
+/// Which complete units of its row an indexer scores: a two-level top-k,
+/// whose first level one layer produces and later layers restrict to.
+///
+/// A pool of `blocks` blocks of `block_units` consecutive units, per row of
+/// `c` complete units: block `b` holds the units `[b·block_units,
+/// (b + 1)·block_units)` below `c` and scores the largest of their scores;
+/// the row's newest block (the one holding unit `c − 1`) scores `+inf`; the
+/// pool is the `blocks` best blocks, ties to the lower block. A restricted
+/// row scores every unit outside the pool `−inf`, then takes its `top` best
+/// units as any row does (ties to the lower unit), so a pool holding fewer
+/// than `min(top, c)` units adds the lowest units outside it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Candidates {
+    /// Every complete unit.
+    All,
+    /// Every complete unit, and the indexer's scores make the pool that later
+    /// indexers over the same rows restrict to.
+    Produce { blocks: u64, block_units: u64 },
+    /// The units of the pool produced by source `part`'s indexer in the
+    /// earlier attention sublayer `source`, over the same rows.
+    Restrict { source: SublayerIndex, part: u64 },
+}
+
+/// The indexer's query heads.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IndexerQuery {
+    pub input: IndexerInput,
+    /// `[heads·width, input width]`.
+    pub projection: WeightDescriptor,
+    /// Per head, over `width`.
+    pub norm: HeadNorm,
+    pub rounding: RowRounding,
+}
+
+/// The row an indexer's query projects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IndexerInput {
+    /// The layer's normed input `x` (`hidden` wide).
+    Hidden,
+    /// The attention's normalized low-rank query row `qr`
+    /// ([`QueryProjection::LowRank`], `rank` wide).
+    QueryRank,
+}
+
+/// The rows an indexer scores, one per unit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum IndexerKeys {
+    /// Its own pooled rows of `x`, one head `width` wide, over a token
+    /// source.
+    Pooled(PooledRows),
+    /// Per row of the read source (a pooled one, which this layer owns):
+    /// `rounding(rotary(RMS(projection·latent)·norm, coordinates(first token
+    /// of the row)))`, `latent` the source's row before its rotary and
+    /// rounding. `projection` `[width, W]`, `norm` `[width]`.
+    Latent {
+        projection: WeightDescriptor,
+        norm: RmsNorm,
+        rounding: RowRounding,
+    },
+    /// The keys of source `part`'s own indexer in the earlier attention
+    /// sublayer `source`, which owns the rows this source reads (its
+    /// [`IndexerKeys::Latent`] keys): read by reference, computed once. The
+    /// layer projects its own query and head weights.
+    Shared { source: SublayerIndex, part: u64 },
+}
+
+/// The per-head weights of an indexer's summed scores.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HeadWeights {
+    /// Every head weighs 1.
+    Uniform,
+    /// `w = weight·x`, `weight` `[heads, hidden]`.
+    Projected(WeightDescriptor),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,13 +816,13 @@ impl Rotary {
     /// the attended row: what a layer's stored history rows depend on.
     pub fn of_keys(&self) -> Self {
         match self {
-            Self::Table { pairs, layout, divisors, .. } => Self::Table {
+            Self::Table { pairs, layout, divisors, output: _ } => Self::Table {
                 pairs: pairs.clone(),
                 layout: *layout,
                 divisors: divisors.clone(),
                 output: OutputRotary::None,
             },
-            other => other.clone(),
+            Self::None | Self::Interleaved { .. } => self.clone(),
         }
     }
 }
@@ -1161,7 +1404,6 @@ pub enum DeferredForm {
     HyperConnectionMix,
     HyperConnectionHead,
     LatentAttention,
-    BlockHistory,
     NGramInput,
 }
 
@@ -1171,7 +1413,6 @@ impl DeferredForm {
             Self::HyperConnectionMix => "hyper-connection input mixing",
             Self::HyperConnectionHead => "hyper-connection readout head",
             Self::LatentAttention => "latent attention",
-            Self::BlockHistory => "block-rate attention history",
             Self::NGramInput => "n-gram input",
         }
     }
@@ -1204,13 +1445,16 @@ impl Decoder {
         })
     }
 
-    /// The domain of the history the attention sublayer `index` reads: its
-    /// own, or that of the layer it shares.
+    /// The domain of the source the attention sublayer `index`'s fresh rows
+    /// join (its first): its own, or that of the layer it shares.
     pub fn history_domain(&self, index: SublayerIndex) -> Option<HistoryDomain> {
-        match &history_owner(&self.blocks, index)?.key_value {
-            KeyValue::Owned { domain, .. } => Some(*domain),
-            KeyValue::Shared { .. } => None,
-        }
+        source_producer(&self.blocks, index, 0).map(RowProducer::domain)
+    }
+
+    /// The producer of source `part` of the attention sublayer `index`: its
+    /// own, or that of the layer it shares.
+    pub fn source_producer(&self, index: SublayerIndex, part: u64) -> Option<&RowProducer> {
+        source_producer(&self.blocks, index, part)
     }
 
     pub fn validate(&self, coordinate_axes: u8) -> Result<(), DefinitionError> {
@@ -1361,17 +1605,7 @@ pub(crate) fn blocks_deferred_forms(blocks: &[Block], forms: &mut Vec<DeferredFo
 
 fn operator_deferred_forms(op: &Operator, forms: &mut Vec<DeferredForm>) {
     match op {
-        Operator::Attention(attention) => {
-            if matches!(
-                attention.key_value,
-                KeyValue::Owned {
-                    domain: HistoryDomain::Block { .. },
-                    ..
-                }
-            ) {
-                forms.push(DeferredForm::BlockHistory);
-            }
-        }
+        Operator::Attention(_) => {}
         Operator::LatentAttention(_) => forms.push(DeferredForm::LatentAttention),
         Operator::NGramInput(_) => forms.push(DeferredForm::NGramInput),
         Operator::Parallel(branches) => {
@@ -1398,26 +1632,48 @@ pub(crate) struct Context<'a> {
     pub coordinate_axes: u8,
     pub residual: &'a ResidualForm,
     pub per_layer: Option<&'a PerLayerEntry>,
-    /// The blocks a `KeyValue::Shared` source names when they are not the
+    /// The blocks a `HistoryRows::Shared` source names when they are not the
     /// validated blocks themselves: the target decoder's, for a draft head
-    /// reading target history. Every attention sublayer is then Shared.
+    /// reading target history. Every attention source is then Shared.
     pub shared_sources: Option<&'a [Block]>,
 }
 
-/// The owning attention sublayer a Shared reader of `source` in `blocks`
-/// reads: `source` itself, or the owner `source` shares.
-pub(crate) fn history_owner(blocks: &[Block], source: SublayerIndex) -> Option<&Attention> {
-    let attention = |index| {
-        sublayer(blocks, index).and_then(|sublayer| match &sublayer.op {
-            Operator::Attention(attention) => Some(attention.as_ref()),
-            _ => None,
-        })
-    };
-    match &attention(source)?.key_value {
-        KeyValue::Owned { .. } => attention(source),
-        KeyValue::Shared { source: owner } => {
-            attention(*owner).filter(|owner| matches!(owner.key_value, KeyValue::Owned { .. }))
+fn attention_at(blocks: &[Block], index: SublayerIndex) -> Option<&Attention> {
+    sublayer(blocks, index).and_then(|sublayer| match &sublayer.op {
+        Operator::Attention(attention) => Some(attention.as_ref()),
+        _ => None,
+    })
+}
+
+/// The owner of source `part` of the attention sublayer `index` in
+/// `blocks`, with the owner's attention: `(index, part)` itself when it owns
+/// the rows, or the owned source a Shared one names.
+pub(crate) fn source_owner(
+    blocks: &[Block],
+    index: SublayerIndex,
+    part: u64,
+) -> Option<(SublayerIndex, u64, &Attention)> {
+    let attention = attention_at(blocks, index)?;
+    match &attention.history.get(part as usize)?.rows {
+        HistoryRows::Own(_) => Some((index, part, attention)),
+        HistoryRows::Shared { source, part } => {
+            let owner = attention_at(blocks, *source)?;
+            matches!(owner.history.get(*part as usize)?.rows, HistoryRows::Own(_))
+                .then_some((*source, *part, owner))
         }
+    }
+}
+
+/// The producer of source `part` of the attention sublayer `index`.
+pub(crate) fn source_producer(
+    blocks: &[Block],
+    index: SublayerIndex,
+    part: u64,
+) -> Option<&RowProducer> {
+    let (_, part, owner) = source_owner(blocks, index, part)?;
+    match &owner.history[part as usize].rows {
+        HistoryRows::Own(producer) => Some(producer),
+        HistoryRows::Shared { .. } => None,
     }
 }
 
@@ -1440,34 +1696,64 @@ pub(crate) fn validate_blocks(blocks: &[Block], context: &Context) -> Result<(),
             }
         }
         if let Operator::Attention(attention) = &sublayer.op {
-            let owner = match (&attention.key_value, context.shared_sources) {
-                (KeyValue::Owned { .. }, None) => continue,
-                (KeyValue::Owned { .. }, Some(_)) => {
-                    return Err(DefinitionError::new(
-                        "attention reading target history owns its own",
-                    ));
-                }
-                (KeyValue::Shared { source }, None) => (*source < index)
-                    .then(|| self::sublayer(blocks, *source))
+            validate_shared_sources(blocks, index, attention, context)?;
+        }
+    }
+    Ok(())
+}
+
+/// A layer's Shared sources and reused selections against the layers they
+/// name: an earlier sublayer of `blocks` that owns the rows (or, for a head
+/// reading target history, the target's owner of them), with equal row
+/// geometry and key rotary.
+fn validate_shared_sources(
+    blocks: &[Block],
+    index: SublayerIndex,
+    attention: &Attention,
+    context: &Context,
+) -> Result<(), DefinitionError> {
+    for (part, source) in attention.history.iter().enumerate() {
+        let owner = match (&source.rows, context.shared_sources) {
+            (HistoryRows::Own(_), None) => None,
+            (HistoryRows::Own(_), Some(_)) => {
+                return Err(DefinitionError::new(
+                    "attention reading target history owns its own",
+                ));
+            }
+            (HistoryRows::Shared { source, part }, None) => Some(
+                (*source < index)
+                    .then(|| attention_at(blocks, *source))
                     .flatten()
-                    .and_then(|owner| match &owner.op {
-                        Operator::Attention(owner) => Some(owner.as_ref()),
-                        _ => None,
+                    .and_then(|owner| {
+                        let rows = &owner.history.get(*part as usize)?.rows;
+                        matches!(rows, HistoryRows::Own(_)).then_some(owner)
                     })
+                    .map(|owner| (owner, *part))
                     .ok_or_else(|| {
                         DefinitionError::new(
                             "shared attention history names no earlier attention sublayer",
                         )
                     })?,
-                (KeyValue::Shared { source }, Some(target)) => history_owner(target, *source)
+            ),
+            (HistoryRows::Shared { source, part }, Some(target)) => Some(
+                source_owner(target, *source, *part)
+                    .map(|(_, part, owner)| (owner, part))
                     .ok_or_else(|| {
                         DefinitionError::new(
                             "shared attention history names no target attention sublayer",
                         )
                     })?,
+            ),
+        };
+        if let Some((owner, owned)) = owner {
+            let agrees = match &owner.history[owned as usize].rows {
+                HistoryRows::Own(RowProducer::Projected(_)) => {
+                    part == 0 && owner.kv_heads == attention.kv_heads
+                }
+                HistoryRows::Own(RowProducer::Pooled(_)) => part > 0,
+                HistoryRows::Shared { .. } => false,
             };
-            if !matches!(owner.key_value, KeyValue::Owned { .. })
-                || owner.kv_heads != attention.kv_heads
+            if !agrees
                 || owner.width != attention.width
                 || owner.rotary.of_keys() != attention.rotary.of_keys()
             {
@@ -1475,6 +1761,108 @@ pub(crate) fn validate_blocks(blocks: &[Block], context: &Context) -> Result<(),
                     "shared attention history disagrees with its source layer",
                 ));
             }
+        }
+        if let HistoryReads::Selected(Selection::Reuse {
+            source: reused,
+            part: reused_part,
+        }) = &source.reads
+        {
+            // Every layer reading these rows binds one launch-scoped picks
+            // table and an own indexer overwrites it, so the reused picks
+            // are the latest own indexer's over the rows this source reads.
+            let rows = source_owner(blocks, index, part as u64).map(|(a, ap, _)| (a, ap));
+            let indexers: Vec<(SublayerIndex, u64)> = indexed_sublayers(blocks)
+                .take_while(|(at, _)| *at < index)
+                .filter_map(|(at, sublayer)| match &sublayer.op {
+                    Operator::Attention(layer) => Some((at, layer)),
+                    _ => None,
+                })
+                .flat_map(|(at, layer)| {
+                    layer.history.iter().enumerate().filter_map(move |(at_part, picked)| {
+                        matches!(picked.reads, HistoryReads::Selected(Selection::Own(_)))
+                            .then_some((at, at_part as u64))
+                    })
+                })
+                .filter(|(at, at_part)| {
+                    rows.is_some()
+                        && source_owner(blocks, *at, *at_part).map(|(b, bp, _)| (b, bp)) == rows
+                })
+                .collect();
+            let named = (*reused, *reused_part);
+            if context.shared_sources.is_some() || !indexers.contains(&named) {
+                return Err(DefinitionError::new(
+                    "reused selection names no earlier indexer over the same rows",
+                ));
+            }
+            if indexers.last() != Some(&named) {
+                return Err(DefinitionError::new(
+                    "reused selection names an indexer other than the latest over the same rows",
+                ));
+            }
+        }
+        if let HistoryReads::Selected(Selection::Own(indexer)) = &source.reads {
+            validate_shared_indexer(blocks, index, part as u64, attention, indexer, context)?;
+        }
+    }
+    Ok(())
+}
+
+/// An own indexer's references to earlier indexers over the same rows: the
+/// keys it shares (an indexer keeping its own), and the candidate pool it
+/// restricts to (one that produces a pool of at least its `top` units).
+fn validate_shared_indexer(
+    blocks: &[Block],
+    index: SublayerIndex,
+    part: u64,
+    attention: &Attention,
+    indexer: &Indexer,
+    context: &Context,
+) -> Result<(), DefinitionError> {
+    // The earlier own indexer at (`source`, `source_part`) over the rows this
+    // source reads.
+    let earlier = |source: SublayerIndex, source_part: u64| {
+        let same_rows = source_owner(blocks, index, part)
+            .zip(source_owner(blocks, source, source_part))
+            .is_some_and(|((a, ap, _), (b, bp, _))| a == b && ap == bp);
+        (context.shared_sources.is_none() && source < index && same_rows)
+            .then(|| attention_at(blocks, source))
+            .flatten()
+            .and_then(|layer| Some((layer, &layer.history.get(source_part as usize)?.reads)))
+            .and_then(|(layer, reads)| match reads {
+                HistoryReads::Selected(Selection::Own(owner)) => Some((layer, owner.as_ref())),
+                _ => None,
+            })
+    };
+    if let IndexerKeys::Shared { source, part: source_part } = indexer.keys {
+        let keys = earlier(source, source_part).filter(|(layer, owner)| {
+            matches!(owner.keys, IndexerKeys::Latent { .. })
+                && owner.width == indexer.width
+                && layer.rotary.of_keys() == attention.rotary.of_keys()
+        });
+        if keys.is_none() {
+            return Err(DefinitionError::new(
+                "shared indexer keys name no earlier indexer keeping its own over the same rows",
+            ));
+        }
+    }
+    if let Candidates::Restrict { source, part: source_part } = indexer.candidates {
+        let pool = earlier(source, source_part).and_then(|(_, owner)| match owner.candidates {
+            Candidates::Produce { blocks, block_units } => blocks.checked_mul(block_units),
+            _ => None,
+        });
+        match pool {
+            None => {
+                return Err(DefinitionError::new(
+                    "a restricted indexer names no earlier candidate pool over the same rows",
+                ));
+            }
+            Some(units) if units < indexer.top => {
+                return Err(DefinitionError::new(format!(
+                    "a candidate pool of {units} units is smaller than its restricted indexer's top {}",
+                    indexer.top
+                )));
+            }
+            Some(_) => {}
         }
     }
     Ok(())
@@ -1744,38 +2132,29 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
         expect_shape(weight, &[rows, hidden], "attention gate")?;
     }
     validate_head_norm(&attention.query_norm, width, "attention query norm")?;
-    if let KeyValue::Owned {
-        key,
-        value,
-        key_norm,
-        value_norm,
-        domain,
-    } = &attention.key_value
-    {
-        let rows = checked_product(&[attention.kv_heads, width])?;
-        expect_shape(key, &[rows, hidden], "attention key")?;
-        match value {
-            ValueSource::Projected(value) => {
-                expect_shape(value, &[rows, hidden], "attention value")?
-            }
-            ValueSource::RawKey => {}
-            ValueSource::StoredKey => {
-                if !matches!(value_norm, ValueNorm::None) {
+    if attention.history.is_empty() {
+        return Err(DefinitionError::new("attention reads no history"));
+    }
+    for (part, source) in attention.history.iter().enumerate() {
+        match &source.rows {
+            HistoryRows::Own(RowProducer::Projected(rows)) => {
+                if part != 0 {
                     return Err(DefinitionError::new(
-                        "stored-key values with a value norm",
+                        "a projected history source after the first",
                     ));
                 }
+                validate_projected(rows, attention, hidden)?;
             }
+            HistoryRows::Own(RowProducer::Pooled(rows)) => {
+                if part == 0 {
+                    return Err(DefinitionError::new("a pooled first history source"));
+                }
+                validate_pooled(rows, width, hidden, "attention pooled rows")?;
+            }
+            HistoryRows::Shared { .. } => {}
         }
-        validate_head_norm(key_norm, width, "attention key norm")?;
-        if let ValueNorm::RmsUnweighted(norm) = value_norm {
-            positive_epsilon(norm.epsilon)?;
-        }
-        if matches!(
-            domain,
-            HistoryDomain::Window { tokens: 0 } | HistoryDomain::Block { rate: 0 }
-        ) {
-            return Err(DefinitionError::new("invalid attention history domain"));
+        if let HistoryReads::Selected(Selection::Own(indexer)) = &source.reads {
+            validate_indexer(indexer, source, attention, hidden)?;
         }
     }
     match &attention.rotary {
@@ -1844,14 +2223,6 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
             }
         }
     }
-    if let HistoryReads::Selected {
-        block,
-        blocks,
-        indexer,
-    } = &attention.reads
-    {
-        validate_indexer(*block, *blocks, indexer, attention, hidden)?;
-    }
     if let Some(sinks) = &attention.sinks {
         expect_shape(sinks, &[attention.heads], "attention sinks")?;
     }
@@ -1870,10 +2241,85 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
     }
 }
 
+fn validate_projected(
+    rows: &ProjectedRows,
+    attention: &Attention,
+    hidden: u64,
+) -> Result<(), DefinitionError> {
+    let width = attention.width;
+    let kv_rows = checked_product(&[attention.kv_heads, width])?;
+    expect_shape(&rows.key, &[kv_rows, hidden], "attention key")?;
+    match &rows.value {
+        ValueSource::Projected(value) => {
+            expect_shape(value, &[kv_rows, hidden], "attention value")?
+        }
+        ValueSource::RawKey => {}
+        ValueSource::StoredKey => {
+            if !matches!(rows.value_norm, ValueNorm::None) {
+                return Err(DefinitionError::new("stored-key values with a value norm"));
+            }
+        }
+    }
+    validate_head_norm(&rows.key_norm, width, "attention key norm")?;
+    if let ValueNorm::RmsUnweighted(norm) = rows.value_norm {
+        positive_epsilon(norm.epsilon)?;
+    }
+    if rows.domain == (TokenDomain::Window { tokens: 0 }) {
+        return Err(DefinitionError::new("invalid attention history domain"));
+    }
+    // A rounded row is read as both key and value: its value is the key.
+    if !matches!(rows.rounding, RowRounding::None)
+        && !matches!(rows.value, ValueSource::StoredKey)
+    {
+        return Err(DefinitionError::new(
+            "a rounded history row whose value is not its key",
+        ));
+    }
+    validate_rounding(rows.rounding, width, "attention key rounding")
+}
+
+fn validate_pooled(
+    rows: &PooledRows,
+    width: u64,
+    hidden: u64,
+    role: &str,
+) -> Result<(), DefinitionError> {
+    let pooled = match &rows.pool {
+        Pool::Identity => rows.rate == 1,
+        Pool::Mean => rows.rate >= 2,
+        Pool::SoftmaxGated { gate } => {
+            expect_shape(gate, &[width, hidden], role)?;
+            rows.rate >= 2
+        }
+    };
+    if !pooled {
+        return Err(DefinitionError::new(format!("{role}: pool and rate disagree")));
+    }
+    expect_shape(&rows.projection, &[width, hidden], role)?;
+    validate_rms(&rows.norm, width, role)?;
+    validate_rounding(rows.rounding, width, role)
+}
+
+fn validate_rounding(rounding: RowRounding, width: u64, role: &str) -> Result<(), DefinitionError> {
+    match rounding {
+        RowRounding::None => Ok(()),
+        RowRounding::Block(block) => {
+            if block.block == 0
+                || !width.is_multiple_of(block.block)
+                || block.amax_floor <= 0.0
+                // The kernels take the floor as f32: it must stay a normal one.
+                || !(block.amax_floor as f32).is_normal()
+            {
+                return Err(DefinitionError::new(format!("{role}: invalid block rounding")));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn validate_indexer(
-    block: u64,
-    blocks: u64,
     indexer: &Indexer,
+    source: &HistorySource,
     attention: &Attention,
     hidden: u64,
 ) -> Result<(), DefinitionError> {
@@ -1882,26 +2328,73 @@ fn validate_indexer(
         Rotary::Interleaved { width, .. } => *width,
         Rotary::Table { pairs, .. } => 2 * pairs.len() as u64,
     };
-    if [block, blocks, indexer.heads, indexer.width].contains(&0)
+    if [indexer.top, indexer.heads, indexer.width].contains(&0)
         || rotary > indexer.width
-        || !matches!(
-            attention.key_value,
-            KeyValue::Owned {
-                domain: HistoryDomain::Token,
-                ..
-            }
-        )
+        || !indexer.scale.is_finite()
+        || indexer.scale <= 0.0
     {
         return Err(DefinitionError::new("invalid selected history geometry"));
     }
+    let input = match (&indexer.query.input, &attention.query) {
+        (IndexerInput::Hidden, _) => hidden,
+        (IndexerInput::QueryRank, QueryProjection::LowRank { down, .. }) => down.shape[0],
+        (IndexerInput::QueryRank, QueryProjection::Full(_)) => {
+            return Err(DefinitionError::new(
+                "indexer reading the query rank of a full-rank query",
+            ));
+        }
+    };
     expect_shape(
-        &indexer.query,
-        &[checked_product(&[indexer.heads, indexer.width])?, hidden],
+        &indexer.query.projection,
+        &[checked_product(&[indexer.heads, indexer.width])?, input],
         "indexer query",
     )?;
-    expect_shape(&indexer.key, &[indexer.width, hidden], "indexer key")?;
-    validate_rms(&indexer.query_norm, indexer.width, "indexer query norm")?;
-    validate_rms(&indexer.key_norm, indexer.width, "indexer key norm")
+    validate_head_norm(&indexer.query.norm, indexer.width, "indexer query norm")?;
+    validate_rounding(indexer.query.rounding, indexer.width, "indexer query rounding")?;
+    if let HeadWeights::Projected(weight) = &indexer.head_weights {
+        expect_shape(weight, &[indexer.heads, hidden], "indexer head weights")?;
+    }
+    // A pool is produced over a pooled source's own rows by the indexer that
+    // keeps their keys; its restrictions are checked against it
+    // (`validate_shared_sources`).
+    if let Candidates::Produce { blocks, block_units } = indexer.candidates {
+        let owns_keys = matches!(indexer.keys, IndexerKeys::Latent { .. });
+        let pooled = matches!(source.rows, HistoryRows::Own(RowProducer::Pooled(_)));
+        if blocks == 0 || block_units == 0 || !owns_keys || !pooled {
+            return Err(DefinitionError::new(
+                "a candidate pool is produced over its own pooled rows and keys, in blocks of units",
+            ));
+        }
+    }
+    match (&indexer.keys, &source.rows) {
+        // Pooled keys over a token source: each covers its group of tokens.
+        (
+            IndexerKeys::Pooled(keys),
+            HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                domain: TokenDomain::Token,
+                ..
+            })),
+        ) => validate_pooled(keys, indexer.width, hidden, "indexer keys"),
+        // One key per row of the layer's own pooled source.
+        (
+            IndexerKeys::Latent {
+                projection,
+                norm,
+                rounding,
+            },
+            HistoryRows::Own(RowProducer::Pooled(_)),
+        ) => {
+            expect_shape(projection, &[indexer.width, attention.width], "indexer keys")?;
+            validate_rms(norm, indexer.width, "indexer key norm")?;
+            validate_rounding(*rounding, indexer.width, "indexer key rounding")
+        }
+        // Another layer's keys over the rows it owns and this layer shares
+        // (`validate_shared_sources`).
+        (IndexerKeys::Shared { .. }, HistoryRows::Shared { .. }) => Ok(()),
+        _ => Err(DefinitionError::new(
+            "indexer keys disagree with the rows they select",
+        )),
+    }
 }
 
 fn validate_ngram(input: &NGramInput, context: &Context) -> Result<(), DefinitionError> {

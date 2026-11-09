@@ -498,7 +498,8 @@ fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
 #[test]
 fn a_units_window_is_the_longest_history_its_layers_keep() {
     use magnitude_family_contracts::{
-        Attention, HistoryDomain, KeyValue, ModelDefinition, Operator, SublayerIndex, WeightScope,
+        Attention, HistoryRows, ModelDefinition, Operator, RowProducer, SublayerIndex,
+        TokenDomain, WeightScope,
     };
     fn mixer(definition: &mut ModelDefinition, block: usize) -> &mut Attention {
         match &mut definition.decoder.blocks[block].sublayers[0].op {
@@ -513,12 +514,17 @@ fn a_units_window_is_the_longest_history_its_layers_keep() {
     let block = definition.decoder.blocks[0].clone();
     definition.decoder.blocks = vec![block; 4];
     for (block, tokens) in [(1, 1024), (2, 2048)] {
-        let KeyValue::Owned { domain, .. } = &mut mixer(&mut definition, block).key_value else {
+        let HistoryRows::Own(RowProducer::Projected(rows)) =
+            &mut mixer(&mut definition, block).history[0].rows
+        else {
             panic!("the fixture's attention owns its history");
         };
-        *domain = HistoryDomain::Window { tokens };
+        rows.domain = TokenDomain::Window { tokens };
     }
-    mixer(&mut definition, 3).key_value = KeyValue::Shared { source: layer(1) };
+    mixer(&mut definition, 3).history[0].rows = HistoryRows::Shared {
+        source: layer(1),
+        part: 0,
+    };
     let inputs = ModelInputs {
         definition: &definition,
         limits: LIMITS,
@@ -559,13 +565,15 @@ fn a_units_window_is_the_longest_history_its_layers_keep() {
 /// requests that arrive together, and every such point is valid.
 #[test]
 fn several_sequences_lie_in_a_window_only_models_store() {
-    use magnitude_family_contracts::{HistoryDomain, KeyValue, Operator};
+    use magnitude_family_contracts::{HistoryRows, Operator, RowProducer, TokenDomain};
     let (mut definition, load) = fixture_load();
     for block in &mut definition.decoder.blocks {
         for sublayer in &mut block.sublayers {
             if let Operator::Attention(attention) = &mut sublayer.op {
-                if let KeyValue::Owned { domain, .. } = &mut attention.key_value {
-                    *domain = HistoryDomain::Window { tokens: 1024 };
+                for source in &mut attention.history {
+                    if let HistoryRows::Own(RowProducer::Projected(rows)) = &mut source.rows {
+                        rows.domain = TokenDomain::Window { tokens: 1024 };
+                    }
                 }
             }
         }
@@ -3133,12 +3141,15 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
             rotary_adjacent: 0,
             rotary_trailing: 0,
             output_rotary: 0,
+            key_rounding: crate::RoundingArgs::NONE,
+            picks: 0,
         },
         scopes: Vec::new(),
         epsilon: 1.0e-5,
         decode_rows: None,
         window: None,
         selection: None,
+        picked: None,
     });
     let implementation = seismic::generated::native_implementation::<
         magnitude_kernels::attention_prefill_k8v4::Entry,

@@ -11,7 +11,7 @@ use magnitude_artifacts::{
 use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     BlockAttention, BlockLayout, CandidateCorrector, DraftDefinition, DraftEmbedding, DraftMethod,
-    DraftVariant, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily, Operator,
+    DraftVariant, HistoryDomain, HistoryRows, ImportTransform, ModelDefinition, ModelFamily, Operator,
     Rotary, CORRECTOR_FEATURES,
 };
 use magnitude_family_dflash::{inspect, recognize, Error};
@@ -113,10 +113,10 @@ fn bolt_reads_a_selectorless_convolved_backbone_with_sinks() {
             (attention.heads, attention.kv_heads, attention.width),
             (32, 2, 128)
         );
-        let KeyValue::Owned { domain, .. } = &attention.key_value else {
+        let HistoryRows::Own(producer) = &attention.fresh().rows else {
             panic!("a draft layer owns its history");
         };
-        assert_eq!(*domain, HistoryDomain::Window { tokens: 1024 });
+        assert_eq!(producer.domain(), HistoryDomain::Window { tokens: 1024 });
     }
 }
 
@@ -181,10 +181,10 @@ fn super_vl_reads_windowed_layers_without_sinks_and_its_own_projection() {
         let attention = attention(&draft, layer);
         assert!(attention.sinks.is_none());
         assert_eq!((attention.heads, attention.kv_heads), (32, 8));
-        let KeyValue::Owned { domain, .. } = &attention.key_value else {
+        let HistoryRows::Own(producer) = &attention.fresh().rows else {
             panic!("a draft layer owns its history");
         };
-        assert_eq!(*domain, HistoryDomain::Window { tokens: 8192 });
+        assert_eq!(producer.domain(), HistoryDomain::Window { tokens: 8192 });
         assert!(matches!(attention.rotary, Rotary::Table { .. }));
     }
 }
@@ -223,11 +223,11 @@ fn both_dspark_drafts_bind_against_their_targets() {
         assert_eq!(definition.mask_token, TokenId(mask));
         assert_eq!(definition.block_attention, vec![attention_kind; layers]);
         for layer in 0..layers {
-            let KeyValue::Owned { domain, .. } = &attention(&definition, layer).key_value else {
+            let HistoryRows::Own(producer) = &attention(&definition, layer).fresh().rows else {
                 panic!("a draft layer owns its history");
             };
             if let Some(tokens) = window {
-                assert_eq!(*domain, HistoryDomain::Window { tokens });
+                assert_eq!(producer.domain(), HistoryDomain::Window { tokens });
             }
         }
         let mut model = target(model);

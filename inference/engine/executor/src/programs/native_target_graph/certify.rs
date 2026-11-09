@@ -386,6 +386,10 @@ impl FamilyLayouts {
             let mut graphs = ShapeLayouts::new();
             let slot = plan.blocks()[index];
             let paired = paired_block(&geometry.blocks[index]).map_err(|error| error.to_string())?;
+            let picked = match slot.mixer() {
+                crate::MixerProgramSlot::Attention(binding) => binding.picked,
+                _ => None,
+            };
             let split = block_split(load, geometry, index, limits)?.is_some();
             let resident = streamed::resident_form(load, block_scopes(index)?[1]);
             let mut regimes: BTreeMap<RowForm, Vec<u64>> = BTreeMap::new();
@@ -442,7 +446,7 @@ impl FamilyLayouts {
                             .iter()
                             .map(|&rows| {
                                 let grouped = if stage == RunStage::Combine { passes.rows() } else { rows };
-                                block_class_slice(&paired, rows, grouped, max_slots, max_segments, &listings, scored)
+                                block_class_slice(&paired, rows, grouped, max_slots, max_segments, &listings, scored, picked)
                             })
                             .collect::<Result<Vec<_>, _>>()?;
                         let layout = graph

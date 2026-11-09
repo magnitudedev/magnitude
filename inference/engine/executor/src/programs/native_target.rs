@@ -18,6 +18,7 @@ use super::{
 use crate::device_table::{SelectedRead, SubmittedRead};
 use crate::host_tables::HostTableError;
 use crate::stored_table::{NoticeStep, StepRows, StoredTable};
+use crate::operators::attention::pooled::ListPorts;
 use crate::operators::block::{BankPorts, HistoryPorts};
 use crate::operators::streams::ResidualCarry;
 use crate::experts::StepRoute;
@@ -368,6 +369,14 @@ pub struct NativeTargetProgram {
 /// The launch whose rows a step runs: its advances' state and conditioning.
 struct RowState<'a>(&'a TargetLaunchCore);
 
+/// A pooled source's planes and reads (`RowState::pooled`).
+struct PooledPlanes<'a> {
+    window: Option<(usize, [&'a Tensor; 2])>,
+    block_read: usize,
+    rows: &'a Tensor,
+    index_keys: Option<&'a Tensor>,
+}
+
 pub struct TargetReadoutGraphResult {
     pub features: GraphOutputTensor,
     pub logits: Option<GraphOutputTensor>,
@@ -690,16 +699,19 @@ impl RowState<'_> {
     /// block keys' reads, each with its planes in descriptor order.
     fn indexer(&self, block: u32) -> Result<[(usize, Vec<&Tensor>); 2], SubmitError> {
         let store = self.0.store();
-        let (window, blocks) = store
-            .indexer_domains(block)
-            .ok_or_else(|| invalid("a selected attention layer has no indexer history"))?;
+        let (Some(window), blocks) = store
+            .index_key_domains(block, 0)
+            .ok_or_else(|| invalid("a selected attention layer has no indexer history"))?
+        else {
+            return Err(invalid("a selected attention layer's indexer keeps no raw keys"));
+        };
         let planes = self
             .0
             .advances()
             .first()
             .map(|advance| advance.bindings().history)
             .ok_or_else(|| invalid("attention batch has no state advance"))?;
-        let layer = LayerRef::Indexer(block);
+        let layer = LayerRef::IndexKeys { block, part: 0 };
         let of = |domain: magnitude_state::HistoryDomainId| {
             (
                 domain.0,
@@ -711,6 +723,45 @@ impl RowState<'_> {
             )
         };
         Ok([of(window), of(blocks)])
+    }
+    /// Target block `block`'s pooled source `part`
+    /// (`StateStore::pooled_domains`): its Window read with its pending
+    /// rows and coordinates (none at rate 1), its Block read with its pooled
+    /// rows, and the index keys an own indexer keeps beside them.
+    fn pooled(&self, block: u32, part: u32) -> Result<PooledPlanes<'_>, SubmitError> {
+        let store = self.0.store();
+        let (window, blocks) = store
+            .pooled_domains(block, part)
+            .ok_or_else(|| invalid("an index-list source has no pooled history"))?;
+        let planes = self
+            .0
+            .advances()
+            .first()
+            .map(|advance| advance.bindings().history)
+            .ok_or_else(|| invalid("attention batch has no state advance"))?;
+        let of = |domain: magnitude_state::HistoryDomainId, layer: LayerRef| {
+            planes
+                .iter()
+                .filter(move |plane| plane.domain == domain && plane.layer == layer)
+                .map(|plane| &plane.buffer)
+                .collect::<Vec<_>>()
+        };
+        let pooled = LayerRef::Pooled { block, part };
+        let window = window
+            .map(|domain| match of(domain, pooled)[..] {
+                [rows, coordinates] => Ok((domain.0, [rows, coordinates])),
+                _ => Err(invalid("a pooled source's window planes are not two")),
+            })
+            .transpose()?;
+        let [rows] = of(blocks, pooled)[..] else {
+            return Err(invalid("a pooled source's Block planes are not one"));
+        };
+        let index_keys = match of(blocks, LayerRef::IndexKeys { block, part })[..] {
+            [] => None,
+            [keys] => Some(keys),
+            _ => return Err(invalid("a pooled source's index-key planes are not one")),
+        };
+        Ok(PooledPlanes { window, block_read: blocks.0, rows, index_keys })
     }
     fn conditioning(&self, slot: usize) -> Option<&ConditioningRef> {
         self.0.conditioning().get(slot).and_then(Option::as_ref)
@@ -2123,8 +2174,65 @@ impl NativeTargetProgram {
                 destinations,
                 history_tiles,
                 indexer,
+                picked,
             }) = &graph.state.history
             {
+                // An index-list source (`attention::pooled`) binds its
+                // pooled source's Block plane and the launch's picks table of
+                // that source's read; an indexing source also the read's
+                // index keys, its rows' complete units and lists (the read's
+                // spans, the pool table a producing indexer stores, or the
+                // pool table a restricted indexer lists); an own source also
+                // its Block destinations and, above rate 1, its Window planes
+                // and the window's spans and destinations.
+                if let Some(picked) = picked {
+                    let source = picked.source;
+                    let pooled = state.pooled(source.block, source.part)?;
+                    let block_read = pooled.block_read;
+                    bindings.set(&picked.plane, pooled.rows).map_err(device)?;
+                    bindings
+                        .set(&picked.picks, controls.bound(LaunchControl::Picks { read: block_read })?)
+                        .map_err(device)?;
+                    if let Some(index) = &picked.index {
+                        let index_keys = pooled
+                            .index_keys
+                            .ok_or_else(|| invalid("an indexed pooled source has no index keys"))?;
+                        bindings.set(&index.index_keys, index_keys).map_err(device)?;
+                        let pool = LaunchControl::Pool { read: block_read };
+                        let mut tables = vec![(&index.complete, LaunchControl::Complete { read: block_read })];
+                        match &index.lists {
+                            ListPorts::Visible { spans, pool: stored } => {
+                                tables.push((spans, LaunchControl::Visible { read: block_read }));
+                                tables.extend(stored.iter().map(|stored| (stored, pool)));
+                            }
+                            ListPorts::Pool(listed) => tables.push((listed, pool)),
+                        }
+                        if let Some(own) = &index.own {
+                            tables.push((
+                                &own.block_destinations,
+                                LaunchControl::Destinations { read: block_read },
+                            ));
+                            match (&own.window, pooled.window) {
+                                (Some(window), Some((window_read, [window_rows, window_coordinates]))) => {
+                                    bindings.set(&window.rows, window_rows).map_err(device)?;
+                                    bindings
+                                        .set(&window.coordinates, window_coordinates)
+                                        .map_err(device)?;
+                                    tables.push((&window.visible, LaunchControl::Visible { read: window_read }));
+                                    tables.push((
+                                        &window.destinations,
+                                        LaunchControl::Destinations { read: window_read },
+                                    ));
+                                }
+                                (None, None) => {}
+                                _ => return Err(invalid("a pooled source's window disagrees with its graph's")),
+                            }
+                        }
+                        for (port, control) in tables {
+                            bindings.set(port, controls.bound(control)?).map_err(device)?;
+                        }
+                    }
+                }
                 // A selected read's indexer: its planes, and its rows'
                 // spans and destinations in its two histories, written
                 // as the block's own read is.
@@ -2488,6 +2596,23 @@ impl GraphControls {
                     }
                     LaunchControl::Fresh { read: at } => pairs(&read(at)?.0.fresh),
                     LaunchControl::Destinations { read: at } => read(at)?.1.destinations.clone(),
+                    // The rows a row's visible spans list in a Block read are
+                    // its complete groups.
+                    LaunchControl::Complete { read: at } => i32_bytes(
+                        &read(at)?
+                            .0
+                            .visible
+                            .iter()
+                            .map(|spans| {
+                                spans.iter().map(|&[start, end]| (end - start).max(0)).sum::<i32>()
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    // The picks and the candidate pool the read's own layer
+                    // stores before any reader.
+                    LaunchControl::Picks { .. } | LaunchControl::Pool { .. } => {
+                        i32_bytes(&vec![-1; extents.iter().product::<u64>() as usize])
+                    }
                     LaunchControl::Segments => pairs(&batch.segments[..=batch.actual_slots]),
                     LaunchControl::Stop => i32_bytes(&batch.stop[..batch.actual_slots]),
                     LaunchControl::PreviousBank => i32_bytes(&batch.bank[..batch.actual_slots]),

@@ -29,6 +29,8 @@
 // element::Act before conversion to the history's physical operand type.
 
 #include "../core/activation.h"
+#include "../core/rotary.h"
+#include "../core/rounding.h"
 #include <seismic/slab.h>
 
 // Head width, and the contiguous columns each of a simdgroup's 32 lanes owns.
@@ -58,29 +60,22 @@
 #define ATTENTION_ROTARY_ADJACENT (SEISMIC_DIM_RA != 0)
 
 static_assert(ATTENTION_W % 32 == 0, "attention head width must be a multiple of 32");
-static_assert(SEISMIC_DIM_P % ATTENTION_E == 0,
-    "each rotary half must cover whole lanes");
-static_assert(!ATTENTION_ROTARY_ADJACENT || ATTENTION_E % 2 == 0 || ATTENTION_E == 1,
-    "an adjacent pair must lie within one lane or span two");
 
 namespace attention {
+
+// The dense entries' trained key rounding from their `KR` and four `key_*`
+// scalars (`rounding.seismic`): the scalars under KR = 1, none (block 0)
+// under KR = 0. Each entry that declares KR passes its own.
+inline rounding::Rounding key_rounding(bool kr, uint block, uint element, uint scale, uint amax_floor) {
+    return rounding::Rounding{kr ? int(block) : 0, int(element), int(scale), as_type<float>(amax_floor)};
+}
 
 // The activation element's MSL scalar.
 typedef element::Act::native Scalar;
 
-// sin and cos of an F32 rotary angle (|angle| up to the context length). The
-// angle is reduced exactly enough to [-pi, pi] by a three-part 2*pi
-// (Cody-Waite, fused products) and evaluated with the fast functions, which
-// are accurate on that interval; the precise library functions cost tens of
-// microseconds per head row here.
-inline float sincos(float angle, thread float &cosine) {
-    const float turns = metal::rint(angle * 0.15915494309189535f);
-    float reduced = metal::fma(-turns, 6.28125f, angle);
-    reduced = metal::fma(-turns, 0.0019354820251464844f, reduced);
-    reduced = metal::fma(-turns, -1.7484555314695172e-07f, reduced);
-    cosine = metal::fast::cos(reduced);
-    return metal::fast::sin(reduced);
-}
+// The entry's head rows and their rotary pairs (`rotary::layout`).
+typedef rotary::layout<ATTENTION_W, SEISMIC_DIM_P, ATTENTION_ROTARY_FIRST, ATTENTION_ROTARY_ADJACENT> head_layout;
+typedef head_layout::table rotary_table;
 
 // Appends lane `lane`'s columns of one kv head row at history row
 // `destination` (the caller skips rows without a destination). The element
@@ -211,17 +206,22 @@ inline float divisor(device const float *sinks, ulong head, float maximum, float
 // The fixed-order merge of `count` partial attention states for one column
 // of query head `head`: state p is slot first + p * stride, with its
 // unnormalized output at partials[slot * W + column] (relative to its
-// maximum) and (maximum, denominator) at statistics[slot * 2]. Empty states
+// maximum) and (maximum, denominator) at statistics[slot * 2]; with
+// `picked`, then one more state, an index-list source's (`prefill_picked`),
+// at slot `first` of `picked_partials` and `picked_statistics`. Empty states
 // (denominator 0) are skipped; a column with no state attends to zero. The
-// merged state is normalized by `normalizer` (with the head's sink, if any).
+// merged state is normalized by `divisor` (with the head's sink, if any).
 inline float merge(device const float *partials, device const float *statistics,
-    ulong first, ulong stride, uint count, uint column, device const float *sinks, ulong head) {
+    ulong first, ulong stride, uint count, uint column, device const float *sinks, ulong head,
+    bool picked, device const float *picked_partials, device const float *picked_statistics) {
     float maximum = -INFINITY;
     for (uint p = 0; p < count; ++p) {
         const ulong slot = first + p * stride;
         if (statistics[slot * 2 + 1] > 0.0f)
             maximum = metal::max(maximum, statistics[slot * 2]);
     }
+    if (picked && picked_statistics[first * 2 + 1] > 0.0f)
+        maximum = metal::max(maximum, picked_statistics[first * 2]);
     float denominator = 0.0f;
     float accumulated = 0.0f;
     for (uint p = 0; p < count; ++p) {
@@ -232,6 +232,11 @@ inline float merge(device const float *partials, device const float *statistics,
             denominator = metal::fma(d, weight, denominator);
             accumulated = metal::fma(partials[slot * ATTENTION_W + column], weight, accumulated);
         }
+    }
+    if (picked && picked_statistics[first * 2 + 1] > 0.0f) {
+        const float weight = metal::fast::exp2(picked_statistics[first * 2] - maximum);
+        denominator = metal::fma(picked_statistics[first * 2 + 1], weight, denominator);
+        accumulated = metal::fma(picked_partials[first * ATTENTION_W + column], weight, accumulated);
     }
     return accumulated / divisor(sinks, head, maximum, denominator);
 }
@@ -260,76 +265,26 @@ inline void head_norm(device const Scalar *raw, device const float *norm, float 
         x[i] = x[i] * inverse * norm[lane * ATTENTION_E + i];
 }
 
-// The place of `column` among a head's rotated columns (`rotate_pairs`):
-// whether it is rotated, its pair, and whether it leads the pair.
-inline bool rotary_rotated(uint column) {
-    return column - ATTENTION_ROTARY_FIRST < 2 * SEISMIC_DIM_P;
-}
-inline uint rotary_pair(uint column) {
-    const uint j = column - ATTENTION_ROTARY_FIRST;
-    return ATTENTION_ROTARY_ADJACENT ? j / 2 : j % SEISMIC_DIM_P;
-}
-inline bool rotary_leads(uint column) {
-    const uint j = column - ATTENTION_ROTARY_FIRST;
-    return ATTENTION_ROTARY_ADJACENT ? j % 2 == 0 : j < SEISMIC_DIM_P;
-}
-// The other column of `column`'s pair.
-inline uint rotary_partner(uint column) {
-    if (ATTENTION_ROTARY_ADJACENT)
-        return column ^ 1u;
-    return rotary_leads(column) ? column + SEISMIC_DIM_P : column - SEISMIC_DIM_P;
-}
-
-// One row's rotary table for lane `lane`'s rotated columns: pair p turns by
-// coordinate axis components[p] at frequencies[p], its cosine and sine
-// scaled by amplitudes[p]. The same table rotates every head of the row.
-struct rotary_table {
-    float cosine[ATTENTION_E];
-    float sine[ATTENTION_E];
-    rotary_table(device const int *coordinates, device const int *components, device const float *frequencies,
-        device const float *amplitudes, uint lane) {
-        if (SEISMIC_DIM_P == 0 || !rotary_rotated(lane * ATTENTION_E))
-            return;
-        ATTENTION_UNROLL
-        for (uint i = 0; i < ATTENTION_E; ++i) {
-            const uint pair = rotary_pair(lane * ATTENTION_E + i);
-            float c;
-            const float s = sincos(float(coordinates[components[pair]]) * frequencies[pair], c);
-            cosine[i] = c * amplitudes[pair];
-            sine[i] = s * amplitudes[pair];
-        }
-    }
-};
-
-// `head_norm`, then the row's pairs rotated by its table. The rotated
-// columns are whole lanes; a half-split pair's partner lives P /
-// ATTENTION_E lanes away, an adjacent pair's in the same lane (or, at one
-// column a lane, the neighbouring one).
+// `head_norm`, then the row's pairs rotated by its table.
 template <bool NORM>
 inline void head_rotary(device const Scalar *raw, device const float *norm, thread const rotary_table &table,
     float epsilon, uint lane, thread float (&x)[ATTENTION_E]) {
     head_norm<NORM>(raw, norm, epsilon, lane, x);
-    if (SEISMIC_DIM_P == 0)
-        return;
-    const bool rotated = rotary_rotated(lane * ATTENTION_E);
-    float partner[ATTENTION_E];
-    if (ATTENTION_ROTARY_ADJACENT && ATTENTION_E > 1) {
-        ATTENTION_UNROLL
-        for (uint i = 0; i < ATTENTION_E; ++i)
-            partner[i] = x[i ^ 1u];
-    } else {
-        const uint partner_lane = rotated ? rotary_partner(lane * ATTENTION_E) / ATTENTION_E : lane;
-        ATTENTION_UNROLL
-        for (uint i = 0; i < ATTENTION_E; ++i)
-            partner[i] = simd_shuffle(x[i], ushort(partner_lane));
-    }
-    if (!rotated)
-        return;
-    ATTENTION_UNROLL
-    for (uint i = 0; i < ATTENTION_E; ++i) {
-        x[i] = rotary_leads(lane * ATTENTION_E + i) ? x[i] * table.cosine[i] - partner[i] * table.sine[i]
-                                                    : x[i] * table.cosine[i] + partner[i] * table.sine[i];
-    }
+    head_layout::rotate(table, lane, x);
+}
+
+// A key `head_rotary` prepares, rounded by `key_rounding` (the portable
+// `rounded_head_rotary`): a rounded row (block > 0) is held in the
+// activation element after its norm and after its rotation, then rounded in
+// F32; an unrounded row is `head_rotary`'s.
+template <bool NORM>
+inline void rounded_head_rotary(device const Scalar *raw, device const float *norm, thread const rotary_table &table,
+    float epsilon, rounding::Rounding key_rounding, uint lane, thread float (&x)[ATTENTION_E]) {
+    head_norm<NORM>(raw, norm, epsilon, lane, x);
+    rounding::hold_lanes<element::Act>(x, key_rounding);
+    head_layout::rotate(table, lane, x);
+    rounding::hold_lanes<element::Act>(x, key_rounding);
+    rounding::round_lanes<ATTENTION_E>(x, key_rounding);
 }
 
 // The output rotary (RO = 1) of one published output column pair, run as
@@ -343,7 +298,7 @@ inline void output_rotary(device Scalar *result, device const int *coordinates, 
     const uint lo = ATTENTION_ROTARY_FIRST + (ATTENTION_ROTARY_ADJACENT ? 2 * pair : pair);
     const uint hi = ATTENTION_ROTARY_ADJACENT ? lo + 1 : lo + SEISMIC_DIM_P;
     float c;
-    const float s = -sincos(float(coordinates[row * 4 + components[pair]]) * frequencies[pair], c);
+    const float s = -rotary::sincos(float(coordinates[row * 4 + components[pair]]) * frequencies[pair], c);
     const float cosine = c * amplitudes[pair], sine = s * amplitudes[pair];
     device Scalar *out = result + (row * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + head) * ATTENTION_W;
     const float low = float(out[lo]), high = float(out[hi]);
@@ -1493,7 +1448,7 @@ inline void prefill_prepare(History history, device const Scalar *query,
     device const int *coordinates, device const int *destinations,
     device typename History::Operand *queries, device typename History::Operand *keys,
     device typename History::Operand *values, ulong M, float epsilon, bool inject_only,
-    uint group, uint simd, uint lane) {
+    uint group, uint simd, uint lane, rounding::Rounding key_rounding) {
     typedef typename History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
@@ -1533,7 +1488,10 @@ inline void prefill_prepare(History history, device const Scalar *query,
     if (!ATTENTION_FRESH)
         return;
     const ulong source = (row * KV + kv_head) * W;
-    head_rotary<ATTENTION_NORM>(key + source, key_norm, table, epsilon, lane, x);
+    // The trained rounding of the prepared key (KR = 1; block 0 rounds
+    // nothing) from its values held in A, in F32 before it is published
+    // (every rounded value is exact in BF16).
+    rounded_head_rotary<ATTENTION_NORM>(key + source, key_norm, table, epsilon, key_rounding, lane, x);
     // A stored-key value is the prepared key.
     float y[E];
     if (ATTENTION_STORED_KEY)
@@ -3242,7 +3200,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     device const typename History::Operand *values, device float *partials,
     device float *statistics, device uint *counts, ulong M, ulong R, float scale, bool softplus,
     threadgroup uchar *shared, threadgroup float *exchange, uint3 group, uint3 groups, uint thread_index,
-    uint simd, uint lane, prefill_selection selection, device const float *sinks = nullptr) {
+    uint simd, uint lane, prefill_selection selection, device const float *sinks = nullptr, bool picks = false) {
     typedef typename History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
@@ -3318,7 +3276,9 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     const uint tiles_hi = metal::min(tiles_lo + per, total_tiles);
     // A call of several launches stores the split record in each, which
     // the fold launch takes.
-    const uint stored = held.first && held.last ? active : metal::max(active, 2u);
+    // An index-list source (`picks`) adds one state the merge takes: every
+    // tile stores split records.
+    const uint stored = held.first && held.last && !picks ? active : metal::max(active, 2u);
 
     // On tensor operations the direct form when the entry takes it, else the
     // tensor form where its rows fit; otherwise the fragment form. A DIRECT
@@ -3433,15 +3393,74 @@ inline void prefill_fold(history_window window, prefill_held held, uint round, d
 template <uint QT>
 inline void prefill_merge(device const Scalar *query, device const Scalar *gate, device Scalar *result,
     device const float *partials, device const float *statistics, device const uint *counts,
-    ulong M, uint tile, ulong head, uint column, bool softplus, device const float *sinks = nullptr) {
+    ulong M, uint tile, ulong head, uint column, bool softplus, device const float *sinks = nullptr,
+    bool picks = false, device const float *picked_partials = nullptr,
+    device const float *picked_statistics = nullptr) {
     constexpr uint W = ATTENTION_W;
     constexpr uint H = SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP;
     const uint count = counts[tile];
-    if (count <= 1)
+    if (count <= 1 && !picks)
         return;
     for (ulong row = ulong(tile) * QT; row < metal::min(ulong(tile + 1) * QT, M); ++row) {
-        const float attended = merge(partials, statistics, row * H + head, M * H, count, column, sinks, head);
-        result[(row * H + head) * W + column] = gate_output(query, gate, row, head, column, attended, softplus);
+        const ulong state = row * H + head;
+        const float attended = merge(partials, statistics, state, M * H, count, column, sinks, head,
+            picks, picked_partials, picked_statistics);
+        result[state * W + column] = gate_output(query, gate, row, head, column, attended, softplus);
+    }
+}
+
+// The index-list source of `attention_prefill` (KS > 0): one
+// simdgroup per (row, query head), lane l holding columns [l E, (l + 1) E).
+// Each of the row's picks (`selected_rows`, -1 none) is a row of the
+// source's one plane `selected`, read as key and value: its score against
+// the row's prepared query (L1's scratch, the operand the key partitions
+// read) at the exp2-domain `scale`, the online softmax in F32, and the
+// unnormalized output. The state is stored beside the key partitions'
+// (`picked_partials` [M][H][W], `picked_statistics` [M][H][2]), and the
+// merge folds it in after them.
+inline void prefill_picked(device const Scalar *queries, device const int *selected_rows,
+    device const ulong *selected, ulong rows_per_slab, device float *picked_partials,
+    device float *picked_statistics, ulong KS, float scale, uint row, uint head, uint lane) {
+    constexpr uint W = ATTENTION_W;
+    constexpr uint E = ATTENTION_E;
+    constexpr uint KV = SEISMIC_DIM_KV;
+    constexpr uint G = ATTENTION_QUERY_GROUP;
+    const uint kv_head = head / G;
+    const ulong state = ulong(row) * KV * G + head;
+    float q[E];
+    float accumulated[E];
+    for (uint i = 0; i < E; ++i) {
+        q[i] = float(queries[state * W + lane * E + i]);
+        accumulated[i] = 0.0f;
+    }
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    for (ulong pick = 0; pick < KS; ++pick) {
+        const int picked = selected_rows[ulong(row) * KS + pick];
+        if (picked < 0)
+            continue;
+        device const Scalar *key = slab::row<Scalar>(selected, ulong(picked), rows_per_slab, KV * W)
+            + kv_head * W + lane * E;
+        float x[E];
+        float dot = 0.0f;
+        for (uint i = 0; i < E; ++i) {
+            x[i] = float(key[i]);
+            dot = metal::fma(q[i], x[i], dot);
+        }
+        const float score = metal::simd_sum(dot) * scale;
+        const float next = metal::max(maximum, score);
+        const float carry = metal::fast::exp2(maximum - next);
+        const float weight = metal::fast::exp2(score - next);
+        denominator = metal::fma(denominator, carry, weight);
+        for (uint i = 0; i < E; ++i)
+            accumulated[i] = metal::fma(accumulated[i], carry, weight * x[i]);
+        maximum = next;
+    }
+    for (uint i = 0; i < E; ++i)
+        picked_partials[state * W + lane * E + i] = accumulated[i];
+    if (lane == 0) {
+        picked_statistics[state * 2] = maximum;
+        picked_statistics[state * 2 + 1] = denominator;
     }
 }
 

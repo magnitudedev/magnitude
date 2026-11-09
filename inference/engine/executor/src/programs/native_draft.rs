@@ -58,8 +58,9 @@ use crate::{
 use magnitude_batching::{row_class, TargetBatchUpload};
 use magnitude_family_contracts::{
     ActivationDType, AffinePart, BlockAttention, CandidateCorrector, CorrectorSite,
-    CorrectorWeight, DraftDefinition, DraftEmbedding, DraftMethod, HistoryDomain, KeyValue,
-    ModelDefinition, SublayerIndex, WeightKind, WeightRole, WeightScope,
+    CorrectorWeight, DraftDefinition, DraftEmbedding, DraftMethod, ModelDefinition,
+    ProjectedRows as ProjectedSource, SublayerIndex, TokenDomain, WeightKind, WeightRole,
+    WeightScope,
 };
 use magnitude_kernels::{
     corrector_attention, corrector_factors, corrector_features, corrector_nodes, corrector_path,
@@ -131,11 +132,11 @@ pub(crate) fn skippable_layers(draft: &DraftDefinition) -> Result<Vec<bool>, Str
             let Mixer::Attention(attention) = paired.mixer else {
                 return Err("draft layers attend".to_owned());
             };
-            Ok(match attention.key_value {
-                KeyValue::Owned {
-                    domain: HistoryDomain::Window { tokens },
+            Ok(match operators::attention::fresh_rows(attention) {
+                operators::attention::FreshRows::Own(ProjectedSource {
+                    domain: TokenDomain::Window { tokens },
                     ..
-                } => Some(tokens),
+                }) => Some(*tokens),
                 _ => None,
             })
         })
@@ -1112,7 +1113,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             continue;
         }
         let shape =
-            operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
+            operators::attention::shape(hidden, attention, None).map_err(|error| error.to_string())?;
         let scope = draft_sublayer(index, 0)?;
         let operands = AttentionOperands::planned(
             &mut graph,
@@ -1165,6 +1166,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             inject_only,
             causal_cache: false,
             selection: None,
+            picked: None,
             controls: crate::programs::graph::draft::ControlSource::Uploaded,
         }
     }
@@ -1387,6 +1389,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             post_norm: None,
             operands: injection_weights.operands.clone(),
             indexer: None,
+            picked: None,
         };
         let join = Join::single(None);
         let (mixed, state, controls) = attention_graph::attention(
@@ -2118,8 +2121,10 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
             inject_only: false,
             causal_cache: false,
             selection: None,
+            picked: None,
             controls: crate::programs::graph::draft::ControlSource::Uploaded,
         },
+        None,
         None,
         None,
     )?;
@@ -3419,13 +3424,15 @@ impl NativeDraftProgram {
                 let paired = operators::draft::draft_block(draft, index)
                     .map_err(|error| invalid(error.to_string()))?;
                 match paired.mixer {
-                    Mixer::Attention(attention) => Ok(match attention.key_value {
-                        KeyValue::Owned {
-                            domain: HistoryDomain::Window { tokens },
-                            ..
-                        } => Some(tokens),
-                        _ => None,
-                    }),
+                    Mixer::Attention(attention) => {
+                        Ok(match operators::attention::fresh_rows(attention) {
+                            operators::attention::FreshRows::Own(ProjectedSource {
+                                domain: TokenDomain::Window { tokens },
+                                ..
+                            }) => Some(*tokens),
+                            _ => None,
+                        })
+                    }
                     _ => Err(invalid("draft layers attend")),
                 }
             })

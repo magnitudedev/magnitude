@@ -4,8 +4,8 @@
 use magnitude_artifacts::{ArtifactIdentity, PackageIdentity};
 use magnitude_family_common::headers;
 use magnitude_family_contracts::{
-    AttentionGate, CellReduction, GateFunction, GateGranularity, HistoryDomain, KeyValue,
-    ModelFamily, Operator, OutputForm, Rotary, VisionActivation, VisionNorm, VisionOperator,
+    AttentionGate, CellReduction, GateFunction, GateGranularity, HistoryRows, ModelFamily,
+    Operator, OutputForm, ProjectedRows, Rotary, RowProducer, TokenDomain, VisionActivation, VisionNorm, VisionOperator,
     VisionResize, VisionStem,
 };
 use magnitude_family_lfm2::{describe_projector, inspect_components, Lfm2Family};
@@ -62,15 +62,18 @@ fn released_quantizations_bind_the_hybrid_decoder() {
                             panic!("layer {index}: an LFM3 head gate");
                         };
                         assert_eq!(weight.shape, [16, 2048]);
-                        let KeyValue::Owned { domain, .. } = &a.key_value else {
+                        let HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                            domain, ..
+                        })) = &a.fresh().rows
+                        else {
                             panic!("layer {index}: an owned key/value history");
                         };
                         if WINDOW.contains(&index) {
-                            assert_eq!(*domain, HistoryDomain::Window { tokens: 256 });
+                            assert_eq!(*domain, TokenDomain::Window { tokens: 256 });
                             assert_eq!(rotated_pairs(&a.rotary), 64);
                         } else {
                             assert!(FULL.contains(&index));
-                            assert_eq!(*domain, HistoryDomain::Token);
+                            assert_eq!(*domain, TokenDomain::Token);
                             assert_eq!(rotated_pairs(&a.rotary), 32);
                             assert!(matches!(
                                 &a.rotary,

@@ -33,7 +33,8 @@ fn shared_prediction_package_retains_raw_streams_and_owns_causal_history() {
     let Operator::Attention(attention) = &head.blocks[0].blocks[0].sublayers[0].op else {
         panic!("prediction must attend")
     };
-    assert_eq!(attention.reads, HistoryReads::Visible);
+    assert_eq!(attention.history.len(), 1);
+    assert_eq!(attention.fresh().reads, HistoryReads::Visible);
     target.head = Some(head);
     target.validate().unwrap();
     assert!(target.deferred_forms().is_empty());

@@ -10,7 +10,7 @@ use magnitude_artifacts::{
 use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     EmbeddingScale, ExitNorm, HeadChain, HeadComponent, HeadHistory, HeadInput, HistoryDomain,
-    KeyValue, ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy, SublayerIndex,
+    HistoryRows, HistorySource, ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy, SublayerIndex,
     VocabularyProjection,
 };
 use magnitude_family_gemma4::{ASSISTANT_ARCHITECTURE, inspect_assistant, inspect_components};
@@ -297,7 +297,11 @@ fn every_published_assistant_is_a_draft_head_of_its_qat_target() {
                 let Operator::Attention(attention) = &block.sublayers[0].op else {
                     panic!("attention sublayer");
                 };
-                let KeyValue::Shared { source } = &attention.key_value else {
+                let [HistorySource {
+                    rows: HistoryRows::Shared { source, part: 0 },
+                    ..
+                }] = &attention.history[..]
+                else {
                     panic!("an assistant layer owns no history");
                 };
                 *source

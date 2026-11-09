@@ -6,7 +6,8 @@ use super::tuning::{
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
         AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
-        IndexerProjectTuning, LowRankQueryProjectTuning, PrefillListing, history_window,
+        IndexerProjectTuning, LowRankQueryProjectTuning, PooledProjectInput,
+        PooledProjectTuning, PrefillListing, history_window, picked_rows,
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
     general_routed::{
@@ -37,6 +38,7 @@ use super::tuning::{
     },
 };
 use super::*;
+use crate::operators::attention::pooled::Pooling;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
 use crate::operators::streams::{BlockStreams, SinkhornBinding, SiteEntryBindings};
@@ -49,11 +51,13 @@ use magnitude_family_contracts::{
     ModelDefinition, SublayerIndex, WeightKind, WeightScope,
 };
 use magnitude_kernels::{
-    attention_append_dense, cluster_token_rows, conditioning_overlay, corrector_attention,
+    attention_append_dense, candidate_blocks, candidate_rows, cluster_token_rows,
+    conditioning_overlay, corrector_attention,
     corrector_factors, corrector_features, corrector_nodes, corrector_path, corrector_rows,
     draft_convolve_input,
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
-    feature_rows, import_dense, moe_tail, ngram_add, ngram_gate, ngram_inject, ngram_rows,
+    feature_rows, import_dense, indexer_keys, indexer_score, moe_tail, ngram_add, ngram_gate,
+    ngram_inject, ngram_rows, pool_rows, rows_topk,
     packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
     selection_notice, stored_rows, stream_collapse, stream_join, stream_mix_sinkhorn, tap_rows,
@@ -1378,7 +1382,15 @@ impl<'a> Preparation<'a> {
                     .map(|(widen, project)| Some(LowRankQueryKernels { widen, project }))
             }
         };
+        let picked = self.picked(binding, &scopes)?;
         let window = history_window(&self.tuning.model(), &scopes).map_err(|outcome| {
+            CatalogFailure::Preparation {
+                entry: "attention_decode",
+                bindings: format!("{shape:?}"),
+                outcome,
+            }
+        })?;
+        let index_list = picked_rows(&self.tuning.model(), &scopes).map_err(|outcome| {
             CatalogFailure::Preparation {
                 entry: "attention_decode",
                 bindings: format!("{shape:?}"),
@@ -1395,6 +1407,7 @@ impl<'a> Preparation<'a> {
             listing: PrefillListing::Every,
             window,
             selection: binding.selection,
+            picked: index_list,
         };
         // The history's prefill reads every visible row (a selected read's
         // classes without scoring too); its WorkList form is the selection's.
@@ -1402,6 +1415,13 @@ impl<'a> Preparation<'a> {
             selection: None,
             ..mix()
         };
+        let append_statics =
+            crate::operators::attention::graph::append_form_statics(&shape, binding.history)
+                .map_err(|outcome| CatalogFailure::Preparation {
+                    entry: "attention_decode",
+                    bindings: format!("{shape:?}"),
+                    outcome,
+                })?;
         let history = match binding.history.encoding() {
             magnitude_state::HistoryEncoding::Dense => {
                 // As for K8/V4, multi-row launches (draft blocks,
@@ -1454,7 +1474,7 @@ impl<'a> Preparation<'a> {
                     attention_append_dense::Elements {
                         A: binding.activation
                     },
-                    statics & shape.append_statics()
+                    statics & append_statics
                 );
                 decode
                     .zip(prefill)
@@ -1564,15 +1584,6 @@ impl<'a> Preparation<'a> {
                 } else {
                     None
                 };
-                let mut append_statics = shape.append_statics();
-                append_statics.extend(
-                    crate::operators::attention::graph::affine_dimensions(binding.history)
-                        .map_err(|error| CatalogFailure::Preparation {
-                            entry: "attention_append_k8v4",
-                            bindings: format!("{:?}", binding.history),
-                            outcome: error.to_string(),
-                        })?,
-                );
                 let append = fixed!(
                     self.spec,
                     attention_append_k8v4,
@@ -1598,11 +1609,7 @@ impl<'a> Preparation<'a> {
                     )
             }
             magnitude_state::HistoryEncoding::Unsupported => {
-                return Err(CatalogFailure::Preparation {
-                    entry: "attention_decode",
-                    bindings: format!("{shape:?}"),
-                    outcome: "the native path has no rotated K4/V4 history entries".into(),
-                });
+                unreachable!("the attention form refuses a rotated K4/V4 history")
             }
         };
         // A selected read's indexer: its projection, tuned over the layers'
@@ -1697,7 +1704,7 @@ impl<'a> Preparation<'a> {
                 )?
                 .map(SublayerOutput::PostNorm),
         };
-        Ok(match (project, history, output, grouped, selection, low_rank_query) {
+        Ok(match (project, history, output, grouped, selection, low_rank_query, picked) {
             (
                 Some(project),
                 Some(history),
@@ -1705,6 +1712,7 @@ impl<'a> Preparation<'a> {
                 Some(grouped),
                 Some(selection),
                 Some(low_rank_query),
+                Some(picked),
             ) => {
                 Some(AttentionKernels {
                     codec: binding.history,
@@ -1714,10 +1722,191 @@ impl<'a> Preparation<'a> {
                     grouped,
                     selection,
                     low_rank_query,
+                    picked,
                 })
             }
             _ => None,
         })
+    }
+
+    /// An indexing index-list source's entries (`PickedKernels`): an own
+    /// source's `u | g` and index-key projections, its indexer's query and
+    /// head-weight projections, each tuned over the layers' weights at the
+    /// elements `PickedElements` assigns, and the widening, pooling, keys,
+    /// scores, picks and candidate pool at their statics. `Some(None)` for a
+    /// binding without an indexing source.
+    fn picked(
+        &mut self,
+        binding: AttentionBinding,
+        scopes: &[WeightScope],
+    ) -> Result<Option<Option<PickedKernels>>, CatalogFailure> {
+        let Some(elements) = crate::operators::attention::pooled::PickedElements::of(binding) else {
+            return Ok(Some(None));
+        };
+        let index = elements.indexer;
+        let shape = binding.shape;
+        let activation = binding.activation;
+        let project = |this: &mut Self, elements, segments, input| {
+            this.spec.tuned(
+                &mut this.tuning,
+                &PooledProjectTuning {
+                    elements,
+                    segments,
+                    input,
+                    scopes: scopes.to_vec(),
+                    epsilon: this.epsilon,
+                },
+            )
+        };
+        let hidden = PooledProjectInput::Hidden { hidden: shape.hidden };
+        let pairs = shape.rotary_pairs;
+        let rotary = [("RA", shape.rotary_adjacent), ("RT", shape.rotary_trailing)];
+        // An own source's rows and keys.
+        let rows = match (binding.picked, elements.rows) {
+            (Some(crate::PickedBinding::Own(pooled)), Some(rows)) => {
+                let gate = pooled.gate.map(|_| WeightKind::PooledGate);
+                let tokens = project(
+                    self,
+                    rows.project,
+                    [Some(WeightKind::PooledProjection), gate],
+                    hidden,
+                )?;
+                let key_project = project(
+                    self,
+                    rows.key_project,
+                    [Some(WeightKind::IndexerKey), None],
+                    match rows.pooling {
+                        Pooling::Grouped => PooledProjectInput::Plain { width: shape.width },
+                        Pooling::Identity => PooledProjectInput::Tokens { width: shape.width },
+                    },
+                )?;
+                let widen = fixed!(
+                    self.spec,
+                    widen_rows,
+                    format!("A={}", activation.name()),
+                    widen_rows::Elements { A: activation }
+                );
+                let width = [("P", pairs), ("S", shape.width - 2 * pairs)];
+                let pool = match rows.pooling {
+                    Pooling::Identity => fixed!(
+                        self.spec,
+                        attention_append_dense,
+                        format!("{pooled:?};{shape:?}"),
+                        attention_append_dense::Elements { A: activation },
+                        statics
+                            & [width.as_slice(), &Pooling::identity_append(pooled.rounding), &rotary].concat()
+                    )
+                    .map(PoolKernel::Identity),
+                    Pooling::Grouped => fixed!(
+                        self.spec,
+                        pool_rows,
+                        format!("{pooled:?};{shape:?}"),
+                        pool_rows::Elements { A: activation },
+                        statics
+                            & [
+                                width.as_slice(),
+                                &[("GT", pooled.gt()), ("RATE", pooled.rate)],
+                                &rotary,
+                            ]
+                            .concat()
+                    )
+                    .map(PoolKernel::Grouped),
+                };
+                let keys = fixed!(
+                    self.spec,
+                    indexer_keys,
+                    format!("{index:?};P={pairs}"),
+                    indexer_keys::Elements { A: activation },
+                    statics & [[("P", pairs), ("S", index.width - 2 * pairs)].as_slice(), &rotary].concat()
+                );
+                match (tokens, widen, pool, key_project, keys) {
+                    (Some(project), Some(widen), Some(pool), Some(key_project), Some(keys)) => {
+                        Some(Some(PooledKernels {
+                            project,
+                            widen,
+                            pool,
+                            key_project,
+                            keys,
+                        }))
+                    }
+                    _ => None,
+                }
+            }
+            (Some(crate::PickedBinding::Reindex { .. }), None) => Some(None),
+            (picked, rows) => unreachable!(
+                "PickedElements::of gives an own source rows and a reindexing source none: \
+                 {picked:?} with rows {rows:?}"
+            ),
+        };
+        let query_project = project(
+            self,
+            elements.query_project,
+            [Some(WeightKind::IndexerQuery), None],
+            PooledProjectInput::QueryRank { rank: elements.query_rank },
+        )?;
+        let weights_project = match elements.weights_project {
+            None => Some(None),
+            Some(elements) => project(
+                self,
+                elements,
+                [Some(WeightKind::IndexerHeadWeights), None],
+                hidden,
+            )?
+            .map(Some),
+        };
+        let score = fixed!(
+            self.spec,
+            indexer_score,
+            format!("{index:?};P={pairs}"),
+            indexer_score::Elements { A: activation },
+            statics
+                & [
+                    [
+                        ("H", index.heads),
+                        ("P", pairs),
+                        ("S", index.width - 2 * pairs),
+                        ("NQ", index.query_norm),
+                        ("HW", if index.head_weights.is_some() { index.heads } else { 0 }),
+                    ]
+                    .as_slice(),
+                    &rotary,
+                ]
+                .concat()
+        );
+        let topk = fixed!(self.spec, rows_topk, format!("{index:?}"));
+        // A producing indexer's candidate pool.
+        let candidates = match index.candidates {
+            crate::CandidatesBinding::Produce(pool) => {
+                let blocks = fixed!(self.spec, candidate_blocks, format!("{pool:?}"));
+                let listed = fixed!(self.spec, candidate_rows, format!("{pool:?}"));
+                blocks
+                    .zip(listed)
+                    .map(|(blocks, rows)| Some(CandidateKernels { blocks, rows }))
+            }
+            crate::CandidatesBinding::All | crate::CandidatesBinding::Restrict(_) => Some(None),
+        };
+        Ok(
+            match (rows, query_project, weights_project, score, topk, candidates) {
+                (
+                    Some(rows),
+                    Some(query_project),
+                    Some(weights_project),
+                    Some(score),
+                    Some(topk),
+                    Some(candidates),
+                ) => Some(Some(PickedKernels {
+                    rows,
+                    indexer: IndexerKernels {
+                        query_project,
+                        weights_project,
+                        score,
+                        topk,
+                        candidates,
+                    },
+                })),
+                _ => None,
+            },
+        )
     }
 
     /// The state-space entries (`operators::state_space`): the projection and
@@ -2022,7 +2211,7 @@ impl<'a> Preparation<'a> {
             .tuned(&mut self.tuning, &projection(WeightKind::NGramValue))?;
         let rows = self.spec.fixed(
             "fixed",
-            &[("C", binding.context), ("P", binding.heads_per_order)],
+            &binding.rule.statics(),
             ngram_rows::native_entry(),
         )?;
         let stored = self.spec.fixed(

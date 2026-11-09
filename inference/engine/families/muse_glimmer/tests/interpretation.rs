@@ -3,8 +3,9 @@ use magnitude_artifacts::{
     ArtifactIdentity, InputLayout, PackageIdentity, TokenId,
 };
 use magnitude_family_contracts::{
-    AttentionGate, CellReduction, ExitNorm, GateFunction, GateGranularity, HeadNorm, HistoryDomain,
-    ImportTransform, InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator, OutputForm,
+    AttentionGate, CellReduction, ExitNorm, GateFunction, GateGranularity, HeadNorm, HistoryRows,
+    HistorySource, ImportTransform, InputNorm, ModelDefinition, ModelFamily, Operator, OutputForm,
+    ProjectedRows, RowProducer, TokenDomain,
     PositionSampling, QueryProjection, Rotary, TokenPlan, ValueSource, VisionAttentionSpan, VisionNorm,
     VisionOperator, VisionResampling, VisionResize, WeightDescriptor,
 };
@@ -116,13 +117,17 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
                     granularity: GateGranularity::Element,
                 } if weight.shape == [4096, 6656] && weight.transforms.is_empty()
             ));
-            let KeyValue::Owned {
-                key,
-                value: ValueSource::Projected(value),
-                key_norm: HeadNorm::Rms(key_norm),
-                domain,
+            let [HistorySource {
+                rows:
+                    HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                        key,
+                        value: ValueSource::Projected(value),
+                        key_norm: HeadNorm::Rms(key_norm),
+                        domain,
+                        ..
+                    })),
                 ..
-            } = &attention.key_value
+            }] = &attention.history[..]
             else {
                 panic!("layer {layer} owns projected history");
             };
@@ -136,14 +141,14 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
             // Full layers are the last of every four; they have no rotary
             // and keep the whole history.
             if layer % 4 == 3 {
-                assert_eq!(*domain, HistoryDomain::Token);
+                assert_eq!(*domain, TokenDomain::Token);
                 assert_eq!(attention.rotary, Rotary::None);
                 for weight in [query, key, &query_norm.weight, &key_norm.weight] {
                     assert!(weight.transforms.is_empty(), "{}", weight.name);
                 }
             } else {
                 windowed += 1;
-                assert_eq!(*domain, HistoryDomain::Window { tokens: 2048 });
+                assert_eq!(*domain, TokenDomain::Window { tokens: 2048 });
                 let Rotary::Table { pairs, .. } = &attention.rotary else {
                     panic!("layer {layer} rotates");
                 };

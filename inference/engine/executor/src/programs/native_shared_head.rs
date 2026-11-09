@@ -521,6 +521,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                         destinations,
                         history_tiles: None,
                         indexer: None,
+                        picked: None,
                     }),
                 bank: None,
             } = state

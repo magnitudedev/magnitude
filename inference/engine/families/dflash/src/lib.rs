@@ -32,8 +32,9 @@ use magnitude_family_contracts::{
     checked_product, ActivationFunction, Affine, Attention, AttentionGate, Block, BlockAttention,
     BlockConvolutions, BlockLayout, CandidateCorrector, CandidateSelector, CenteredNorm,
     ConfidenceHead, CorrectorLayer, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding,
-    DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, HeadNorm, HistoryDomain,
-    HistoryReads, ImportTransform, InputNorm, KeyValue, LayerConvolutions, MarkovHead,
+    DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, HeadNorm, HistoryRows,
+    HistorySource, ImportTransform, InputNorm, LayerConvolutions, MarkovHead, ProjectedRows,
+    RowProducer, RowRounding, TokenDomain,
     MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection, OutputRotary,
     QueryProjection, RmsNorm, Rotary, RotaryLayout, Sublayer, TapPoint,
     ValueNorm, ValueSource, WeightDescriptor, CORRECTOR_FEATURES,
@@ -576,15 +577,18 @@ pub fn inspect(
                 query: QueryProjection::Full(weight("attn_q", &[query_rows, hidden])?),
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::Rms(rms(weight("attn_q_norm", &[width])?)),
-                key_value: KeyValue::Owned {
-                    key: weight("attn_k", &[key_rows, hidden])?,
-                    value: ValueSource::Projected(weight("attn_v", &[key_rows, hidden])?),
-                    key_norm: HeadNorm::Rms(rms(weight("attn_k_norm", &[width])?)),
-                    value_norm: ValueNorm::None,
-                    domain,
-                },
-                rotary: rotary.clone(),                scale: 1.0 / (width as f64).sqrt(),
-                reads: HistoryReads::Visible,
+                history: vec![HistorySource::visible(HistoryRows::Own(
+                    RowProducer::Projected(ProjectedRows {
+                        key: weight("attn_k", &[key_rows, hidden])?,
+                        value: ValueSource::Projected(weight("attn_v", &[key_rows, hidden])?),
+                        key_norm: HeadNorm::Rms(rms(weight("attn_k_norm", &[width])?)),
+                        value_norm: ValueNorm::None,
+                        domain,
+                        rounding: RowRounding::None,
+                    }),
+                ))],
+                rotary: rotary.clone(),
+                scale: 1.0 / (width as f64).sqrt(),
                 media_rows: MediaRowAttention::Causal,
                 sinks,
                 output: OutputProjection::Full(weight("attn_output", &[hidden, query_rows])?),
@@ -956,7 +960,7 @@ fn layer_attention(
     m: &Metadata<'_>,
     block_count: u64,
     context_length: u64,
-) -> Result<Vec<(HistoryDomain, BlockAttention)>, Error> {
+) -> Result<Vec<(TokenDomain, BlockAttention)>, Error> {
     let window = m.optional_integer("attention.sliding_window")?;
     let causal = match m.value("attention.causal") {
         None => return Err(Error::MissingCausality),
@@ -977,14 +981,14 @@ fn layer_attention(
         .zip(causal)
         .map(|(sliding, causal)| {
             let domain = match (sliding, window) {
-                (true, Some(tokens)) => HistoryDomain::Window { tokens },
+                (true, Some(tokens)) => TokenDomain::Window { tokens },
                 (true, None) => {
                     return Err(Error::Metadata {
                         key: m.key("attention.sliding_window"),
                         expected: "present for sliding layers",
                     })
                 }
-                (false, _) => HistoryDomain::Window {
+                (false, _) => TokenDomain::Window {
                     tokens: context_length,
                 },
             };

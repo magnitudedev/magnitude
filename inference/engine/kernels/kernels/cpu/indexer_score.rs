@@ -1,6 +1,7 @@
 // indexer_score on CPU (contract and portable body in indexer.seismic): one
 // work item per (256 scores, row) prepares the row's query heads (normed
-// when NQ = 1, rotated at the row's coordinates, rounded), then scores the
+// when NQ = 1, rotated at the row's coordinates, rounded from the norm and
+// rotation held in A), then scores the
 // rows of its share of the row's list: scale * sum_h relu(q[h] . K) * w[h],
 // each dot an ascending FMA chain. Scores past the list are -inf.
 
@@ -46,18 +47,27 @@ fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
     let rounding = Rounding::of(cx.arg_block(), cx.arg_element(), cx.arg_rounding_scale(), cx.arg_amax_floor());
     let norm = (cx.dim_nq() == 1).then(|| cx.arg_query_norm().row([0, 0]));
     let layout = Layout::new(cx.dim_ra(), cx.dim_rt());
+    // A rounded query is rounded from its norm and rotation held in A.
+    let hold = rounding.map(|_| lib::core::activation::publish::<E::A> as fn(f32) -> f32);
     let query = cx.arg_query();
     for head in 0..h {
-        query.decode_row(row * h + head, key);
+        lib::core::activation::widen::<E::A>(query.row([row, head, 0]), key);
         let prepared = &mut queries[head * w..][..w];
-        attention::prepare_head::<seismic::cpu::F32>(key, norm, layout, cosines, sines, cx.arg_epsilon(), prepared);
-        if let Some(rounding) = rounding {
-            rounding.apply(prepared);
-        }
+        attention::prepare_rounded_head::<seismic::cpu::F32>(
+            key,
+            norm,
+            layout,
+            cosines,
+            sines,
+            cx.arg_epsilon(),
+            rounding,
+            hold,
+            prepared,
+        );
     }
     let mut weights = vec![1.0f32; h];
     if cx.dim_hw() > 0 {
-        cx.arg_head_weights().decode_row(row, &mut weights);
+        lib::core::activation::widen::<E::A>(cx.arg_head_weights().row([row, 0]), &mut weights);
     }
     let keys = SlabTensor::from_bound(cx.arg_keys(), cx.arg_slab_rows() as usize);
     let scale = cx.arg_scale();

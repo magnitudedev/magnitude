@@ -700,6 +700,10 @@ pub(super) fn derive_program_plan(
                     |kind| planned_scalable(target, mixer, kind),
                     active_element,
                     history,
+                    Some(operators::attention::DecoderSite {
+                        decoder,
+                        index: SublayerIndex { block: index, sublayer: 0 },
+                    }),
                 )?,
                 paired
                     .feed_forward
@@ -1007,7 +1011,10 @@ pub(super) fn derive_program_plan(
         matches!(
             &sublayer.op,
             Operator::Attention(attention)
-                if matches!(attention.reads, HistoryReads::Selected { .. })
+                if attention
+                    .history
+                    .iter()
+                    .any(|source| matches!(source.reads, HistoryReads::Selected(_)))
         )
     }) {
         copies.push(Element::i32());
@@ -1055,6 +1062,7 @@ fn shared_head_program_plan(
                 |kind| planned_scalable(weights, mixer, kind),
                 activation,
                 history,
+                None,
             )?,
             paired
                 .feed_forward

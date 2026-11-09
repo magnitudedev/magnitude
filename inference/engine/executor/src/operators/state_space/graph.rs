@@ -47,7 +47,7 @@ impl<'a> From<&'a StateSpaceKernels> for StateSpaceGraphEntries<'a, NativeGraph>
 /// Entry element assignments from the program binding. The projection's
 /// empty segments are views of the projection weight.
 pub(crate) struct CheckedStateSpaceEntries {
-    project: [(&'static str, Element); 6],
+    project: [(&'static str, Element); 7],
     activation: [(&'static str, Element); 1],
     output: [(&'static str, Element); 2],
 }
@@ -62,6 +62,7 @@ impl CheckedStateSpaceEntries {
                 ("KW", binding.projection),
                 ("VW", binding.projection),
                 ("A", binding.activation),
+                ("Y", binding.activation),
             ],
             activation: [("A", binding.activation)],
             output: [("OW", binding.output), ("A", binding.activation)],
@@ -270,9 +271,11 @@ mod tests {
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId, FeedForwardUp,
-        HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
-        KeyValue, LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-        OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
+        HeadNorm, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
+        LatentExperts, MediaRowAttention, ModelDefinition, Operator, OutputForm,
+        OutputProjection, ProjectedRows, QueryProjection, ResidualForm, RmsNorm, Rotary,
+        RouteNormalization, RoutedFfn, Router, RouterInput, RowProducer, RowRounding,
+        TokenDomain,
         ScaledActivations,
         ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, SublayerIndex,
         ValueNorm, ValueSource, WeightDescriptor, WeightKind, WeightRole, WeightScope,
@@ -422,15 +425,21 @@ mod tests {
                     query: QueryProjection::Full(tensor(name("attn_q"), vec![512, HIDDEN])),
                     gate: AttentionGate::None,
                     query_norm: HeadNorm::None,
-                    key_value: KeyValue::Owned {
-                        key: tensor(name("attn_k"), vec![256, HIDDEN]),
-                        value: ValueSource::Projected(tensor(name("attn_v"), vec![256, HIDDEN])),
-                        key_norm: HeadNorm::None,
-                        value_norm: ValueNorm::None,
-                        domain: HistoryDomain::Token,
-                    },
-                    rotary: Rotary::None,                    scale: 1.0 / 128f64.sqrt(),
-                    reads: HistoryReads::Visible,
+                    history: vec![HistorySource::visible(HistoryRows::Own(
+                        RowProducer::Projected(ProjectedRows {
+                            key: tensor(name("attn_k"), vec![256, HIDDEN]),
+                            value: ValueSource::Projected(tensor(
+                                name("attn_v"),
+                                vec![256, HIDDEN],
+                            )),
+                            key_norm: HeadNorm::None,
+                            value_norm: ValueNorm::None,
+                            domain: TokenDomain::Token,
+                            rounding: RowRounding::None,
+                        }),
+                    ))],
+                    rotary: Rotary::None,
+                    scale: 1.0 / 128f64.sqrt(),
                     media_rows: MediaRowAttention::Causal,
                     sinks: None,
                     output: OutputProjection::Full(tensor(name("attn_output"), vec![HIDDEN, 512])),

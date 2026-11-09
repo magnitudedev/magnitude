@@ -899,7 +899,7 @@ pub(super) fn skippable_window(store: &StateStore) -> Option<usize> {
     // An indexer's domains are no attention's.
     let reaches = store
         .history_domains()
-        .filter(|&domain| !super::target::indexer_domain(store, domain))
+        .filter(|&domain| !store.is_produced_domain(domain))
         .map(|domain| match store.history_domain_kind(domain) {
             magnitude_state::HistoryDomainKind::Window { rows } => Some(rows),
             _ => None,

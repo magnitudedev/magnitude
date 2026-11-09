@@ -744,7 +744,7 @@ fn target_reading_head_fixture() -> (ModelDefinition, magnitude_artifacts::Packa
     use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest};
     use magnitude_family_contracts::{
         ExitNorm, FeedForwardUp, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory,
-        HeadInput, HeadNorm, HeadReadout, InputNorm, KeyValue, Operator, RmsNorm,
+        HeadInput, HeadNorm, HeadReadout, HistoryRows, InputNorm, Operator, RmsNorm,
         SublayerIndex, VocabularyProjection, WeightDescriptor,
     };
     const WIDTH: u64 = 96;
@@ -780,11 +780,12 @@ fn target_reading_head_fixture() -> (ModelDefinition, magnitude_artifacts::Packa
                 if let HeadNorm::Rms(norm) = &mut attention.query_norm {
                     norm.weight = descriptor("query_norm", &norm.weight.shape);
                 }
-                attention.key_value = KeyValue::Shared {
+                attention.history[0].rows = HistoryRows::Shared {
                     source: SublayerIndex {
                         block: 0,
                         sublayer: 0,
                     },
+                    part: 0,
                 };
             }
             Operator::DenseFfn(dense) => {

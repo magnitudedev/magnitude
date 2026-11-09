@@ -18,8 +18,10 @@ use magnitude_artifacts::{
 use magnitude_family_common::Tensors;
 use magnitude_family_contracts::{
     ActivationDType, Block, Decoder, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
-    ExitSite, GateFunction, HeadComponent, HistoryReads, HyperConnectionExit, HyperConnectionInput,
-    HyperConnectionMixing, HyperConnectionWeights, HyperConnections, Indexer, InputNorm,
+    ExitSite, GateFunction, HeadComponent, HeadNorm, HeadWeights, HistoryReads,
+    HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing, HyperConnectionWeights,
+    HyperConnections, Indexer, IndexerInput, IndexerKeys, IndexerQuery, InputNorm, Pool,
+    PooledRows, RowRounding, Selection,
     LowRankGatedSite, InputSemantics, ModelDefinition, NGramConvolution, NGramGate, NGramHash,
     NGramInput, NGramMedia,
     Operator, OutputForm, ResidualForm, Sublayer, WeightDescriptor,
@@ -206,21 +208,34 @@ impl Extensions {
             ));
         }
         let (heads, width, hidden) = (self.indexer_heads, self.indexer_width, geometry.hidden);
-        Ok(HistoryReads::Selected {
-            block,
-            blocks: self.selected / block,
-            indexer: Indexer {
-                heads,
-                width,
-                query: weight(
-                    "indexer.q_proj.weight",
-                    &[product(&[heads, width])?, hidden],
-                )?,
-                key: weight("indexer.k_proj.weight", &[width, hidden])?,
-                query_norm: geometry.rms(weight("indexer.q_norm.weight", &[width])?),
-                key_norm: geometry.rms(weight("indexer.k_norm.weight", &[width])?),
-            },
-        })
+        let query = IndexerQuery {
+            input: IndexerInput::Hidden,
+            projection: weight(
+                "indexer.q_proj.weight",
+                &[product(&[heads, width])?, hidden],
+            )?,
+            norm: HeadNorm::Rms(geometry.rms(weight("indexer.q_norm.weight", &[width])?)),
+            rounding: RowRounding::None,
+        };
+        // Each block key is the mean of its rows' raw keys; a one-row block's
+        // mean is the row itself.
+        let keys = IndexerKeys::Pooled(PooledRows {
+            rate: block,
+            projection: weight("indexer.k_proj.weight", &[width, hidden])?,
+            pool: if block == 1 { Pool::Identity } else { Pool::Mean },
+            norm: geometry.rms(weight("indexer.k_norm.weight", &[width])?),
+            rounding: RowRounding::None,
+        });
+        Ok(HistoryReads::Selected(Selection::Own(Box::new(Indexer {
+            heads,
+            width,
+            query,
+            keys,
+            head_weights: HeadWeights::Uniform,
+            scale: 1.0 / (width as f64).sqrt(),
+            top: self.selected / block,
+            candidates: magnitude_family_contracts::Candidates::All,
+        }))))
     }
 
     fn ngram(
@@ -271,7 +286,7 @@ fn block(
     let mixer = match kind {
         MixerKind::Attention => {
             let mut attention = geometry.attention(weight)?;
-            attention.reads =
+            attention.history[0].reads =
                 extensions.reads(geometry, weight, extensions.blocks[layer as usize])?;
             Operator::Attention(Box::new(attention))
         }

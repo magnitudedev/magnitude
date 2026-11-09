@@ -13,6 +13,7 @@ pub(crate) mod graph;
 
 use super::PlanError;
 use super::streams::StreamsGeometry;
+use crate::planning::NGramRowRule;
 use crate::{NGramBinding, NGramGateForm, NGramTaps};
 use magnitude_family_contracts::{
     Decoder, InputNorm, NGramGate, NGramInput, NGramMedia, OutputForm, Sublayer, WeightKind,
@@ -151,8 +152,7 @@ pub(crate) fn binding(
     Ok(NGramBinding {
         hidden: decoder.hidden,
         streams: streams.streams,
-        context: op.hash.context,
-        heads_per_order: op.hash.heads_per_order,
+        rule: NGramRowRule::of(&op.hash),
         width: op.width,
         gate,
         convolution,

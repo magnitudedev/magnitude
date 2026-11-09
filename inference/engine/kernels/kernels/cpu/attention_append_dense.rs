@@ -7,7 +7,8 @@ fn attention_append_dense<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group
     // The keys' and values' form: no queries, so no query norm or output
     // rotary.
     let layout = Layout::new(cx.dim_ra(), cx.dim_rt());
-    let form = Form::new(cx.dim_kv(), 0, cx.dim_p(), cx.dim_s(), 0, 0, cx.dim_f(), 0, cx.dim_n(), cx.dim_nv(), layout, 0, cx.dim_vk());
+    let form = Form::new(cx.dim_kv(), 0, cx.dim_p(), cx.dim_s(), 0, 0, cx.dim_f(), 0, cx.dim_n(), cx.dim_nv(), layout, 0, cx.dim_vk())
+        .with_key_rounding(cx.dim_kr(), cx.arg_key_block(), cx.arg_key_element(), cx.arg_key_scale(), cx.arg_key_amax_floor());
     let destination = cx.arg_destinations().get([row]);
     if !form.fresh || destination < 0 { return; }
     let (w, kv) = (form.heads.w, form.heads.kv);

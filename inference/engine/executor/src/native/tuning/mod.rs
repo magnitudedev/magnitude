@@ -346,7 +346,10 @@ pub const STREAMING_ROWS: u64 = 8;
 /// discovery was refused for its bytes, its other units expired with one
 /// candidate each, and held a unit's first challengers to its own input
 /// build again: 21.66 GB for a piece needing about 2.4).
-pub const SEARCH_VERSION: u32 = 43;
+/// 44: a case's picks name the rows its index-list source holds at the
+/// position its point stands for, in a plane of those rows (a result of 43
+/// timed every pick as none, of a plane of no rows).
+pub const SEARCH_VERSION: u32 = 44;
 /// The tuning budget of a served load: the time one first-load preparation
 /// spends tuning, on any device.
 pub const STANDARD_TUNING_BUDGET: Duration = Duration::from_secs(60);

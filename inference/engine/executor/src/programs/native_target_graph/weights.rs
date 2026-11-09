@@ -768,6 +768,7 @@ impl PackingBound {
 
 /// A projection weight an entry with a packed form binds: its values and
 /// their operands (second-level scale and packing bound).
+#[derive(Clone)]
 pub(crate) struct PackedWeight {
     pub weight: WorkflowTensor,
     pub operands: WeightOperands,

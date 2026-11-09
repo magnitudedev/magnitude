@@ -6,7 +6,7 @@ use magnitude_artifacts::{
 use magnitude_family_common::headers::{self, Header};
 use magnitude_family_contracts::{
     AttentionGate, BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod,
-    DraftVariant, HeadNorm, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily,
+    DraftVariant, HeadNorm, HistoryDomain, HistoryRows, ImportTransform, ModelDefinition, ModelFamily,
     Operator, OutputRotary, Rotary, RotaryLayout, ScaledActivations, SublayerIndex, TapPoint,
 };
 use magnitude_family_dflash::{inspect, recognize, recognizes, Error};
@@ -132,9 +132,9 @@ fn domains(draft: &DraftDefinition) -> Vec<HistoryDomain> {
         .blocks
         .iter()
         .map(|block| match &block.sublayers[0].op {
-            Operator::Attention(attention) => match &attention.key_value {
-                KeyValue::Owned { domain, .. } => domain.clone(),
-                KeyValue::Shared { .. } => panic!("a draft layer owns its history"),
+            Operator::Attention(attention) => match &attention.fresh().rows {
+                HistoryRows::Own(producer) => producer.domain(),
+                HistoryRows::Shared { .. } => panic!("a draft layer owns its history"),
             },
             _ => panic!("a draft layer starts with attention"),
         })

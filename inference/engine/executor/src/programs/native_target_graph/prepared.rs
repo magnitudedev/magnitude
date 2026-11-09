@@ -22,7 +22,7 @@ use crate::{
     native::AttestedTarget,
     operators,
     operators::{
-        MixerKind, paired_block,
+        BlockKeeps, paired_block,
         routed::split::{OnceStage, RunStage, Stage},
         streams::StreamsGeometry,
     },
@@ -55,8 +55,9 @@ pub struct PreparedTargetGraphs {
     upload_regions: Vec<u64>,
     /// The most history segments a launch has.
     max_segments: u64,
-    /// Block mixers, which decide the class a launch selects per block.
-    pub(super) mixers: Vec<MixerKind>,
+    /// The state each block keeps, which decides the class a launch
+    /// selects per block.
+    pub(super) keeps: Vec<BlockKeeps>,
     /// Per block, its selected read's shape, which decides whether a launch
     /// takes its scoring class.
     selections: Vec<Option<crate::SelectionShape>>,
@@ -184,15 +185,15 @@ impl BlockTaps {
 }
 
 /// The first block of the longest run of trailing blocks that publish no
-/// state: attention blocks reading another layer's history (a Shared
-/// domain, which they never append to) that write no draft taps. A row's
-/// output from such a block reaches nothing but later blocks of the run and
-/// the readout, so a step need run the run only over the rows its readout
-/// consumes. The block count when the last block publishes state.
-fn stateless_tail(state: &StateResourcePlan, mixers: &[MixerKind], taps: &[BlockTaps]) -> usize {
-    trailing_run(mixers.len(), |index| {
+/// state: blocks keeping a history and no bank, that read another layer's
+/// history (a Shared domain, which they never append to) and write no draft
+/// taps. A row's output from such a block reaches nothing but later blocks
+/// of the run and the readout, so a step need run the run only over the
+/// rows its readout consumes. The block count when the last block publishes state.
+fn stateless_tail(state: &StateResourcePlan, keeps: &[BlockKeeps], taps: &[BlockTaps]) -> usize {
+    trailing_run(keeps.len(), |index| {
         let layer = LayerRef::Target(index as u32);
-        mixers[index] == MixerKind::Attention
+        keeps[index] == BlockKeeps::History
             && taps[index] == BlockTaps::default()
             && state
                 .target_state()
@@ -389,27 +390,41 @@ pub(super) fn block_graph_shapes(
                 })
                 .collect::<Vec<_>>();
             weights.sort_by_key(|(sublayer, kind, ..)| (*sublayer, format!("{kind:?}")));
-            let state = match paired.mixer.kind() {
-                MixerKind::Recurrent => {
+            // Blocks share a plan only over equal bank components, and
+            // within one history domain's rows and slabs.
+            let keeps = paired.keeps();
+            let bank = match keeps.bank() {
+                false => None,
+                true => {
                     let first = operators::bank_component_index(&geometry.blocks, index)
                         .map_err(|error| error.to_string())?;
                     let count = paired.bank_components();
-                    format!("{:?}", components.get(first..first + count))
+                    Some(components.get(first..first + count))
                 }
-                // Blocks share a plan only within one history domain's rows
-                // and slabs.
-                MixerKind::Attention => {
+            };
+            let history = match keeps.history() {
+                false => None,
+                true => {
                     let history = state
                         .target_state()
                         .layer_history(LayerRef::Target(
                             u32::try_from(index).map_err(|_| "block index exceeds u32")?,
                         ))
                         .ok_or("attention block has no history domain")?;
-                    format!("{:?}", (history.store.rows, history.store.slab_rows))
+                    Some((history.store.rows, history.store.slab_rows))
                 }
             };
+            let state = format!("{:?}", (bank, history));
             Ok(BlockGraphShape {
-                geometry: paired.shape_key().map_err(|error| error.to_string())?,
+                geometry: paired
+                    .shape_key(Some(operators::attention::DecoderSite {
+                        decoder: geometry,
+                        index: SublayerIndex {
+                            block: u32::try_from(index).map_err(|_| "block index exceeds u32")?,
+                            sublayer: 0,
+                        },
+                    }))
+                    .map_err(|error| error.to_string())?,
                 weights,
                 state,
                 widens_streams: index == 0
@@ -503,7 +518,7 @@ impl PreparedTargetGraphs {
         let TargetFamilyCertificate { outline, served, passes, group: certificate_group, .. } = certificate;
         let largest_rows = outline.largest_rows;
         let tap_width = outline.tap_width;
-        let stateless_tail = stateless_tail(state, &outline.mixers, &outline.tapped);
+        let stateless_tail = stateless_tail(state, &outline.keeps, &outline.tapped);
         // Output scales are values of the sealed graph.
         let scales = handles
             .blocks
@@ -886,7 +901,7 @@ impl PreparedTargetGraphs {
             controls,
             upload_regions: certificate.upload_regions,
             max_segments: outline.max_segments,
-            mixers: outline.mixers,
+            keeps: outline.keeps,
             selections: plan.blocks().iter().copied().map(slot_selection).collect(),
             family,
             max_output_bytes,

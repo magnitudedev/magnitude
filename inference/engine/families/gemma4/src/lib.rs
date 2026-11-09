@@ -27,8 +27,9 @@ use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Branch,
     BranchOutput, Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm,
-    ExpertSelection, FamilyId, FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads,
-    ImportTransform, InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition,
+    ExpertSelection, FamilyId, FeedForwardUp, HeadNorm, HistoryRows, HistorySource,
+    ImportTransform, InputNorm, InputSemantics, MediaRowAttention, ModelDefinition,
+    ProjectedRows, RowProducer, RowRounding, TokenDomain,
     Operator, OutputForm, OutputProjection, PerLayerEntry, PerLayerInput,
     QueryProjection, ResidualForm, RmsNorm, Rotary,
     RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
@@ -125,7 +126,7 @@ enum LayerKind {
 struct KindGeometry {
     width: u64,
     rotary: Rotary,
-    domain: HistoryDomain,
+    domain: TokenDomain,
     media_rows: MediaRowAttention,
 }
 
@@ -158,7 +159,7 @@ fn window_geometry(m: &Metadata, media_rows: MediaRowAttention) -> Result<KindGe
     Ok(KindGeometry {
         width,
         rotary: rotary::table(width, width, m.positive_number("rope.freq_base_swa")?)?,
-        domain: HistoryDomain::Window {
+        domain: TokenDomain::Window {
             tokens: m.integer("attention.sliding_window")?,
         },
         media_rows,
@@ -186,7 +187,7 @@ fn full_geometry(m: &Metadata, b: &mut Tensors) -> Result<KindGeometry, Error> {
             width / 2 / FULL_ROTATED_PAIR_FRACTION,
             divisors,
         )?,
-        domain: HistoryDomain::Token,
+        domain: TokenDomain::Token,
         media_rows: MediaRowAttention::Causal,
     })
 }
@@ -468,10 +469,10 @@ fn attention(
     let query = QueryProjection::Full(b.bind(&format!("{p}attn_q.weight"), &[head_rows, hidden])?);
     let query_norm =
         HeadNorm::Rms(shape.rms(b.bind(&format!("{p}attn_q_norm.weight"), &[width])?));
-    let key_value = match shared {
+    let rows = match shared {
         None => {
             let value_name = format!("{p}attn_v.weight");
-            KeyValue::Owned {
+            HistoryRows::Own(RowProducer::Projected(ProjectedRows {
                 key: b.bind(&format!("{p}attn_k.weight"), &[kv_rows, hidden])?,
                 // Full layers without their own value projection use their
                 // raw keys as values.
@@ -487,13 +488,15 @@ fn attention(
                     epsilon: shape.epsilon,
                 }),
                 domain: geometry.domain,
-            }
+                rounding: RowRounding::None,
+            }))
         }
-        Some(source) => KeyValue::Shared {
+        Some(source) => HistoryRows::Shared {
             source: SublayerIndex {
                 block: source as u32,
                 sublayer: 0,
             },
+            part: 0,
         },
     };
     Ok(Sublayer {
@@ -505,9 +508,9 @@ fn attention(
             query,
             gate: AttentionGate::None,
             query_norm,
-            key_value,
-            rotary: geometry.rotary.clone(),            scale: 1.0,
-            reads: HistoryReads::Visible,
+            history: vec![HistorySource::visible(rows)],
+            rotary: geometry.rotary.clone(),
+            scale: 1.0,
             media_rows: geometry.media_rows,
             sinks: None,
             output: OutputProjection::Full(

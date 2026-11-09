@@ -23,8 +23,8 @@ use magnitude_family_common::{architecture_keys, rotary, HeaderError, Metadata, 
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
     DefinitionError, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
-    FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue,
-    MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
+    FeedForwardUp, HeadNorm, HistoryRows, HistorySource, InputNorm, InputSemantics,
+    MediaRowAttention, ProjectedRows, RowProducer, RowRounding, TokenDomain, ModelDefinition, Operator, OutputForm, OutputProjection,
     QueryProjection, ResidualForm, RmsNorm, Sublayer,
     ValueNorm, ValueSource, WeightDescriptor, FamilyError,
 };
@@ -388,15 +388,20 @@ pub fn inspect_components(
                 query: QueryProjection::Full(query),
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::None,
-                key_value: KeyValue::Owned {
-                    key,
-                    value: ValueSource::Projected(weight("attn_v.weight", &[key_rows, hidden])?),
-                    key_norm: HeadNorm::None,
-                    value_norm: ValueNorm::None,
-                    domain: HistoryDomain::Token,
-                },
-                rotary: rotary.clone(),                scale: 1.0 / (width as f64).sqrt(),
-                reads: HistoryReads::Visible,
+                history: vec![HistorySource::visible(HistoryRows::Own(
+                    RowProducer::Projected(ProjectedRows {
+                        key,
+                        value: ValueSource::Projected(
+                            weight("attn_v.weight", &[key_rows, hidden])?,
+                        ),
+                        key_norm: HeadNorm::None,
+                        value_norm: ValueNorm::None,
+                        domain: TokenDomain::Token,
+                        rounding: RowRounding::None,
+                    }),
+                ))],
+                rotary: rotary.clone(),
+                scale: 1.0 / (width as f64).sqrt(),
                 media_rows: MediaRowAttention::Causal,
                 sinks: None,
                 output: OutputProjection::Full(weight(

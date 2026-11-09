@@ -233,7 +233,7 @@ impl<'a> QualificationView<'a> {
             .into_iter()
             .chain([seismic::SlabRegion {
                 element: Element::u32(),
-                row_shape: vec![binding.context + 1, 1],
+                row_shape: vec![binding.rule.context + 1, 1],
             }])
             .collect::<Vec<_>>();
         let token_region = regions.len() - 1;

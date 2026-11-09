@@ -275,10 +275,11 @@ mod tests {
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId, FeedForwardUp,
-        HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
-        KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
-        OutputRotary, QueryProjection, ResidualForm, RmsNorm, Rotary, RotaryLayout, RotaryPair,
-        RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
+        HeadNorm, HistoryRows, HistorySource, ImportTransform, InputNorm, InputSemantics,
+        MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
+        OutputRotary, ProjectedRows, QueryProjection, ResidualForm, RmsNorm, Rotary,
+        RotaryLayout, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput,
+        RowProducer, RowRange, RowRounding, TokenDomain,
         ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
     };
     use magnitude_state::KvCodec;
@@ -360,13 +361,19 @@ mod tests {
                     query: QueryProjection::Full(tensor(name("attn_q"), vec![HIDDEN, HIDDEN])),
                     gate: AttentionGate::None,
                     query_norm: HeadNorm::Rms(rms(tensor(name("attn_q_norm"), vec![64]))),
-                    key_value: KeyValue::Owned {
-                        key: tensor(name("attn_k"), vec![128, HIDDEN]),
-                        value: ValueSource::Projected(tensor(name("attn_v"), vec![128, HIDDEN])),
-                        key_norm: HeadNorm::Rms(rms(tensor(name("attn_k_norm"), vec![64]))),
-                        value_norm: ValueNorm::None,
-                        domain: HistoryDomain::Token,
-                    },
+                    history: vec![HistorySource::visible(HistoryRows::Own(
+                        RowProducer::Projected(ProjectedRows {
+                            key: tensor(name("attn_k"), vec![128, HIDDEN]),
+                            value: ValueSource::Projected(tensor(
+                                name("attn_v"),
+                                vec![128, HIDDEN],
+                            )),
+                            key_norm: HeadNorm::Rms(rms(tensor(name("attn_k_norm"), vec![64]))),
+                            value_norm: ValueNorm::None,
+                            domain: TokenDomain::Token,
+                            rounding: RowRounding::None,
+                        }),
+                    ))],
                     rotary: Rotary::Table {
                         pairs: (0..32)
                             .map(|pair| RotaryPair {
@@ -379,7 +386,6 @@ mod tests {
                         output: OutputRotary::None,
                     },
                     scale: 1.0 / 8.0,
-                    reads: HistoryReads::Visible,
                     media_rows: MediaRowAttention::Causal,
                     sinks: None,
                     output: OutputProjection::Full(tensor(

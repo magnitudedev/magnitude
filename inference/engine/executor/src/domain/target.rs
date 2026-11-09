@@ -713,6 +713,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             }
         }
         let upload = batch.upload();
+        if let Some(rows) = std::env::var_os("MAGNITUDE_TRACE_TARGET_BLOCK_ROWS") {
+            self.trace_block_rows(&rows.to_string_lossy(), batch.actual_rows())
+                .map_err(DomainError::invariant)?;
+        }
         let selected = if upload.select_rows.is_empty() {
             Vec::new()
         } else {
@@ -1113,6 +1117,57 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(reads)
     }
 
+    /// The launch audit's stored values (`MAGNITUDE_TRACE_TARGET_BLOCK_ROWS`,
+    /// a comma list of physical rows): once a target launch of `launch_rows`
+    /// rows completes, every Block domain plane's values at those rows (the
+    /// pooled rows and index keys as stored, after their rounding), so two
+    /// runs' stored codes compare row for row.
+    fn trace_block_rows(&self, rows: &str, launch_rows: usize) -> Result<(), String> {
+        let wanted = rows
+            .split(',')
+            .map(|row| row.trim().parse::<usize>().map_err(|_| format!("a traced block row {row:?} is no row")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let planes = self.target_store.history_planes().map_err(|error| error.to_string())?;
+        for plane in planes {
+            if !matches!(
+                self.target_store.history_domain_kind(plane.domain),
+                magnitude_state::HistoryDomainKind::Block { .. }
+            ) {
+                continue;
+            }
+            let dtype = self.target_store.history_components(plane.domain)[plane.component_index]
+                .planes()
+                .iter()
+                .find(|described| described.name == plane.name && described.vector == plane.vector)
+                .map(|described| described.dtype)
+                .ok_or("a history plane has no descriptor")?;
+            let bytes = plane.buffer.read_to_host().map_err(|error| error.to_string())?;
+            for &row in &wanted {
+                let Some(stored) = bytes.get(row * plane.row_bytes..(row + 1) * plane.row_bytes) else {
+                    continue;
+                };
+                let values = match dtype {
+                    seismic::DType::BF16 => stored
+                        .chunks_exact(2)
+                        .map(|value| f32::from_bits(u32::from(u16::from_le_bytes([value[0], value[1]])) << 16).to_string())
+                        .collect::<Vec<_>>(),
+                    seismic::DType::F32 => stored
+                        .chunks_exact(4)
+                        .map(|value| f32::from_le_bytes([value[0], value[1], value[2], value[3]]).to_string())
+                        .collect(),
+                    _ => stored.iter().map(|byte| format!("{byte:02x}")).collect(),
+                };
+                eprintln!(
+                    "target block row launch_rows={launch_rows} layer={:?} plane={:?} row={row} values={}",
+                    plane.layer,
+                    plane.name,
+                    values.join(",")
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn target_slot(
         &self,
         operation: &Operation,
@@ -1236,7 +1291,7 @@ pub(super) fn row_histories(
     let binding = advance.bindings();
     let end = |read: usize| span_end.filter(|_| bidirectional[read]);
     let stored = store.history_domains().map(|domain| {
-        if indexer_domain(store, domain) {
+        if store.is_produced_domain(domain) {
             let appended = appends.causal[domain.0]
                 .as_ref()
                 .ok_or("an indexer domain has no appended rows")?;
@@ -1284,22 +1339,14 @@ pub(super) fn row_histories(
     stored.chain(shared).collect()
 }
 
-/// Whether `domain` holds a selected read's indexer keys
-/// (`ComponentDescriptor::attended`): no attention reads it, its indexer
-/// does (`indexer_history`).
-pub(crate) fn indexer_domain(store: &StateStore, domain: magnitude_state::HistoryDomainId) -> bool {
-    !store
-        .history_components(domain)
-        .iter()
-        .all(magnitude_state::ComponentDescriptor::attended)
-}
-
 /// What row `index` of `advance` reads of an indexer's `domain`
 /// (`indexer_select`), every row as stored history, this launch's earlier
 /// rows at their destinations: in its raw keys' Window domain the rows of
 /// the `rows` positions before it, and its own destination; in its block
-/// keys' Block domain every block complete before it, and the destination
-/// of the block it completes (or -1). Its fresh span is the row alone.
+/// keys' Block domain every block complete through it (`advance_blocks`:
+/// the one it completes too, which its launch writes before any row reads
+/// it), and the destination of the block it completes (or -1). Its fresh
+/// span is the row alone.
 /// `appended` is the advance's runs in `domain` (`AppendedRuns::of`).
 pub(crate) fn indexer_history(
     store: &StateStore,
@@ -1319,14 +1366,11 @@ pub(crate) fn indexer_history(
             (from, from.saturating_sub(start)..index, destinations.get(index))
         }
         magnitude_state::HistoryDomainKind::Block { rate } => {
-            // The blocks the advance completed before the row, then the one
-            // it completes.
-            let before = position / rate - start / rate;
-            let completes = (position + 1) % rate == 0;
+            let (read, completes) = advance_blocks(rate, start, position);
             (
                 0,
-                0..before,
-                completes.then(|| destinations.get(before)).flatten(),
+                0..read,
+                completes.and_then(|block| destinations.get(block)),
             )
         }
         kind => return Err(format!("an indexer in a {kind:?} history domain")),
@@ -1353,6 +1397,16 @@ pub(crate) fn indexer_history(
     })
 }
 
+/// What a row at `position` of an advance from `start` makes of a
+/// Block(rate) domain: how many of the advance's appended blocks it reads,
+/// the first that many, every block complete through the row (the
+/// model's `(position + 1) / rate` visible blocks less the accepted ones),
+/// and the block it completes, the last it reads, if any.
+fn advance_blocks(rate: usize, start: usize, position: usize) -> (usize, Option<usize>) {
+    let read = (position + 1) / rate - start / rate;
+    (read, ((position + 1) % rate == 0).then(|| read - 1))
+}
+
 /// Target domains whose rows read their launch's earlier rows as stored
 /// history even while those rows belong to the same launch: a compressed
 /// history's, whose prior causal rows must use their stored representation,
@@ -1365,7 +1419,7 @@ pub(crate) fn cached_causal_domain(
     store.history_components(domain).iter().any(|component| {
         component.causal_rows_use_cache()
             || matches!(component.layer, magnitude_state::LayerRef::Target(block)
-                if store.indexer_domains(block).is_some())
+                if store.index_key_domains(block, 0).is_some())
     })
 }
 
@@ -1549,8 +1603,8 @@ impl AppendedRuns {
 
 /// The appended runs the rows of one advance read, formed once for its slot:
 /// of each compressed causal stored domain (`cached_causal_domain`) and each
-/// indexer domain (`indexer_domain`), by domain, and of each Shared source
-/// domain, in `HistoryReads::shared_sources` order.
+/// produced domain (`StateStore::is_produced_domain`), by domain, and of each
+/// Shared source domain, in `HistoryReads::shared_sources` order.
 pub(super) struct SlotAppends {
     causal: Vec<Option<AppendedRuns>>,
     shared: Vec<(magnitude_state::HistoryDomainId, AppendedRuns)>,
@@ -1564,7 +1618,7 @@ impl SlotAppends {
             causal: store
                 .history_domains()
                 .map(|domain| {
-                    (cached_causal_domain(store, domain) || indexer_domain(store, domain))
+                    (cached_causal_domain(store, domain) || store.is_produced_domain(domain))
                         .then(|| AppendedRuns::of(store, advance, domain))
                 })
                 .collect(),
@@ -1581,7 +1635,10 @@ impl SlotAppends {
 /// The history ranges a launch reserves per row for an advance of `rows`
 /// rows over a state of `spans` accepted ranges: those ranges, and for a
 /// store with Shared reads (`shared_read_history`) the ranges of the rows
-/// the advance appends, at most one per slab they touch.
+/// the advance appends, at most one per slab they touch. A row reads those
+/// of a cached-causal or produced domain when an earlier row of its launch
+/// appended them, and a Block domain's row the block it completes even
+/// alone (`advance_blocks`).
 pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -> usize {
     // A Shared reader also sees the rows its source appends in the advance:
     // the rest of the source's last page, then whole pages (see
@@ -1593,7 +1650,11 @@ pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -
             .iter()
             .copied()
             .chain(store.history_domains().filter(|&domain| {
-                rows > 1 && (cached_causal_domain(store, domain) || indexer_domain(store, domain))
+                matches!(
+                    store.history_domain_kind(domain),
+                    magnitude_state::HistoryDomainKind::Block { .. }
+                ) || (rows > 1
+                    && (cached_causal_domain(store, domain) || store.is_produced_domain(domain)))
             }))
             .map(|domain| rows.div_ceil(store.history_page_rows(domain)) + 1)
             .max()
@@ -1634,8 +1695,10 @@ pub(crate) fn accepted_history(
 /// so it reads the source's accepted rows and, as history, the rows the
 /// source appended for the advance from the window start through the row
 /// (through its media span's end `bidirectional_end` for a row attending its
-/// span bidirectionally), each range within one slab. Its fresh span and
-/// destination are unused. `appended` is the advance's runs in `domain`.
+/// span bidirectionally), each range within one slab; of a Block source,
+/// the blocks the advance completed through the row (`advance_blocks`). Its
+/// fresh span and destination are unused. `appended` is the advance's runs
+/// in `domain`.
 fn shared_read_history(
     store: &StateStore,
     advance: &TentativeAdvance,
@@ -1645,7 +1708,22 @@ fn shared_read_history(
     bidirectional_end: Option<usize>,
 ) -> Result<RowHistory, String> {
     let (mut visible, fresh_start) = accepted_history(store, advance, domain, index)?;
-    visible.extend(appended.shared_appended(fresh_start, bidirectional_end.unwrap_or(index + 1))?);
+    let (start, end) = match store.history_domain_kind(domain) {
+        magnitude_state::HistoryDomainKind::Block { rate } => {
+            if bidirectional_end.is_some() {
+                return Err(
+                    "a Shared read of pooled rows attends no media span bidirectionally".into(),
+                );
+            }
+            let position = advance
+                .position()
+                .checked_add(index)
+                .ok_or("target row position overflows")?;
+            (0, advance_blocks(rate, advance.position(), position).0)
+        }
+        _ => (fresh_start, bidirectional_end.unwrap_or(index + 1)),
+    };
+    visible.extend(appended.shared_appended(start, end)?);
     Ok(RowHistory {
         visible,
         fresh_start: i32::try_from(index).map_err(|_| "fresh start exceeds i32")?,

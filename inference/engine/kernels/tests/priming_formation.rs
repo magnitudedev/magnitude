@@ -67,6 +67,7 @@ fn vulkan_priming_abi_forms() {
                 "attention_project",
                 &[
                     ("A", Element::bf16()),
+                    ("Y", Element::bf16()),
                     ("NW", Element::bf16()),
                     ("QW", weight),
                     ("GW", weight),

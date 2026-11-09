@@ -1,7 +1,8 @@
 // indexer_keys on CPU (contract and portable body in indexer.seismic): one
 // work item per row that completes a unit widens its projected key, norms it
 // with the key norm, rotates it at its unit's first coordinates (in the
-// attention's layout), rounds it and stores it at its key-plane row (F32).
+// attention's layout), rounds it (from its norm and rotation held in A) and
+// stores it at its key-plane row (F32).
 
 use lib::attention::attention::{self, Layout};
 use lib::core::rounding::Rounding;
@@ -26,19 +27,20 @@ fn indexer_keys<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3]
         cosines,
         sines,
     );
-    cx.arg_key().decode_row(row, raw);
-    attention::prepare_head::<seismic::cpu::F32>(
+    lib::core::activation::widen::<E::A>(cx.arg_key().row([row, 0]), raw);
+    // A rounded key is rounded from its norm and rotation held in A.
+    let rounding = Rounding::of(cx.arg_block(), cx.arg_element(), cx.arg_scale(), cx.arg_amax_floor());
+    attention::prepare_rounded_head::<seismic::cpu::F32>(
         raw,
         Some(cx.arg_key_norm().row([0, 0])),
         Layout::new(cx.dim_ra(), cx.dim_rt()),
         cosines,
         sines,
         cx.arg_epsilon(),
+        rounding,
+        rounding.map(|_| lib::core::activation::publish::<E::A> as fn(f32) -> f32),
         prepared,
     );
-    if let Some(rounding) = Rounding::of(cx.arg_block(), cx.arg_element(), cx.arg_scale(), cx.arg_amax_floor()) {
-        rounding.apply(prepared);
-    }
     let keys = SlabTensor::from_bound(cx.arg_keys(), cx.arg_slab_rows() as usize);
     // SAFETY: key-plane rows are distinct freshly completed rows no work
     // item of this launch reads.

@@ -132,13 +132,26 @@ impl Declarations {
     }
 
     /// Every specialization of `kernel` the load prepares at operand recipe
-    /// `recipe`, each at its request's elements.
-    fn prepared(&self, kernel: Kernel, recipe: OperandRecipe) -> Result<Vec<Prepared>, AssessmentError> {
+    /// `recipe` of the call's form `statics` (one layer's, where an entry
+    /// serves several), each at its request's elements. A request holds
+    /// exactly the statics its backend's implementation declares
+    /// (`domain_statics`), so the form selects on those: an axis the backend
+    /// leaves dynamic (the CPU's `KV` and `G`) names no specialization.
+    fn prepared(
+        &self,
+        kernel: Kernel,
+        recipe: OperandRecipe,
+        statics: &[(&'static str, u64)],
+    ) -> Result<Vec<Prepared>, AssessmentError> {
         let prepared = self
             .requests
             .iter()
             .filter(|request| {
-                request.entry == kernel.name && operand_recipe(request.elements.values().copied()) == recipe
+                request.entry == kernel.name
+                    && operand_recipe(request.elements.values().copied()) == recipe
+                    && statics.iter().all(|(name, value)| {
+                        request.statics.get(*name).is_none_or(|held| held == value)
+                    })
             })
             .map(|request| {
                 let elements = request
@@ -180,7 +193,7 @@ impl Declarations {
             .collect::<Result<Vec<_>, AssessmentError>>()?;
         if prepared.is_empty() {
             return Err(launch_error(format!(
-                "the load prepares no `{}` at {recipe:?} operands on {}",
+                "the load prepares no `{}` at {recipe:?} operands and statics {statics:?} on {}",
                 kernel.name,
                 self.backend.as_str()
             )));
@@ -189,18 +202,19 @@ impl Declarations {
     }
 
     /// The launches of a call of `kernel` at operand recipe `recipe` (its
-    /// weights', `operand_recipe`) stating `dimensions`, encoded under
-    /// `words`, at any row count.
+    /// weights', `operand_recipe`) of the specializations with `statics`,
+    /// stating `dimensions`, encoded under `words`, at any row count.
     pub fn launches(
         &self,
         kernel: Kernel,
         recipe: OperandRecipe,
+        statics: &[(&'static str, u64)],
         dimensions: &[(&'static str, u64)],
         words: &'static Words,
     ) -> Result<Launches, AssessmentError> {
         Ok(Launches {
             kernel,
-            prepared: self.prepared(kernel, recipe)?,
+            prepared: self.prepared(kernel, recipe, statics)?,
             recipe,
             dimensions: dimensions.to_vec(),
             words,

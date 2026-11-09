@@ -18,6 +18,11 @@ struct Rounding {
     float amax_floor;
 };
 
+// No rounding (block 0).
+inline Rounding none() {
+    return Rounding{0, 0, 0, 0.0f};
+}
+
 // v to the nearest code of `mantissa` bits and smallest normal exponent
 // `min_exponent`, ties to even (`round_codes`).
 inline float round_codes(float v, uint mantissa, int min_exponent) {
@@ -80,6 +85,17 @@ inline void round_lanes(thread float (&x)[E], Rounding rounding) {
     const float s = block_scale(amax, rounding);
     for (uint i = 0; i < E; ++i)
         x[i] = round_element(x[i], s, rounding.element);
+}
+
+// A lane's values of a rounded row (block > 0) as the model holds them in
+// its activation element `A` before the rounding takes them (the portable
+// `held_in_activation`): each rounded once to A. An unrounded row holds nothing.
+template <typename A, uint E>
+inline void hold_lanes(thread float (&x)[E], Rounding rounding) {
+    if (rounding.block == 0)
+        return;
+    for (uint i = 0; i < E; ++i)
+        x[i] = A::round(x[i]);
 }
 
 } // namespace rounding

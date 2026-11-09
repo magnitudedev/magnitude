@@ -475,6 +475,7 @@ mod tests {
                 seismic::OperandRecipe::Rounded,
                 &[],
                 &[],
+                &[],
             )
             .unwrap();
         DecodeDemand {

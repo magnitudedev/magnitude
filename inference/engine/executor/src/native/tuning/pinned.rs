@@ -345,7 +345,15 @@ mod tests {
         let (weights, activation) = (seismic::Element::bf16(), seismic::Element::f32());
         let projection = metal(seismic::generated::native_implementation_at::<magnitude_kernels::attention_project::Entry>(
             BackendName::Metal,
-            &[("NW", activation), ("QW", weights), ("GW", weights), ("KW", weights), ("VW", weights), ("A", activation)],
+            &[
+                ("NW", activation),
+                ("QW", weights),
+                ("GW", weights),
+                ("KW", weights),
+                ("VW", weights),
+                ("A", activation),
+                ("Y", activation),
+            ],
         ));
         let key_of = at("attention_project", &projection, ("RESIDUE", 1));
         check(projection, key_of, ("RESIDUE", 1), 2);

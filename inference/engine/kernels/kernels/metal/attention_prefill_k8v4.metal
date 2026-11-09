@@ -111,7 +111,7 @@ kernel void attention_prefill_k8v4_prepare(
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, destinations, queries, keys, values, SEISMIC_DIM_M,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1,
-        group, simd, lane);
+        group, simd, lane, rounding::none());
 }
 
 kernel void attention_prefill_k8v4_decode(

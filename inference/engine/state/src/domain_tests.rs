@@ -750,10 +750,11 @@ fn a_single_token_domain_is_the_one_domain_store() {
 /// raw keys in a Window(3) domain and its block keys in a Block(4) domain.
 const RAW: HistoryDomainId = HistoryDomainId(1);
 const BLOCKS: HistoryDomainId = HistoryDomainId(2);
+const INDEX_KEYS: LayerRef = LayerRef::IndexKeys { block: 0, part: 0 };
 
 fn indexed_store(device: Rc<Device>, context: usize, max_advance: usize) -> StoreBindings {
     let keys = |coordinates| {
-        ComponentDescriptor::indexer(LayerRef::Indexer(0), DType::F32, 4, coordinates).unwrap()
+        ComponentDescriptor::produced(INDEX_KEYS, DType::F32, 4, coordinates).unwrap()
     };
     StateStore::new(
         device,
@@ -795,11 +796,13 @@ fn block_histories_hold_the_complete_blocks() {
     // The indexer's domains follow the one attention reads; a launch row
     // reads each.
     assert_eq!(store.history_reads().len(), 3);
-    assert_eq!(store.indexer_domains(0), Some((RAW, BLOCKS)));
+    assert_eq!(store.index_key_domains(0, 0), Some((Some(RAW), BLOCKS)));
+    assert!(!store.is_produced_domain(HistoryDomainId(0)));
+    assert!(store.is_produced_domain(RAW) && store.is_produced_domain(BLOCKS));
     // Raw keys carry their coordinates; block keys do not.
     assert_eq!(store.history_components(RAW)[0].planes().len(), 2);
     assert_eq!(store.history_components(BLOCKS)[0].planes().len(), 1);
-    assert_eq!(store.indexer_domains(1), None);
+    assert_eq!(store.index_key_domains(1, 0), None);
     // Ten rows from 0 complete blocks 0 and 1: two block rows, the
     // advance's destinations in block order.
     let advance = OwnedStateAdvance::begin(store.create().unwrap(), 10).ok().unwrap();
@@ -888,25 +891,134 @@ fn checkpoints_and_successors_share_the_block_rows() {
     assert_eq!(store.occupied_rows(BLOCKS), 5);
 }
 
+/// V4.1's compressed layer at rate 2 in one store: its 128-row window
+/// (domain 0), its pooled source's incomplete group, a Window(1) of F32
+/// projections and gate scores with coordinates (domain 1), and its rows
+/// beside their indexer keys, a Block(2) (domain 2).
+const PENDING: HistoryDomainId = HistoryDomainId(1);
+const POOLED: HistoryDomainId = HistoryDomainId(2);
+
+fn pooled_store(device: Rc<Device>, context: usize, max_advance: usize) -> StoreBindings {
+    let source = LayerRef::Pooled { block: 0, part: 1 };
+    let keys = LayerRef::IndexKeys { block: 0, part: 1 };
+    StateStore::new(
+        device,
+        context,
+        max_advance,
+        vec![
+            HistoryDomainPlan {
+                layout: HistoryDomainLayout::Window {
+                    rows: 128,
+                    components: vec![component(0, 4)],
+                },
+                logical_rows: context,
+            },
+            HistoryDomainPlan {
+                layout: HistoryDomainLayout::Window {
+                    rows: 1,
+                    components: vec![
+                        ComponentDescriptor::produced(source, DType::F32, 8, true).unwrap(),
+                    ],
+                },
+                logical_rows: context,
+            },
+            HistoryDomainPlan {
+                layout: HistoryDomainLayout::Block {
+                    rate: 2,
+                    components: vec![
+                        ComponentDescriptor::model_history(
+                            source,
+                            CodecSpec::stored_key(DType::BF16, 4),
+                            1,
+                        )
+                        .unwrap(),
+                        ComponentDescriptor::produced(keys, DType::BF16, 4, false).unwrap(),
+                    ],
+                },
+                logical_rows: context / 2,
+            },
+        ],
+        vec![],
+        banks(),
+    )
+    .unwrap()
+    .1
+}
+
+/// What a pooled history references at its position: its pending group's
+/// first position and row count, and its complete groups' row count.
+fn pooled_extent(state: &SequenceState) -> (usize, usize, usize) {
+    (
+        state.history_start(PENDING),
+        rows_of(&state.history_ranges(PENDING)).len(),
+        rows_of(&state.history_ranges(POOLED)).len(),
+    )
+}
+
 #[test]
-fn indexer_domains_follow_the_attended_ones() {
+fn a_rejected_verify_keeps_the_accepted_prefix_partial_group() {
     let device = cpu_device();
-    let keys = ComponentDescriptor::indexer(LayerRef::Indexer(0), DType::F32, 4, false).unwrap();
-    let plans = vec![
-        HistoryDomainPlan {
-            layout: HistoryDomainLayout::Block {
-                rate: 4,
-                components: vec![keys],
-            },
-            logical_rows: 16,
-        },
-        HistoryDomainPlan {
-            layout: HistoryDomainLayout::Token {
-                components: vec![component(0, 1)],
-            },
-            logical_rows: 64,
-        },
-    ];
-    assert!(StateStore::new(device, 64, 16, plans, vec![], banks()).is_err());
-    assert!(ComponentDescriptor::indexer(LayerRef::Target(0), DType::F32, 4, true).is_err());
+    let store = pooled_store(device.clone(), 64, 8);
+    assert_eq!(store.pooled_domains(0, 1), Some((Some(PENDING), POOLED)));
+    assert_eq!(store.index_key_domains(0, 1), Some((None, POOLED)));
+    // Three rows (positions 0..3): group 0 complete, position 2 pending.
+    let state = commit(store.create().unwrap(), 3);
+    assert_eq!(pooled_extent(&state), (2, 1, 1));
+    // A verify of three rows from 3 completes groups 1 (position 3) and 2
+    // (position 5); accepting two (positions 3, 4) keeps group 1 and leaves
+    // position 4 pending.
+    let advance = OwnedStateAdvance::begin(state, 3).ok().unwrap();
+    assert_eq!(advance.bindings().destinations[POOLED.0].len(), 2);
+    let OwnedAdvanceResolution::Committed(state) = advance.commit(2).ok().unwrap() else {
+        panic!("a prefix commits");
+    };
+    assert_eq!(state.position(), 5);
+    // A cold advance of the five accepted rows references the same rows.
+    let cold_store = pooled_store(device, 64, 8);
+    let cold = commit(cold_store.create().unwrap(), 5);
+    assert_eq!(pooled_extent(&state), pooled_extent(&cold));
+    assert_eq!(pooled_extent(&state), (4, 1, 2));
+    // The rejected group's row is released.
+    assert_eq!(store.occupied_rows(POOLED), cold_store.occupied_rows(POOLED));
+    assert_eq!(store.occupied_rows(PENDING), cold_store.occupied_rows(PENDING));
+    // Decoding on from the partial group completes group 2 at position 5.
+    let state = commit(state, 1);
+    assert_eq!(pooled_extent(&state), (5, 1, 3));
+}
+
+#[test]
+fn produced_domains_follow_the_per_token_ones() {
+    let device = cpu_device();
+    let keys = || ComponentDescriptor::produced(INDEX_KEYS, DType::F32, 4, false).unwrap();
+    let pooled = LayerRef::Pooled { block: 0, part: 1 };
+    let rows = || {
+        ComponentDescriptor::model_history(pooled, CodecSpec::stored_key(DType::BF16, 4), 1)
+            .unwrap()
+    };
+    let plan = |layout| HistoryDomainPlan {
+        logical_rows: 64,
+        layout,
+    };
+    let token = |components| plan(HistoryDomainLayout::Token { components });
+    let block = |components| plan(HistoryDomainLayout::Block { rate: 4, components });
+    let store = |plans| StateStore::new(device.clone(), 64, 16, plans, vec![], banks());
+    // A produced domain before a per-token one.
+    assert!(store(vec![block(vec![keys()]), token(vec![component(0, 1)])]).is_err());
+    // A per-token domain holding produced rows, or a Block holding
+    // per-token rows.
+    assert!(store(vec![token(vec![component(0, 1), keys()])]).is_err());
+    assert!(store(vec![token(vec![component(0, 1)]), block(vec![component(1, 1)])]).is_err());
+    // A pooled source's rows beside their indexer's keys, read through its
+    // attended rows.
+    let (_, bindings) = store(vec![token(vec![component(0, 1)]), block(vec![rows(), keys()])])
+        .unwrap();
+    assert_eq!(
+        bindings.history_source(pooled).map(|source| source.domain),
+        Some(HistoryDomainId(1))
+    );
+    assert_eq!(bindings.index_key_domains(0, 0), Some((None, HistoryDomainId(1))));
+    assert_eq!(bindings.history_reads().read(pooled), Some(1));
+    assert_eq!(bindings.history_reads().read(INDEX_KEYS), None);
+    assert!(ComponentDescriptor::produced(LayerRef::Target(0), DType::F32, 4, true).is_err());
+    assert!(ComponentDescriptor::new(INDEX_KEYS, CodecSpec::dense(DType::F32, 4, 4), 1).is_err());
 }

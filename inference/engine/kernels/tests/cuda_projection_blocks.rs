@@ -195,6 +195,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                 KW: formats[1].resident(),
                 VW: formats[2].resident(),
                 A: Element::bf16(),
+                Y: Element::bf16(),
             }),
             |_: &Device, mapping: Mapping| {
                 mapping.projection_params(statics_specialization(&[
@@ -383,6 +384,7 @@ fn cuda_scaled_projections_match_host_model() {
                 KW: format.resident(),
                 VW: format.resident(),
                 A: Element::bf16(),
+                Y: Element::bf16(),
             }),
             |_: &Device, mapping: Mapping| {
                 mapping.projection_params(statics_specialization(&[

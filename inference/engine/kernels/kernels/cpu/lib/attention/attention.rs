@@ -17,7 +17,7 @@
 // partitions merge in partition order: the reassociations every native
 // backend is qualified under.
 
-use super::super::core::{activation, reduce};
+use super::super::core::{activation, reduce, rounding::Rounding};
 use seismic::cpu::{math, slab::SlabTensor, Dense, F16};
 use std::ops::Range;
 
@@ -120,6 +120,10 @@ pub struct Form {
     pub layout: Layout,
     pub output_rotary: bool,
     pub stored_key: bool,
+    /// The trained rounding of the prepared key (KR = 1): applied in F32
+    /// before the key is published, attended or stored, to the key held in
+    /// the activation element after its norm and after its rotation.
+    pub key_rounding: Option<Rounding>,
 }
 
 impl Form {
@@ -150,7 +154,17 @@ impl Form {
             layout,
             output_rotary: ro == 1,
             stored_key: vk == 1,
+            key_rounding: None,
         }
+    }
+
+    /// The form with its prepared keys rounded as the dense entries' `KR`
+    /// and four `key_*` scalars say: KR = 1 rounds by the scalars, which then
+    /// name a rounding, and KR = 0 rounds nothing, the scalars naming none.
+    pub fn with_key_rounding(self, kr: u64, block: i32, element: i32, scale: i32, amax_floor: f32) -> Self {
+        let rounding = Rounding::of(block, element, scale, amax_floor);
+        assert_eq!(kr == 1, rounding.is_some(), "KR {kr} beside key rounding block {block}");
+        Self { key_rounding: rounding, ..self }
     }
 
     /// Whether the row takes a value of its own: a fresh layer whose values
@@ -193,6 +207,35 @@ pub fn prepare_head<A: Dense>(
     epsilon: f32,
     out: &mut [f32],
 ) {
+    prepare_rounded_head::<A>(x, norm, layout, cosines, sines, epsilon, None, None, out);
+}
+
+/// `values` as `hold` holds them (each value through it), or as they are
+/// without one: a rounded row's hold in its activation element
+/// (`activation::publish`), the portable `held_in_activation`.
+pub fn held(hold: Option<fn(f32) -> f32>, values: &mut [f32]) {
+    if let Some(hold) = hold {
+        values.iter_mut().for_each(|value| *value = hold(*value));
+    }
+}
+
+/// [`prepare_head`] with the rotated row rounded by `rounding` in F32
+/// before it is published (the portable `block_round` of `head_rotary`),
+/// and, with `hold`, every value held by it after the norm (when there is
+/// one) and after the rotation, before the rounding (a stored row's BF16
+/// holds, `activation::publish` of the activation element).
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_rounded_head<A: Dense>(
+    x: &[A::Storage],
+    norm: Option<&[f32]>,
+    layout: Layout,
+    cosines: &[f32],
+    sines: &[f32],
+    epsilon: f32,
+    rounding: Option<Rounding>,
+    hold: Option<fn(f32) -> f32>,
+    out: &mut [f32],
+) {
     let (w, p) = (x.len(), cosines.len());
     let out = &mut out[..w];
     activation::widen::<A>(x, out);
@@ -201,6 +244,7 @@ pub fn prepare_head<A: Dense>(
         for (value, weight) in out.iter_mut().zip(&norm[..w]) {
             *value = *value * inverse * weight;
         }
+        held(hold, out);
     }
     for pair in 0..p {
         let (lo, hi) = layout.columns(pair, p, w);
@@ -208,6 +252,10 @@ pub fn prepare_head<A: Dense>(
         let (cosine, sine) = (cosines[pair], sines[pair]);
         out[lo] = low * cosine - high * sine;
         out[hi] = high * cosine + low * sine;
+    }
+    held(hold, out);
+    if let Some(rounding) = rounding {
+        rounding.apply(out);
     }
     for value in out.iter_mut() {
         *value = activation::publish::<A>(*value);
@@ -279,7 +327,17 @@ pub fn prepare_form_row<'q, A: Dense>(
         return;
     }
     for head in 0..form.heads.kv {
-        prepare_head::<A>(&key[head * w..][..w], key_norm, form.layout, cosines, sines, epsilon, &mut keys[head * w..][..w]);
+        prepare_rounded_head::<A>(
+            &key[head * w..][..w],
+            key_norm,
+            form.layout,
+            cosines,
+            sines,
+            epsilon,
+            form.key_rounding,
+            form.key_rounding.map(|_| activation::publish::<A> as fn(f32) -> f32),
+            &mut keys[head * w..][..w],
+        );
     }
     if form.stored_key {
         values[..form.heads.kv * w].copy_from_slice(&keys[..form.heads.kv * w]);
@@ -761,6 +819,42 @@ pub fn attend_rows(
             |j, out| fresh_value(first + j, out),
         ),
     });
+}
+
+/// Absorbs a row's index-list picks (`selected_rows`, -1 for none), each
+/// row `load(pick, out)` of the source's one plane read as key and value,
+/// into `state` as [`attend_rows`] absorbs its keys (the portable
+/// `attention_rows`' index-list source).
+#[inline(always)]
+pub fn attend_picks(
+    state: &mut Online<'_>,
+    queries: &[f32],
+    scale: f32,
+    scores: &mut [f32],
+    row: &mut [f32],
+    picks: &[i32],
+    load: impl Fn(usize, &mut [f32]),
+) {
+    let mut first = 0;
+    while first < picks.len() {
+        if picks[first] < 0 {
+            first += 1;
+            continue;
+        }
+        let end = picks[first..].iter().position(|pick| *pick < 0).map_or(picks.len(), |run| first + run);
+        let run = &picks[first..end];
+        // A pick is its own value.
+        state.absorb(
+            queries,
+            scale,
+            run.len(),
+            scores,
+            row,
+            |j, out| load(run[j] as usize, out),
+            |j, out| load(run[j] as usize, out),
+        );
+        first = end;
+    }
 }
 
 /// Whether a row's WorkList `bitmap` (one bit per block of `block_rows`

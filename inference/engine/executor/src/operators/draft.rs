@@ -10,7 +10,7 @@ use super::{FeedForward, Mixer, PairedBlock, paired_block, role, sublayer_weight
 use crate::error::PlanError;
 use magnitude_family_contracts::{
     AffinePart, AttentionGate, Block, CorrectorSite, CorrectorWeight, DraftDefinition,
-    DraftEmbedding, DraftMethod, HeadHistory, KeyValue, ModelDefinition, OutputForm,
+    DraftEmbedding, DraftMethod, HeadHistory, ModelDefinition, OutputForm, ProjectedRows,
     SublayerIndex, TapPoint, ValueSource, WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 
@@ -183,11 +183,11 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
         if draft.convolutions.is_some()
             && (!matches!(attention.gate, AttentionGate::None)
                 || !matches!(
-                    attention.key_value,
-                    KeyValue::Owned {
+                    super::attention::fresh_rows(attention),
+                    super::attention::FreshRows::Own(ProjectedRows {
                         value: ValueSource::Projected(_),
                         ..
-                    }
+                    })
                 ))
         {
             return Err(PlanError::Unsupported(

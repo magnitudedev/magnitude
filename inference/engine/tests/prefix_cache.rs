@@ -58,7 +58,7 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
-            kv_codec: KvCodec::AffineK8V4,
+            kv_codec: Some(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: 512,
             numerical_profile: None,

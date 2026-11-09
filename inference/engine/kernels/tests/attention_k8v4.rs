@@ -971,7 +971,8 @@ fn dense_specialization(spec: &NativeSpecialization) -> NativeSpecialization {
         }
         dense = dense.with_param(name, *value);
     }
-    dense
+    // The dense entries' key rounding, which the affine ones lack: none.
+    dense.with_static("KR", 0)
 }
 
 /// The affine prefill's specialization of `params` on `device`. Metal's has
@@ -1857,6 +1858,10 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     sources.push(SourceFile {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "rounding.seismic".into(),
+        text: include_str!("../kernels/rounding.seismic").into(),
     });
     let module = crate::common::check(sources);
     let logical = module
@@ -3665,9 +3670,13 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
                     destinations: &bound.destinations,
                     history_key: &mut dense_key,
                     history_value: &mut dense_value,
-                    form: &half_split_append_layout(&device),
+                    form: &dense_append_layout(&device),
                     epsilon,
                     slab_rows: m as u32,
+                    key_block: 0,
+                    key_element: 0,
+                    key_scale: 0,
+                    key_amax_floor: 0.0,
                 })
                 .unwrap();
             let dense_k = bf16_values(&dense_key);
@@ -4032,9 +4041,13 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                     destinations: &inputs.destinations,
                     history_key: &mut dk,
                     history_value: &mut dv,
-                    form: &half_split_append_layout(&device),
+                    form: &dense_append_layout(&device),
                     epsilon,
                     slab_rows: m as u32,
+                    key_block: 0,
+                    key_element: 0,
+                    key_scale: 0,
+                    key_amax_floor: 0.0,
                 })
                 .unwrap();
             let affine_publish = attention_append_k8v4::native_for_device_with(

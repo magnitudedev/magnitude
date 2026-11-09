@@ -72,10 +72,14 @@ kernel void indexer_score(
         device const Scalar *raw = query + (row * SCORE_H + head) * SCORE_W;
         for (uint i = 0; i < SCORE_E; ++i)
             x[i] = float(raw[lane * SCORE_E + i]);
-        if (SEISMIC_DIM_NQ != 0)
+        // A rounded query is rounded from its norm and rotation held in A.
+        if (SEISMIC_DIM_NQ != 0) {
             query_lanes::normalize(x, query_norm, epsilon, lane);
+            rounding::hold_lanes<element::Act>(x, trained);
+        }
         query_lanes::rotate(x, coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes,
             lane);
+        rounding::hold_lanes<element::Act>(x, trained);
         rounding::round_lanes<SCORE_E>(x, trained);
         for (uint i = 0; i < SCORE_E; ++i)
             prepared[head * SCORE_W + lane * SCORE_E + i] = x[i];

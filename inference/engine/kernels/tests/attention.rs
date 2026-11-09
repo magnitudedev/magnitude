@@ -34,6 +34,9 @@ struct Bound {
     destinations: Tensor,
     selection: Tensor,
     block_slots: Tensor,
+    /// No index-list source (`KS` = 0, `TS` = 0).
+    selected_rows: Tensor,
+    selected: Tensor,
     rotary_layout: Tensor,
     append_layout: Tensor,
     _history_key_slabs: SlabTensor,
@@ -132,6 +135,7 @@ impl Bound {
             (history_key_slabs, history_key),
             (history_value_slabs, history_value),
         ] = history_slabs(device, case, slab_rows, reuse_middle);
+        let (selected_rows, selected) = no_picks(device, m, kv, w);
         Self {
             query: bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
             gate: bf16_tensor(device, &[m, kv * g, 0], &[]),
@@ -150,8 +154,10 @@ impl Bound {
             destinations: i32_tensor(device, &[m], &case.destinations),
             selection: no_selection(device, m),
             block_slots: block_slots(device, 1),
-            rotary_layout: half_split_layout(device),
-            append_layout: half_split_append_layout(device),
+            selected_rows,
+            selected,
+            rotary_layout: dense_layout(device),
+            append_layout: dense_append_layout(device),
             _history_key_slabs: history_key_slabs,
             _history_value_slabs: history_value_slabs,
             history_key,
@@ -362,7 +368,7 @@ fn decode_kernel(
     attention_decode::native_for_device_with(
         device,
         attention_decode::Elements { A: Element::bf16() },
-        &specialization.clone().with_static("SK", 0),
+        &dense_statics(specialization.clone().with_static("SK", 0)),
     )
     .unwrap()
 }
@@ -374,7 +380,7 @@ fn prefill_kernel(
     attention_prefill::native_for_device_with(
         device,
         attention_prefill::Elements { A: Element::bf16() },
-        &visible_prefill(device, specialization.clone().with_static("SK", 0)),
+        &visible_prefill(device, dense_statics(specialization.clone().with_static("SK", 0))),
     )
     .unwrap()
 }
@@ -397,6 +403,10 @@ macro_rules! args {
             form: &$bound.append_layout,
             epsilon: $case.epsilon,
             slab_rows: $bound.slab_rows,
+            key_block: 0,
+            key_element: 0,
+            key_scale: 0,
+            key_amax_floor: 0.0,
         }
     };
     (attention_prefill, $bound:expr, $case:expr) => {
@@ -418,6 +428,8 @@ macro_rules! args {
             destinations: &$bound.destinations,
             selection: &$bound.selection,
             block_slots: &$bound.block_slots,
+            selected_rows: &$bound.selected_rows,
+            selected: &$bound.selected,
             history_key: &mut $bound.history_key,
             history_value: &mut $bound.history_value,
             form: &$bound.rotary_layout,
@@ -425,6 +437,11 @@ macro_rules! args {
             scale: $case.scale,
             gate_function: 0,
             slab_rows: $bound.slab_rows,
+            selected_slab_rows: 1,
+            key_block: 0,
+            key_element: 0,
+            key_scale: 0,
+            key_amax_floor: 0.0,
         }
     };
     ($module:ident, $bound:expr, $case:expr) => {
@@ -444,6 +461,8 @@ macro_rules! args {
             visible: &$bound.visible,
             fresh: &$bound.fresh,
             destinations: &$bound.destinations,
+            selected_rows: &$bound.selected_rows,
+            selected: &$bound.selected,
             history_key: &mut $bound.history_key,
             history_value: &mut $bound.history_value,
             form: &$bound.rotary_layout,
@@ -451,6 +470,11 @@ macro_rules! args {
             scale: $case.scale,
             gate_function: 0,
             slab_rows: $bound.slab_rows,
+            selected_slab_rows: 1,
+            key_block: 0,
+            key_element: 0,
+            key_scale: 0,
+            key_amax_floor: 0.0,
         }
     };
 }
@@ -538,6 +562,10 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         path: "functions.seismic".into(),
         text: include_str!("../kernels/functions.seismic").into(),
     });
+    sources.push(SourceFile {
+        path: "rounding.seismic".into(),
+        text: include_str!("../kernels/rounding.seismic").into(),
+    });
     let module = crate::common::check(sources);
     let logical = module
         .entry(
@@ -574,14 +602,23 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         tensor(DType::I32, vec![m, case.spans, 2], ints(&case.visible)),
         tensor(DType::I32, vec![m, 2], ints(&case.fresh)),
         tensor(DType::I32, vec![m], ints(&case.destinations)),
+        // No index-list source (KS = 0, TS = 0).
+        tensor(DType::I32, vec![m, 0], Vec::new()),
+        tensor(DType::BF16, vec![0, kv, w], Vec::new()),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_key)),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
-        // Half-split leading rotary pairs, no output rotary, own values.
-        tensor(DType::I32, vec![0, 0, 0, 0, 0], Vec::new()),
+        // Half-split leading rotary pairs, no output rotary, own values, no
+        // key rounding.
+        tensor(DType::I32, vec![0, 0, 0, 0, 0, 0], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
+        Arg::Scalar(ReferenceScalar::U32(1)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::I32(0)),
+        Arg::Scalar(ReferenceScalar::F32(0.0f32.to_bits())),
     ];
     // The prefill takes its WorkList bitmap (none: B = 0) and block keys
     // (BR = 1) after the destinations.
@@ -591,7 +628,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         args.insert(15, tensor(DType::U32, vec![m, 0], Vec::new()));
     }
     // The history planes' parameter ordinals.
-    let planes = if prefill { 17 } else { 15 };
+    let planes = if prefill { 19 } else { 17 };
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{entry} portable body failed: {failure}");
@@ -1146,4 +1183,6 @@ fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecial
         .fold(NativeSpecialization::new(), |spec, (name, value)| {
             spec.with_static(name, *value)
         })
+        // No key rounding.
+        .with_static("KR", 0)
 }

@@ -11,9 +11,9 @@ use magnitude_artifacts::{
     gguf::{Encoding, TensorDescriptor},
 };
 use magnitude_family_contracts::{
-    ActivationDType, HeadComponent, ImportTransform, ModelDefinition, ProgressiveCodeDepth,
-    ProgressivePlane, ScaledActivations, VisionDescription, WeightDescriptor, WeightKind,
-    WeightRole, WeightScope,
+    ActivationDType, BlockElement, BlockScale, HeadComponent, ImportTransform, ModelDefinition,
+    ProgressiveCodeDepth, ProgressivePlane, RowRounding, ScaledActivations, VisionDescription,
+    WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{BackendName, DType, Element, GgufScales, Layout, MetalPacking, OperandRecipe};
@@ -445,6 +445,76 @@ pub enum AttentionValues {
     StoredKey,
 }
 
+/// A rounding as the entries take it (`rounding.seismic`'s four scalars):
+/// the one conversion of a [`RowRounding`] to them, for every entry that
+/// rounds a row. It keys specializations (the dense entries' `KR` is
+/// [`RoundingArgs::rounds`]), so the floor is held as its bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RoundingArgs {
+    pub block: i32,
+    pub element: i32,
+    pub scale: i32,
+    amax_floor_bits: u32,
+}
+
+impl RoundingArgs {
+    /// No rounding: `block` 0.
+    pub const NONE: Self = Self { block: 0, element: 0, scale: 0, amax_floor_bits: 0 };
+
+    /// Whether it rounds anything (`block` > 0).
+    pub fn rounds(self) -> bool {
+        self.block > 0
+    }
+
+    pub fn amax_floor(self) -> f32 {
+        f32::from_bits(self.amax_floor_bits)
+    }
+
+    /// Whether the Metal and CUDA entries can round a `width`-value row
+    /// with it (`round_lanes`): they spread the row over 32 lanes of
+    /// `width / 32` values, and a run lies within one lane or spans a power
+    /// of two of aligned lanes, so `width / block` is a multiple of 32 or a
+    /// power of two. Contract validation holds `block` to dividing `width`.
+    pub fn rounds_in_lanes(self, width: u64) -> bool {
+        if !self.rounds() {
+            return true;
+        }
+        let block = u64::try_from(self.block).expect("a rounding's positive run");
+        assert!(
+            width.is_multiple_of(block),
+            "a validated rounding's run of {block} divides its row's width {width}"
+        );
+        // A row spreads over 32 lanes of width / 32 values each; a run
+        // stays within a lane or spans a power of two of whole lanes.
+        let runs = width / block;
+        width.is_multiple_of(32) && (runs.is_multiple_of(32) || runs.is_power_of_two())
+    }
+}
+
+/// `rounding` as the entries' scalars: `block` 0 for none. Contract
+/// validation bounds the run and the floor; a run past `i32` is an invariant
+/// violation.
+pub fn rounding_args(rounding: RowRounding) -> RoundingArgs {
+    match rounding {
+        RowRounding::None => RoundingArgs::NONE,
+        RowRounding::Block(block) => RoundingArgs {
+            block: i32::try_from(block.block).expect("a validated rounding run fits i32"),
+            amax_floor_bits: {
+                assert!((block.amax_floor as f32).is_normal(), "a validated rounding's floor is a positive normal f32");
+                (block.amax_floor as f32).to_bits()
+            },
+            element: match block.element {
+                BlockElement::E4M3 => 0,
+                BlockElement::E2M1 => 1,
+            },
+            scale: match block.scale {
+                BlockScale::Ue8m0 => 0,
+                BlockScale::E4M3 => 1,
+            },
+        },
+    }
+}
+
 /// The static axes the attention entries are specialized to. Optional
 /// parts of the operator are axes of extent 0 or 1 (`attention.seismic`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -486,11 +556,25 @@ pub struct AttentionShape {
     /// `RO` ∈ {0, 1}: whether the attended row is turned back by the inverse
     /// rotation (`OutputRotary::Inverse`).
     pub output_rotary: u64,
+    /// The layer's trained key rounding (`ProjectedRows::rounding`), applied
+    /// to each prepared key before it is attended and stored: the dense
+    /// entries' `KR` ([`AttentionShape::rounds_keys`]) and their four
+    /// `key_*` scalars. The dense entries alone hold it.
+    pub key_rounding: RoundingArgs,
+    /// `KS`: the picks each row reads from the layer's second, index-list
+    /// source (its selection's `top`); 0 for a layer reading one source.
+    /// The dense attending entries alone hold it.
+    pub picks: u64,
 }
 
 impl AttentionShape {
     pub fn heads(&self) -> u64 {
         self.kv_heads * self.group
+    }
+
+    /// `KR` ∈ {0, 1}: whether the dense entries round each prepared key.
+    pub fn rounds_keys(&self) -> u64 {
+        u64::from(self.key_rounding.rounds())
     }
 
     /// `Q`: query (and interleaved gate) projection rows.
@@ -567,19 +651,39 @@ impl AttentionShape {
         ]
     }
 
-    /// Cache publication has no query-head, gate, query norm, sink or output
-    /// geometry.
-    pub fn append_statics(&self) -> Vec<(&'static str, u64)> {
+    /// The static axes of the dense fused entries: the shared ones, then
+    /// the key rounding and the second source's picks, which no K8/V4 entry
+    /// holds.
+    pub fn dense_mix_statics(&self) -> Vec<(&'static str, u64)> {
         self.mix_statics()
             .into_iter()
-            .filter(|(name, _)| !Self::unread_by_appends(name))
+            .chain([("KR", self.rounds_keys()), ("KS", self.picks)])
             .collect()
     }
 
     /// Whether the cache-publishing entries lack the fused entries' axis
     /// `name`.
     pub fn unread_by_appends(name: &str) -> bool {
-        matches!(name, "G" | "I" | "U" | "SK" | "NQ" | "RO" | "R")
+        matches!(name, "G" | "I" | "U" | "SK" | "NQ" | "RO" | "R" | "KS" | "TS")
+    }
+
+    /// The dense fused entries' dimensions: [`Self::mix_dimensions`], the
+    /// key rounding, the picks and the second source's plane rows `TS`.
+    pub fn dense_mix_dimensions(
+        &self,
+        rows: u64,
+        history_rows: u64,
+        segments: u64,
+        selected_rows: u64,
+    ) -> Vec<(&'static str, u64)> {
+        self.mix_dimensions(rows, history_rows, segments)
+            .into_iter()
+            .chain([
+                ("KR", self.rounds_keys()),
+                ("KS", self.picks),
+                ("TS", selected_rows),
+            ])
+            .collect()
     }
 
     /// The fused entries' dimensions for `rows` rows over `history_rows`
@@ -644,6 +748,117 @@ pub struct AttentionBinding {
     /// A grouped output's first product (`OutputProjection::GroupedLowRank`'s
     /// `a`); none for a full output projection.
     pub grouped: Option<GroupedOutputBinding>,
+    /// The second source a row reads by its picks (`KS = shape.picks`);
+    /// none for a layer reading one source.
+    pub picked: Option<PickedBinding>,
+}
+
+/// A layer's second source as its entries bind it: its own pooled rows
+/// and indexer, its own indexer over another layer's rows and their index
+/// keys (Reindex), or another layer's rows through that layer's picks. Its
+/// rows are a one-head `[W]` plane in the activation element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PickedBinding {
+    Own(PooledBinding),
+    /// Its indexer over part `part` of target block `source`'s pooled rows
+    /// (`LayerRef::Pooled`) and their index keys.
+    Reindex {
+        source: u32,
+        part: u32,
+        indexer: IndexerBinding,
+    },
+    Reused,
+}
+
+impl PickedBinding {
+    /// The indexer the layer runs itself; none for reused picks.
+    pub fn indexer(&self) -> Option<IndexerBinding> {
+        match self {
+            Self::Own(pooled) => Some(pooled.indexer),
+            Self::Reindex { indexer, .. } => Some(*indexer),
+            Self::Reused => None,
+        }
+    }
+}
+
+/// A layer's own pooled source (`pool_rows`; at rate 1
+/// `attention_append_dense`), the projection of its rows' index keys (`indexer_keys`) and the indexer that picks its rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PooledBinding {
+    /// The source's part of the layer's history (`LayerRef::Pooled`).
+    pub part: u32,
+    /// `RATE`: tokens per pooled row.
+    pub rate: u64,
+    /// The per-token projection's element and the softmax gate's (none for
+    /// a mean pool).
+    pub projection: Element,
+    pub gate: Option<Element>,
+    /// The pooled rows' norm (at rate 1, the index keys' projection's input
+    /// norm, which forms the latent) and rounding.
+    pub norm: Element,
+    pub rounding: RoundingArgs,
+    /// The index keys' projection of the latent and their norm.
+    pub key: Element,
+    pub key_norm: Element,
+    pub indexer: IndexerBinding,
+}
+
+impl PooledBinding {
+    /// `GT` ∈ {0, 1}: whether the pool is softmax-gated (it has a gate).
+    pub fn gt(&self) -> u64 {
+        u64::from(self.gate.is_some())
+    }
+}
+
+/// An indexer over a pooled source's index keys (`selection.rs`): its
+/// heads, their width and its picks, its query's and head weights'
+/// elements, and the candidates it scores. The most rows a row's list
+/// holds (`N`) is its class's
+/// ([`crate::operators::attention::list_scores`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IndexerBinding {
+    pub heads: u64,
+    pub width: u64,
+    pub top: u64,
+    /// `NQ` ∈ {0, 1}: whether the query heads have their own norm.
+    pub query_norm: u64,
+    pub query: Element,
+    /// The head weights' projection; none for uniform heads.
+    pub head_weights: Option<Element>,
+    pub candidates: CandidatesBinding,
+    /// The trained roundings of its query rows (`indexer_score`) and of the
+    /// keys it writes (`indexer_keys`); the keys' is none for keys it
+    /// shares, which their owner writes.
+    pub query_rounding: RoundingArgs,
+    pub key_rounding: RoundingArgs,
+}
+
+/// The units an indexer scores (`Candidates`): every complete unit, those
+/// of every complete unit while it also produces the candidate pool, or
+/// those of the pool an earlier indexer produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CandidatesBinding {
+    All,
+    Produce(CandidatePool),
+    Restrict(CandidatePool),
+}
+
+/// A candidate pool: `blocks` blocks of `block_units` units, listed for
+/// the restricted indexers' `top` picks (`candidate_rows`' `K`, which fills
+/// a pool of fewer units).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CandidatePool {
+    pub blocks: u64,
+    pub block_units: u64,
+    pub top: u64,
+}
+
+impl CandidatePool {
+    /// The most units a row's pool list holds: its blocks' units, which
+    /// the fill never exceeds (`top ≤ blocks · block_units`).
+    pub fn units(&self) -> u64 {
+        self.blocks * self.block_units
+    }
 }
 
 impl AttentionBinding {
@@ -1887,10 +2102,9 @@ pub struct PerLayerEntryBinding {
 pub struct NGramBinding {
     pub hidden: u64,
     pub streams: u64,
-    /// Predecessors the row rule reads (C): its orders are 2..=C + 1.
-    pub context: u64,
-    /// Rows gathered per order (P), each `width` wide.
-    pub heads_per_order: u64,
+    /// The row rule's form, which `ngram_rows` specializes on.
+    pub rule: NGramRowRule,
+    /// Each gathered row's width.
     pub width: u64,
     pub gate: NGramGateForm,
     /// The convolution's, when the input mixes its gated value.
@@ -1901,6 +2115,41 @@ pub struct NGramBinding {
     /// The gate's weights' and the convolution norm's.
     pub norm: Element,
     pub activation: Element,
+}
+
+/// The form of an n-gram input's row rule (`NGramHash`): the one owner of
+/// `ngram_rows`'s statics, which every backend specializes on a subset of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NGramRowRule {
+    /// Predecessors the rule reads (C): its orders are 2..=C + 1.
+    pub context: u64,
+    /// Rows gathered per order (P).
+    pub heads_per_order: u64,
+    /// The token map's entries (V), 0 where tokens hash as themselves.
+    pub mapped: u64,
+    /// Boundary tokens (NB): 1 where one cuts the lookback, else 0.
+    pub boundaries: u64,
+}
+
+impl NGramRowRule {
+    pub fn of(hash: &magnitude_family_contracts::NGramHash) -> Self {
+        Self {
+            context: hash.context,
+            heads_per_order: hash.heads_per_order,
+            mapped: hash.token_map.as_ref().map_or(0, |map| map.len() as u64),
+            boundaries: u64::from(hash.boundary.is_some()),
+        }
+    }
+
+    /// `ngram_rows`'s statics.
+    pub fn statics(self) -> [(&'static str, u64); 4] {
+        [
+            ("C", self.context),
+            ("P", self.heads_per_order),
+            ("V", self.mapped),
+            ("NB", self.boundaries),
+        ]
+    }
 }
 
 /// The weights `ngram_gate` weighs its product by: the key and query norms,
@@ -1938,7 +2187,7 @@ impl NGramTaps {
 impl NGramBinding {
     /// Rows gathered per position.
     pub fn heads(&self) -> u64 {
-        self.context * self.heads_per_order
+        self.rule.context * self.rule.heads_per_order
     }
 
     /// The width of a position's gathered rows.

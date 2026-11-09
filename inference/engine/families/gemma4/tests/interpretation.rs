@@ -7,8 +7,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::headers;
 use magnitude_family_contracts::{
-    ActivationFunction, CellReduction, EmbeddingScale, FeedForwardUp, HistoryDomain,
-    ImportTransform, InputNorm, KeyValue, MediaRowAttention, ModelDefinition, ModelInputAdapter,
+    ActivationFunction, CellReduction, EmbeddingScale, FeedForwardUp, HistoryRows,
+    ImportTransform, InputNorm, MediaRowAttention, ProjectedRows, RowProducer, TokenDomain, ModelDefinition, ModelInputAdapter,
     Operator, OutputForm, OutputRotary, PositionSampling, QueryProjection, Rotary, RotaryLayout, SublayerIndex, TokenPlan, ValueNorm,
     ValueSource, VisionActivation, VisionAttentionScale, VisionOperator, VisionResize, VisionStem,
     VisionUp,
@@ -82,24 +82,27 @@ fn per_layer_input_models_bind_every_catalog_weight() {
             assert_eq!(attention.width, if full { 512 } else { 256 });
             assert_eq!(attention.scale, 1.0);
             assert_eq!(attention.media_rows, MediaRowAttention::Causal);
-            match &attention.key_value {
-                KeyValue::Owned {
+            assert_eq!(attention.history.len(), 1);
+            match &attention.fresh().rows {
+                HistoryRows::Own(RowProducer::Projected(ProjectedRows {
                     value,
                     value_norm,
                     domain,
                     ..
-                } => {
+                })) => {
                     assert!(layer < owning);
                     assert!(matches!(value, ValueSource::Projected(_)));
                     assert!(matches!(value_norm, ValueNorm::RmsUnweighted(_)));
                     let expected = if full {
-                        HistoryDomain::Token
+                        TokenDomain::Token
                     } else {
-                        HistoryDomain::Window { tokens: window }
+                        TokenDomain::Window { tokens: window }
                     };
                     assert_eq!(*domain, expected);
                 }
-                KeyValue::Shared { source } => {
+                HistoryRows::Own(RowProducer::Pooled(_)) => panic!("{model} pools no history"),
+                HistoryRows::Shared { source, part } => {
+                    assert_eq!(*part, 0);
                     assert!(layer >= owning);
                     let expected = if full { sources.1 } else { sources.0 };
                     assert_eq!(source.block, expected, "{model} layer {layer}");
@@ -170,7 +173,8 @@ fn full_layers_rotate_a_quarter_of_their_pairs_over_the_whole_head() {
     assert_eq!(divisors.bases.len(), 256);
     assert!((divisors.bases[100] - 1e6f64.powf(-200.0 / 512.0)).abs() < 1e-15);
     // No weight is reordered.
-    let KeyValue::Owned { key, .. } = &full.key_value else {
+    let HistoryRows::Own(RowProducer::Projected(ProjectedRows { key, .. })) = &full.fresh().rows
+    else {
         panic!("owning layer");
     };
     assert!(
@@ -191,15 +195,16 @@ fn values_are_keys_on_full_layers_without_a_value_projection() {
         assert!(definition.decoder.entry.per_layer.is_none());
         for layer in 0..layers {
             let full = (layer + 1) % period == 0;
-            let KeyValue::Owned { value, domain, .. } = &attention(&definition, layer).key_value
+            let HistoryRows::Own(RowProducer::Projected(ProjectedRows { value, domain, .. })) =
+                &attention(&definition, layer).fresh().rows
             else {
                 panic!("{model}: every layer owns its history");
             };
             assert_eq!(matches!(value, ValueSource::RawKey), full, "{model} {layer}");
             let expected = if full {
-                HistoryDomain::Token
+                TokenDomain::Token
             } else {
-                HistoryDomain::Window { tokens: window }
+                TokenDomain::Window { tokens: window }
             };
             assert_eq!(*domain, expected);
         }
@@ -227,11 +232,11 @@ fn image_rows_are_bidirectional_only_on_window_layers_of_the_larger_models() {
             // Sharing layers carry no domain; every catalog window layer is
             // 256 wide and every full layer 512.
             let window = matches!(
-                &attention.key_value,
-                KeyValue::Owned {
-                    domain: HistoryDomain::Window { .. },
+                &attention.fresh().rows,
+                HistoryRows::Own(RowProducer::Projected(ProjectedRows {
+                    domain: TokenDomain::Window { .. },
                     ..
-                }
+                }))
             ) || attention.width == 256;
             let expected = if window && bidirectional_windows {
                 MediaRowAttention::Bidirectional
