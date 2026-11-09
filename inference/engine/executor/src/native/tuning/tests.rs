@@ -1831,6 +1831,120 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
     }
 }
 
+/// A unit the census meets without serving demand is served at its
+/// canonical default and stores no settled record: the store's key holds no
+/// demand, so a settled default would be replayed, never searched, by a
+/// later load that serves the unit. That load searches it.
+#[test]
+fn a_unit_without_demand_leaves_its_record_for_a_later_search() {
+    let device = crate::test_support::open_backend(
+        &seismic::Devices::discover(&[]).unwrap(),
+        BackendName::Cpu,
+    )
+    .unwrap();
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
+    };
+    let limits = TuningLimits {
+        max_rows: 64,
+        max_projected_rows: 8,
+        context_tokens: 256,
+    };
+    let implementation = dense_output_implementation(&device);
+    let statics = implementation
+        .statics
+        .iter()
+        .fold(NativeSpecialization::new(), |spec, name| {
+            spec.with_static(
+                name.clone(),
+                if name == "DS" || name == "DB" {
+                    0
+                } else if name == "H" {
+                    8
+                } else {
+                    16
+                },
+            )
+        });
+    let root = std::env::temp_dir().join(format!(
+        "magnitude-tuning-without-demand-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let cache = KernelCache::open(root.clone(), crate::DEFAULT_KERNEL_CACHE_BYTES).unwrap();
+    let recorder = Recorder::default();
+    let prepare = |case: &FakeCase| {
+        let mut tuner = Tuner::count(
+            &device,
+            TuningContext {
+                definition: &definition,
+                weights: &ZeroTuningWeights,
+                observer: &recorder,
+                cache: Some(&cache),
+                numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+                settings: TuningSettings::STANDARD,
+            },
+            limits,
+            TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+            fixture_invocations(case, &statics, limits),
+        );
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let mut tuner = tuner.search().unwrap();
+        tuner.tune(case, &implementation, &statics).unwrap();
+        let slot = tuner
+            .slots
+            .values()
+            .next()
+            .cloned()
+            .expect("the unit has a slot in the store");
+        (slot, tuner.conclude())
+    };
+    let stored = |slot: &TuningCacheKey| {
+        cache
+            .tuning::<super::record::StoredChoice>(slot)
+            .expect("the unit's record is stored")
+            .0
+    };
+    // A load without demand for the unit serves its canonical default.
+    let mut idle = FakeCase::new(&implementation, &statics, "without-demand");
+    idle.launches = 0;
+    let served = FakeCase::new(&implementation, &statics, "without-demand");
+    // The setup: one unit, of no launches on the first load and some on the
+    // second.
+    let launched = |case: &FakeCase| {
+        let demand = fixture_invocations(case, &statics, limits);
+        assert_eq!(demand.units.len(), 1, "the fixture tunes one unit");
+        demand
+            .units
+            .values()
+            .flat_map(|counts| counts.launches())
+            .map(|(_, count)| count)
+            .sum::<f64>()
+    };
+    assert_eq!(launched(&idle), 0.);
+    assert!(launched(&served) > 0.);
+    assert_eq!(idle.bindings, served.bindings, "both loads tune one key");
+    let (slot, _) = prepare(&idle);
+    assert!(idle.stages.borrow().is_empty(), "nothing is searched");
+    // Its record, the mandatory phase's, stays provisional.
+    assert!(!stored(&slot).settled);
+    // A later load that serves it finds no settled record and searches it.
+    let (again, tuned) = prepare(&served);
+    assert_eq!(again, slot, "both loads tune one key");
+    assert_eq!(served.formations.get(), 1, "its canonical artifact is formed");
+    assert!(!served.stages.borrow().is_empty(), "the unit is searched");
+    assert_eq!(tuned.len(), 1);
+    assert_eq!(tuned[0].origin, TuningOrigin::Searched);
+    // Its search settles the record.
+    assert!(stored(&slot).settled);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let Some(device) = metal() else {

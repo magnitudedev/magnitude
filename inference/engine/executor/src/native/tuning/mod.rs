@@ -4501,9 +4501,11 @@ impl<'a> Tuner<'a> {
         };
         if unit.shapes.iter().all(|shape| shape.weight == 0.) {
             // A unit without serving demand has no optional work: nothing
-            // could be ranked. Its canonical default is its record, settled
-            // now.
-            unit.settle(self)?;
+            // could be ranked. This load serves its canonical default, the
+            // record its mandatory phase published provisional, and that
+            // record stays provisional: only a search settles one, and the
+            // store's key holds no demand, so a later load that serves the
+            // unit searches it.
             unit.finish(self)?;
             let Phase::Census { launches, .. } = &mut self.phase else {
                 unreachable!("the phase is the census");
