@@ -257,7 +257,11 @@ struct FamilyLayouts {
     entries: BTreeMap<EntryTokens, NativeGraphLayout>,
     per_layer: Option<NativeGraphLayout>,
     launches: Vec<(BlockGraphShape, ShapeLayouts)>,
-    groups: Vec<(BlockGraphShape, Passes, ShapeLayouts)>,
+    /// A shape's group graphs at a group's passes: a block's own, its
+    /// combines and its passes and fills; or, of a tapped block's untapped
+    /// shape (`true`), its combines alone. A block of that shape in another
+    /// family certifies its own.
+    groups: Vec<(BlockGraphShape, Passes, bool, ShapeLayouts)>,
     /// The passes a group runs beside each workspace arena found: a
     /// function of the arena alone, since a block's pass is of its shape
     /// without its drafter's writes, of which every family has each
@@ -521,13 +525,14 @@ impl FamilyLayouts {
         };
         for &(index, of_untapped) in &shaped {
             let shape = shape_of(index, of_untapped);
-            let graphs = match self.groups.iter().find(|(certified, at, _)| *certified == shape && *at == passes) {
+            let found = self.groups.iter().find(|(certified, at, untapped, _)| *certified == shape && *at == passes && *untapped == of_untapped);
+            let graphs = match found {
                 Some((.., graphs)) => graphs.clone(),
                 None if of_untapped => {
                     // An untapped graph is only ever a run's: a block's once
                     // graphs tap nothing, so the tapped block's serve.
                     let graphs = runs(index, true, passes, true)?;
-                    self.groups.push((shape, passes, graphs.clone()));
+                    self.groups.push((shape, passes, true, graphs.clone()));
                     graphs
                 }
                 None => {
@@ -540,7 +545,7 @@ impl FamilyLayouts {
                             (CertifiedBlockGraph { layout, owned }, Included::Once(constants)),
                         );
                     }
-                    self.groups.push((shape, passes, graphs.clone()));
+                    self.groups.push((shape, passes, false, graphs.clone()));
                     graphs
                 }
             };
@@ -592,7 +597,9 @@ impl FamilyLayouts {
                 true => &untapped[index],
                 false => &blocks[index],
             };
-            layouts.get(&class_topology(class)).ok_or_else(|| GraphError::from("a block class has no certified layout"))
+            layouts.get(&class_topology(class)).ok_or_else(|| {
+                GraphError::from(format!("target graph class {class:?} of block {index} (untapped: {of_untapped}) has no certified layout"))
+            })
         };
         // The graphs a load seals: two entries and the per-layer entry per row
         // class, and the enumerated block plans, each into its regime's layout.
@@ -812,7 +819,12 @@ impl FamilyLayouts {
             let layout = match graphed {
                 Graphed::Entry(source) => &entries[&source],
                 Graphed::PerLayer => per_layer.as_ref().ok_or("a per-layer run has no layout")?,
-                Graphed::Block(index, topology) => &blocks[index].get(&topology).ok_or("a block class has no certified layout")?.layout,
+                Graphed::Block(index, topology) => {
+                    &blocks[index]
+                        .get(&topology)
+                        .ok_or_else(|| format!("target graph topology {topology:?} of block {index} has no certified layout"))?
+                        .layout
+                }
                 Graphed::Untapped(index, topology) => {
                     &untapped[index].get(&topology).ok_or("an untapped block class has no certified layout")?.layout
                 }
