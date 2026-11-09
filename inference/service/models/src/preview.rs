@@ -183,7 +183,8 @@ impl HuggingFaceDiscovery {
     }
 
     /// What `result`'s model file says: its header's architecture, which replaces the Hub's and is
-    /// unsupported when the engine doesn't run it, the engine's refusal of the header itself
+    /// unsupported when the service doesn't serve it (the engine doesn't run it, or its family is
+    /// withheld), the engine's refusal of the header itself
     /// (reasons that hold for every version, never weight types or this machine's), and the first
     /// catalog model whose shape fingerprint it has. Names and declared lineage never decide. A repository whose headers were read and hold no model file
     /// (no architecture, a projector's or a drafter's, or a layer-split piece) is unreadable,
@@ -216,7 +217,7 @@ impl HuggingFaceDiscovery {
                 unsupported,
             }) => {
                 result.architecture = Some(architecture.clone());
-                if !self.architectures.targets.contains(&architecture) {
+                if !self.architectures.serves(&architecture) {
                     result.unsupported = vec![UnsupportedReason::Known(
                         KnownUnsupportedReason::Architecture { architecture },
                     )];
@@ -4660,6 +4661,42 @@ mod tests {
         assert!(
             requests.load(std::sync::atomic::Ordering::SeqCst) == 3,
             "one header read per repository: the first file read decides, or fails"
+        );
+    }
+
+    /// A previewed model of a withheld family is listed as unsupported for its architecture, as its
+    /// custom load is refused; a model of an architecture the service serves is listed as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_previewed_model_of_a_withheld_family_is_unsupported() {
+        let (endpoint, _, _) = serve_repositories(vec![
+            StubRepository::new("someone/DeepSeek-V4.1-Flash-GGUF", Some("deepseek41"))
+                .file("model.gguf", 2_000_000_000, Some(architecture_only("deepseek41"))),
+            StubRepository::new("someone/Llama-8B-GGUF", Some("llama"))
+                .file("model.gguf", 2_000_000_000, Some(architecture_only("llama"))),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let discovery = HuggingFaceDiscovery::new(
+            Arc::clone(&store),
+            RecognizedArchitectures::new(["llama", "deepseek41"], ["dflash"])
+                .withholding([("deepseek41", crate::test_gguf::DEEPSEEK41_WITHHELD)]),
+            NoRefusals::new(),
+            CatalogLineage::new(
+                Arc::clone(&store),
+                catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40)),
+            ),
+            Arc::new(StubCatalog(Vec::new())),
+        );
+        let results = search_all(&discovery).await;
+        assert_eq!(
+            results["someone/DeepSeek-V4.1-Flash-GGUF"].unsupported,
+            [UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                architecture: "deepseek41".to_owned()
+            })],
+            "a withheld family's model is listed as unsupported"
+        );
+        assert!(
+            results["someone/Llama-8B-GGUF"].unsupported.is_empty(),
+            "a served architecture's model is listed as supported"
         );
     }
 

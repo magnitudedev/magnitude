@@ -20,14 +20,19 @@ pub struct RecognizedArchitectures {
 }
 
 impl RecognizedArchitectures {
-    /// A stable key for the recognized sets, for caches of results that depend on them. Withheld
-    /// families change no file's classification, so they aren't part of it.
+    /// A stable key for these sets, the withheld ones and their reasons among them, for caches of
+    /// results that depend on them.
     #[must_use]
     pub fn key(&self) -> String {
         format!(
-            "{}|{}",
+            "{}|{}|{}",
             self.targets.iter().cloned().collect::<Vec<_>>().join(","),
-            self.drafters.iter().cloned().collect::<Vec<_>>().join(",")
+            self.drafters.iter().cloned().collect::<Vec<_>>().join(","),
+            self.withheld
+                .iter()
+                .map(|(architecture, reason)| format!("{architecture}={reason}"))
+                .collect::<Vec<_>>()
+                .join(",")
         )
     }
 
@@ -62,14 +67,21 @@ impl RecognizedArchitectures {
         self.withheld.get(architecture).map(String::as_str)
     }
 
-    /// Whether search keeps a repository whose Hub-level architecture is `architecture`. The Hub
-    /// describes one file it picks, sometimes a projector, so `clip` and an absent architecture
-    /// stay for the per-file check.
+    /// Whether the service serves a model declaring `architecture`: one the engine runs as a
+    /// target, of a family not withheld.
+    #[must_use]
+    pub fn serves(&self, architecture: &str) -> bool {
+        self.targets.contains(architecture) && self.withheld(architecture).is_none()
+    }
+
+    /// Whether search lists a repository whose Hub-level architecture is `architecture` as
+    /// supported: one the service serves. The Hub describes one file it picks, sometimes a
+    /// projector, so `clip` and an absent architecture stay for the per-file check.
     #[must_use]
     pub fn admits_repository(&self, architecture: Option<&str>) -> bool {
         match architecture {
             None | Some(PROJECTOR_ARCHITECTURE) => true,
-            Some(architecture) => self.targets.contains(architecture),
+            Some(architecture) => self.serves(architecture),
         }
     }
 
@@ -847,6 +859,18 @@ mod tests {
                 architecture: "qwen4exp".to_owned()
             }
         );
+    }
+
+    /// A withheld family's architecture is recognized but not served, and the withheld set is part
+    /// of the key that cached classifications follow.
+    #[test]
+    fn a_withheld_architecture_is_recognized_but_not_served() {
+        let recognized = RecognizedArchitectures::new(["llama", "deepseek41"], ["dflash"]);
+        let withheld = recognized.clone().withholding([("deepseek41", "withheld for a defect")]);
+        assert!(recognized.serves("deepseek41") && recognized.admits_repository(Some("deepseek41")));
+        assert!(!withheld.serves("deepseek41") && !withheld.admits_repository(Some("deepseek41")));
+        assert!(withheld.serves("llama") && withheld.admits_repository(Some("llama")));
+        assert_ne!(recognized.key(), withheld.key());
     }
 
     #[test]
