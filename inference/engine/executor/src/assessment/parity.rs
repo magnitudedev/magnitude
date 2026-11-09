@@ -1,7 +1,8 @@
 //! Placement parity with the resident-only planner this one replaced: every
 //! served catalog target, on every executor of every recorded machine, at
-//! the standard service's limits and at the KL harness's, is placed whole
-//! (and fits) wherever the resident-only planner's charge fits. Plans only:
+//! the standard service's limits and at the KL harness's, each at one
+//! conversation (the load the resident-only planner charged), is placed
+//! whole (and fits) wherever the resident-only planner's charge fits. Plans only:
 //! no device is opened and no payload read.
 //!
 //! The resident-only planner's charge is ported from its source at
@@ -284,10 +285,10 @@ fn row(
         Err(error) => return failed("selection", error.to_string()),
     };
     let room = StableRoom { topology, executor, status, reserves: &reserves };
-    // The resident-only planner's load: this load at one conversation
-    // (`main` charged one, whatever the harness decoded) and one place.
-    let main_limits = ResourceLimits { conversations: NonZeroUsize::MIN, ..workload.limits };
-    let main_basis = match plan(&definition, manifest, &device, main_limits) {
+    // Both planners are compared at one load: this workload at one
+    // conversation (`main` charged one, whatever the harness decoded).
+    let limits = ResourceLimits { conversations: NonZeroUsize::MIN, ..workload.limits };
+    let main_basis = match plan(&definition, manifest, &device, limits) {
         Ok(draft) => draft,
         Err(error) => return failed("planning", error),
     };
@@ -299,8 +300,8 @@ fn row(
         Ok(fit) => need(&fit),
         Err(error) => return failed("main's fit", error),
     };
-    // This planner's load and its placement, as `plan_banked` places it.
-    let draft = match plan(&definition, manifest, &device, workload.limits) {
+    // This planner's placement of the same load, as `plan_banked` places it.
+    let draft = match plan(&definition, manifest, &device, limits) {
         Ok(draft) => draft,
         Err(error) => return failed("planning", error),
     };
@@ -338,7 +339,7 @@ fn row(
         gb(whole_need),
         if whole_fits { "fits" } else { "short" },
         verdict.0,
-        terms(&main, 1, 1 + usize::from(main_limits.lookahead)),
+        terms(&main, 1, 1 + usize::from(limits.lookahead)),
         terms(&whole_charge, whole_limits.chain_capacity.get(), whole_limits.target_successor_banks()),
     );
     Row { line, regression: main_fits && !verdict.1, panicked: false }
