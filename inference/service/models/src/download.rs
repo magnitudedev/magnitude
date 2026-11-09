@@ -533,16 +533,53 @@ impl ManagedModelStore {
             };
             resolved_packages.push((key, package, installed));
         }
-        let mut operations = self.operations.lock().await;
+        // What each package to admit would write, known before any operation is admitted: a
+        // failed probe of its sources admits none. The probes run without the operations lock,
+        // so cancellations and releases are not held up behind them; a package whose operation
+        // ended in the meantime is probed on the next round.
+        let mut owns = std::collections::BTreeMap::new();
+        let mut operations = loop {
+            let operations = self.operations.lock().await;
+            let unprobed = resolved_packages
+                .iter()
+                .filter(|(key, _, installed)| {
+                    installed.is_none()
+                        && !owns.contains_key(key)
+                        && !operations
+                            .get(key)
+                            .is_some_and(|operation| !operation.is_cancelled())
+                })
+                .map(|(key, package, _)| (key, package))
+                .collect::<Vec<_>>();
+            if unprobed.is_empty() {
+                break operations;
+            }
+            drop(operations);
+            for (key, package) in unprobed {
+                let own = self
+                    .outstanding_bytes(package)
+                    .await
+                    .map_err(|error| InventoryError::Io(error.to_string()))?;
+                owns.insert(key.clone(), own);
+            }
+        };
         let mut streams = Vec::with_capacity(resolved_packages.len());
-        let mut admitted = Vec::new();
+        let mut admitted: Vec<(String, String, ValidatedDownloadPackage, Arc<DownloadOperation>, u64)> =
+            Vec::new();
         for (key, package, installed) in resolved_packages {
-            // A cancelled operation is still settling; joining it would end the new request
-            // as cancelled. A fresh operation replaces it and waits on the repository lock.
-            if let Some(operation) = operations
-                .get(&key)
-                .filter(|operation| !operation.is_cancelled())
-            {
+            // A package admitted earlier in this request is joined. A cancelled operation is
+            // still settling; joining it would end the new request as cancelled. A fresh
+            // operation replaces it and waits on the repository lock.
+            let joined = admitted
+                .iter()
+                .find(|(admitted_key, ..)| *admitted_key == key)
+                .map(|(.., operation, _)| operation)
+                .or_else(|| {
+                    operations
+                        .get(&key)
+                        .filter(|operation| !operation.is_cancelled())
+                });
+            if let Some(operation) = joined {
                 streams.push(operation.subscribe());
                 continue;
             }
@@ -555,6 +592,8 @@ impl ManagedModelStore {
                 streams.push(watch_stream(receiver));
                 continue;
             }
+            // Probed above: under this lock, a package neither joined nor installed was.
+            let own = owns[&key];
             let (repository, revision) = package.repository_revision();
             let initial = ModelDownloadEvent::Resolving {
                 operation_id: operation_id.clone(),
@@ -563,21 +602,18 @@ impl ManagedModelStore {
             };
             let operation = Arc::new(DownloadOperation::new(initial));
             streams.push(operation.subscribe());
-            admitted.push((key.clone(), operation_id, package, Arc::clone(&operation)));
-            operations.insert(key, operation);
+            admitted.push((key, operation_id, package, operation, own));
+        }
+        for (key, _, _, operation, _) in &admitted {
+            operations.insert(key.clone(), Arc::clone(operation));
         }
         drop(operations);
         // Packages admitted together, such as a model and its separate draft, need disk space
         // together, so each checks against their combined need and reports the same shortfall.
-        let mut outstanding = Vec::with_capacity(admitted.len());
-        for (_, _, package, _) in &admitted {
-            outstanding.push(self.outstanding_bytes(package).await);
-        }
-        let admitted_bytes = outstanding
+        let admitted_bytes = admitted
             .iter()
-            .fold(0_u64, |sum, bytes| sum.saturating_add(*bytes));
-        for ((key, operation_id, package, operation), own) in admitted.into_iter().zip(outstanding)
-        {
+            .fold(0_u64, |sum, (.., own)| sum.saturating_add(*own));
+        for (key, operation_id, package, operation, own) in admitted {
             let companion_bytes = admitted_bytes.saturating_sub(own);
             let manager = self.clone();
             magnitude_service_utils::owner::spawn("a download", async move {
@@ -612,14 +648,47 @@ impl ManagedModelStore {
         Ok(())
     }
 
-    /// Bytes a package still has to write into this store, after what is already on disk.
-    async fn outstanding_bytes(&self, package: &ValidatedDownloadPackage) -> u64 {
+    /// Bytes a package still has to write into this store's volume, from each component's source.
+    async fn outstanding_bytes(&self, package: &ValidatedDownloadPackage) -> std::io::Result<u64> {
         let (repository, _) = package.repository_revision();
         let repo_root = self.config.root.join("hub").join(hf_repo_dir(repository));
-        let total_bytes = package.components().iter().fold(0_u64, |sum, component| {
-            sum.saturating_add(component.size_bytes)
-        });
-        total_bytes.saturating_sub(resumable_bytes(&repo_root, package.components()).await)
+        let components = package.components();
+        Ok(space_bytes(components, &self.component_sources(&repo_root, components).await?))
+    }
+
+    /// Where each of `components` of the repository at `repo_root` comes from: a file on this
+    /// computer holding its content (`local_sources`), cloned where the volume of the
+    /// repository's blobs clones it and copied otherwise, or the Hub, after what the store
+    /// already holds of it. The download takes each component exactly as decided here.
+    async fn component_sources(
+        &self,
+        repo_root: &Path,
+        components: &[ModelComponent],
+    ) -> std::io::Result<Vec<ComponentSource>> {
+        let mut sources = Vec::with_capacity(components.len());
+        for (component, local) in components.iter().zip(self.local_sources(components)) {
+            let resumed = component_partial_len(repo_root, component).await;
+            let local = match local {
+                Some(path) if resumed < component.size_bytes => {
+                    // The copy names the file itself: a Hugging Face snapshot entry is a
+                    // symbolic link.
+                    tokio::fs::canonicalize(&path).await.ok()
+                }
+                _ => None,
+            };
+            sources.push(match local {
+                None => ComponentSource::Hub { resumed },
+                Some(path) => {
+                    let (blobs, root) = (repo_root.join("blobs"), self.config.root.clone());
+                    let local = magnitude_service_utils::blocking::run(move || {
+                        LocalSource::probe(path, &blobs, &root)
+                    })
+                    .await?;
+                    ComponentSource::Local(local)
+                }
+            });
+        }
+        Ok(sources)
     }
 
     async fn run_download(
@@ -862,8 +931,11 @@ impl ManagedModelStore {
         }
 
         let completed_bytes = resumable_bytes(&repo_root, &components).await;
-        let missing_bytes = total_bytes.saturating_sub(completed_bytes);
-        let required_bytes = missing_bytes.saturating_add(companion_bytes);
+        let sources = self
+            .component_sources(&repo_root, &components)
+            .await
+            .map_err(download_io)?;
+        let required_bytes = space_bytes(&components, &sources).saturating_add(companion_bytes);
         // What the volume has above its reserve, which its writer's space owns.
         let (available_bytes, admitted) = self.volume.admit(required_bytes)?;
         operation
@@ -950,7 +1022,6 @@ impl ManagedModelStore {
             })?;
         ensure_owned_directory(&repo_root).await?;
         ensure_owned_directory(&repo_root.join("blobs")).await?;
-        let local_sources = self.local_sources(&components);
         let started = Instant::now();
         let mut resumed_by_component = Vec::with_capacity(components.len());
         for component in &components {
@@ -967,7 +1038,7 @@ impl ManagedModelStore {
                 &self.config.root,
                 &commit,
                 component,
-                local_sources[index].as_deref(),
+                sources[index].local(),
                 |file_completed, stage| {
                     let timestamp = Instant::now();
                     if file_completed != component.size_bytes
@@ -1160,7 +1231,7 @@ async fn download_component_with_retry(
     root: &Path,
     commit: &str,
     component: &ModelComponent,
-    local_source: Option<&Path>,
+    local_source: Option<&LocalSource>,
     mut progress: impl FnMut(u64, DownloadStage),
     control: &TransferControl,
     writes: &DownloadWrites,
@@ -1180,7 +1251,7 @@ async fn download_component_with_retry(
             Err(error) if matches!(error.kind, DownloadErrorKind::Cancelled) => return Err(error),
             Err(error) => tracing::warn!(
                 path = %component.path.display(),
-                source = %source.display(),
+                source = %source.path().display(),
                 %error,
                 "copying the component from this computer failed; downloading it instead"
             ),
@@ -1332,11 +1403,13 @@ async fn download_component_once(
 
 /// A component taken from a file already on this computer with the same content (the exact file
 /// in a Hugging Face cache) instead of fetched. The blob is always Magnitude's own file, never a
-/// link to the other one: a copy-on-write clone where the file system supports one, so the bytes
-/// stay shared on disk until either file changes, otherwise a streamed copy. Either way it is
+/// link to the other one: a copy-on-write clone where the source was admitted as one, so the
+/// bytes stay shared on disk until either file changes, otherwise a streamed copy, which a clone
+/// that fails also falls back to. A copy, like a fetch, checks each write against the volume, so
+/// a clone admitted as writing nothing still writes only what the volume admits. Either way it is
 /// verified in full like a download before it becomes the blob, and the other file is only read.
 async fn copy_local_component(
-    source: &Path,
+    source: &LocalSource,
     component: &ModelComponent,
     paths: &DownloadComponentPaths,
     progress: &mut impl FnMut(u64, DownloadStage),
@@ -1354,16 +1427,17 @@ async fn copy_local_component(
     discard_component_files(paths).await?;
     progress(0, DownloadStage::Verifying);
     let result = async {
-        // The copy names the file itself: a Hugging Face snapshot entry is a symbolic link.
-        let source = tokio::fs::canonicalize(source).await.map_err(download_io)?;
-        let cloned = {
-            let (source, partial) = (source.clone(), paths.partial.clone());
-            magnitude_service_utils::blocking::run(move || clone_file(&source, &partial)).await
+        let cloned = match source {
+            LocalSource::Clone(path) => {
+                let (from, partial) = (path.clone(), paths.partial.clone());
+                magnitude_service_utils::blocking::run(move || clone_file(&from, &partial)).await
+            }
+            LocalSource::Copy(_) => false,
         };
         let integrity = if cloned {
             verified_integrity(&paths.partial, component, progress, control).await?
         } else {
-            streamed_copy(&source, &paths.partial, component, progress, control, writes).await?
+            streamed_copy(source.path(), &paths.partial, component, progress, control, writes).await?
         };
         atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
         publish_verified_blob(paths).await
@@ -1373,6 +1447,97 @@ async fn copy_local_component(
         discard_component_files(paths).await?;
     }
     result
+}
+
+/// Where a component's bytes come from ([`ManagedModelStore::component_sources`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ComponentSource {
+    /// The Hub, after the `resumed` bytes the store already holds of it (all of them for a
+    /// completed blob).
+    Hub { resumed: u64 },
+    /// A file on this computer.
+    Local(LocalSource),
+}
+
+/// A file on this computer holding a component's content: the file itself, never a link to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LocalSource {
+    /// The volume of the repository's blobs clones it: the blob shares its extents.
+    Clone(PathBuf),
+    /// The volume of the repository's blobs cannot clone it: copied whole.
+    Copy(PathBuf),
+}
+
+impl ComponentSource {
+    /// What it writes to the store's volume for a component of `size_bytes`.
+    fn space_bytes(&self, size_bytes: u64) -> u64 {
+        match self {
+            Self::Hub { resumed } => size_bytes.saturating_sub(*resumed),
+            Self::Local(LocalSource::Clone(_)) => 0,
+            Self::Local(LocalSource::Copy(_)) => size_bytes,
+        }
+    }
+
+    /// The file on this computer it takes, if any.
+    fn local(&self) -> Option<&LocalSource> {
+        match self {
+            Self::Hub { .. } => None,
+            Self::Local(local) => Some(local),
+        }
+    }
+}
+
+impl LocalSource {
+    /// `path`, cloned where the file system that holds (or will hold) `blobs`, in the store at
+    /// `root`, clones it, and copied otherwise. The probe runs in `blobs`, or before the download
+    /// creates it in its nearest existing ancestor within the store, the directory it is created
+    /// in and so on its volume; never outside the store.
+    fn probe(path: PathBuf, blobs: &Path, root: &Path) -> std::io::Result<Self> {
+        let directory = blobs
+            .ancestors()
+            .take_while(|directory| directory.starts_with(root))
+            .find(|directory| directory.is_dir())
+            .ok_or_else(|| {
+                let message = format!("the model store {} does not exist", root.display());
+                std::io::Error::new(std::io::ErrorKind::NotFound, message)
+            })?;
+        Ok(if clones_into(&path, directory)? {
+            Self::Clone(path)
+        } else {
+            Self::Copy(path)
+        })
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Clone(path) | Self::Copy(path) => path,
+        }
+    }
+}
+
+/// What `components`, from `sources`, write to the store's volume.
+fn space_bytes(components: &[ModelComponent], sources: &[ComponentSource]) -> u64 {
+    components
+        .iter()
+        .zip(sources)
+        .fold(0_u64, |sum, (component, source)| {
+            sum.saturating_add(source.space_bytes(component.size_bytes))
+        })
+}
+
+/// Whether the file system holding `directory` clones `source` into it: a clone made in
+/// `directory` and removed again (a clone it cannot remove is an error, never left behind unnamed).
+fn clones_into(source: &Path, directory: &Path) -> std::io::Result<bool> {
+    let probe = random_id("clone-probe").map_err(std::io::Error::other)?;
+    let probe = directory.join(format!(".{probe}"));
+    let cloned = clone_file(source, &probe);
+    if cloned {
+        std::fs::remove_file(&probe).map_err(|error| {
+            let message = format!("removing the clone probe {}: {error}", probe.display());
+            std::io::Error::new(error.kind(), message)
+        })?;
+    }
+    Ok(cloned)
 }
 
 /// Creates `destination` as a copy-on-write clone of `source` (APFS `clonefile`), sharing its
@@ -2531,6 +2696,51 @@ mod tests {
         }
     }
 
+    /// A component cloned from this computer writes nothing to the store's volume; one copied
+    /// writes all of it, and one from the Hub what the store does not yet hold.
+    #[test]
+    fn space_counts_each_component_from_its_source() {
+        let components = [
+            model_component(b"cloned"),
+            model_component(b"copied!"),
+            model_component(b"resumed from the hub"),
+        ];
+        let sources = [
+            ComponentSource::Local(LocalSource::Clone(PathBuf::from("/volume/cloned.gguf"))),
+            ComponentSource::Local(LocalSource::Copy(PathBuf::from("/other/copied.gguf"))),
+            ComponentSource::Hub { resumed: 5 },
+        ];
+        assert_eq!(sources[0].space_bytes(components[0].size_bytes), 0);
+        assert_eq!(space_bytes(&components, &sources), 7 + (20 - 5));
+    }
+
+    /// The store's volume clones a file of its own into itself exactly where its file system
+    /// clones, and the probe leaves nothing behind.
+    #[test]
+    fn clone_probe_leaves_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.gguf");
+        std::fs::write(&source, b"weights").unwrap();
+        let probe = tempfile::tempdir_in(directory.path()).unwrap();
+        let cloned = clones_into(&source, probe.path()).unwrap();
+        assert_eq!(cloned, clone_file(&source, &directory.path().join("direct.gguf")));
+        assert_eq!(std::fs::read_dir(probe.path()).unwrap().count(), 0);
+    }
+
+    /// The clone probe stays within the store: without a store directory it probes nowhere,
+    /// leaving nothing in the directory around it.
+    #[test]
+    fn clone_probe_stays_within_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.gguf");
+        std::fs::write(&source, b"weights").unwrap();
+        let root = directory.path().join("store");
+        let blobs = root.join("hub").join("models--owner--repository").join("blobs");
+        let error = LocalSource::probe(source, &blobs, &root).expect_err("no store to probe in");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
     fn exact_package(path: &str, contents: &[u8]) -> ModelPackage {
         let sha256 = format!("{:x}", Sha256::digest(contents));
         ModelPackage {
@@ -3319,7 +3529,7 @@ mod tests {
             directory.path(),
             &"a".repeat(40),
             &component,
-            Some(&found),
+            Some(&LocalSource::probe(found.clone(), &blobs, directory.path()).expect("probe")),
             |_, _| {},
             &control,
             &DownloadWrites::unbounded(),
@@ -3379,6 +3589,52 @@ mod tests {
         assert!(sources[1].is_none());
     }
 
+    /// A local copy the store's volume cannot clone (here on tmpfs, another volume that clones
+    /// nothing) is an ordinary copy, never a refusal: the probe answers "no", the component counts
+    /// at its full size, and the package's admission count is that size.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_copy_on_another_volume_counts_at_full_size_and_is_admitted() {
+        let store = tempfile::tempdir().expect("store directory");
+        let other = tempfile::tempdir_in("/dev/shm").expect("a directory on tmpfs");
+        let contents = crate::test_gguf::gguf_bytes(
+            &[("general.architecture", crate::test_gguf::Meta::Str("llama"))],
+            &["token_embd.weight"],
+        );
+        let digest = format!("{:x}", Sha256::digest(&contents));
+        let repository = other.path().join("models--owner--repository");
+        let blob = repository.join("blobs").join(&digest);
+        let snapshot = repository.join("snapshots").join("a".repeat(40));
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(&blob, &contents).unwrap();
+        std::os::unix::fs::symlink(format!("../../blobs/{digest}"), snapshot.join("model.gguf"))
+            .unwrap();
+        let mut config =
+            InventoryConfig::with_roots(store.path().join("store"), store.path().join("cache"))
+                .unwrap();
+        config.add_hugging_face_caches([other.path().to_path_buf()]);
+        let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+
+        assert!(!clones_into(&blob, &manager.config.root).unwrap(), "tmpfs clones nothing");
+        let component = model_component(&contents);
+        let repo_root = manager.config.root.join("hub").join("models--owner--repository");
+        let sources = manager
+            .component_sources(&repo_root, std::slice::from_ref(&component))
+            .await
+            .expect("a copy that cannot be cloned is a source, not an error");
+        assert_eq!(
+            sources,
+            [ComponentSource::Local(LocalSource::Copy(blob.canonicalize().unwrap()))]
+        );
+        let package = ValidatedDownloadPackage::new(exact_package("model.gguf", &contents)).unwrap();
+        assert_eq!(
+            manager.outstanding_bytes(&package).await.expect("admitted"),
+            component.size_bytes
+        );
+    }
+
     #[tokio::test]
     async fn a_local_copy_that_does_not_verify_is_downloaded_instead() {
         let contents = vec![9_u8; 64 * 1024];
@@ -3403,7 +3659,7 @@ mod tests {
             directory.path(),
             &"a".repeat(40),
             &component,
-            Some(&changed),
+            Some(&LocalSource::probe(changed.clone(), &blobs, directory.path()).expect("probe")),
             |_, _| {},
             &control,
             &DownloadWrites::unbounded(),
@@ -3458,7 +3714,10 @@ mod tests {
             directory.path(),
             &"a".repeat(40),
             &component,
-            Some(&snapshot_entry),
+            Some(
+                &LocalSource::probe(snapshot_entry.canonicalize().expect("entry"), &blobs, directory.path())
+                    .expect("probe"),
+            ),
             |_, _| {},
             &control,
             &DownloadWrites::unbounded(),
@@ -3547,7 +3806,7 @@ mod tests {
         tokio::fs::write(&other, &changed)
             .await
             .expect("other file");
-        let error = copy_local_component(&other, &component, &paths, &mut |_, _| {}, &control, &DownloadWrites::unbounded())
+        let error = copy_local_component(&LocalSource::Copy(other.clone()), &component, &paths, &mut |_, _| {}, &control, &DownloadWrites::unbounded())
             .await
             .expect_err("mismatched source");
         assert!(matches!(error.kind, DownloadErrorKind::Integrity));
@@ -3555,6 +3814,77 @@ mod tests {
             assert!(!path.exists(), "{} was left behind", path.display());
         }
         assert_eq!(tokio::fs::read(&other).await.expect("other file"), changed);
+    }
+
+    /// A source admitted as a clone is taken from this computer whether or not the clone
+    /// succeeds: where the store's volume clones nothing (most file systems but APFS, btrfs, XFS
+    /// and bcachefs), the failed clone is copied instead, never fetched.
+    #[tokio::test]
+    async fn an_admitted_clone_that_fails_is_copied() {
+        let contents = vec![4_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let found = directory.path().join("found.gguf");
+        std::fs::write(&found, &contents).expect("found file");
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        std::fs::create_dir_all(&blobs).expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&LocalSource::Clone(found)),
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("a clone, or a copy where it fails");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert_eq!(std::fs::read(&paths.blob).expect("blob"), contents);
+        assert!(ranges.lock().expect("ranges").is_empty(), "nothing is fetched");
+    }
+
+    /// A source admitted as a clone that can be neither cloned nor copied (it vanished) is
+    /// fetched, after both fail.
+    #[tokio::test]
+    async fn an_admitted_clone_that_cannot_be_copied_is_fetched() {
+        let contents = vec![5_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        std::fs::create_dir_all(&blobs).expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&LocalSource::Clone(directory.path().join("vanished.gguf"))),
+            |_, _| {},
+            &control,
+            &DownloadWrites::unbounded(),
+        )
+        .await
+        .expect("a vanished source is fetched instead");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert_eq!(std::fs::read(&paths.blob).expect("blob"), contents);
+        assert!(!ranges.lock().expect("ranges").is_empty(), "the component is fetched");
     }
 
     #[tokio::test]

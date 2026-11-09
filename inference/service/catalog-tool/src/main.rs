@@ -44,23 +44,15 @@ enum Command {
         output: PathBuf,
         #[arg(long = "model")]
         models: Vec<String>,
-        #[arg(long)]
-        model_store: PathBuf,
-        #[arg(long)]
-        cache_root: PathBuf,
-        #[arg(long = "hf-cache")]
-        hf_caches: Vec<PathBuf>,
+        #[command(flatten)]
+        store: StoreArgs,
     },
     /// Build the assessment header bundle from the pinned catalog revisions.
     BuildBundle {
         #[arg(long)]
         output: PathBuf,
-        #[arg(long)]
-        model_store: PathBuf,
-        #[arg(long)]
-        cache_root: PathBuf,
-        #[arg(long = "hf-cache")]
-        hf_caches: Vec<PathBuf>,
+        #[command(flatten)]
+        store: StoreArgs,
     },
     /// Export every catalog component's exact header at its locked revision, and each pinned
     /// artifact's outside the catalog, for header-only tests: builds the header bundle under
@@ -169,6 +161,10 @@ struct StoreArgs {
     /// Derived-cache root for repository metadata and GGUF headers.
     #[arg(long)]
     cache_root: Option<PathBuf>,
+    /// Hugging Face caches whose files the store copies (cloned where the volume can) instead of
+    /// downloading them.
+    #[arg(long = "hf-cache")]
+    hf_caches: Vec<PathBuf>,
 }
 
 impl StoreArgs {
@@ -187,7 +183,7 @@ impl StoreArgs {
     /// The store, presenting `HF_TOKEN` on Hub requests when it is set.
     async fn open(&self) -> anyhow::Result<Arc<ManagedModelStore>> {
         let (model_store, cache_root) = self.roots()?;
-        let models = open_catalog_models(model_store, cache_root, Vec::new()).await?;
+        let models = open_catalog_models(model_store, cache_root, self.hf_caches.clone()).await?;
         if let Ok(token) = std::env::var("HF_TOKEN") {
             models.configure_hub_credential(Some(token))?;
         }
@@ -322,11 +318,9 @@ fn describe(gguf: &Gguf) -> Value {
 async fn update_lock(
     output: PathBuf,
     advance: CatalogLockAdvance,
-    model_store: PathBuf,
-    cache_root: PathBuf,
-    hf_caches: Vec<PathBuf>,
+    store: &StoreArgs,
 ) -> anyhow::Result<()> {
-    let models = open_catalog_models(model_store, cache_root, hf_caches).await?;
+    let models = store.open().await?;
     eprintln!("Resolving current catalog revisions...");
     let lock = advance_model_catalog_lock(Arc::clone(&models), advance).await?;
     eprintln!("Validating candidate catalog lock...");
@@ -372,12 +366,7 @@ fn ensure_catalog_resolved(
     Ok(())
 }
 
-async fn build_bundle(
-    output: PathBuf,
-    model_store: PathBuf,
-    cache_root: PathBuf,
-    hf_caches: Vec<PathBuf>,
-) -> anyhow::Result<()> {
+async fn build_bundle(output: PathBuf, store: &StoreArgs) -> anyhow::Result<()> {
     if output.is_file()
         && load_release_catalog(&output)
             .and_then(|catalog| catalog.verify_all_headers())
@@ -386,7 +375,7 @@ async fn build_bundle(
         eprintln!("Model catalog bundle is already current.");
         return Ok(());
     }
-    let models = open_catalog_models(model_store, cache_root, hf_caches).await?;
+    let models = store.open().await?;
     eprintln!("Resolving pinned catalog models...");
     let generated = ResolvingRecommendableCatalog::new(models)
         .resolve_release_catalog(report_progress)
@@ -415,9 +404,8 @@ async fn build_bundle(
 /// Writes the header export under `output` unless it is current, and returns its directory.
 async fn headers(output: PathBuf, store: &StoreArgs) -> anyhow::Result<PathBuf> {
     let output = std::path::absolute(&output)?;
-    let (model_store, cache_root) = store.roots()?;
     let bundle = output.join("model-planner-inputs.bundle");
-    build_bundle(bundle.clone(), model_store, cache_root, Vec::new()).await?;
+    build_bundle(bundle.clone(), store).await?;
     let exported = output.join("headers");
     let artifacts = catalog_headers::artifacts();
     // An export of another lock or other artifacts, or none, is replaced.
@@ -548,23 +536,16 @@ async fn main() -> anyhow::Result<()> {
         Command::UpdateLock {
             output,
             models,
-            model_store,
-            cache_root,
-            hf_caches,
+            store,
         } => {
             let advance = if models.is_empty() {
                 CatalogLockAdvance::All
             } else {
                 CatalogLockAdvance::Models(models.into_iter().collect())
             };
-            update_lock(output, advance, model_store, cache_root, hf_caches).await
+            update_lock(output, advance, &store).await
         }
-        Command::BuildBundle {
-            output,
-            model_store,
-            cache_root,
-            hf_caches,
-        } => build_bundle(output, model_store, cache_root, hf_caches).await,
+        Command::BuildBundle { output, store } => build_bundle(output, &store).await,
         Command::Headers { output, store } => {
             let exported = headers(output, &store).await?;
             println!("{}", exported.display());
