@@ -2451,6 +2451,7 @@ mod tests {
                         tags: vec!["gguf".to_owned()],
                         architecture: Some("qwen35moe".to_owned()),
                         variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+                        developer: None,
                         version_count: Some(3),
                         unsupported: Vec::new(),
                     }],
@@ -2961,6 +2962,7 @@ mod tests {
             display_name: "Fine Tune".to_owned(),
             variant_label: Some("Q4_K_M".to_owned()),
             variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
+            developer: None,
             files: vec![CustomModelFile {
                 path: "/models/fine-tune.gguf".into(),
                 size_bytes: 100,
@@ -3173,6 +3175,7 @@ mod tests {
                     display_name: "Repo".to_owned(),
                     license: Some("apache-2.0".to_owned()),
                     variant_of: None,
+                    developer: None,
                     versions: vec![magnitude_service_contracts::models::CandidateVersion {
                         label: "Q4_K_M".to_owned(),
                         model_id: "hf:owner/repo/repo-Q4_K_M.gguf".parse().unwrap(),

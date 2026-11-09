@@ -28,6 +28,7 @@ string_id!(ModelAssessmentId);
 string_id!(AssessmentEnvironmentId);
 string_id!(ModelInstanceId);
 string_id!(CatalogInstallationOperationId);
+string_id!(LabId);
 
 /// A model's identity. Two `local:` IDs are the same model exactly when their hashes match: the
 /// label is for reading only, so equality, order and hashing ignore it.
@@ -1640,6 +1641,17 @@ impl CatalogSupport {
     }
 }
 
+/// The lab that develops a model, from the catalog's lab table. `country` is its ISO 3166-1
+/// alpha-2 code.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelDeveloper {
+    pub lab: LabId,
+    pub name: String,
+    pub country: String,
+}
+
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1653,6 +1665,7 @@ pub struct RecommendableModel {
     pub release_date: ModelReleaseDate,
     pub license: String,
     pub parameterization: ModelParameterization,
+    pub developer: ModelDeveloper,
     pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
@@ -1746,6 +1759,7 @@ pub struct CatalogModel {
     pub license: String,
     pub source_urls: Vec<String>,
     pub parameterization: ModelParameterization,
+    pub developer: ModelDeveloper,
     pub support: CatalogSupport,
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
@@ -2138,6 +2152,9 @@ pub struct CustomModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub variant_of: Option<ModelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub developer: Option<ModelDeveloper>,
     pub files: Vec<CustomModelFile>,
     pub size_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2364,6 +2381,9 @@ pub struct CandidateInspection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub variant_of: Option<ModelId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub developer: Option<ModelDeveloper>,
     pub versions: Vec<CandidateVersion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]

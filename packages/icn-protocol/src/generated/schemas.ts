@@ -184,6 +184,10 @@ export type CandidateFile = S.Schema.Type<typeof CandidateFile>
 export type CandidateFileEncoded = S.Schema.Encoded<typeof CandidateFile>
 
 export const CandidateInspection = S.Struct({
+  developer: S.optionalWith(
+    S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+    { exact: true, as: "Option" },
+  ),
   displayName: S.String,
   license: S.optionalWith(S.String, { exact: true, as: "Option" }),
   projector: S.optionalWith(
@@ -479,6 +483,7 @@ export const CatalogModel = S.Struct({
   }),
   description: S.String,
   desired: S.suspend((): S.Schema<ReadyModel, ReadyModelEncoded> => ReadyModel),
+  developer: S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
   displayName: S.String,
   drafterWithheld: S.Boolean,
   fidelityRank: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1039,6 +1044,10 @@ export type CountTokensResponse = S.Schema.Type<typeof CountTokensResponse>
 export type CountTokensResponseEncoded = S.Schema.Encoded<typeof CountTokensResponse>
 
 export const CustomModel = S.Struct({
+  developer: S.optionalWith(
+    S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+    { exact: true, as: "Option" },
+  ),
   displayName: S.String,
   drafter: S.optionalWith(
     S.suspend((): S.Schema<AttachedDrafter, AttachedDrafterEncoded> => AttachedDrafter),
@@ -1748,6 +1757,10 @@ export type HuggingFaceModelSearchRequestEncoded = S.Schema.Encoded<typeof Huggi
 export const HuggingFaceModelSearchResult = S.Struct({
   architecture: S.optionalWith(S.String, { exact: true, as: "Option" }),
   commit: S.String,
+  developer: S.optionalWith(
+    S.suspend((): S.Schema<ModelDeveloper, ModelDeveloperEncoded> => ModelDeveloper),
+    { exact: true, as: "Option" },
+  ),
   downloads: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   gated: S.Boolean,
   lastModified: S.optionalWith(S.String, { exact: true, as: "Option" }),
@@ -2027,6 +2040,10 @@ export const KnownUnsupportedReason = S.Union(
 )
 export type KnownUnsupportedReason = S.Schema.Type<typeof KnownUnsupportedReason>
 export type KnownUnsupportedReasonEncoded = S.Schema.Encoded<typeof KnownUnsupportedReason>
+
+export const LabId = S.String
+export type LabId = S.Schema.Type<typeof LabId>
+export type LabIdEncoded = S.Schema.Encoded<typeof LabId>
 
 export const LocalModelRemoval = S.Struct({
   freedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -2333,6 +2350,14 @@ export const ModelCapabilities = S.Struct({
 })
 export type ModelCapabilities = S.Schema.Type<typeof ModelCapabilities>
 export type ModelCapabilitiesEncoded = S.Schema.Encoded<typeof ModelCapabilities>
+
+export const ModelDeveloper = S.Struct({
+  country: S.String,
+  lab: S.suspend((): S.Schema<LabId, LabIdEncoded> => LabId),
+  name: S.String,
+})
+export type ModelDeveloper = S.Schema.Type<typeof ModelDeveloper>
+export type ModelDeveloperEncoded = S.Schema.Encoded<typeof ModelDeveloper>
 
 export const ModelDownload = S.Struct({
   bundle: S.suspend((): S.Schema<ServableModelBundle, ServableModelBundleEncoded> => ServableModelBundle),

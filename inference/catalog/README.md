@@ -6,6 +6,12 @@ so a model's variants can come from different publishers. A separately packaged 
 names its own repository. `models.lock.json` maps every repository the catalog resolves from to its
 immutable Hugging Face commit.
 
+`labs` is the table of developers: each lab's `id`, display `name`, ISO 3166-1 alpha-2 `country`
+and the `huggingFaceOrganizations` it publishes under. Every model names its `lab`. The service
+gives every catalog model its lab's developer, and attributes any other model by the organization
+of its Hugging Face repository, else of a base model its GGUF declares, else through the catalog
+model whose shape it has.
+
 Input modality is inspected from the exact target package. Image-capable targets receive a
 projector during generation: a sole repository `mmproj` is selected automatically, while
 repositories with multiple candidates require an exact `projector.path` declaration on the source.

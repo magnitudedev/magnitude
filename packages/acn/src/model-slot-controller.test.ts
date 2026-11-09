@@ -32,6 +32,7 @@ describe("model slot reconciliation", () => {
           variantLabel: "GGUF",
           sourceLabel: "Hugging Face cache",
           variantOf: Option.none(),
+          developer: Option.none(),
           license: Option.none(),
           sourceUrls: ["https://huggingface.co/owner/repository"],
         },

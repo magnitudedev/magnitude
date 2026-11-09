@@ -2880,6 +2880,11 @@ mod tests {
             parameterization: magnitude_service_contracts::models::ModelParameterization::Dense {
                 total_parameters: 8_000_000_000,
             },
+            developer: magnitude_service_contracts::models::ModelDeveloper {
+                lab: magnitude_service_contracts::models::LabId("alibaba".to_owned()),
+                name: "Alibaba".to_owned(),
+                country: "CN".to_owned(),
+            },
             support: magnitude_service_contracts::models::CatalogSupport::Supported {
                 intelligence: 0,
             },

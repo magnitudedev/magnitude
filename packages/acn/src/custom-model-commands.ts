@@ -397,6 +397,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         : source._tag === "HuggingFace" ? repositoryDisplayName(source.repository) : basename(source.path),
       ...presentField("license", native.license),
       ...presentField("variantOf", native.variantOf),
+      ...presentField("developer", native.developer),
       versions: versions.map(({ assessment, catalogModel, onThisComputer, ...version }) => ({
         ...version,
         ...presentField("assessment", Option.map(assessment, (value) => Schema.encodeSync(LocalModelAssessmentSchema)(value))),
@@ -760,6 +761,7 @@ export const CustomModelCommandsLive: Layer.Layer<
             displayName: repositoryDisplayName(repository.value),
             uploader: repository.value.split("/")[0],
             ...presentField("variantOf", result.variantOf),
+            ...presentField("developer", result.developer),
             downloads: Option.getOrElse(result.downloads, () => 0),
             gated: result.gated,
             ...presentField("versionCount", result.versionCount),

@@ -27,7 +27,7 @@ use magnitude_service_contracts::models::{
     DrafterCandidatesResponse, DrafterCategory, DrafterChoice, DrafterLineage, DrafterReference,
     DrafterVerdict, HuggingFaceRepositoryId, LocalModels, ModelAssessment, ModelAssessmentProfile,
     ModelAssessmentSubject, ModelCandidate, ModelCandidates, ModelFileRole, ModelFingerprint,
-    ModelId, ModelPackage, ModelPackageSource, ParsedModelId, ServableModelBundle, ServingProfile,
+    ModelDeveloper, ModelId, ModelPackage, ModelPackageSource, ParsedModelId, ServableModelBundle, ServingProfile,
     SpeculativeDraftSource, SpeculativeMethod,
 };
 use magnitude_service_contracts::{
@@ -40,6 +40,7 @@ use magnitude_service_models::candidate_files::{
     base_model_repositories, group_ggufs, header_inspection,
     hugging_face_repository_from_url, is_q4_k_class, local_directory, version_label,
 };
+use magnitude_service_models::developers::DeveloperEvidence;
 use magnitude_service_models::lineage::{
     CatalogLineage, CatalogLineageMatch,
 };
@@ -183,6 +184,7 @@ struct ClassifiedGroup {
     local_id: Option<ModelId>,
     quantization: Option<String>,
     embedded_mtp: bool,
+    base_repositories: BTreeSet<String>,
     unreadable: Option<String>,
 }
 
@@ -1537,6 +1539,11 @@ impl ManagedModelCandidates {
             },
             display_name: display_name(&snapshot.repository),
             license: snapshot.license.clone(),
+            developer: inspection_developer(
+                Some(&snapshot.repository),
+                &targets,
+                variant_of.as_ref(),
+            ),
             variant_of,
             versions: candidate_versions(versions, Some(projector_bytes)),
             projector: projector.map(|projector| candidate_file(projector.group.primary())),
@@ -1670,6 +1677,7 @@ impl ManagedModelCandidates {
             source: CandidateSource::Local { path: root.clone() },
             display_name: display_name(name),
             license: None,
+            developer: inspection_developer(None, &targets, variant_of.as_ref()),
             variant_of,
             versions: candidate_versions(versions, None),
             projector: projector.map(|projector| candidate_file(projector.group.primary())),
@@ -3479,12 +3487,33 @@ fn classified_group(
         role: classification.role,
         quantization: classification.quantization,
         embedded_mtp: classification.embedded_mtp,
+        base_repositories: classification.base_repositories,
         header_digest,
         local_digest: None,
         local_id: None,
         group,
         unreadable: None,
     }
+}
+
+/// An inspected repository's or folder's developer: its repository's organization, else a base
+/// model its versions' headers declare, else the catalog model it is a variant of.
+fn inspection_developer(
+    repository: Option<&str>,
+    targets: &[&ClassifiedGroup],
+    variant_of: Option<&ModelId>,
+) -> Option<ModelDeveloper> {
+    let base_repositories = targets
+        .iter()
+        .flat_map(|group| group.base_repositories.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    magnitude_service_models::model_developers().resolve(DeveloperEvidence {
+        repository,
+        base_repositories: &base_repositories,
+        variant_of,
+    })
 }
 
 /// A file whose header is invalid, such as one with a tensor type the engine doesn't know: a
@@ -3497,6 +3526,7 @@ fn unreadable_group(group: GgufGroup, detail: String) -> ClassifiedGroup {
         local_id: None,
         quantization: None,
         embedded_mtp: false,
+        base_repositories: BTreeSet::new(),
         group,
         unreadable: Some(detail),
     }
@@ -3523,6 +3553,7 @@ fn classify_local(
                 role: classification.role,
                 quantization: classification.quantization,
                 embedded_mtp: classification.embedded_mtp,
+                base_repositories: classification.base_repositories,
                 local_id: local_digest.as_deref().and_then(|digest| {
                     magnitude_service_models::gguf::local_model_id(
                         digest,
@@ -4055,6 +4086,7 @@ mod tests {
             local_id: None,
             quantization: Some(quantization.to_owned()),
             embedded_mtp: false,
+            base_repositories: BTreeSet::new(),
             unreadable: None,
         };
         let fits = |ceiling: u32, served: u32| CachedModelAssessment {

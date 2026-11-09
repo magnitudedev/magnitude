@@ -616,6 +616,24 @@ fn is_nextn_tensor(name: &str) -> bool {
         })
 }
 
+/// The header's `general.base_model.N.*` lineage entries that name a model or a repository.
+pub(crate) fn base_models(directory: &Directory) -> Vec<GgufBaseModel> {
+    let count = u32_value(directory, "general.base_model.count").unwrap_or(0);
+    (0..count)
+        .map(|index| {
+            let field = |field: &str| {
+                string_value(directory, &format!("general.base_model.{index}.{field}"))
+            };
+            GgufBaseModel {
+                name: field("name"),
+                organization: field("organization"),
+                repo_url: field("repo_url"),
+            }
+        })
+        .filter(|base| base.name.is_some() || base.repo_url.is_some())
+        .collect()
+}
+
 /// `unknown_types` are the type ids of the header's tensors that `directory` leaves out (see
 /// [`known_tensors_and_unknown_types`]).
 pub(crate) fn interpret(
@@ -634,20 +652,7 @@ pub(crate) fn interpret(
     // shared experts, and output tensors remain active. Publish no active count unless GGUF grows
     // an authoritative aggregate field.
     let active_parameter_count = u64_value(directory, "general.active_parameter_count");
-    let base_model_count = u32_value(directory, "general.base_model.count").unwrap_or(0);
-    let base_models = (0..base_model_count)
-        .map(|index| {
-            let field = |field: &str| {
-                string_value(directory, &format!("general.base_model.{index}.{field}"))
-            };
-            GgufBaseModel {
-                name: field("name"),
-                organization: field("organization"),
-                repo_url: field("repo_url"),
-            }
-        })
-        .filter(|base| base.name.is_some() || base.repo_url.is_some())
-        .collect();
+    let base_models = base_models(directory);
     // `general.*` describes the file and never decides: a file type this service doesn't know
     // (a quantization newer than it) is no declared quantization, and the label comes from the name.
     let declared = directory

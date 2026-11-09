@@ -2872,6 +2872,9 @@
           "variantOf": {
             "$ref": "#/components/schemas/ModelId"
           },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
+          },
           "versions": {
             "type": "array",
             "items": {
@@ -3514,6 +3517,7 @@
           "license",
           "sourceUrls",
           "parameterization",
+          "developer",
           "support",
           "fidelityRank",
           "quantizationAware",
@@ -3552,6 +3556,9 @@
           },
           "parameterization": {
             "$ref": "#/components/schemas/ModelParameterization"
+          },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
           },
           "support": {
             "$ref": "#/components/schemas/CatalogSupport"
@@ -4849,6 +4856,9 @@
           },
           "variantOf": {
             "$ref": "#/components/schemas/ModelId"
+          },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
           },
           "files": {
             "type": "array",
@@ -6630,6 +6640,9 @@
           "variantOf": {
             "$ref": "#/components/schemas/ModelId"
           },
+          "developer": {
+            "$ref": "#/components/schemas/ModelDeveloper"
+          },
           "versionCount": {
             "type": "integer",
             "format": "int32",
@@ -7340,6 +7353,9 @@
           }
         ],
         "description": "A reason the engine raises, typed where it raises it. `DraftArchitecture` is a separate drafter\nwhose architecture no drafter family binds, such as a Nemotron-H MTP file. `UnsupportedFormat`\nis the service's own: a found model whose files are not GGUF, such as an Ollama model stored for\nits MLX runner."
+      },
+      "LabId": {
+        "type": "string"
       },
       "LocalModelRemoval": {
         "type": "object",
@@ -8187,6 +8203,27 @@
           },
           "reasoning": {
             "$ref": "#/components/schemas/ModelReasoningCapabilities"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ModelDeveloper": {
+        "type": "object",
+        "description": "The lab that develops a model, from the catalog's lab table. `country` is its ISO 3166-1\nalpha-2 code.",
+        "required": [
+          "lab",
+          "name",
+          "country"
+        ],
+        "properties": {
+          "lab": {
+            "$ref": "#/components/schemas/LabId"
+          },
+          "name": {
+            "type": "string"
+          },
+          "country": {
+            "type": "string"
           }
         },
         "additionalProperties": false

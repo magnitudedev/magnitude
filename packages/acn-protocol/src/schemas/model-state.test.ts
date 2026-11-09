@@ -11,6 +11,7 @@ import {
   LocalModelsStateSchema,
   UnsupportedReasonSchema,
   IntelligenceScoreSchema,
+  LocalModelDeveloperSchema,
   LocalModelMemorySchema,
   LocalModelPreparationSchema,
   LocalModelSchema,
@@ -37,6 +38,7 @@ const catalogModel = {
   catalogData: {
     releaseDate: "2026-08-29",
     parameterization: { architecture: "dense", totalParameters: 1 },
+    developer: { lab: "alibaba", name: "Alibaba", country: "CN" },
     intelligence: 1,
     support: { _tag: "Supported" },
     fidelityRank: 1,
@@ -101,6 +103,16 @@ describe("CatalogSupportSchema", () => {
       ...catalogModel,
       catalogData: { ...unrated, support: { _tag: "Disabled", reason: "not implemented yet" } },
     })).not.toThrow()
+  })
+})
+
+describe("LocalModelDeveloperSchema", () => {
+  it("names a lab with an ISO 3166-1 alpha-2 country", () => {
+    const decode = Schema.decodeUnknownSync(LocalModelDeveloperSchema)
+    expect(decode({ lab: "google", name: "Google", country: "US" }).country).toBe("US")
+    expect(() => decode({ lab: "google", name: "Google", country: "us" })).toThrow()
+    expect(() => decode({ lab: "google", name: "Google", country: "USA" })).toThrow()
+    expect(() => decode({ lab: "", name: "Google", country: "US" })).toThrow()
   })
 })
 

@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use crate::cache::{ModelCacheWorkspace, ModelIndexKind};
 use crate::candidate_files::RecognizedArchitectures;
 use crate::catalog::write_header_file;
+use crate::developers::DeveloperEvidence;
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ManagedModelStore, build_model, now};
@@ -214,9 +215,16 @@ impl HuggingFaceDiscovery {
             Some(RepositoryModel::Model {
                 architecture,
                 shape,
+                base_repositories,
                 unsupported,
             }) => {
                 result.architecture = Some(architecture.clone());
+                let variant_of = shape.and_then(|shape| shape.variant_of(catalog));
+                result.developer = crate::model_developers().resolve(DeveloperEvidence {
+                    repository: Some(&result.repository),
+                    base_repositories: &base_repositories,
+                    variant_of: variant_of.as_ref(),
+                });
                 if !self.architectures.serves(&architecture) {
                     result.unsupported = vec![UnsupportedReason::Known(
                         KnownUnsupportedReason::Architecture { architecture },
@@ -224,7 +232,7 @@ impl HuggingFaceDiscovery {
                     return true;
                 }
                 result.unsupported = unsupported;
-                result.variant_of = shape.and_then(|shape| shape.variant_of(catalog));
+                result.variant_of = variant_of;
             }
             Some(RepositoryModel::Unreadable) => {
                 result.unsupported = vec![UnsupportedReason::Known(
@@ -507,6 +515,10 @@ impl HubSearchModel {
                     .filter(|path| valid_gguf_path(path)),
             )
         });
+        let developer = crate::model_developers().resolve(DeveloperEvidence {
+            repository: Some(&self.id),
+            ..DeveloperEvidence::default()
+        });
         Some(HuggingFaceModelSearchResult {
             repository: self.id,
             commit: immutable_commit(self.sha?)?,
@@ -518,6 +530,7 @@ impl HubSearchModel {
             tags: self.tags,
             architecture,
             variant_of: None,
+            developer,
             version_count,
             unsupported: Vec::new(),
         })
@@ -3833,6 +3846,11 @@ mod tests {
                 license: "apache-2.0".to_owned(),
                 parameterization: ModelParameterization::Dense {
                     total_parameters: 1,
+                },
+                developer: magnitude_service_contracts::models::ModelDeveloper {
+                    lab: magnitude_service_contracts::models::LabId("alibaba".to_owned()),
+                    name: "Alibaba".to_owned(),
+                    country: "CN".to_owned(),
                 },
                 support: CatalogSupport::Supported { intelligence: 1 },
                 fidelity_rank: 1,

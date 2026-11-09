@@ -9,6 +9,7 @@ import {
   CustomFormModelIdSchema,
   CustomModelOriginSchema,
   DrafterVerdictSchema,
+  LocalModelDeveloperSchema,
   ModelReleaseDateSchema,
   ModelVariantLabelSchema,
   ModelCapabilitiesSchema,
@@ -97,6 +98,8 @@ const validateUnsupportedLocalModel = Schema.validateOption(UnsupportedLocalMode
 const decodeUnsupportedLocalModel = Schema.decodeUnknownOption(UnsupportedLocalModelSchema)
 const decodeVariantLabel = Schema.decodeUnknownSync(ModelVariantLabelSchema)
 const decodeReleaseDate = Schema.decodeUnknownSync(ModelReleaseDateSchema)
+const decodeDeveloper = Schema.decodeUnknownSync(LocalModelDeveloperSchema)
+const decodeOptionalDeveloper = Schema.decodeUnknownOption(LocalModelDeveloperSchema)
 const decodeCustomFormModelId = Schema.decodeUnknownOption(CustomFormModelIdSchema)
 const decodeCatalogFormModelId = Schema.decodeUnknownOption(CatalogFormModelIdSchema)
 const decodeCustomModelOrigin = Schema.decodeUnknownSync(CustomModelOriginSchema)
@@ -415,6 +418,7 @@ const catalogModel = (
   const catalogData = {
     releaseDate: decodeReleaseDate(source.releaseDate),
     parameterization: source.parameterization,
+    developer: decodeDeveloper(source.developer),
     fidelityRank: source.fidelityRank,
     quantizationAware: source.quantizationAware,
     aliases: Option.getOrElse(source.aliases, () => [])
@@ -631,6 +635,7 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
       )),
       sourceLabel: customModelSourceLabel(origin),
       variantOf: Option.flatMap(entry.source.variantOf, decodeCatalogFormModelId),
+      developer: Option.flatMap(entry.source.developer, decodeOptionalDeveloper),
       license: Option.filter(Option.map(entry.source.license, (license) => license.trim()), (license) => license.length > 0),
       sourceUrls: sourceUrls(entry.id),
     },

@@ -44,7 +44,7 @@ pub const MAX_MODEL_FILE_READS: usize = 3;
 const MODEL_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Versions the cached outcome: a change to how the model file is found or what is kept of it
 /// drops older entries.
-const CACHE_VERSION: &str = "model-file.v6";
+const CACHE_VERSION: &str = "model-file.v7";
 const TOKENS_KEY: &str = "tokenizer.ggml.tokens";
 
 /// Each catalog model's shape fingerprint, as its first variant's model ID, in catalog order.
@@ -85,8 +85,8 @@ pub struct ModelShape {
 }
 
 /// What a repository's commit holds for search: the model file's architecture, shape (absent
-/// when its header doesn't state one) and the engine's refusal of its header (empty when it
-/// refuses nothing), headers read that hold no model file, headers read that are all drafters'
+/// when its header doesn't state one), the repositories its header declares as base models and
+/// the engine's refusal of its header (empty when it refuses nothing), headers read that hold no model file, headers read that are all drafters'
 /// (a drafter repository, never a model result), or headers read that are all projectors' (no GGUF
 /// model at all, never a result).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +94,7 @@ pub(crate) enum RepositoryModel {
     Model {
         architecture: String,
         shape: Option<ModelShape>,
+        base_repositories: Vec<String>,
         unsupported: Vec<UnsupportedReason>,
     },
     Unreadable,
@@ -422,6 +423,14 @@ async fn read_repository_model(
             projectors_only &= file == FileKind::Projector;
             continue;
         };
+        let base_repositories = metadata
+            .as_ref()
+            .map(|directory| {
+                crate::candidate_files::base_model_repositories(&crate::gguf::base_models(directory))
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         // Keys a writer put after the token list (some put the shape's, or an appended MTP head
         // count) are seen only in the whole header. A prefix's shape stands when the header ends
         // in the prefix, when it is a catalog model's, or when no catalog model is even of its
@@ -472,6 +481,7 @@ async fn read_repository_model(
                             shape: ModelShape::from_header_prefix(&header),
                             unsupported: header_refusal(verdicts, &header, Some(&header)),
                             architecture,
+                            base_repositories,
                         });
                     }
                     Err(InventoryError::Integrity(_)) => (prefix_shape, None),
@@ -483,6 +493,7 @@ async fn read_repository_model(
             unsupported: header_refusal(verdicts, &prefix, whole),
             architecture,
             shape,
+            base_repositories,
         });
     }
     // Only headers actually read and naming no model architecture make a repository unreadable;

@@ -1,5 +1,5 @@
 import { Option, Schema } from "effect"
-import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, LocalInferenceDeviceIdSchema, CustomFormModelIdSchema, LocalModelFitResidencySchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelStreamingStatusSchema, ModelVariantLabelSchema, type AvailableCatalogLocalModel, type CustomLocalModel, type LocalModel, type LocalModelFitResidency, type ModelInstanceAllocation, type ModelResidency, type ModelStreamingStatus } from "@magnitudedev/sdk"
+import { AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CountryCodeSchema, LabIdSchema, LocalInferenceDeviceIdSchema, CustomFormModelIdSchema, LocalModelFitResidencySchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelStreamingStatusSchema, ModelVariantLabelSchema, type AvailableCatalogLocalModel, type CustomLocalModel, type LocalModel, type LocalModelFitResidency, type ModelInstanceAllocation, type ModelResidency, type ModelStreamingStatus } from "@magnitudedev/sdk"
 export const providerModelId = CatalogFormModelIdSchema.make("setup-model:gguf:q4")
 export const makeSetupModel = (installed: boolean): AvailableCatalogLocalModel => {
   return {
@@ -16,6 +16,7 @@ export const makeSetupModel = (installed: boolean): AvailableCatalogLocalModel =
     catalogData: {
         releaseDate: ModelReleaseDateSchema.make("2026-01-01"),
         parameterization: { architecture: "dense", totalParameters: 1 },
+        developer: { lab: LabIdSchema.make("alibaba"), name: "Alibaba", country: CountryCodeSchema.make("CN") },
         intelligence: 1,
         support: { _tag: "Supported" },
         fidelityRank: 1,
@@ -95,6 +96,7 @@ export const makeFoundModel = (
     variantLabel: ModelVariantLabelSchema.make("Q4_K_P"),
     sourceLabel: "Hugging Face cache",
     variantOf: Option.some(providerModelId),
+    developer: Option.none(),
     license: Option.none(),
     sourceUrls: [],
   },

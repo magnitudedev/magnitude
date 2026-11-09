@@ -1137,6 +1137,11 @@ async fn llama_test_catalog(
             parameterization: ModelParameterization::Dense {
                 total_parameters: 1,
             },
+            developer: magnitude_service_contracts::models::ModelDeveloper {
+                lab: magnitude_service_contracts::models::LabId("alibaba".to_owned()),
+                name: "Alibaba".to_owned(),
+                country: "CN".to_owned(),
+            },
             support: CatalogSupport::Supported { intelligence: 1 },
             fidelity_rank: 1,
             quantization_aware: false,
@@ -1853,6 +1858,7 @@ fn custom_model(model_id: ModelId, size_bytes: u64) -> CustomModel {
         display_name: "Found".to_owned(),
         variant_label: None,
         variant_of: None,
+        developer: None,
         files: vec![magnitude_service_contracts::models::CustomModelFile {
             path: PathBuf::from("/found/model.gguf"),
             size_bytes,
@@ -3247,6 +3253,7 @@ async fn a_version_at_another_commit_is_not_the_added_model_at_its_own() {
         local_id: None,
         quantization: None,
         embedded_mtp: false,
+        base_repositories: std::collections::BTreeSet::new(),
         unreadable: None,
     };
     let at = |commit: &str, model: &CustomModel| {
@@ -5933,6 +5940,11 @@ impl CatalogModels for ListedCatalog {
             source_urls: Vec::new(),
             parameterization: ModelParameterization::Dense {
                 total_parameters: 1,
+            },
+            developer: magnitude_service_contracts::models::ModelDeveloper {
+                lab: magnitude_service_contracts::models::LabId("alibaba".to_owned()),
+                name: "Alibaba".to_owned(),
+                country: "CN".to_owned(),
             },
             support: CatalogSupport::Supported { intelligence: 1 },
             fidelity_rank: 1,

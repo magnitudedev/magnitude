@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest"
 import {
   AssessmentEnvironmentIdSchema,
   CatalogSupportSchema,
+  CountryCodeSchema,
+  LabIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   LocalModelSchema,
   ModelIdSchema,
@@ -75,6 +77,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
         variantLabel: ModelVariantLabelSchema.make("Q4"),
         sourceLabel: "Hugging Face cache",
         variantOf: Option.none(),
+        developer: Option.none(),
         license: Option.none(),
         sourceUrls: [],
       },
@@ -101,6 +104,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
     catalogData: {
       releaseDate: "2026-08-29",
       parameterization: { architecture: "dense", totalParameters: 1 },
+      developer: { lab: LabIdSchema.make("alibaba"), name: "Alibaba", country: CountryCodeSchema.make("CN") },
       intelligence: 1,
       support: { _tag: "Supported" },
       fidelityRank: 1,

@@ -180,6 +180,7 @@ const harness = (options: {
         tags: [],
         unsupported: [],
         variantOf: Option.some("qwen3.6-35b-a3b:gguf:q4"),
+        developer: Option.some({ lab: "alibaba", name: "Alibaba", country: "CN" }),
       }, {
         repository: "unsloth/DeepSeek-V4-Flash-GGUF",
         architecture: Option.some("deepseek4"),
@@ -193,6 +194,7 @@ const harness = (options: {
         tags: [],
         unsupported: [{ _tag: "Architecture", architecture: "deepseek4" }],
         variantOf: Option.none(),
+        developer: Option.none(),
       }],
     }) as never,
     resolveRepository: () => Effect.die("unused"),
@@ -302,6 +304,7 @@ describe("finding models", () => {
     expect(result.results[1]).toMatchObject({
       displayName: "DeepSeek V4 Flash",
       variantOf: Option.none(),
+      developer: Option.none(),
       unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]),
       gated: true,
     })
@@ -309,6 +312,7 @@ describe("finding models", () => {
       displayName: "Qwen3.6 35B A3B Uncensored HauhauCS Aggressive",
       uploader: "HauhauCS",
       variantOf: Option.some("qwen3.6-35b-a3b:gguf:q4"),
+      developer: Option.some({ lab: "alibaba", name: "Alibaba", country: "CN" }),
       downloads: 12,
       architecture: Option.some("qwen35moe"),
       unsupported: Option.none(),

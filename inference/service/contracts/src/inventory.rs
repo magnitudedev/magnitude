@@ -809,6 +809,9 @@ pub struct HuggingFaceModelSearchResult {
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub variant_of: Option<crate::models::ModelId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub developer: Option<crate::models::ModelDeveloper>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, minimum = 1))]
     pub version_count: Option<u32>,
     pub unsupported: Vec<crate::models::UnsupportedReason>,

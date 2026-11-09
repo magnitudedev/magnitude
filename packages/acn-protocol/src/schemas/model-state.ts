@@ -812,9 +812,28 @@ export const CatalogSupportSchema = Schema.Union(
 )
 export type CatalogSupport = typeof CatalogSupportSchema.Type
 
+export const LabIdSchema = NonEmptyString.pipe(Schema.brand("LabId"))
+export type LabId = typeof LabIdSchema.Type
+
+/** An ISO 3166-1 alpha-2 country code. */
+export const CountryCodeSchema = Schema.String.pipe(
+  Schema.pattern(/^[A-Z]{2}$/, { message: () => "country must be an ISO 3166-1 alpha-2 code" }),
+  Schema.brand("CountryCode"),
+)
+export type CountryCode = typeof CountryCodeSchema.Type
+
+/** The lab that develops a model, from the release catalog's lab table. */
+export const LocalModelDeveloperSchema = Schema.Struct({
+  lab: LabIdSchema,
+  name: NonEmptyString,
+  country: CountryCodeSchema,
+})
+export type LocalModelDeveloper = typeof LocalModelDeveloperSchema.Type
+
 const LocalModelCatalogDataFields = {
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
+  developer: LocalModelDeveloperSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
   aliases: Schema.Array(CustomFormModelIdSchema),
@@ -1280,6 +1299,7 @@ export const CustomModelPresentationSchema = Schema.Struct({
   variantLabel: ModelVariantLabelSchema,
   sourceLabel: NonEmptyString,
   variantOf: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
+  developer: Schema.optionalWith(LocalModelDeveloperSchema, { as: "Option", exact: true }),
   license: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   sourceUrls: Schema.Array(HttpsUrlSchema),
 }).pipe(Schema.filter((presentation) => new Set(presentation.sourceUrls).size === presentation.sourceUrls.length,
@@ -1454,6 +1474,7 @@ export const HuggingFaceSearchResultSchema = Schema.Struct({
   displayName: NonEmptyString,
   uploader: NonEmptyString,
   variantOf: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
+  developer: Schema.optionalWith(LocalModelDeveloperSchema, { as: "Option", exact: true }),
   downloads: NonNegativeSafeInteger,
   architecture: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   unsupported: Schema.optionalWith(Schema.NonEmptyArray(UnsupportedReasonSchema), { as: "Option", exact: true }),
@@ -1518,6 +1539,7 @@ export const CandidateInspectionSchema = Schema.Struct({
   displayName: NonEmptyString,
   license: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   variantOf: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
+  developer: Schema.optionalWith(LocalModelDeveloperSchema, { as: "Option", exact: true }),
   versions: Schema.Array(CandidateVersionSchema),
   selectedVersion: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
   projector: Schema.optionalWith(CandidateFileSchema, { as: "Option", exact: true }),

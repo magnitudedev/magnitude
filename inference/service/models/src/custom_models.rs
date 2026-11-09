@@ -33,6 +33,7 @@ use magnitude_service_contracts::{
 
 use crate::candidate_files::RecognizedArchitectures;
 use crate::catalog_models::catalog_id;
+use crate::developers::DeveloperEvidence;
 use crate::gguf::{GgufBaseModel, GgufRole};
 use crate::inventory::{
     InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, UNSUPPORTED_FORMAT_CODE,
@@ -1332,13 +1333,27 @@ impl ModelContext<'_> {
             || chosen_pending)
             && configuration.is_ok()
             && withheld.is_none();
+        let variant_of = inspected
+            .as_ref()
+            .and_then(|known| known.variant_of.clone())
+            .or_else(|| enriched.variant_of.clone());
+        let lineage_repository = group.lineage_repository();
+        let base_repositories =
+            crate::candidate_files::base_model_repositories(&evidence.base_models)
+                .into_iter()
+                .collect::<Vec<_>>();
+        let developer = crate::model_developers().resolve(DeveloperEvidence {
+            repository: lineage_repository.as_deref(),
+            base_repositories: &base_repositories,
+            variant_of: variant_of.as_ref(),
+        });
         Some(ProjectedModel {
             locations: group
                 .occurrences
                 .iter()
                 .map(|occurrence| occurrence.primary.clone())
                 .collect(),
-            lineage_repository: group.lineage_repository(),
+            lineage_repository,
             candidate_drafters,
             drafter_pending,
             awaited_drafter: None,
@@ -1355,8 +1370,8 @@ impl ModelContext<'_> {
                 origin,
                 display_name,
                 variant_label,
-                variant_of: inspected.as_ref().and_then(|known| known.variant_of.clone())
-                    .or_else(|| enriched.variant_of.clone()),
+                variant_of,
+                developer,
                 files,
                 size_bytes,
                 projector,
@@ -1433,6 +1448,12 @@ impl ModelContext<'_> {
             None,
         );
         let inspected = self.cache.read_model_presentation(&model_id, &added.revision);
+        let variant_of = inspected.as_ref().and_then(|known| known.variant_of.clone());
+        let developer = crate::model_developers().resolve(DeveloperEvidence {
+            repository: Some(added.repository.as_str()),
+            base_repositories: &[],
+            variant_of: variant_of.as_ref(),
+        });
         Some(ProjectedModel {
             locations: Vec::new(),
             lineage_repository: Some(added.repository.as_str().to_owned()),
@@ -1444,7 +1465,8 @@ impl ModelContext<'_> {
                 },
                 display_name: inspected.as_ref().map_or(display_name, |known| known.display_name.clone()),
                 variant_label: inspected.as_ref().map_or(variant_label, |known| Some(known.variant_label.clone())),
-                variant_of: inspected.as_ref().and_then(|known| known.variant_of.clone()),
+                variant_of,
+                developer,
                 files: crate::candidate_files::split_set(added.path.as_str())
                     .into_iter()
                     .map(|path| CustomModelFile {
@@ -3856,6 +3878,11 @@ mod tests {
             license: "test".to_owned(),
             parameterization: magnitude_service_contracts::models::ModelParameterization::Dense {
                 total_parameters: 1_000_000_000,
+            },
+            developer: magnitude_service_contracts::models::ModelDeveloper {
+                lab: magnitude_service_contracts::models::LabId("alibaba".to_owned()),
+                name: "Alibaba".to_owned(),
+                country: "CN".to_owned(),
             },
             support: magnitude_service_contracts::models::CatalogSupport::Supported {
                 intelligence: 0,

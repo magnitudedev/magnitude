@@ -776,6 +776,7 @@ fn catalog_model(
             .into_iter()
             .collect(),
         parameterization: definition.parameterization.clone(),
+        developer: definition.developer.clone(),
         support: definition.support.clone(),
         fidelity_rank: definition.fidelity_rank,
         quantization_aware: definition.quantization_aware,
@@ -1454,6 +1455,11 @@ mod tests {
             license: "test".to_owned(),
             parameterization: ModelParameterization::Dense {
                 total_parameters: 1_000_000,
+            },
+            developer: magnitude_service_contracts::models::ModelDeveloper {
+                lab: magnitude_service_contracts::models::LabId("alibaba".to_owned()),
+                name: "Alibaba".to_owned(),
+                country: "CN".to_owned(),
             },
             support: CatalogSupport::Supported { intelligence: 1 },
             fidelity_rank: 1,

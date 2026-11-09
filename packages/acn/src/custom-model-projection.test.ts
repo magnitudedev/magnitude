@@ -410,7 +410,7 @@ describe("local models state", () => {
         id: modelId,
         source: {
           aliases: Option.none(), description: "", desired, displayName: "Gemma 4 E2B", fidelityRank: 1,
-          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: true,
+          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, developer: { lab: "alibaba", name: "Alibaba", country: "CN" }, quantizationAware: true,
           releaseDate: "2026-04-02", sourceUrls: [], support: { level: "supported", intelligence: 1 }, variantLabel: "Q4 QAT",
           localState: {
             _tag: "Installed",
@@ -452,7 +452,7 @@ describe("local models state", () => {
           aliases: Option.none(), description: "", displayName: "MiniCPM5 2B", fidelityRank: 1,
           desired: { metadata: { storageBytes: 2_679_710_688 }, profile: { contextLength: 131_072 }, speculativeMethod: Option.none() },
           drafterWithheld: true,
-          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, quantizationAware: false,
+          license: "apache-2.0", parameterization: { architecture: "dense", totalParameters: 1 }, developer: { lab: "alibaba", name: "Alibaba", country: "CN" }, quantizationAware: false,
           releaseDate: "2026-09-01", sourceUrls: [], support: { level: "supported", intelligence: 1 }, variantLabel: "Q8",
           localState,
         },
@@ -493,6 +493,7 @@ describe("local models state", () => {
         },
         drafterWithheld: false,
         parameterization: { architecture: "dense", totalParameters: 1 },
+        developer: { lab: "alibaba", name: "Alibaba", country: "CN" },
         quantizationAware: false,
         releaseDate: "2026-08-29",
         sourceUrls: [],

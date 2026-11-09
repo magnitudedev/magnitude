@@ -11,8 +11,8 @@ use magnitude_artifacts::catalog_headers::{
 };
 use magnitude_service_contracts::ComponentRole;
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, ModelFailure,
-    ModelFileRole, ModelId, ModelPackage, ModelPackageSource, ModelParameterization,
+    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, LabId, ModelDeveloper,
+    ModelFailure, ModelFileRole, ModelId, ModelPackage, ModelPackageSource, ModelParameterization,
     ModelReleaseDate, ModelServingConfiguration, PackageValidation, ParsedModelId,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
     ResolvedServableModelBundle, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
@@ -27,6 +27,7 @@ use magnitude_service_contracts::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::developers::ModelDevelopers;
 use crate::inventory::ManagedModelStore;
 use crate::package_service::{
     ServableModelBundleKey, servable_model_bundle_key_for_bundle, validated_package_from_resolved,
@@ -48,7 +49,64 @@ const MAX_PLANNER_BUNDLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CatalogSource {
     artificial_analysis_frontier: ArtificialAnalysisFrontier,
+    labs: Vec<CatalogLab>,
     models: Vec<CatalogModel>,
+}
+
+/// A lab that develops catalog models: its display name, its country (ISO 3166-1 alpha-2) and the
+/// Hugging Face organizations it publishes under, which attribute models outside the catalog.
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CatalogLab {
+    id: String,
+    name: String,
+    country: String,
+    hugging_face_organizations: Vec<String>,
+}
+
+impl CatalogLab {
+    fn developer(&self) -> ModelDeveloper {
+        ModelDeveloper {
+            lab: LabId(self.id.clone()),
+            name: self.name.clone(),
+            country: self.country.clone(),
+        }
+    }
+}
+
+impl CatalogSource {
+    /// The developer of a catalog model, whose lab `catalog_source` requires the table to hold.
+    fn developer(&self, model: &CatalogModel) -> ModelDeveloper {
+        self.labs
+            .iter()
+            .find(|lab| lab.id == model.lab)
+            .expect("catalog_source requires every model's lab in the lab table")
+            .developer()
+    }
+
+    fn developers(&self) -> ModelDevelopers {
+        ModelDevelopers::new(
+            self.labs
+                .iter()
+                .map(|lab| (lab.developer(), lab.hugging_face_organizations.clone())),
+            self.models
+                .iter()
+                .filter_map(|model| {
+                    Some((CatalogBaseId::new(model.id.clone()).ok()?, LabId(model.lab.clone())))
+                })
+                .collect(),
+        )
+    }
+}
+
+/// The developers of the compiled catalog, whose source its tests validate.
+pub fn model_developers() -> &'static ModelDevelopers {
+    static DEVELOPERS: std::sync::LazyLock<ModelDevelopers> = std::sync::LazyLock::new(|| {
+        catalog_source()
+            .expect("the compiled catalog source is valid")
+            .developers()
+    });
+    &DEVELOPERS
 }
 
 /// The top Artificial Analysis Intelligence Index result. Catalog intelligence is each model's
@@ -111,6 +169,7 @@ enum ArtificialAnalysisProvenance {
 struct CatalogModel {
     id: String,
     display_name: String,
+    lab: String,
     description: String,
     release_date: ModelReleaseDate,
     parameterization: ModelParameterization,
@@ -382,6 +441,11 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
             "invalid Artificial Analysis frontier declaration".to_owned(),
         ));
     }
+    if !valid_labs(&source.labs) {
+        return Err(InventoryError::Integrity(
+            "invalid or duplicate catalog lab declaration".to_owned(),
+        ));
+    }
     let mut ids = BTreeSet::new();
     let mut presentations = BTreeSet::new();
     for model in &source.models {
@@ -458,6 +522,7 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                     }
                 })
             || !valid_model_score(model, &source.artificial_analysis_frontier)
+            || !source.labs.iter().any(|lab| lab.id == model.lab)
             || !ids.insert(model.id.as_str())
             || model.variants().any(|(_, variant)| {
                 !presentations.insert((model.display_name.as_str(), variant.variant_label.as_str()))
@@ -480,6 +545,27 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
         )));
     }
     Ok(source)
+}
+
+/// Every lab has an identity-component ID, a name, an ISO 3166-1 alpha-2 country and at least one
+/// Hugging Face organization; no two labs share an ID or an organization (ignoring case).
+fn valid_labs(labs: &[CatalogLab]) -> bool {
+    let mut ids = BTreeSet::new();
+    let mut organizations = BTreeSet::new();
+    !labs.is_empty()
+        && labs.iter().all(|lab| {
+            valid_identity_component(&lab.id)
+                && ids.insert(lab.id.as_str())
+                && valid_non_empty(&lab.name)
+                && lab.country.len() == 2
+                && lab.country.bytes().all(|byte| byte.is_ascii_uppercase())
+                && !lab.hugging_face_organizations.is_empty()
+                && lab.hugging_face_organizations.iter().all(|organization| {
+                    valid_identity_component(organization)
+                        && !organization.contains('/')
+                        && organizations.insert(organization.to_lowercase())
+                })
+        })
 }
 
 /// A deprecation names its date and reason, and its replacement is an exact supported catalog
@@ -1591,8 +1677,8 @@ fn package_source_matches(
 }
 
 fn recommendable_model(
+    catalog: &CatalogSource,
     declaration: &CatalogModel,
-    frontier: &ArtificialAnalysisFrontier,
     source: &CatalogModelSource,
     variant: &CatalogVariant,
     target: ModelPackage,
@@ -1667,7 +1753,8 @@ fn recommendable_model(
         release_date: declaration.release_date.clone(),
         license: source.license.clone(),
         parameterization: declaration.parameterization.clone(),
-        support: declaration.rated_support(frontier),
+        developer: catalog.developer(declaration),
+        support: declaration.rated_support(&catalog.artificial_analysis_frontier),
         fidelity_rank: variant.fidelity_rank,
         quantization_aware: variant.quantization_aware,
     })
@@ -1702,8 +1789,8 @@ fn catalog_from_planner_inputs(
                 ))
             })?;
             let model = recommendable_model(
+                source,
                 declaration,
-                &source.artificial_analysis_frontier,
                 declared_source,
                 variant,
                 input.target.package.clone(),
@@ -1742,8 +1829,8 @@ impl ResolvingRecommendableCatalog {
 
     async fn resolve_model(
         &self,
+        catalog: &CatalogSource,
         declaration: &CatalogModel,
-        frontier: &ArtificialAnalysisFrontier,
         source: &CatalogModelSource,
         variant: &CatalogVariant,
         snapshots: &BTreeMap<String, HuggingFaceRepositorySnapshot>,
@@ -1844,8 +1931,8 @@ impl ResolvingRecommendableCatalog {
             None => None,
         };
         let model = recommendable_model(
+            catalog,
             declaration,
-            frontier,
             source,
             variant,
             target.package.clone(),
@@ -2102,8 +2189,8 @@ impl ResolvingRecommendableCatalog {
         }
         let (model, _, _) = self
             .resolve_model(
+                &source,
                 &selected.declaration,
-                &source.artificial_analysis_frontier,
                 &selected.source,
                 &selected.variant,
                 &snapshots,
@@ -2193,7 +2280,7 @@ impl ResolvingRecommendableCatalog {
         }
         let resolved_snapshots = &resolved_snapshots;
         let snapshot_failures = &snapshot_failures;
-        let frontier = &source.artificial_analysis_frontier;
+        let catalog = &source;
         let model_total = source.models.len();
         let mut model_completed = 0;
         let resolved =
@@ -2208,8 +2295,8 @@ impl ResolvingRecommendableCatalog {
                             match missing_repository {
                                 None => {
                                     self.resolve_model(
+                                        catalog,
                                         &declaration,
-                                        frontier,
                                         source,
                                         variant,
                                         resolved_snapshots,
@@ -2489,6 +2576,25 @@ mod tests {
             .find(|model| model.id == "bonsai-8b-q1")
             .expect("deprecated model");
         assert!(!valid_catalog_support(deprecated, &source));
+    }
+
+    #[test]
+    fn labs_have_distinct_ids_and_organizations_and_a_country_code() {
+        let source = catalog_source().expect("catalog source should be valid");
+        assert!(valid_labs(&source.labs));
+        assert!(source
+            .models
+            .iter()
+            .all(|model| source.labs.iter().any(|lab| lab.id == model.lab)));
+        let mut shared = source.labs.clone();
+        shared[1].hugging_face_organizations.push("QWEN".to_owned());
+        assert!(!valid_labs(&shared));
+        let mut duplicate = source.labs.clone();
+        duplicate[1].id = duplicate[0].id.clone();
+        assert!(!valid_labs(&duplicate));
+        let mut country = source.labs.clone();
+        country[0].country = "China".to_owned();
+        assert!(!valid_labs(&country));
     }
 
     #[test]
