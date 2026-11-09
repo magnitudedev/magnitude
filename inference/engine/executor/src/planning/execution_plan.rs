@@ -1759,7 +1759,27 @@ mod tests {
         host: u64,
         cost: seismic::GraphCost,
     ) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
+        recorded_granted(topology, backend, host, cost, None)
+    }
+
+    /// [`recorded`] with the executor's device path granted `grant` bytes
+    /// (a Vulkan heap's budget left, `VK_EXT_memory_budget`), where given.
+    fn recorded_granted(
+        topology: seismic::DeviceTopology,
+        backend: BackendName,
+        host: u64,
+        cost: seismic::GraphCost,
+        grant: Option<u64>,
+    ) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
         use crate::platform::{GraphPricing, MemoryReserves};
+        let info = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap().clone();
+        let grants = grant
+            .map(|bytes| {
+                let path = info.paths(seismic::Placing::Fixed(seismic::Contract::DeviceOnly))[0];
+                (path, Ok(seismic::Reported::new(bytes, seismic::ReportedBy::VulkanHeapBudget)))
+            })
+            .into_iter()
+            .collect();
         let status = seismic::Status {
             sample: seismic::Sample {
                 taken: std::time::SystemTime::now(),
@@ -1776,12 +1796,11 @@ mod tests {
                 }),
                 volumes: Vec::new(),
                 executors: topology.executors().iter().map(|executor| executor.id()).collect(),
-                grants: Vec::new(),
+                grants,
             },
             runtime: Default::default(),
         };
         let reserves = MemoryReserves::of_machine(None);
-        let info = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap().clone();
         let device = crate::platform::selected(&topology, &status, &reserves, info, GraphPricing::Measured(cost)).unwrap();
         (topology, status, reserves, device)
     }
@@ -1950,6 +1969,52 @@ mod tests {
         assert_eq!((bank.slots, bank.ceiling), (256, 256), "every expert is held");
         assert!(bank.whole());
         assert_eq!(bank.host_slots, 0, "a whole bank holds no host tier");
+    }
+
+    /// Qwen3.6 35B-A3B q4's routed shape at 4k on the RTX 3090's Vulkan
+    /// executor, its device heap's budget as the card grants it
+    /// (`VK_EXT_memory_budget`, 25,336,446,976 bytes left, read on the
+    /// card), planned as the load plans it before the executor's costs are
+    /// measured: the room holds
+    /// its experts whole, so the load holds them whole, in a whole bank or
+    /// none, never a partial bank that streams what the room holds.
+    #[test]
+    fn qwen36_q4_on_a_vulkan_3090_at_its_budget_holds_no_partial_bank() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        let (_, _, _, device) =
+            recorded_granted(seismic::fixtures::recorded::rtx3090(), BackendName::Vulkan, 64 << 30, seismic::GraphCost::None, Some(25_336_446_976));
+        let mut definition = routed_fixture_definition(RoutedShape { layers: 40, experts: 256, selected: 8, hidden: 2048, intermediate: 512 });
+        definition.decoder.context_limit = 4096;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: false, vision: false },
+            ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            LIMITS,
+        )
+        .unwrap();
+        // The setup's precondition: the experts held whole, charged as every
+        // way of holding them is, fit the budget's stable room.
+        let whole = draft.held_whole(&definition).unwrap();
+        let mut held = HeldCharges::<AssessmentMemoryCharge>::default();
+        let charge = held.charge(&definition, &whole).unwrap().charge().clone();
+        let fit = StableRoom::of(&whole.device).fit(&whole, &charge).unwrap();
+        assert!(
+            matches!(fit.verdict, super::super::AssessmentFitVerdict::Fits),
+            "the experts held whole fit the card's budget: {:?}",
+            fit.verdict
+        );
+        // As the real load plans it: before the executor's costs are
+        // measured.
+        let prices = Priced::Pending("the executor's costs are not measured yet".into());
+        let planned = draft.with_bank::<AssessmentMemoryCharge>(&definition, None, &prices).unwrap();
+        if let Some(bank) = planned.draft().load().expert_bank() {
+            assert_eq!((bank.slots, bank.ceiling), (256, 256), "a bank of the experts the room holds whole is whole");
+        }
     }
 
     /// A weight cap bounds every weight byte the load holds, its host tier's
