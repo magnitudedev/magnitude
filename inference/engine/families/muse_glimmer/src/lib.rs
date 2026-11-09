@@ -271,7 +271,6 @@ pub fn inspect_components(
                 scale: EmbeddingScale::Unit,
                 norm: Some(UnweightedRms { epsilon }),
                 per_layer: None,
-                hash_routing: None,
             },
             blocks,
             exit: ExitForm {

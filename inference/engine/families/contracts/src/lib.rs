@@ -22,7 +22,7 @@ mod vision;
 pub use decoder::{
     ActivationFunction, Attention, AttentionGate, Block, Branch, BranchOutput, Decoder,
     DeferredForm, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
-    FeedForwardUp, GateFunction, GateGranularity, GatedDelta, HashRoutingTable, HeadNorm,
+    FeedForwardUp, GateFunction, GateGranularity, GatedDelta, HeadNorm,
     HistoryDomain, HistoryReads, HyperConnectionMixing, HyperConnectionWeights, HyperConnections,
     Indexer, InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention,
     NGramHash, NGramInput, Operator, OutputForm, PerLayerEntry, PerLayerInput,
@@ -502,7 +502,6 @@ pub enum WeightKind {
     PerLayerTable,
     PerLayerModelProjection,
     PerLayerProjectionNorm,
-    HashRoutingTable,
     /// A sublayer's or branch's input normalization.
     InputNorm,
     /// A sublayer's or branch's output normalization.
@@ -1118,7 +1117,6 @@ mod tests {
                     scale: EmbeddingScale::Unit,
                     norm: None,
                     per_layer: None,
-                    hash_routing: None,
                 },
                 blocks: sublayers
                     .into_iter()

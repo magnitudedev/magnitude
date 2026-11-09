@@ -271,9 +271,6 @@ pub(crate) fn hint_kinds(routed: &RoutedFfn) -> Vec<WeightKind> {
 /// ungated shared expert.
 pub(crate) fn admit(routed: &RoutedFfn) -> Result<(), PlanError> {
     let router = &routed.router;
-    if !matches!(router.selection, ExpertSelection::TopK { .. }) {
-        return Err(PlanError::Unsupported("expert selection"));
-    }
     if !matches!(
         router.score,
         ScoreFunction::Softmax | ScoreFunction::Sigmoid

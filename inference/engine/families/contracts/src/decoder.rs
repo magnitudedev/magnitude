@@ -10,8 +10,8 @@
 //!
 //! Some forms exist only as interface points for deferred families (plan §9):
 //! hyper-connection residuals, latent attention, block-rate and gathered
-//! history, hash routing and sqrt-softplus scores. They are legal
-//! descriptions; [`ModelDefinition::deferred_forms`](crate::ModelDefinition::deferred_forms)
+//! history and sqrt-softplus scores. They are legal descriptions;
+//! [`ModelDefinition::deferred_forms`](crate::ModelDefinition::deferred_forms)
 //! names them so an executor rejects them with a typed error.
 
 use crate::{DefinitionError, WeightDescriptor, checked_product, expect_shape};
@@ -73,8 +73,6 @@ pub struct EntryForm {
     pub norm: Option<UnweightedRms>,
     /// Per-layer inputs gathered once per token (Gemma PLE).
     pub per_layer: Option<PerLayerEntry>,
-    /// Token-keyed expert table for hash-routed layers. Deferred (§9).
-    pub hash_routing: Option<HashRoutingTable>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,12 +108,6 @@ pub struct PerLayerEntry {
     pub combine_scale: f64,
     /// The table row media rows read in place of a token.
     pub media_row: u64,
-}
-
-/// Deferred (§9): token-keyed expert selection for the first routed layers.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HashRoutingTable {
-    pub table: WeightDescriptor,
 }
 
 /// How the final residual becomes logits.
@@ -675,8 +667,6 @@ pub enum ExpertSelection {
     /// The `selected` highest scores, ranked on `score + bias` when a
     /// selection-only bias (`[experts]`) is present.
     TopK { bias: Option<WeightDescriptor> },
-    /// Experts read from the entry hash table. Deferred (§9).
-    Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -886,7 +876,6 @@ pub enum DeferredForm {
     BlockHistory,
     NGramInput,
     SqrtSoftplusScore,
-    HashRouting,
 }
 
 impl DeferredForm {
@@ -898,7 +887,6 @@ impl DeferredForm {
             Self::BlockHistory => "block-rate attention history",
             Self::NGramInput => "n-gram input",
             Self::SqrtSoftplusScore => "sqrt-softplus expert scores",
-            Self::HashRouting => "hash expert routing",
         }
     }
 }
@@ -1022,18 +1010,10 @@ impl Decoder {
                 "per-layer input norm",
             )?;
         }
-        if let Some(table) = &entry.hash_routing {
-            if table.table.shape.len() != 2 || table.table.shape[0] != self.vocabulary {
-                return Err(DefinitionError::new("invalid hash routing table"));
-            }
-        }
         Ok(())
     }
 
     pub(crate) fn deferred_forms(&self, forms: &mut Vec<DeferredForm>) {
-        if self.entry.hash_routing.is_some() {
-            forms.push(DeferredForm::HashRouting);
-        }
         for block in &self.blocks {
             for sublayer in &block.sublayers {
                 let mut operator = Vec::new();
@@ -1102,9 +1082,6 @@ fn operator_deferred_forms(op: &Operator, forms: &mut Vec<DeferredForm>) {
         Operator::RoutedFfn(routed) => {
             if routed.router.score == ScoreFunction::SqrtSoftplus {
                 forms.push(DeferredForm::SqrtSoftplusScore);
-            }
-            if matches!(routed.router.selection, ExpertSelection::Hash) {
-                forms.push(DeferredForm::HashRouting);
             }
         }
         Operator::Parallel(branches) => {

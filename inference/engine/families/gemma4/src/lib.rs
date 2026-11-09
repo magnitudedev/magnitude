@@ -433,7 +433,6 @@ pub fn inspect_components(
                 scale: EmbeddingScale::SqrtHidden,
                 norm: None,
                 per_layer,
-                hash_routing: None,
             },
             blocks,
             exit: ExitForm {

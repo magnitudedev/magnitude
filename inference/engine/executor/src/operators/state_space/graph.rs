@@ -473,7 +473,6 @@ mod tests {
                     scale: EmbeddingScale::Unit,
                     norm: None,
                     per_layer: None,
-                    hash_routing: None,
                 },
                 blocks,
                 exit: ExitForm {

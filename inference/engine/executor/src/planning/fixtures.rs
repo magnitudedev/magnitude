@@ -108,7 +108,6 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
                 scale: EmbeddingScale::Unit,
                 norm: None,
                 per_layer: None,
-                hash_routing: None,
             },
             blocks: vec![Block {
                 sublayers: vec![

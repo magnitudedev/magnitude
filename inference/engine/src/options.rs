@@ -769,7 +769,6 @@ pub(crate) mod tests {
                     scale: EmbeddingScale::Unit,
                     norm: None,
                     per_layer: None,
-                    hash_routing: None,
                 },
                 blocks: vec![block("")],
                 exit: ExitForm {
