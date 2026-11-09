@@ -574,13 +574,14 @@ fn planned_executor<'a>(
 }
 
 /// Whether the standard workload of one prepared model of `definition` fits
-/// stable capacity. A plan that does not fit holds its experts as a load
-/// does ([`ExecutionPlanDraft::with_held_experts`]) within the allocation
-/// domain's stable capacity, and fits so; otherwise the plan's own shortfall
-/// is the verdict. Its plans are charged from the charges planning made
-/// ([`HeldCharges`]), so a way of holding the experts planning charged is
-/// never charged from its structure again. On a machine whose prices are
-/// not measured the fit is sized by memory alone
+/// stable capacity: its experts held as a load holds them
+/// ([`ExecutionPlanDraft::with_held_experts`]), placed whole where the
+/// allocation domain's stable room holds them so, else streamed within it;
+/// where neither fits, the prepared plan's own shortfall is the verdict.
+/// Its plans are charged from the charges planning made ([`HeldCharges`]),
+/// so a way of holding the experts planning charged is never charged from
+/// its structure again. On a machine whose prices are not measured a
+/// streamed fit is sized by memory alone
 /// ([`crate::Unmeasured::SizedByMemory`]): fit is assessed, and speed is
 /// what is pending.
 pub fn assess_execution_fit(
@@ -593,27 +594,22 @@ pub fn assess_execution_fit(
     prices: &crate::assessment::Priced<crate::PlanPrices>,
 ) -> Result<ExecutionAssessment, AssessmentError> {
     let device = planned_executor(draft, topology)?;
-    // The plan is confirmed as a load's plan of it is (`StableRoom::fit`),
-    // and settles into the same room.
+    // Every plan is confirmed as a load's plan of it is (`StableRoom::fit`),
+    // and settles into the same room: the allocation domain's stable fit;
+    // every other store `Fit` places the plan in is its confirm's.
     let room = crate::planning::StableRoom { topology, executor: device, status, reserves: &request.reserves };
     let fit = room.fit(draft, &prepared.charge)?;
-    let (limiting, deficit_bytes) = match fit.verdict {
-        AssessmentFitVerdict::Fits => {
-            return Ok(ExecutionAssessment::Fits(ExecutionFit {
-                fit_context_tokens: prepared.fit_context_tokens,
-                breakdown: prepared.charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
-                domains: fit.domains,
-                bank: draft.load().expert_bank().cloned(),
-            }));
-        }
-        AssessmentFitVerdict::DoesNotFit {
-            limiting,
-            deficit_bytes,
-        } => (limiting, deficit_bytes),
-    };
-    // The settle grants into the allocation domain's stable fit, as the
-    // load's plan does (`ExecutionPlanDraft::with_bank`); every other store
-    // `Fit` places the plan in is its confirm's.
+    // A prepared plan whose experts are whole (a bank of every expert at
+    // its largest pass, or their own allocations) that fits is the plan
+    // placement holds first.
+    if matches!(fit.verdict, AssessmentFitVerdict::Fits) && draft.load().expert_bank().is_none_or(|bank| bank.whole()) {
+        return Ok(ExecutionAssessment::Fits(ExecutionFit {
+            fit_context_tokens: prepared.fit_context_tokens,
+            breakdown: prepared.charge.breakdown(&fit.domains).map_err(AssessmentError::Memory)?,
+            domains: fit.domains,
+            bank: draft.load().expert_bank().cloned(),
+        }));
+    }
     let bound = fit.settle_bound().map_err(AssessmentError::Memory)?;
     let confirm = |candidate: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge| {
         let fit = room.fit(candidate, charge)?;
@@ -632,12 +628,17 @@ pub fn assess_execution_fit(
             breakdown,
             bank: held.draft().load().expert_bank().cloned(),
         }),
-        Err(_) => ExecutionAssessment::DoesNotFit(ExecutionShortfall {
-            fit_context_tokens: prepared.fit_context_tokens,
-            domains: fit.domains,
-            limiting,
-            deficit_bytes,
-        }),
+        Err(_) => match fit.verdict {
+            AssessmentFitVerdict::DoesNotFit { limiting, deficit_bytes } => ExecutionAssessment::DoesNotFit(ExecutionShortfall {
+                fit_context_tokens: prepared.fit_context_tokens,
+                domains: fit.domains,
+                limiting,
+                deficit_bytes,
+            }),
+            AssessmentFitVerdict::Fits => {
+                return Err(AssessmentError::Plan("the prepared plan fits, yet no holding of its experts does".into()));
+            }
+        },
     })
 }
 

@@ -1,7 +1,7 @@
 //! A prompt group's room as priced holdings of the one heap
 //! (`domain::value`): its merged-expert pass size beyond one launch
 //! ([`PassLaunches`]), which a plan's settle grants with the class of its
-//! chain places (`ExecutionPlanDraft::with_largest_bank`), and its places
+//! chain places (`ExecutionPlanDraft::settle_bank`), and its places
 //! beyond one ([`Holding::Places`]), which every serving settle prices
 //! beside the bank's slots.
 //! Each is worth the prefill (or launch) seconds it saves times how often

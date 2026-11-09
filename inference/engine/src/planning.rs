@@ -14,7 +14,7 @@ use magnitude_executor::{
     platform::{self, PlatformError, SelectedDevice},
     BackendPlan, ComponentSelection,
     DraftWidths,
-    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, PlannedMethod, ResourceLimits,
+    ChargedDraft, ExecutionPlanDraft, ExecutionPlanner, HeldCharge, PlanError, Placed, PlannedMethod, ResourceLimits,
 };
 use magnitude_scheduler::ServiceLimits;
 use seismic::Devices;
@@ -106,17 +106,19 @@ pub fn plan_resident(
     .map_err(ExecutionPlanningError::Plan)
 }
 
-/// [`plan_execution`]'s plan from its `resident` plan: its expert bank,
-/// under the model policy's weight cap, if any, with its charge, settled on
-/// the machine's prices (`assessment::plan_prices`): the records of its
-/// kernel cache, its model store's figures.
+/// [`plan_execution`]'s plan from its `resident` plan, in two stages: its
+/// experts placed whole under the model policy's weight cap, if any, from
+/// memory alone (`ExecutionPlanDraft::placed`), reading no price and asking
+/// no measurement; else streamed through the expert bank its settle grants
+/// on the machine's prices (`assessment::plan_prices`, `Unplaced::streamed`):
+/// the records of its kernel cache, its model store's figures.
 ///
-/// Every load, banked or not, is priced on its executor's costs as it
-/// serves, so none plans before the measurement job stored the costs'
-/// required figures: while they are pending the plan's prices are
-/// (`PlanError::Unpriced`), and the load waits for them holding nothing of
-/// the device, once per machine. Without a kernel cache nothing is measured
-/// for it, and its prices are unavailable.
+/// Every load, whole or streamed, is priced on its executor's costs as it
+/// serves (`execution::load_measures`), so none plans before the
+/// measurement job stored the costs' required figures: while they are
+/// pending the plan's prices are (`PlanError::Unpriced`), and the load waits
+/// for them holding nothing of the device, once per machine. Without a
+/// kernel cache nothing is measured for it, and its prices are unavailable.
 pub fn plan_banked<C: HeldCharge>(
     manifest: &ExecutionManifest,
     selected: &SelectedDevice,
@@ -138,10 +140,12 @@ pub fn plan_banked<C: HeldCharge>(
             reason: "the executor's costs are not measured yet".into(),
         }));
     }
-    let prices = crate::assessment::plan_prices(&measurements, &resident);
-    resident
-        .with_bank(&manifest.definition, manifest.model.weight_bound, &prices)
-        .map_err(ExecutionPlanningError::Plan)
+    let short = match resident.placed(&manifest.definition, manifest.model.weight_bound).map_err(ExecutionPlanningError::Plan)? {
+        Placed::Whole(whole) => return Ok(whole),
+        Placed::Short(short) => short,
+    };
+    let prices = crate::assessment::plan_prices(&measurements, short.draft());
+    short.streamed(&manifest.definition, &prices).map_err(ExecutionPlanningError::Plan)
 }
 
 /// Plan the manifest's model on `backend`, which is all planning reads of a
