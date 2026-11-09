@@ -1,5 +1,7 @@
 // Renders the brand tile onto Apple's macOS app icon grid: an 824pt tile centered on a
 // 1024pt canvas, with the standard drop shadow in the margin. AppKit rasterizes the SVG.
+// Like Apple's own dark icons, the tile gets a top-down lift and a light inner rim so its
+// edge reads against the dark Dock instead of shrinking to the white glyph.
 import AppKit
 
 let arguments = CommandLine.arguments
@@ -21,7 +23,18 @@ func render(_ pixels: Int, to url: URL) throws {
   shadow.shadowOffset = NSSize(width: 0, height: -10 * scale)
   shadow.shadowBlurRadius = 20 * scale
   shadow.set()
-  tile.draw(in: NSRect(x: 100 * scale, y: 100 * scale, width: 824 * scale, height: 824 * scale))
+  let rect = NSRect(x: 100 * scale, y: 100 * scale, width: 824 * scale, height: 824 * scale)
+  tile.draw(in: rect)
+  shadow.shadowColor = nil
+  shadow.set()
+  let radius = rect.width * 197 / 1024
+  NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).addClip()
+  NSGradient(starting: NSColor.white.withAlphaComponent(0.08), ending: NSColor.white.withAlphaComponent(0))!.draw(in: rect, angle: -90)
+  let rim = 6 * scale
+  let edge = NSBezierPath(roundedRect: rect.insetBy(dx: rim / 2, dy: rim / 2), xRadius: radius - rim / 2, yRadius: radius - rim / 2)
+  edge.lineWidth = rim
+  NSColor.white.withAlphaComponent(0.14).setStroke()
+  edge.stroke()
   NSGraphicsContext.restoreGraphicsState()
   try rep.representation(using: .png, properties: [:])!.write(to: url)
 }
