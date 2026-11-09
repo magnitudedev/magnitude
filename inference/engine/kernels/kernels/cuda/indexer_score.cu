@@ -34,9 +34,7 @@ constexpr int E = W / 32;
 constexpr int H = SEISMIC_DIM_H;
 static_assert(W % 32 == 0, "indexer head width must be a multiple of 32");
 
-typedef rotary::layout<W, SEISMIC_DIM_P, SEISMIC_DIM_RT != 0 ? static_cast<int>(SEISMIC_DIM_S) : 0,
-                       SEISMIC_DIM_RA != 0>
-    query_layout;
+typedef ROTARY_ENTRY_LAYOUT(W) query_layout;
 
 } // namespace score
 
@@ -65,18 +63,11 @@ extern "C" __global__ void indexer_score(SEISMIC_KERNEL_PARAMS) {
     }
     // The row's query heads, prepared in F32.
     const float epsilon = element::word_f32(SEISMIC_PARAM_EPSILON);
-    const rounding::Rounding trained{static_cast<int>(static_cast<u32>(SEISMIC_PARAM_BLOCK)),
-                                     static_cast<int>(static_cast<u32>(SEISMIC_PARAM_ELEMENT)),
-                                     static_cast<int>(static_cast<u32>(SEISMIC_PARAM_ROUNDING_SCALE)),
-                                     element::word_f32(SEISMIC_PARAM_AMAX_FLOOR)};
-    const rotary::table table{
+    const rounding::Rounding trained =
+        rounding::of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_ROUNDING_SCALE, SEISMIC_PARAM_AMAX_FLOOR);
+    const rotary::table table = ROTARY_ENTRY_TABLE(
         reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES)) + row * SEISMIC_COORDINATES_STRIDE_0,
-        SEISMIC_COORDINATES_STRIDE_1,
-        reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS)), SEISMIC_ROTARY_COMPONENTS_STRIDE_0,
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES)),
-        SEISMIC_ROTARY_FREQUENCIES_STRIDE_0,
-        reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)),
-        SEISMIC_ROTARY_AMPLITUDES_STRIDE_0};
+        SEISMIC_COORDINATES_STRIDE_1);
     const element::u8 *query = SEISMIC_PTR(SEISMIC_BUFFER_QUERY);
     for (int head = warp; head < H; head += 8) {
         float x[E];
@@ -105,18 +96,8 @@ extern "C" __global__ void indexer_score(SEISMIC_KERNEL_PARAMS) {
         out[ordinal * out_stride] = -__int_as_float(0x7f800000);
         return;
     }
-    // The ordinal's key-plane row: its span's first row plus its place.
-    int at = 0;
-    u64 before = 0;
-    for (u64 span = 0; span < r; ++span) {
-        const int lo = row_spans[span * span_stride];
-        const u64 length = indexer::span_length(lo, row_spans[span * span_stride + bound_stride]);
-        if (ordinal < before + length) {
-            at = lo + static_cast<int>(ordinal - before);
-            break;
-        }
-        before += length;
-    }
+    // The ordinal's key-plane row (a listed ordinal lies within the spans).
+    const int at = indexer::span_row(row_spans, r, span_stride, bound_stride, ordinal);
     const float *k = reinterpret_cast<const float *>(slab::row(reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_KEYS)),
                                                                static_cast<u64>(at), SEISMIC_PARAM_SLAB_ROWS,
                                                                W * sizeof(float)));

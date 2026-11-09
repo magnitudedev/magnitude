@@ -47,10 +47,8 @@ constexpr bool VALUE_NORM = SEISMIC_DIM_NV != 0;
 // Stored-key values (VK = 1): a row's value is its prepared key, and the
 // history holds the key plane alone.
 constexpr bool STORED_KEY = SEISMIC_DIM_VK != 0;
-// The rotated 2P columns: the leading ones, or the trailing ones (RT = 1,
-// from S); half-split pairs, or adjacent ones (RA = 1).
-typedef rotary::layout<W, P, SEISMIC_DIM_RT != 0 ? static_cast<int>(SEISMIC_DIM_S) : 0, SEISMIC_DIM_RA != 0>
-    head_layout;
+// The rotated 2P columns (`ROTARY_ENTRY_LAYOUT`).
+typedef ROTARY_ENTRY_LAYOUT(W) head_layout;
 static_assert(I == 0 || I == W, "interleaved gates are one per column");
 static_assert(U == 0 || U == 1 || U == W, "separate gates are one per head or per column");
 static_assert(I == 0 || U == 0, "a head's gates are interleaved or separate");
@@ -409,9 +407,7 @@ __device__ __forceinline__ void head_norm(float (&x)[DPL], const float *weight, 
 // under KR = 0. Each entry that declares KR passes its own.
 __device__ __forceinline__ rounding::Rounding key_rounding(bool kr, u64 block, u64 element, u64 scale,
                                                            u64 amax_floor) {
-    return rounding::Rounding{kr ? static_cast<int>(static_cast<u32>(block)) : 0,
-                              static_cast<int>(static_cast<u32>(element)),
-                              static_cast<int>(static_cast<u32>(scale)), element::word_f32(amax_floor)};
+    return kr ? rounding::of(block, element, scale, amax_floor) : rounding::none();
 }
 
 // The rotary tables of batch row `row`.

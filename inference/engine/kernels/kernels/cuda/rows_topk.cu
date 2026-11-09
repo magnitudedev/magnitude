@@ -6,7 +6,7 @@
 // ordinals are the first min(N, listed). A row that reads a prefix (dense,
 // complete <= K, or with at most K scored ordinals) picks the first
 // min(K, scored). A selecting row finds its K-th best score T by a radix
-// select over the scores' order keys (`ordered_key`: a < b exactly when
+// select over the scores' order keys (`order::key`: a < b exactly when
 // their keys are, -0.0 and 0.0 one key), a byte a pass from the top: each
 // pass's histogram takes one atomic per distinct digit of a warp, and the
 // digit is found by a scan of the bins. It picks every ordinal above T and
@@ -21,6 +21,7 @@
 // [256], the scans' 8 warp sums and the select state [4]. Dynamic extents and
 // strides read `seismic_words`.
 
+#include "lib/core/order.cuh"
 #include "lib/core/reduce.cuh"
 #include "lib/indexer/indexer.cuh"
 
@@ -30,12 +31,6 @@ typedef unsigned int u32;
 typedef unsigned long long u64;
 
 constexpr u32 THREADS = 256;
-
-// `ordered_key` (sampling.seismic) of a non-NaN score.
-__device__ __forceinline__ u32 ordered_key(float value) {
-    const u32 bits = __float_as_uint(value + 0.0f);
-    return bits >= 0x80000000u ? 0xffffffffu - bits : bits ^ 0x80000000u;
-}
 
 } // namespace topk
 
@@ -59,7 +54,7 @@ extern "C" __global__ void rows_topk(SEISMIC_KERNEL_PARAMS) {
     const u64 score_stride = SEISMIC_SCORES_STRIDE_1;
     int *out = reinterpret_cast<int *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + row * SEISMIC_RESULT_0_STRIDE_0;
     const u64 out_stride = SEISMIC_RESULT_0_STRIDE_1;
-    auto key = [&](u32 ordinal) { return ordered_key(row_scores[ordinal * score_stride]); };
+    auto key = [&](u32 ordinal) { return order::key(row_scores[ordinal * score_stride]); };
     u32 total = 0;
 
     // The span offsets [R + 1]: the listed rows before each span, then the

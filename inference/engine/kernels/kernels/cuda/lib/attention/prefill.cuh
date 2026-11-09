@@ -555,16 +555,23 @@ __device__ __forceinline__ void put_row(u8 *tile, int row, int first, const floa
 // denominator) per (row, query head) and `merge_partitions` combines them.
 // `counts` holds each query tile's partition count. Entries without key
 // partitions (a grid z extent of 1) pass null scratch.
+//
+// An index-list source (an entry defining ATTENTION_PICKS nonzero: its
+// KS > 0, `picked`) keeps its state in the partition after the key
+// partitions'.
+#ifndef ATTENTION_PICKS
+#define ATTENTION_PICKS 0
+#endif
+constexpr bool PICKS = ATTENTION_PICKS != 0;
 struct Split {
     float *partials;    // [parts][M][KV * G][W]
     float *statistics;  // [parts][M][KV * G][2]
     u32 *counts;        // [query tiles]
-    // An index-list source's state (KS > 0, `picked`): the partition after
-    // the key partitions', [M][KV * G][W] and [M][KV * G][2]. Every tile
-    // then publishes partials and the merge folds this state in.
+    // The index-list source's state (PICKS), [M][KV * G][W] and
+    // [M][KV * G][2]. Every tile then publishes partials and the merge folds
+    // this state in.
     float *picked_partials;
     float *picked_statistics;
-    __device__ __forceinline__ bool picked() const { return picked_partials != nullptr; }
 };
 
 // A prefill launch's WorkList selection (`indexer_select`'s per-row block
@@ -620,7 +627,7 @@ struct PrefillRows {
     }
 
     __device__ __forceinline__ void partitioned(Block block, int active) const {
-        if ((block.parts > 1 || split.picked()) && block.partition == 0 && block.kv == 0 && threadIdx.x == 0)
+        if ((block.parts > 1 || PICKS) && block.partition == 0 && block.kv == 0 && threadIdx.x == 0)
             split.counts[block.tile] = active;
     }
 
@@ -657,7 +664,7 @@ struct PrefillRows {
                                           float denominator) const {
         [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
         const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
-        if (active > 1 || split.picked()) {
+        if (active > 1 || PICKS) {
             // A partition's partial: the output relative to its row maximum,
             // and (maximum, denominator).
             const u64 slot =
@@ -1501,7 +1508,7 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
     const int query_head = static_cast<int>(blockIdx.y);
     const int column = static_cast<int>(threadIdx.x);
     const int count = static_cast<int>(split.counts[tile]);
-    if (count <= 1 && !split.picked()) return;
+    if (count <= 1 && !PICKS) return;
     const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
     const u64 heads = KV * G;
     for (long long token = static_cast<long long>(tile) * QT;
@@ -1513,7 +1520,7 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
                   split.partials + slot * W + column, static_cast<u64>(rows_total) * heads * W, count,
                   denominator, accumulated);
         // The index-list source's state, after the key partitions'.
-        if (split.picked() && split.picked_statistics[slot * 2 + 1] > 0.0f) {
+        if (PICKS && split.picked_statistics[slot * 2 + 1] > 0.0f) {
             const float picked = split.picked_statistics[slot * 2];
             const float next = fmaxf(maximum, picked);
             const float carry = seismic_ex2_approx(maximum - next);

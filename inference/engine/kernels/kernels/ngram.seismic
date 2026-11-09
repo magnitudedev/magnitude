@@ -212,7 +212,7 @@ fn ngram_inject[M, B, N, R, S, H, K](hidden: &tensor[M, S * H] f32,
 # item M + b publishing slot b's successor window. The successor window is
 # no slot's source, so the publishing threads run beside the row threads.
 native ngram_rows for metal from "metal/ngram_rows.metal":
-    static (C, P)
+    static (C, P, V, NB)
     launch ngram_rows:
         threadgroups (ceil_div(M + B, 64), 1, 1)
         threads_per_threadgroup (64, 1, 1)

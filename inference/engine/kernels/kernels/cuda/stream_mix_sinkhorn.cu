@@ -5,13 +5,13 @@
 // first thread forms and publishes pre, post and the Sinkhorn comb from the
 // reduced mixes. The threads mix the streams by the previous site's pre
 // column by column.
+#include "lib/core/functions.cuh"
 #include "lib/core/reduce.cuh"
+#include "lib/core/streams.cuh"
 
 constexpr unsigned STREAMS = SEISMIC_DIM_S;
 constexpr unsigned MIXES = (2u + STREAMS) * STREAMS;
 constexpr unsigned THREADS = 256u;
-
-__device__ __forceinline__ float sigmoid(float value) { return 1.0f / (1.0f + expf(-value)); }
 
 extern "C" __global__ void stream_mix_sinkhorn(SEISMIC_KERNEL_PARAMS) {
     typedef unsigned long long u64;
@@ -88,9 +88,9 @@ extern "C" __global__ void stream_mix_sinkhorn(SEISMIC_KERNEL_PARAMS) {
         float *joined = join + (u64)row * SEISMIC_RESULT_2_STRIDE_0;
         for (unsigned stream = 0; stream < STREAMS; ++stream) {
             own[(u64)stream * SEISMIC_RESULT_1_STRIDE_1] =
-                sigmoid(mixes[stream] * scale[0] + base[(u64)stream * SEISMIC_BASE_STRIDE_0]) + epsilon;
+                functions::sigmoid(mixes[stream] * scale[0] + base[(u64)stream * SEISMIC_BASE_STRIDE_0]) + epsilon;
             joined[(u64)stream * SEISMIC_RESULT_2_STRIDE_1] =
-                2.0f * sigmoid(mixes[STREAMS + stream] * scale[SEISMIC_SCALE_STRIDE_0] +
+                2.0f * functions::sigmoid(mixes[STREAMS + stream] * scale[SEISMIC_SCALE_STRIDE_0] +
                                base[(u64)(STREAMS + stream) * SEISMIC_BASE_STRIDE_0]);
         }
         for (unsigned source = 0; source < STREAMS; ++source)
@@ -98,15 +98,7 @@ extern "C" __global__ void stream_mix_sinkhorn(SEISMIC_KERNEL_PARAMS) {
                 joined[(u64)(STREAMS + source * STREAMS + target) * SEISMIC_RESULT_2_STRIDE_1] = comb[source][target];
     }
     // The sublayer's input: the streams mixed by the previous site's pre.
-    float carried[STREAMS];
-#pragma unroll
-    for (unsigned stream = 0; stream < STREAMS; ++stream)
-        carried[stream] = previous[(u64)row * SEISMIC_PREVIOUS_STRIDE_0 + (u64)stream * SEISMIC_PREVIOUS_STRIDE_1];
-    for (unsigned column = threadIdx.x; column < h; column += THREADS) {
-        float sum = 0.0f;
-#pragma unroll
-        for (unsigned stream = 0; stream < STREAMS; ++stream)
-            sum += carried[stream] * x[(u64)stream * SEISMIC_HIDDEN_STRIDE_1 + (u64)column * SEISMIC_HIDDEN_STRIDE_2];
-        input[(u64)row * SEISMIC_RESULT_0_STRIDE_0 + (u64)column * SEISMIC_RESULT_0_STRIDE_1] = sum;
-    }
+    streams::collapse<STREAMS>(x, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2,
+                               previous + (u64)row * SEISMIC_PREVIOUS_STRIDE_0, SEISMIC_PREVIOUS_STRIDE_1,
+                               input + (u64)row * SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, h, THREADS);
 }

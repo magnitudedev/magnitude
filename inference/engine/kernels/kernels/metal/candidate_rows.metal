@@ -9,6 +9,8 @@
 //
 // Dynamic extents read `seismic_words`.
 
+#include "lib/indexer/indexer.h"
+
 namespace candidate {
 
 // A row's taken units as plane-row spans: the pending run (joined with an
@@ -25,15 +27,11 @@ struct Pool {
     uint start;
     uint end;
 
-    static uint length(int lo, int hi) {
-        return lo >= 0 && hi > lo ? uint(hi - lo) : 0u;
-    }
-
     void flush() {
         uint at = start;
         while (at < end && span < spans) {
             const int lo = list[span * 2];
-            const uint size = length(lo, list[span * 2 + 1]);
+            const uint size = indexer::span_length(lo, list[span * 2 + 1]);
             if (offset + size <= at) {
                 offset += size;
                 ++span;
@@ -84,7 +82,7 @@ kernel void candidate_rows(
     device const int *picks = blocks + row * b;
     uint units = 0;
     for (uint span = 0; span < r; ++span)
-        units += candidate::Pool::length(row_spans[span * 2], row_spans[span * 2 + 1]);
+        units += indexer::span_length(row_spans[span * 2], row_spans[span * 2 + 1]);
     uint pooled = 0;
     for (uint pick = 0; pick < b; ++pick)
         if (picks[pick] >= 0)

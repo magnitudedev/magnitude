@@ -14,6 +14,7 @@
 #define ATTENTION_COLUMNS SEISMIC_TUNE_COLUMNS
 #define ATTENTION_Q_REGISTERS SEISMIC_TUNE_QREG
 #define ATTENTION_PRODUCER_WARPS 0
+#define ATTENTION_PICKS SEISMIC_DIM_KS
 #include "lib/attention/prefill.cuh"
 
 // Dense history planes [T, KV, W] (activation element).
@@ -63,7 +64,7 @@ extern "C" __global__ void __launch_bounds__(256) attention_prefill_prepare(SEIS
     max(1ull, (static_cast<unsigned long long>(SEISMIC_TUNE_SPLIT_GROUPS) + PREFILL_LIST_TILES * SEISMIC_DIM_KV - 1) / \
                   (PREFILL_LIST_TILES * SEISMIC_DIM_KV))
 #define PREFILL_PICKED(records, width)                                                    \
-    (SEISMIC_DIM_KS > 0 ? (records) + PREFILL_PARTS * SEISMIC_DIM_M * SEISMIC_DIM_KV * attention::G * (width) \
+    (attention::prefill::PICKS ? (records) + PREFILL_PARTS * SEISMIC_DIM_M * SEISMIC_DIM_KV * attention::G * (width) \
                         : nullptr)
 #define SPLIT()                                                                           \
     attention::prefill::Split {                                                           \

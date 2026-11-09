@@ -27,6 +27,9 @@
 // needs one takes its value as an argument.
 
 #include "lib/core/activation.h"
+#include "lib/core/head.h"
+#include "lib/core/rotary.h"
+#include "lib/indexer/indexer.h"
 #include <seismic/slab.h>
 
 #define INDEXER_W uint(2 * SEISMIC_DIM_P + SEISMIC_DIM_S)
@@ -37,71 +40,19 @@
 // Blocks a score simdgroup takes, their key loads in flight together.
 #define INDEXER_BATCH 4u
 
-static_assert(INDEXER_W % 32 == 0, "indexer head width must be a multiple of 32");
-static_assert(SEISMIC_DIM_P % INDEXER_E == 0, "each rotary half must cover whole lanes");
-
 typedef element::Act::native Scalar;
+// A key or query head row's rotary pairs (p, p + P) over its first 2P
+// columns: the portable `head_rotary`, unrounded.
+typedef rotary::layout<INDEXER_W, SEISMIC_DIM_P, 0, false> key_layout;
 
 namespace indexer {
-
-// The rotary angle's sine and cosine, reduced as the attention entries reduce
-// it (`attention::sincos`).
-inline float sincos(float angle, thread float &cosine) {
-    const float turns = metal::rint(angle * 0.15915494309189535f);
-    float reduced = metal::fma(-turns, 6.28125f, angle);
-    reduced = metal::fma(-turns, 0.0019354820251464844f, reduced);
-    reduced = metal::fma(-turns, -1.7484555314695172e-07f, reduced);
-    cosine = metal::fast::cos(reduced);
-    return metal::fast::sin(reduced);
-}
-
-// Lane `lane`'s E columns of one head row `x` (already in registers, F32)
-// RMS-normed with `norm` and its first 2P columns rotated at `coordinates`:
-// the portable `head_rotary`, unrounded. The whole simdgroup calls it.
-inline void norm_rotary(thread float (&x)[INDEXER_E], device const float *norm, device const int *coordinates,
-    device const int *components, device const float *frequencies, device const float *amplitudes, float epsilon,
-    uint lane) {
-    float squares = 0.0f;
-    INDEXER_UNROLL
-    for (uint i = 0; i < INDEXER_E; ++i)
-        squares = metal::fma(x[i], x[i], squares);
-    squares = simd_sum(squares);
-    const float inverse = metal::rsqrt(squares / float(INDEXER_W) + epsilon);
-    INDEXER_UNROLL
-    for (uint i = 0; i < INDEXER_E; ++i)
-        x[i] = x[i] * inverse * norm[lane * INDEXER_E + i];
-    if (SEISMIC_DIM_P == 0)
-        return;
-    constexpr uint half_lanes = SEISMIC_DIM_P / INDEXER_E;
-    const uint partner_lane = lane < half_lanes ? lane + half_lanes
-        : (lane < 2 * half_lanes ? lane - half_lanes : lane);
-    float partner[INDEXER_E];
-    INDEXER_UNROLL
-    for (uint i = 0; i < INDEXER_E; ++i)
-        partner[i] = simd_shuffle(x[i], ushort(partner_lane));
-    if (lane >= 2 * half_lanes)
-        return;
-    INDEXER_UNROLL
-    for (uint i = 0; i < INDEXER_E; ++i) {
-        const uint column = lane * INDEXER_E + i;
-        const uint pair = column % SEISMIC_DIM_P;
-        float c;
-        const float s = sincos(float(coordinates[components[pair]]) * frequencies[pair], c);
-        c *= amplitudes[pair];
-        const float sn = s * amplitudes[pair];
-        x[i] = column < SEISMIC_DIM_P ? x[i] * c - partner[i] * sn : x[i] * c + partner[i] * sn;
-    }
-}
 
 // The rows of a row's spans: every lane of a simdgroup calls it, each
 // taking the spans lane, lane + 32, ...
 inline uint simd_span_rows(device const int *spans, uint count, uint lane) {
     uint total = 0;
-    for (uint span = lane; span < count; span += 32) {
-        const int lo = spans[span * 2];
-        const int hi = spans[span * 2 + 1];
-        total += hi > lo ? uint(hi - lo) : 0u;
-    }
+    for (uint span = lane; span < count; span += 32)
+        total += span_length(spans[span * 2], spans[span * 2 + 1]);
     return simd_sum(total);
 }
 
@@ -115,8 +66,7 @@ struct span_cursor {
     int row(device const int *spans, uint count, uint ordinal, int own) {
         for (; span < count; ++span) {
             const int lo = spans[span * 2];
-            const int hi = spans[span * 2 + 1];
-            const uint length = hi > lo ? uint(hi - lo) : 0u;
+            const uint length = span_length(lo, spans[span * 2 + 1]);
             if (ordinal < before + length)
                 return lo + int(ordinal - before);
             before += length;
@@ -124,25 +74,6 @@ struct span_cursor {
         return own;
     }
 };
-
-// The exclusive prefix of `value` over the 256 threads of a threadgroup in
-// thread order, and in `total` their sum. Every thread calls it; `totals`
-// holds the 8 simdgroups' sums.
-inline uint group_exclusive(uint value, threadgroup uint *totals, uint simd, uint lane, thread uint &total) {
-    const uint inclusive = simd_prefix_inclusive_sum(value);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lane == 31)
-        totals[simd] = inclusive;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint before = 0;
-    total = 0;
-    for (uint other = 0; other < 8; ++other) {
-        const uint sum = totals[other];
-        before += other < simd ? sum : 0u;
-        total += sum;
-    }
-    return before + inclusive - value;
-}
 
 } // namespace indexer
 
@@ -215,8 +146,9 @@ kernel void indexer_select_complete(
         x[i] = sum[i] / float(INDEXER_SB);
     device const int *first_coordinates = reinterpret_cast<device const int *>(
         slab::row<int>(window_coordinates, ulong(first_member), window_slab_rows, 4));
-    indexer::norm_rotary(x, key_norm, first_coordinates, rotary_components, rotary_frequencies,
-        rotary_amplitudes, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
+    head::rms_norm(x, key_norm, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
+    const key_layout::table table(first_coordinates, rotary_components, rotary_frequencies, rotary_amplitudes, lane);
+    key_layout::rotate(table, lane, x);
     device float *target =
         slab::row<float>(block_keys, ulong(destination), ulong(SEISMIC_PARAM_BLOCK_SLAB_ROWS), INDEXER_W);
     INDEXER_UNROLL
@@ -247,15 +179,17 @@ kernel void indexer_select_score(
     const uint first = group.x * (8 * INDEXER_BATCH);
     if (first >= complete)
         return;
-    // The row's query heads, prepared in F32.
+    // The row's query heads, prepared in F32; one table rotates them all.
+    const key_layout::table table(coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes,
+        lane);
     for (uint head = simd; head < INDEXER_H; head += 8) {
         float x[INDEXER_E];
         device const Scalar *raw = query + (row * INDEXER_H + head) * INDEXER_W;
         INDEXER_UNROLL
         for (uint i = 0; i < INDEXER_E; ++i)
             x[i] = float(raw[lane * INDEXER_E + i]);
-        indexer::norm_rotary(x, query_norm, coordinates + row * 4, rotary_components, rotary_frequencies,
-            rotary_amplitudes, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
+        head::rms_norm(x, query_norm, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
+        key_layout::rotate(table, lane, x);
         INDEXER_UNROLL
         for (uint i = 0; i < INDEXER_E; ++i)
             prepared[head * INDEXER_W + lane * INDEXER_E + i] = x[i];
@@ -427,7 +361,7 @@ kernel void indexer_select_select(
         const int lo = span < spans ? row_visible[span * 2] : 0;
         const int hi = span < spans ? row_visible[span * 2 + 1] : 0;
         uint chunk = 0;
-        const uint before = indexer::group_exclusive(hi > lo ? uint(hi - lo) : 0u, totals, simd, lane, chunk);
+        const uint before = indexer::group_exclusive(indexer::span_length(lo, hi), totals, simd, lane, chunk);
         if (span < spans)
             span_first[span] = keys + before;
         keys += chunk;

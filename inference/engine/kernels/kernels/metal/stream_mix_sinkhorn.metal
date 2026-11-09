@@ -4,16 +4,14 @@
 // and every function row's products; the threadgroup reduces them in fixed
 // order, and the first thread forms and publishes pre, post and the
 // Sinkhorn comb from the reduced mixes. The threads mix the streams by the
-// previous site's pre column by column.
+// previous site's pre column by column (`streams::collapse`).
+#include "lib/core/functions.h"
 #include "lib/core/reduce.h"
+#include "lib/core/streams.h"
 
 constant constexpr uint STREAMS = uint(SEISMIC_DIM_S);
 constant constexpr uint MIXES = (2u + STREAMS) * STREAMS;
 constant constexpr uint THREADS = 256u;
-
-inline float sigmoid(float value) {
-    return 1.0f / (1.0f + metal::exp(-value));
-}
 
 kernel void stream_mix_sinkhorn(
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],
@@ -91,9 +89,9 @@ kernel void stream_mix_sinkhorn(
         device float *joined = join + ulong(row) * SEISMIC_RESULT_2_STRIDE_0;
         for (uint stream = 0; stream < STREAMS; ++stream) {
             own[ulong(stream) * SEISMIC_RESULT_1_STRIDE_1] =
-                sigmoid(mixes[stream] * scale[0] + base[ulong(stream) * SEISMIC_BASE_STRIDE_0]) + epsilon;
+                functions::sigmoid(mixes[stream] * scale[0] + base[ulong(stream) * SEISMIC_BASE_STRIDE_0]) + epsilon;
             joined[ulong(stream) * SEISMIC_RESULT_2_STRIDE_1] = 2.0f
-                * sigmoid(mixes[STREAMS + stream] * scale[SEISMIC_SCALE_STRIDE_0]
+                * functions::sigmoid(mixes[STREAMS + stream] * scale[SEISMIC_SCALE_STRIDE_0]
                     + base[ulong(STREAMS + stream) * SEISMIC_BASE_STRIDE_0]);
         }
         for (uint source = 0; source < STREAMS; ++source)
@@ -101,14 +99,7 @@ kernel void stream_mix_sinkhorn(
                 joined[ulong(STREAMS + source * STREAMS + target) * SEISMIC_RESULT_2_STRIDE_1] = comb[source][target];
     }
     // The sublayer's input: the streams mixed by the previous site's pre.
-    float carried[STREAMS];
-    for (uint stream = 0; stream < STREAMS; ++stream)
-        carried[stream] = previous[ulong(row) * SEISMIC_PREVIOUS_STRIDE_0 + ulong(stream) * SEISMIC_PREVIOUS_STRIDE_1];
-    for (uint column = thread_index; column < h; column += THREADS) {
-        float sum = 0.0f;
-        for (uint stream = 0; stream < STREAMS; ++stream)
-            sum += carried[stream]
-                * x[ulong(stream) * SEISMIC_HIDDEN_STRIDE_1 + ulong(column) * SEISMIC_HIDDEN_STRIDE_2];
-        input[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(column) * SEISMIC_RESULT_0_STRIDE_1] = sum;
-    }
+    streams::collapse<STREAMS>(x, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_HIDDEN_STRIDE_2,
+        previous + ulong(row) * SEISMIC_PREVIOUS_STRIDE_0, SEISMIC_PREVIOUS_STRIDE_1,
+        input + ulong(row) * SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, h, thread_index, THREADS);
 }

@@ -29,6 +29,7 @@
 // element::Act before conversion to the history's physical operand type.
 
 #include "../core/activation.h"
+#include "../core/head.h"
 #include "../core/rotary.h"
 #include "../core/rounding.h"
 #include <seismic/slab.h>
@@ -67,7 +68,7 @@ namespace attention {
 // scalars (`rounding.seismic`): the scalars under KR = 1, none (block 0)
 // under KR = 0. Each entry that declares KR passes its own.
 inline rounding::Rounding key_rounding(bool kr, uint block, uint element, uint scale, uint amax_floor) {
-    return rounding::Rounding{kr ? int(block) : 0, int(element), int(scale), as_type<float>(amax_floor)};
+    return kr ? rounding::of(block, element, scale, amax_floor) : rounding::none();
 }
 
 // The activation element's MSL scalar.
@@ -250,19 +251,11 @@ inline float merge(device const float *partials, device const float *statistics,
 template <bool NORM>
 inline void head_norm(device const Scalar *raw, device const float *norm, float epsilon, uint lane,
     thread float (&x)[ATTENTION_E]) {
-    float squares = 0.0f;
-    ATTENTION_UNROLL
-    for (uint i = 0; i < ATTENTION_E; ++i) {
-        x[i] = float(raw[lane * ATTENTION_E + i]);
-        squares = metal::fma(x[i], x[i], squares);
-    }
-    if (!NORM)
-        return;
-    squares = simd_sum(squares);
-    const float inverse = metal::rsqrt(squares / float(ATTENTION_W) + epsilon);
     ATTENTION_UNROLL
     for (uint i = 0; i < ATTENTION_E; ++i)
-        x[i] = x[i] * inverse * norm[lane * ATTENTION_E + i];
+        x[i] = float(raw[lane * ATTENTION_E + i]);
+    if (NORM)
+        head::rms_norm(x, norm, epsilon, lane);
 }
 
 // `head_norm`, then the row's pairs rotated by its table.
@@ -295,8 +288,8 @@ inline void output_rotary(device Scalar *result, device const int *coordinates, 
     device const float *frequencies, device const float *amplitudes, ulong row, ulong head, uint pair) {
     if (pair >= SEISMIC_DIM_P)
         return;
-    const uint lo = ATTENTION_ROTARY_FIRST + (ATTENTION_ROTARY_ADJACENT ? 2 * pair : pair);
-    const uint hi = ATTENTION_ROTARY_ADJACENT ? lo + 1 : lo + SEISMIC_DIM_P;
+    const uint lo = head_layout::lead(pair);
+    const uint hi = head_layout::partner(lo);
     float c;
     const float s = -rotary::sincos(float(coordinates[row * 4 + components[pair]]) * frequencies[pair], c);
     const float cosine = c * amplitudes[pair], sine = s * amplitudes[pair];

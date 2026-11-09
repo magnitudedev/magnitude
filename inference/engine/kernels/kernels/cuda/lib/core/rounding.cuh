@@ -23,6 +23,14 @@ struct Rounding {
 // No rounding (block 0).
 __device__ __forceinline__ Rounding none() { return Rounding{0, 0, 0, 0.0f}; }
 
+// The rounding of an entry's four scalar words (`rounding.seismic`): its
+// block, element and scale codes, and its amax floor's F32 bits.
+__device__ __forceinline__ Rounding of(unsigned long long block, unsigned long long element,
+                                       unsigned long long scale, unsigned long long amax_floor) {
+    return Rounding{static_cast<int>(static_cast<unsigned>(block)), static_cast<int>(static_cast<unsigned>(element)),
+                    static_cast<int>(static_cast<unsigned>(scale)), __uint_as_float(static_cast<unsigned>(amax_floor))};
+}
+
 // v to the nearest code of `mantissa` bits and smallest normal exponent
 // `min_exponent`, ties to even (`round_codes`).
 __device__ __forceinline__ float round_codes(float v, unsigned mantissa, int min_exponent) {

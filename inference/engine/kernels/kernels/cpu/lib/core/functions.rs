@@ -70,6 +70,31 @@ pub fn clamped_glu<A: Dense>(function: i32, limit: f32, gate: f32, up: f32) -> f
     activation::publish::<A>(A::widen(A::narrow(activate(function, gate))) * up)
 }
 
+/// The expansion of a row's accumulator pairs: each `(target, gate, up)`
+/// stores to `target` the published F32 [`glu`] of `gate_scale * gate` and
+/// `up_scale * up` ([`clamped_glu`] at `limit` where the expansion has one).
+#[inline(always)]
+pub fn glu_row<A: Dense, T>(
+    function: i32,
+    limit: Option<f32>,
+    (gate_scale, up_scale): (f32, f32),
+    pairs: impl Iterator<Item = (T, f32, f32)>,
+    mut store: impl FnMut(T, f32),
+) {
+    match limit {
+        None => {
+            for (target, gate, up) in pairs {
+                store(target, glu::<A>(function, gate_scale * gate, up_scale * up));
+            }
+        }
+        Some(limit) => {
+            for (target, gate, up) in pairs {
+                store(target, clamped_glu::<A>(function, limit, gate_scale * gate, up_scale * up));
+            }
+        }
+    }
+}
+
 /// A gated delta net's output gate on `z`, by the code the entries take
 /// (`gate_function: i32`): 0 SiLU, 1 sigmoid.
 pub const GATE_SIGMOID: i32 = 1;
@@ -83,28 +108,73 @@ pub fn output_gate(function: i32, z: f32) -> f32 {
     }
 }
 
-/// `scatter` (functions.seismic) of one column of one row: stream `stream`'s
-/// joined value from the output `y`, the row's `inject_width` (`IN`) inject
-/// values (`inject(i)`) over `streams` (`SN`) streams, and the streams'
-/// values of the column (`residual(s)`): the stream's own value, or (a comb
-/// after the inject values, `IN > SN`) the streams mixed by `comb[., stream]`
-/// in source order, plus `y`, times the stream's inject value where the row
-/// has them.
+/// `scatter` (functions.seismic) of columns of one row into stream
+/// `stream`: each column `c` of `out` the stream's joined value from the
+/// output `y(c)`, the row's `inject_width` (`IN`) inject values
+/// (`inject(i)`) over `streams` (`SN`) streams, and the streams' values of
+/// the same columns (`residual(s)`): the stream's own value, or (a comb after
+/// the inject values, `IN > SN`) the streams mixed by `comb[., stream]` in
+/// source order, plus `y`, times the stream's inject value where the row has
+/// them.
 #[inline(always)]
-pub fn scatter(
+pub fn scatter<'r>(
     streams: usize,
     inject_width: usize,
     stream: usize,
-    y: f32,
+    y: impl Fn(usize) -> f32,
     inject: impl Fn(usize) -> f32,
-    residual: impl Fn(usize) -> f32,
-) -> f32 {
-    let mixed = if inject_width > streams {
-        (0..streams).fold(0.0f32, |mixed, from| mixed + inject(streams + from * streams + stream) * residual(from))
+    residual: impl Fn(usize) -> &'r [f32],
+    out: &mut [f32],
+) {
+    if inject_width > streams {
+        out.fill(0.0);
+        for from in 0..streams {
+            let weight = inject(streams + from * streams + stream);
+            for (mixed, value) in out.iter_mut().zip(residual(from)) {
+                *mixed = *mixed + weight * *value;
+            }
+        }
     } else {
-        residual(stream)
-    };
-    if inject_width == 0 { mixed + y } else { mixed + y * inject(stream) }
+        out.copy_from_slice(residual(stream));
+    }
+    if inject_width == 0 {
+        for (column, target) in out.iter_mut().enumerate() {
+            *target = *target + y(column);
+        }
+    } else {
+        let factor = inject(stream);
+        for (column, target) in out.iter_mut().enumerate() {
+            *target = *target + y(column) * factor;
+        }
+    }
+}
+
+/// `collapse` (streams.seismic) of one row: each column of `out` the
+/// streams' values of it (`stream(s)`) summed by `carried[s]` in stream
+/// order.
+#[inline(always)]
+pub fn collapse<'r>(carried: &[f32], stream: impl Fn(usize) -> &'r [f32], out: &mut [f32]) {
+    out.fill(0.0);
+    for (index, weight) in carried.iter().enumerate() {
+        for (sum, value) in out.iter_mut().zip(stream(index)) {
+            *sum = *sum + weight * value;
+        }
+    }
+}
+
+/// `ordered_key` (sampling.seismic): `a < b` exactly when their keys are,
+/// -0 and +0 one key, and every NaN the canonical NaN's key, above +inf's.
+#[inline(always)]
+pub fn ordered_key(value: f32) -> u32 {
+    if value.is_nan() { 0xFFC0_0000 } else { finite_ordered_key(value) }
+}
+
+/// [`ordered_key`] of a value its caller holds to be no NaN (the sampling
+/// shape's, which refuses a row holding one before it keys any value).
+#[inline(always)]
+pub fn finite_ordered_key(value: f32) -> u32 {
+    let bits = (value + 0.0).to_bits();
+    if bits & 0x8000_0000 != 0 { !bits } else { bits | 0x8000_0000 }
 }
 
 #[inline(always)]

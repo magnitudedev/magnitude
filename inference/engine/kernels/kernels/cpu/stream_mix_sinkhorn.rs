@@ -3,7 +3,7 @@
 // function row under the row's one RMS statistic, forms pre, post and the
 // Sinkhorn comb in place, and mixes the streams by the previous site's pre.
 
-use lib::core::{activation, reduce};
+use lib::core::{activation, functions, reduce};
 
 /// The most streams a row's coefficients hold in place.
 const MAX_STREAMS: usize = 8;
@@ -82,7 +82,5 @@ fn stream_mix_sinkhorn<L: Isa, E: Elements>(
         join[s + source * s..s + (source + 1) * s].copy_from_slice(&comb[source][..s]);
     }
     let previous = cx.arg_previous().row([row, 0]);
-    for (column, target) in input.iter_mut().enumerate() {
-        *target = (0..s).fold(0.0, |sum, stream| sum + previous[stream] * streams[stream][column]);
-    }
+    functions::collapse(previous, |stream| streams[stream], input);
 }

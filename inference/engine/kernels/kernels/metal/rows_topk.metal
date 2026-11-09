@@ -19,17 +19,8 @@
 // Threadgroup memory: the bins [256], the scans' 8 simdgroup sums and the
 // select state [4]. Dynamic extents read `seismic_words`.
 
+#include "lib/core/order.h"
 #include "lib/indexer/indexer.h"
-
-namespace topk {
-
-// `ordered_key` (sampling.seismic) of a non-NaN score.
-inline uint ordered_key(float value) {
-    const uint bits = as_type<uint>(value + 0.0f);
-    return bits >= 0x80000000u ? 0xffffffffu - bits : bits ^ 0x80000000u;
-}
-
-} // namespace topk
 
 kernel void rows_topk(
     device const float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
@@ -98,7 +89,7 @@ kernel void rows_topk(
             // the first pending lane's digit add their count together.
             for (uint base = 0; base < scored; base += THREADS) {
                 const uint ordinal = base + thread_index;
-                const uint u = ordinal < scored ? topk::ordered_key(row_scores[ordinal]) : 0u;
+                const uint u = ordinal < scored ? order::key(row_scores[ordinal]) : 0u;
                 const uint value = (u >> shift) & 255u;
                 bool pending = ordinal < scored && (u & mask) == prefix_bits;
                 for (uint waiting = uint(uint64_t(simd_ballot(pending))); waiting != 0u;
@@ -141,13 +132,13 @@ kernel void rows_topk(
     uint equal = 0;
     if (!prefix)
         for (uint ordinal = lo; ordinal < hi; ++ordinal)
-            equal += topk::ordered_key(row_scores[ordinal]) == threshold ? 1u : 0u;
+            equal += order::key(row_scores[ordinal]) == threshold ? 1u : 0u;
     const uint first_rank = indexer::group_exclusive(equal, totals, simd, lane, total);
     // Whether `ordinal` is picked, its equal ones ranked from `rank`.
     auto picked = [&](uint ordinal, thread uint &rank) {
         if (prefix)
             return ordinal < limit;
-        const uint u = topk::ordered_key(row_scores[ordinal]);
+        const uint u = order::key(row_scores[ordinal]);
         if (u > threshold)
             return true;
         if (u != threshold)

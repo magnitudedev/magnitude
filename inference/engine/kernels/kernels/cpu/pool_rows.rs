@@ -9,7 +9,7 @@
 // (a rounded row held in A after its pooling, its norm and its rotation).
 
 use lib::attention::attention::{self, Layout};
-use lib::core::{reduce, rounding::Rounding};
+use lib::core::{reduce, rounding::Rounding, spans};
 use seismic::cpu::{math, slab::SlabTensor};
 
 fn pool_rows_append<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
@@ -69,11 +69,7 @@ fn pool_rows_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     // The group's earlier tokens: the last RATE - 1 rows of the window
     // spans, in order.
     let window_visible = cx.arg_window_visible();
-    let earlier = (0..cx.dim_r() as usize)
-        .flat_map(|span| {
-            let (first, last) = (window_visible.get([row, span, 0]), window_visible.get([row, span, 1]));
-            first..last.max(first)
-        })
+    let earlier = spans::rows(&|span, bound| window_visible.get([row, span, bound]), cx.dim_r() as usize)
         .collect::<Vec<_>>();
     let members = &earlier[earlier.len() - (rate - 1)..];
     let window = SlabTensor::from_bound(cx.arg_window_rows(), slab_rows);

@@ -14,8 +14,10 @@
 //           block row -1 and zero coordinates.
 
 #include "lib/core/activation.h"
+#include "lib/core/head.h"
 #include "lib/core/rotary.h"
 #include "lib/core/rounding.h"
+#include "lib/indexer/indexer.h"
 #include <seismic/slab.h>
 
 #define POOL_W uint(2 * SEISMIC_DIM_P + SEISMIC_DIM_S)
@@ -30,20 +32,6 @@ namespace pooled {
 
 // A pooled row's rotary pairs: the reading attention's key layout (RA, RT).
 typedef rotary::layout<POOL_W, SEISMIC_DIM_P, (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM_S : 0), (SEISMIC_DIM_RA != 0)> row_layout;
-
-// The physical row of ordinal `ordinal` of a row's `count` spans.
-inline int span_row(device const int *spans, uint count, uint ordinal) {
-    uint before = 0;
-    for (uint span = 0; span < count; ++span) {
-        const int lo = spans[span * 2];
-        const int hi = spans[span * 2 + 1];
-        const uint length = hi > lo ? uint(hi - lo) : 0u;
-        if (ordinal < before + length)
-            return lo + int(ordinal - before);
-        before += length;
-    }
-    return -1;
-}
 
 } // namespace pooled
 
@@ -113,14 +101,11 @@ kernel void pool_rows_complete(
     const uint spans = uint(SEISMIC_DIM_R);
     device const int *row_spans = window_visible + row * spans * 2;
     uint earlier = 0;
-    for (uint span = 0; span < spans; ++span) {
-        const int lo = row_spans[span * 2];
-        const int hi = row_spans[span * 2 + 1];
-        earlier += hi > lo ? uint(hi - lo) : 0u;
-    }
+    for (uint span = 0; span < spans; ++span)
+        earlier += indexer::span_length(row_spans[span * 2], row_spans[span * 2 + 1]);
     device const float *members[POOL_RATE];
     for (uint member = 0; member + 1 < POOL_RATE; ++member) {
-        const int at = pooled::span_row(row_spans, spans, earlier - (POOL_RATE - 1) + member);
+        const int at = indexer::span_row(row_spans, spans, earlier - (POOL_RATE - 1) + member);
         members[member] = slab::row<float>(window_rows, ulong(at), window_slab_rows, width);
     }
     members[POOL_RATE - 1] = u + row * W;
@@ -168,19 +153,11 @@ kernel void pool_rows_complete(
     }
     // A rounded row is rounded from values held in A: the pooled row, the
     // latent and the rotated row (`pooled.seismic`).
-    const rounding::Rounding trained{int(uint(SEISMIC_PARAM_BLOCK)), int(uint(SEISMIC_PARAM_ELEMENT)),
-        int(uint(SEISMIC_PARAM_SCALE)), as_type<float>(uint(SEISMIC_PARAM_AMAX_FLOOR))};
+    const rounding::Rounding trained = rounding::of(uint(SEISMIC_PARAM_BLOCK), uint(SEISMIC_PARAM_ELEMENT),
+        uint(SEISMIC_PARAM_SCALE), uint(SEISMIC_PARAM_AMAX_FLOOR));
     rounding::hold_lanes<element::Act>(x, trained);
     // The latent: RMS-normed with `norm`.
-    float squares = 0.0f;
-    POOL_UNROLL
-    for (uint i = 0; i < E; ++i)
-        squares = metal::fma(x[i], x[i], squares);
-    squares = simd_sum(squares);
-    const float inverse = metal::rsqrt(squares / float(W) + as_type<float>(uint(SEISMIC_PARAM_EPSILON)));
-    POOL_UNROLL
-    for (uint i = 0; i < E; ++i)
-        x[i] = x[i] * inverse * norm[lane * E + i];
+    head::rms_norm(x, norm, as_type<float>(uint(SEISMIC_PARAM_EPSILON)), lane);
     rounding::hold_lanes<element::Act>(x, trained);
     POOL_UNROLL
     for (uint i = 0; i < E; ++i)
@@ -189,7 +166,7 @@ kernel void pool_rows_complete(
         latent_rows[row * SEISMIC_RESULT_1_STRIDE_0] = destination;
     // Rotated at the group's first token, rounded, stored.
     device const int *origin = reinterpret_cast<device const int *>(slab::row<int>(window_coordinates,
-        ulong(pooled::span_row(row_spans, spans, earlier - (POOL_RATE - 1))), window_slab_rows, 4));
+        ulong(indexer::span_row(row_spans, spans, earlier - (POOL_RATE - 1))), window_slab_rows, 4));
     if (lane < 4)
         latent_coordinates[row * SEISMIC_RESULT_2_STRIDE_0 + lane * SEISMIC_RESULT_2_STRIDE_1] = origin[lane];
     const pooled::row_layout::table table(origin, rotary_components, rotary_frequencies, rotary_amplitudes, lane);

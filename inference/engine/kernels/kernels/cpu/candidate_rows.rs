@@ -5,13 +5,16 @@
 // rest of the fill. Each run is mapped through the row's spans, split where
 // a span ends, and adjacent runs within one span join.
 
+use lib::core::spans;
+
 fn candidate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
     let (r, b, bu, k) = (cx.dim_r() as usize, cx.dim_b() as usize, cx.dim_bu() as usize, cx.dim_k() as usize);
-    let spans = cx.arg_spans();
+    let bounds = cx.arg_spans();
     let list = (0..r)
-        .map(|span| (spans.get([row, span, 0]), spans.get([row, span, 1])))
-        .filter(|(lo, hi)| *lo >= 0 && hi > lo)
+        .map(|span| spans::span(bounds.get([row, span, 0]), bounds.get([row, span, 1])))
+        .filter(|rows| !rows.is_empty())
+        .map(|rows| (rows.start, rows.end))
         .collect::<Vec<_>>();
     let units = list.iter().map(|(lo, hi)| (hi - lo) as usize).sum::<usize>();
     let picks = cx.arg_blocks();
@@ -24,6 +27,7 @@ fn candidate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
     let mut out = Pool { list: &list, spans: Vec::new(), span: 0, offset: 0, run: None };
     let mut cursor = 0;
     for (start, end) in pooled.into_iter().chain([(units, units)]) {
+        assert!(start >= cursor, "the picked blocks ascend");
         let take = fill.min(start - cursor);
         out.take(cursor, cursor + take);
         fill -= take;
@@ -31,7 +35,10 @@ fn candidate_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 
         cursor = end;
     }
     out.flush();
-    debug_assert!(out.spans.len() <= b + r, "the pool's runs exceed B + R spans");
+    // At most B + 1 runs (the fill takes every gap unit below its end, so
+    // the units below it are one run, then one run per later block), split
+    // only where one of the R list spans ends.
+    assert!(out.spans.len() <= b + r, "the pool's runs exceed B + R spans");
     let result = cx.result_0();
     for entry in 0..b + r {
         let [lo, hi] = out.spans.get(entry).copied().unwrap_or([-1, -1]);

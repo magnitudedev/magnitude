@@ -9,7 +9,7 @@
 // its block bitmap and, with C > 0, its segments.
 
 use lib::attention::attention;
-use lib::core::activation;
+use lib::core::{activation, spans};
 use seismic::cpu::slab::SlabTensor;
 
 fn indexer_select_append<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
@@ -44,11 +44,6 @@ unsafe fn coordinate_row<'a>(plane: seismic::cpu::Scalars<'a, i32, 2>, slab_rows
     }
 }
 
-/// The physical rows of row `row`'s `count` spans `spans`, in order.
-fn span_rows(spans: &impl Fn(usize, usize) -> i32, count: usize) -> impl Iterator<Item = i32> + '_ {
-    (0..count).flat_map(move |span| spans(span, 0)..spans(span, 1).max(spans(span, 0)))
-}
-
 fn indexer_select_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let destination = cx.arg_block_destinations().get([row]);
@@ -64,7 +59,7 @@ fn indexer_select_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     // The block's raw keys: the last SB - 1 rows of the window spans, then
     // the row's own.
     let window_visible = cx.arg_window_visible();
-    let earlier = span_rows(&|span, bound| window_visible.get([row, span, bound]), cx.dim_r() as usize)
+    let earlier = spans::rows(&|span, bound| window_visible.get([row, span, bound]), cx.dim_r() as usize)
         .collect::<Vec<_>>();
     let own = cx.arg_window_destinations().get([row]);
     let members = earlier[earlier.len().saturating_sub(sb - 1)..]
@@ -143,8 +138,8 @@ fn indexer_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
         );
     }
     // The row's complete blocks in block order, scored.
-    let spans = cx.arg_block_visible();
-    let physical = span_rows(&|span, bound| spans.get([row, span, bound]), r)
+    let block_visible = cx.arg_block_visible();
+    let physical = spans::rows(&|span, bound| block_visible.get([row, span, bound]), r)
         .take(nb)
         .collect::<Vec<_>>();
     let complete = physical.len();
@@ -196,7 +191,7 @@ fn indexer_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
         let visible = cx.arg_visible();
         let slab_rows = cx.arg_slab_rows() as i32;
         let bounds = |span, bound| visible.get([row, span, bound]);
-        let keys = span_rows(&bounds, r);
+        let keys = spans::rows(&bounds, r);
         let mut runs: Vec<[i32; 2]> = Vec::new();
         let mut open = false;
         for (position, stored) in keys.enumerate() {

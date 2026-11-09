@@ -624,12 +624,13 @@ impl Sinkhorn {
                     }
                 }
             };
-            columns(&mut comb);
-            for _ in 1..iterations {
-                for values in comb.iter_mut() {
-                    let sum: f64 = values.iter().sum();
-                    for value in values.iter_mut() {
-                        *value /= sum + epsilon;
+            for sweep in 0..iterations {
+                if sweep > 0 {
+                    for values in comb.iter_mut() {
+                        let sum: f64 = values.iter().sum();
+                        for value in values.iter_mut() {
+                            *value /= sum + epsilon;
+                        }
                     }
                 }
                 columns(&mut comb);

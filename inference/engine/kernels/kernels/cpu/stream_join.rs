@@ -11,15 +11,14 @@ fn stream_join<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3],
     // SAFETY: each work item writes its own row.
     let out = unsafe { cx.result_0().row_mut([row, 0]) };
     for (stream, joined) in out.chunks_exact_mut(h).enumerate() {
-        for (column, target) in joined.iter_mut().enumerate() {
-            *target = functions::scatter(
-                streams,
-                inject_width,
-                stream,
-                y[column],
-                |at| inject.get([row, at]),
-                |from| residual.get([row, from * h + column]),
-            );
-        }
+        functions::scatter(
+            streams,
+            inject_width,
+            stream,
+            |column| y[column],
+            |at| inject.get([row, at]),
+            |from| residual.span([row, from * h], h),
+            joined,
+        );
     }
 }

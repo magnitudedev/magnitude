@@ -8,13 +8,16 @@
 # order. Rows are shaped in place: every stage after the first reads only the
 # values the first wrote, so a row's logits are read once, by the stage that
 # replaces them. The portable body is the semantic oracle.
-# The order of a non-NaN f32 as an unsigned key: a < b exactly when
-# ordered_key(a) < ordered_key(b), and -0.0 and 0.0 share one key.
+# The order of an f32 as an unsigned key: a < b exactly when
+# ordered_key(a) < ordered_key(b), and -0.0 and 0.0 share one key. Every NaN
+# takes the canonical NaN's key 0xFFC00000, above +inf's.
 fn ordered_key(value: f32) -> u32:
     let bits = bitcast_u32(value + 0.0)
     let mut key = bits ^ u32(2147483648)
     if bits >= u32(2147483648):
         key = u32(4294967295) - bits
+    if value != value:
+        key = u32(4290772992)
     return key
 
 # The least key with fewer than `count` keys strictly above it (a binary

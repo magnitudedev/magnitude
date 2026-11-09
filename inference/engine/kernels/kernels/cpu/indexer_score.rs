@@ -6,7 +6,7 @@
 // each dot an ascending FMA chain. Scores past the list are -inf.
 
 use lib::attention::attention::{self, Layout};
-use lib::core::rounding::Rounding;
+use lib::core::{rounding::Rounding, spans};
 use seismic::cpu::slab::SlabTensor;
 
 fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
@@ -16,12 +16,8 @@ fn indexer_score<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3
     let (first, last) = (share * 256, (share * 256 + 256).min(n));
     let scores = cx.result_0();
     // The row's list: the plane rows of its spans in order.
-    let spans = cx.arg_spans();
-    let list = (0..r)
-        .flat_map(|span| {
-            let (lo, hi) = (spans.get([row, span, 0]), spans.get([row, span, 1]));
-            if lo >= 0 && hi >= lo { lo..hi } else { 0..0 }
-        })
+    let bounds = cx.arg_spans();
+    let list = spans::rows(&|span, bound| bounds.get([row, span, bound]), r)
         .skip(first)
         .take(last - first)
         .collect::<Vec<_>>();

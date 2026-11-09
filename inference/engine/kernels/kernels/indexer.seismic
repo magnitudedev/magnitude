@@ -394,9 +394,12 @@ fn indexer_score[M, H, P, S, NQ, HW, TB, R, N, RA, RT](query: &tensor[M, H, 2 * 
 # `indexer_score`) it reads, ascending by position (span order), -1 padded.
 # A row with `complete[row]` complete units at most K reads every row of its
 # spans (the first K); past it, the K best of its scored rows, score
-# descending with ties to the lower ordinal (the lower unit). A row's scored
-# rows are the first min(N, rows of its spans). Rows are indexed by class
-# row. `top_slots` holds no values: its extent is the picks K.
+# descending with ties to the lower ordinal (the lower unit). Scores rank by
+# `ordered_key` (sampling.seismic): -0.0 and 0.0 tie, and every NaN takes the
+# canonical NaN's key, above +inf's, so NaNs tie and rank by ordinal. The
+# body's comparisons state that order for scores without NaN. A row's
+# scored rows are the first min(N, rows of its spans). Rows are indexed by
+# class row. `top_slots` holds no values: its extent is the picks K.
 fn rows_topk[M, N, R, K](scores: &tensor[M, N] f32, complete: &tensor[M] i32,
     spans: &tensor[M, R, 2] i32, top_slots: &tensor[0, K] i32) -> tensor[M, K] i32
     where N >= 0 and K >= 0:

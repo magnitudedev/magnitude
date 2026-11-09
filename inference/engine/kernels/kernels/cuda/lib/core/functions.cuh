@@ -31,6 +31,8 @@ __device__ __forceinline__ float activate(int function, float x) {
     return x / (1.0f + expf(-x));
 }
 
+__device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
+
 __device__ __forceinline__ float softcap(float cap, float z) {
     return cap * (2.0f / (1.0f + expf(-2.0f * z / cap)) - 1.0f);
 }
@@ -41,7 +43,7 @@ constexpr int gate_sigmoid = 1;
 
 __device__ __forceinline__ float output_gate(int function, float z) {
     if (function == gate_sigmoid)
-        return 1.0f / (1.0f + expf(-z));
+        return sigmoid(z);
     return z / (1.0f + expf(-z));
 }
 

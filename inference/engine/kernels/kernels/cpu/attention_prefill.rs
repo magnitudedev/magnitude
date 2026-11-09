@@ -6,7 +6,7 @@
 // span) for the kv head's G query heads and stores their gated outputs.
 
 use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
-use lib::core::activation;
+use lib::core::{activation, spans};
 use seismic::cpu::slab::SlabTensor;
 
 fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
@@ -93,8 +93,9 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     let (m, r) = (cx.dim_m() as usize, cx.dim_r() as usize);
     let (visible, fresh) = (cx.arg_visible(), cx.arg_fresh());
     let spans = (0..r)
-        .map(move |span| (visible.get([row, span, 0]), visible.get([row, span, 1])))
-        .filter(|(lo, hi)| hi > lo);
+        .map(move |span| spans::span(visible.get([row, span, 0]), visible.get([row, span, 1])))
+        .filter(|rows| !rows.is_empty())
+        .map(|rows| (rows.start, rows.end));
     // A layer without fresh rows sees none (the portable `for layer in 0..F`).
     let fresh = if form.fresh { (fresh.get([row, 0]), fresh.get([row, 1])) } else { (0, 0) };
     let range = 0..attention::total(spans.clone(), fresh);

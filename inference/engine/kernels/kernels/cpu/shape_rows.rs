@@ -17,12 +17,7 @@
 // ceil(top_p * total). A row whose tempered values contain NaN or +inf, or
 // whose maximum is -inf, is left unfiltered (sampling reports it).
 
-/// The order-preserving key of `value` (-0 and +0 share one key).
-#[inline(always)]
-fn key(value: f32) -> u32 {
-    let bits = (value + 0.0).to_bits();
-    if bits & 0x8000_0000 != 0 { !bits } else { bits | 0x8000_0000 }
-}
+use lib::core::functions::finite_ordered_key;
 
 /// exp(value - maximum) as a 64-bit 2^-32 fixed-point mass.
 #[inline(always)]
@@ -172,7 +167,7 @@ fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
     let need = s.top_k.max(0) as usize;
     let threshold = if top_k && need <= vocabulary {
         for (slot, value) in order.iter_mut().zip(values.iter()) {
-            *slot = u64::from(key(*value));
+            *slot = u64::from(finite_ordered_key(*value));
         }
         let (_, kth, _) = order.select_nth_unstable_by(need - 1, |a, b| b.cmp(a));
         *kth as u32
@@ -180,7 +175,7 @@ fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
         0
     };
     let survives = |value: f32| {
-        key(value) >= threshold && !(min_p && seismic::cpu::math::exp(value - maximum) < s.min_p)
+        finite_ordered_key(value) >= threshold && !(min_p && seismic::cpu::math::exp(value - maximum) < s.min_p)
     };
     if !top_p {
         for value in values.iter_mut() {
@@ -197,7 +192,7 @@ fn shape_rows_filter<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u6
     let mut total = 0u64;
     for (token, value) in values.iter_mut().enumerate() {
         if survives(*value) {
-            order[survivors] = (u64::from(!key(*value)) << 32) | token as u64;
+            order[survivors] = (u64::from(!finite_ordered_key(*value)) << 32) | token as u64;
             survivors += 1;
             total += mass(*value, maximum);
         } else {

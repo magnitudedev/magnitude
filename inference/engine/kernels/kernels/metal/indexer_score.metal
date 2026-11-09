@@ -15,6 +15,8 @@
 // Dynamic extents and parameters read `seismic_words`.
 
 #include "lib/core/activation.h"
+#include "lib/core/head.h"
+#include "lib/core/rotary.h"
 #include "lib/core/rounding.h"
 #include "lib/indexer/indexer.h"
 #include <seismic/slab.h>
@@ -23,12 +25,9 @@
 #define SCORE_E (SCORE_W / 32)
 #define SCORE_H uint(SEISMIC_DIM_H)
 
-static_assert(SCORE_W % 32 == 0, "indexer head width must be a multiple of 32");
-static_assert(SEISMIC_DIM_P % SCORE_E == 0, "each rotary half must cover whole lanes");
-
 typedef element::Act::native Scalar;
-typedef indexer::Lanes<SCORE_E, SEISMIC_DIM_P, (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM_S : 0), (SEISMIC_DIM_RA != 0)>
-    query_lanes;
+typedef rotary::layout<SCORE_W, SEISMIC_DIM_P, (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM_S : 0), (SEISMIC_DIM_RA != 0)>
+    query_layout;
 
 kernel void indexer_score(
     device const Scalar *query [[buffer(SEISMIC_BUFFER_QUERY)]],
@@ -65,8 +64,11 @@ kernel void indexer_score(
     }
     // The row's query heads, prepared in F32.
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
-    const rounding::Rounding trained = {int(uint(SEISMIC_PARAM_BLOCK)), int(uint(SEISMIC_PARAM_ELEMENT)),
-        int(uint(SEISMIC_PARAM_ROUNDING_SCALE)), as_type<float>(uint(SEISMIC_PARAM_AMAX_FLOOR))};
+    const rounding::Rounding trained = rounding::of(uint(SEISMIC_PARAM_BLOCK), uint(SEISMIC_PARAM_ELEMENT),
+        uint(SEISMIC_PARAM_ROUNDING_SCALE), uint(SEISMIC_PARAM_AMAX_FLOOR));
+    // One table rotates every head of the row.
+    const query_layout::table table(coordinates + row * 4, rotary_components, rotary_frequencies,
+        rotary_amplitudes, lane);
     for (uint head = simd; head < SCORE_H; head += 8) {
         float x[SCORE_E];
         device const Scalar *raw = query + (row * SCORE_H + head) * SCORE_W;
@@ -74,11 +76,10 @@ kernel void indexer_score(
             x[i] = float(raw[lane * SCORE_E + i]);
         // A rounded query is rounded from its norm and rotation held in A.
         if (SEISMIC_DIM_NQ != 0) {
-            query_lanes::normalize(x, query_norm, epsilon, lane);
+            head::rms_norm(x, query_norm, epsilon, lane);
             rounding::hold_lanes<element::Act>(x, trained);
         }
-        query_lanes::rotate(x, coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes,
-            lane);
+        query_layout::rotate(table, lane, x);
         rounding::hold_lanes<element::Act>(x, trained);
         rounding::round_lanes<SCORE_E>(x, trained);
         for (uint i = 0; i < SCORE_E; ++i)

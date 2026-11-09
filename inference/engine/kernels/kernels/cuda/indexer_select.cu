@@ -29,6 +29,7 @@
 
 #include "lib/core/activation.cuh"
 #include "lib/core/reduce.cuh"
+#include "lib/indexer/indexer.cuh"
 #include <seismic/slab.cuh>
 
 namespace indexer {
@@ -93,9 +94,7 @@ struct Spans {
 
     __device__ __forceinline__ int lo(u64 span) const { return spans[span * span_stride]; }
     __device__ __forceinline__ u32 length(u64 span) const {
-        const int first = lo(span);
-        const int last = spans[span * span_stride + bound_stride];
-        return last > first ? static_cast<u32>(last - first) : 0u;
+        return indexer::span_length(lo(span), spans[span * span_stride + bound_stride]);
     }
 
     // The rows of the spans (`reduce::span_total`; the whole warp calls it).

@@ -34,6 +34,9 @@ struct layout {
     static_assert(W % 32 == 0, "a head row must cover whole lanes");
     static_assert(P % E == 0, "each rotary half must cover whole lanes");
     static_assert(!ADJACENT || E % 2 == 0 || E == 1, "an adjacent pair must lie within one lane or span two");
+    // An adjacent pair's columns differ in their lowest bit only (`partner`).
+    static_assert(!ADJACENT || FIRST % 2 == 0, "adjacent pairs start at an even column");
+    static_assert(FIRST % E == 0, "the rotated columns start at a lane");
 
     // The place of `column` among the rotated columns: whether it is
     // rotated, its pair, whether it leads the pair, its pair's other column.
@@ -52,6 +55,10 @@ struct layout {
         if (ADJACENT)
             return column ^ 1u;
         return leads(column) ? column + P : column - P;
+    }
+    // The column leading pair `pair` (its other is `partner`).
+    static uint lead(uint pair) {
+        return FIRST + (ADJACENT ? 2 * pair : pair);
     }
 
     // One row's table for lane `lane`'s rotated columns: pair p turns by

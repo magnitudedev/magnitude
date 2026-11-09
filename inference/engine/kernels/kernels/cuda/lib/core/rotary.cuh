@@ -5,9 +5,32 @@
 //
 // This file is independent of any entry ABI: a caller names its layout with
 // `rotary::layout<W, P, FIRST, ADJACENT>` and its row's tables with
-// `rotary::table`.
+// `rotary::table`. An entry whose ABI declares P, S, RT and RA and the
+// `rotary_components`, `rotary_frequencies` and `rotary_amplitudes` tensors
+// names them with `ROTARY_ENTRY_LAYOUT` and `ROTARY_ENTRY_TABLE`, expanded
+// where its words are in scope.
 
 #pragma once
+
+// The entry's layout of a W-column row: its P pairs over the leading columns,
+// or the trailing ones (RT = 1, from S); half-split pairs, or adjacent ones
+// (RA = 1).
+#define ROTARY_ENTRY_LAYOUT(W)                                                                     \
+    rotary::layout<(W), static_cast<int>(SEISMIC_DIM_P), SEISMIC_DIM_RT != 0 ? static_cast<int>(SEISMIC_DIM_S) : 0, \
+                   SEISMIC_DIM_RA != 0>
+
+// The entry's rotary tables at the row coordinates `coordinates`, stepping by
+// `coordinate_stride`.
+#define ROTARY_ENTRY_TABLE(coordinates, coordinate_stride)                                         \
+    rotary::table {                                                                                \
+        (coordinates), (coordinate_stride),                                                        \
+            reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS)),          \
+            SEISMIC_ROTARY_COMPONENTS_STRIDE_0,                                                    \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES)),       \
+            SEISMIC_ROTARY_FREQUENCIES_STRIDE_0,                                                   \
+            reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)),        \
+            SEISMIC_ROTARY_AMPLITUDES_STRIDE_0                                                     \
+    }
 
 namespace rotary {
 
@@ -44,6 +67,8 @@ template <int W, int P, int FIRST, bool ADJACENT>
 struct layout {
     static constexpr int E = W / 32;
     static_assert(W % 32 == 0, "a head row must cover whole lanes");
+    // An adjacent pair's columns differ in their lowest bit only (`partner`).
+    static_assert(!ADJACENT || FIRST % 2 == 0, "adjacent pairs start at an even column");
 
     // The place of `column` among the rotated columns: whether it is
     // rotated, its pair, whether it leads the pair, its pair's other column.

@@ -23,6 +23,12 @@ inline Rounding none() {
     return Rounding{0, 0, 0, 0.0f};
 }
 
+// A rounding from an entry's four words: `block`, `element` and `scale` as
+// their codes, `amax_floor` the bits of its F32.
+inline Rounding of(uint block, uint element, uint scale, uint amax_floor) {
+    return Rounding{int(block), int(element), int(scale), as_type<float>(amax_floor)};
+}
+
 // v to the nearest code of `mantissa` bits and smallest normal exponent
 // `min_exponent`, ties to even (`round_codes`).
 inline float round_codes(float v, uint mantissa, int min_exponent) {

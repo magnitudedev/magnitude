@@ -68,20 +68,17 @@ fn attention_output_rows<L: Isa, E: Elements>(
         |row, projected| {
             // `scatter` of the projection into each stream.
             for stream in 0..streams {
-                let first = stream * d + rows.start;
                 // SAFETY: each work item writes its own columns of every row.
-                let out = unsafe { result.span_mut([row, first], rows.len()) };
-                for (column, (target, projected)) in out.iter_mut().zip(projected).enumerate() {
-                    let y = activation::publish::<E::A>(output_scale * *projected);
-                    *target = functions::scatter(
-                        streams,
-                        inject_width,
-                        stream,
-                        y,
-                        |at| inject.get([row, at]),
-                        |from| hidden.get([row, from * d + rows.start + column]),
-                    );
-                }
+                let out = unsafe { result.span_mut([row, stream * d + rows.start], rows.len()) };
+                functions::scatter(
+                    streams,
+                    inject_width,
+                    stream,
+                    |column| activation::publish::<E::A>(output_scale * projected[column]),
+                    |at| inject.get([row, at]),
+                    |from| hidden.span([row, from * d + rows.start], rows.len()),
+                    out,
+                );
             }
         },
     );

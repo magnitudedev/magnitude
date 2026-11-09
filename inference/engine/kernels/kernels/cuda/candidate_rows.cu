@@ -10,6 +10,8 @@
 //
 // Dynamic extents and strides read `seismic_words`.
 
+#include "lib/indexer/indexer.cuh"
+
 namespace candidate {
 
 typedef unsigned int u32;
@@ -31,15 +33,11 @@ struct Pool {
     u32 start;
     u32 end;
 
-    __device__ static __forceinline__ u32 length(int lo, int hi) {
-        return lo >= 0 && hi > lo ? static_cast<u32>(hi - lo) : 0u;
-    }
-
     __device__ __forceinline__ void flush() {
         u32 at = start;
         while (at < end && span < spans) {
             const int lo = list[span * list_stride];
-            const u32 size = length(lo, list[span * list_stride + list_bound]);
+            const u32 size = indexer::span_length(lo, list[span * list_stride + list_bound]);
             if (offset + size <= at) {
                 offset += size;
                 ++span;
@@ -86,7 +84,7 @@ extern "C" __global__ void candidate_rows(SEISMIC_KERNEL_PARAMS) {
     const u64 pick_stride = SEISMIC_BLOCKS_STRIDE_1;
     u32 units = 0;
     for (u32 span = 0; span < r; ++span)
-        units += Pool::length(row_spans[span * span_stride], row_spans[span * span_stride + bound_stride]);
+        units += indexer::span_length(row_spans[span * span_stride], row_spans[span * span_stride + bound_stride]);
     u32 pooled = 0;
     for (u32 pick = 0; pick < b; ++pick) {
         const int block = picks[pick * pick_stride];

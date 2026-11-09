@@ -19,6 +19,7 @@
 #include "../projection/projection.h"
 #include "../core/arrive.h"
 #include "../core/gumbel.h"
+#include "../core/order.h"
 
 #define PROGRESSIVE_LOW_PLANES uint(SEISMIC_DIM_P)
 #define PROGRESSIVE_HALF_BITS (PROGRESSIVE_LOW_PLANES + 1u)
@@ -205,13 +206,11 @@ typedef element::Act activation;
 static_assert(activation::bytes == 2, "the progressive readout requires a bf16 or f16 activation element");
 
 // Order-preserving key of an F32 (larger float, larger key; every key of a
-// non-NaN float is nonzero, so zero is below every key), and back.
+// non-NaN float is nonzero, so zero is below every key); back through
+// `order::value`. Unlike `order::key` it keeps -0.0 and 0.0 apart.
 inline uint key(float value) {
     const uint bits = as_type<uint>(value);
     return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-}
-inline float value_of(uint k) {
-    return as_type<float>((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
 }
 
 // The bits of quarter q of a plane word (code 8q + e at bit 4e + q) as +1
@@ -309,7 +308,7 @@ struct Selection {
     void raise(threadgroup atomic_uint *lowest, uint m, uint v, float logit) const {
         const float plain = transform(logit) / divisor(m);
         const uint best = atomic_load_explicit(lowest, memory_order_relaxed);
-        if (best != 0u && plain + PROGRESSIVE_NOISE < value_of(best))
+        if (best != 0u && plain + PROGRESSIVE_NOISE < order::value(best))
             return;
         atomic_fetch_max_explicit(lowest, key(plain + noise(m, v)), memory_order_relaxed);
     }
@@ -328,7 +327,7 @@ inline void publish(threadgroup atomic_uint *lowest, device atomic_uint *bounds,
             memory_order_relaxed);
     if (arrive::last(&bounds[PROGRESSIVE_ROWS], tiles, last, tid) && tid < rows) {
         const uint k = atomic_load_explicit(&bounds[tid], memory_order_relaxed);
-        const float raised = k == 0u ? -INFINITY : value_of(k);
+        const float raised = k == 0u ? -INFINITY : order::value(k);
         const float floored = floor ? metal::max(floor[tid * floor_stride], raised) : raised;
         threshold[tid * threshold_stride] = metal::isfinite(lengths[tid * length_stride]) ? floored : -INFINITY;
         atomic_store_explicit(&bounds[tid], 0u, memory_order_relaxed);

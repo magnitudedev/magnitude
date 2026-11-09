@@ -20,6 +20,7 @@
 #include "lib/core/head.cuh"
 #include "lib/core/rotary.cuh"
 #include "lib/core/rounding.cuh"
+#include "lib/indexer/indexer.cuh"
 #include <seismic/slab.cuh>
 
 namespace pooled {
@@ -38,23 +39,7 @@ static_assert(W % 32 == 0, "a pooled row must cover whole lanes");
 static_assert(RATE >= 2 && RATE <= 16, "a group holds 2 to 16 tokens");
 
 // A pooled row's rotary pairs: the reading attention's key layout (RA, RT).
-typedef rotary::layout<W, SEISMIC_DIM_P, SEISMIC_DIM_RT != 0 ? static_cast<int>(SEISMIC_DIM_S) : 0,
-                       SEISMIC_DIM_RA != 0>
-    row_layout;
-
-// The physical row of ordinal `ordinal` of a row's `count` spans, `stride`
-// apart with their bounds `bound` apart.
-__device__ __forceinline__ int span_row(const int *spans, u64 count, u64 stride, u64 bound, u32 ordinal) {
-    u32 before = 0;
-    for (u64 span = 0; span < count; ++span) {
-        const int lo = spans[span * stride];
-        const int hi = spans[span * stride + bound];
-        const u32 length = hi > lo ? static_cast<u32>(hi - lo) : 0u;
-        if (ordinal < before + length) return lo + static_cast<int>(ordinal - before);
-        before += length;
-    }
-    return -1;
-}
+typedef ROTARY_ENTRY_LAYOUT(W) row_layout;
 
 } // namespace pooled
 
@@ -112,11 +97,10 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
     const u64 span_stride = SEISMIC_WINDOW_VISIBLE_STRIDE_1;
     const u64 bound_stride = SEISMIC_WINDOW_VISIBLE_STRIDE_2;
     u32 earlier = 0;
-    for (u64 span = 0; span < spans; ++span) {
-        const int lo = row_spans[span * span_stride];
-        const int hi = row_spans[span * span_stride + bound_stride];
-        earlier += hi > lo ? static_cast<u32>(hi - lo) : 0u;
-    }
+    for (u64 span = 0; span < spans; ++span)
+        earlier += indexer::span_length(row_spans[span * span_stride], row_spans[span * span_stride + bound_stride]);
+    // A completing row's window spans hold its group's earlier tokens.
+    if (earlier < static_cast<u32>(RATE - 1)) __trap();
     const u32 first_member = earlier - static_cast<u32>(RATE - 1);
     // Member m's u, and (gated) its gate scores: a window row's follow its u,
     // the row's own are g.
@@ -127,7 +111,8 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
     for (int member = 0; member + 1 < RATE; ++member)
         members[member] = reinterpret_cast<const float *>(
             slab::row(window_rows,
-                      static_cast<u64>(span_row(row_spans, spans, span_stride, bound_stride, first_member + member)),
+                      static_cast<u64>(
+                          indexer::span_row(row_spans, spans, span_stride, bound_stride, first_member + member)),
                       window_slab_rows, WIDTH * sizeof(float)));
     auto value = [&](int member, int column) {
         return member + 1 < RATE ? members[member][column]
@@ -167,10 +152,8 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
     }
     // A rounded row is rounded from values held in A: the pooled row, the
     // latent and the rotated row (`pooled.seismic`).
-    const rounding::Rounding trained{static_cast<int>(static_cast<u32>(SEISMIC_PARAM_BLOCK)),
-                                     static_cast<int>(static_cast<u32>(SEISMIC_PARAM_ELEMENT)),
-                                     static_cast<int>(static_cast<u32>(SEISMIC_PARAM_SCALE)),
-                                     element::word_f32(SEISMIC_PARAM_AMAX_FLOOR)};
+    const rounding::Rounding trained = rounding::of(SEISMIC_PARAM_BLOCK, SEISMIC_PARAM_ELEMENT, SEISMIC_PARAM_SCALE,
+                                                   SEISMIC_PARAM_AMAX_FLOOR);
     rounding::hold_lanes<Act>(x, trained);
     // The latent: RMS-normed with `norm`.
     head::rms_norm(x, reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_NORM)), SEISMIC_NORM_STRIDE_1,
@@ -182,16 +165,10 @@ extern "C" __global__ void pool_rows_complete(SEISMIC_KERNEL_PARAMS) {
     // Rotated at the group's first token, rounded, stored.
     const int *origin = reinterpret_cast<const int *>(
         slab::row(reinterpret_cast<const u32 *>(SEISMIC_PTR(SEISMIC_BUFFER_WINDOW_COORDINATES)),
-                  static_cast<u64>(span_row(row_spans, spans, span_stride, bound_stride, first_member)),
+                  static_cast<u64>(indexer::span_row(row_spans, spans, span_stride, bound_stride, first_member)),
                   window_slab_rows, 4 * sizeof(int)));
     if (lane < 4) latent_coordinates[lane * SEISMIC_RESULT_2_STRIDE_1] = origin[lane];
-    const rotary::table table{origin, 1,
-                              reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_COMPONENTS)),
-                              SEISMIC_ROTARY_COMPONENTS_STRIDE_0,
-                              reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_FREQUENCIES)),
-                              SEISMIC_ROTARY_FREQUENCIES_STRIDE_0,
-                              reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)),
-                              SEISMIC_ROTARY_AMPLITUDES_STRIDE_0};
+    const rotary::table table = ROTARY_ENTRY_TABLE(origin, 1);
     row_layout::rotate(x, table, exchange, lane);
     rounding::hold_lanes<Act>(x, trained);
     rounding::round_lanes<E>(x, trained);

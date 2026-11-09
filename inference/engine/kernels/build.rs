@@ -231,8 +231,23 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/core/head",
-        &[BackendName::Cuda],
-        "a warp-held head row's RMS norm, shared by CUDA's attention, pooled rows and indexers; inside each family's library elsewhere",
+        &[BackendName::Metal, BackendName::Cuda],
+        "a lane-held head row's RMS norm (Metal's simdgroup, CUDA's warp), shared by attention, pooled rows and the indexers; the CPU's natives norm a row in their own work item, and Vulkan runs none of the pooled forms",
+    ),
+    (
+        "lib/core/order",
+        &[BackendName::Metal, BackendName::Cuda],
+        "the F32 order key (`ordered_key`) shared by the sampling shape, `rows_topk` and the progressive readout's values; the CPU's is `functions::ordered_key`, beside the functions it shares",
+    ),
+    (
+        "lib/core/streams",
+        &[BackendName::Metal, BackendName::Cuda],
+        "the hyper-connection stream collapse shared by `stream_collapse` and `stream_mix_sinkhorn`; the CPU's is `functions::collapse`, and Vulkan runs neither entry",
+    ),
+    (
+        "lib/core/spans",
+        &[BackendName::Cpu],
+        "the list spans' one predicate and row walk, shared by the CPU's attention, pooled-row, indexer and candidate entries; the GPU bodies keep theirs in `lib/indexer/indexer`, beside the lane helpers that walk them",
     ),
     (
         "lib/core/rotary",

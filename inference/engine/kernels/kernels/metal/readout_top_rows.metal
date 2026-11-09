@@ -113,7 +113,7 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
             memory_order_relaxed);
     if (arrive::last(&bounds[PROGRESSIVE_ROWS], tiles, last, tid) && tid < rows) {
         const uint k = atomic_load_explicit(&bounds[tid], memory_order_relaxed);
-        const float raised = k == 0u ? -INFINITY : progressive::value_of(k);
+        const float raised = k == 0u ? -INFINITY : order::value(k);
         threshold[tid * threshold_stride] = metal::isfinite(lengths[tid]) ? raised : -INFINITY;
         atomic_store_explicit(&bounds[tid], 0u, memory_order_relaxed);
     }

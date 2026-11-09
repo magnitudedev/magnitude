@@ -75,24 +75,10 @@ fn dense_expand_rows<L: Isa, E: Elements>(
         |row, gate, up| {
             // SAFETY: each work item writes its own columns of every row.
             let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
-            let pairs = out.iter_mut().zip(gate.iter()).zip(up.iter());
-            match limit {
-                None => {
-                    for ((target, gate), up) in pairs {
-                        *target = E::A::narrow(functions::glu::<E::A>(function, gate_scale * *gate, up_scale * *up));
-                    }
-                }
-                Some(limit) => {
-                    for ((target, gate), up) in pairs {
-                        *target = E::A::narrow(functions::clamped_glu::<E::A>(
-                            function,
-                            limit,
-                            gate_scale * *gate,
-                            up_scale * *up,
-                        ));
-                    }
-                }
-            }
+            let pairs = out.iter_mut().zip(gate).zip(up).map(|((target, gate), up)| (target, *gate, *up));
+            functions::glu_row::<E::A, _>(function, limit, (gate_scale, up_scale), pairs, |target, value| {
+                *target = E::A::narrow(value)
+            });
         },
     );
 }

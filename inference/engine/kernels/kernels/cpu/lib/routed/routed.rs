@@ -42,26 +42,18 @@ pub fn expand<A: Dense>(
     q8: Option<&[Q8Block]>,
     function: i32,
     limit: Option<f32>,
-    (gate_scale, up_scale): (f32, f32),
+    scales: (f32, f32),
     out: &mut [f32],
 ) {
     let mut up_sums = [0.0f32; projection::MAX_BLOCK];
     let up_sums = &mut up_sums[..out.len()];
     projection::project_arithmetic(gate, first, x, q8, out);
     projection::project_arithmetic(up, first, x, q8, up_sums);
-    let pairs = out.iter_mut().zip(up_sums.iter());
-    match limit {
-        None => {
-            for (target, up) in pairs {
-                *target = functions::glu::<A>(function, gate_scale * *target, up_scale * up);
-            }
-        }
-        Some(limit) => {
-            for (target, up) in pairs {
-                *target = functions::clamped_glu::<A>(function, limit, gate_scale * *target, up_scale * up);
-            }
-        }
-    }
+    let pairs = out.iter_mut().zip(up_sums.iter()).map(|(target, up)| {
+        let gate = *target;
+        (target, gate, *up)
+    });
+    functions::glu_row::<A, _>(function, limit, scales, pairs, |target, value| *target = value);
 }
 
 /// [`expand`] stored to a row span of `A` elements.

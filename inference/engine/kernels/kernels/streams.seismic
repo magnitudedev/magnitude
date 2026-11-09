@@ -93,8 +93,8 @@ fn stream_mix_up[M, H, S, LR](low: &tensor[M, LR] A, up_weight: &tensor[S * H, L
 #   pre  = sigmoid(m[0:S] scale[0] + base[0:S]) + epsilon
 #   post = 2 sigmoid(m[S:2S] scale[1] + base[S:2S])
 #   comb = rowsoftmax(m[2S:] scale[2] + base[2S:]) + epsilon      ([S, S], source major)
-#   comb = comb / (colsum + epsilon), then iterations - 1 times
-#          comb / (rowsum + epsilon), comb / (colsum + epsilon)
+#   then `iterations` sweeps, each comb = comb / (rowsum + epsilon) (every
+#   sweep but the first) and comb = comb / (colsum + epsilon)
 # in F32. Results: the sublayer's input `sum_s previous[s] X[s]` (the
 # previous site's pre, which its consumer normalizes: `form_input`, PT = 1),
 # this site's pre (the next site's `previous`), and the join row
