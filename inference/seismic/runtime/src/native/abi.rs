@@ -818,25 +818,41 @@ fn written_grid_loop(
     ));
 }
 
+/// The spelling every module constant's symbol starts with.
+const CONSTANT_PREFIX: &str = "SEISMIC_CONST_";
+
 /// `#define SEISMIC_CONST_<NAME> <value>` for each module constant the asset
-/// names. A source that names none renders as before the module declared
-/// any, so the kernel digests tuning results are stored under keep.
-fn constant_macros(prefix: &mut String, asset: NativeAsset<'_>) {
+/// names, in module order. A source that names none renders as before the
+/// module declared any, so the kernel digests tuning results are stored
+/// under keep.
+pub(super) fn constant_macros(prefix: &mut String, asset: NativeAsset<'_>) {
+    let named = named_constants(asset.text);
     for (name, value) in asset.constants {
-        let symbol = format!("SEISMIC_CONST_{}", native_macro(name));
-        if names_symbol(asset.text, &symbol) {
+        let symbol = format!("{CONSTANT_PREFIX}{}", native_macro(name));
+        if named.contains(symbol.as_str()) {
             prefix.push_str(&format!("#define {symbol} {value}\n"));
         }
     }
 }
 
-/// Whether `text` has `symbol` as a whole identifier.
-fn names_symbol(text: &str, symbol: &str) -> bool {
-    let identifier = |character: char| character.is_ascii_alphanumeric() || character == '_';
-    text.match_indices(symbol).any(|(at, _)| {
-        !text[..at].chars().next_back().is_some_and(identifier)
-            && !text[at + symbol.len()..].chars().next().is_some_and(identifier)
-    })
+/// Every whole identifier of `text` that starts with [`CONSTANT_PREFIX`], in
+/// one pass over the text: an asset is most of its source, and a module
+/// declares many constants.
+fn named_constants(text: &str) -> std::collections::BTreeSet<&str> {
+    let identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    let bytes = text.as_bytes();
+    // The prefix has no proper prefix that is also its suffix, so its
+    // non-overlapping occurrences are all of them.
+    text.match_indices(CONSTANT_PREFIX)
+        .filter(|(at, _)| !at.checked_sub(1).is_some_and(|before| identifier(bytes[before])))
+        .map(|(at, _)| {
+            let end = bytes[at..]
+                .iter()
+                .position(|byte| !identifier(*byte))
+                .map_or(text.len(), |length| at + length);
+            &text[at..end]
+        })
+        .collect()
 }
 
 /// The tables a CUDA source's tensors read that its tables header declares
