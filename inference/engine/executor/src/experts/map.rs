@@ -66,6 +66,12 @@ impl MapView {
         self.load_step(expert, MAP_FROM)
     }
 
+    /// The step `expert`'s entry is unmapped from: no step from it on
+    /// resolves the entry to its record.
+    pub fn until(&self, expert: usize) -> Step {
+        self.load_step(expert, MAP_UNTIL)
+    }
+
     /// The record the map holds `expert` in while mapped, none unmapped.
     pub fn held(&self, expert: usize) -> Option<usize> {
         let record = usize::try_from(self.load(expert, MAP_RECORD)).ok()?;

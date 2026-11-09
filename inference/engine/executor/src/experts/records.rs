@@ -8,7 +8,8 @@
 //! - `Free → Promoting(Queued)`: [`BankRecords::promote`], the ranking's
 //!   promotion into a record no step reads; `Queued → Copying`:
 //!   [`BankRecords::copy`]; `Copying → Held`: [`BankRecords::promoted`],
-//!   mapped from the first step not yet begun; `Promoting → Free`:
+//!   mapped from the first step not yet begun and for every step its entry
+//!   resolved already ([`BankRecords::map`]); `Promoting → Free`:
 //!   [`BankRecords::unpromoted`]. Never into a lent record a prompt group
 //!   holds reserved.
 //! - `Held → Releasing`: [`BankRecords::release`], for the reserve, its
@@ -284,9 +285,19 @@ impl BankRecords {
         self.maps().expect("a bank that resolves steps maps them")[layer].view()
     }
 
+    /// Map `expert` to `record`, which holds it whole, from `from` on, or
+    /// from its entry's FROM where its entry covers an earlier step: a step
+    /// its old mapping covers may yet resolve the layer (a prompt step whose
+    /// hit the host planned at its request reads no scratch slot), and it
+    /// reads the expert in its new record, as does a step between the old
+    /// UNTIL and `from` that resolves the layer after this. The entry's
+    /// FROM, which its release reads, so covers every step that may read
+    /// the record.
     fn map(&self, (layer, expert): Staged, record: usize, from: Step) {
         if let Some(maps) = self.maps() {
-            maps[layer].map(expert, record, from);
+            let view = maps[layer].view();
+            let (covered, until) = (view.from(expert), view.until(expert));
+            maps[layer].map(expert, record, if covered < until { from.min(covered) } else { from });
         }
     }
 
@@ -850,6 +861,22 @@ mod tests {
         let lent = LentRecords::new();
         bank.release(0, BankRecord(2), &Unbegun::at(5), &lent.lock());
         bank.fill(Point::whole(3, 0, 4), (0, 5), BankRecord(3));
+    }
+
+    /// A regression: a hit a prompt group's steps planned at their request
+    /// was released mid-group and its expert promoted again, whose mapping
+    /// from the first step not yet begun overwrote the one entry, so the
+    /// group's later passes resolved it absent and read a scratch slot no
+    /// round filled. A remap keeps every step the entry resolved.
+    #[test]
+    fn a_remap_keeps_the_steps_its_entry_resolved() {
+        let (mut bank, view) = bank();
+        promoted(&mut bank, 2, 5, 1);
+        // Group 3's steps 3 and 4 have begun: the release unmaps 5 from 5.
+        let lent = LentRecords::new();
+        bank.release(0, BankRecord(2), &Unbegun::at(5), &lent.lock());
+        promoted(&mut bank, 3, 5, 6);
+        assert_eq!((view.resolve(5, 0), view.resolve(5, 4), view.resolve(5, 6)), (None, Some(3), Some(3)));
     }
 
     /// A regression: a record taken from a lent one after a prompt group's

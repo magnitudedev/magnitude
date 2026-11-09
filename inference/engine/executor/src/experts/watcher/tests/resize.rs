@@ -72,7 +72,11 @@ fn a_resize_between_flights_keeps_the_most_recent_experts() {
     shared.commit_shrink(plan).unwrap();
     assert_eq!(mapped(), [1, 0, -1, -1]);
     let next = sequence + 2;
-    assert_eq!((map.resolve(1, next - 1), map.resolve(1, next)), (None, Some(1)), "moved for the steps not yet begun");
+    assert_eq!(
+        (map.resolve(1, next - 1), map.resolve(1, next)),
+        (Some(1), Some(1)),
+        "moved for the steps not yet begun, and for those its entry resolved"
+    );
     assert_eq!(shared.costs().records, [2]);
     assert_eq!(shared.held(), [vec![1, 2]]);
     // A regrowth adds free records, which the next seeds take; it joins
