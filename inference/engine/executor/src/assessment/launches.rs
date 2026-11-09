@@ -108,9 +108,7 @@ impl Declarations {
         limits: TuningLimits,
     ) -> Result<Self, AssessmentError> {
         let requests = crate::native::kernel_requests(backend, programs, definition, load, limits)
-            .map_err(|failure| {
-                launch_error(crate::CatalogError::native(backend, failure).to_string())
-            })?;
+            .map_err(|failure| AssessmentError::Catalog(crate::CatalogError::native(backend, failure)))?;
         Self::new(backend, requests)
     }
 
@@ -161,12 +159,9 @@ impl Declarations {
                     .collect::<Vec<_>>();
                 let implementation = (kernel.implementation)(self.backend, &elements)
                     .map_err(|error| launch_error(format!("`{}`: {error}", kernel.name)))?
-                    .ok_or_else(|| {
-                        launch_error(format!(
-                            "`{}` has no native implementation for {}",
-                            kernel.name,
-                            self.backend.as_str()
-                        ))
+                    .ok_or(AssessmentError::Unimplemented {
+                        entry: kernel.name,
+                        backend: self.backend,
                     })?;
                 let statics = request
                     .statics

@@ -6,8 +6,10 @@
 //! does not run is refused with a typed reason before any term is derived;
 //! a served target past admission whose terms or graphs fail, or whose
 //! experts a backend that streams experts refuses to stream, is a failure.
-//! A target that need not serve may lack a form on any backend: what it
-//! fails is listed as refused.
+//! A target that need not serve may lack a form on any backend: its failed
+//! inspection, load or bank is listed as refused, and its terms only where
+//! the backend has no native of an entry the load prepares; any other
+//! failure of its terms fails.
 
 use super::demand::DecodeDemand;
 use super::launches::Declarations;
@@ -188,12 +190,16 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             // Every routed form streams: a bank that refuses one fails.
             let loads = std::iter::once(("resident", Ok(load))).chain(banked.map(|banked| ("banked", banked)));
             for (form, load) in loads {
-                match load
-                    .map_err(|error| error.to_string())
-                    .and_then(|load| derive_terms(&definition, &load, SELECTION, backend))
-                {
-                    Ok(terms) => admitted.push(format!("{name} {} {form}: {terms}", backend.as_str())),
-                    Err(error) => sort(format!("{name} {} {form}: {error}", backend.as_str()), served, &mut failures, &mut refused),
+                let line = |error: &dyn std::fmt::Display| format!("{name} {} {form}: {error}", backend.as_str());
+                match load.map(|load| derive_terms(&definition, &load, SELECTION, backend)) {
+                    Err(error) => sort(line(&error), served, &mut failures, &mut refused),
+                    Ok(Ok(terms)) => admitted.push(line(&terms)),
+                    // Only a missing native refuses a target that need not
+                    // serve; any other failure of its terms fails.
+                    Ok(Err(underived)) => match !served && underived.unoffered {
+                        true => refused.push(line(&underived.line)),
+                        false => failures.push(line(&underived.line)),
+                    },
                 }
             }
         }
@@ -445,9 +451,9 @@ fn derive_terms(
     load: &ModelLoadPlan,
     selection: ComponentSelection,
     backend: BackendName,
-) -> Result<String, String> {
+) -> Result<String, Underived> {
     load.program_plan(definition, KvCodec::AffineK8V4)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| Underived::failed(error.to_string()))?;
     // Each call's launches are its entry's declaration's at the statics the
     // load prepares it with.
     let demands = [KvCodec::Dense, KvCodec::AffineK8V4]
@@ -528,13 +534,40 @@ fn derive_terms(
                     .sum::<u64>()
             ))
         }
-        (Ok(demands), Ok(_), Ok(_)) => Err(format!("an empty decode step: {demands:?}")),
-        (demands, memory, graphs) => Err(format!(
-            "{:?} / {:?} / {:?}",
-            demands.err(),
-            memory.err(),
-            graphs.err()
-        )),
+        (Ok(demands), Ok(_), Ok(_)) => Err(Underived::failed(format!("an empty decode step: {demands:?}"))),
+        (demands, memory, graphs) => {
+            let demands = demands.err();
+            // The memory and graph terms read the same kernel inventory, so
+            // a missing native fails them too.
+            let unoffered = matches!(
+                demands,
+                Some(
+                    AssessmentError::Unimplemented { .. }
+                        | AssessmentError::Catalog(crate::CatalogError {
+                            failure: crate::CatalogFailure::KernelDomain { .. },
+                            ..
+                        })
+                )
+            );
+            Err(Underived {
+                line: format!("{demands:?} / {:?} / {:?}", memory.err(), graphs.err()),
+                unoffered,
+            })
+        }
+    }
+}
+
+/// Why a load's terms did not derive.
+struct Underived {
+    line: String,
+    /// The load's demand names an entry the backend has no native of: no
+    /// configuration admits its statics, or the backend implements none.
+    unoffered: bool,
+}
+
+impl Underived {
+    fn failed(line: String) -> Self {
+        Self { line, unoffered: false }
     }
 }
 

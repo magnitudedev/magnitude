@@ -2203,7 +2203,10 @@ pub(crate) mod tests {
         );
         assert!(matches!(
             demand(&definition, &load, KvCodec::RotatedK4V4),
-            Err(AssessmentError::Demand(_))
+            Err(AssessmentError::Catalog(crate::CatalogError {
+                failure: crate::CatalogFailure::Preparation { entry: "attention_decode", .. },
+                ..
+            }))
         ));
     }
 

@@ -87,6 +87,14 @@ pub enum AssessmentError {
     Demand(String),
     /// The model's graphs could not be built on the planned backend.
     Graph(GraphError),
+    /// The load's kernel inventory could not be formed on the backend.
+    Catalog(crate::CatalogError),
+    /// The backend has no native implementation of an entry the load
+    /// prepares.
+    Unimplemented {
+        entry: &'static str,
+        backend: seismic::BackendName,
+    },
     /// A memory observation or fit bound could not be established.
     Memory(String),
 }
@@ -100,6 +108,12 @@ impl fmt::Display for AssessmentError {
                 write!(formatter, "assessment graph construction failed: {error}")
             }
             Self::Memory(message) => write!(formatter, "assessment memory bound failed: {message}"),
+            Self::Catalog(error) => write!(formatter, "assessment demand failed: {error}"),
+            Self::Unimplemented { entry, backend } => write!(
+                formatter,
+                "assessment demand failed: `{entry}` has no native implementation for {}",
+                backend.as_str()
+            ),
         }
     }
 }
