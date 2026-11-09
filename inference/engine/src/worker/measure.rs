@@ -36,6 +36,112 @@ use std::sync::Arc;
 /// the first was not a transient.
 const ENDED_JOBS: u32 = 2;
 
+/// The most times [`JobTime::first`] a job is given, when the jobs before it
+/// measured nothing.
+const LONGEST_JOB: u32 = 8;
+
+/// The time each measurement job is given from its start, whichever host
+/// runs the jobs: in its own process ([`InProcessJobs`]) or in a worker
+/// beside it. A point whose first sample is not read when a job's time ends
+/// is released uncounted, and the next job starts at the same point, so a
+/// job that measured nothing and reported no failure of its own gives the
+/// next twice its time, up to [`LONGEST_JOB`] times the first, and one that
+/// measured gives the next the first again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JobTime {
+    given: std::time::Duration,
+}
+
+/// What a job's end says of the next job's time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobProgress {
+    /// It measured something: stored a record, or left fewer requests
+    /// outstanding.
+    Measured,
+    /// It measured nothing; `failed` when it reported a failure of its own
+    /// ([`MeasureFailure::fails_job`]) or ended without reporting.
+    Empty { failed: bool },
+}
+
+/// The next job, after one that did not stall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NextJob {
+    /// The job measured: the next takes the rest in the first time.
+    Resumes,
+    /// The job's time ended before its point read a sample: the next, given
+    /// twice as long, takes the point again.
+    Longer,
+}
+
+/// Why a job that measured nothing gives no next job.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStall {
+    /// It reported a failure of its own.
+    Failed,
+    /// It was given the longest time already.
+    Exhausted,
+}
+
+impl fmt::Display for JobStall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed => formatter.write_str("it failed"),
+            Self::Exhausted => write!(formatter, "its time ended inside a point given the longest job time, {:?}", JobTime::longest()),
+        }
+    }
+}
+
+impl Default for JobTime {
+    fn default() -> Self {
+        Self { given: Self::first() }
+    }
+}
+
+impl JobTime {
+    /// The first job's time.
+    pub fn first() -> std::time::Duration {
+        std::time::Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS)
+    }
+
+    /// The longest time a job is given.
+    pub fn longest() -> std::time::Duration {
+        Self::first() * LONGEST_JOB
+    }
+
+    /// The next job's time.
+    pub fn given(self) -> std::time::Duration {
+        self.given
+    }
+
+    /// The pause a host that keeps the device's jobs going takes after an
+    /// empty job that ran for `ran` and reported no failure of its own,
+    /// whether it gave a longer next job or was given the longest time
+    /// already: twice what it ran, so jobs whose time keeps ending inside a
+    /// point occupy the device at most a third of the time, at that cadence
+    /// however long they stall.
+    pub fn pause(ran: std::time::Duration) -> std::time::Duration {
+        ran * 2
+    }
+
+    /// Take the end of the job given [`JobTime::given`]: the next job, or
+    /// why there is none. An empty job gives the next twice its time, never
+    /// less than the first nor more than the longest, whether or not it
+    /// stalls, so a host that retries a stalled job retries it at that time.
+    pub fn after(&mut self, end: JobProgress) -> Result<NextJob, JobStall> {
+        let JobProgress::Empty { failed } = end else {
+            self.given = Self::first();
+            return Ok(NextJob::Resumes);
+        };
+        let exhausted = self.given >= Self::longest();
+        self.given = (self.given * 2).clamp(Self::first(), Self::longest());
+        match (failed, exhausted) {
+            (true, _) => Err(JobStall::Failed),
+            (false, true) => Err(JobStall::Exhausted),
+            (false, false) => Ok(NextJob::Longer),
+        }
+    }
+}
+
 /// What one measurement job measures.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MeasureRequest {
@@ -54,9 +160,9 @@ pub struct MeasureRequest {
     /// its host kills is released rather than counted ([`release_killed`]).
     pub job: MeasureJob,
     /// The time the job has from its start: what its host's time for it
-    /// ([`magnitude_executor::assessment::MEASUREMENT_SECONDS`]) has left,
-    /// the bound however many points are requested: the order, not a
-    /// larger budget, measures what loads wait on first.
+    /// ([`JobTime::given`]) has left, the bound however many points are
+    /// requested: the order, not a larger budget, measures what loads wait
+    /// on first.
     pub time: std::time::Duration,
 }
 
@@ -114,6 +220,16 @@ impl fmt::Display for MeasureFailure {
             Self::Figure { reason } => write!(formatter, "a priced figure: {reason}"),
             Self::Probe { reason } => write!(formatter, "a device probe: {reason}"),
         }
+    }
+}
+
+impl MeasureFailure {
+    /// Whether it is the job's own failure. A figure that could not be read
+    /// outside its points' timings fails each job alike and stays priced,
+    /// and a probe that kept nothing leaves its property at its safe value,
+    /// so neither is any job's.
+    pub fn fails_job(&self) -> bool {
+        !matches!(self, Self::Figure { .. } | Self::Probe { .. })
     }
 }
 
@@ -298,23 +414,53 @@ pub struct MeasureEnd {
 }
 
 /// Measurement jobs run in this process ([`measure_machine`]), one after
-/// another, on the executor a load of a manifest selects: how a host that
-/// runs no job beside it (a tool, a load in its own process) has what a
-/// load waits on measured.
+/// another, on the executor a load of a manifest selects, each given its
+/// [`JobTime`]: how a host that runs no job beside it (a tool, a load in its
+/// own process) has what a load waits on measured.
 pub struct InProcessJobs {
     request: MeasureRequest,
     topology: Arc<seismic::DeviceTopology>,
     executor: seismic::Executor,
+    time: JobTime,
 }
 
-/// What one in-process job did.
+/// What the in-process jobs measured.
 pub struct JobRun {
-    /// Whether it recorded a point or left fewer requests outstanding.
-    pub progressed: bool,
-    /// The requests still outstanding after it.
+    /// The requests still outstanding after them.
     pub outstanding: Vec<magnitude_executor::assessment::PointRequest>,
+    /// What the job that measured could not.
     pub failures: Vec<MeasureFailure>,
 }
+
+/// Why the in-process jobs stopped measuring.
+#[derive(Debug)]
+pub enum JobsStopped {
+    /// The outstanding requests could not be read.
+    Requests(String),
+    /// A job measured nothing, and its time gives no next one.
+    Stalled {
+        stall: JobStall,
+        outstanding: Vec<magnitude_executor::assessment::PointRequest>,
+        failures: Vec<MeasureFailure>,
+    },
+}
+
+impl fmt::Display for JobsStopped {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Requests(reason) => write!(formatter, "the outstanding point requests: {reason}"),
+            Self::Stalled { stall, outstanding, failures } => {
+                write!(formatter, "a measurement job measured nothing of {outstanding:?}, as {stall}")?;
+                for failure in failures {
+                    write!(formatter, "; {failure}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for JobsStopped {}
 
 impl InProcessJobs {
     /// Jobs for `manifest`'s load on the machine `catalog` discovered with
@@ -323,6 +469,7 @@ impl InProcessJobs {
     pub fn of_load(catalog: &Devices, paths: Vec<PathBuf>, manifest: &crate::options::ExecutionManifest) -> Result<Option<Self>, String> {
         let Some(kernels) = manifest.kernel_cache.clone() else { return Ok(None) };
         let selected = crate::planning::select_load_device(catalog, manifest).map_err(|error| error.to_string())?;
+        let time = JobTime::default();
         Ok(Some(Self {
             request: MeasureRequest {
                 paths,
@@ -330,10 +477,11 @@ impl InProcessJobs {
                 storage: manifest.store().to_path_buf(),
                 executor: selected.info.selector(),
                 job: MeasureJob(0),
-                time: std::time::Duration::from_secs_f64(magnitude_executor::assessment::MEASUREMENT_SECONDS),
+                time: time.given(),
             },
             topology: catalog.topology(),
             executor: selected.info,
+            time,
         }))
     }
 
@@ -345,15 +493,29 @@ impl InProcessJobs {
         PointRequests::new(&self.request.kernels).outstanding(&self.topology, &self.executor, &self.request.storage, &records, costs)
     }
 
-    /// Run the next job to its end, releasing what it held.
-    pub fn run(&mut self) -> Result<JobRun, String> {
-        let before = self.outstanding()?;
-        self.request.job = MeasureJob(self.request.job.0 + 1);
-        let mut recorded = false;
-        let end = measure_machine(&self.request, &mut |event| recorded |= matches!(event, MeasureEvent::Recorded(..)));
-        drop(end.held);
-        let outstanding = self.outstanding()?;
-        Ok(JobRun { progressed: recorded || outstanding != before, outstanding, failures: end.failures })
+    /// Run jobs, each to its end and releasing what it held, until one
+    /// measures something or a job's [`JobTime`] gives no next one.
+    pub fn run(&mut self) -> Result<JobRun, JobsStopped> {
+        let before = self.outstanding().map_err(JobsStopped::Requests)?;
+        loop {
+            self.request.job = MeasureJob(self.request.job.0 + 1);
+            self.request.time = self.time.given();
+            let mut recorded = false;
+            let end = measure_machine(&self.request, &mut |event| recorded |= matches!(event, MeasureEvent::Recorded(..)));
+            drop(end.held);
+            let outstanding = self.outstanding().map_err(JobsStopped::Requests)?;
+            let job = match recorded || outstanding != before {
+                true => JobProgress::Measured,
+                false => JobProgress::Empty { failed: end.failures.iter().any(MeasureFailure::fails_job) },
+            };
+            match self.time.after(job) {
+                Ok(NextJob::Resumes) => return Ok(JobRun { outstanding, failures: end.failures }),
+                Ok(NextJob::Longer) => {
+                    tracing::info!(given = ?self.request.time, next = ?self.time.given(), "a measurement job's time ended inside a point; the next is given longer");
+                }
+                Err(stall) => return Err(JobsStopped::Stalled { stall, outstanding, failures: end.failures }),
+            }
+        }
     }
 }
 
@@ -652,6 +814,7 @@ mod tests {
             },
             topology,
             executor,
+            time: JobTime { given: std::time::Duration::ZERO },
         }
     }
 
@@ -664,7 +827,37 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut jobs = cut_off_jobs(root.path());
         let run = jobs.run().unwrap();
-        assert!(run.progressed, "a measurement job measured nothing of {:?}: {:?}", run.outstanding, run.failures);
+        assert_eq!(jobs.request.job, MeasureJob(2), "the cut-off job is followed by one that measures");
+        assert_eq!(jobs.request.time, JobTime::first(), "twice no time, never less than the first");
+        assert_eq!(jobs.time.given(), JobTime::first(), "a job that measured gives the next the first time");
+        assert!(run.failures.iter().all(|failure| !failure.fails_job()), "{:?}", run.failures);
+    }
+
+    /// A job that measured nothing and reported no failure of its own gives
+    /// the next twice its time, up to the longest, past which it stalls; one
+    /// that reported a failure stalls at once, still doubling the time a
+    /// retry is given; one that measured gives the next the first time.
+    #[test]
+    fn an_empty_job_doubles_the_next_jobs_time_up_to_the_longest() {
+        let empty = JobProgress::Empty { failed: false };
+        let mut time = JobTime::default();
+        assert_eq!(time.given(), JobTime::first());
+        for doubled in [2, 4, 8] {
+            assert_eq!(time.after(empty), Ok(NextJob::Longer));
+            assert_eq!(time.given(), JobTime::first() * doubled);
+        }
+        assert_eq!(time.given(), JobTime::longest());
+        assert_eq!(time.after(empty), Err(JobStall::Exhausted));
+        assert_eq!(time.given(), JobTime::longest());
+        assert_eq!(time.after(JobProgress::Measured), Ok(NextJob::Resumes));
+        assert_eq!(time.given(), JobTime::first());
+        assert_eq!(time.after(JobProgress::Empty { failed: true }), Err(JobStall::Failed));
+        assert_eq!(time.given(), JobTime::first() * 2);
+        let mut longest = JobTime { given: JobTime::longest() };
+        assert_eq!(longest.after(JobProgress::Empty { failed: true }), Err(JobStall::Failed));
+        // A job at the longest time is retried at the same cadence as the
+        // jobs before it, twice what it ran, however often it stalls.
+        assert_eq!(JobTime::pause(JobTime::longest()), JobTime::longest() * 2);
     }
 
     /// Requests and outcomes cross the process encoding.

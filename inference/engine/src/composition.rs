@@ -209,12 +209,13 @@ impl ReadyEngine {
 /// process before it loads or prepares (`preview::priced`): no job runs
 /// beside a host that loads in its own process, so while they are pending
 /// its own jobs measure them ([`InProcessJobs`]), and the plan is taken
-/// again. A job that measures nothing of what is pending fails the load
+/// again. Jobs whose time gives no next one before they measure anything
+/// of what is pending ([`crate::worker::measure::JobTime`]) fail the load
 /// with why. A preview that fails otherwise is the load's to report, as it
-/// plans the same. Returns the jobs it ran; none without a kernel cache,
-/// which holds the figures. A load in its own process settles them once an
-/// attempt finds them pending ([`load_in_process`]), so a priced machine's
-/// load plans nothing more.
+/// plans the same. Returns how often its jobs measured; never without a
+/// kernel cache, which holds the figures. A load in its own process
+/// settles them once an attempt finds them pending ([`load_in_process`]),
+/// so a priced machine's load plans nothing more.
 pub fn settle_prices(manifest: &ExecutionManifest) -> Result<u64, LoadError> {
     let internal = |reason: String| LoadError::Internal { reason };
     let paths = vec![manifest.store().to_path_buf()];
@@ -225,15 +226,9 @@ pub fn settle_prices(manifest: &ExecutionManifest) -> Result<u64, LoadError> {
     let mut ran = 0;
     let mut measured = || {
         ran += 1;
-        let run = jobs.run().map_err(internal)?;
-        match run.progressed {
-            true => Ok(()),
-            false => Err(internal(format!(
-                "the plan's prices are pending, and a measurement job measured nothing of {:?}: {}",
-                run.outstanding,
-                run.failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "),
-            ))),
-        }
+        jobs.run()
+            .map(drop)
+            .map_err(|stopped| internal(format!("the plan's prices are pending, and {stopped}")))
     };
     now(priced(
         || std::future::ready(manifest.preview(&catalog)),

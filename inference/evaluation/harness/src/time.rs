@@ -440,30 +440,51 @@ impl Ceilings {
 }
 
 /// Measure `requests` on `device` in this process, as the measurement job
-/// measures them (`assessment::requests::measure`), within a job's time
-/// (`MEASUREMENT_SECONDS`), into `store`: the harness is a tool, which may
-/// measure in its own process. Why the job could not run.
+/// measures them (`assessment::requests::measure`), each walk given its job
+/// time (`worker::measure::JobTime`), into `store`, until no point is left
+/// expired: the harness is a tool, which may measure in its own process.
+/// Why the walks could not run, or stopped before measuring the rest.
 fn measure_requested(
     device: &seismic::Device,
     store: &dyn seismic::measure::RecordStore<seismic::PointKey>,
     requests: &[magnitude_executor::assessment::PointRequest],
 ) -> Result<(), String> {
-    use magnitude_executor::assessment::{requests, MEASUREMENT_SECONDS};
-    let mut measurer = seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(MEASUREMENT_SECONDS);
-    let measured = requests::measure(
-        &mut measurer,
-        device,
-        store,
-        requests,
-        deadline,
-        &mut |_| seismic::measure::Attempt::Proceed,
-        &mut |_, _| {},
-    )
-    .map_err(|error| error.to_string())?;
-    match measured.ended.into_iter().chain(measured.failures).next() {
-        Some(error) => Err(error.to_string()),
-        None => Ok(()),
+    use magnitude_engine::worker::measure::{JobProgress, JobTime};
+    use magnitude_executor::assessment::requests;
+    use seismic::measure::Outcome;
+    let mut time = JobTime::default();
+    loop {
+        let mut measurer = seismic::Measurer::new(magnitude_executor::SEARCH_SETTINGS.error_rate, magnitude_executor::MIN_SAMPLE_SECONDS);
+        let deadline = std::time::Instant::now() + time.given();
+        let (mut measured, mut failed, mut expired) = (false, false, false);
+        let walked = requests::measure(
+            &mut measurer,
+            device,
+            store,
+            requests,
+            deadline,
+            &mut |_| seismic::measure::Attempt::Proceed,
+            &mut |_, outcome| match outcome {
+                Outcome::Loaded(_) => {}
+                Outcome::Measured(_) | Outcome::Skipped(_) | Outcome::Unformed(_) => measured = true,
+                Outcome::Unmade(_) | Outcome::Failed(_) | Outcome::Store(_) => failed = true,
+                Outcome::Expired => expired = true,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(error) = walked.ended.into_iter().chain(walked.failures).next() {
+            return Err(error.to_string());
+        }
+        // A point left unrecorded otherwise is the caller's to report, from
+        // what is stored.
+        if !expired {
+            return Ok(());
+        }
+        let progress = match measured {
+            true => JobProgress::Measured,
+            false => JobProgress::Empty { failed },
+        };
+        time.after(progress).map_err(|stall| format!("the measurement walk stopped: {stall}"))?;
     }
 }
 

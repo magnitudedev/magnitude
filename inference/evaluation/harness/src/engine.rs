@@ -225,11 +225,12 @@ pub fn prepare(artifacts: &Artifacts, options: &EngineOptions, load: &Load) -> R
 /// load is once its job has run. The load's points come of its plan, which
 /// prices its holdings on the standing figures, so those settle first, as
 /// every load in its own process settles them (`composition::settle_prices`).
-/// The rest stops early only where a job leaves them as they were,
-/// reporting why, and the load then serves what is pending as any load
-/// does. Nothing to do without a kernel cache.
+/// The rest stops early only where the jobs' time gives no next job before
+/// one measures (`worker::measure::JobTime`), reporting why, and the load
+/// then serves what is pending as any load does. Nothing to do without a
+/// kernel cache.
 fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::composition::ResolvedEngineConfiguration) -> Result<(), String> {
-    use magnitude_engine::worker::measure::InProcessJobs;
+    use magnitude_engine::worker::measure::{InProcessJobs, JobsStopped};
     let manifest = &resolved.manifest;
     let Some(root) = &manifest.kernel_cache else {
         return Ok(());
@@ -240,15 +241,14 @@ fn settle_measurements(artifacts: &Artifacts, resolved: &magnitude_engine::compo
     let mut jobs = InProcessJobs::of_load(&catalog, paths, manifest)?.expect("a load with a kernel cache has jobs");
     let mut left = jobs.outstanding()?;
     while !left.is_empty() {
-        let run = jobs.run()?;
-        if !run.progressed {
-            for failure in &run.failures {
-                eprintln!("magnitude-harness: not measured: {failure}");
+        match jobs.run() {
+            Ok(run) => left = run.outstanding,
+            Err(stopped @ JobsStopped::Stalled { .. }) => {
+                eprintln!("magnitude-harness: not measured: {stopped}");
+                break;
             }
-            eprintln!("magnitude-harness: the job left {} requests outstanding: {:?}", run.outstanding.len(), run.outstanding);
-            break;
+            Err(stopped) => return Err(stopped.to_string()),
         }
-        left = run.outstanding;
     }
     Ok(())
 }
