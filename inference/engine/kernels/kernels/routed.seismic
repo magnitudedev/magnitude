@@ -1996,7 +1996,9 @@ fn publish_hints[M, K, RING](routes: &tensor[M, K] i32,
 #   with the rest, its record pending (SOURCE_SITE -2 where the CPU's; the
 #   tier wait names it). The route does not wait; with no choice absent the
 #   host is not involved.
-# Every choice of an expert has its expert's source. A layer whose policy's
+# Every choice of an expert has its expert's source, read once, on its
+# first choice: the host maps and unmaps while a step runs, so two reads of
+# an expert's map or tier words may differ. A layer whose policy's
 # POLICY_WHOLE word is set (its group holds every expert at its home record)
 # sources each choice from `home + expert`: nothing misses, nothing is
 # published, and neither the routing record nor the grids are written.
@@ -2037,10 +2039,16 @@ fn resolve[M, K, E, FW, FLIGHT, P, GM, TM](routes: &tensor[M, K] i32, map: &tens
         for row in 0..M:
             for choice in 0..K:
                 let expert = routes[row, choice]
-                let mut source = held(map, home + expert, q)
-                if source < 0 and TM > 0:
-                    if tier[expert] >= 0:
-                        source = -2 - tier[expert]
+                let first = first_of(routes, i32(row), i32(choice))
+                let mut source = -1
+                if first == i32(row * K + choice):
+                    source = held(map, home + expert, q)
+                    if source < 0 and TM > 0:
+                        let tiered = tier[expert]
+                        if tiered >= 0:
+                            source = -2 - tiered
+                else:
+                    source = sources[SOURCE_RECORD, first / i32(K), first % i32(K)]
                 if source == -1:
                     absent = 1
                 sources[SOURCE_RECORD, row, choice] = source
@@ -2056,7 +2064,7 @@ fn resolve[M, K, E, FW, FLIGHT, P, GM, TM](routes: &tensor[M, K] i32, map: &tens
                 for choice in 0..K:
                     let entry = FILE_ENTRIES + FILE_ENTRY_WORDS * (row * K + choice)
                     file[record, entry + FILE_CHOICE] = -1 - routes[row, choice]
-                    if held(map, home + routes[row, choice], q) == -1 and (TM == 0 or tier[routes[row, choice]] < 0):
+                    if routing[record, RING_EXPERTS + P + row * K + choice] == -1:
                         file[record, entry + FILE_CHOICE] = routes[row, choice]
             file[record, FILE_COUNT] = i32(M * K)
             store_pair(file, record, SLOT_REQUEST, q)
@@ -2064,16 +2072,20 @@ fn resolve[M, K, E, FW, FLIGHT, P, GM, TM](routes: &tensor[M, K] i32, map: &tens
         grids[WAIT_GRID, 1] = 1
         grids[WAIT_GRID, 2] = 1
 
-# Whether choice (row, choice) is its expert's first in choice order
-# (row-major): the one that stands for the expert.
-fn first_choice[M, K](routes: &tensor[M, K] i32, row: i32, choice: i32) -> bool:
-    let mut first = true
+# The first choice in choice order (row-major) of choice (row, choice)'s
+# expert, as row * K + choice: the one that stands for the expert.
+fn first_of[M, K](routes: &tensor[M, K] i32, row: i32, choice: i32) -> i32:
+    let mut first = row * i32(K) + choice
     for earlier_row in 0..M:
         for earlier_choice in 0..K:
-            if i32(earlier_row * K + earlier_choice) < row * i32(K) + choice:
-                if routes[earlier_row, earlier_choice] == routes[row, choice]:
-                    first = false
+            let earlier = i32(earlier_row * K + earlier_choice)
+            if earlier < first and routes[earlier_row, earlier_choice] == routes[row, choice]:
+                first = earlier
     return first
+
+# Whether choice (row, choice) is its expert's first (`first_of`).
+fn first_choice[M, K](routes: &tensor[M, K] i32, row: i32, choice: i32) -> bool:
+    return first_of(routes, row, choice) == row * i32(K) + choice
 
 # The rows naming expert `expert`: its choices, one a row at most.
 fn expert_rows[M, K](routes: &tensor[M, K] i32, expert: i32) -> i32:

@@ -1,8 +1,9 @@
 // Expert streaming's decode resolve and assignment (`resolve` and `assign`
 // in routed.seismic), shared by every streamed route, over the backend's
 // shim (streaming/contract.hpp): after its selection, the group that holds
-// every row's routes resolves each choice's source once into the step's
-// snapshot (`sources`, which every later entry of the layer reads):
+// every row's routes resolves each expert's source once, on its first
+// choice, into the step's snapshot (`sources`, which every later entry of
+// the layer reads), every choice of the expert taking it:
 // - the bank record its layer's map holds for the step (`streaming_held`
 //   over the group's map `map` [GM, MAP_WORDS], the layer's expert e at row
 //   `home + e`, its home `policy[POLICY_HOME]`);
@@ -160,9 +161,17 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
     if (tid == 0)
         STREAMING_GROUP(0) = 0;
     streaming_device_barrier();
-    for (u32 c = tid; c < choices; c += threads) {
-        const int expert =
+    for (u32 c = tid; c < choices; c += threads)
+        STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c)) =
             streaming_device_load(STREAMING_AT(routes, u64(c / K) * routes0 + u64(c % K) * routes1));
+    streaming_barrier();
+    // Each expert's source, read once, on its first choice: the host maps
+    // and unmaps while a step runs, so two reads of an expert's words may
+    // differ, and every choice of an expert takes its expert's one source.
+    for (u32 c = tid; c < choices; c += threads) {
+        if (streaming_first_choice(c, streaming_group) != c)
+            continue;
+        const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
         int source = streaming_held(STREAMING_AT(map, u64(home + expert) * map0), map1, q);
         if (source < 0 && tiered != 0) {
             // Acquire: the host maps a tier record with release once its
@@ -170,10 +179,17 @@ STREAMING_FN void streaming_resolve(STREAMING_DEVICE_READ routes, u64 routes0, u
             const int held = streaming_load_acquire(STREAMING_AT(tier, u64(expert) * tier0));
             source = held >= 0 ? -2 - held : -1;
         }
+        STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) = source;
+    }
+    streaming_barrier();
+    for (u32 c = tid; c < choices; c += threads) {
+        const int expert = STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c));
+        const u32 first = streaming_first_choice(c, streaming_group);
+        const int source = STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, first));
         if (source == -1)
             STREAMING_GROUP(0) = 1;
-        STREAMING_GROUP(STREAMING_RESOLVE_EXPERT(c)) = expert;
-        STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) = source;
+        if (first != c)
+            STREAMING_GROUP(STREAMING_RESOLVE_SOURCE(choices, c)) = source;
         STREAMING_GROUP(STREAMING_RESOLVE_SITE(choices, c)) = -1;
         streaming_store(STREAMING_AT(record, (SEISMIC_CONST_RING_EXPERTS + c) * routing1), expert);
         streaming_store(STREAMING_AT(record, (SEISMIC_CONST_RING_EXPERTS + width + c) * routing1), source);
