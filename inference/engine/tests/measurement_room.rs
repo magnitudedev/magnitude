@@ -1,7 +1,7 @@
 //! The measurement job's room claimed of the service owner, over the
 //! controlled domain's fake expert bank (`magnitude_executor::fixtures`): a
 //! claim the room beside the model holds is answered made at the first
-//! probe; one beyond it shrinks the bank a row at a time, each shrink decided
+//! probe; one beyond it shrinks the bank once by what it is short, decided
 //! at a probe no resize ran across, and is made by the rows given back; one
 //! beyond what the bank holds above its floor is refused before anything
 //! shrinks. The fixture's heap reads the host's memory as first sampled,
@@ -72,11 +72,11 @@ fn experts(host: &Host<TestFamily>) -> ExpertResidency {
     host.owner().serving_census().unwrap().experts.expect("the load has an expert bank")
 }
 
-/// The slots a shrink of one row for the measurement left.
-fn shrunk_to(resize: &BankResize) -> u64 {
+/// The slots a shrink for the measurement left, and the rows it gave back.
+fn shrunk(resize: &BankResize) -> (u64, u64) {
     match *resize {
-        BankResize::Shrank { cause: ShrinkCause::Measurement, to, by, .. } if by.get() == 1 => to,
-        other => panic!("a one-row shrink for the measurement, not {other:?}"),
+        BankResize::Shrank { cause: ShrinkCause::Measurement, to, by, .. } => (to, by.get()),
+        other => panic!("a shrink for the measurement, not {other:?}"),
     }
 }
 
@@ -95,9 +95,10 @@ fn a_claim_the_room_holds_is_answered_at_the_first_probe() {
 }
 
 /// A claim two rows beyond the room shrinks the bank for the measurement
-/// one row at a time, each shrink decided only once a probe read the one
-/// before it finished, and is answered made at a probe after the second
-/// finished: the rows the bank gave back are the room it reads.
+/// once, by the two rows it is short (`ExecutorDomain::shrink_expert_bank_by`:
+/// one shrink covering the claim's deficit, as every release settles to its
+/// size), and is answered made at a probe after that shrink finished: the
+/// rows the bank gave back are the room it reads.
 #[test]
 fn a_claim_beyond_the_room_is_made_by_the_banks_shrinks() {
     'backends: for backend in bank_backends() {
@@ -114,11 +115,8 @@ fn a_claim_beyond_the_room_is_made_by_the_banks_shrinks() {
                 continue;
             };
             assert_eq!(answer, RoomAnswer::Made);
-            let steps = resizes.iter().map(|(_, resize)| shrunk_to(resize)).collect::<Vec<_>>();
-            assert_eq!(steps, [3, 2], "one row a shrink, as many as the claim was short");
-            for pair in resizes.windows(2) {
-                assert!(pair[1].0 - pair[0].0 >= 3, "a shrink begins, installs and releases at boundaries of its own: {resizes:?}");
-            }
+            let steps = resizes.iter().map(|(_, resize)| shrunk(resize)).collect::<Vec<_>>();
+            assert_eq!(steps, [(2, 2)], "one shrink, by the rows the claim was short");
             let (made, _) = resizes.last().unwrap();
             assert!(observation > *made, "answered at a probe after the last shrink finished, not across it");
             assert_eq!(census.slots, 2);
