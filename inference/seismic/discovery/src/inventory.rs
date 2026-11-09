@@ -31,6 +31,7 @@ impl Inventory {
     /// report of each device, the OS's memory, CPU, adapter and filesystem
     /// interfaces, and nothing timed.
     pub fn discover(paths: &[PathBuf]) -> Result<Self, DiscoveryError> {
+        seismic_lang::registry::test_device_reached("discovers devices");
         Ok(Self::from_gathered(paths.to_vec(), gather::gather(paths)?))
     }
 

@@ -27,6 +27,99 @@ pub fn devices(backends: &[seismic::BackendName]) -> Vec<seismic::Device> {
     )
 }
 
+/// What a test forms before it touches a device, for one backend it runs
+/// on: each native request it will prepare, checked as preparation checks
+/// it, without a device ([`setup`]).
+pub struct Setup {
+    backend: seismic::BackendName,
+    checked: usize,
+    unchecked: Vec<String>,
+}
+
+impl Setup {
+    /// The backend this setup forms the test's requests for.
+    pub fn backend(&self) -> seismic::BackendName {
+        self.backend
+    }
+
+    /// Check one request the test will prepare on this backend, `what` naming
+    /// it, by what its entry's generated `native_admission` decides: a refusal
+    /// fails the test here, with preparation's own message, before any device
+    /// opens. One whose decision reads a device is left to preparation, and a
+    /// setup run reports the test unchecked.
+    pub fn admit(
+        &mut self,
+        what: impl std::fmt::Display,
+        admission: Result<seismic::NativeAdmission, seismic::CheckedBundleError>,
+    ) {
+        match admission.unwrap_or_else(|error| panic!("{what}: the checked module does not load: {error}")) {
+            seismic::NativeAdmission::Admitted => self.checked += 1,
+            seismic::NativeAdmission::Refused(why) => {
+                panic!("{what} on {:?}: preparation refuses it: {why}", self.backend)
+            }
+            seismic::NativeAdmission::Unchecked(why) => {
+                self.unchecked.push(format!("{what} on {:?}: {why}", self.backend))
+            }
+        }
+    }
+}
+
+/// A test's setup, then its devices ([`devices`]): `form` runs once for
+/// each backend of `domain` the test runs on (the one the runner requests,
+/// where it lies in `domain`; every one of `domain` where none is), forming
+/// what the test will prepare there and checking it ([`Setup::admit`]), so a
+/// request the backend's declarations refuse fails before any device opens.
+/// The checks read no device: they cost the test nothing it would not spend
+/// preparing.
+///
+/// In a setup run (`seismic::testing::setup_only`) the test ends after
+/// `form`, its device work unrun, with what it checked
+/// (`seismic::testing::SETUP_CHECKED`), or, where a check reads a device,
+/// as unchecked (`seismic::testing::SETUP_UNCHECKED`): a runner reads each
+/// test's setup before it books a device.
+pub fn setup(domain: &[seismic::BackendName], form: impl FnMut(&mut Setup)) -> Vec<seismic::Device> {
+    formed(domain, form);
+    devices(domain)
+}
+
+/// [`setup`], its devices opened with `options` ([`devices_with`]).
+pub fn setup_with(
+    domain: &[seismic::BackendName],
+    options: seismic::DeviceOptions,
+    form: impl FnMut(&mut Setup),
+) -> Vec<seismic::Device> {
+    formed(domain, form);
+    devices_with(domain, options)
+}
+
+fn formed(domain: &[seismic::BackendName], mut form: impl FnMut(&mut Setup)) {
+    let backends = match seismic::testing::requested_backend() {
+        Some(requested) => domain.iter().copied().filter(|backend| *backend == requested).collect(),
+        None => domain.to_vec(),
+    };
+    let mut checked = 0;
+    let mut unchecked = Vec::new();
+    for backend in &backends {
+        let mut setup = Setup { backend: *backend, checked: 0, unchecked: Vec::new() };
+        form(&mut setup);
+        checked += setup.checked;
+        unchecked.extend(setup.unchecked);
+    }
+    if !seismic::testing::setup_only() {
+        return;
+    }
+    if !unchecked.is_empty() {
+        panic!(
+            "{}: {checked} requests admitted on {backends:?}, {} read a device: {}",
+            seismic::testing::SETUP_UNCHECKED,
+            unchecked.len(),
+            unchecked.join("; ")
+        );
+    }
+    // Its device work unrun: the test ends here, as a runner of setups reads it.
+    panic!("{} {checked} requests admitted on {backends:?}", seismic::testing::SETUP_CHECKED);
+}
+
 /// A line of a test's progress, written to stderr past the test harness's
 /// capture: a test whose host model takes minutes stays visibly alive, so its
 /// silence means no progress.

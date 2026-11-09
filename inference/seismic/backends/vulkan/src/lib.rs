@@ -63,6 +63,7 @@ pub(crate) fn unbounded_accounts(facts: &Facts) -> MemoryAccounts {
 /// Vulkan refuses a failed discovery or finding no such device.
 #[cfg(test)]
 pub(crate) fn test_devices() -> Vec<Description> {
+    seismic_lang::registry::test_device_reached("discovers the Vulkan test devices");
     let requested = seismic_lang::registry::requested_test_backend();
     if requested.is_some_and(|backend| backend != seismic_lang::registry::BackendName::Vulkan) {
         return Vec::new();

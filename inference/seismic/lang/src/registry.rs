@@ -5008,6 +5008,32 @@ mod tests {
     }
 }
 
+/// How a setup run (`SEISMIC_TEST_SETUP`, [`test_setup_only`]) ends a test
+/// that formed its setup without a device: the test stops there, its
+/// device work unrun, with this message and what it checked.
+pub const TEST_SETUP_CHECKED: &str = "seismic test setup: checked";
+/// How a setup run ends a test that reached a device ([`test_device_reached`]):
+/// nothing was checked of what it does there.
+pub const TEST_SETUP_UNCHECKED: &str = "seismic test setup: unchecked";
+
+/// Whether the test runner runs each test's setup alone
+/// (`SEISMIC_TEST_SETUP` set), the one owner of that variable: a test then
+/// forms what it would prepare and checks it without a device
+/// (`seismic_native_tests::setup`), and no test reaches one
+/// ([`test_device_reached`]).
+pub fn test_setup_only() -> bool {
+    std::env::var_os("SEISMIC_TEST_SETUP").is_some()
+}
+
+/// Where a test reaches a device (discovery, or a backend's own test
+/// device): in a setup run ([`test_setup_only`]) the test stops here,
+/// unchecked ([`TEST_SETUP_UNCHECKED`]), before any device is touched.
+pub fn test_device_reached(what: &str) {
+    if test_setup_only() {
+        panic!("{TEST_SETUP_UNCHECKED}: it {what} outside a setup, which a setup run never does");
+    }
+}
+
 /// The backend the test runner requests (`SEISMIC_TEST_BACKEND`), the one
 /// owner of that variable: a test then runs on it alone, and is skipped
 /// where it lies outside the test's backends. None when the variable is
