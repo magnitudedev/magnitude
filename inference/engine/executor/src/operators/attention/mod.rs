@@ -844,7 +844,11 @@ pub(crate) fn grouped_output(attention: &Attention) -> Option<GroupedOutputShape
         OutputProjection::Full(_) => None,
         OutputProjection::GroupedLowRank { groups, rank, .. } => Some(GroupedOutputShape {
             groups: *groups,
-            inputs: attention.heads * attention.width / groups,
+            inputs: magnitude_family_contracts::grouped_output_columns(
+                attention.heads * attention.width,
+                *groups,
+            )
+            .unwrap_or_else(|error| unreachable!("validation splits a grouped output evenly: {error}")),
             rank: *rank,
         }),
     }
@@ -1486,8 +1490,8 @@ pub(crate) mod tests {
 
         /// A stored-key window layer's state holds the key plane alone (two
         /// kv heads of 64 bf16 values: 256 bytes a row, half of K + V), and
-        /// its graphs bind that one plane and certify on the CPU and Metal at
-        /// every row class. CUDA's and Vulkan's attention entries refuse
+        /// its graphs bind that one plane and certify on the CPU, Metal and
+        /// CUDA at every row class. Vulkan's attention entries refuse
         /// stored-key values (`VK`) by declaration.
         #[test]
         fn stored_key_history_plans_one_plane_and_certifies_where_natives_read_it() {
@@ -1540,10 +1544,10 @@ pub(crate) mod tests {
                     limits,
                 );
                 match backend {
-                    BackendName::Cpu | BackendName::Metal => {
+                    BackendName::Cpu | BackendName::Metal | BackendName::Cuda => {
                         certified.unwrap_or_else(|error| panic!("{backend:?}: {error}"));
                     }
-                    BackendName::Cuda | BackendName::Vulkan => match certified {
+                    BackendName::Vulkan => match certified {
                         Err(crate::programs::graph::GraphError::KernelDomain(violation)) => {
                             assert!(
                                 violation.entry.starts_with("attention_"),
@@ -1758,13 +1762,13 @@ pub(crate) mod tests {
         /// Slice C's Full and Reuse layers plan their rounded keys (`KR`)
         /// and two picks a row (`KS`), the Full layer its own pooled source
         /// and the Reuse layer its source's, and their graphs (the pooling,
-        /// the indexer, the shared picks table) certify on the CPU and Metal
-        /// at every row class.
+        /// the indexer, the shared picks table) certify on the CPU, Metal
+        /// and CUDA at every row class.
         #[test]
-        fn compressed_full_and_reuse_layers_plan_and_certify_on_cpu_and_metal() {
+        fn compressed_full_and_reuse_layers_plan_and_certify_on_cpu_metal_and_cuda() {
             let (definition, manifest) = compressed(CompressedForm::FullAndReuse);
             let limits = limits();
-            for backend in [BackendName::Cpu, BackendName::Metal] {
+            for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda] {
                 let codec = KvCodec::Dense;
                 let load = ModelLoadPlan::derive(
                     &manifest,
@@ -1837,9 +1841,9 @@ pub(crate) mod tests {
         /// layer's top; the Reindex layer block 0's rows and keys), the
         /// rate-1 rows keep no Window domain, and their graphs (the
         /// identity pooling without a window, the pool, the restricted
-        /// indexer over its table) certify on the CPU and Metal.
+        /// indexer over its table) certify on the CPU, Metal and CUDA.
         #[test]
-        fn identity_rows_and_a_reindex_layer_plan_and_certify_on_cpu_and_metal() {
+        fn identity_rows_and_a_reindex_layer_plan_and_certify_on_cpu_metal_and_cuda() {
             let (definition, manifest) = compressed(SMALL_POOL);
             let limits = limits();
             let pool = crate::CandidatePool {
@@ -1847,7 +1851,7 @@ pub(crate) mod tests {
                 block_units: 2,
                 top: 2,
             };
-            for backend in [BackendName::Cpu, BackendName::Metal] {
+            for backend in [BackendName::Cpu, BackendName::Metal, BackendName::Cuda] {
                 let codec = KvCodec::Dense;
                 let load = ModelLoadPlan::derive(
                     &manifest,

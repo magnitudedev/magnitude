@@ -384,6 +384,17 @@ pub enum QueryProjection {
     },
 }
 
+/// The columns of each of a grouped low-rank output's `groups` runs over
+/// its `head_rows` (`heads·W`) attended columns
+/// ([`OutputProjection::GroupedLowRank`]), or the refusal of a grouping
+/// that doesn't split them evenly.
+pub fn grouped_output_columns(head_rows: u64, groups: u64) -> Result<u64, DefinitionError> {
+    if groups == 0 || !head_rows.is_multiple_of(groups) {
+        return Err(DefinitionError::new("invalid grouped attention output"));
+    }
+    Ok(head_rows / groups)
+}
+
 /// The projection of the `heads·W` attended (and gated) row back to the
 /// hidden width.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -604,7 +615,8 @@ pub enum RowRounding {
 /// - [`BlockScale::E4M3`]: `s = e4m3(a / m)`, to the nearest code.
 ///
 /// `amax_floor` is the model's own (it keeps an all-zero run's scale
-/// finite). Every value it yields is exact in BF16.
+/// finite and nonzero: validation refuses a floor whose scale rounds to
+/// zero). Every value it yields is exact in BF16.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlockRounding {
     pub element: BlockElement,
@@ -1697,9 +1709,42 @@ pub(crate) fn validate_blocks(blocks: &[Block], context: &Context) -> Result<(),
         }
         if let Operator::Attention(attention) = &sublayer.op {
             validate_shared_sources(blocks, index, attention, context)?;
+            validate_output_rotary(blocks, attention, context)?;
         }
     }
     Ok(())
+}
+
+/// An inverse output rotary undoes the key rotation the attended values
+/// carry: only stored-key values (the first source's, own or shared) are
+/// rotated keys. Pooled sources, which follow the first, are always rotated.
+fn validate_output_rotary(
+    blocks: &[Block],
+    attention: &Attention,
+    context: &Context,
+) -> Result<(), DefinitionError> {
+    let Rotary::Table {
+        output: OutputRotary::Inverse,
+        ..
+    } = &attention.rotary
+    else {
+        return Ok(());
+    };
+    let producer = match &attention.history[0].rows {
+        HistoryRows::Own(producer) => Some(producer),
+        HistoryRows::Shared { source, part } => {
+            source_producer(context.shared_sources.unwrap_or(blocks), *source, *part)
+        }
+    };
+    match producer {
+        Some(RowProducer::Projected(ProjectedRows {
+            value: ValueSource::StoredKey,
+            ..
+        })) => Ok(()),
+        _ => Err(DefinitionError::new(
+            "an inverse output rotary over values other than the stored keys",
+        )),
+    }
 }
 
 /// A layer's Shared sources and reused selections against the layers they
@@ -2231,11 +2276,12 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
             expect_shape(output, &[hidden, head_rows], "attention output")
         }
         OutputProjection::GroupedLowRank { groups, rank, a, b } => {
-            if *groups == 0 || *rank == 0 || !attention.heads.is_multiple_of(*groups) {
+            let columns = grouped_output_columns(head_rows, *groups)?;
+            if *rank == 0 {
                 return Err(DefinitionError::new("invalid grouped attention output"));
             }
             let low = checked_product(&[*groups, *rank])?;
-            expect_shape(a, &[low, head_rows / groups], "attention output a")?;
+            expect_shape(a, &[low, columns], "attention output a")?;
             expect_shape(b, &[hidden, low], "attention output b")
         }
     }
@@ -2304,11 +2350,29 @@ fn validate_rounding(rounding: RowRounding, width: u64, role: &str) -> Result<()
     match rounding {
         RowRounding::None => Ok(()),
         RowRounding::Block(block) => {
+            let floor = block.amax_floor as f32;
+            // The element's largest code (`rounding.seismic`).
+            let m = match block.element {
+                BlockElement::E4M3 => 448.0f32,
+                BlockElement::E2M1 => 6.0f32,
+            };
+            // The floor's scale must be nonzero, or an all-zero run divides
+            // 0 by 0. A power-of-two scale is the power of two at or above
+            // floor / m, which must be a normal f32: the GPUs' arithmetic
+            // flushes a subnormal quotient to zero before its power of two
+            // is taken. An E4M3 scale is the
+            // nearest E4M3 code of floor / m (ties to even), zero at or below
+            // half the least subnormal code 2^-9.
+            let scale_vanishes = match block.scale {
+                BlockScale::Ue8m0 => floor / m < f32::MIN_POSITIVE,
+                BlockScale::E4M3 => floor / m <= 2.0f32.powi(-10),
+            };
             if block.block == 0
                 || !width.is_multiple_of(block.block)
                 || block.amax_floor <= 0.0
                 // The kernels take the floor as f32: it must stay a normal one.
-                || !(block.amax_floor as f32).is_normal()
+                || !floor.is_normal()
+                || scale_vanishes
             {
                 return Err(DefinitionError::new(format!("{role}: invalid block rounding")));
             }

@@ -2604,7 +2604,13 @@ impl GraphControls {
                             .visible
                             .iter()
                             .map(|spans| {
-                                spans.iter().map(|&[start, end]| (end - start).max(0)).sum::<i32>()
+                                spans
+                                    .iter()
+                                    .map(|&[start, end]| {
+                                        assert!(end >= start, "a visible span [{start}, {end}) ends before it starts");
+                                        end - start
+                                    })
+                                    .sum::<i32>()
                             })
                             .collect::<Vec<_>>(),
                     ),

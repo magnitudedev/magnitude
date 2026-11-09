@@ -3231,7 +3231,7 @@ fn composition_chain(
                     up_scale: scale.tensor().into(),
                     gate_bound: expand_bound.tensor().into(),
                     up_bound: expand_bound.tensor().into(),
-                    glu_limit: (&rows.tensor().slice_leading(0, 0).reshape(&[0, GluLimit::word(None)])).into(),
+                    glu_limit: (&crate::operators::glu_limit(rows.tensor(), None)).into(),
                 },
             )
             .map_err(|cause| error(&cause))?

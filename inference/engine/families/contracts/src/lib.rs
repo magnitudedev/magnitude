@@ -34,7 +34,7 @@ pub use decoder::{
     RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
     SharedExpertGate, ShortConv, SinkhornSite, StateSpace, Sublayer, SublayerIndex,
     UnweightedRms, ValueNorm,
-    ValueSource,
+    ValueSource, grouped_output_columns,
 };
 pub use draft::{
     Affine, AffinePart, BlockAttention, BlockConvolutions, BlockLayout, CORRECTOR_FEATURES,
@@ -1299,6 +1299,20 @@ mod tests {
                 *up = weight("a.q_b", &[4, 2]);
             },
             "invalid attention query up shape for \"a.q_b\"",
+        );
+        // Raw-key values are unrotated: an inverse output rotary would turn
+        // them away from the rows.
+        invalid(
+            &|attention| {
+                let HistoryRows::Own(RowProducer::Projected(rows)) =
+                    &mut attention.history[0].rows
+                else {
+                    unreachable!()
+                };
+                rows.value = ValueSource::RawKey;
+                rows.rounding = RowRounding::None;
+            },
+            "an inverse output rotary over values other than the stored keys",
         );
     }
 

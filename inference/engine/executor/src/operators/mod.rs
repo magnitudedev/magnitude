@@ -1312,6 +1312,22 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
         }
         op => return Err(unsupported_operator(op, "mixer")),
     };
+    // Of the mixers, only attention reads a Sinkhorn site's input row and
+    // joins its output through the site; the state-space and
+    // short-convolution kernels read only the normalized residual row.
+    match (mixer_input, &mixer_op) {
+        (SublayerSource::Sinkhorn(_), mixer) if !matches!(mixer, Mixer::Attention(_)) => {
+            return Err(PlanError::Unsupported(
+                "a Sinkhorn hyper-connection input to a mixer other than attention",
+            ));
+        }
+        (SublayerSource::Mix(_), Mixer::StateSpace(_) | Mixer::ShortConv(_)) => {
+            return Err(PlanError::Unsupported(
+                "a low-rank hyper-connection input to a state-space or short-convolution mixer",
+            ));
+        }
+        _ => {}
+    }
     // Post-norm tails exist for the attention, short-convolution and dense
     // output projections.
     if !matches!(mixer_op, Mixer::Attention(_) | Mixer::ShortConv(_)) && !joins(&mixer.output) {
@@ -1332,14 +1348,13 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
                     output: &feed_forward.output,
                 });
             }
+            let input = sublayer_source(&feed_forward.input)?;
             let op = match &feed_forward.op {
                 Operator::DenseFfn(dense) => {
                     dense_ffn::admit(dense)?;
                     FeedForward::Dense(dense)
                 }
-                Operator::RoutedFfn(routed) => {
-                    routed_feed_forward(routed, sublayer_source(&feed_forward.input)?.epsilon())?
-                }
+                Operator::RoutedFfn(routed) => routed_feed_forward(routed, input.epsilon())?,
                 op => return Err(unsupported_operator(op, "feed-forward")),
             };
             if !matches!(op, FeedForward::Dense(_)) && !joins(&feed_forward.output) {
@@ -1347,8 +1362,17 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
                     "sublayer post-norm after this operator",
                 ));
             }
+            // Of the feed-forwards, only the general routed form reads a
+            // Sinkhorn site's input row and joins its branch through the
+            // site.
+            if matches!(input, SublayerSource::Sinkhorn(_)) && !matches!(op, FeedForward::GeneralRouted(_)) {
+                return Err(PlanError::Unsupported(
+                    "a Sinkhorn hyper-connection input to a feed-forward other than the general \
+                     routed form",
+                ));
+            }
             Ok(FeedForwardSublayer {
-                input: Some(sublayer_source(&feed_forward.input)?),
+                input: Some(input),
                 op,
                 output: &feed_forward.output,
             })

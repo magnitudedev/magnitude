@@ -3586,9 +3586,8 @@ fn causal_heads_launch_apart_from_chained_drafts() {
 /// V4.1's compressed layer forms (`attention::tests::selected::compressed`:
 /// a Full layer with its rounded window, ratio-2 pooled source and indexer,
 /// and a Reuse layer; or a ratio-1 Full layer whose indexer produces a
-/// candidate pool, and a Reindex layer restricted to it) run on each
-/// available backend that implements pooled history (`pool_rows`'s entry
-/// exception: CPU and Metal): every graph binds every state plane and
+/// candidate pool, and a Reindex layer restricted to it) run on Metal, CUDA
+/// and the CPU, wherever available: every graph binds every state plane and
 /// control it declares, through a prompt ending in a pending row, an
 /// advance from it completing groups, and a decode completing a group from
 /// its pending row. (A Plain load plans no draft rows, so it verifies no
@@ -3597,9 +3596,13 @@ fn causal_heads_launch_apart_from_chained_drafts() {
 #[test]
 fn compressed_layers_bind_their_state_on_the_device() {
     let catalog = seismic::Devices::discover(&[]).expect("devices are discovered");
-    for backend in [seismic::BackendName::Metal, seismic::BackendName::Cpu]
-        .into_iter()
-        .filter(|&backend| crate::test_support::available(&catalog, backend))
+    for backend in [
+        seismic::BackendName::Metal,
+        seismic::BackendName::Cuda,
+        seismic::BackendName::Cpu,
+    ]
+    .into_iter()
+    .filter(|&backend| crate::test_support::available(&catalog, backend))
     {
         for form in [CompressedForm::FullAndReuse, selected::SMALL_POOL] {
             compressed_layers_bind_their_state_on(backend, form);

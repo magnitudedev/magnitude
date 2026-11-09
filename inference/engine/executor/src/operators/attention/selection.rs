@@ -279,7 +279,7 @@ pub(crate) fn indexer<'a, G: GraphDraft + 'a>(
             return Err("an indexer's keys and their write disagree".into());
         }
         (IndexerKeys::Pooled(_), _) => {
-            return Err("an indexer over pooled keys of a token source has no latent keys".into());
+            unreachable!("picked_source refuses pooled indexer keys over a pooled source")
         }
     }
     let query = project(graph, entries.query_project, rows, heads * width, &inputs.query_input, &inputs.query, constants)?

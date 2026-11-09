@@ -309,15 +309,6 @@ pub(crate) fn checked_per_layer(
         .transpose()
 }
 
-/// Reject a residual-streams input for a mixer whose kernels read only one
-/// normalized row.
-fn single_stream(form: InputForm) -> Result<(), GraphError> {
-    if form.parts != 1 {
-        return Err("this mixer over residual streams".into());
-    }
-    Ok(())
-}
-
 /// What a sublayer reads of the residual, and how its output joins it
 /// (`BlockSublayers::read`).
 struct SublayerRead {
@@ -732,7 +723,6 @@ impl BlockSublayers<'_> {
                 (mixed, (ports, controls).into())
             }
             (Mixer::StateSpace(operator), MixerEntries::StateSpace(entries)) => {
-                single_stream(input.form)?;
                 let (mixed, ports, controls) = state_space(
                     graph,
                     entries,
@@ -758,7 +748,6 @@ impl BlockSublayers<'_> {
                 (mixed, (ports, controls).into())
             }
             (Mixer::ShortConv(operator), MixerEntries::ShortConv(entries)) => {
-                single_stream(input.form)?;
                 let (mixed, window, controls) = short_conv(
                     graph,
                     entries,

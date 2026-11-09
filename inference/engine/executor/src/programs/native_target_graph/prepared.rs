@@ -186,19 +186,30 @@ impl BlockTaps {
 
 /// The first block of the longest run of trailing blocks that publish no
 /// state: blocks keeping a history and no bank, that read another layer's
-/// history (a Shared domain, which they never append to) and write no draft
+/// history (a Shared domain, which they never append to), own no pooled
+/// source rows or indexer keys (which they would append) and write no draft
 /// taps. A row's output from such a block reaches nothing but later blocks
 /// of the run and the readout, so a step need run the run only over the
 /// rows its readout consumes. The block count when the last block publishes state.
 fn stateless_tail(state: &StateResourcePlan, keeps: &[BlockKeeps], taps: &[BlockTaps]) -> usize {
     trailing_run(keeps.len(), |index| {
-        let layer = LayerRef::Target(index as u32);
+        let block = index as u32;
+        let layer = LayerRef::Target(block);
+        let target = state.target_state();
         keeps[index] == BlockKeeps::History
             && taps[index] == BlockTaps::default()
-            && state
-                .target_state()
+            && target
                 .layer_history(layer)
                 .is_some_and(|history| history.component.layer != layer)
+            && !target.domains.iter().any(|store| {
+                store.components.iter().any(|component| {
+                    matches!(
+                        component.layer,
+                        LayerRef::Pooled { block: owner, .. } | LayerRef::IndexKeys { block: owner, .. }
+                            if owner == block
+                    )
+                })
+            })
     })
 }
 

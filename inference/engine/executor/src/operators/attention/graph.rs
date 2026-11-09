@@ -157,15 +157,21 @@ impl<'a, G: GraphDraft + 'a> Clone for DenseDecodeEntries<'a, G> {
 }
 
 /// Whether a dense history's decode row classes attend with the decode
-/// entry on `backend`. Where its declaration holds no form of the binding's
-/// shape (CUDA's and Vulkan's, which declare neither rounded keys nor
-/// index-list picks: only `KR = KS = 0`), the prefill entry, tuned on those
-/// classes, attends them. A selected read's decode rows read the indexer's
-/// segments, which only the decode entry takes, so its refusal stands.
+/// entry on `backend`. A shape of the base form
+/// (`AttentionShape::extends_base_form`) always does, so the decode entry's
+/// refusal of it stands. Where the decode declaration holds no form of an
+/// extended shape (CUDA's and Vulkan's, which declare neither rounded keys
+/// nor index-list picks: only `KR = KS = 0`), the prefill entry, tuned on
+/// those classes, attends them. A selected read's decode rows read the
+/// indexer's segments, which only the decode entry takes, so its refusal
+/// stands.
 pub(crate) fn dense_decodes(
     backend: seismic::BackendName,
     binding: AttentionBinding,
 ) -> Result<bool, crate::native::CatalogFailure> {
+    if !binding.shape.extends_base_form() {
+        return Ok(true);
+    }
     let entry = attention_decode::native_entry_with(attention_decode::Elements {
         A: binding.activation,
     });
@@ -1672,7 +1678,7 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     let selected_prefill = scoring.map(|selection| selection.prefill);
     let dense = matches!(&history, AttentionHistoryEntries::Dense { .. });
     if !dense && (shape.key_rounding.rounds() || shape.picks > 0 || picked.is_some()) {
-        return Err("invariant: binding admits a rounded or index-list source beside a dense history alone".into());
+        unreachable!("the binding admits a rounded or index-list source beside a dense history alone");
     }
     // Priming publishes history rows alone, and an index-list source's
     // pooled rows and keys only its attending graph makes.
@@ -2455,8 +2461,8 @@ mod tests {
     /// DeepSeek V4.1's window attention (64 query heads over one 512-wide
     /// head, adjacent trailing pairs turned back) decodes through the decode
     /// entry on Metal (its matrix form, in head groups of 8) and on CPU, as
-    /// a Qwen-shaped layer does on Metal; CUDA's and Vulkan's entries each
-    /// hold the new forms in both entries or neither.
+    /// a Qwen-shaped layer does; CUDA's and Vulkan's decode entries hold
+    /// none of the new forms, so CUDA attends them with its prefill entry.
     #[test]
     fn decode_classes_attend_with_the_decode_entry_where_it_holds_them() {
         use seismic::{BackendName, DType};
@@ -2521,9 +2527,12 @@ mod tests {
         assert!(decodes(BackendName::Metal, v41));
         assert!(decodes(BackendName::Cpu, v41));
         assert!(decodes(BackendName::Metal, qwen));
-        // CUDA's and Vulkan's mix entries declare none of the new forms, each
-        // alone: a query norm without a key norm, adjacent pairs, trailing
-        // pairs, the output rotary.
+        assert!(!decodes(BackendName::Cuda, v41));
+        assert!(decodes(BackendName::Cuda, qwen));
+        // Each new form alone (a query norm without a key norm, adjacent
+        // pairs, trailing pairs, the output rotary, V4.1's own): CUDA's
+        // decode entry declares none of them and its prefill entry all of
+        // them; Vulkan's mix entries declare none.
         let holds = |backend, shape: AttentionShape| {
             // The prefill's block and listing axes at one block, unlisted.
             let mut statics = shape.dense_mix_statics();
@@ -2550,8 +2559,7 @@ mod tests {
                 &bindings,
                 &statics,
             ));
-            assert_eq!(decode, prefill, "{backend:?} {shape:?}");
-            decode
+            (decode, prefill)
         };
         let forms = [
             AttentionShape { query_norm: 0, ..qwen },
@@ -2561,13 +2569,12 @@ mod tests {
             v41,
         ];
         for backend in [BackendName::Cuda, BackendName::Vulkan] {
-            assert!(holds(backend, qwen), "{backend:?}");
-            for form in forms {
-                assert!(!holds(backend, form), "{backend:?} {form:?}");
-            }
+            assert_eq!(holds(backend, qwen), (true, true), "{backend:?}");
         }
         for form in forms {
-            assert!(holds(BackendName::Cpu, form), "{form:?}");
+            assert_eq!(holds(BackendName::Cuda, form), (false, true), "{form:?}");
+            assert_eq!(holds(BackendName::Vulkan, form), (false, false), "{form:?}");
+            assert_eq!(holds(BackendName::Cpu, form), (true, true), "{form:?}");
         }
     }
 }

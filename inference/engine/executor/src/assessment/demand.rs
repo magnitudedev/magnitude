@@ -1058,22 +1058,25 @@ fn block_component(
     Err(demand_error(format!("{layer:?} has no Block-domain rows")))
 }
 
-/// The pooled rows target block `layer`'s index-list source reads: its own
-/// (`LayerRef::Pooled`), or those of the layer a Shared domain names as
-/// their source (a Reindex or reused source's).
-fn picked_rows(domains: &[HistoryDomainLayout], layer: u32) -> Result<LayerRef, AssessmentError> {
-    let ours = |candidate: &LayerRef| {
-        matches!(candidate, LayerRef::Pooled { block, .. } if *block == layer)
-    };
+/// The pooled rows part `part` of target block `layer`'s index-list source
+/// reads: its own (`LayerRef::Pooled`), or those of the layer a Shared
+/// domain names as their source (a Reindex or reused source's).
+fn picked_rows(
+    domains: &[HistoryDomainLayout],
+    layer: u32,
+    part: u32,
+) -> Result<LayerRef, AssessmentError> {
+    let ours = LayerRef::Pooled { block: layer, part };
     domains
         .iter()
         .find_map(|domain| match domain {
             HistoryDomainLayout::Shared { source, layers } => {
-                layers.iter().any(ours).then_some(*source)
+                layers.contains(&ours).then_some(*source)
             }
-            HistoryDomainLayout::Block { components, .. } => {
-                components.iter().map(|component| component.layer).find(ours)
-            }
+            HistoryDomainLayout::Block { components, .. } => components
+                .iter()
+                .any(|component| component.layer == ours)
+                .then_some(ours),
             HistoryDomainLayout::Token { .. } | HistoryDomainLayout::Window { .. } => None,
         })
         .ok_or_else(|| demand_error(format!("attention layer {layer} has no pooled rows")))
@@ -1097,17 +1100,19 @@ fn picked_rows(domains: &[HistoryDomainLayout], layer: u32) -> Result<LayerRef, 
 /// their rows (`candidate_rows`, over a row's few blocks). A list is every
 /// complete unit, or a restricted indexer's pool of at most its units. The
 /// fused projections' input norms are priced as attention's are: by their
-/// consumer, not read as weights.
+/// consumer, not read as weights. The picks' products are in the
+/// attention's `activation` element, as its history's.
 fn picked<'a>(
     step: &mut Step<'_>,
     domains: &[HistoryDomainLayout],
     layer: u32,
     picked: PickedBinding,
     (picks, flops_per_pick): (u64, u64),
+    activation: Element,
     weight: impl Fn(WeightKind, Element) -> Result<&'a WeightPlan, AssessmentError>,
 ) -> Result<Work, AssessmentError> {
     let project = Kernel::of::<kernels::attention_project::Entry>();
-    let plane_rows = picked_rows(domains, layer)?;
+    let plane_rows = picked_rows(domains, layer, picked.part())?;
     let (plane_row, _) = block_component(domains, plane_rows)?;
     let indexer = match picked {
         PickedBinding::Reused => None,
@@ -1208,7 +1213,7 @@ fn picked<'a>(
     Ok(Work {
         row_bytes: product(picks, plane_row, "picked row bytes")?,
         row_flops: vec![Flops {
-            format: Element::bf16(),
+            format: activation,
             flops: product(picks, flops_per_pick, "picked row FLOPs")?,
         }],
         ..Work::default()
@@ -1334,22 +1339,27 @@ impl DecodeDemand {
                         step.call(Kernel::of::<kernels::widen_rows::Entry>(), Work::default())?;
                         step.call(project, projection(&[weight(query, binding.query)?])?)?;
                     }
-                    let attend = match binding.history.encoding() {
+                    // The entry attending the layer's history, and the
+                    // layout it reads: the layer's own (`history_codec`; the
+                    // model's own store is dense whatever the policy).
+                    let (attend, history_layout) = match binding.history.encoding() {
                         // The entry the graph attends decode rows with
                         // (`graph::dense_decodes`): the prefill entry where
                         // the decode entry holds no form of the shape.
-                        HistoryEncoding::Dense => {
+                        HistoryEncoding::Dense => (
                             if crate::operators::attention::graph::dense_decodes(backend, binding)
                                 .map_err(|error| demand_error(format!("{error:?}")))?
                             {
                                 Kernel::of::<kernels::attention_decode::Entry>()
                             } else {
                                 Kernel::of::<kernels::attention_prefill::Entry>()
-                            }
-                        }
-                        HistoryEncoding::Affine => {
-                            Kernel::of::<kernels::attention_decode_k8v4::Entry>()
-                        }
+                            },
+                            KvCodec::Dense,
+                        ),
+                        HistoryEncoding::Affine => (
+                            Kernel::of::<kernels::attention_decode_k8v4::Entry>(),
+                            KvCodec::AffineK8V4,
+                        ),
                         HistoryEncoding::Unsupported => {
                             return Err(demand_error(
                                 "rotated K4/V4 history has no native attention entry",
@@ -1366,7 +1376,7 @@ impl DecodeDemand {
                         history_read(&layout.target_history, LayerRef::Target(layer))?;
                     let flops_per_token = 2 * shape.kv_heads * shape.group * (2 * shape.width);
                     let read = |window| HistoryRead {
-                        layout: Some(codec),
+                        layout: Some(history_layout),
                         bytes_per_token: row_bytes,
                         flops_per_token,
                         window,
@@ -1381,6 +1391,7 @@ impl DecodeDemand {
                             layer,
                             source,
                             (shape.picks, flops_per_token),
+                            binding.activation,
                             weight,
                         )?,
                     };

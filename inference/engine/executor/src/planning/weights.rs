@@ -577,6 +577,21 @@ impl AttentionShape {
         u64::from(self.key_rounding.rounds())
     }
 
+    /// Whether the shape takes a form beyond the base dense mix every
+    /// backend's decode entry is held to: a query norm apart from the key's,
+    /// stored-key values, adjacent or trailing pairs, the output rotary,
+    /// rounded keys or picks. Only such a shape's decode classes may attend
+    /// with the prefill entry (`operators::attention::graph::dense_decodes`).
+    pub fn extends_base_form(&self) -> bool {
+        self.query_norm != self.key_norm
+            || self.values == AttentionValues::StoredKey
+            || self.rotary_adjacent != 0
+            || self.rotary_trailing != 0
+            || self.output_rotary != 0
+            || self.key_rounding.rounds()
+            || self.picks != 0
+    }
+
     /// `Q`: query (and interleaved gate) projection rows.
     pub fn query_rows(&self) -> u64 {
         self.heads() * (self.width + self.interleaved_gate)
@@ -771,6 +786,16 @@ pub enum PickedBinding {
 }
 
 impl PickedBinding {
+    /// The layer's own history part its picked rows are
+    /// (`LayerRef::Pooled { part, .. }`): its second source
+    /// (`operators::attention::picked_source`).
+    pub fn part(&self) -> u32 {
+        match self {
+            Self::Own(pooled) => pooled.part,
+            Self::Reindex { .. } | Self::Reused => 1,
+        }
+    }
+
     /// The indexer the layer runs itself; none for reused picks.
     pub fn indexer(&self) -> Option<IndexerBinding> {
         match self {

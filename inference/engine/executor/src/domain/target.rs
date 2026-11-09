@@ -1637,8 +1637,8 @@ impl SlotAppends {
 /// store with Shared reads (`shared_read_history`) the ranges of the rows
 /// the advance appends, at most one per slab they touch. A row reads those
 /// of a cached-causal or produced domain when an earlier row of its launch
-/// appended them, and a Block domain's row the block it completes even
-/// alone (`advance_blocks`).
+/// appended them, and a Block domain's row the blocks the advance completed
+/// through it, the one it completes even alone (`advance_blocks`).
 pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -> usize {
     // A Shared reader also sees the rows its source appends in the advance:
     // the rest of the source's last page, then whole pages (see
@@ -1656,7 +1656,21 @@ pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -
                 ) || (rows > 1
                     && (cached_causal_domain(store, domain) || store.is_produced_domain(domain)))
             }))
-            .map(|domain| rows.div_ceil(store.history_page_rows(domain)) + 1)
+            .map(|domain| {
+                let page = store.history_page_rows(domain);
+                match store.history_domain_kind(domain) {
+                    // An advance of `rows` rows completes at most
+                    // rows.div_ceil(rate) blocks, appended as one run of
+                    // block rows: the rest of a page, then whole pages.
+                    magnitude_state::HistoryDomainKind::Block { rate } => {
+                        match rows.div_ceil(rate) {
+                            0 => 0,
+                            blocks => 1 + (blocks - 1).div_ceil(page),
+                        }
+                    }
+                    _ => rows.div_ceil(page) + 1,
+                }
+            })
             .max()
             .unwrap_or(0)
 }

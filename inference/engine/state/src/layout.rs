@@ -557,12 +557,15 @@ pub fn history_codec(
 /// `requested` when named, else the serving default ([`KvCodec::AffineK8V4`]).
 /// The model's own store ([`model_store`]) stays dense under either
 /// ([`history_codec`]); a lossy policy named for a model with such rows is
-/// refused, since it can't apply to them and is never silently replaced.
+/// refused, since it can't apply to them and is never silently replaced,
+/// so such a model's default is the one policy it admits, dense: the policy
+/// its store identifies as (`advance::identify_codec`).
 pub fn kv_codec_policy(decoder: &Decoder, requested: Option<KvCodec>) -> Result<KvCodec, String> {
     let own_store = decoder.blocks.iter().flat_map(|block| &block.sublayers).any(|sublayer| {
         matches!(&sublayer.op, Operator::Attention(attention) if model_store(attention))
     });
     match requested {
+        None if own_store => Ok(KvCodec::Dense),
         None => Ok(KvCodec::AffineK8V4),
         Some(codec) if own_store && codec != KvCodec::Dense => {
             Err("a lossy KV codec over the model's dense-only history rows".into())
@@ -1319,8 +1322,9 @@ mod tests {
             .collect()
     }
 
-    /// Slice C under the serving default: the windows and the pooled rows
-    /// are the model's own BF16 stores whatever the host policy; the pooled
+    /// Slice C under the serving default (dense, the one policy its own
+    /// stores admit): the windows and the pooled rows are the model's own
+    /// BF16 stores whatever the host policy; the pooled
     /// source's incomplete group is a Window(1) of F32 projections and gate
     /// scores with coordinates; its rows and its indexer's keys share one
     /// Block(2), so their rows coincide; layer 3 shares part 1.
@@ -1329,7 +1333,7 @@ mod tests {
         use crate::VectorKind::{Key, Value};
         let decoder = v41_slice_c();
         let codec = kv_codec_policy(&decoder, None).unwrap();
-        assert_eq!(codec, KvCodec::AffineK8V4);
+        assert_eq!(codec, KvCodec::Dense);
         let layout = ModelStateLayout::derive(&decoder, &[], codec, 0).unwrap();
         let pooled = LayerRef::Pooled { block: 2, part: 1 };
         let keys = LayerRef::IndexKeys { block: 2, part: 1 };
@@ -1377,7 +1381,7 @@ mod tests {
     }
 
     /// A lossy policy can't apply to rows the model rounds: named, it is
-    /// refused; unnamed, the default leaves them their own store.
+    /// refused; unnamed, the default is dense.
     #[test]
     fn a_lossy_policy_named_for_rounded_rows_is_refused() {
         let rounded = v41_slice_c();
@@ -1388,6 +1392,7 @@ mod tests {
             );
         }
         assert_eq!(kv_codec_policy(&rounded, Some(KvCodec::Dense)), Ok(KvCodec::Dense));
+        assert_eq!(kv_codec_policy(&rounded, None), Ok(KvCodec::Dense));
         let plain = decoder(ActivationDType::BF16, vec![block(attention())]);
         assert_eq!(
             kv_codec_policy(&plain, Some(KvCodec::RotatedK4V4)),
