@@ -592,6 +592,104 @@ fn a_streamed_load_whose_rows_cost_more_than_they_earn_decodes_plain() {
     assert!(run.share(0, 0..2_980) >= 0.9, "{}", run.rounds());
 }
 
+/// Flash Next q4's MTP head streamed at a 28 GB cap on an M4 Pro (served,
+/// traced): a plain decode settles at 50 ms, a round drafting three and
+/// verifying them takes about 147 ms.
+const FLASH: Costs = Costs {
+    draft: |generated| match generated {
+        0 => 0.0,
+        1 => 30.0,
+        2..=3 => 45.0,
+        4..=7 => 60.0,
+        _ => 75.0,
+    },
+    verify: |rows| match rows {
+        1 => 50.0,
+        2 => 80.0,
+        3..=4 => 102.0,
+        5..=8 => 150.0,
+        _ => 250.0,
+    },
+};
+
+/// The same load with a plain decode as slow as on its cold expert bank, so
+/// that drafting wins.
+const FLASH_SLOW_PLAIN: Costs = Costs {
+    draft: FLASH.draft,
+    verify: |rows| if rows == 1 { 92.0 } else { (FLASH.verify)(rows) },
+};
+
+/// Served (Flash Next q4 MTP, prose-continue): the plain decode was measured
+/// only right after prefill, on a cold expert bank (90-95 ms), at a shorter
+/// context. The next request, at a new context class, priced its plain
+/// decode by that and drafted every round at about 67 ms a token, while a
+/// plain decode had settled at 50 ms: no round measured it again. That price
+/// bounds the plain decode at the new class only as long as any price lasts;
+/// past that a plain look measures it.
+#[test]
+fn a_plain_decode_measured_cold_is_measured_again_once_drafting_runs_on_its_price() {
+    use super::{Durations, LaunchCosts};
+    let stream = Stream::of(&[(3_000, CONTINUED)]);
+    let (width, plain) = fastest_fixed(&stream, FLASH);
+    assert_eq!(width, 0, "plain decoding is the fastest");
+    let load = Arc::new(DraftLoad::default());
+    {
+        let mut cold = LaunchCosts::default();
+        cold.verify.insert(1, Durations::settled(&[(1, 0.090), (2, 0.095), (3, 0.092)]));
+        load.costs
+            .lock()
+            .unwrap()
+            .insert(((CONTEXT / 2).next_power_of_two(), 1), cold);
+        *load.rounds.lock().unwrap() = 3;
+    }
+    let run = adaptive(&stream, FLASH, &load);
+    // The cold price lasts until its durations are `STALE_ROUNDS` old; the
+    // plain look then comes once the look share of the drafting rounds pays
+    // for what it loses at that price (12-25 ms against 1.1 ms a round), and
+    // the width drafting kept past it ends within a few rounds.
+    const SWITCHED: usize = super::STALE_ROUNDS as usize + 60;
+    let after = &run.rounds[SWITCHED..];
+    let plain_rounds = after.iter().filter(|(choice, _)| choice.generated == 0).count();
+    assert!(
+        plain_rounds * 10 >= after.len() * 9,
+        "plain from round {SWITCHED} on: {}",
+        run.rounds()
+    );
+    assert!(
+        run.milliseconds <= plain * 1.05,
+        "adaptive {:.0} ms, plain {plain:.0} ms ({:+.1}%): {}",
+        run.milliseconds,
+        (run.milliseconds / plain - 1.0) * 100.0,
+        run.rounds()
+    );
+}
+
+/// Where drafting wins and the plain decode's cost holds, the plain decode
+/// is taken again only to prove its price and once that price is stale, and
+/// drafting goes on.
+#[test]
+fn drafting_that_wins_pays_only_for_its_looks_at_the_plain_decode() {
+    let stream = Stream::of(&[(3_000, CONTINUED)]);
+    let (width, best) = fastest_fixed(&stream, FLASH_SLOW_PLAIN);
+    assert!(width > 0, "drafting pays");
+    let run = adaptive(&stream, FLASH_SLOW_PLAIN, &warmed(&stream, FLASH_SLOW_PLAIN));
+    let plain = run.rounds.iter().filter(|(choice, _)| choice.generated == 0).count();
+    let looks = run
+        .rounds
+        .iter()
+        .filter(|(choice, _)| choice.generated == 0 && choice.look)
+        .count();
+    assert!(looks > 0, "the plain decode is measured again: {}", run.rounds());
+    assert!(plain * 10 <= run.rounds.len(), "drafting goes on: {}", run.rounds());
+    assert!(
+        run.milliseconds <= best * (1.0 + 2.0 * super::LOOK_SHARE),
+        "adaptive {:.0} ms, fixed {width} {best:.0} ms ({:+.1}%): {}",
+        run.milliseconds,
+        (run.milliseconds / best - 1.0) * 100.0,
+        run.rounds()
+    );
+}
+
 #[test]
 fn the_last_tokens_of_a_request_are_still_drafted() {
     let stream = Stream::of(&[(256, PERFECT)]);
@@ -961,6 +1059,7 @@ fn a_width_held_up_on_its_first_launch_is_taken_again() {
             calibration: std::sync::Mutex::new(warm.calibration.lock().unwrap().clone()),
             look_run: std::sync::Mutex::new(*warm.look_run.lock().unwrap()),
             look_seconds: std::sync::Mutex::new(*warm.look_seconds.lock().unwrap()),
+            plain_seconds: std::sync::Mutex::new(*warm.plain_seconds.lock().unwrap()),
             beside_fill: std::sync::Mutex::new(*warm.beside_fill.lock().unwrap()),
         });
         let round = std::cell::Cell::new(0usize);
