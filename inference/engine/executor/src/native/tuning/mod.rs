@@ -4501,11 +4501,11 @@ impl<'a> Tuner<'a> {
         };
         if unit.shapes.iter().all(|shape| shape.weight == 0.) {
             // A unit without serving demand has no optional work: nothing
-            // could be ranked. This load serves its canonical default, the
-            // record its mandatory phase published provisional, and that
-            // record stays provisional: only a search settles one, and the
-            // store's key holds no demand, so a later load that serves the
-            // unit searches it.
+            // could be ranked. Its canonical default is its record, settled
+            // now and stating it was made without demand
+            // ([`StoredChoice::demanded`]): a later load without demand
+            // reads it, and one that serves the unit searches it.
+            unit.settle(self)?;
             unit.finish(self)?;
             let Phase::Census { launches, .. } = &mut self.phase else {
                 unreachable!("the phase is the census");
@@ -4714,8 +4714,12 @@ impl<'a> Tuner<'a> {
         };
         // A provisional record is what a search abandoned before its optional
         // work stopped left: the unit has no choice yet, and is searched
-        // again as if nothing were stored.
-        let hit = match stored.filter(|(choice, _)| choice.settled) {
+        // again as if nothing were stored. A record made without demand is
+        // the unit's choice only for a load without demand for it: one that
+        // serves the unit searches it. The store's key holds no demand.
+        let demanded = shapes.iter().any(|shape| shape.weight > 0.);
+        let hit = match stored.filter(|(choice, _)| choice.settled && (choice.demanded || !demanded))
+        {
             None => None,
             Some((choice, evidence)) if choice.requirement == requirement => {
                 Some((choice, Receipt::Stored(evidence)))

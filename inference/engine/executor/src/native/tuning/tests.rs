@@ -1832,11 +1832,12 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
 }
 
 /// A unit the census meets without serving demand is served at its
-/// canonical default and stores no settled record: the store's key holds no
-/// demand, so a settled default would be replayed, never searched, by a
-/// later load that serves the unit. That load searches it.
+/// canonical default, settled as a record made without demand. The store's
+/// key holds no demand: a later load without demand reads that record and
+/// forms nothing, as it reads any settled one, and a load that serves the
+/// unit searches it instead of replaying the unsearched default.
 #[test]
-fn a_unit_without_demand_leaves_its_record_for_a_later_search() {
+fn a_record_made_without_demand_is_read_without_demand_and_searched_with_it() {
     let device = crate::test_support::open_backend(
         &seismic::Devices::discover(&[]).unwrap(),
         BackendName::Cpu,
@@ -1896,13 +1897,12 @@ fn a_unit_without_demand_leaves_its_record_for_a_later_search() {
         tuner.tune(case, &implementation, &statics).unwrap();
         let mut tuner = tuner.search().unwrap();
         tuner.tune(case, &implementation, &statics).unwrap();
-        let slot = tuner
-            .slots
-            .values()
-            .next()
-            .cloned()
-            .expect("the unit has a slot in the store");
-        (slot, tuner.conclude())
+        // A unit the load opened a search for has its slot; one served from
+        // its stored record has none.
+        let slot = tuner.slots.values().next().cloned();
+        let tuned = tuner.conclude();
+        assert_eq!(tuned.len(), 1, "the load tunes one unit");
+        (slot, tuned[0].origin)
     };
     let stored = |slot: &TuningCacheKey| {
         cache
@@ -1910,12 +1910,14 @@ fn a_unit_without_demand_leaves_its_record_for_a_later_search() {
             .expect("the unit's record is stored")
             .0
     };
-    // A load without demand for the unit serves its canonical default.
-    let mut idle = FakeCase::new(&implementation, &statics, "without-demand");
-    idle.launches = 0;
+    let idle = || {
+        let mut case = FakeCase::new(&implementation, &statics, "without-demand");
+        case.launches = 0;
+        case
+    };
     let served = FakeCase::new(&implementation, &statics, "without-demand");
-    // The setup: one unit, of no launches on the first load and some on the
-    // second.
+    // The setup: one unit, of no launches on the loads without demand and
+    // some on the one with it, under one key.
     let launched = |case: &FakeCase| {
         let demand = fixture_invocations(case, &statics, limits);
         assert_eq!(demand.units.len(), 1, "the fixture tunes one unit");
@@ -1926,22 +1928,38 @@ fn a_unit_without_demand_leaves_its_record_for_a_later_search() {
             .map(|(_, count)| count)
             .sum::<f64>()
     };
-    assert_eq!(launched(&idle), 0.);
+    assert_eq!(launched(&idle()), 0.);
     assert!(launched(&served) > 0.);
-    assert_eq!(idle.bindings, served.bindings, "both loads tune one key");
-    let (slot, _) = prepare(&idle);
-    assert!(idle.stages.borrow().is_empty(), "nothing is searched");
-    // Its record, the mandatory phase's, stays provisional.
-    assert!(!stored(&slot).settled);
-    // A later load that serves it finds no settled record and searches it.
-    let (again, tuned) = prepare(&served);
-    assert_eq!(again, slot, "both loads tune one key");
-    assert_eq!(served.formations.get(), 1, "its canonical artifact is formed");
+    assert_eq!(idle().bindings, served.bindings);
+    // The first load without demand forms the canonical default and
+    // settles it as made without demand.
+    let first = idle();
+    let (slot, origin) = prepare(&first);
+    let slot = slot.expect("the first load opens the unit's search");
+    assert_eq!(first.formations.get(), 1);
+    assert!(first.stages.borrow().is_empty(), "nothing is searched");
+    assert_eq!(origin, TuningOrigin::Searched);
+    let record = stored(&slot);
+    assert!(record.settled && !record.demanded, "{record:?}");
+    // Another load without demand reads it: nothing is formed or searched.
+    let again = idle();
+    assert_eq!(prepare(&again), (None, TuningOrigin::Stored));
+    assert_eq!(again.formations.get(), 0);
+    assert!(again.stages.borrow().is_empty());
+    // A load that serves the unit does not replay it: it searches the unit
+    // and settles what it found, as made with demand.
+    let (searched, origin) = prepare(&served);
+    assert_eq!(searched, Some(slot.clone()), "the loads tune one key");
+    assert_eq!(origin, TuningOrigin::Searched);
+    assert_eq!(served.formations.get(), 1);
     assert!(!served.stages.borrow().is_empty(), "the unit is searched");
-    assert_eq!(tuned.len(), 1);
-    assert_eq!(tuned[0].origin, TuningOrigin::Searched);
-    // Its search settles the record.
-    assert!(stored(&slot).settled);
+    let record = stored(&slot);
+    assert!(record.settled && record.demanded, "{record:?}");
+    // A load without demand after it reads that record.
+    let after = idle();
+    assert_eq!(prepare(&after), (None, TuningOrigin::Stored));
+    assert_eq!(after.formations.get(), 0);
+    assert!(after.stages.borrow().is_empty());
     std::fs::remove_dir_all(root).unwrap();
 }
 

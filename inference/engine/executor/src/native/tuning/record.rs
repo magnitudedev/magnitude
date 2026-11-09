@@ -48,6 +48,10 @@ pub(crate) struct StoredChoice {
     pub first_rejection: Option<String>,
     pub chosen: ChosenEvidence,
     pub settled: bool,
+    /// Whether any of the result's points carried serving demand. A record
+    /// made without demand settles a unit no load ran: a load that serves
+    /// the unit searches it, and one that does not reads it.
+    pub demanded: bool,
 }
 
 /// What a unit's evidence holds of its chosen configuration: what a load
@@ -175,6 +179,7 @@ impl StoredChoice {
             first_rejection,
             chosen: ChosenEvidence::of(result),
             settled: true,
+            demanded: result.points.iter().any(|point| point.weight > 0.),
         }
     }
 
