@@ -515,18 +515,25 @@ impl ExecutionPlanDraft {
         let ceiling = match self.bank_ceiling(definition, bound)? {
             Ok(ceiling) => ceiling,
             Err(NoBank::Unstreamed(reason)) => {
-                let Some(resident) = self.held_whole_within(definition, bound)? else {
+                let Some(chains) = self.whole_chains(definition, bound)? else {
                     return placed(figures, Placing::None(NoBank::Unstreamed(reason)));
                 };
-                let charge = held.charge(definition, &resident)?;
-                figures.resident = Some(Need { fit: None, terms: NeedTerms::of(&resident, charge.charge())? });
-                return match confirm(&resident, charge.charge())? {
-                    Ok(found) => {
-                        figures.form = Some(WholeForm::Resident);
-                        placed(figures, Placing::Whole { draft: resident, charge, found })
+                // The longest chain the room holds, else the shortest,
+                // each as `confirm` decides it.
+                let last = chains.len() - 1;
+                for (at, places) in chains.into_iter().enumerate() {
+                    let resident = self.held_whole_at(definition, places)?;
+                    let charge = held.charge(definition, &resident)?;
+                    let fit = room.fit_whole(&resident, charge.charge())?;
+                    figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
+                    if fit.short.is_none() || at == last {
+                        if let Ok(found) = confirm(&resident, charge.charge())? {
+                            figures.form = Some(WholeForm::Resident);
+                            return placed(figures, Placing::Whole { draft: resident, charge, found });
+                        }
                     }
-                    Err(_) => placed(figures, Placing::None(NoBank::Unstreamed(reason))),
-                };
+                }
+                return placed(figures, Placing::None(NoBank::Unstreamed(reason)));
             }
             Err(no) => return placed(figures, Placing::None(no)),
         };
@@ -548,7 +555,8 @@ impl ExecutionPlanDraft {
                 }
             }
         }
-        if let Some(resident) = self.held_whole_within(definition, bound)? {
+        for places in self.whole_chains(definition, bound)?.into_iter().flatten() {
+            let resident = self.held_whole_at(definition, places)?;
             let charge = held.charge(definition, &resident)?;
             let fit = room.fit_whole(&resident, charge.charge())?;
             figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
@@ -948,16 +956,47 @@ impl ExecutionPlanDraft {
         Ok(bound.limit.is_none_or(|limit| bytes <= limit.bytes()).then_some(whole))
     }
 
+    /// The chains a plan holding its experts whole may run, longest first,
+    /// where the load's own bound holds its weights (which no chain
+    /// changes): a whole-context prompt's ([`Self::held_whole`]), then each
+    /// half of the one before, down to one launch a group, as a load without
+    /// routed experts runs. A shorter chain merges fewer chunks' passes and
+    /// commits less: one launch-row region per launch it runs
+    /// (`chain_rows`), and the graphs of the chains it seals. A placement
+    /// holds the longest whose plan the room holds.
+    fn whole_chains(&self, definition: &ModelDefinition, bound: HeldBound) -> Result<Option<Vec<u64>>, PlanError> {
+        let bytes = weight_bytes(&self.load.clone().unbanked())?;
+        if bound.limit.is_some_and(|limit| bytes > limit.bytes()) {
+            return Ok(None);
+        }
+        let mut places = vec![self.whole_places(definition)?];
+        while let Some(&last) = places.last().filter(|&&last| last > 1) {
+            places.push(last.div_ceil(2));
+        }
+        Ok(Some(places))
+    }
+
     /// The draft with its experts held whole: its prompt groups chain every
     /// chunk of a whole-context prompt, as a banked load's do (a chain is
     /// what merges their passes); one launch where the load has no routed
     /// experts, which have nothing to merge.
     pub(crate) fn held_whole(&self, definition: &ModelDefinition) -> Result<Self, PlanError> {
-        let places = match super::bank::routed_experts(definition) {
-            Ok(_) => self.prompt_places(definition),
-            Err(PlanError::Unstreamed(UnstreamedExperts::Unrouted)) => 1,
-            Err(error) => return Err(error),
-        };
+        self.held_whole_at(definition, self.whole_places(definition)?)
+    }
+
+    /// The most launches a group of a plan holding its experts whole
+    /// chains ([`Self::held_whole`]).
+    fn whole_places(&self, definition: &ModelDefinition) -> Result<u64, PlanError> {
+        match super::bank::routed_experts(definition) {
+            Ok(_) => Ok(self.prompt_places(definition)),
+            Err(PlanError::Unstreamed(UnstreamedExperts::Unrouted)) => Ok(1),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The draft with its experts held whole, its prompt groups chaining up
+    /// to `places` launches.
+    fn held_whole_at(&self, definition: &ModelDefinition, places: u64) -> Result<Self, PlanError> {
         let load = self.load.clone().unbanked();
         let programs = load.program_plan(definition, self.policy.codec)?;
         Self { load, programs, ..self.clone() }.with_chain(places)
@@ -972,7 +1011,7 @@ impl ExecutionPlanDraft {
     /// plans' charges at one holding of the experts.
     pub fn holding_as(&self, definition: &ModelDefinition, held: &Self) -> Result<Self, PlanError> {
         let draft = match held.load.bank.as_ref() {
-            None => self.held_whole(definition)?,
+            None => self.held_whole_at(definition, held.policy.limits.chain_capacity.get() as u64)?,
             Some(bank) => {
                 let mut load = self
                     .load
@@ -1079,9 +1118,10 @@ impl ExecutionPlan {
 /// a draft's experts, once charged: through a bank, at whatever slots, or
 /// whole. A bank search's plans differ only in their slots, whose charges
 /// follow from any one's ([`AssessmentMemoryCharge::at_bank_slots`]), and a
-/// whole plan is the one its draft's experts held whole make, so each way is
-/// charged from its structure ([`crate::assessment::StructuralCharge`]) once
-/// however often one draft is searched, as a `C` ([`HeldCharge`]).
+/// whole plan is the one its draft's experts held whole make at one chain,
+/// so each way is charged from its structure
+/// ([`crate::assessment::StructuralCharge`]) once however often one draft is
+/// searched, as a `C` ([`HeldCharge`]).
 #[derive(Clone, Debug)]
 pub struct HeldCharges<C = AssessmentMemoryCharge> {
     /// A bank's, by the pass size it was certified at and whether its
@@ -1090,7 +1130,11 @@ pub struct HeldCharges<C = AssessmentMemoryCharge> {
     /// (`ExpertBankPlan::reaches_whole`), so a bank of another is charged
     /// from its structure again.
     banked: Option<((PassLaunches, bool), C)>,
-    whole: Option<C>,
+    /// A whole plan's, by the launches its prompt groups chain: a chain
+    /// sizes the target family's pass buffers, bound constants and graphs
+    /// (`ExecutionPlanDraft::whole_chains`), so a whole plan of another
+    /// chain is charged from its structure again.
+    whole: Option<(NonZeroUsize, C)>,
 }
 
 impl<C> Default for HeldCharges<C> {
@@ -1158,9 +1202,10 @@ impl<C: HeldCharge> HeldCharges<C> {
     /// The charge of `draft`, of its way of holding its experts.
     fn charge(&mut self, definition: &ModelDefinition, draft: &ExecutionPlanDraft) -> Result<C, PlanError> {
         let Some(bank) = draft.load.bank.as_ref() else {
+            let chain = draft.policy.limits.chain_capacity;
             return match &self.whole {
-                Some(whole) => Ok(whole.clone()),
-                None => Ok(self.whole.insert(C::of(definition, draft)?).clone()),
+                Some((of, whole)) if *of == chain => Ok(whole.clone()),
+                _ => Ok(self.whole.insert((chain, C::of(definition, draft)?)).1.clone()),
             };
         };
         let structure = (bank.pass, bank.reaches_whole());
@@ -1177,7 +1222,7 @@ impl<C: HeldCharge> HeldCharges<C> {
     pub fn charges(&self) -> HeldCharges {
         HeldCharges {
             banked: self.banked.as_ref().map(|(structure, held)| (*structure, held.charge().clone())),
-            whole: self.whole.as_ref().map(|held| held.charge().clone()),
+            whole: self.whole.as_ref().map(|(chain, held)| (*chain, held.charge().clone())),
         }
     }
 }
@@ -2532,10 +2577,10 @@ mod tests {
         );
         let (definition, draft) = prepare(&card, 4096, served);
         match draft.placed::<AssessmentMemoryCharge>(&definition, None).unwrap() {
-            Placed::Whole(placed) => assert!(
-                placed.draft.load().expert_bank().is_none_or(|bank| bank.whole()),
-                "the served load holds every expert"
-            ),
+            Placed::Whole(placed) => {
+                assert!(placed.draft.load().expert_bank().is_none_or(|bank| bank.whole()), "the served load holds every expert");
+                assert_eq!(placed.draft.policy.limits.chain_capacity.get(), 8, "the served load chains every chunk of its 4,096-token prompt");
+            }
             Placed::Short(_) => panic!("the served load's one conversation holds the experts whole"),
         }
     }
