@@ -572,7 +572,7 @@ impl Underived {
 }
 
 /// The catalog's separate draft of catalog model `model`.
-const fn catalog_draft(model: &'static str) -> Header {
+pub(super) const fn catalog_draft(model: &'static str) -> Header {
     Header::Catalog(model, ComponentRole::Draft)
 }
 
@@ -621,7 +621,7 @@ const SEPARATE_DRAFTS: [(&str, Header, &dyn ModelFamily); 6] = [
 /// explicit attention semantics for each named draft. These do not establish
 /// admission of the captured artifacts; binary-header admission is qualified
 /// separately by the DFlash family's publication test.
-fn synthetic_separate_draft_directory(draft: Header) -> magnitude_artifacts::gguf::Directory {
+pub(super) fn synthetic_separate_draft_directory(draft: Header) -> magnitude_artifacts::gguf::Directory {
     use magnitude_artifacts::gguf::{Metadata, Value};
     let causal: &[bool] = match draft {
         Header::Catalog("qwen3.6-35b-a3b:gguf:q4", ComponentRole::Draft) => {

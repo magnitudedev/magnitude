@@ -466,3 +466,57 @@ fn every_target_is_placed_whole_wherever_the_resident_planner_fits_it() {
         regressions.join("\n")
     );
 }
+
+/// Qwen3.6 35B-A3B q4 with its catalog draft at 4,096 tokens, on the
+/// recorded M4 Pro's Metal and RTX 3090's CUDA at the service's limits, is
+/// placed as its assessment places it: its drafted plan's charge certifies
+/// the target's family and the family of the target alone, whose block
+/// shapes the draft's taps leave as a tapped block's untapped shape.
+#[test]
+fn qwen3_6_with_its_draft_is_placed_on_an_m4_pro_and_an_rtx3090() {
+    use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest};
+    use magnitude_family_contracts::ModelFamily;
+    use magnitude_family_qwen35::Qwen35Family;
+    let target = "qwen3.6-35b-a3b:gguf:q4";
+    let draft = super::catalog::catalog_draft(target);
+    let (target_directory, draft_directory) =
+        (magnitude_family_common::headers::target(target), super::catalog::synthetic_separate_draft_directory(draft));
+    let identity = PackageIdentity { target: ArtifactIdentity([7; 32]), projector: None };
+    let component = |file: &str, directory: &magnitude_artifacts::gguf::Directory, identity| ComponentManifest {
+        files: vec![ComponentFile { path: file.into(), size: directory.tensors.iter().map(|tensor| tensor.nbytes).sum() }],
+        identity,
+        tensors: directory.tensors.clone(),
+    };
+    let declared = Qwen35Family.inspect(&target_directory, None, identity).unwrap();
+    let bound = magnitude_family_dflash::inspect(&draft_directory, &declared, &|layer| Qwen35Family.layer_entry(&declared, layer)).unwrap();
+    let proposals = u8::try_from(bound.max_proposals()).unwrap();
+    let mut definition = ModelDefinition { head: None, draft: Some(bound), ..declared };
+    definition.decoder.context_limit = 4096;
+    let manifest = PackageManifest {
+        identity,
+        target: component(target, &target_directory, identity.target),
+        projector: None,
+        draft: Some(component(&draft.to_string(), &draft_directory, ArtifactIdentity([9; 32]))),
+    };
+    let method = PlannedMethod::DFlash { proposals, widths: crate::DraftWidths::Adaptive };
+    for (machine, topology, backend) in [("m4_pro", recorded::m4_pro(), BackendName::Metal), ("rtx3090", recorded::rtx3090(), BackendName::Cuda)] {
+        let status = unopened(&topology);
+        let executor = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap();
+        let reserves = MemoryReserves::of_machine(None);
+        let device = crate::platform::selected(&topology, &status, &reserves, executor.clone(), pricing(machine, backend).unwrap()).unwrap();
+        let draft = ExecutionPlanner::prepare(
+            &device,
+            &manifest,
+            &definition,
+            ComponentSelection { head: true, vision: false },
+            ExecutionPath::Native,
+            method,
+            CODEC,
+            service(backend, &definition),
+        )
+        .unwrap_or_else(|error| panic!("{machine}: {error}"));
+        if let Err(error) = draft.placed::<crate::DraftedCharge>(&definition, None) {
+            panic!("{machine}: {error}");
+        }
+    }
+}
