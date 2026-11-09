@@ -80,7 +80,7 @@ use seismic_compiler::prepared::{
 };
 use seismic_lang::checked::{
     CheckedModule, NativeCondition, NativeImplementation, NativeNatExpr, NativeSpecialization,
-    OnDevice,
+    NativeSpecializationError, OnDevice,
 };
 use seismic_lang::entry::{
     CallSchema, CheckedProgramSubject, ElementBindings, LogicalEntry, ParameterKind, ResultClass,
@@ -914,6 +914,133 @@ fn vulkan_geometry(
         .collect()
 }
 
+/// What preparation decides of a native request before it reaches a device:
+/// the backend's implementation, its formation at the element bindings, and
+/// the specialization it takes ([`admission`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeAdmission {
+    /// Preparation takes the request.
+    Admitted,
+    /// Preparation refuses the request, with the message it fails with.
+    Refused(String),
+    /// What decides it reads a device (a `device.NAME`, or a parameter only a
+    /// device's binding holds): only preparation on one decides.
+    Unchecked(String),
+}
+
+/// Why preparation refuses an implementation it has found: the checks it makes
+/// of the declaration before any device work ([`specialized`]).
+enum Refusal {
+    Elements,
+    LaunchScoped,
+    Specialization(NativeSpecializationError),
+    Ranged(String),
+    NoCpuFunctions,
+}
+
+impl Refusal {
+    fn message(&self, name: &str, backend: BackendName) -> String {
+        match self {
+            Self::Elements => format!(
+                "`{name}` has no `{}` implementation at these element bindings",
+                backend.as_str()
+            ),
+            Self::LaunchScoped => format!(
+                "`{name}` has launch-scoped parameters but per-launch native formation is not available for `{}`",
+                backend.as_str()
+            ),
+            Self::Specialization(error) => format!("`{name}`: {error}"),
+            Self::Ranged(ranged) => {
+                format!("`{name}`: `{ranged}` is not a dimension of the entry and takes no range")
+            }
+            Self::NoCpuFunctions => {
+                format!("`{name}` has no compiled CPU native functions in this build")
+            }
+        }
+    }
+}
+
+/// The specialization preparation forms of `implementation` (the backend's
+/// declaration at the request's element bindings, bound on a device or not)
+/// for `specialization`, or why it refuses it: every check preparation makes
+/// of the declaration, so preparation and [`admission`] decide alike.
+fn specialized(
+    implementation: &NativeImplementation,
+    backend: BackendName,
+    dimensions: &[String],
+    specialization: NativeSpecialization,
+    cpu: Option<&'static CpuNativeKernels>,
+) -> Result<NativeSpecialization, Refusal> {
+    if implementation.launch_scoped() && !matches!(backend, BackendName::Metal | BackendName::Cuda) {
+        return Err(Refusal::LaunchScoped);
+    }
+    let specialization = implementation
+        .prepared(specialization)
+        .map_err(Refusal::Specialization)?;
+    // A range holds a call-time dimension of the entry; the declaration
+    // alone does not know them.
+    if let Some(ranged) = specialization
+        .ranges()
+        .keys()
+        .find(|ranged| !dimensions.contains(ranged))
+    {
+        return Err(Refusal::Ranged(ranged.clone()));
+    }
+    if backend == BackendName::Cpu && cpu.is_none() {
+        return Err(Refusal::NoCpuFunctions);
+    }
+    Ok(specialization)
+}
+
+/// Whether preparation on a `backend` device takes `specialization` of
+/// `entry` at `bindings`, decided without a device: the checks preparation
+/// makes before any device work, of the declaration a device would bind.
+/// What the declaration reads of a device has no value here, so where the
+/// decision reads it, it is [`NativeAdmission::Unchecked`], never admitted.
+pub fn admission(
+    module: &CheckedModule,
+    entry: EntryId,
+    bindings: &ElementBindings,
+    backend: BackendName,
+    specialization: NativeSpecialization,
+    cpu: Option<&'static CpuNativeKernels>,
+) -> NativeAdmission {
+    use seismic_lang::checked::NativeEvalError;
+    let name = entry_name(module, entry);
+    let Some(implementation) = module.native_implementation(entry, backend) else {
+        return NativeAdmission::Refused(no_implementation(&name, backend));
+    };
+    if let Err(error) = module.entry(entry, bindings) {
+        return NativeAdmission::Refused(error.to_string());
+    }
+    let formed = implementation
+        .at_elements(bindings)
+        .ok_or(Refusal::Elements)
+        .and_then(|implementation| {
+            specialized(
+                &implementation,
+                backend,
+                &entry_info(module, entry).dimensions,
+                specialization,
+                cpu,
+            )
+        });
+    match formed {
+        Ok(_) => NativeAdmission::Admitted,
+        Err(Refusal::Specialization(NativeSpecializationError::Evaluation(NativeEvalError::Unbound(read)))) => {
+            NativeAdmission::Unchecked(format!(
+                "`{name}`: its `{}` declaration reads `{read}`, which only a device binds",
+                backend.as_str()
+            ))
+        }
+        Err(refusal) => NativeAdmission::Refused(refusal.message(&name, backend)),
+    }
+}
+
+fn no_implementation(name: &str, backend: BackendName) -> String {
+    format!("`{name}` has no native implementation for `{}`", backend.as_str())
+}
+
 /// `implementation` as `device` offers it, bound on it: on a CPU device
 /// with the Seismic-owned participant count of each launch and the tier
 /// appended, their domains exact for the device (its pool size, the tiers
@@ -1700,13 +1827,7 @@ impl NativePrepared {
         let implementation = module
             .native_implementation(entry, backend)
             .cloned()
-            .ok_or_else(|| {
-                preparation(format!(
-                    "`{}` has no native implementation for `{}`",
-                    entry_name(module, entry),
-                    backend.as_str()
-                ))
-            })?;
+            .ok_or_else(|| preparation(no_implementation(&entry_name(module, entry), backend)))?;
         let logical = Arc::new(
             module
                 .entry(entry, &bindings)
@@ -1742,36 +1863,18 @@ impl NativePrepared {
     ) -> Result<Arc<Self>, PrepareError> {
         let backend = backend_name(&device.kind);
         let name = entry_name(module, entry);
+        let refused = |refusal: Refusal| preparation(refusal.message(&name, backend));
         let implementation = on_device(device, implementation)
             .at_elements(&bindings)
-            .ok_or_else(|| {
-                preparation(format!(
-                    "`{name}` has no `{}` implementation at these element bindings",
-                    backend.as_str()
-                ))
-            })?;
-        let scoped = implementation.launch_scoped();
-        if scoped && !matches!(backend, BackendName::Metal | BackendName::Cuda) {
-            return Err(preparation(format!(
-                "`{name}` has launch-scoped parameters but per-launch native formation is not available for `{}`",
-                backend.as_str()
-            )));
-        }
-        let specialization = implementation
-            .prepared(specialization)
-            .map_err(|error| preparation(format!("`{name}`: {error}")))?;
-        // A range holds a call-time dimension of the entry; the declaration
-        // alone does not know them.
-        let dimensions = &entry_info(module, entry).dimensions;
-        if let Some(ranged) = specialization
-            .ranges()
-            .keys()
-            .find(|ranged| !dimensions.contains(ranged))
-        {
-            return Err(preparation(format!(
-                "`{name}`: `{ranged}` is not a dimension of the entry and takes no range"
-            )));
-        }
+            .ok_or_else(|| refused(Refusal::Elements))?;
+        let specialization = specialized(
+            &implementation,
+            backend,
+            &entry_info(module, entry).dimensions,
+            specialization,
+            cpu,
+        )
+        .map_err(refused)?;
         let handoff = NativeHandoffKey::new(module, entry, logical, &specialization, backend, cpu);
         // A specialization tuning already formed and chose is served as
         // formed: it is never formed twice.
@@ -1834,11 +1937,8 @@ impl NativePrepared {
             let mut digest = Sha256::new();
             let (route, toolchain) = match &device.kind {
                 OpenedKind::Cpu(opened) => {
-                    let kernels = cpu.ok_or_else(|| {
-                        preparation(format!(
-                            "`{name}` has no compiled CPU native functions in this build"
-                        ))
-                    })?;
+                    let kernels =
+                        cpu.expect("a CPU specialization is formed with its CPU native functions");
                     let route = cpu_route(
                         opened,
                         &name,
@@ -4189,5 +4289,67 @@ mod issue_lifecycle_tests {
                 validate_standalone_parking(entry.schema(), backend, Parking::Answered).unwrap();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use seismic_lang::checked::{check_source_with, SourceFile, SourceSet};
+
+    /// A request's admission is decided without a device, by preparation's own
+    /// checks: admitted where the declaration takes it, refused with
+    /// preparation's message where it does not, and unchecked, never
+    /// admitted, where the decision reads a device.
+    #[test]
+    fn a_request_is_admitted_refused_or_left_to_a_device_without_one() {
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "parts.seismic".into(),
+                text: "fn parts[N](x: &mut tensor[N] f32):\n    for i in 0..N:\n        x[i] = 0.0\n\n\
+                       native parts for cuda from \"parts.cu\":\n    static (N)\n    params (PARTS in [1, 2, 4] default 1)\n    \
+                       where PARTS <= N and PARTS <= device.subgroup_width\n    launch parts:\n        \
+                       threadgroups (PARTS, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n\n\
+                       native parts for vulkan from \"parts.comp\":\n    static (N)\n    params (PARTS in [1, 2, 4] default 1)\n    \
+                       where PARTS <= N\n    launch parts:\n        threadgroups (PARTS, 1, 1)\n        \
+                       threads_per_threadgroup (1, 1, 1)\n"
+                    .into(),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("void parts() {}\n".into()))
+            },
+        )
+        .expect("parts source checks");
+        let entry = module.entry_named("parts").expect("parts entry");
+        let admit = |backend, n, parts| {
+            admission(
+                &module,
+                entry,
+                &ElementBindings::default(),
+                backend,
+                NativeSpecialization::new().with_static("N", n).with_param("PARTS", parts),
+                None,
+            )
+        };
+        assert_eq!(admit(BackendName::Vulkan, 4, 2), NativeAdmission::Admitted);
+        assert_eq!(
+            admit(BackendName::Vulkan, 2, 4),
+            NativeAdmission::Refused("`parts`: configuration violates the native `where` condition".into())
+        );
+        assert_eq!(
+            admit(BackendName::Vulkan, 4, 3),
+            NativeAdmission::Refused("`parts`: native parameter `PARTS` does not admit 3".into())
+        );
+        assert_eq!(
+            admit(BackendName::Metal, 4, 2),
+            NativeAdmission::Refused("`parts` has no native implementation for `metal`".into())
+        );
+        // Its `where` holds or fails only on a device's warp width.
+        assert_eq!(
+            admit(BackendName::Cuda, 4, 2),
+            NativeAdmission::Unchecked(
+                "`parts`: its `cuda` declaration reads `device.subgroup_width`, which only a device binds".into()
+            )
+        );
     }
 }

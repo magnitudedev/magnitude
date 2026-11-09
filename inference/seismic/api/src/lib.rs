@@ -33,6 +33,10 @@ pub mod testing {
     use super::{Availability, BackendName, DeviceTopology, Executor};
 
     pub use seismic_lang::registry::requested_test_backend as requested_backend;
+    pub use seismic_lang::registry::{
+        test_setup_only as setup_only, TEST_SETUP_CHECKED as SETUP_CHECKED,
+        TEST_SETUP_UNCHECKED as SETUP_UNCHECKED,
+    };
 
     /// The executor a test runs `backend` on: the first available one of
     /// it in `topology`, where the runner requests `backend` or none. A
@@ -151,7 +155,7 @@ pub use seismic_runtime::native::tune::{
     Violation, Work, Workers, WorkloadRotation, WrittenRows, COMPARISON_VERSION, GOVERNING_STEP,
 };
 pub use seismic_runtime::native::{
-    Footprint, GraphReplays, NativeArtifactIdentity, NativeQueue, Observed, Quote,
+    Footprint, GraphReplays, NativeAdmission, NativeArtifactIdentity, NativeQueue, Observed, Quote,
 };
 
 /// Result of checking one native entry's element bindings without device
@@ -4880,6 +4884,27 @@ pub mod generated {
             element_bindings(elements),
             cpu,
         )
+    }
+
+    /// Whether preparation on a `backend` device takes `specialization` at
+    /// `elements`, decided without a device by the checks preparation makes
+    /// of the declaration (`seismic_runtime::native::admission`).
+    pub fn admit_native<E: Entry>(
+        backend: BackendName,
+        specialization: &NativeSpecialization,
+        elements: &[(&str, Element)],
+        cpu: Option<&'static native_cpu::CpuNativeKernels>,
+    ) -> Result<NativeAdmission, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(seismic_runtime::native::admission(
+            module.checked(),
+            entry.id(),
+            &element_bindings(elements),
+            backend,
+            specialization.clone(),
+            cpu,
+        ))
     }
 
     /// The checked native implementation of an entry for a backend, without
