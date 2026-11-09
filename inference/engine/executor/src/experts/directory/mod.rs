@@ -27,7 +27,7 @@
 mod replay;
 mod stack;
 
-use super::host_records::{Claim, Demand, Grant, HostRecords, InboundTable, Kept, Located, Resolution};
+use super::host_records::{Claim, Demand, Grant, HostRecords, InboundTable, Kept, Located, Resolution, Taking};
 use super::map::{LandingMap, StampedMap};
 use super::records::{BankRecords, Lent, Record};
 use super::reuse::{Rank, Ranking, Reuse, Unlogged};
@@ -585,12 +585,12 @@ impl Directory {
     }
 
     /// Claim a landing of `layer`'s `expert` in its group's host tier,
-    /// leaving `keep` ready (the demand reserve, which a read ahead leaves)
-    /// or the experts still lacked where fewer ([`HostRecords::claim`]):
-    /// every landing of an expert, whoever lands it, claims it here. Short
-    /// without a tier.
-    pub fn claim_landing(&mut self, layer: usize, expert: usize, keep: usize) -> Claim {
-        self.tier(layer).claim((layer, expert), keep)
+    /// leaving `keep` of the reserve's records (the reserve, which a fill
+    /// leaves) or the experts still lacked where fewer, the record taken as
+    /// `taking` says ([`HostRecords::claim`]): every landing of an expert,
+    /// whoever lands it, claims it here. Short without a tier.
+    pub fn claim_landing(&mut self, layer: usize, expert: usize, keep: usize, taking: Taking) -> Claim {
+        self.tier(layer).claim((layer, expert), keep, taking)
     }
 
     /// Seed the one store with `layer`'s experts a prompt group read into
@@ -631,7 +631,7 @@ impl Directory {
                 break;
             };
             let (_, _, (_, expert)) = place;
-            match self.claim_landing(layer, expert, 0) {
+            match self.claim_landing(layer, expert, 0, Taking::Out) {
                 Claim::Taken(grant) => {
                     displaceable.next();
                     self.host[group].displace(record, least.2);

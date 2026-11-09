@@ -225,8 +225,10 @@ pub(in crate::experts) struct Extents {
     /// The staging records reads ahead leave free for demand
     /// (`ExpertBankPlan::demand_records`).
     pub demand: usize,
-    /// The tier records each group keeps ready or graced for the reads
-    /// ahead (`ExpertBankPlan::tier_reserve`), which hold no expert.
+    /// The tier records each group keeps holding no expert mapped (ready,
+    /// graced, or taken by a read ahead's landing in flight,
+    /// `HostRecords::reserved`) for the reads ahead
+    /// (`ExpertBankPlan::tier_reserve`).
     pub reserve: usize,
     /// Who places into the bank (`ExpertBankPlan::placer`): where the
     /// device does, landings are into tier records, answered as -2 - t;

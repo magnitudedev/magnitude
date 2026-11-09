@@ -12,7 +12,7 @@ fn a_refill_past_the_last_step_leaves_no_grace() {
     let mut state = residency::lock(&harness.watcher.state);
     let mut grants = Vec::new();
     for expert in 0..EXPERTS {
-        if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0) {
+        if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0, crate::experts::host_records::Taking::Out) {
             grants.push(grant);
         }
         if state.core.directory.refill_short(reserve) {
@@ -208,7 +208,7 @@ fn a_request_between_a_turns_jobs_finds_residency_as_at_a_turns_end() {
     let claimed = std::cell::RefCell::new(Vec::new());
     let short = |state: &mut residency::Residency, _: &mut residency::Turn, _: Option<&super::super::promotions::Copier>, _: Option<&crate::experts::directory::MissCurve>| {
         for expert in 0..EXPERTS {
-            if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0) {
+            if let crate::experts::host_records::Claim::Taken(grant) = state.core.directory.claim_landing(0, expert, 0, crate::experts::host_records::Taking::Out) {
                 grants.borrow_mut().push(grant);
             }
             if state.core.directory.refill_short(reserve) {
