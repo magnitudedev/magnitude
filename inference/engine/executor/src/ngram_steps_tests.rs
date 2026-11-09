@@ -562,10 +562,11 @@ fn scores(
             assert!(planned <= cap, "{backend:?}: the tier is planned at {planned} host slots, past its cap of {cap}");
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
-                let host = domain.expert_residency().unwrap().unwrap().host.unwrap_or_else(|| panic!("{backend:?}: a linked load has a host tier"));
+                let residency = domain.expert_residency().unwrap().unwrap();
+                let host = residency.host.unwrap_or_else(|| panic!("{backend:?}: a linked load has a host tier"));
                 assert_eq!(host.ceiling, cap, "{backend:?}: the host tier's ceiling is its cap");
                 assert!(host.slots <= cap, "{backend:?}: the host tier holds {} host slots, past its cap of {cap}", host.slots);
-                if host.fill == crate::TierFill::Filled && host.slots == planned {
+                if residency.fill == crate::TierFill::Filled && host.slots == planned {
                     break;
                 }
                 assert!(std::time::Instant::now() < deadline, "{backend:?}: the host tier never filled to its planned {planned} host slots ({host:?})");

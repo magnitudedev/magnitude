@@ -535,10 +535,7 @@ impl ElasticBank for ServedBank {
     }
 
     fn wait_tier_filled(&self) -> Result<(), DomainError> {
-        match self.bank.host_tier() {
-            Some(_) => self.bank.watcher.shared().wait_filled().map_err(DomainError::invariant),
-            None => Ok(()),
-        }
+        self.bank.watcher.shared().wait_filled().map_err(DomainError::invariant)
     }
 
     fn residency(&self) -> Result<ExpertResidency, DomainError> {

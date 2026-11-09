@@ -10,25 +10,27 @@ use serde_json::{json, Value};
 pub const STEADY_ATTEMPTS: usize = 4;
 
 /// What a timed span's regime follows: the expert bank's resizes begun and
-/// whether one runs, its slots, and its host tier's slots and fill. A span
-/// runs steady when none of these moved across it, no resize ran at either
-/// end and the tier's fill had finished before it (`TierFill::Filled`):
-/// its misses are served as every later span's are, by a bank and tier of
-/// the capacity they will keep. Which experts they hold churns at that
-/// capacity, each miss displacing another, which is the steady state
-/// itself. A load without a bank is always at rest, as a unified load's
-/// bank is beside no tier to fill.
+/// whether one runs, its slots, its host tier's slots, and the fill of the
+/// store its misses land into (the host tier where the device places, the
+/// one store where the host does). A span runs steady when none of these
+/// moved across it, no resize ran at either end and the fill had finished
+/// before it (`TierFill::Filled`): its misses are served as every later
+/// span's are, by a store of the capacity and fill it will keep, and no
+/// fill's reads share the drive with the span's own. Which experts it
+/// holds churns at that capacity, each miss displacing another, which is
+/// the steady state itself. A load without a bank is always at rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BankRest {
     resizes: magnitude_executor::ExpertResizes,
     slots: u64,
-    host: Option<(u64, magnitude_executor::TierFill)>,
+    host: Option<u64>,
+    fill: magnitude_executor::TierFill,
 }
 
 impl BankRest {
     /// Its host tier's slots; none without a tier.
     pub fn host_slots(&self) -> Option<u64> {
-        self.host.map(|(slots, _)| slots)
+        self.host
     }
 
     /// The bank as `engine` holds it now; none without a bank.
@@ -37,25 +39,26 @@ impl BankRest {
         Ok(residency.map(|residency| Self {
             resizes: engine.domain.expert_resizes(),
             slots: residency.slots,
-            host: residency.host.map(|host| (host.slots, host.fill)),
+            host: residency.host.map(|host| host.slots),
+            fill: residency.fill,
         }))
     }
 
-    /// The bank as `engine` holds it once its host tier is filled, waited
-    /// for: a span begins only there. The tier grows and fills on the
-    /// bank's own threads, for minutes where it backs much, so no span need
-    /// run to drive it; the wait is woken by the fill's publication
-    /// (`ExecutorDomain::wait_expert_tier_filled`) and bounded only by the
-    /// run's own.
+    /// The bank as `engine` holds it once the store its misses land into is
+    /// filled, waited for: a span begins only there. The store grows and
+    /// fills on the bank's own threads, for minutes where it backs much, so
+    /// no span need run to drive it; the wait is woken by the fill's
+    /// publication (`ExecutorDomain::wait_expert_tier_filled`) and bounded
+    /// only by the run's own.
     pub fn filled(engine: &Engine) -> Result<Option<Self>, String> {
-        engine.domain.wait_expert_tier_filled().map_err(|error| format!("the host tier's fill: {error}"))?;
+        engine.domain.wait_expert_tier_filled().map_err(|error| format!("the expert store's fill: {error}"))?;
         Self::of(engine)
     }
 
     /// Whether a span may begin or end at this bank: no resize runs and
-    /// the tier, where there is one, is filled.
+    /// the store its misses land into is filled.
     fn settled(self) -> bool {
-        !self.resizes.running && self.host.is_none_or(|(_, fill)| fill == magnitude_executor::TierFill::Filled)
+        !self.resizes.running && self.fill == magnitude_executor::TierFill::Filled
     }
 
     /// What moved between `before`, read before a span, and `after`; none
@@ -66,8 +69,8 @@ impl BankRest {
             "resizes_begun": after.resizes.begun - before.resizes.begun,
             "resizing": [before.resizes.running, after.resizes.running],
             "slots": [before.slots, after.slots],
-            "host_slots": [before.host.map(|(slots, _)| slots), after.host.map(|(slots, _)| slots)],
-            "tier_fill": [before.host.map(|(_, fill)| format!("{fill:?}")), after.host.map(|(_, fill)| format!("{fill:?}"))],
+            "host_slots": [before.host, after.host],
+            "fill": [format!("{:?}", before.fill), format!("{:?}", after.fill)],
         }))
     }
 }
@@ -106,7 +109,25 @@ mod tests {
     use magnitude_executor::TierFill::{Filled, Filling};
 
     fn rest(begun: u64, running: bool, slots: u64, host: Option<(u64, magnitude_executor::TierFill)>) -> Option<BankRest> {
-        Some(BankRest { resizes: magnitude_executor::ExpertResizes { begun, running }, slots, host })
+        on(begun, running, slots, host.map(|(slots, _)| slots), host.map_or(Filled, |(_, fill)| fill))
+    }
+
+    fn on(begun: u64, running: bool, slots: u64, host: Option<u64>, fill: magnitude_executor::TierFill) -> Option<BankRest> {
+        Some(BankRest { resizes: magnitude_executor::ExpertResizes { begun, running }, slots, host, fill })
+    }
+
+    /// The one store (no host tier) still filling at either end makes a
+    /// span unsteady, as a host tier's fill does: its fill's reads share the
+    /// drive with the span's, and its records not yet filled take the
+    /// span's seeds, so a span begun mid-fill is served unlike any later.
+    #[test]
+    fn a_filling_one_store_is_unsteady() {
+        let (filled, filling) = (on(3, false, 180, None, Filled), on(3, false, 180, None, Filling));
+        assert!([filled, filling].iter().all(|rest| rest.is_some_and(|rest| rest.host_slots().is_none())), "setup: a bank beside no host tier");
+        assert!(BankRest::moved(filling, filling).is_some());
+        assert!(BankRest::moved(filling, filled).is_some());
+        assert!(BankRest::moved(filled, filling).is_some());
+        assert_eq!(BankRest::moved(filled, filled), None);
     }
 
     /// Experts churning through a bank and tier at fixed slots (the bytes

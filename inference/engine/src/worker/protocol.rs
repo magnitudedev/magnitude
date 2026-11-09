@@ -337,9 +337,9 @@ mod tests {
                             slots: 12,
                             ceiling: 256,
                             bytes: 14,
-                            fill: magnitude_executor::TierFill::Filled,
                             last_resize: None,
                         }),
+                        fill: magnitude_executor::TierFill::Filled,
                         disk_bytes: 11,
                         tables: vec![magnitude_executor::TableResidency {
                             records: 40,

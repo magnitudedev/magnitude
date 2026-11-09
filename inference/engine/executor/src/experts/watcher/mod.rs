@@ -348,9 +348,10 @@ impl Shared {
         *self.copy.lock().expect("a copy's price") = Some(costs.clone());
     }
 
-    /// The host tier's fill as residency last published it: filling from
-    /// the bank's open until its first turn finds it filled
-    /// (`Prefetch::filling`).
+    /// The fill of the store misses land into (the host tier where the
+    /// device places, the one store where the host does) as residency last
+    /// published it: filling from the bank's open until its first turn
+    /// finds it filled (`Prefetch::filling`).
     pub fn tier_fill(&self) -> crate::TierFill {
         match self.fill_epoch() % 2 {
             1 => crate::TierFill::Filled,
@@ -381,7 +382,8 @@ impl Shared {
         changed
     }
 
-    /// Wait until the host tier is filled, as residency publishes it, woken
+    /// Wait until the store misses land into is filled, as residency
+    /// publishes it ([`Self::tier_fill`]), woken
     /// by each of the load's events; why serving ended, if it ends first,
     /// or that the load stops.
     pub fn wait_filled(&self) -> Result<(), String> {

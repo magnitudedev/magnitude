@@ -162,9 +162,9 @@ mod tests {
                         slots: 20,
                         ceiling: 256,
                         bytes: 650,
-                        fill: magnitude_engine::census::TierFill::Filled,
                         last_resize: Some(BankResize::Grew { from: 19, by: positive(1), at_unix_ms: 11 }),
                     }),
+                    fill: magnitude_engine::census::TierFill::Filled,
                     disk_bytes: 900,
                     tables: vec![TableResidency {
                         records: 40,

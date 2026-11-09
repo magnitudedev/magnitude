@@ -1232,8 +1232,9 @@ impl ElasticBank for FakeBank {
             host: std::num::NonZeroU64::new(self.host_ceiling).map(|ceiling| {
                 let slots = self.host.load(std::sync::atomic::Ordering::Relaxed);
                 let last_resize = *self.host_last_resize.lock().expect("the fake host tier's last resize");
-                crate::HostResidency { slots, ceiling: ceiling.get(), bytes: slots, fill: crate::TierFill::Filled, last_resize }
+                crate::HostResidency { slots, ceiling: ceiling.get(), bytes: slots, last_resize }
             }),
+            fill: crate::TierFill::Filled,
             disk_bytes: experts - self.slots(),
             tables: Vec::new(),
             last_resize: *self.last_resize.lock().expect("the fake bank's last resize"),

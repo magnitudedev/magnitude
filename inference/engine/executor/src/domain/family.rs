@@ -195,8 +195,9 @@ pub trait ElasticBank {
     /// as that holding's last: kept with the holding, which the bank owns.
     fn record_resize(&self, holding: BankHolding, resize: BankResize);
 
-    /// Wait until the host tier is filled ([`TierFill::Filled`]), as its
-    /// fill publishes it; at once without a tier.
+    /// Wait until the store misses land into is filled
+    /// ([`TierFill::Filled`]), as its fill publishes it: the host tier
+    /// where the device places, the one store where the host does.
     fn wait_tier_filled(&self) -> Result<(), super::DomainError>;
 
     /// How many times the bank's fill started or finished
@@ -223,6 +224,9 @@ pub struct ExpertResidency {
     /// The host tier, where the load has one (a discrete device's,
     /// `ExpertBankPlan::host`); none on unified memory.
     pub host: Option<HostResidency>,
+    /// The fill of the store misses land into: the host tier where the
+    /// device places, the one store where the host does.
+    pub fill: TierFill,
     /// The experts of every layer in no slot and not in the host tier, as
     /// the model file stores them.
     pub disk_bytes: u64,
@@ -245,14 +249,13 @@ pub struct TableResidency {
 }
 
 /// Where a host tier is now: its host slots (each a record of every
-/// streamed layer beside the staging floor), up to its ceiling, Seismic's
-/// charge of its records in host RAM, and its fill.
+/// streamed layer beside the staging floor), up to its ceiling, and
+/// Seismic's charge of its records in host RAM.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HostResidency {
     pub slots: u64,
     pub ceiling: u64,
     pub bytes: u64,
-    pub fill: TierFill,
     /// The host slots' last finished resize; none before one.
     pub last_resize: Option<BankResize>,
 }
@@ -318,12 +321,13 @@ pub enum ShrinkCause {
     Measurement,
 }
 
-/// Whether a host tier's fill has finished: the fill lands experts into
-/// every record beyond the landing reserve, from the bank's open and again
-/// after a growth. Filled once each such record keeps an expert (or the
-/// tier keeps every expert) and no fill's landing is in flight; from then
-/// the tier's members change only by its misses' landings displacing what
-/// it keeps, at the same records.
+/// Whether the fill of the store misses land into (the host tier where
+/// the device places, the one store where the host does) has finished:
+/// the fill lands experts into every record beyond the landing reserve,
+/// from the bank's open and again after a growth. Filled once each such
+/// record keeps an expert (or the store keeps every expert) and no fill's
+/// landing is in flight; from then the store's members change only by its
+/// misses' landings displacing what it keeps, at the same records.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TierFill {
     Filling,

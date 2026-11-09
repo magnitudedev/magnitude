@@ -306,11 +306,9 @@ impl ExpertBank {
                     let tier = tier.lock().expect("host tier");
                     (tier.slots.load(Ordering::Acquire), tier.ceiling, tier.last_resize)
                 })
-                .map(|(slots, ceiling, last_resize)| {
-                    let fill = self.watcher.shared().tier_fill();
-                    self.host_charged().map(|bytes| HostResidency { slots, ceiling, bytes, fill, last_resize })
-                })
+                .map(|(slots, ceiling, last_resize)| self.host_charged().map(|bytes| HostResidency { slots, ceiling, bytes, last_resize }))
                 .transpose()?,
+            fill: self.watcher.shared().tier_fill(),
             // The tables are the served bank's (`ServedBank::residency`).
             tables: Vec::new(),
             last_resize: *self.last_resize.lock().expect("the experts' last resize"),
