@@ -644,15 +644,17 @@ pub(crate) struct HistoryPlacement {
     pub extent: u64,
 }
 
-/// Where `point`'s histories lie. One sequence's history is one span, as a
-/// store keeps a request that grows alone. Several sequences' lie where the
-/// target's Token history store, of `codec`, places requests that arrive
-/// together ([`magnitude_state::fresh_history_ranges`]): apart from one
-/// another, so a kernel form that reads its rows' histories as one range
-/// is timed over what lies between them, as it is in service.
+/// Where `point`'s histories lie in layers keeping at most `window` rows
+/// (the whole context without one). One sequence's history is one span, as
+/// a store keeps a request that grows alone. Several sequences' lie where
+/// the target's store of those layers' history domain, of `codec`, places
+/// requests that arrive together ([`magnitude_state::fresh_history_ranges`]):
+/// apart from one another, so a kernel form that reads its rows' histories
+/// as one range is timed over what lies between them, as it is in service.
 pub(crate) fn history_placement(
     model: &ModelInputs<'_>,
     codec: magnitude_state::KvCodec,
+    window: Option<u64>,
     point: &PointShape,
 ) -> Result<HistoryPlacement, String> {
     let context = point.context.unwrap_or(0);
@@ -668,21 +670,8 @@ pub(crate) fn history_placement(
             extent: context,
         });
     }
-    let layout =
-        magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
-    let geometry = layout
-        .target_history
-        .iter()
-        .find(|domain| matches!(domain, magnitude_state::HistoryDomainLayout::Token { .. }))
-        .ok_or("a point of several sequences needs a Token history domain")?
-        .geometry(
-            &layout.target_history,
-            usize::try_from(model.limits.context_tokens).map_err(|_| "context exceeds usize")?,
-            usize::try_from(model.limits.max_rows).map_err(|_| "rows exceed usize")?,
-        )
-        .map_err(|error| error.to_string())?;
     let sequences = magnitude_state::fresh_history_ranges(
-        geometry,
+        history_geometry(model, codec, window)?,
         usize::try_from(point.sequences).map_err(|_| "sequences exceed usize")?,
         usize::try_from(context).map_err(|_| "context exceeds usize")?,
     )
@@ -713,9 +702,25 @@ pub(crate) fn request_history_rows(
     codec: magnitude_state::KvCodec,
     window: Option<u64>,
 ) -> Result<u64, String> {
+    let geometry = history_geometry(model, codec, window)?;
+    geometry
+        .span_limit
+        .checked_mul(geometry.page_rows)
+        .map(|rows| rows as u64)
+        .ok_or_else(|| "a request's history rows overflow".to_owned())
+}
+
+/// The geometry of the target's history store, of `codec`, for layers
+/// keeping at most `window` rows: its Token domain without a window, else
+/// the Window domain of exactly that many rows.
+fn history_geometry(
+    model: &ModelInputs<'_>,
+    codec: magnitude_state::KvCodec,
+    window: Option<u64>,
+) -> Result<magnitude_state::HistoryGeometry, String> {
     let layout =
         magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
-    let domain = layout
+    layout
         .target_history
         .iter()
         .find(|domain| match (domain, window) {
@@ -725,19 +730,13 @@ pub(crate) fn request_history_rows(
             }
             _ => false,
         })
-        .ok_or("the layers' history domain is not the target's")?;
-    let geometry = domain
+        .ok_or("the layers' history domain is not the target's")?
         .geometry(
             &layout.target_history,
             usize::try_from(model.limits.context_tokens).map_err(|_| "context exceeds usize")?,
             usize::try_from(model.limits.max_rows).map_err(|_| "rows exceed usize")?,
         )
-        .map_err(|error| error.to_string())?;
-    geometry
-        .span_limit
-        .checked_mul(geometry.page_rows)
-        .map(|rows| rows as u64)
-        .ok_or_else(|| "a request's history rows overflow".to_owned())
+        .map_err(|error| error.to_string())
 }
 
 /// `point`, a row point of one sequence, as `sequences` sequences' rows.

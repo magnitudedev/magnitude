@@ -554,6 +554,59 @@ fn a_units_window_is_the_longest_history_its_layers_keep() {
     }
 }
 
+/// A model whose every attention layer keeps a window has no Token history
+/// domain: points of several sequences lie where its Window store places
+/// requests that arrive together, and every such point is valid.
+#[test]
+fn several_sequences_lie_in_a_window_only_models_store() {
+    use magnitude_family_contracts::{HistoryDomain, KeyValue, Operator};
+    let (mut definition, load) = fixture_load();
+    for block in &mut definition.decoder.blocks {
+        for sublayer in &mut block.sublayers {
+            if let Operator::Attention(attention) = &mut sublayer.op {
+                if let KeyValue::Owned { domain, .. } = &mut attention.key_value {
+                    *domain = HistoryDomain::Window { tokens: 1024 };
+                }
+            }
+        }
+    }
+    let inputs = ModelInputs {
+        definition: &definition,
+        limits: LIMITS,
+        load: &load,
+    };
+    let codec = magnitude_state::KvCodec::AffineK8V4;
+    let point = across_sequences(
+        &PointShape {
+            context: Some(600),
+            ..row_point(2, 1.)
+        },
+        2,
+    );
+    let placement = history_placement(&inputs, codec, Some(1024), &point).unwrap();
+    assert_eq!(placement.sequences.len(), 2);
+    for history in &placement.sequences {
+        assert_eq!(
+            history.iter().map(|range| range[1] - range[0]).sum::<i32>(),
+            600,
+            "{history:?}"
+        );
+    }
+    let rows = |history: &Vec<[i32; 2]>| {
+        history
+            .iter()
+            .flat_map(|range| range[0]..range[1])
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert!(
+        rows(&placement.sequences[0]).is_disjoint(&rows(&placement.sequences[1])),
+        "{:?}",
+        placement.sequences
+    );
+    // The model has no whole-context domain to place them in.
+    assert!(history_placement(&inputs, codec, None, &point).is_err());
+}
+
 #[test]
 fn numerical_histories_include_witnesses_and_the_window_limit() {
     let decode = || served_row_points(LIMITS, |rows| rows == 1);
@@ -2709,7 +2762,7 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
         2,
     );
     let placement =
-        history_placement(&inputs, magnitude_state::KvCodec::AffineK8V4, &point).unwrap();
+        history_placement(&inputs, magnitude_state::KvCodec::AffineK8V4, None, &point).unwrap();
     assert_eq!(placement.sequences.len(), 2);
     assert_eq!(placement.sequences[0], [[0, 600]]);
     let second = &placement.sequences[1];
@@ -2733,6 +2786,7 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let alone = history_placement(
         &inputs,
         magnitude_state::KvCodec::AffineK8V4,
+        None,
         &PointShape {
             context: Some(600),
             ..row_point(2, 1.)

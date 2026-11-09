@@ -1235,7 +1235,7 @@ impl AttentionMix {
         // count has its own planes, so no point ever reads rows another
         // point appended.
         let sequences = point.sequences;
-        let placement = history_placement(inputs, H::CODEC, point)?;
+        let placement = history_placement(inputs, H::CODEC, self.window, point)?;
         let histories = placement.extent;
         let view = histories + rows;
         let history = H::build(
