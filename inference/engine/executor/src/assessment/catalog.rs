@@ -77,6 +77,35 @@ const LIMITS: ResourceLimits = ResourceLimits {
     conversations: std::num::NonZeroUsize::MIN,
 };
 
+/// Every catalog target that must serve (its catalog model neither disabled
+/// nor deprecated, or named in `REQUIRED`) and the executor admits, by
+/// catalog model ID, with its definition and its package alone.
+pub(super) fn served_targets() -> Vec<(String, magnitude_family_contracts::ModelDefinition, PackageManifest)> {
+    let identity = PackageIdentity { target: ArtifactIdentity([7; 32]), projector: None };
+    let levels = support_levels();
+    let mut targets = Vec::new();
+    for component in headers::index() {
+        let name = component.model.as_str();
+        let served = REQUIRED.contains(&name) || !matches!(levels.get(name).map(String::as_str), Some("disabled" | "deprecated"));
+        if component.role != ComponentRole::Target || !served {
+            continue;
+        }
+        let target = headers::component(component);
+        let family = FAMILIES
+            .iter()
+            .find(|family| family.recognizes(&target))
+            .unwrap_or_else(|| panic!("{name}: a family recognizes the served target"));
+        let definition = family
+            .inspect(&target, None, identity)
+            .unwrap_or_else(|error| panic!("{name}: its family inspects it: {error}"));
+        if crate::operators::admit(&definition, false).is_err() {
+            continue;
+        }
+        targets.push((name.to_owned(), definition, target_manifest(component, &target, identity)));
+    }
+    targets
+}
+
 #[test]
 fn every_admitted_catalog_target_derives_complete_terms() {
     let identity = PackageIdentity {

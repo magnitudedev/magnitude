@@ -26,6 +26,8 @@ pub(crate) mod fixtures;
 pub mod launches;
 pub mod miss_model;
 pub mod misses;
+#[cfg(test)]
+mod parity;
 pub mod priced;
 pub mod requests;
 pub mod step;
