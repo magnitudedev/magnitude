@@ -52,9 +52,31 @@ pub(crate) fn open_backend(
 /// Whether a test runs on `backend` ([`seismic::testing::selected`]): the
 /// runner requests it or none, and discovery found an available executor
 /// of it. Such a test runs on each backend this holds for, and fails where
-/// an available one does not open.
+/// an available one does not open. A build for a booked host names its
+/// backend (`--config env.SEISMIC_TEST_BOOKED=cuda`, read when the tests
+/// compile), and that backend holds or panics, naming it: a test never
+/// passes by skipping the backend its run was booked for.
 pub(crate) fn available(devices: &seismic::Devices, backend: seismic::BackendName) -> bool {
-    seismic::testing::selected(&devices.topology(), backend).is_some()
+    let topology = devices.topology();
+    let found = seismic::testing::selected(&topology, backend).is_some();
+    if !found && booked() == Some(backend) {
+        let listed = topology
+            .executors()
+            .iter()
+            .filter(|executor| executor.backend() == backend)
+            .map(|executor| format!("{}: {:?}", executor.selector(), executor.availability()))
+            .collect::<Vec<_>>();
+        panic!("the build was booked for {backend:?}, and this host has no available {backend:?} executor: {listed:?}");
+    }
+    found
+}
+
+/// The backend the build names as its host's (`SEISMIC_TEST_BOOKED`, at
+/// compile time); a value that names no backend panics.
+pub(crate) fn booked() -> Option<seismic::BackendName> {
+    option_env!("SEISMIC_TEST_BOOKED").map(|name| {
+        seismic::BackendName::parse(name).unwrap_or_else(|| panic!("unknown SEISMIC_TEST_BOOKED {name:?}"))
+    })
 }
 
 /// `sources`, held in memory, checked with each native implementation's
