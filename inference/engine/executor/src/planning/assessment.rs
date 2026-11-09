@@ -65,6 +65,8 @@ pub struct AssessmentMemoryBounds {
     /// What the startup graphs (`AssessmentGraphResourceBounds::recorded_graphs`)
     /// hold on the planned device, in its device and upload storage.
     pub recorded_graph_bytes: u64,
+    /// The part of `recorded_graph_bytes` in its upload storage.
+    pub recorded_graph_upload_bytes: u64,
     pub startup_additional_bytes: u64,
     pub component_upload_bytes: u64,
     pub staging_upload_bytes: u64,
@@ -924,6 +926,7 @@ impl AssessmentHeaderBounds {
                 .device
                 .checked_add(recorded.upload)
                 .ok_or("the startup graphs' memory overflows")?,
+            recorded_graph_upload_bytes: recorded.upload,
             startup_additional_bytes: self.startup_additional_bytes,
             component_upload_bytes: self.component_upload_bytes,
             staging_upload_bytes: self.staging_upload_bytes,

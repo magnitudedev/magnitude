@@ -1826,6 +1826,7 @@ fn fixture_charge(allocation_bytes: u64, staging_bytes: u64) -> AssessmentMemory
         bounds: AssessmentMemoryBounds {
             graph_bytes: 0,
             recorded_graph_bytes: 0,
+            recorded_graph_upload_bytes: 0,
             startup_additional_bytes: 0,
             component_upload_bytes: 0,
             staging_upload_bytes: staging_bytes,
@@ -1866,6 +1867,7 @@ fn workload_charge_composes_exact_terms_and_upper_bounds() {
         // 40 prepared resource bytes, the programs' owner among them.
         graph_bytes: 40 - AttestedPrograms::DEVICE_BYTES,
         recorded_graph_bytes: 0,
+        recorded_graph_upload_bytes: 0,
         startup_additional_bytes: 60,
         component_upload_bytes: 0,
         staging_upload_bytes: 7,

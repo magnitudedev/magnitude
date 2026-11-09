@@ -42,9 +42,10 @@ pub struct PlannedDevice {
     /// tier asks of `Fit` ([`ExecutionPlanDraft::with_host_tier`]).
     executor: seismic::Executor,
     reading: FitReading,
-    /// What its recorded graphs hold for their census
+    /// What its recorded graphs are priced at for their census, and
+    /// whether that is the device's own cost or its backend's bound
     /// (`SelectedDevice::graph_cost`).
-    graph_cost: seismic::GraphCost,
+    graph_pricing: crate::platform::GraphPricing,
 }
 
 impl PlannedDevice {
@@ -79,7 +80,13 @@ impl PlannedDevice {
 
     /// What its recorded graphs hold for their census.
     pub fn graph_cost(&self) -> seismic::GraphCost {
-        self.graph_cost
+        self.graph_pricing.cost()
+    }
+
+    /// Whether its graphs are priced at the device's own cost or its
+    /// backend's bound.
+    pub fn graph_pricing(&self) -> crate::platform::GraphPricing {
+        self.graph_pricing
     }
 }
 
@@ -503,7 +510,7 @@ impl ExecutionPlanDraft {
         room: &impl SettleRoom,
         confirm: &mut impl FnMut(&Self, &AssessmentMemoryCharge) -> Result<Result<T, NonZeroU64>, E>,
     ) -> Result<Placement<C, T>, E> {
-        let mut figures = PlacementFigures::default();
+        let mut figures = PlacementFigures { pricing: self.device.graph_pricing, form: None, bank: None, resident: None };
         let placed = |figures, outcome| Ok(Placement { figures, outcome });
         let ceiling = match self.bank_ceiling(definition, bound)? {
             Ok(ceiling) => ceiling,
@@ -512,7 +519,7 @@ impl ExecutionPlanDraft {
                     return placed(figures, Placing::None(NoBank::Unstreamed(reason)));
                 };
                 let charge = held.charge(definition, &resident)?;
-                figures.resident = Some(Self::allocated(charge.charge())?);
+                figures.resident = Some(Need { fit: None, terms: NeedTerms::of(&resident, charge.charge())? });
                 return match confirm(&resident, charge.charge())? {
                     Ok(found) => {
                         figures.form = Some(WholeForm::Resident);
@@ -532,7 +539,7 @@ impl ExecutionPlanDraft {
                 let draft = ceiling.whole.resized(experts, experts, pass)?;
                 let charge = held.charge(definition, &draft)?;
                 let fit = room.fit_whole(&draft, charge.charge())?;
-                (figures.room, figures.bank, figures.deficit) = (Some(fit.room), Some(fit.needed), fit.short);
+                figures.bank = Some(Need { fit: Some(fit), terms: NeedTerms::of(&draft, charge.charge())? });
                 if fit.short.is_none() {
                     if let Ok(found) = confirm(&draft, charge.charge())? {
                         figures.form = Some(WholeForm::Bank);
@@ -544,7 +551,7 @@ impl ExecutionPlanDraft {
         if let Some(resident) = self.held_whole_within(definition, bound)? {
             let charge = held.charge(definition, &resident)?;
             let fit = room.fit_whole(&resident, charge.charge())?;
-            (figures.room, figures.resident, figures.deficit) = (Some(fit.room), Some(fit.needed), fit.short);
+            figures.resident = Some(Need { fit: Some(fit), terms: NeedTerms::of(&resident, charge.charge())? });
             if fit.short.is_none() {
                 if let Ok(found) = confirm(&resident, charge.charge())? {
                     figures.form = Some(WholeForm::Resident);
@@ -1339,13 +1346,16 @@ pub trait SettleRoom {
     fn fit_whole(&self, draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<WholeFit, PlanError>;
 }
 
-/// A whole plan's fit ([`SettleRoom::fit_whole`]): the room it was fitted
-/// into, what it needs there, and how far it is short, if it is.
+/// A whole plan's fit ([`SettleRoom::fit_whole`]), as the one verdict that
+/// decides it reads it: the room of the store its device storage is placed
+/// on, what the plan requires there, and how far the plan is short and in
+/// which role of store, if it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WholeFit {
     pub room: PlanRoom,
     pub needed: u64,
     pub short: Option<NonZeroU64>,
+    pub limiting: Option<crate::platform::DomainRole>,
 }
 
 impl<F: Fn(u64) -> PlanRoom> SettleRoom for F {
@@ -1357,7 +1367,8 @@ impl<F: Fn(u64) -> PlanRoom> SettleRoom for F {
     /// admission fits it.
     fn fit_whole(&self, draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<WholeFit, PlanError> {
         let (room, needed) = (self(0), draft.fitted(charge)?);
-        Ok(WholeFit { room, needed, short: NonZeroU64::new(needed.saturating_sub(room.free.min(room.ceiling))) })
+        let short = NonZeroU64::new(needed.saturating_sub(room.free.min(room.ceiling)));
+        Ok(WholeFit { room, needed, short, limiting: short.map(|_| crate::platform::DomainRole::Allocation) })
     }
 }
 
@@ -1402,12 +1413,19 @@ impl SettleRoom for StableRoom<'_> {
     /// domain's stable room.
     fn fit_whole(&self, draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<WholeFit, PlanError> {
         let fit = self.fit(draft, charge)?;
-        let bound = fit.settle_bound().map_err(PlanError::ResourcePlanning)?;
-        let short = match fit.verdict {
-            super::AssessmentFitVerdict::Fits => None,
-            super::AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Some(deficit_bytes),
+        let allocation = fit
+            .domains
+            .iter()
+            .find(|domain| domain.role == crate::platform::DomainRole::Allocation)
+            .ok_or_else(|| PlanError::ResourcePlanning("the fit reaches no allocation domain".into()))?;
+        let bound = allocation.capacity_bytes - allocation.reserve_bytes;
+        let (short, limiting) = match fit.verdict {
+            super::AssessmentFitVerdict::Fits => (None, None),
+            super::AssessmentFitVerdict::DoesNotFit { limiting, deficit_bytes } => {
+                (Some(deficit_bytes), fit.domains.iter().find(|domain| domain.domain == limiting).map(|domain| domain.role))
+            }
         };
-        Ok(WholeFit { room: PlanRoom { free: bound, ceiling: bound }, needed: draft.fitted(charge)?, short })
+        Ok(WholeFit { room: PlanRoom { free: bound, ceiling: bound }, needed: allocation.required_bytes, short, limiting })
     }
 
     fn room(&self, mandatory: &AssessmentMemoryCharge, bytes: u64) -> Result<PlanRoom, PlanError> {
@@ -1459,29 +1477,121 @@ enum Placing<C, T> {
     None(NoBank),
 }
 
-/// The figures a placement decided on: the room it fitted into, what the
-/// whole bank (at the last pass tried, the smallest) and the experts' own
-/// allocations need there where tried, the form held, and the last
-/// deficit found.
-#[derive(Default)]
+/// The figures a placement decided on: how the device's graphs are
+/// priced, the form held, and, for each whole form tried (the bank at the
+/// last pass tried, its smallest), its fit as the verdict that decided it
+/// reads it and the terms of the charge that fit was of.
 struct PlacementFigures {
-    room: Option<PlanRoom>,
-    bank: Option<u64>,
-    resident: Option<u64>,
+    pricing: crate::platform::GraphPricing,
     form: Option<WholeForm>,
-    deficit: Option<NonZeroU64>,
+    bank: Option<Need>,
+    resident: Option<Need>,
+}
+
+/// A whole form's fit, where `room` judged it (none where `confirm` alone
+/// did), and its charge's terms.
+struct Need {
+    fit: Option<WholeFit>,
+    terms: NeedTerms,
+}
+
+/// The terms of a whole plan's charge (`AssessmentMemoryCharge`): its
+/// weights and what of them lies in device storage, its state at the fit
+/// depth, at startup and once loaded, its graph pools at its prompt groups'
+/// chain places, its prompt groups' class beyond the floor's, its recorded
+/// graphs in device and upload storage, its prepared resources, the
+/// worker's device bytes, the startup and component import peaks, and the
+/// allocation they compose to.
+struct NeedTerms {
+    weights: u64,
+    weights_device: u64,
+    state: u64,
+    startup_state: u64,
+    loaded_state: u64,
+    graph_pools: u64,
+    chain_places: usize,
+    group_class: u64,
+    recorded_graphs_device: u64,
+    recorded_graphs_upload: u64,
+    prepared: u64,
+    process: u64,
+    startup_additional: u64,
+    component_upload: u64,
+    allocation: u64,
+}
+
+impl NeedTerms {
+    fn of(draft: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge) -> Result<Self, PlanError> {
+        let bounds = &charge.bounds;
+        let allocation = ExecutionPlanDraft::allocated(charge)?;
+        let resource = |result: Result<u64, String>| result.map_err(PlanError::ResourcePlanning);
+        Ok(Self {
+            weights: charge.weight_demand.checked_bytes().ok_or(PlanError::Arithmetic("weight demand overflows"))?,
+            weights_device: charge.weight_demand.device.saturating_add(charge.weight_demand.reserved),
+            state: charge.state_bytes,
+            startup_state: charge.startup_state_bytes,
+            loaded_state: charge.loaded_state_bytes,
+            graph_pools: bounds.graph_bytes,
+            chain_places: draft.policy.limits.chain_capacity.get(),
+            group_class: draft.fitted(charge)? - allocation,
+            recorded_graphs_device: bounds.recorded_graph_bytes - bounds.recorded_graph_upload_bytes,
+            recorded_graphs_upload: bounds.recorded_graph_upload_bytes,
+            prepared: resource(bounds.prepared_resource_bytes())?,
+            process: resource(bounds.device_process.bytes())?,
+            startup_additional: bounds.startup_additional_bytes,
+            component_upload: bounds.component_upload_bytes,
+            allocation,
+        })
+    }
+}
+
+impl std::fmt::Display for NeedTerms {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            weights,
+            weights_device,
+            state,
+            startup_state,
+            loaded_state,
+            graph_pools,
+            chain_places,
+            group_class,
+            recorded_graphs_device,
+            recorded_graphs_upload,
+            prepared,
+            process,
+            startup_additional,
+            component_upload,
+            allocation,
+        } = self;
+        write!(
+            formatter,
+            "weights {weights} ({weights_device} in device storage), state {state} (startup {startup_state}, loaded {loaded_state}), \
+             graph pools {graph_pools} at {chain_places} chain places, group class {group_class}, \
+             recorded graphs {recorded_graphs_device} device and {recorded_graphs_upload} upload, prepared {prepared}, process {process}, \
+             startup import {startup_additional}, component import {component_upload}, allocation {allocation}"
+        )
+    }
 }
 
 impl PlacementFigures {
     /// One event of a load's placement.
     fn report(&self) {
+        let fit = |need: &Option<Need>| need.as_ref().and_then(|need| need.fit);
+        let room = fit(&self.bank).or(fit(&self.resident)).map(|fit| fit.room);
         tracing::info!(
-            room_free = ?self.room.map(|room| room.free),
-            room_ceiling = ?self.room.map(|room| room.ceiling),
-            whole_bank_bytes = ?self.bank,
-            resident_bytes = ?self.resident,
+            room_free = ?room.map(|room| room.free),
+            room_ceiling = ?room.map(|room| room.ceiling),
+            whole_bank_bytes = ?fit(&self.bank).map(|fit| fit.needed),
+            whole_bank_short = ?fit(&self.bank).and_then(|fit| fit.short).map(NonZeroU64::get),
+            whole_bank_limiting = ?fit(&self.bank).and_then(|fit| fit.limiting),
+            whole_bank_terms = %self.bank.as_ref().map_or("none".to_owned(), |need| need.terms.to_string()),
+            resident_bytes = ?fit(&self.resident).map(|fit| fit.needed),
+            resident_short = ?fit(&self.resident).and_then(|fit| fit.short).map(NonZeroU64::get),
+            resident_limiting = ?fit(&self.resident).and_then(|fit| fit.limiting),
+            resident_terms = %self.resident.as_ref().map_or("none".to_owned(), |need| need.terms.to_string()),
+            graph_pricing = ?self.pricing,
             form = ?self.form,
-            deficit_bytes = ?self.deficit.map(NonZeroU64::get),
             "the load's experts are placed"
         );
     }
@@ -1788,7 +1898,7 @@ impl ExecutionPlanner {
                 host: device.host_tier.clone(),
                 executor: device.info.clone(),
                 reading: device.reading.clone(),
-                graph_cost: device.graph_cost.cost(),
+                graph_pricing: device.graph_cost,
             },
             components,
             load,
