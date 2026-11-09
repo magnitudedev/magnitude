@@ -4,9 +4,10 @@
 //! its kernel's domain; where its experts stream on a backend, the same of
 //! its load with them in an expert bank at its floor. A form the executor
 //! does not run is refused with a typed reason before any term is derived;
-//! a target past admission whose terms or graphs fail, or a served target
-//! whose experts a backend that streams experts refuses to stream, is a
-//! failure.
+//! a served target past admission whose terms or graphs fail, or whose
+//! experts a backend that streams experts refuses to stream, is a failure.
+//! A target that need not serve may lack a form on any backend: what it
+//! fails is listed as refused.
 
 use super::demand::DecodeDemand;
 use super::launches::Declarations;
@@ -113,12 +114,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
         let definition = match family.inspect(&target, None, identity) {
             Ok(definition) => definition,
             Err(error) => {
-                let line = format!("{name}: its family fails to inspect it: {error}");
-                if served {
-                    failures.push(line);
-                } else {
-                    refused.push(line);
-                }
+                sort(format!("{name}: its family fails to inspect it: {error}"), served, &mut failures, &mut refused);
                 continue;
             }
         };
@@ -133,12 +129,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                 // A target that must serve derives its load on every
                 // backend; another may lack a resident form.
                 Err(error) => {
-                    let line = format!("{name} {}: {error}", backend.as_str());
-                    if served {
-                        failures.push(line);
-                    } else {
-                        refused.push(line);
-                    }
+                    sort(format!("{name} {}: {error}", backend.as_str()), served, &mut failures, &mut refused);
                     continue;
                 }
             };
@@ -161,7 +152,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                     None
                 }
                 Err(error) => {
-                    failures.push(format!("{name} {} banked: {error}", backend.as_str()));
+                    sort(format!("{name} {} banked: {error}", backend.as_str()), served, &mut failures, &mut refused);
                     None
                 }
             };
@@ -173,7 +164,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                     .and_then(|load| derive_terms(&definition, &load, SELECTION, backend))
                 {
                     Ok(terms) => admitted.push(format!("{name} {} {form}: {terms}", backend.as_str())),
-                    Err(error) => failures.push(format!("{name} {} {form}: {error}", backend.as_str())),
+                    Err(error) => sort(format!("{name} {} {form}: {error}", backend.as_str()), served, &mut failures, &mut refused),
                 }
             }
         }
@@ -200,6 +191,15 @@ fn every_admitted_catalog_target_derives_complete_terms() {
                 backend.as_str()
             );
         }
+    }
+}
+
+/// Lists what a target fails: a failure where it must serve, a refusal
+/// where it need not.
+fn sort(line: String, served: bool, failures: &mut Vec<String>, refused: &mut Vec<String>) {
+    match served {
+        true => failures.push(line),
+        false => refused.push(line),
     }
 }
 
