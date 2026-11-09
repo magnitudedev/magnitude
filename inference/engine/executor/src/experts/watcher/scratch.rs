@@ -682,7 +682,7 @@ impl Scratch {
         for listed in converted {
             listed.release(&mut self.conveyor);
         }
-        let settled = self.conveyor.settle(|ticket| ticket.wait_until(Instant::now()));
+        let settled = self.conveyor.settle();
         for &(layer, ..) in &settled.landed {
             self.mark(shared, layer, Mark::Landed);
         }

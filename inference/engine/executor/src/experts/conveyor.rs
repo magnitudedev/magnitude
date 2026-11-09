@@ -158,6 +158,9 @@ pub(super) struct Conveyor {
     /// past it.
     pub serving: Option<Serving>,
     pub carrier: Carrier,
+    /// A test's hold on the group's reads ([`Self::hold_reads`]).
+    #[cfg(test)]
+    held: bool,
 }
 
 /// The order a carried expert lies in a round's list: whole first, then
@@ -185,7 +188,28 @@ impl Conveyor {
             form_of,
             serving: None,
             carrier,
+            #[cfg(test)]
+            held: false,
         }
+    }
+
+    /// While `held`, no read of the conveyor has ended as it observes them
+    /// ([`Self::ended`]): a test holds a group's reads in flight for as
+    /// long as it needs, whatever the drive's speed. A release is observed
+    /// at the load's next event.
+    #[cfg(test)]
+    pub fn hold_reads(&mut self, held: bool) {
+        self.held = held;
+    }
+
+    /// How `ticket`'s read ended, none while it runs: the one observation
+    /// settling ([`Self::settle`]) and quiet ([`Self::quiet`]) read.
+    fn ended(&self, ticket: &Ticket) -> Option<Outcome> {
+        #[cfg(test)]
+        if self.held {
+            return None;
+        }
+        ticket.wait_until(std::time::Instant::now())
     }
 
     /// The group lending the records that carry it.
@@ -321,11 +345,11 @@ impl Conveyor {
         self.reading.len()
     }
 
-    /// Settle the reads that ended (`outcome`, none while one runs): one
-    /// that landed holds its expert whole; one that failed carries nothing,
-    /// its record free. The reads that ended, the experts landed whole, and
-    /// the experts whose reads failed, with why.
-    pub fn settle(&mut self, mut outcome: impl FnMut(&Ticket) -> Option<Outcome>) -> Settled {
+    /// Settle the reads that ended ([`Self::ended`]): one that landed
+    /// holds its expert whole; one that failed carries nothing, its record
+    /// free. The reads that ended, the experts landed whole, and the experts
+    /// whose reads failed, with why.
+    pub fn settle(&mut self) -> Settled {
         let mut settled = Settled::default();
         let mut reading = std::mem::take(&mut self.reading);
         reading.retain(|&(layer, expert)| {
@@ -333,7 +357,7 @@ impl Conveyor {
                 unreachable!("expert {expert} of layer {layer} is listed as being read");
             };
             let record = *record;
-            let Some(ended) = outcome(ticket) else {
+            let Some(ended) = self.ended(ticket) else {
                 return true;
             };
             settled.ended += 1;
@@ -417,7 +441,7 @@ impl Conveyor {
     pub fn quiet(&self) -> bool {
         self.landings.is_empty()
             && !self.reading.iter().any(|&(layer, expert)| {
-                matches!(&self.carried[layer][expert], Some(State::Reading { ticket, .. }) if ticket.running())
+                matches!(&self.carried[layer][expert], Some(State::Reading { ticket, .. }) if self.ended(ticket).is_none())
             })
     }
 
