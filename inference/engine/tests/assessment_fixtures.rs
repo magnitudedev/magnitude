@@ -780,7 +780,7 @@ fn a_linked_host_tier_holds_the_slots_host_memory_admits() {
     // lie in.
     let replan = |draft: &magnitude_executor::ExecutionPlanDraft| {
         draft
-            .with_held_experts(&definition, HeldBound::of(None, draft.device().assessment_capacity_bytes()), &synthetic_prices(), &mut HeldCharges::<AssessmentMemoryCharge>::default(), unbounded, |_, _| {
+            .with_held_experts(&definition, HeldBound::of(None, draft.device().assessment_capacity_bytes()), &synthetic_prices(), magnitude_executor::Unmeasured::Waits, &mut HeldCharges::<AssessmentMemoryCharge>::default(), unbounded, |_, _| {
                 Ok::<_, AssessmentError>(Ok(()))
             })
             .unwrap()
@@ -872,7 +872,7 @@ fn a_q4_moe_on_24_gb_holds_its_bank_and_a_merged_pass() {
     };
     let prices = plan_prices(&setup.measurements, draft);
     let (planned, ()) = draft
-        .with_held_experts(definition, HeldBound::room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
+        .with_held_experts(definition, HeldBound::room(bound), &prices, magnitude_executor::Unmeasured::Waits, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |_, _| {
             Ok::<_, AssessmentError>(Ok(()))
         })
         .unwrap()
@@ -1030,7 +1030,7 @@ fn a_model_fits_resident_streamed_or_not_at_all() {
             PlanRoom { free: left, ceiling: left }
         };
         let (planned, ()) = draft
-            .with_held_experts(definition, HeldBound::room(bound), &prices, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |candidate, charge| {
+            .with_held_experts(definition, HeldBound::room(bound), &prices, magnitude_executor::Unmeasured::Waits, &mut HeldCharges::<AssessmentMemoryCharge>::default(), room, |candidate, charge| {
                 Ok::<_, AssessmentError>(match stable.fit(candidate, charge).unwrap().verdict {
                     AssessmentFitVerdict::Fits => Ok(()),
                     AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),

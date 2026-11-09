@@ -46,7 +46,8 @@ impl PlanPrices {
     /// adds are what the settle sizes, so the prior cannot read them first.
     /// Serving starts its meter at the step the bank it holds then prices
     /// (`ExecutorDomain::serving_prior`).
-    pub(crate) fn of_bank(&self, banked: &ExecutionPlanDraft, definition: &ModelDefinition) -> Result<BankPrices, PlanError> {
+    /// Pending or unavailable as its layers' lines are (`StreamedLayers::of_bank`).
+    pub(crate) fn of_bank(&self, banked: &ExecutionPlanDraft, definition: &ModelDefinition) -> Result<Priced<BankPrices>, PlanError> {
         let priced = |error: String| PlanError::ResourcePlanning(format!("the plan's prices: {error}"));
         let bank = banked.load().expert_bank().ok_or_else(|| priced("the plan holds no bank".into()))?;
         let limits = banked.policy().limits();
@@ -55,8 +56,13 @@ impl PlanPrices {
         let step = |rows: u32, depth: u32| step(rows, depth).map_err(|error| priced(error.to_string()));
         let compute = step(1, prior.decode_depth)?;
         let rates = prior.rates(compute.resident, |rows, depth| step(rows, depth).map(|step| step.resident))?;
-        Ok(BankPrices {
-            layers: measured(StreamedLayers::of_bank(bank, &self.costs, &self.figures))?,
+        let layers = match StreamedLayers::of_bank(bank, &self.costs, &self.figures) {
+            Priced::Measured(layers) => layers,
+            Priced::Pending(reason) => return Ok(Priced::Pending(reason)),
+            Priced::Unavailable(reason) => return Ok(Priced::Unavailable(reason)),
+        };
+        Ok(Priced::Measured(BankPrices {
+            layers,
             pass: ExpertPass::of_bank(bank, self.costs.clone()).map_err(|error| priced(error.to_string()))?,
             routed: bank.layers().iter().map(|layer| (layer.experts, bank.selected())).collect(),
             read: self.figures.read,
@@ -68,18 +74,32 @@ impl PlanPrices {
             // a pass the prior's half-context prompt fills would split
             // longer prompts into more passes, each reading its misses again.
             prompt_rows: definition.decoder.context_limit,
-        })
+        }))
     }
 }
 
-/// What a plan takes of an input it prices with: a pending input waits for
-/// the job, as the load does (`PlanError::Unpriced`, retried once the job
-/// stores its points); an unavailable one leaves the plan unpriced.
-pub(crate) fn measured<T>(input: Priced<T>) -> Result<T, PlanError> {
-    match input {
-        Priced::Measured(input) => Ok(input),
-        Priced::Pending(reason) => Err(PlanError::Unpriced { pending: true, reason }),
-        Priced::Unavailable(reason) => Err(PlanError::Unpriced { pending: false, reason }),
+/// How a plan's settle meets a bank's prices that are not measured: the
+/// one decision of what an unmeasured machine's plan holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unmeasured {
+    /// A load's plan: its bank waits for them (`PlanError::Unpriced`, which
+    /// every host meets by having them measured, `preview::priced`).
+    Waits,
+    /// An assessment's: the bank is sized by memory alone, the largest the
+    /// room admits at the floor pass, its host tier the most host memory
+    /// admits, and its speed is what is pending or unavailable.
+    SizedByMemory,
+}
+
+impl Unmeasured {
+    /// The prices a settle takes of `priced`: none where it sizes by memory.
+    pub(crate) fn prices<T>(self, priced: Priced<T>) -> Result<Option<T>, PlanError> {
+        match (priced, self) {
+            (Priced::Measured(prices), _) => Ok(Some(prices)),
+            (_, Self::SizedByMemory) => Ok(None),
+            (Priced::Pending(reason), Self::Waits) => Err(PlanError::Unpriced { pending: true, reason }),
+            (Priced::Unavailable(reason), Self::Waits) => Err(PlanError::Unpriced { pending: false, reason }),
+        }
     }
 }
 

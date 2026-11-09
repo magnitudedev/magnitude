@@ -579,7 +579,10 @@ fn planned_executor<'a>(
 /// domain's stable capacity, and fits so; otherwise the plan's own shortfall
 /// is the verdict. Its plans are charged from the charges planning made
 /// ([`HeldCharges`]), so a way of holding the experts planning charged is
-/// never charged from its structure again.
+/// never charged from its structure again. On a machine whose prices are
+/// not measured the fit is sized by memory alone
+/// ([`crate::Unmeasured::SizedByMemory`]): fit is assessed, and speed is
+/// what is pending.
 pub fn assess_execution_fit(
     definition: &ModelDefinition,
     prepared: &PreparedExecutionAssessment,
@@ -622,7 +625,7 @@ pub fn assess_execution_fit(
         })
     };
     let mut held = prepared.held.clone();
-    Ok(match draft.with_held_experts(definition, crate::HeldBound::room(bound), prices, &mut held, room, confirm)? {
+    Ok(match draft.with_held_experts(definition, crate::HeldBound::room(bound), prices, crate::Unmeasured::SizedByMemory, &mut held, room, confirm)? {
         Ok((held, (breakdown, domains))) => ExecutionAssessment::Fits(ExecutionFit {
             fit_context_tokens: prepared.fit_context_tokens,
             domains,

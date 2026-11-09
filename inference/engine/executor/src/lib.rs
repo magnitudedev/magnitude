@@ -130,7 +130,7 @@ pub use planning::{
     FeedForwardProgramSlot, FlightDepth, GraphSlots, HeadBinding, HeadProgramPlan, HostProcessBytes,
     HostTablePlan, ImportProgramSlot, MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding,
     MixerProgramSlot, ModelLoadPlan, NGramBinding, NoBank, PlanRoom, SettleRoom, StableRoom, NativeGraphCharge, ParallelBinding,
-    PassLaunches, PlanPrices, PlanSteps, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
+    PassLaunches, PlanPrices, PlanSteps, Unmeasured, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod, ProgramPlan,
     ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding, ResolvedPolicy,
     ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding,
     ScalableWeight, SealedGraphHostBytes, SelectionBinding, SelectionShape, SelectorBinding,
