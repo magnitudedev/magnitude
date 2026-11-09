@@ -344,6 +344,47 @@ fn row(
     Row { line, regression: main_fits && !verdict.1, panicked: false }
 }
 
+/// The chain a served target's load is placed whole on, of `context` on
+/// `machine`'s `backend` at the service's limits; none where it is not
+/// placed whole.
+fn placed_chain(target: &(String, ModelDefinition, magnitude_artifacts::PackageManifest), machine: &str, topology: &DeviceTopology, backend: BackendName, context: u64) -> Option<usize> {
+    let executor = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap();
+    let status = unopened(topology);
+    let reserves = MemoryReserves::of_machine(None);
+    let device = crate::platform::selected(topology, &status, &reserves, executor.clone(), pricing(machine, backend).unwrap()).unwrap();
+    let mut definition = target.1.clone();
+    definition.decoder.context_limit = context;
+    match plan(&definition, &target.2, &device, service(backend, &definition)).unwrap().placed::<AssessmentMemoryCharge>(&definition, None).unwrap() {
+        Placed::Whole(placed) => Some(placed.draft().policy().limits().chain_capacity.get()),
+        Placed::Short(_) => None,
+    }
+}
+
+/// LFM2.5 8B-A1B q4 on the A10-8Q's CUDA, graphs at CUDA's unmeasured
+/// bound, at the service's limits. At its declared 128,000 tokens main's
+/// charge fits (a chain of one launch), while every expert held whole at a
+/// whole-context prompt's chain of 250 launches is short of the room: the
+/// load is placed whole on the longest shorter chain the room holds. At the
+/// served floor of 32,768 it fits on its whole-context chain of 64 launches,
+/// which it keeps.
+#[test]
+fn lfm2_5_8b_on_an_a10_8q_is_placed_whole_on_the_longest_chain_its_room_holds() {
+    let target = served_targets().into_iter().find(|target| target.0 == "lfm2.5-8b-a1b:gguf:q4").expect("the catalog serves LFM2.5 8B-A1B q4");
+    let topology = recorded::a10_8q();
+    let status = unopened(&topology);
+    let executor = topology.executors().iter().find(|executor| executor.backend() == BackendName::Cuda).unwrap();
+    for (context, chain) in [(128_000, None), (SERVED_FLOOR, Some(64))] {
+        let workload = Workload { label: "service", context, limits: service(BackendName::Cuda, &target.1) };
+        let row = row(&target.0, &target.1, &target.2, "a10_8q", &topology, &status, executor, workload);
+        assert!(!row.regression && !row.panicked, "{}", row.line);
+        let placed = placed_chain(&target, "a10_8q", &topology, BackendName::Cuda, context).expect("placed whole");
+        match chain {
+            Some(chain) => assert_eq!(placed, chain, "at {context} the load keeps its whole-context chain: {}", row.line),
+            None => assert!(placed < 250, "at {context} the load runs a shorter chain than a whole-context prompt's: {}", row.line),
+        }
+    }
+}
+
 /// Every served catalog target is placed whole, fitting, on every recorded
 /// machine's every executor under every workload where the resident-only
 /// planner's charge of it fits; the table of both charges, term by term,
