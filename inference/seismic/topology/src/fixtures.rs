@@ -16,13 +16,10 @@ use crate::model::{
     Reported, ReportedBy, Reservation, Revision, StoreId, StoreKind, VolumeId,
 };
 use crate::reports::{
-    build, AdapterReport, CpuReport, CudaReport, MetalReport, Reports, VolumeReport,
+    build, AdapterReport, CpuReport, CudaMemory, CudaReport, MetalReport, Reports, VolumeReport,
     VulkanHeap, VulkanMemory, VulkanReport,
 };
 use seismic_lang::registry::BackendName;
-/// A CUDA device's memory report, which a test sets to the memory it plans
-/// against.
-pub use crate::reports::CudaMemory;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -466,12 +463,18 @@ pub const A10_8Q_LAYOUT: Layout<'static> = &[&["DL", "DL|HV|HC"]];
 
 /// RTX 3090, report 52089 (NVIDIA 615.71.09, Linux).
 pub fn rtx3090_vulkan(uuid: [u8; 16]) -> VulkanReport {
+    rtx3090_vulkan_of(uuid, RTX3090_VULKAN_HEAP)
+}
+
+/// Report 52089 with a device-local heap of `heap` bytes, each memory type
+/// on it reporting it as the report does.
+fn rtx3090_vulkan_of(uuid: [u8; 16], heap: u64) -> VulkanReport {
     vulkan(
         uuid,
         "NVIDIA GeForce RTX 3090",
         RTX3090_VULKAN_DRIVER,
         false,
-        &[(RTX3090_VULKAN_HEAP, true), (101_123_254_272, false)],
+        &[(heap, true), (101_123_254_272, false)],
         RTX3090_LAYOUT,
         NVIDIA_VULKAN_MAX_ALLOCATION,
         None,
@@ -489,6 +492,11 @@ pub fn rtx3090_vulkan(uuid: [u8; 16]) -> VulkanReport {
 
 /// CUDA's view of the RTX 3090 machine's GPU.
 pub fn rtx3090_cuda(uuid: [u8; 16], peers: Vec<[u8; 16]>) -> CudaReport {
+    rtx3090_cuda_of(uuid, peers, RTX3090_CUDA_USABLE)
+}
+
+/// CUDA's view of the RTX 3090 letting this process use `usable` bytes.
+fn rtx3090_cuda_of(uuid: [u8; 16], peers: Vec<[u8; 16]>, usable: u64) -> CudaReport {
     cuda(
         CudaReport {
             uuid,
@@ -501,7 +509,7 @@ pub fn rtx3090_cuda(uuid: [u8; 16], peers: Vec<[u8; 16]>) -> CudaReport {
             integrated: false,
             l2: Some(RTX3090_CUDA_L2),
             memory: CudaMemory::Own {
-                usable: Ok(RTX3090_CUDA_USABLE),
+                usable: Ok(usable),
             },
             peers,
             kinds: Vec::new(),
@@ -525,6 +533,37 @@ pub fn rtx3090() -> Reports {
     let mut reports = rtx3090_host();
     reports.cuda.push(rtx3090_cuda(gpu, Vec::new()));
     reports.vulkan.push(rtx3090_vulkan(gpu));
+    reports
+}
+
+/// The most the RTX 3090 grants `backend`'s device storage: the memory
+/// the backend reports of the card, CUDA's total or Vulkan's device-local
+/// heap.
+pub fn rtx3090_most_granted(backend: BackendName) -> u64 {
+    match backend {
+        BackendName::Cuda => RTX3090_CUDA_TOTAL,
+        BackendName::Vulkan => RTX3090_VULKAN_HEAP,
+        other => panic!("the RTX 3090 grants device storage on CUDA and Vulkan, not {other:?}"),
+    }
+}
+
+/// The rtx3090 machine with its RTX 3090 granting `grant` bytes to
+/// `backend`'s device storage, the grant stable fit plans against: CUDA's
+/// usable memory, or Vulkan's device-local heap, as the heap and each
+/// memory type on it report it. The other backend reports as recorded. A
+/// grant is of the memory the backend reports of the card
+/// ([`rtx3090_most_granted`]).
+pub fn rtx3090_granting(backend: BackendName, grant: u64) -> Reports {
+    let most = rtx3090_most_granted(backend);
+    assert!(grant <= most, "the RTX 3090 grants {backend:?} no more than its {most} bytes");
+    let gpu = rtx3090_uuid();
+    let mut reports = rtx3090_host();
+    let (usable, heap) = match backend {
+        BackendName::Vulkan => (RTX3090_CUDA_USABLE, grant),
+        _ => (grant, RTX3090_VULKAN_HEAP),
+    };
+    reports.cuda.push(rtx3090_cuda_of(gpu, Vec::new(), usable));
+    reports.vulkan.push(rtx3090_vulkan_of(gpu, heap));
     reports
 }
 

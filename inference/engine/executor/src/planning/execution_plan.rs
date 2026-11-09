@@ -2138,42 +2138,16 @@ mod tests {
     }
 
     /// [`recorded`] of the recorded RTX 3090 machine whose `backend` device
-    /// reports `grant` bytes of memory, the stable grant every plan and its
-    /// assessment fit into (`FitMode::Stable`): CUDA's usable memory, or
-    /// Vulkan's device-local heap, as the heap and each of its memory types
-    /// report it. The device path's grant is asserted to be it.
+    /// grants `grant` bytes (`seismic::fixtures::rtx3090_granting`), the
+    /// stable grant every plan and its assessment fit into
+    /// (`FitMode::Stable`).
     fn rtx3090_granted(
         backend: BackendName,
         host: u64,
         cost: seismic::GraphCost,
         grant: u64,
     ) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
-        let mut reports = seismic::fixtures::rtx3090();
-        match backend {
-            BackendName::Cuda => reports.cuda[0].memory = seismic::fixtures::CudaMemory::Own { usable: Ok(grant) },
-            BackendName::Vulkan => {
-                let vulkan = &mut reports.vulkan[0];
-                let heap = vulkan.memory.heaps.iter().position(|heap| heap.device_local).expect("the RTX 3090 has a device-local heap");
-                vulkan.memory.heaps[heap].bytes = grant;
-                for kind in &mut vulkan.kinds {
-                    if let seismic::KindMemory::Heap { index, bytes, .. } = &mut kind.memory {
-                        if *index == heap {
-                            *bytes = grant;
-                        }
-                    }
-                }
-            }
-            other => panic!("the RTX 3090 reports no device grant on {other:?}"),
-        }
-        let topology = seismic::fixtures::topology(&reports);
-        let info = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap();
-        let path = info.paths(seismic::Placing::Fixed(seismic::Contract::DeviceOnly))[0];
-        assert_eq!(
-            topology.access_path(path).and_then(|path| path.grant()).map(|granted| granted.value),
-            Some(grant),
-            "{backend:?}: the device path's stable grant is the memory its device reports"
-        );
-        recorded(topology, backend, host, cost)
+        recorded(seismic::fixtures::topology(&seismic::fixtures::rtx3090_granting(backend, grant)), backend, host, cost)
     }
 
     /// What the RTX 3090's recorded graphs hold on each backend: CUDA's
@@ -2409,6 +2383,45 @@ mod tests {
         assert_eq!(held_as(assessed.draft()), held_as(planned.draft()), "the assessment holds the experts as the load does");
     }
 
+    /// The stable room a plan fits into follows the grant the RTX 3090
+    /// reports on each backend: a card planned at a grant is planned at it,
+    /// not at the grant it recorded.
+    #[test]
+    fn the_stable_room_follows_the_grant_the_card_reports() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        let mut definition = routed_fixture_definition(RoutedShape { layers: 40, experts: 256, selected: 8, hidden: 2048, intermediate: 512 });
+        definition.decoder.context_limit = 4096;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        for backend in [BackendName::Cuda, BackendName::Vulkan] {
+            let granted = |grant| rtx3090_granted(backend, 64 << 30, rtx3090_graphs(backend), grant);
+            let most = seismic::fixtures::rtx3090_most_granted(backend);
+            let (_, _, _, device) = granted(most);
+            let draft = ExecutionPlanner::prepare(
+                &device,
+                &manifest,
+                &definition,
+                ComponentSelection { head: false, vision: false },
+                ExecutionPath::Native,
+                PlannedMethod::Plain,
+                KvCodec::Dense,
+                LIMITS,
+            )
+            .unwrap();
+            let whole = draft.held_whole(&definition).unwrap();
+            let charge = HeldCharges::<AssessmentMemoryCharge>::default().charge(&definition, &whole).unwrap().charge().clone();
+            let room = |grant| {
+                let (topology, status, reserves, device) = granted(grant);
+                StableRoom { topology: &topology, executor: &device.info, status: &status, reserves: &reserves }
+                    .fit_whole(&whole, &charge)
+                    .unwrap()
+                    .room
+                    .free
+            };
+            let (less, more) = (room(most - (1 << 30)), room(most));
+            assert!(less < more && more <= most, "{backend:?}: the room follows the card's grant: {less} at 1 GiB less, {more} at {most}");
+        }
+    }
+
     /// The draft's experts held as `assess_execution_fit` holds them, prices
     /// pending: from its largest plan (`with_ceiling_bank`), settled into the
     /// stable fit's bound and confirmed by its fit, sized by memory alone.
@@ -2508,7 +2521,7 @@ mod tests {
             };
             // The least grant that holds the bank so.
             let least = |holds: &dyn Fn(u64) -> bool| {
-                let (mut short, mut held) = (0u64, 64u64 << 30);
+                let (mut short, mut held) = (0u64, seismic::fixtures::rtx3090_most_granted(backend));
                 assert!(holds(held), "{backend:?}: the card holds the bank at the most it grants");
                 while held - short > 1 {
                     let mid = short + (held - short) / 2;

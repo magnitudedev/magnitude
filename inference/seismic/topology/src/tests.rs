@@ -4,9 +4,9 @@
 
 use crate::fixtures::{
     a10_8q, assert_consistent, executor, gb10, linux_host, lunar_lake, m4_pro,
-    m4_pro_without_unified_memory, placement, rtx3090, rtx3090_cuda, rtx3090_host, rtx3090_uuid,
-    rtx3090_volume, rtx3090_vulkan, ryzen_igpu_and_rtx4070, show, strix_halo_linux,
-    strix_halo_windows, topology, uuid, volume, A10_8Q_CUDA_USABLE, A10_8Q_VULKAN_HEAP, GB,
+    m4_pro_without_unified_memory, placement, rtx3090, rtx3090_cuda, rtx3090_granting, rtx3090_host,
+    rtx3090_most_granted, rtx3090_uuid, rtx3090_volume, rtx3090_vulkan, ryzen_igpu_and_rtx4070,
+    show, strix_halo_linux, strix_halo_windows, topology, uuid, volume, A10_8Q_CUDA_USABLE, A10_8Q_VULKAN_HEAP, GB,
     GB10_CUDA_TOTAL, GB10_UUID, GB10_VULKAN_HEAP, LUNAR_LAKE_HEAP, LUNAR_LAKE_UUID,
     M4_PRO_REGISTRY, M4_PRO_WORKING_SET, RTX3090_CUDA_TOTAL, RTX3090_CUDA_USABLE, RTX3090_HOST,
     RTX3090_VULKAN_DRIVER, RTX3090_VULKAN_HEAP, RTX4070_HEAP, RTX4070_UUID, RYZEN_IGPU_HEAPS,
@@ -196,6 +196,32 @@ fn only_a_record_a_chunk_holds_whole_packs() {
     );
     // A record that does not fit the rest of a chunk starts the next.
     assert_eq!(packing.at(chunks.granule - 1, 0), chunks.granule);
+}
+
+/// A machine granting a backend's device storage other bytes than it
+/// recorded grants them on that backend's device path, the grant stable fit
+/// plans against, and leaves the other backend's as recorded: a test that
+/// plans a card at a grant plans at it.
+#[test]
+fn rtx3090_granting_grants_the_backends_device_path_alone() {
+    let gpu = PhysicalIdentity::Uuid(rtx3090_uuid());
+    let grant_of = |topology: &DeviceTopology, backend| {
+        placement(topology, executor(topology, backend, &gpu), Contract::DeviceOnly)
+            .into_iter()
+            .map(|(_, grant)| grant.map(|grant| grant.value))
+            .collect::<Vec<_>>()
+    };
+    for (backend, other, recorded) in [
+        (BackendName::Cuda, BackendName::Vulkan, RTX3090_VULKAN_HEAP),
+        (BackendName::Vulkan, BackendName::Cuda, RTX3090_CUDA_USABLE),
+    ] {
+        for grant in [20 * GB, rtx3090_most_granted(backend) - GB] {
+            let topology = topology(&rtx3090_granting(backend, grant));
+            assert_consistent(&topology);
+            assert_eq!(grant_of(&topology, backend), [Some(grant)], "{backend:?} at {grant}");
+            assert_eq!(grant_of(&topology, other), [Some(recorded)], "{other:?} beside {backend:?} at {grant}");
+        }
+    }
 }
 
 #[test]
