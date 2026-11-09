@@ -75,32 +75,75 @@ impl BankRest {
     }
 }
 
-/// Warm a decode to rest before its window: `warm` steps, then more until
-/// one runs at rest. `unrested` is what the bank moved across the window
-/// just discarded, if one was: the decode is warm then, and steps on only
-/// until a step runs at rest, so no window begins inside a resize. Past
-/// `STEADY_ATTEMPTS` times the cell's warm steps the bank is taken never to
-/// rest. `step` runs one step and says what moved across it
-/// ([`BankRest::moved`]).
-pub fn warm_to_rest(
+/// The rows past its history a timed decode of `warm` warm steps, windows
+/// of `steps` and `attribution` attributed steps after its window advances
+/// at most, its discarded attempts too ([`steady_window`]): what its load's
+/// context holds beyond the history.
+pub fn decode_context_rows(warm: usize, steps: usize, attribution: usize) -> usize {
+    warm + steps + attribution + 1
+}
+
+/// A decode's one window the bank rests across, the decode never deeper
+/// than its histories by more than `warm` steps and its window: each
+/// attempt warms the decode to rest, then runs its window (`window`: what
+/// it gives, or what the bank moved across it, discarding it), and a
+/// discarded attempt's decode begins again from its histories (`rewind`),
+/// so the next runs at the depth the first did, as the bank stands.
+///
+/// The warm-up is `warm` steps (`step` one step, saying what moved across
+/// it: [`BankRest::moved`]), then more until one runs at rest, so no window
+/// begins inside a resize; each `warm` steps it begins again from the
+/// histories. A warm-up past `warm` steps is run again from them, `warm`
+/// steps whose last ran at rest, so the window follows a warm-up as the
+/// first ran. Past `STEADY_ATTEMPTS` times the cell's warm steps in one
+/// warm-up, or `STEADY_ATTEMPTS` attempts, the bank is taken never to rest.
+/// Gives the window and the discarded attempts' records, in order.
+pub fn steady_window<S, W>(
+    decode: &mut S,
     warm: usize,
-    unrested: Option<Value>,
-    mut step: impl FnMut() -> Result<Option<Value>, String>,
-) -> Result<(), String> {
-    let wanted = if unrested.is_none() { warm } else { 0 };
-    let mut moved = unrested;
-    let mut warmed = 0;
-    while warmed < wanted || moved.is_some() {
-        if warmed == STEADY_ATTEMPTS * warm.max(1) {
+    mut step: impl FnMut(&mut S) -> Result<Option<Value>, String>,
+    mut window: impl FnMut(&mut S) -> Result<Result<W, Value>, String>,
+    mut rewind: impl FnMut(&mut S) -> Result<(), String>,
+) -> Result<(W, Vec<Value>), String> {
+    let mut discarded = Vec::new();
+    loop {
+        let mut moved = None;
+        let mut warmed = 0;
+        while warmed < warm || moved.is_some() {
+            if warmed == STEADY_ATTEMPTS * warm {
+                return Err(format!(
+                    "the expert bank was not at rest after {warmed} warm decode steps: {}",
+                    moved.unwrap_or(Value::Null)
+                ));
+            }
+            if warmed > 0 && warmed % warm == 0 {
+                rewind(decode)?;
+            }
+            moved = step(decode)?;
+            warmed += 1;
+        }
+        if warmed > warm {
+            rewind(decode)?;
+            for _ in 0..warm {
+                moved = step(decode)?;
+            }
+        }
+        let outcome = match moved {
+            Some(moved) => Err(json!({ "warm": moved })),
+            None => window(decode)?,
+        };
+        match outcome {
+            Ok(window) => return Ok((window, discarded)),
+            Err(moved) => discarded.push(moved),
+        }
+        if discarded.len() == STEADY_ATTEMPTS {
             return Err(format!(
-                "the expert bank was not at rest after {warmed} warm decode steps: {}",
-                moved.unwrap_or(Value::Null)
+                "no decode window ran with the expert bank at rest in {STEADY_ATTEMPTS} attempts: {}",
+                Value::from(discarded)
             ));
         }
-        moved = step()?;
-        warmed += 1;
+        rewind(decode)?;
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -175,26 +218,86 @@ mod tests {
         assert_eq!(BankRest::moved(None, None), None);
     }
 
-    /// After a window the bank moved across (a resize still running at its
-    /// end), the decode steps on until a step runs at rest, as long as the
-    /// first warm-up may take, before the next window begins.
+    /// A decode of a history of `history` tokens, `warm` warm steps and
+    /// windows of `steps`, whose load holds `context` rows; its bank moves
+    /// across its first `unrested` steps and every window (`never`), or
+    /// none after them.
+    struct Fake {
+        history: usize,
+        steps: usize,
+        context: usize,
+        position: usize,
+        deepest: usize,
+        ran: usize,
+        unrested: usize,
+        never: bool,
+    }
+
+    impl Fake {
+        fn advance(&mut self, rows: usize) -> Result<(), String> {
+            self.position += rows;
+            self.deepest = self.deepest.max(self.position);
+            match self.position <= self.context {
+                true => Ok(()),
+                false => Err(format!("advance exceeds context capacity: {} of {}", self.position, self.context)),
+            }
+        }
+    }
+
+    fn steady(fake: &mut Fake, warm: usize) -> Result<(usize, Vec<Value>), String> {
+        let moved = json!({ "slots": [180, 181] });
+        steady_window(
+            fake,
+            warm,
+            |fake| {
+                fake.advance(1)?;
+                fake.ran += 1;
+                Ok((fake.ran <= fake.unrested).then(|| moved.clone()))
+            },
+            |fake| {
+                fake.advance(fake.steps)?;
+                fake.ran += fake.steps;
+                Ok(match fake.never {
+                    true => Err(json!({ "step": 0, "moved": moved.clone() })),
+                    false => Ok(fake.position - fake.history),
+                })
+            },
+            |fake| {
+                fake.position = fake.history;
+                Ok(())
+            },
+        )
+    }
+
+    /// A decode whose bank moves across every window, or rests only after
+    /// a long warm-up, runs no deeper than its histories, its warm steps
+    /// and its window, the context `time` sizes its load at: every
+    /// discarded attempt, and every warm-up past its warm steps, begins
+    /// again from the histories.
     #[test]
-    fn a_discarded_window_warms_on_to_rest() {
-        let moved = json!({ "resizing": [true, true] });
-        // The resize runs on for 10 steps; the cell warms 8.
-        let mut steps = 0;
-        let warmed = warm_to_rest(8, Some(moved.clone()), || {
-            steps += 1;
-            Ok((steps <= 10).then(|| moved.clone()))
-        });
-        assert_eq!((warmed, steps), (Ok(()), 11));
-        // A bank that never rests is refused past the cell's bound.
-        let mut steps = 0;
-        let refused = warm_to_rest(8, Some(moved.clone()), || {
-            steps += 1;
-            Ok(Some(moved.clone()))
-        });
-        assert!(refused.is_err());
-        assert_eq!(steps, STEADY_ATTEMPTS * 8);
+    fn a_decode_whose_bank_does_not_rest_stays_within_its_context() {
+        for (warm, steps) in [(8, 48), (0, 2), (120, 200)] {
+            let context = 4096 + decode_context_rows(warm, steps, 0);
+            let fake = |unrested, never| Fake { history: 4096, steps, context, position: 4096, deepest: 4096, ran: 0, unrested, never };
+            // Every window moved across: refused once its attempts are spent.
+            let mut never = fake(0, true);
+            let refused = steady(&mut never, warm);
+            assert!(
+                refused.as_ref().is_err_and(|error| error.starts_with("no decode window ran")),
+                "{warm} warm + {steps} steps: {refused:?}"
+            );
+            assert!(never.deepest <= context, "{warm} warm + {steps} steps reached {} of {context}", never.deepest);
+            // A warm-up three times the cell's: its window follows `warm`
+            // steps from the histories, at rest.
+            let mut slow = fake(3 * warm, false);
+            let (depth, discarded) = steady(&mut slow, warm).unwrap();
+            assert_eq!((depth, discarded.len()), (warm + steps, 0), "{warm} warm + {steps} steps");
+            assert!(slow.deepest <= context);
+        }
+        // A bank that never rests in a warm-up is refused within it.
+        let mut moving = Fake { history: 4096, steps: 48, context: 4096 + decode_context_rows(8, 48, 0), position: 4096, deepest: 4096, ran: 0, unrested: usize::MAX, never: false };
+        let refused = steady(&mut moving, 8);
+        assert!(refused.is_err_and(|error| error.starts_with("the expert bank was not at rest after 32")));
+        assert!(moving.deepest <= 4096 + 8);
     }
 }
