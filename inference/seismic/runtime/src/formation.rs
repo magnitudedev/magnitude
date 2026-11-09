@@ -578,15 +578,17 @@ mod tests {
         threads: Mutex<Vec<Option<String>>>,
     }
 
-    /// Recurse through `frames` frames of 4 KiB each, as a platform
-    /// compiler may: what a caller's stack does not hold.
+    /// Recurse, a 4 KiB frame at a time, until the stack holds `bytes`
+    /// below `start` (an address on it), as a platform compiler may: what
+    /// a caller's stack does not hold. Measured by address, not by frames,
+    /// whose size the build's optimization decides.
     #[inline(never)]
-    fn deep(frames: usize) -> u8 {
-        let pad = std::hint::black_box([frames as u8; 4096]);
-        if frames == 0 {
+    fn deep(start: usize, bytes: usize) -> u8 {
+        let pad = std::hint::black_box([1u8; 4096]);
+        if start - pad.as_ptr() as usize >= bytes {
             pad[0]
         } else {
-            deep(frames - 1).wrapping_add(pad[frames % 4096])
+            deep(start, bytes).wrapping_add(pad[4095])
         }
     }
 
@@ -625,8 +627,9 @@ mod tests {
         ) -> Result<(Names, Vec<String>), NativeCompilationError> {
             self.ran();
             if source.text == "deep" {
-                // 8 MiB of frames: four times a libtest thread's stack.
-                std::hint::black_box(deep(2048));
+                // 8 MiB of stack: four times a libtest thread's.
+                let start = std::hint::black_box(0u8);
+                std::hint::black_box(deep(&start as *const u8 as usize, 8 << 20));
             }
             self.compiles.fetch_add(1, Ordering::SeqCst);
             self.entries.fetch_add(source.entries.len(), Ordering::SeqCst);
