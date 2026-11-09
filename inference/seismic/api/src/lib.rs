@@ -2318,8 +2318,9 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
     }
 
     /// The most a single piece of the unit's work has added to the bytes
-    /// held: what an unpriced footprint is held to.
-    pub fn largest_footprint(&self) -> u64 {
+    /// held beyond the inputs it kept resident: what an unpriced footprint
+    /// is held to; none until a piece of it has been measured.
+    pub fn largest_footprint(&self) -> Option<u64> {
         self.inner.largest_footprint()
     }
 

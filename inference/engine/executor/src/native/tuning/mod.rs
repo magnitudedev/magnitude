@@ -338,7 +338,15 @@ pub const STREAMING_ROWS: u64 = 8;
 /// program has one owner that loads it or compiles it once (a result of 41
 /// priced promoting and confirming a choice by the artifact it would
 /// publish).
-pub const SEARCH_VERSION: u32 = 42;
+/// 43: a unit whose work can never start again leaves the optional work,
+/// one still undiscovered leaving the objective, and the others' search
+/// goes on; and a unit's challengers whose bytes it has not observed are
+/// held to what its pieces' operations added beyond the inputs they kept
+/// resident (a result of 42 stopped every unit's search when one unit's
+/// discovery was refused for its bytes, its other units expired with one
+/// candidate each, and held a unit's first challengers to its own input
+/// build again: 21.66 GB for a piece needing about 2.4).
+pub const SEARCH_VERSION: u32 = 43;
 /// The tuning budget of a served load: the time one first-load preparation
 /// spends tuning, on any device.
 pub const STANDARD_TUNING_BUDGET: Duration = Duration::from_secs(60);
@@ -947,8 +955,8 @@ pub(crate) trait EntrySearch<E: seismic::Entry> {
     /// Give up the formed programs the unit's search holds.
     fn give_up_programs(&mut self);
     /// The most a single piece of the unit's work has added to the bytes
-    /// held.
-    fn largest_footprint(&self) -> u64;
+    /// held; none until a piece of it has been measured.
+    fn largest_footprint(&self) -> Option<u64>;
     /// The longest single operation the unit has completed.
     fn longest_operation(&self) -> Duration;
     /// What building the inputs the unit holds took.
@@ -1017,7 +1025,7 @@ impl<E: seismic::Entry> EntrySearch<E> for seismic::NativeSearch<'static, E> {
     fn give_up_programs(&mut self) {
         seismic::NativeSearch::give_up_programs(self)
     }
-    fn largest_footprint(&self) -> u64 {
+    fn largest_footprint(&self) -> Option<u64> {
         seismic::NativeSearch::largest_footprint(self)
     }
     fn longest_operation(&self) -> Duration {
@@ -1384,8 +1392,9 @@ pub struct TuningMemory {
     /// Every piece and burst of compiles that added more to the host than
     /// it was priced at, in order: each raised its price to what it added.
     pub mispriced: Vec<Mispricing>,
-    /// The optional work stopped because nothing offered fit the bytes
-    /// free; none when it stopped for anything else.
+    /// The first piece refused for its bytes for good (its unit left the
+    /// optional work for them, or waited for them when the ending began),
+    /// as the room stood then; none when nothing was.
     pub no_room: Option<NoRoom>,
     /// The host ceiling less that growth: negative when tuning's host
     /// working set passed the load's planned host peak.
@@ -1444,14 +1453,14 @@ pub struct Mispricing {
     pub added_bytes: u64,
 }
 
-/// The stop of the optional work for bytes: with nothing in flight and the
-/// pages tuning freed returned, the smallest piece still offered did not
-/// fit what was free. It is neither the budget running out nor a unit's
-/// domain exhausted.
+/// A piece refused for its bytes for good: with nothing in flight and the
+/// pages tuning freed returned, it did not fit what was free with
+/// everything another unit could give up for it, or needed more than the
+/// optional work may ever hold. It is neither the budget running out nor a
+/// unit's domain exhausted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoRoom {
-    /// The domains the smallest piece did not fit, each as it stood at the
-    /// stop.
+    /// The domains the piece was refused in, each as it stood then.
     pub domains: Vec<Room>,
     /// What a load holds on the host that the host ceiling has no term for
     /// ([`crate::planning::HostPeak::UNPLANNED`]): each would raise the
@@ -1469,10 +1478,10 @@ pub struct Room {
     /// platform lets the engine claim of host RAM.
     pub domain: &'static str,
     pub ceiling_bytes: u64,
-    /// What tuning held in the domain, as measured, at the stop.
+    /// What tuning held in the domain, as measured, at the refusal.
     pub held_bytes: u64,
-    /// The least any refused piece was taken to add to the domain.
-    pub smallest_footprint_bytes: u64,
+    /// What the refused piece was taken to add to the domain.
+    pub footprint_bytes: u64,
     /// What the domain lacked for that piece.
     pub lacking_bytes: u64,
 }
@@ -2675,34 +2684,42 @@ trait SearchedUnit<'a> {
     fn narrow(&mut self) -> bool {
         false
     }
-    /// The optional work stopped with the unit's next piece refused for
-    /// its bytes ([`allocation::Unit::refused_for_bytes`]).
+    /// The unit's next piece was refused for its bytes for good
+    /// ([`allocation::Unit::refused_for_bytes`]).
     fn refused_for_bytes(&mut self, _: &mut Tuner<'a>) {}
-    /// The most a single piece of the unit's work has added to the bytes
-    /// held.
-    fn largest_footprint(&self) -> u64 {
-        0
+    /// The most a single piece of the unit's operations has added to the
+    /// bytes held beyond the inputs it kept resident; none until a piece
+    /// of it has been measured.
+    fn largest_footprint(&self) -> Option<u64> {
+        None
     }
     /// The load's optional work is over: report the unit's record.
     fn finish(&mut self, tuner: &mut Tuner<'a>) -> Result<(), CatalogFailure>;
 }
 
 impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
-    fn objective_ready(units: &[Self]) -> bool {
-        units.iter().all(|unit| unit.discovered())
+    fn discovered(&self) -> bool {
+        (**self).discovered()
     }
 
-    /// Freeze the objective only after every ordinary unit has measured its
-    /// baseline. Missing measurements never become zero-cost service.
-    fn refresh(units: &mut [Self], tuner: &mut Tuner<'a>) {
-        if units.iter().any(|unit| !unit.discovered()) {
-            return;
-        }
+    /// Freeze the objective over its units once each has measured its
+    /// baseline. A unit that left the objective undiscovered is not in it:
+    /// missing measurements never become zero-cost service.
+    fn refresh(units: &mut [Self], members: &[bool], tuner: &mut Tuner<'a>) {
+        assert!(
+            units
+                .iter()
+                .zip(members)
+                .all(|(unit, member)| !member || unit.discovered()),
+            "the objective is refreshed only once its units are discovered"
+        );
         let objective = &mut tuner.invocations.objective;
         let terms = objective.terms.len();
         let times = units
             .iter()
-            .map(|unit| unit.times(terms))
+            .zip(members)
+            .filter(|(_, member)| **member)
+            .map(|(unit, _)| unit.times(terms))
             .collect::<Vec<_>>();
         let weights = objective
             .terms
@@ -2712,7 +2729,12 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         objective.measured = (0..terms)
             .map(|term| times.iter().map(|unit| unit[term]).sum())
             .collect();
-        for (unit, share) in units.iter_mut().zip(shares(&times, &weights)) {
+        let units = units
+            .iter_mut()
+            .zip(members)
+            .filter(|(_, member)| **member)
+            .map(|(unit, _)| unit);
+        for (unit, share) in units.zip(shares(&times, &weights)) {
             unit.set_share(share);
             unit.reweigh(objective);
         }
@@ -2824,11 +2846,16 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
         (**self).narrow()
     }
 
+    /// The first refusal for bytes is stated as the room stood when it
+    /// was made.
     fn refused_for_bytes(&mut self, tuner: &mut Tuner<'a>) {
+        if tuner.memory.no_room.is_none() {
+            tuner.memory.no_room = Some(tuner.no_room(self));
+        }
         (**self).refused_for_bytes(tuner);
     }
 
-    fn largest_footprint(&self) -> u64 {
+    fn largest_footprint(&self) -> Option<u64> {
         (**self).largest_footprint()
     }
 
@@ -3179,7 +3206,7 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         tuner.without_room.insert(self.key.clone());
     }
 
-    fn largest_footprint(&self) -> u64 {
+    fn largest_footprint(&self) -> Option<u64> {
         self.search.largest_footprint()
     }
 
@@ -3374,9 +3401,8 @@ pub(crate) struct Tuner<'a> {
     longest: Duration,
     /// What the load's tuning has held on the device, for its report.
     memory: TuningMemory,
-    /// The units whose next piece was refused for its bytes when the
-    /// optional work stopped: their records state that stop
-    /// ([`SearchStop::NoRoom`]).
+    /// The units whose next piece was refused for its bytes for good: their
+    /// records state that stop ([`SearchStop::NoRoom`]).
     without_room: std::collections::HashSet<TuningKey>,
     /// What the platform lets the engine claim: the ceiling of what the
     /// search holds. None for a tuner given no room, which bounds nothing.
@@ -3517,64 +3543,42 @@ impl<'a> Tuner<'a> {
     fn budget(&self) -> Duration {
         self.context.settings.budget
     }
-    /// The stop of the optional work as a stop for bytes: none unless a
-    /// piece still offered when the allocator stopped was refused for its
-    /// bytes. The allocator refuses for bytes only with nothing in flight,
+    /// The room `unit`'s next piece was refused for its bytes for good in,
+    /// as it stands now: when the refusal is made, with nothing in flight,
     /// the pages tuning freed returned, and nothing left that another unit
-    /// could give up for the piece; each bounded domain is stated as it
-    /// stands now that the allocator has stopped, with the least a refused
-    /// piece was taken to add to it.
-    fn no_room(
-        &self,
-        units: &[Box<dyn SearchedUnit<'a> + 'a>],
-        report: &allocation::Report,
-    ) -> Option<NoRoom> {
+    /// could give up for the piece, or at the ending. Each bounded domain
+    /// is stated with what the piece was taken to add to it.
+    fn no_room(&self, unit: &Box<dyn SearchedUnit<'a> + 'a>) -> NoRoom {
         use allocation::Unit as _;
-        let refused = report
-            .refused
-            .iter()
-            .filter(|refused| refused.refusal == allocation::Refusal::Bytes)
-            .collect::<Vec<_>>();
-        if refused.is_empty() {
-            return None;
-        }
-        let room = |domain, ceiling: Option<u64>, held: Option<u64>, smallest: Option<u64>| {
-            let ((ceiling, held), smallest) = ceiling.zip(held).zip(smallest)?;
+        let room = |domain, ceiling: Option<u64>, held: Option<u64>, footprint: u64| {
+            let (ceiling, held) = ceiling.zip(held)?;
             Some(Room {
                 domain,
                 ceiling_bytes: ceiling,
                 held_bytes: held,
-                smallest_footprint_bytes: smallest,
-                lacking_bytes: held.saturating_add(smallest).saturating_sub(ceiling),
+                footprint_bytes: footprint,
+                lacking_bytes: held.saturating_add(footprint).saturating_sub(ceiling),
             })
         };
-        // What a refused piece is taken to add where the device allocates:
-        // its footprint, an unpriced part at the most a piece of its unit
-        // has added.
-        let charged = refused
-            .iter()
-            .map(|refused| {
-                refused
-                    .footprint
-                    .forecast(units[refused.unit].largest_footprint())
-            })
-            .min();
+        // What the piece is taken to add where the device allocates: its
+        // footprint, an unpriced part at the most a piece of its unit's
+        // operations has added.
+        let charged = unit
+            .next()
+            .expect("a unit refused for its bytes offers a piece")
+            .footprint
+            .forecast(unit.largest_footprint());
         // And on the host: the most a piece of its unit has added, with
         // what its compile holds on each of its threads.
-        let host = refused
-            .iter()
-            .map(|refused| {
-                let unit = &units[refused.unit];
-                let compile = unit.forming().map_or(0, |forming| {
-                    self.memory
-                        .compile_host_bytes
-                        .saturating_mul(seismic::Forming::threads(&forming) as u64)
-                });
-                unit.host_footprint(self)
-                    .unwrap_or(0)
-                    .saturating_add(compile)
-            })
-            .min();
+        let compile = unit.forming().map_or(0, |forming| {
+            self.memory
+                .compile_host_bytes
+                .saturating_mul(seismic::Forming::threads(&forming) as u64)
+        });
+        let host = unit
+            .host_footprint(self)
+            .unwrap_or(0)
+            .saturating_add(compile);
         let domains = [
             room(
                 "device",
@@ -3595,10 +3599,10 @@ impl<'a> Tuner<'a> {
                 host,
             ),
         ];
-        Some(NoRoom {
+        NoRoom {
             domains: domains.into_iter().flatten().collect(),
             unplanned_holders: crate::planning::HostPeak::UNPLANNED,
-        })
+        }
     }
 
     /// The preparation's worker threads, which it has until its search
@@ -4058,7 +4062,6 @@ impl<'a> Tuner<'a> {
                     }),
             );
         drop(threads);
-        self.memory.no_room = self.no_room(&units, &report);
         self.memory.ended_bytes = self
             .device
             .device_ledger()

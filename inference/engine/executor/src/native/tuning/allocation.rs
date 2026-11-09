@@ -43,10 +43,21 @@
 //!   fit, the piece worth the most first. Units keep their inputs while
 //!   pieces are narrowed to what is left.
 //!
-//! Baseline discovery precedes candidate search: all demanded units must
-//! contribute actual measurements before their relative service costs are
-//! known. Discovery is shared by elapsed effort, with preparation order
-//! breaking ties; it never assigns an invented latency to an unknown unit.
+//! Baseline discovery precedes candidate search: every unit of the
+//! objective must contribute actual measurements before their relative
+//! service costs are known. Discovery is shared by elapsed effort, with
+//! preparation order breaking ties; it never assigns an invented latency to
+//! an unknown unit.
+//!
+//! A unit that can never start again leaves the work and holds nothing of
+//! it back. When nothing can start and nothing is in flight, what remains
+//! only shrinks: a unit whose next piece was refused for its bytes, with
+//! nothing left that another unit could give up for it, and a unit of the
+//! objective still undiscovered then leave ([`Refused`]). An undiscovered
+//! unit leaves the objective too: the others' shares are fractions of what
+//! was measured, and its unmeasured points are no zero-cost service. Its
+//! prerequisites' dependants and the others' search then go on, and the
+//! allocator stops only when no unit left has work that starts.
 //!
 //! Search effort is divided by measured remaining service. A unit's next
 //! piece has virtual finish `(effort + price) / (share * opportunity)`:
@@ -168,7 +179,7 @@
 //! the load, whose piece with its own inputs needs more than the optional
 //! work may ever hold ([`Unit::capacity`]). A unit refused for bytes that
 //! others still hold keeps its inputs while other work may free them, and
-//! gives them up when the allocator stops. When
+//! gives them up when it leaves the work (above). When
 //! the chosen piece does not fit, the units not in flight give theirs up
 //! one at a time, the one whose own next work is worth least first, until
 //! it fits; a unit that gave its inputs up offers its next piece with
@@ -228,20 +239,17 @@ pub(crate) trait Unit {
     /// formed.
     type Forming;
     type Formed;
-    /// Recompute the shared served-work objective from current evidence.
-    /// Refresh performs no device work.
-    fn refresh(_units: &mut [Self], _context: &mut Self::Context)
+    /// Recompute the shared served-work objective from current evidence:
+    /// the units of the objective are those `members` marks, and every one
+    /// of them is discovered. Refresh performs no device work.
+    fn refresh(_units: &mut [Self], _members: &[bool], _context: &mut Self::Context)
     where
         Self: Sized,
     {
     }
-    /// Whether every baseline needed to compare candidates is measured.
-    fn objective_ready(_units: &[Self]) -> bool
-    where
-        Self: Sized,
-    {
-        true
-    }
+    /// Whether the unit's defaults are measured at every baseline point:
+    /// what comparing candidates across the objective needs of it.
+    fn discovered(&self) -> bool;
 
     /// The units whose current choices this unit's work reads.
     fn prerequisites(&self) -> Vec<usize> {
@@ -299,9 +307,15 @@ pub(crate) trait Unit {
     /// what it runs again and is priced with that.
     fn give_up(&mut self, _context: &mut Self::Context) {}
     /// The most a single piece of the unit's work has added to the bytes
-    /// held: what an unpriced footprint is held to.
-    fn largest_footprint(&self) -> u64 {
-        0
+    /// held beyond the inputs it kept resident: what an unpriced footprint
+    /// is held to. Inputs a piece built stay resident and are counted in
+    /// what is held from then on, so they are not counted again. A piece
+    /// measured to add 0 bytes prices them at 0, like any measure. None
+    /// while no piece of the unit has been measured: an unpriced footprint
+    /// then has no bound, and its piece runs with no other such piece in
+    /// flight.
+    fn largest_footprint(&self) -> Option<u64> {
+        None
     }
     /// The bytes the load's tuning may still take under its ceiling; none
     /// when no ceiling is known, and nothing is then bounded.
@@ -319,10 +333,11 @@ pub(crate) trait Unit {
     fn narrow(&mut self, _context: &mut Self::Context) -> bool {
         false
     }
-    /// The allocator stopped with the unit's next piece refused for its
-    /// bytes ([`Refusal::Bytes`]): nothing in flight, what is held for
-    /// nothing returned, and nothing another unit could give up for it.
-    /// Told before what the unit owes is settled, so the record it then
+    /// The unit's next piece was refused for its bytes for good
+    /// ([`Refusal::Bytes`]): the unit left the work with nothing in flight,
+    /// what is held for nothing returned, and nothing another unit could
+    /// give up for it, or the ending began with it waiting for room. Told
+    /// before what the unit owes is settled, so the record it then
     /// publishes states what stopped its search.
     fn refused_for_bytes(&mut self, _context: &mut Self::Context) {}
     /// Give back what the load holds for nothing: memory it has freed that
@@ -493,7 +508,9 @@ pub(crate) struct Report {
     pub budget: Duration,
     /// Every piece of work started, in order.
     pub admitted: Vec<Admitted>,
-    /// The work still offered when the allocator stopped: none of it fit.
+    /// The work refused for good, in order: each unit's that left the work
+    /// with a piece still offered, then the work still offered when the
+    /// allocator stopped. None of it fit.
     pub refused: Vec<Refused>,
     /// The pieces in flight when the ending began, never measured.
     pub abandoned: Vec<Abandoned>,
@@ -711,6 +728,8 @@ pub(crate) fn allocate<U: Unit>(
         ..Report::default()
     };
     let mut sealed = vec![false; units.len()];
+    // Units that left the work: none of their work can ever start again.
+    let mut departed = vec![false; units.len()];
     // Units whose next piece does not fit the bytes free with every other
     // unit's inputs given up: nothing changes that until a piece runs.
     let mut starved = vec![false; units.len()];
@@ -762,12 +781,21 @@ pub(crate) fn allocate<U: Unit>(
         if let Err(failure) = landed {
             break Err(failure);
         }
-        U::refresh(units, context);
+        // The objective is every unit still of the work and every unit that
+        // left it discovered; it is measured once each of them is.
+        let objective = (0..units.len())
+            .map(|unit| !departed[unit] || units[unit].discovered())
+            .collect::<Vec<_>>();
+        let objective_ready =
+            (0..units.len()).all(|unit| departed[unit] || units[unit].discovered());
+        if objective_ready {
+            U::refresh(units, &objective, context);
+        }
         let flying = |unit: usize| flights.iter().any(|flight| flight.unit == unit);
         let offers = units
             .iter()
             .enumerate()
-            .filter(|(unit, _)| !sealed[*unit] && !flying(*unit))
+            .filter(|(unit, _)| !sealed[*unit] && !departed[*unit] && !flying(*unit))
             .filter_map(|(unit, offered)| offered.next().map(|work| (unit, work)))
             .collect::<Vec<_>>();
         // A unit that will be given no more work, sealed or with none left,
@@ -960,10 +988,6 @@ pub(crate) fn allocate<U: Unit>(
                 && (!ahead(work)
                     || now.saturating_add(forecast(&work.forming, longest).max(compiled)) <= total)
         };
-        let objective_ready = U::objective_ready(units);
-        let discovering = offers.iter().any(|(unit, work)| {
-            work.stage == Stage::Discovery && !starved[*unit] && !barred[*unit] && fits(*unit, work)
-        });
         let (fitting, refused): (Vec<_>, Vec<_>) = offers
             .iter()
             .copied()
@@ -973,9 +997,9 @@ pub(crate) fn allocate<U: Unit>(
         // flight is abandoned, and every offer still standing is refused.
         if concluding.is_some_and(|concluding| now >= concluding) {
             let standing = fitting.into_iter().chain(refused).collect();
-            report.refused = refuse(units, context, standing, |unit| {
+            report.refused.extend(refuse(units, context, standing, |unit| {
                 starved[unit] || barred[unit]
-            });
+            }));
             break Ok(());
         }
         // When a piece's compile is due to start: so that the piece is
@@ -990,7 +1014,8 @@ pub(crate) fn allocate<U: Unit>(
             device_ends(now, before).saturating_sub(ready.saturating_sub(now))
         };
         // A compile not yet due waits, as does one whose threads are taken:
-        // the device meanwhile takes other work.
+        // the device meanwhile takes other work. Candidate work waits for
+        // the objective.
         let earliest = fitting
             .iter()
             .filter(|(unit, work)| ahead(work) && !crowded[*unit])
@@ -999,7 +1024,7 @@ pub(crate) fn allocate<U: Unit>(
             .min();
         let fitting = fitting
             .into_iter()
-            .filter(|(_, work)| work.stage == Stage::Discovery || (!discovering && objective_ready))
+            .filter(|(_, work)| work.stage == Stage::Discovery || objective_ready)
             .filter(|(unit, work)| !ahead(work) || (!crowded[*unit] && due(work) <= now))
             .filter(|(unit, _)| !alone[*unit])
             .collect::<Vec<_>>();
@@ -1038,7 +1063,7 @@ pub(crate) fn allocate<U: Unit>(
         let unpriced = choice.is_some_and(|(unit, work)| {
             let device = U::free(context).is_some()
                 && work.footprint.unpriced > 0
-                && units[unit].largest_footprint() == 0;
+                && units[unit].largest_footprint().is_none();
             let host = U::host_free(context) != HostRoom::Unbounded
                 && (units[unit].host_footprint(context).is_none()
                     || (ahead(&work) && U::compile_host(context).max(workers.compile_host()) == 0));
@@ -1265,9 +1290,33 @@ pub(crate) fn allocate<U: Unit>(
                 if narrowed {
                     continue;
                 }
-                report.refused = refuse(units, context, refused, |unit| {
-                    starved[unit] || barred[unit]
-                });
+                // What remains only shrinks: a unit whose piece was refused
+                // for its bytes, with nothing left to give up for it, and a
+                // unit of the objective still undiscovered can never start
+                // again. They leave the work, and the others go on.
+                let bytes = |unit: usize| starved[unit] || barred[unit];
+                let leaving = (0..units.len())
+                    .filter(|unit| {
+                        !departed[*unit]
+                            && (!units[*unit].discovered()
+                                || offers
+                                    .iter()
+                                    .any(|(offering, _)| offering == unit && bytes(*unit)))
+                    })
+                    .collect::<Vec<_>>();
+                if !leaving.is_empty() {
+                    let standing = offers
+                        .iter()
+                        .copied()
+                        .filter(|(unit, _)| leaving.contains(unit))
+                        .collect();
+                    report.refused.extend(refuse(units, context, standing, bytes));
+                    for unit in leaving {
+                        departed[unit] = true;
+                    }
+                    continue;
+                }
+                report.refused.extend(refuse(units, context, refused, bytes));
                 break Ok(());
             }
             // Work is in flight and nothing can start now: wait for a
@@ -1378,10 +1427,10 @@ pub(crate) fn allocate<U: Unit>(
     (report, outcome.and(settled))
 }
 
-/// Nothing more starts: every offer still `standing` is refused for good,
-/// for its bytes where `bytes` says so and otherwise for its seconds. A
-/// unit refused for its bytes is told before what it owes is settled: its
-/// record states what stopped it.
+/// Nothing more of theirs starts: every offer still `standing` is refused
+/// for good, for its bytes where `bytes` says so and otherwise for its
+/// seconds. A unit refused for its bytes is told before what it owes is
+/// settled: its record states what stopped it.
 fn refuse<U: Unit>(
     units: &mut [U],
     context: &mut U::Context,
@@ -1664,6 +1713,13 @@ mod tests {
         resident: bool,
         /// How often the unit's inputs were built.
         built: usize,
+        /// The most a piece's operations added beyond the unit's inputs:
+        /// what its discovery keeps, and what a challenger's compile holds
+        /// and leaves held; none until a piece has run.
+        largest: Option<u64>,
+        /// The unit was told its next piece was refused for its bytes for
+        /// good: its record would say so.
+        refused: bool,
         /// After discovery, the unit's pieces hold bytes of a class it has
         /// not observed: one unpriced operation each.
         unobserved: bool,
@@ -1768,6 +1824,8 @@ mod tests {
                 inputs: 0,
                 resident: false,
                 built: 0,
+                largest: None,
+                refused: false,
                 unobserved: false,
                 forms: 0,
                 kept: 0,
@@ -1827,8 +1885,16 @@ mod tests {
             self.prerequisites.clone()
         }
 
+        fn discovered(&self) -> bool {
+            self.discovered >= self.points
+        }
+
         fn share(&self) -> f64 {
             self.share
+        }
+
+        fn refused_for_bytes(&mut self, _: &mut Log) {
+            self.refused = true;
         }
 
         fn next(&self) -> Option<Work> {
@@ -1942,8 +2008,8 @@ mod tests {
             });
         }
 
-        fn largest_footprint(&self) -> u64 {
-            if self.built > 0 { self.inputs } else { 0 }
+        fn largest_footprint(&self) -> Option<u64> {
+            self.largest
         }
 
         fn free(_: &Log) -> Option<u64> {
@@ -2027,6 +2093,7 @@ mod tests {
             match work.stage {
                 Stage::Discovery => {
                     self.discovered += 1;
+                    self.largest = Some(self.largest.unwrap_or(0).max(self.kept));
                     MEMORY.with(|memory| {
                         let mut now = memory.get();
                         now.held += self.kept;
@@ -2037,6 +2104,11 @@ mod tests {
                 Stage::Form | Stage::Measure => {
                     let programs = self.program * self.challenging() as u64;
                     self.programs_held += programs;
+                    self.largest = Some(
+                        self.largest
+                            .unwrap_or(0)
+                            .max(programs + self.residue + self.garbage),
+                    );
                     MEMORY.with(|memory| {
                         let mut now = memory.get();
                         now.held += programs + self.residue + self.garbage;
@@ -3276,16 +3348,28 @@ mod tests {
 
     /// A piece whose bytes have no observed price is admitted on nothing
     /// but the room as it is, so two such pieces are never in flight
-    /// together: units whose compiles would overlap compile one at a time
-    /// while their pieces' bytes stay unpriced, and all their work still
-    /// runs.
+    /// together: units of one piece each, none of whose pieces has been
+    /// measured, compile one at a time, and all their work still runs. A piece measured to add 0 bytes prices them at 0, like any
+    /// measure: once the units' discoveries are measured adding nothing
+    /// beyond their inputs, their compiles overlap as priced ones do.
     #[test]
     fn a_piece_without_a_price_runs_with_no_other_such_piece_in_flight() {
         let clock = Fake::default();
-        let overlap = |unobserved: bool| {
-            let mut units = compiling(&clock, 3, 2, 1.);
+        let overlap = |unobserved: bool, points: usize, challengers: usize| {
+            let mut units = compiling(&clock, 3, challengers, 1.);
             for unit in &mut units {
                 unit.unobserved = unobserved;
+                unit.points = points;
+            }
+            // The setup: no piece of any unit measured, and without a
+            // discovery each unit's first piece is its unobserved one.
+            assert!(units.iter().all(|unit| unit.largest.is_none()));
+            if points == 0 {
+                assert!(units.iter().all(|unit| {
+                    let work = unit.next().expect("a unit offers its challenger");
+                    work.stage != Stage::Discovery
+                        && work.footprint.unpriced == usize::from(unobserved)
+                }));
             }
             MEMORY.with(|memory| {
                 memory.set(Memory {
@@ -3304,11 +3388,16 @@ mod tests {
             );
             MEMORY.with(Cell::take);
             outcome.expect("no synthetic work fails");
-            assert!(units.iter().all(|unit| unit.measured.len() == 2));
+            assert!(units.iter().all(|unit| unit.measured.len() == challengers));
+            // What the units' pieces were measured to add: nothing.
+            assert!(units.iter().all(|unit| unit.largest == Some(0)));
             workers.most
         };
-        assert!(overlap(false) > 1, "priced pieces' compiles overlap");
-        assert_eq!(overlap(true), 1);
+        assert!(overlap(false, 1, 2) > 1, "priced pieces' compiles overlap");
+        // No piece of the units measured: one compile at a time.
+        assert_eq!(overlap(true, 0, 1), 1);
+        // Their discoveries measured adding 0 bytes: a price, not none.
+        assert!(overlap(true, 1, 2) > 1, "a measured 0 is a price");
     }
 
     /// A unit's other forms are measured before it refines any of them;
@@ -3430,17 +3519,22 @@ mod tests {
         assert_eq!(device, SECOND * (5 + 16 + lesser.len() as u32));
     }
 
-    /// What one unit builds says nothing of another unit's work: a unit
+    /// What a build holds says nothing of an operation's bytes: a unit
     /// whose first challengers' bytes are not yet observed starts them
     /// beside a unit that made a large build, where holding each of its
     /// unobserved operations to that build would refuse it for the load.
+    /// Nor is a unit's own unobserved operation held to its own build: its
+    /// inputs stay resident and are counted in what is held, and the
+    /// operation is held to what the unit's operations added beyond them.
     #[test]
-    fn an_unobserved_piece_is_not_held_to_another_units_largest_build() {
+    fn an_unobserved_piece_is_held_to_its_units_operations_not_to_a_build() {
         let clock = Fake::default();
         let mut units = [
-            // A large build: more than is free beside it.
+            // A large build, whose discovery's operations keep 100 beyond
+            // it: 600 more on its 700 would never fit 1000.
             Synthetic {
                 inputs: 600,
+                kept: 100,
                 unobserved: true,
                 ..Synthetic::new(0, &clock, 0.1, &[1.; 3])
             },
@@ -3456,17 +3550,11 @@ mod tests {
         assert_eq!(units[1].served, 0.5);
         // Nothing was given up for it: both units' inputs were built once.
         assert_eq!((units[0].built, units[1].built), (1, 1));
-        // The large unit's own unobserved piece is held to its own build,
-        // which does not fit: it is refused for its bytes, and says so.
-        assert!(units[0].measured.is_empty());
-        assert_eq!(
-            report
-                .refused
-                .iter()
-                .map(|refused| (refused.unit, refused.refusal))
-                .collect::<Vec<_>>(),
-            [(0, Refusal::Bytes)]
-        );
+        // The large unit's unobserved pieces are held to its discovery's
+        // 100 beyond its 600 of inputs, which fit the 250 free beside both
+        // units' work: it is measured whole, and nothing is refused.
+        assert_eq!(units[0].measured.len(), 3, "{:?}", report.refused);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
     }
 
     /// Each unit whose work changed its record owes one publication when
@@ -3522,11 +3610,11 @@ mod tests {
     fn a_unit_refused_for_bytes_for_the_load_holds_nothing() {
         let clock = Fake::default();
         let mut units = [
-            // Its unobserved challenger is held to its own build: 600 on
-            // top of its 600 of inputs never fits 1000.
+            // Its challenger's compile leaves 600 held: on top of its 600
+            // of inputs that never fits 1000.
             Synthetic {
                 inputs: 600,
-                unobserved: true,
+                residue: 600,
                 ..Synthetic::new(0, &clock, 0.5, &[1.; 3])
             },
             Synthetic {
@@ -3554,6 +3642,9 @@ mod tests {
         assert_eq!(memory.peak, 600);
         assert_eq!(memory.held, 0);
         assert!(units.iter().skip(1).all(|unit| unit.measured.len() == 3));
+        // It was told, so its record states the room stopped it; the units
+        // that ran out of work were not.
+        assert_eq!(units.each_ref().map(|unit| unit.refused), [true, false, false]);
     }
 
     /// A unit refused for bytes that another unit's kept work holds keeps
@@ -3567,11 +3658,11 @@ mod tests {
                 kept: 300,
                 ..Synthetic::new(0, &clock, 0.5, &[])
             },
-            // 400 of inputs and 400 more for its unobserved challenger fit
-            // the ceiling, but not beside the other unit's 300.
+            // 400 of inputs and the 400 its challenger's compile leaves
+            // fit the ceiling, but not beside the other unit's 300.
             Synthetic {
                 inputs: 400,
-                unobserved: true,
+                residue: 400,
                 ..Synthetic::new(1, &clock, 0.5, &[1.; 3])
             },
         ];
@@ -3614,5 +3705,134 @@ mod tests {
         // it gave its inputs up before the second unit's work held more.
         assert_eq!(memory.peak, 100);
         assert_eq!(units[1].measured.len(), 4);
+    }
+
+    /// A DeepSeek load on Metal (be06f1), in tens of megabytes: under a
+    /// ceiling of 35.12 GB, routed_gate_up's discovery builds 19.25 GB of
+    /// inputs and its operations add 2.41 GB beyond them, while down,
+    /// readout_head and attention_prefill keep 7.27, 1.32 and 0.61 GB.
+    /// routed_experts' discovery then needs 24.40 GB: 0.89 GB more than the
+    /// 23.51 GB free with gate_up's inputs given up. It can never start, so
+    /// it leaves the work and the objective, told it was refused for its
+    /// bytes, and the others' search goes on. gate_up's first challengers,
+    /// whose bytes it has not observed, are held to the 2.41 GB its
+    /// operations added beyond its resident inputs, not to its 19.25 GB
+    /// build again.
+    #[test]
+    fn a_unit_discovery_cannot_fit_leaves_and_the_others_search_on() {
+        let clock = Fake::default();
+        let unit = |name, share| Synthetic::new(name, &clock, share, &[1.; 3]);
+        let mut units = [
+            Synthetic {
+                inputs: 1925,
+                kept: 241,
+                unobserved: true,
+                ..unit(0, 0.4)
+            },
+            Synthetic {
+                kept: 727,
+                ..unit(1, 0.2)
+            },
+            Synthetic {
+                kept: 132,
+                ..unit(2, 0.1)
+            },
+            Synthetic {
+                kept: 61,
+                ..unit(3, 0.1)
+            },
+            Synthetic {
+                inputs: 2440,
+                ..unit(4, 0.2)
+            },
+        ];
+        let (memory, report) = bounded(&mut units, &clock, 600, 3512);
+        assert!(memory.peak <= 3512, "{} held over 3512", memory.peak);
+        assert_eq!(
+            units[0].measured.len(),
+            3,
+            "gate_up's unpriced first piece is held to the 241 its operations \
+             added beyond its 1925 of resident inputs, which fit the 426 \
+             free; held to its build again, 1925 + 1925 = 3850 passes 3512: \
+             {:?}",
+            report.refused
+        );
+        assert!(
+            units[1..4].iter().all(|unit| unit.measured.len() == 3),
+            "down, readout_head and attention_prefill search on once \
+             routed_experts' 2440 leaves, lacking 89 of the 2351 free with \
+             gate_up's 1925 given up: {:?}",
+            report.refused
+        );
+        assert_eq!(
+            (units[4].discovered, units[4].built),
+            (0, 0),
+            "routed_experts' 2440 never fits the 3512 beside the 1161 the \
+             others keep"
+        );
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refused| (refused.unit, refused.stage, refused.refusal))
+                .collect::<Vec<_>>(),
+            [(4, Stage::Discovery, Refusal::Bytes)]
+        );
+        assert_eq!(
+            units.each_ref().map(|unit| unit.refused),
+            [false, false, false, false, true],
+            "routed_experts alone was stopped by the room, and was told"
+        );
+    }
+
+    /// A unit stopped by the room, not by the budget, is told so, and what
+    /// it can never do holds nothing of the others back: a prerequisite
+    /// whose lead's conversion needs 300 beyond the 800 its work holds
+    /// under a ceiling of 1000, with nothing another unit could give up,
+    /// leaves the work told it was refused for its bytes. Its dependant,
+    /// whose own work fits, no longer waits on that conversion until the
+    /// allocator stops: it is tuned, and is not told.
+    #[test]
+    fn a_unit_stopped_by_the_room_says_so_and_its_dependants_go_on() {
+        let clock = Fake::default();
+        let mut units = [
+            // 500 of inputs, and its challenger's compile leaves 300 held:
+            // its conversion is held to those 300, with 200 free.
+            Synthetic {
+                inputs: 500,
+                residue: 300,
+                unobserved: true,
+                ..Synthetic::new(0, &clock, 0.9, &[0.5])
+            },
+            Synthetic {
+                prerequisites: vec![0],
+                ..Synthetic::new(1, &clock, 0.1, &[0.5])
+            },
+        ];
+        let (memory, report) = bounded(&mut units, &clock, 60, 1000);
+        assert!(memory.peak <= 1000, "{} held over 1000", memory.peak);
+        assert_eq!(
+            (units[0].measured.as_slice(), units[0].served),
+            ([0.5].as_slice(), 1.),
+            "the prerequisite's lead was measured and never converted"
+        );
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refused| (refused.unit, refused.stage, refused.refusal))
+                .collect::<Vec<_>>(),
+            [(0, Stage::Promote, Refusal::Bytes)]
+        );
+        assert_eq!(
+            units[1].served, 0.5,
+            "the dependant was tuned once the prerequisite left: {:?}",
+            report.refused
+        );
+        assert_eq!(
+            units.each_ref().map(|unit| unit.refused),
+            [true, false],
+            "the unit the room stopped was told, the one tuned was not"
+        );
     }
 }

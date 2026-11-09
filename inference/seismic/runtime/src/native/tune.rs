@@ -3436,9 +3436,17 @@ pub struct UnitSearch<'m, 'a> {
     /// classes a challenger piece's and a conversion's bytes are priced by.
     measure_bytes: Observed,
     conversion_bytes: Observed,
-    /// The most a single piece of the unit's work added to the bytes held:
-    /// what an unpriced footprint is held to ([`Footprint::fits`]).
-    largest_bytes: u64,
+    /// The most a single piece of the unit's operations added to the bytes
+    /// held beyond the inputs the piece kept resident: what an unpriced
+    /// footprint is held to ([`Footprint::fits`]). A piece's inputs stay
+    /// resident and are counted in what is held from then on, so holding an
+    /// operation to their build again counted them twice: a unit's first
+    /// challengers were held to the 19.25 GB its discovery built, as a
+    /// 21.66 GB piece. None until a piece of the unit has been measured:
+    /// an unpriced footprint then has no bound, and its piece runs with no
+    /// other such piece in flight, on the room as it is. A measure of 0
+    /// bytes is a price like any other.
+    largest_bytes: Option<u64>,
     /// What compiles of this unit took: the price of every compile of it.
     formation_price: Mutex<FormationPrice>,
     time: TuningTime,
@@ -3536,7 +3544,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             resident_bytes: Vec::new(),
             measure_bytes: Observed::default(),
             conversion_bytes: Observed::default(),
-            largest_bytes: 0,
+            largest_bytes: None,
             formation_price: Mutex::new(FormationPrice::default()),
             time: TuningTime::default(),
             forming: 0.,
@@ -3929,9 +3937,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         )
     }
 
-    /// The most a single piece of this unit's work has added to the bytes
-    /// held: what [`Footprint::fits`] holds an unpriced operation to.
-    pub fn largest_footprint(&self) -> u64 {
+    /// The most a single piece of this unit's operations has added to the
+    /// bytes held beyond the inputs it kept resident: what
+    /// [`Footprint::fits`] holds an unpriced operation to; none until a
+    /// piece of it has been measured.
+    pub fn largest_footprint(&self) -> Option<u64> {
         self.largest_bytes
     }
 
@@ -4477,7 +4487,15 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             resident = self.held();
             Ok(match work.stage {
                 _ if !restored => (false, false),
-                Stage::Discovery => (self.discover(source, deadline)?, false),
+                Stage::Discovery => match self.discover(source, deadline)? {
+                    // Its inputs, once built, are resident: what the
+                    // defaults' measurement adds is over them.
+                    Some(inputs) => {
+                        resident = inputs;
+                        (true, false)
+                    }
+                    None => (false, false),
+                },
                 Stage::Form | Stage::Measure => {
                     self.measure(deadline)?;
                     (true, false)
@@ -4553,7 +4571,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     .as_ref()
                     .map_or(0, |ground| ground.validator.retained_high_water()),
         };
-        let operations = memory.peak_bytes.saturating_sub(resident) as f64;
+        // What the piece's operations added beyond the inputs it kept
+        // resident.
+        let operations = memory.peak_bytes.saturating_sub(resident);
         match work.stage {
             // The refused point was priced as its build was refused, and
             // the piece's operations did not run.
@@ -4564,10 +4584,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             }
             Stage::Form | Stage::Measure => self
                 .measure_bytes
-                .observe(operations / challengers.max(1) as f64),
-            Stage::Promote | Stage::Confirm => self.conversion_bytes.observe(operations),
+                .observe(operations as f64 / challengers.max(1) as f64),
+            Stage::Promote | Stage::Confirm => self.conversion_bytes.observe(operations as f64),
         }
-        self.largest_bytes = self.largest_bytes.max(memory.added());
+        if built {
+            self.largest_bytes = Some(self.largest_bytes.unwrap_or(0).max(operations));
+        }
         Ok(Performed {
             stage: work.stage,
             quote: work.quote,
@@ -4582,7 +4604,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     }
 
     /// Build the next discovery point and measure the defaults there; with
-    /// the last, plan the search. False when the device refused the point's
+    /// the last, plan the search. Returns what was held once the point's
+    /// inputs were built, and none when the device refused the point's
     /// build ([`build_point`]) or the measurement of its defaults
     /// ([`Exclusion::Refused`]): nothing was measured, and the point is
     /// priced at what the piece demanded.
@@ -4590,7 +4613,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         &mut self,
         source: &mut dyn PointSource<'a>,
         deadline: Deadline,
-    ) -> Result<bool, WorkError<TuneError>> {
+    ) -> Result<Option<u64>, WorkError<TuneError>> {
         let index = self
             .undiscovered()
             .expect("discovery has an unmeasured point");
@@ -4608,9 +4631,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             &mut self.resident_bytes[index],
         )?
         else {
-            return Ok(false);
+            return Ok(None);
         };
         let built = building.elapsed().as_secs_f64();
+        let resident = self.held();
         self.builds[index].observe(built);
         self.time.building_seconds += built;
         let ground = self
@@ -4668,7 +4692,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             })) => {
                 let taken = before.saturating_sub(available);
                 self.resident_bytes[index].observe(taken.saturating_add(required) as f64);
-                return Ok(false);
+                return Ok(None);
             }
             Err(WorkError::Failed(exclusion)) => {
                 return Err(TuneError::DefaultUnusable(exclusion).into());
@@ -4692,7 +4716,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             self.longest = self.longest.max(planning.elapsed().as_secs_f64());
             opened?;
         }
-        Ok(true)
+        Ok(Some(resident))
     }
 
     /// Every discovery point is measured: fix the objective and plan the

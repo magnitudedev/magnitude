@@ -138,9 +138,15 @@ impl Footprint {
     }
 
     /// What the work is taken to add: its priced bytes, with each unpriced
-    /// operation at `largest`, the most a single piece of work of this load
-    /// has added.
-    pub fn forecast(&self, largest: u64) -> u64 {
+    /// operation at `largest`, the most a single piece of the unit's work
+    /// has been measured to add, 0 bytes being such a measure. None while no
+    /// piece of it has been measured: its unpriced operations then have no
+    /// bound, and are taken at its priced bytes alone; its piece runs with
+    /// no other such piece in flight, on the room as it is.
+    pub fn forecast(&self, largest: Option<u64>) -> u64 {
+        let Some(largest) = largest else {
+            return self.priced;
+        };
         u64::try_from(self.unpriced)
             .ok()
             .and_then(|unpriced| largest.checked_mul(unpriced))
@@ -152,7 +158,7 @@ impl Footprint {
     /// `free`, the bytes its device's memory plan leaves for it. A device
     /// without a plan (`None`) bounds nothing: what is known of it is that
     /// no limit is enforced, and no number is put in its place.
-    pub fn fits(&self, free: Option<u64>, largest: u64) -> bool {
+    pub fn fits(&self, free: Option<u64>, largest: Option<u64>) -> bool {
         free.is_none_or(|free| self.forecast(largest) <= free)
     }
 }

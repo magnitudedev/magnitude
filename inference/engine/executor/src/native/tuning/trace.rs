@@ -537,7 +537,7 @@ fn host_admission(memory: &super::TuningMemory) -> Value {
                 "domain": room.domain,
                 "ceiling_bytes": room.ceiling_bytes,
                 "held_bytes": room.held_bytes,
-                "smallest_footprint_bytes": room.smallest_footprint_bytes,
+                "footprint_bytes": room.footprint_bytes,
                 "lacking_bytes": room.lacking_bytes,
             })).collect::<Vec<_>>(),
             "unplanned_holders": stop.unplanned_holders,

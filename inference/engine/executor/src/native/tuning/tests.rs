@@ -1280,8 +1280,8 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
 
     fn give_up_programs(&mut self) {}
 
-    fn largest_footprint(&self) -> u64 {
-        0
+    fn largest_footprint(&self) -> Option<u64> {
+        None
     }
 
     fn longest_operation(&self) -> Duration {
