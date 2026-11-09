@@ -1746,9 +1746,7 @@ mod tests {
     /// The recorded RTX 3090 with `host` bytes of host RAM free, CUDA's
     /// pooled graph memory as it measured it.
     fn rtx3090(host: u64) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
-        // CUDA's pooled driver memory as the RTX 3090 measured it.
-        let cost = seismic::GraphCost::Pooled { graph: 92_663, launch: 8_102, granule: 2 << 20 };
-        recorded(seismic::fixtures::recorded::rtx3090(), BackendName::Cuda, host, cost)
+        recorded(seismic::fixtures::recorded::rtx3090(), BackendName::Cuda, host, RTX3090_CUDA_GRAPHS)
     }
 
     /// `topology`'s `backend` executor with `host` bytes of host RAM free,
@@ -1759,27 +1757,8 @@ mod tests {
         host: u64,
         cost: seismic::GraphCost,
     ) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
-        recorded_granted(topology, backend, host, cost, None)
-    }
-
-    /// [`recorded`] with the executor's device path granted `grant` bytes
-    /// (a Vulkan heap's budget left, `VK_EXT_memory_budget`), where given.
-    fn recorded_granted(
-        topology: seismic::DeviceTopology,
-        backend: BackendName,
-        host: u64,
-        cost: seismic::GraphCost,
-        grant: Option<u64>,
-    ) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
         use crate::platform::{GraphPricing, MemoryReserves};
         let info = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap().clone();
-        let grants = grant
-            .map(|bytes| {
-                let path = info.paths(seismic::Placing::Fixed(seismic::Contract::DeviceOnly))[0];
-                (path, Ok(seismic::Reported::new(bytes, seismic::ReportedBy::VulkanHeapBudget)))
-            })
-            .into_iter()
-            .collect();
         let status = seismic::Status {
             sample: seismic::Sample {
                 taken: std::time::SystemTime::now(),
@@ -1796,13 +1775,67 @@ mod tests {
                 }),
                 volumes: Vec::new(),
                 executors: topology.executors().iter().map(|executor| executor.id()).collect(),
-                grants,
+                grants: Vec::new(),
             },
             runtime: Default::default(),
         };
         let reserves = MemoryReserves::of_machine(None);
         let device = crate::platform::selected(&topology, &status, &reserves, info, GraphPricing::Measured(cost)).unwrap();
         (topology, status, reserves, device)
+    }
+
+    /// [`recorded`] of the recorded RTX 3090 machine whose `backend` device
+    /// reports `grant` bytes of memory, the stable grant every plan and its
+    /// assessment fit into (`FitMode::Stable`): CUDA's usable memory, or
+    /// Vulkan's device-local heap, as the heap and each of its memory types
+    /// report it. The device path's grant is asserted to be it.
+    fn rtx3090_granted(
+        backend: BackendName,
+        host: u64,
+        cost: seismic::GraphCost,
+        grant: u64,
+    ) -> (seismic::DeviceTopology, seismic::Status, crate::platform::MemoryReserves, crate::platform::SelectedDevice) {
+        let mut reports = seismic::fixtures::rtx3090();
+        match backend {
+            BackendName::Cuda => reports.cuda[0].memory = seismic::fixtures::CudaMemory::Own { usable: Ok(grant) },
+            BackendName::Vulkan => {
+                let vulkan = &mut reports.vulkan[0];
+                let heap = vulkan.memory.heaps.iter().position(|heap| heap.device_local).expect("the RTX 3090 has a device-local heap");
+                vulkan.memory.heaps[heap].bytes = grant;
+                for kind in &mut vulkan.kinds {
+                    if let seismic::KindMemory::Heap { index, bytes, .. } = &mut kind.memory {
+                        if *index == heap {
+                            *bytes = grant;
+                        }
+                    }
+                }
+            }
+            other => panic!("the RTX 3090 reports no device grant on {other:?}"),
+        }
+        let topology = seismic::fixtures::topology(&reports);
+        let info = topology.executors().iter().find(|executor| executor.backend() == backend).unwrap();
+        let path = info.paths(seismic::Placing::Fixed(seismic::Contract::DeviceOnly))[0];
+        assert_eq!(
+            topology.access_path(path).and_then(|path| path.grant()).map(|granted| granted.value),
+            Some(grant),
+            "{backend:?}: the device path's stable grant is the memory its device reports"
+        );
+        recorded(topology, backend, host, cost)
+    }
+
+    /// What the RTX 3090's recorded graphs hold on each backend: CUDA's
+    /// pooled driver memory as the card measured it, and Vulkan's argument
+    /// chunks as the recorded engine tests take them.
+    const RTX3090_CUDA_GRAPHS: seismic::GraphCost = seismic::GraphCost::Pooled { graph: 92_663, launch: 8_102, granule: 2 << 20 };
+    const RTX3090_VULKAN_GRAPHS: seismic::GraphCost = seismic::GraphCost::Chunked { launch: 0, chunk: 256 << 10 };
+
+    /// The RTX 3090's graph cost on `backend`.
+    fn rtx3090_graphs(backend: BackendName) -> seismic::GraphCost {
+        match backend {
+            BackendName::Cuda => RTX3090_CUDA_GRAPHS,
+            BackendName::Vulkan => RTX3090_VULKAN_GRAPHS,
+            other => panic!("the RTX 3090's graphs are measured on CUDA and Vulkan, not {other:?}"),
+        }
     }
 
     /// Gemma 26B q4's routed shape on the recorded RTX 3090 (24 GB, CUDA,
@@ -1972,17 +2005,17 @@ mod tests {
     }
 
     /// Qwen3.6 35B-A3B q4's routed shape at 4k on the RTX 3090's Vulkan
-    /// executor, its device heap's budget as the card grants it
+    /// executor, its device-local heap reported as the card's budget
     /// (`VK_EXT_memory_budget`, 25,336,446,976 bytes left, read on the
-    /// card), planned as the load plans it before the executor's costs are
-    /// measured: the room holds
-    /// its experts whole, so the load holds them whole, in a whole bank or
-    /// none, never a partial bank that streams what the room holds.
+    /// card) and its graphs as the RTX 3090's are taken (`RTX3090_VULKAN_GRAPHS`), planned as the load
+    /// plans it before the executor's costs are measured: the room holds its
+    /// experts whole, so the load holds them whole, in a whole bank or none,
+    /// never a partial bank that streams what the room holds.
     #[test]
     fn qwen36_q4_on_a_vulkan_3090_at_its_budget_holds_no_partial_bank() {
         use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
         let (_, _, _, device) =
-            recorded_granted(seismic::fixtures::recorded::rtx3090(), BackendName::Vulkan, 64 << 30, seismic::GraphCost::None, Some(25_336_446_976));
+            rtx3090_granted(BackendName::Vulkan, 64 << 30, RTX3090_VULKAN_GRAPHS, 25_336_446_976);
         let mut definition = routed_fixture_definition(RoutedShape { layers: 40, experts: 256, selected: 8, hidden: 2048, intermediate: 512 });
         definition.decoder.context_limit = 4096;
         let manifest = gemma_moe_fixture_manifest(&definition);
@@ -2014,6 +2047,140 @@ mod tests {
         let planned = draft.with_bank::<AssessmentMemoryCharge>(&definition, None, &prices).unwrap();
         if let Some(bank) = planned.draft().load().expert_bank() {
             assert_eq!((bank.slots, bank.ceiling), (256, 256), "a bank of the experts the room holds whole is whole");
+        }
+    }
+
+    /// The draft's experts held as `assess_execution_fit` holds them, prices
+    /// pending: from its largest plan (`with_ceiling_bank`), settled into the
+    /// stable fit's bound and confirmed by its fit, sized by memory alone.
+    fn assessed_as_fit(definition: &ModelDefinition, draft: ExecutionPlanDraft) -> ChargedDraft {
+        let ceiling = draft.with_ceiling_bank::<AssessmentMemoryCharge>(definition, None).unwrap();
+        let room = StableRoom::of(&ceiling.draft.device);
+        let fit = room.fit(&ceiling.draft, ceiling.charge.charge()).unwrap();
+        if matches!(fit.verdict, super::super::AssessmentFitVerdict::Fits) {
+            return ceiling;
+        }
+        let confirm = |candidate: &ExecutionPlanDraft, charge: &AssessmentMemoryCharge| {
+            Ok::<_, PlanError>(match room.fit(candidate, charge)?.verdict {
+                super::super::AssessmentFitVerdict::Fits => Ok(()),
+                super::super::AssessmentFitVerdict::DoesNotFit { deficit_bytes, .. } => Err(deficit_bytes),
+            })
+        };
+        let pending = Priced::Pending("the executor's costs are not measured yet".into());
+        let mut held = ceiling.held.clone();
+        let (assessed, ()) = ceiling
+            .draft
+            .with_held_experts(definition, HeldBound::room(fit.settle_bound().unwrap()), &pending, crate::Unmeasured::SizedByMemory, &mut held, room, confirm)
+            .unwrap()
+            .unwrap_or_else(|no| panic!("the assessment finds no plan: {no:?}"));
+        assessed
+    }
+
+    /// Qwen3.6 35B-A3B q4's routed shape at 4k on the recorded RTX 3090, on
+    /// CUDA and on Vulkan, its graphs as the RTX 3090's are taken (`rtx3090_graphs`), its device
+    /// reporting memory between the least grant
+    /// at which admission's fit holds a bank of every expert and the least at
+    /// which every slot also fits the settle's room beside the bank's
+    /// mandatory part (the bank at its floor), both derived here and
+    /// asserted of the draft planned at that grant: before any price is
+    /// measured, the load and its assessment hold the bank whole, as
+    /// admission fits it, never waiting on the prices a partial bank
+    /// settles on.
+    #[test]
+    fn a_bank_admission_holds_whole_is_held_whole_before_any_price() {
+        use crate::planning::fixtures::{LIMITS, RoutedShape, gemma_moe_fixture_manifest, routed_fixture_definition};
+        use super::super::AssessmentFitVerdict::Fits;
+        let mut definition = routed_fixture_definition(RoutedShape { layers: 40, experts: 256, selected: 8, hidden: 2048, intermediate: 512 });
+        definition.decoder.context_limit = 4096;
+        let manifest = gemma_moe_fixture_manifest(&definition);
+        for backend in [BackendName::Cuda, BackendName::Vulkan] {
+            let granted = |grant: Option<u64>| match grant {
+                Some(grant) => rtx3090_granted(backend, 64 << 30, rtx3090_graphs(backend), grant),
+                None => recorded(seismic::fixtures::recorded::rtx3090(), backend, 64 << 30, rtx3090_graphs(backend)),
+            };
+            let prepare = |device: &crate::platform::SelectedDevice| {
+                ExecutionPlanner::prepare(
+                    device,
+                    &manifest,
+                    &definition,
+                    ComponentSelection { head: false, vision: false },
+                    ExecutionPath::Native,
+                    PlannedMethod::Plain,
+                    KvCodec::Dense,
+                    LIMITS,
+                )
+                .unwrap()
+            };
+            // A bank of every expert at its smallest pass with its charge,
+            // its mandatory part's charge, and what its slots hold beyond
+            // the floor's.
+            let whole_bank = |draft: &ExecutionPlanDraft| {
+                let mut held = HeldCharges::<AssessmentMemoryCharge>::default();
+                let bound = HeldBound::of(None, draft.device.assessment_capacity_bytes);
+                let BankCeiling { whole, ceiling, .. } = draft.bank_ceiling(&definition, bound).unwrap().unwrap();
+                let experts = whole.bank().slots;
+                assert_eq!(ceiling, experts, "{backend:?}: the bound holds a bank of every expert");
+                let reserved = |slots| whole.bank().resident_charge(slots).map_err(PlanError::ResourcePlanning);
+                let floor = rising(whole.bank().floor(), experts, &reserved).unwrap()[0];
+                let bank = whole.resized(experts, experts, PassLaunches::FLOOR).unwrap();
+                let mandatory = whole.resized(floor, experts, PassLaunches::FLOOR).unwrap();
+                let charge = held.charge(&definition, &bank).unwrap();
+                let floor_charge = held.charge(&definition, &mandatory).unwrap();
+                (bank, charge, floor_charge, reserved(experts).unwrap() - reserved(floor).unwrap())
+            };
+            type WholeBank = (ExecutionPlanDraft, AssessmentMemoryCharge, AssessmentMemoryCharge, u64);
+            // Whether the card granted `grant` holds the bank as admission
+            // fits it, and as 280dd4f52's check did: every slot within the
+            // settle's room beside the mandatory part, and the bank's charge
+            // there, and admission's fit.
+            let admits = |grant: u64, (bank, charge, _, _): &WholeBank| {
+                let (topology, status, reserves, device) = granted(Some(grant));
+                let room = StableRoom { topology: &topology, executor: &device.info, status: &status, reserves: &reserves };
+                matches!(room.fit(bank, charge).unwrap().verdict, Fits)
+            };
+            let beside_mandatory = |grant: u64, (bank, charge, floor_charge, grown): &WholeBank| {
+                let (topology, status, reserves, device) = granted(Some(grant));
+                let room = StableRoom { topology: &topology, executor: &device.info, status: &status, reserves: &reserves };
+                let mandatory = ExecutionPlanDraft::allocated(floor_charge).unwrap();
+                let beside = room.room(floor_charge, mandatory).unwrap();
+                let left = beside.free.min(beside.ceiling);
+                let needed = ExecutionPlanDraft::allocated(charge).unwrap();
+                *grown <= left && needed.saturating_sub(mandatory) <= left && matches!(room.fit(bank, charge).unwrap().verdict, Fits)
+            };
+            // The least grant that holds the bank so.
+            let least = |holds: &dyn Fn(u64) -> bool| {
+                let (mut short, mut held) = (0u64, 64u64 << 30);
+                assert!(holds(held), "{backend:?}: the card holds the bank at the most it grants");
+                while held - short > 1 {
+                    let mid = short + (held - short) / 2;
+                    match holds(mid) {
+                        true => held = mid,
+                        false => short = mid,
+                    }
+                }
+                held
+            };
+            let bank = whole_bank(&prepare(&granted(None).3));
+            let (admitted, old) = (least(&|grant| admits(grant, &bank)), least(&|grant| beside_mandatory(grant, &bank)));
+            assert!(
+                admitted < old,
+                "{backend:?}: admission holds the bank from {admitted} bytes, the room beside its mandatory part from {old}"
+            );
+            let grant = admitted + (old - admitted) / 2;
+            // The setup's precondition, of the draft planned at the grant.
+            let draft = prepare(&granted(Some(grant)).3);
+            let bank = whole_bank(&draft);
+            assert!(admits(grant, &bank), "{backend:?}: admission holds the bank at {grant} bytes");
+            assert!(!beside_mandatory(grant, &bank), "{backend:?}: the room beside its mandatory part does not at {grant} bytes");
+            let pending = Priced::Pending("the executor's costs are not measured yet".into());
+            let whole = |planned: &ExecutionPlanDraft| planned.load().expert_bank().map(|bank| (bank.slots, bank.ceiling, bank.host_slots));
+            let planned = draft
+                .clone()
+                .with_bank::<AssessmentMemoryCharge>(&definition, None, &pending)
+                .unwrap_or_else(|error| panic!("{backend:?}: the load is held before any price is measured: {error:?}"));
+            assert_eq!(whole(planned.draft()), Some((256, 256, 0)), "{backend:?}: the load holds the bank whole");
+            let assessed = assessed_as_fit(&definition, draft);
+            assert_eq!(whole(assessed.draft()), Some((256, 256, 0)), "{backend:?}: its assessment holds the bank whole");
         }
     }
 

@@ -16,10 +16,13 @@ use crate::model::{
     Reported, ReportedBy, Reservation, Revision, StoreId, StoreKind, VolumeId,
 };
 use crate::reports::{
-    build, AdapterReport, CpuReport, CudaMemory, CudaReport, MetalReport, Reports, VolumeReport,
+    build, AdapterReport, CpuReport, CudaReport, MetalReport, Reports, VolumeReport,
     VulkanHeap, VulkanMemory, VulkanReport,
 };
 use seismic_lang::registry::BackendName;
+/// A CUDA device's memory report, which a test sets to the memory it plans
+/// against.
+pub use crate::reports::CudaMemory;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
