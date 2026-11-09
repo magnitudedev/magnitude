@@ -503,6 +503,8 @@ mod resource_template_tests {
     struct Charged {
         reservation: u64,
         family: u64,
+        /// The largest workspace of the block's exact 512-row classes.
+        largest: u64,
         listed: Vec<u64>,
         unlisted: u64,
     }
@@ -598,6 +600,7 @@ mod resource_template_tests {
             listings.tiles.is_empty(),
             !(tensor_operations || matches!(head_width, 128 | 256 | 512))
         );
+        let mut most = 0;
         for class in block_classes(BlockKeeps::History, 512, 512, max_segments, &listings, false)
         {
             let (graph, _, _) = checked_block_graph_draft(
@@ -620,6 +623,7 @@ mod resource_template_tests {
                 layout.storage_bytes()
             );
             assert!(layout.storage_bytes().workspace <= family);
+            most = most.max(layout.storage_bytes().workspace);
         }
         let class = |listed| {
             checked_block_graph_resources(
@@ -653,6 +657,7 @@ mod resource_template_tests {
         Charged {
             reservation: history.rows as u64,
             family,
+            largest: most,
             listed: listings.tiles.iter().map(|&tiles| class(tiles)).collect(),
             unlisted: class(0),
         }
@@ -660,12 +665,11 @@ mod resource_template_tests {
 
     /// An attention block's graph scratch follows neither the store's
     /// reservation of history rows (an address-space ceiling from the
-    /// device's bytes) nor the context limit, and listing a launch's history
-    /// row tiles adds nothing to it: on Metal over K8/V4 history every
-    /// 512-row class that lists tiles is charged what the class that lists
-    /// none is (the DIRECT and COISSUE forms decode into the rows of the
-    /// partial outputs their key partitions leave), so the family holds the
-    /// same bytes with and without tensor operations.
+    /// device's bytes) nor the context limit: on Metal over K8/V4 history
+    /// every 512-row class that lists tiles is charged at least what the
+    /// class that lists none is, each over the configurations it admits, and
+    /// the family, its largest class's, holds the same bytes with and
+    /// without tensor operations.
     #[test]
     fn attention_graph_scratch_follows_neither_the_reservation_nor_the_context() {
         for heads in [(4, 256), (1, 128), (2, 128), (1, 256), (2, 512), (4, 512)] {
@@ -675,13 +679,23 @@ mod resource_template_tests {
                 let large = charged(heads, context, 256 << 30, true);
                 assert!(large.reservation > small.reservation);
                 assert!(!small.listed.is_empty());
+                eprintln!(
+                    "kv heads and width {heads:?}, context {context}, reservation {} / {} rows: family {} bytes, largest class {} bytes, 512-row attention class {} bytes listing none and {:?} listing",
+                    small.reservation,
+                    large.reservation,
+                    small.family,
+                    small.largest,
+                    small.unlisted,
+                    small.listed
+                );
+                assert_eq!(small.family, small.largest, "{heads:?} at {context}: the family's workspace is its largest class's");
                 for &listed in small
                     .listed
                     .iter()
                     .chain(&large.listed)
                     .chain(&plain.listed)
                 {
-                    assert_eq!(listed, small.unlisted, "{heads:?} at {context}");
+                    assert!(listed >= small.unlisted, "{heads:?} at {context}: a listing class {listed} below the unlisted {}", small.unlisted);
                 }
                 assert_eq!(
                     (small.family, small.unlisted),
@@ -695,14 +709,6 @@ mod resource_template_tests {
                 assert_eq!(
                     charged(heads, context, 256 << 30, false).family,
                     plain.family
-                );
-                eprintln!(
-                    "kv heads and width {heads:?}, context {context}, reservation {} / {} rows: family {} bytes, 512-row attention class {} bytes in {} listing classes and the one listing none",
-                    small.reservation,
-                    large.reservation,
-                    small.family,
-                    small.unlisted,
-                    small.listed.len()
                 );
             }
         }

@@ -2920,18 +2920,30 @@ impl NativeGraphResourceTemplate {
                 implementation
                     .scratch
                     .iter()
-                    .map(|buffer| {
+                    .enumerate()
+                    .map(|(index, buffer)| {
                         let reads = buffer.dimensions();
                         let reads = reads.iter().map(String::as_str).collect::<Vec<_>>();
                         maximum(&reads, &|point| {
-                            buffer
-                                .maximum_bytes(&implementation.params, &|name| {
-                                    point
-                                        .iter()
-                                        .find(|(candidate, _)| *candidate == name)
-                                        .map(|(_, value)| *value)
-                                })
-                                .map_err(|error| format!("scratch `{}`: {error}", buffer.name))
+                            // The class point's dimensions over the call's
+                            // own (its statics among them).
+                            let dimension = |name: &str| {
+                                point
+                                    .iter()
+                                    .find(|(candidate, _)| *candidate == name)
+                                    .map(|(_, value)| *value)
+                                    .or_else(|| {
+                                        source
+                                            .dimensions
+                                            .iter()
+                                            .find(|(candidate, _)| candidate == name)
+                                            .map(|(_, value)| *value)
+                                    })
+                            };
+                            implementation
+                                .scratch_bound(&dimension)
+                                .map(|bound| bound[index])
+                                .map_err(|error| error.to_string())
                         })
                         .map(|bytes| {
                             seismic_runtime::native::ScratchNeed {
@@ -2956,69 +2968,6 @@ impl NativeGraphResourceTemplate {
                 inner: Arc::new(inner),
             })
             .map_err(NativeGraphMetadataError::Workflow)
-    }
-}
-
-fn checked_native_scratch_bound(
-    scratch_buffers: &[NativeScratch],
-    tuning_parameters: &[NativeParameter],
-    dimensions: &[(&str, u64)],
-) -> Result<Vec<seismic_runtime::native::ScratchNeed>, String> {
-    scratch_buffers
-        .iter()
-        .map(|scratch| {
-            scratch
-                .maximum_bytes(tuning_parameters, &|name| {
-                    dimensions
-                        .iter()
-                        .find(|(candidate, _)| *candidate == name)
-                        .map(|(_, value)| *value)
-                })
-                .map(|bytes| seismic_runtime::native::ScratchNeed {
-                    bytes,
-                    sync: scratch.sync,
-                })
-        })
-        .collect::<Result<_, _>>()
-        .map_err(|error| error.to_string())
-}
-
-#[cfg(test)]
-mod metadata_scratch_tests {
-    use super::*;
-    use seismic_lang::checked::NativeParameterRole;
-
-    #[test]
-    fn scratch_bound_covers_conditional_tuning_choices() {
-        let parameter = NativeParameter {
-            name: "tile".into(),
-            code: false,
-            arithmetic: false,
-            form: false,
-            values: vec![1, 4],
-            default: seismic_lang::checked::NativeDefault::Value(NativeNatExpr::Constant(1)),
-            role: NativeParameterRole::Declared,
-        };
-        let scratch = NativeScratch {
-            name: "staged".into(),
-            bytes: NativeNatExpr::Mul(
-                Box::new(NativeNatExpr::Dimension("D".into())),
-                Box::new(NativeNatExpr::Parameter("tile".into())),
-            ),
-            sync: false,
-            when: Some(NativeCondition::Compare {
-                comparison: NativeComparison::Gt,
-                left: NativeNatExpr::Parameter("tile".into()),
-                right: NativeNatExpr::Constant(1),
-            }),
-        };
-        assert_eq!(
-            checked_native_scratch_bound(&[scratch], &[parameter], &[("D", 4)]).unwrap(),
-            vec![seismic_runtime::native::ScratchNeed {
-                bytes: 16,
-                sync: false
-            }]
-        );
     }
 }
 
@@ -3520,14 +3469,26 @@ impl NativeGraphMetadata {
                 )));
             }
         }
-        let scratch = checked_native_scratch_bound(
-            &implementation.scratch,
-            &implementation.params,
-            dimensions,
-        )
-        .map_err(|reason| {
-            NativeGraphMetadataError::Unsupported(format!("`{}` scratch bound: {reason}", E::NAME))
-        })?;
+        let scratch = implementation
+            .scratch_bound(&|name| {
+                dimensions
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name)
+                    .map(|(_, value)| *value)
+            })
+            .map_err(|reason| {
+                NativeGraphMetadataError::Unsupported(format!(
+                    "`{}` scratch bound at {dimensions:?}: {reason}",
+                    E::NAME
+                ))
+            })?
+            .into_iter()
+            .zip(&implementation.scratch)
+            .map(|(bytes, buffer)| seismic_runtime::native::ScratchNeed {
+                bytes,
+                sync: buffer.sync,
+            })
+            .collect();
         let node = Arc::new(CheckedNode {
             parameters: parameters
                 .into_iter()

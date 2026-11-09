@@ -2400,60 +2400,20 @@ impl NativeCondition {
 }
 
 impl NativeScratch {
-    /// The largest charge of this buffer at exact dimension values over
-    /// every declared tuning choice it reads. A buffer whose guard does not
-    /// hold keeps its ABI slot at the minimum charge of one byte.
-    pub fn maximum_bytes(
+    /// This buffer's charge in one configuration: its bytes at the
+    /// dimension and parameter values, or the minimum charge of one byte
+    /// (its ABI slot) when its guard does not hold.
+    pub fn charge(
         &self,
-        tuning_parameters: &[NativeParameter],
         dimension: &impl Fn(&str) -> Option<u64>,
+        parameter: &impl Fn(&str) -> Option<u64>,
     ) -> Result<u64, NativeEvalError> {
-        fn largest(
-            scratch: &NativeScratch,
-            dimension: &impl Fn(&str) -> Option<u64>,
-            parameters: &[&NativeParameter],
-            values: &mut Vec<u64>,
-        ) -> Result<u64, NativeEvalError> {
-            if let Some(parameter) = parameters.get(values.len()) {
-                let mut maximum = 0;
-                for &value in &parameter.values {
-                    values.push(value);
-                    maximum = maximum.max(largest(scratch, dimension, parameters, values)?);
-                    values.pop();
-                }
-                return Ok(maximum);
-            }
-            let parameter = |name: &str| {
-                parameters
-                    .iter()
-                    .position(|parameter| parameter.name == name)
-                    .map(|index| values[index])
-            };
-            if let Some(condition) = &scratch.when {
-                if !condition.holds(dimension, &parameter)? {
-                    return Ok(1);
-                }
-            }
-            scratch
-                .bytes
-                .evaluate(dimension, &parameter)
-                .map(|bytes| bytes.max(1))
-        }
-        let mut names = Vec::new();
-        self.bytes.parameters(&mut names);
         if let Some(condition) = &self.when {
-            condition.parameters(&mut names);
+            if !condition.holds(dimension, parameter)? {
+                return Ok(1);
+            }
         }
-        let parameters = names
-            .iter()
-            .map(|name| {
-                tuning_parameters
-                    .iter()
-                    .find(|parameter| &parameter.name == name && !parameter.values.is_empty())
-                    .ok_or_else(|| NativeEvalError::Unbound(name.clone()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        largest(self, dimension, &parameters, &mut Vec::new())
+        self.bytes.evaluate(dimension, parameter).map(|bytes| bytes.max(1))
     }
 
     /// Every dimension name the charge or its guard reads.
@@ -2464,6 +2424,15 @@ impl NativeScratch {
             condition.dimensions(&mut names);
         }
         names
+    }
+
+    /// Every tuning parameter the charge or its guard reads into `out`:
+    /// entry-wide ones alone, as a launch's parameters stay in its scope.
+    pub fn parameters(&self, out: &mut Vec<String>) {
+        self.bytes.parameters(out);
+        if let Some(condition) = &self.when {
+            condition.parameters(out);
+        }
     }
 }
 
@@ -2767,6 +2736,39 @@ impl std::fmt::Display for NativeSpecializationError {
 
 impl std::error::Error for NativeSpecializationError {}
 
+/// A declaration's scratch bound could not be formed: its statics name no
+/// admitted configuration, or an admitted configuration's charge does not
+/// evaluate (an invariant violation of the declaration).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativeScratchBoundError {
+    Specialization(NativeSpecializationError),
+    /// Buffer `scratch` of the admitted configuration with tuning `params`.
+    Charge {
+        scratch: String,
+        params: std::collections::BTreeMap<String, u64>,
+        error: NativeEvalError,
+    },
+}
+
+impl From<NativeSpecializationError> for NativeScratchBoundError {
+    fn from(error: NativeSpecializationError) -> Self {
+        Self::Specialization(error)
+    }
+}
+
+impl std::fmt::Display for NativeScratchBoundError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Specialization(error) => write!(f, "{error}"),
+            Self::Charge { scratch, params, error } => {
+                write!(f, "scratch `{scratch}` of the admitted configuration {params:?}: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NativeScratchBoundError {}
+
 impl NativeImplementation {
     /// Check a complete specialization against the declaration.
     pub fn validate(
@@ -2971,6 +2973,59 @@ impl NativeImplementation {
             Ok(())
         } else {
             Err(NativeSpecializationError::Inadmissible)
+        }
+    }
+
+    /// Each scratch buffer's bound at a call's dimensions (statics among
+    /// them): its largest charge over the configurations the declaration
+    /// admits at those statics ([`Self::walk_admissible`], the admission
+    /// dispatch prepares by), so a configuration the `where` refuses is
+    /// never sized. An admitted configuration whose charge cannot be
+    /// evaluated is an error naming it.
+    ///
+    /// A charge reads only entry-wide parameters, so the walk visits one
+    /// admitted configuration for each admitted assignment of the
+    /// parameters the buffers read ([`Self::walk_admitted_of`]), not the
+    /// product of every domain: the configurations it skips charge what the
+    /// one it visits does.
+    pub fn scratch_bound(
+        &self,
+        dimension: &impl Fn(&str) -> Option<u64>,
+    ) -> Result<Vec<u64>, NativeScratchBoundError> {
+        let mut statics = NativeSpecialization::new();
+        for name in &self.statics {
+            let value = dimension(name)
+                .ok_or_else(|| NativeSpecializationError::MissingStatic(name.clone()))?;
+            statics = statics.with_static(name.clone(), value);
+        }
+        let mut read = Vec::new();
+        for buffer in &self.scratch {
+            buffer.parameters(&mut read);
+        }
+        let mut bound = vec![0u64; self.scratch.len()];
+        let mut admitted = false;
+        let mut failure = None;
+        self.walk_admitted_of(&statics, &read, |configuration| {
+            admitted = true;
+            for (buffer, bytes) in self.scratch.iter().zip(&mut bound) {
+                match buffer.charge(dimension, &|name| configuration.param(name)) {
+                    Ok(charge) => *bytes = (*bytes).max(charge),
+                    Err(error) => {
+                        failure = Some(NativeScratchBoundError::Charge {
+                            scratch: buffer.name.clone(),
+                            params: configuration.params().clone(),
+                            error,
+                        });
+                        return false;
+                    }
+                }
+            }
+            true
+        })?;
+        match failure {
+            Some(failure) => Err(failure),
+            None if admitted => Ok(bound),
+            None => Err(NativeSpecializationError::Inadmissible.into()),
         }
     }
 
@@ -3405,6 +3460,37 @@ impl NativeImplementation {
     pub fn walk_admissible_while(
         &self,
         statics: &NativeSpecialization,
+        keep_going: impl FnMut() -> bool,
+        visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        self.walk(statics, None, keep_going, visit)
+    }
+
+    /// Visit, until `visit` returns false, the first admissible
+    /// configuration at `statics` holding each admitted assignment of the
+    /// entry-wide parameters `leading` names (names it holds that are not
+    /// one are ignored): what a caller reading only those parameters can
+    /// tell apart, with no walk over the product of the others once one of
+    /// their completions is admitted. The assignments come in the order of
+    /// the walk of [`Self::walk_admissible`] with those parameters moved
+    /// first, keeping their declared order.
+    pub fn walk_admitted_of(
+        &self,
+        statics: &NativeSpecialization,
+        leading: &[String],
+        visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        self.walk(statics, Some(leading), || true, visit)
+    }
+
+    /// The walk of [`Self::walk_admissible_while`], or, with `leading`,
+    /// that of [`Self::walk_admitted_of`]: the named entry-wide parameters
+    /// walked first, and each admitted configuration ending the walk over
+    /// the parameters after them.
+    fn walk(
+        &self,
+        statics: &NativeSpecialization,
+        leading: Option<&[String]>,
         mut keep_going: impl FnMut() -> bool,
         mut visit: impl FnMut(&NativeSpecialization) -> bool,
     ) -> Result<(), NativeSpecializationError> {
@@ -3423,9 +3509,16 @@ impl NativeImplementation {
         {
             return Err(NativeSpecializationError::UnknownStatic(name.clone()));
         }
+        // The entry-wide parameters `leading` names first, in declared order.
+        let led = |parameter: &&NativeParameter| {
+            leading.is_some_and(|leading| leading.contains(&parameter.name))
+        };
+        let lead = leading.map(|_| self.params.iter().filter(led).count());
         let domains = self
             .params
             .iter()
+            .filter(led)
+            .chain(self.params.iter().filter(|parameter| !led(parameter)))
             .map(|parameter| (None, parameter))
             .chain(
                 self.launches
@@ -3534,7 +3627,8 @@ impl NativeImplementation {
                     Some(launch) => configuration.launch_param(launch, name),
                 }
             };
-            // The shortest rejected prefix, if a conjunct rejects one.
+            // The shortest prefix the walk is done with: one a conjunct
+            // rejects, or the leading parameters of an admitted configuration.
             let mut rejected: Option<usize> = None;
             let mut failed = false;
             for (last, conjunct) in &prefixes {
@@ -3557,6 +3651,12 @@ impl NativeImplementation {
                     Ok(()) => {
                         if !visit(&configuration) {
                             return Ok(());
+                        }
+                        if let Some(lead) = lead {
+                            if lead == 0 {
+                                return Ok(());
+                            }
+                            rejected = Some(lead - 1);
                         }
                     }
                     Err(NativeSpecializationError::Inadmissible) => {}
@@ -3838,7 +3938,7 @@ mod native_tests {
     }
 
     #[test]
-    fn scratch_maximum_evaluates_guards_and_charges_exactly() {
+    fn scratch_charge_evaluates_guards_and_charges_exactly() {
         let rows = || NativeNatExpr::Dimension("M".into());
         let scratch = NativeScratch {
             name: "groups".into(),
@@ -3859,7 +3959,7 @@ mod native_tests {
         };
         let at = |value: u64| {
             scratch
-                .maximum_bytes(&[], &|name| (name == "M").then_some(value))
+                .charge(&|name| (name == "M").then_some(value), &|_| None)
                 .unwrap()
         };
         assert_eq!([at(16), at(32), at(64), at(128)], [1, 128, 256, 1]);
@@ -3874,7 +3974,7 @@ mod native_tests {
             when: None,
         };
         assert_eq!(
-            overflow.maximum_bytes(&[], &|_| Some(2)),
+            overflow.charge(&|_| Some(2), &|_| None),
             Err(NativeEvalError::Arithmetic)
         );
     }
@@ -4353,6 +4453,131 @@ mod native_tests {
         assert!(conjuncts[0].holds(&at(96), &none).is_err());
         assert_eq!(conjuncts[1].decided(&none, &wide), Some(true));
         assert_eq!(conjuncts[1].decided(&none, &none), None);
+    }
+
+    /// A row tile of WARPS * 16 / N tokens, admitted only where it holds a
+    /// token (`where N <= WARPS * 16`), as CUDA's prefill sizes its tiles,
+    /// and a buffer only the widest configurations charge.
+    fn tiled(constraint: &str) -> NativeImplementation {
+        let module = check_source(source(&format!(
+            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic WARPS in [4, 2, 8, 1] default 4)\n    where {constraint}\n    scratch tiles bytes (ceil_div(N, WARPS * 16 / N) * 4)\n    scratch wide bytes (N * WARPS) when WARPS > 4\n    launch scale:\n        threadgroups (ceil_div(N, WARPS * 16 / N), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+        )))
+        .expect("tiled declaration checks");
+        module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn scratch_bound_sizes_only_admitted_configurations() {
+        let at = |n: u64| move |name: &str| (name == "N").then_some(n);
+        // At N = 64, WARPS 2 and 1 are refused, and their tiles would divide
+        // by zero; WARPS 4 holds 1 token a tile, 8 holds 2 and alone charges
+        // the guarded buffer.
+        let native = tiled("N <= WARPS * 16");
+        assert_eq!(native.scratch_bound(&at(64)), Ok(vec![256, 512]));
+        // At N = 16 every WARPS is admitted.
+        assert_eq!(native.scratch_bound(&at(16)), Ok(vec![64, 128]));
+        assert_eq!(
+            native.scratch_bound(&at(1024)),
+            Err(NativeScratchBoundError::Specialization(NativeSpecializationError::Inadmissible))
+        );
+        assert_eq!(
+            native.scratch_bound(&|_| None),
+            Err(NativeScratchBoundError::Specialization(NativeSpecializationError::MissingStatic(
+                "N".into()
+            )))
+        );
+    }
+
+    /// Each buffer's largest charge over every configuration of the full
+    /// product of the domains that [`NativeImplementation::validate`]
+    /// admits, `None` where it admits none: the bound by definition.
+    fn brute_scratch_bound(native: &NativeImplementation, n: u64) -> Option<Vec<u64>> {
+        let domains = native
+            .params
+            .iter()
+            .map(|parameter| (None, parameter))
+            .chain(native.launches.iter().enumerate().flat_map(|(launch, declaration)| {
+                declaration.params.iter().map(move |parameter| (Some(launch), parameter))
+            }))
+            .collect::<Vec<_>>();
+        let dimension = |name: &str| (name == "N").then_some(n);
+        let mut bound: Option<Vec<u64>> = None;
+        let mut steps = vec![0usize; domains.len()];
+        loop {
+            let configuration = domains.iter().zip(&steps).fold(
+                NativeSpecialization::new().with_static("N", n),
+                |configuration, ((launch, parameter), &step)| match launch {
+                    None => configuration.with_param(parameter.name.clone(), parameter.values[step]),
+                    Some(launch) => configuration.with_launch_param(
+                        *launch,
+                        parameter.name.clone(),
+                        parameter.values[step],
+                    ),
+                },
+            );
+            if native.validate(&configuration).is_ok() {
+                let charges = native.scratch.iter().map(|buffer| {
+                    buffer
+                        .charge(&dimension, &|name| configuration.param(name))
+                        .expect("an admitted configuration is sized")
+                });
+                bound = Some(match bound {
+                    None => charges.collect(),
+                    Some(bound) => bound.iter().zip(charges).map(|(a, b)| (*a).max(b)).collect(),
+                });
+            }
+            let Some(position) =
+                (0..domains.len()).rev().find(|&position| steps[position] + 1 < domains[position].1.values.len())
+            else {
+                return bound;
+            };
+            steps[position] += 1;
+            steps[position + 1..].fill(0);
+        }
+    }
+
+    #[test]
+    fn scratch_bound_equals_the_maximum_over_every_admitted_configuration() {
+        // STAGES leads the declaration and no buffer reads it; the launch's
+        // LANES and ROWS are refused by `where` alongside the entry's. WARPS
+        // 1 and 2 at N = 64 are refused, and their tiles divide by zero.
+        let module = crate::native_source::check_fixture(source(
+            "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic STAGES in [1, 2] default 1, arithmetic WARPS in [4, 2, 8, 1] default 4, arithmetic SPLIT in [1, 2, 4] default 1, form PACK in [0, 1] default 0)\n    where N <= WARPS * 16 and (PACK == 0 or LANES == 8) and (SPLIT == 1 or ROWS == 2) and (STAGES == 1 or PACK == 1) and (SPLIT < 4 or WARPS < 8 or LANES == 32)\n    scratch tiles bytes (ceil_div(N, WARPS * 16 / N) * 4)\n    scratch wide bytes (N * WARPS * SPLIT) when WARPS > 4 and PACK == 0\n    scratch packed bytes (N * SPLIT * 3) when PACK == 1\n    launch scale:\n        params (LANES in [16, 8, 32] default 16, ROWS in [1, 2] default 1)\n        threadgroups (ceil_div(N, WARPS * 16 / N) * LANES, ROWS, 1)\n        threads_per_threadgroup (32, 1, 1)\n",
+        ), &[])
+        .expect("scaled declaration checks");
+        let native = module
+            .native_implementation(module.entries()[0].id, BackendName::Cuda)
+            .unwrap();
+        for n in [1, 16, 32, 48, 64, 96, 128, 1024] {
+            let at = |name: &str| (name == "N").then_some(n);
+            match brute_scratch_bound(native, n) {
+                Some(bound) => assert_eq!(native.scratch_bound(&at), Ok(bound), "N = {n}"),
+                None => assert_eq!(
+                    native.scratch_bound(&at),
+                    Err(NativeScratchBoundError::Specialization(
+                        NativeSpecializationError::Inadmissible
+                    )),
+                    "N = {n}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_bound_refuses_an_admitted_configuration_it_cannot_size() {
+        // A `where` that admits WARPS 2 at N = 64, whose tile holds no token.
+        let native = tiled("N <= WARPS * 64");
+        assert_eq!(
+            native.scratch_bound(&|name: &str| (name == "N").then_some(64)),
+            Err(NativeScratchBoundError::Charge {
+                scratch: "tiles".into(),
+                params: [("WARPS".to_owned(), 2)].into_iter().collect(),
+                error: NativeEvalError::Arithmetic,
+            })
+        );
     }
 
     #[test]
