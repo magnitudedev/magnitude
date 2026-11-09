@@ -12,29 +12,10 @@
 
 use magnitude_artifacts::{catalog_headers::ComponentRole, ArtifactIdentity, PackageIdentity};
 use magnitude_family_common::headers;
-use magnitude_family_contracts::ModelFamily;
-use magnitude_family_deepseek41::DeepSeek41Family;
-use magnitude_family_gemma4::Gemma4Family;
-use magnitude_family_lfm2::Lfm2Family;
-use magnitude_family_llama::LlamaFamily;
-use magnitude_family_muse_glimmer::MuseGlimmerFamily;
-use magnitude_family_nemotron_h::NemotronHFamily;
-use magnitude_family_qwen4exp::Qwen4ExpFamily;
-use magnitude_family_qwen35::Qwen35Family;
+use magnitude_family_registry::FAMILIES;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::PathBuf};
-
-const FAMILIES: [&dyn ModelFamily; 8] = [
-    &Qwen35Family,
-    &Qwen4ExpFamily,
-    &LlamaFamily,
-    &NemotronHFamily,
-    &Lfm2Family,
-    &Gemma4Family,
-    &MuseGlimmerFamily,
-    &DeepSeek41Family,
-];
 
 fn fixture() -> PathBuf {
     PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"))

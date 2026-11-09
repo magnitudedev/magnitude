@@ -8,6 +8,7 @@ The same model boundary supports embedded execution and scheduled generation.
 | Owner | Owns | Delegates |
 | --- | --- | --- |
 | Model loading | Artifacts, metadata, architecture descriptions, weight roles | Representation operations and physical imports to Seismic |
+| Family registry (`magnitude-family-registry`) | The one list of registered model families, read by recognition, assessment and the catalog pins; a new family is registered there only | Each family's recognition and inspection to its own family crate |
 | Model executor | Model programs, packed inputs, sequence advances, requested readout | Numerical work and native submissions to Seismic |
 | Logical state | Positions, visibility, sharing, tentative advances, accepted history | Physical storage and completion lifetime to Seismic |
 | Generation | Accepted tokens, grammar progress, output queues, recovery | Packed computation to the model executor |

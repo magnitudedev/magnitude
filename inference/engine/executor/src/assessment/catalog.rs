@@ -22,28 +22,14 @@ use magnitude_artifacts::{
 };
 use magnitude_family_common::headers::{self, Header};
 use magnitude_family_contracts::ModelFamily;
-use magnitude_family_gemma4::Gemma4Family;
 use magnitude_family_lfm2::Lfm2Family;
-use magnitude_family_llama::LlamaFamily;
-use magnitude_family_muse_glimmer::MuseGlimmerFamily;
 use magnitude_family_nemotron_h::NemotronHFamily;
 use magnitude_family_qwen35::Qwen35Family;
-use magnitude_family_qwen4exp::Qwen4ExpFamily;
+use magnitude_family_registry::FAMILIES;
 use magnitude_state::KvCodec;
 use seismic::BackendName;
 use std::collections::BTreeMap;
 use std::path::Path;
-
-const FAMILIES: [&dyn ModelFamily; 8] = [
-    &Qwen35Family,
-    &LlamaFamily,
-    &NemotronHFamily,
-    &Lfm2Family,
-    &Gemma4Family,
-    &MuseGlimmerFamily,
-    &Qwen4ExpFamily,
-    &magnitude_family_deepseek41::DeepSeek41Family,
-];
 
 /// Catalog models whose target's load must derive whatever their catalog
 /// support level.

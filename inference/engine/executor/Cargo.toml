@@ -41,15 +41,14 @@ fixtures = []
 gimli = { version = "0.32", default-features = false, features = ["read-core"] }
 
 [dev-dependencies]
-# The catalog's families and headers, for the assessment terms of every
-# catalog target (`assessment::catalog`).
+# The registered families and the catalog's headers, for the assessment terms
+# of every catalog target, and the families its drafts name
+# (`assessment::catalog`).
 magnitude-family-common = { path = "../families/common", features = ["catalog-headers"] }
-magnitude-family-deepseek41 = { path = "../families/deepseek41" }
+magnitude-family-registry = { path = "../families/registry" }
 magnitude-family-dflash = { path = "../families/dflash" }
 magnitude-family-gemma4 = { path = "../families/gemma4" }
 magnitude-family-lfm2 = { path = "../families/lfm2" }
-magnitude-family-llama = { path = "../families/llama" }
-magnitude-family-muse-glimmer = { path = "../families/muse_glimmer" }
 magnitude-family-nemotron-h = { path = "../families/nemotron_h" }
 magnitude-family-qwen35 = { path = "../families/qwen35" }
 magnitude-family-qwen4exp = { path = "../families/qwen4exp" }

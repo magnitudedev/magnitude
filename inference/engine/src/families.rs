@@ -1,30 +1,13 @@
-//! The registered model families (integration spec §4.3). Recognition runs
-//! over every family; exactly one must claim a package's architecture.
-//! Whether that family admits the file's feature set is its inspection's
-//! decision, which names every feature it refuses.
+//! Recognition over the registered model families (integration spec §4.3;
+//! the list is `magnitude_family_registry::FAMILIES`). Exactly one family
+//! must claim a package's architecture. Whether that family admits the
+//! file's feature set is its inspection's decision, which names every
+//! feature it refuses.
 
 use crate::error::{UnsupportedModel, UnsupportedReason};
 use magnitude_artifacts::gguf::{Directory, Value};
 use magnitude_family_contracts::ModelFamily;
-use magnitude_family_deepseek41::DeepSeek41Family;
-use magnitude_family_gemma4::Gemma4Family;
-use magnitude_family_lfm2::Lfm2Family;
-use magnitude_family_llama::LlamaFamily;
-use magnitude_family_muse_glimmer::MuseGlimmerFamily;
-use magnitude_family_nemotron_h::NemotronHFamily;
-use magnitude_family_qwen35::Qwen35Family;
-use magnitude_family_qwen4exp::Qwen4ExpFamily;
-
-static FAMILIES: &[&dyn ModelFamily] = &[
-    &Qwen35Family,
-    &Qwen4ExpFamily,
-    &LlamaFamily,
-    &NemotronHFamily,
-    &Lfm2Family,
-    &Gemma4Family,
-    &MuseGlimmerFamily,
-    &DeepSeek41Family,
-];
+use magnitude_family_registry::FAMILIES;
 
 /// The architectures a separate drafter's GGUF may declare: a DFlash-family
 /// block drafter, a Gemma 4 assistant and a Qwen4 prediction head
