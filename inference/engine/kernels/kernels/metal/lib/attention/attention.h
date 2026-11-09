@@ -13,8 +13,13 @@
 // Every entry defines its form before including this library: ATTENTION_I
 // interleaved gate columns after each query head's W columns (0 or W),
 // ATTENTION_U separate gate values per query head (0, 1 or W), and whether
-// the layer has fresh rows (ATTENTION_FRESH), q/k norms (ATTENTION_NORM) and a
-// value norm (ATTENTION_VALUE_NORM). An entry with attention sinks (SK = 1)
+// the layer has fresh rows (ATTENTION_FRESH), a key norm (ATTENTION_NORM, N), a
+// query norm (ATTENTION_QUERY_NORM, NQ; entries without queries define it 0)
+// and a value norm (ATTENTION_VALUE_NORM). A dense entry whose values are
+// the stored keys (VK = 1) defines ATTENTION_STORED_KEY to 1: a fresh value
+// is the prepared key, history values are read from the key plane
+// (`values_plane`), and only the key is appended. Every entry declares the rotary
+// layout statics RA and RT (`rotate_pairs`), which place each pair's columns. An entry with attention sinks (SK = 1)
 // defines ATTENTION_SINKS to 1 and passes its `sinks` to the bodies that
 // normalize an output (`divisor`).
 //
@@ -35,6 +40,10 @@
 #define ATTENTION_SINKS 0
 #endif
 
+#ifndef ATTENTION_STORED_KEY
+#define ATTENTION_STORED_KEY 0
+#endif
+
 // Loops over register arrays (8x8 fragments, per-lane columns) must unroll
 // fully: a dynamically indexed array lives in stack memory, which costs the
 // streaming kernels a factor of 2-3. Staging loops stay rolled so their loads
@@ -42,9 +51,17 @@
 #define ATTENTION_UNROLL _Pragma("clang loop unroll(full)")
 #define ATTENTION_ROLLED _Pragma("clang loop unroll(disable)")
 
+// The rotated 2P columns start at ATTENTION_ROTARY_FIRST (the trailing ones
+// with RT = 1); within them pair p is (p, p + P), or (2p, 2p + 1) with
+// ATTENTION_ROTARY_ADJACENT (RA = 1).
+#define ATTENTION_ROTARY_FIRST (SEISMIC_DIM_RT != 0 ? SEISMIC_DIM_S : 0)
+#define ATTENTION_ROTARY_ADJACENT (SEISMIC_DIM_RA != 0)
+
 static_assert(ATTENTION_W % 32 == 0, "attention head width must be a multiple of 32");
 static_assert(SEISMIC_DIM_P % ATTENTION_E == 0,
     "each rotary half must cover whole lanes");
+static_assert(!ATTENTION_ROTARY_ADJACENT || ATTENTION_E % 2 == 0 || ATTENTION_E == 1,
+    "an adjacent pair must lie within one lane or span two");
 
 namespace attention {
 
@@ -243,6 +260,26 @@ inline void head_norm(device const Scalar *raw, device const float *norm, float 
         x[i] = x[i] * inverse * norm[lane * ATTENTION_E + i];
 }
 
+// The place of `column` among a head's rotated columns (`rotate_pairs`):
+// whether it is rotated, its pair, and whether it leads the pair.
+inline bool rotary_rotated(uint column) {
+    return column - ATTENTION_ROTARY_FIRST < 2 * SEISMIC_DIM_P;
+}
+inline uint rotary_pair(uint column) {
+    const uint j = column - ATTENTION_ROTARY_FIRST;
+    return ATTENTION_ROTARY_ADJACENT ? j / 2 : j % SEISMIC_DIM_P;
+}
+inline bool rotary_leads(uint column) {
+    const uint j = column - ATTENTION_ROTARY_FIRST;
+    return ATTENTION_ROTARY_ADJACENT ? j % 2 == 0 : j < SEISMIC_DIM_P;
+}
+// The other column of `column`'s pair.
+inline uint rotary_partner(uint column) {
+    if (ATTENTION_ROTARY_ADJACENT)
+        return column ^ 1u;
+    return rotary_leads(column) ? column + SEISMIC_DIM_P : column - SEISMIC_DIM_P;
+}
+
 // One row's rotary table for lane `lane`'s rotated columns: pair p turns by
 // coordinate axis components[p] at frequencies[p], its cosine and sine
 // scaled by amplitudes[p]. The same table rotates every head of the row.
@@ -251,11 +288,11 @@ struct rotary_table {
     float sine[ATTENTION_E];
     rotary_table(device const int *coordinates, device const int *components, device const float *frequencies,
         device const float *amplitudes, uint lane) {
-        if (SEISMIC_DIM_P == 0 || lane >= 2 * SEISMIC_DIM_P / ATTENTION_E)
+        if (SEISMIC_DIM_P == 0 || !rotary_rotated(lane * ATTENTION_E))
             return;
         ATTENTION_UNROLL
         for (uint i = 0; i < ATTENTION_E; ++i) {
-            const uint pair = (lane * ATTENTION_E + i) % SEISMIC_DIM_P;
+            const uint pair = rotary_pair(lane * ATTENTION_E + i);
             float c;
             const float s = sincos(float(coordinates[components[pair]]) * frequencies[pair], c);
             cosine[i] = c * amplitudes[pair];
@@ -264,29 +301,54 @@ struct rotary_table {
     }
 };
 
-// `head_norm`, then the first 2P columns rotated by the row's table. Each
-// rotated column's pair partner lives P / ATTENTION_E lanes away.
+// `head_norm`, then the row's pairs rotated by its table. The rotated
+// columns are whole lanes; a half-split pair's partner lives P /
+// ATTENTION_E lanes away, an adjacent pair's in the same lane (or, at one
+// column a lane, the neighbouring one).
 template <bool NORM>
 inline void head_rotary(device const Scalar *raw, device const float *norm, thread const rotary_table &table,
     float epsilon, uint lane, thread float (&x)[ATTENTION_E]) {
     head_norm<NORM>(raw, norm, epsilon, lane, x);
     if (SEISMIC_DIM_P == 0)
         return;
-    constexpr uint half_lanes = SEISMIC_DIM_P / ATTENTION_E;
-    const uint partner_lane = lane < half_lanes ? lane + half_lanes
-        : (lane < 2 * half_lanes ? lane - half_lanes : lane);
+    const bool rotated = rotary_rotated(lane * ATTENTION_E);
     float partner[ATTENTION_E];
-    ATTENTION_UNROLL
-    for (uint i = 0; i < ATTENTION_E; ++i)
-        partner[i] = simd_shuffle(x[i], ushort(partner_lane));
-    if (lane >= 2 * half_lanes)
+    if (ATTENTION_ROTARY_ADJACENT && ATTENTION_E > 1) {
+        ATTENTION_UNROLL
+        for (uint i = 0; i < ATTENTION_E; ++i)
+            partner[i] = x[i ^ 1u];
+    } else {
+        const uint partner_lane = rotated ? rotary_partner(lane * ATTENTION_E) / ATTENTION_E : lane;
+        ATTENTION_UNROLL
+        for (uint i = 0; i < ATTENTION_E; ++i)
+            partner[i] = simd_shuffle(x[i], ushort(partner_lane));
+    }
+    if (!rotated)
         return;
     ATTENTION_UNROLL
     for (uint i = 0; i < ATTENTION_E; ++i) {
-        const uint column = lane * ATTENTION_E + i;
-        x[i] = column < SEISMIC_DIM_P ? x[i] * table.cosine[i] - partner[i] * table.sine[i]
-                                      : x[i] * table.cosine[i] + partner[i] * table.sine[i];
+        x[i] = rotary_leads(lane * ATTENTION_E + i) ? x[i] * table.cosine[i] - partner[i] * table.sine[i]
+                                                    : x[i] * table.cosine[i] + partner[i] * table.sine[i];
     }
+}
+
+// The output rotary (RO = 1) of one published output column pair, run as
+// its own launch after the entry has stored every query head's ungated
+// output: threadgroup (row, query head), thread p turns pair p back by the
+// row's negated angles (`output_rotary`), in F32, and publishes it again.
+inline void output_rotary(device Scalar *result, device const int *coordinates, device const int *components,
+    device const float *frequencies, device const float *amplitudes, ulong row, ulong head, uint pair) {
+    if (pair >= SEISMIC_DIM_P)
+        return;
+    const uint lo = ATTENTION_ROTARY_FIRST + (ATTENTION_ROTARY_ADJACENT ? 2 * pair : pair);
+    const uint hi = ATTENTION_ROTARY_ADJACENT ? lo + 1 : lo + SEISMIC_DIM_P;
+    float c;
+    const float s = -sincos(float(coordinates[row * 4 + components[pair]]) * frequencies[pair], c);
+    const float cosine = c * amplitudes[pair], sine = s * amplitudes[pair];
+    device Scalar *out = result + (row * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + head) * ATTENTION_W;
+    const float low = float(out[lo]), high = float(out[hi]);
+    out[lo] = Scalar(low * cosine - high * sine);
+    out[hi] = Scalar(high * cosine + low * sine);
 }
 
 // One head row normalized and rotated by its own table.
@@ -797,8 +859,14 @@ struct prefill_run {
     uint masked;
 };
 
+// The plane a dense entry reads history values from: its value plane, or
+// the key plane for stored-key values (whose value plane has no rows).
+inline device const ulong *values_plane(device const ulong *history_key, device const ulong *history_value) {
+    return ATTENTION_STORED_KEY ? history_key : history_value;
+}
+
 // Dense history: [T, KV, W] activation planes, whose products take
-// activation-dtype operands.
+// activation-dtype operands; `value` is `values_plane`'s.
 struct dense_history {
     enum : bool { AFFINE = false };
     typedef Scalar Operand;
@@ -810,8 +878,9 @@ struct dense_history {
         thread const float (&v)[ATTENTION_E]) const {
         attention::append(slab::row<Scalar>(key, ulong(destination), rows_per_slab,
             SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, k);
-        attention::append(slab::row<Scalar>(value, ulong(destination), rows_per_slab,
-            SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, v);
+        if (!ATTENTION_STORED_KEY)
+            attention::append(slab::row<Scalar>(value, ulong(destination), rows_per_slab,
+                SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, v);
     }
 
     template <uint THREADS, uint KEYS = PREFILL_KEYS>
@@ -1456,7 +1525,7 @@ inline void prefill_prepare(History history, device const Scalar *query,
     if (!inject_only) {
         for (uint g = 0; g < G; ++g) {
             const ulong head = row * KV * G + kv_head * G + g;
-            head_rotary<ATTENTION_NORM>(query + head * ATTENTION_QUERY_STRIDE, query_norm, table, epsilon, lane, x);
+            head_rotary<ATTENTION_QUERY_NORM>(query + head * ATTENTION_QUERY_STRIDE, query_norm, table, epsilon, lane, x);
             for (uint i = 0; i < E; ++i)
                 queries[head * W + lane * E + i] = Operand(element::Act::round(x[i]));
         }
@@ -1465,8 +1534,13 @@ inline void prefill_prepare(History history, device const Scalar *query,
         return;
     const ulong source = (row * KV + kv_head) * W;
     head_rotary<ATTENTION_NORM>(key + source, key_norm, table, epsilon, lane, x);
+    // A stored-key value is the prepared key.
     float y[E];
-    head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, y);
+    if (ATTENTION_STORED_KEY)
+        for (uint i = 0; i < E; ++i)
+            y[i] = x[i];
+    else
+        head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, y);
     float v[E];
     for (uint i = 0; i < E; ++i) {
         if (!inject_only)
@@ -3419,7 +3493,8 @@ inline void decode_matrix_fresh(threadgroup Operand *region, device const Scalar
         if (k < count) {
             const ulong token = ulong(first) + k;
             const ulong at = (token * SEISMIC_DIM_KV + kv_head) * W;
-            if (KEY)
+            // A stored-key value is the prepared key.
+            if (KEY || ATTENTION_STORED_KEY)
                 head_rotary<ATTENTION_NORM>(key + at, key_norm, coordinates + token * 4, rotary_components,
                     rotary_frequencies, rotary_amplitudes, epsilon, lane, x);
             else
@@ -3534,7 +3609,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         const ulong row = row0 + (PACKED ? team : global_g / G);
         const uint head = PACKED ? head_base + g : global_g % G;
         if (head < G && (PACKED || global_g < TOKENS * G) && row < rows) {
-            head_rotary<ATTENTION_NORM>(query + (row * KV * G + kv_head * G + head) * ATTENTION_QUERY_STRIDE,
+            head_rotary<ATTENTION_QUERY_NORM>(query + (row * KV * G + kv_head * G + head) * ATTENTION_QUERY_STRIDE,
                 query_norm, coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes, epsilon,
                 lane, x);
         } else {

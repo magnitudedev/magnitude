@@ -21,11 +21,12 @@ pub use domain::{
 
 pub use codec::{
     AFFINE_GROUP, AffineGeometry, Codec, CodecIdentity, CodecSpec, ComponentDescriptor,
-    HistoryEncoding, KvCodec, LayerRef, LayoutError, PlaneDescriptor, PlaneName, VectorKind,
+    HistoryEncoding, HistoryValue, KvCodec, LayerRef, LayoutError, PlaneDescriptor, PlaneName,
+    VectorKind,
 };
 pub use layout::{
     HistoryGeometry, MAX_HISTORY_SPANS, ModelStateLayout, SLAB_BYTE_TARGET, SLAB_ROW_TILE,
-    banks_per_slab, history_geometry,
+    banks_per_slab, history_codec, history_geometry,
 };
 
 use placement::{Generation, LogicalId, Placement, PlacementError};

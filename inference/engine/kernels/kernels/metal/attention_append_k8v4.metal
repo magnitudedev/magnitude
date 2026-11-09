@@ -8,6 +8,7 @@
 #define ATTENTION_U 0
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_QUERY_NORM 0
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #include "lib/attention/attention.h"
 

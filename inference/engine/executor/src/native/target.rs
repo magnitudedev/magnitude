@@ -17,6 +17,7 @@ use magnitude_kernels::{
 use magnitude_kernels::{
     dense_up, feature_rows, routed_down, routed_experts_up, routed_gate_up, routed_scatter,
     routed_select, routed_up, state_space_chunk, state_space_gate, state_space_step, tap_rows,
+    widen_rows,
 };
 use magnitude_kernels::{short_conv_project, short_conv_rows};
 use seismic::NativeKernel;
@@ -447,9 +448,23 @@ pub struct AttentionKernels {
     pub project: NativeKernel<attention_project::Entry>,
     pub history: AttentionHistoryKernels,
     pub output: SublayerOutput<NativeKernel<attention_output::Entry>>,
+    /// A grouped output's first product (`AttentionBinding::grouped`).
+    pub grouped: Option<NativeKernel<project_rows::Entry>>,
     /// A selected read's indexer and selected prefill
     /// (`AttentionBinding::selection`).
     pub selection: Option<SelectionKernels>,
+    /// A low-rank query's up projection
+    /// (`AttentionBinding::low_rank_query`).
+    pub low_rank_query: Option<LowRankQueryKernels>,
+}
+
+/// A low-rank query's entries after the attention projection: its `qr`
+/// rows widened to F32 (`widen_rows`), then normalized and projected to the
+/// query heads (`attention_project`, a query segment alone).
+#[derive(Clone, Debug)]
+pub struct LowRankQueryKernels {
+    pub widen: NativeKernel<widen_rows::Entry>,
+    pub project: NativeKernel<attention_project::Entry>,
 }
 
 /// A selected read's entries: the indexer's normed query and raw-key
@@ -492,11 +507,7 @@ pub struct PostNormKernels {
 pub enum AttentionHistoryKernels {
     Dense {
         append: NativeKernel<attention_append_dense::Entry>,
-        decode: NativeKernel<attention_decode::Entry>,
-        /// The multi-row decode (draft blocks, verification), tuned on its
-        /// own row classes so it can read each history tile once for all
-        /// rows.
-        verify: Option<NativeKernel<attention_decode::Entry>>,
+        decode: DenseDecodeKernels,
         prefill: NativeKernel<attention_prefill::Entry>,
     },
     AffineK8V4 {
@@ -513,6 +524,22 @@ pub enum AttentionHistoryKernels {
         /// (`StateResourcePlan::lists_history_tiles`).
         prefill_listed: Option<NativeKernel<attention_prefill_k8v4::Entry>>,
     },
+}
+
+/// What attends a dense history's decode row classes
+/// (`graph::dense_decodes`).
+#[derive(Clone, Debug)]
+pub enum DenseDecodeKernels {
+    Decode {
+        single: NativeKernel<attention_decode::Entry>,
+        /// The multi-row decode (draft blocks, verification), tuned on its
+        /// own row classes so it can read each history tile once for all
+        /// rows.
+        verify: Option<NativeKernel<attention_decode::Entry>>,
+    },
+    /// The prefill entry tuned on the decode row classes, where the decode
+    /// entry holds no form of the shape.
+    Prefill(NativeKernel<attention_prefill::Entry>),
 }
 
 #[derive(Clone, Debug)]

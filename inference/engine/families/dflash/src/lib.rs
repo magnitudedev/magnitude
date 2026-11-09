@@ -25,7 +25,7 @@ use magnitude_artifacts::{
     TokenId, UnsupportedReason,
 };
 use magnitude_family_common::{
-    rotary::{self, Yarn},
+    rotary::{self, Yarn, YarnAmplitude},
     architecture_keys, HeaderError, Metadata, Tensors,
 };
 use magnitude_family_contracts::{
@@ -34,7 +34,8 @@ use magnitude_family_contracts::{
     ConfidenceHead, CorrectorLayer, DefinitionError, DenseFfn, DraftDefinition, DraftEmbedding,
     DraftMethod, DynamicConvolution, FamilyError, FeedForwardUp, HeadNorm, HistoryDomain,
     HistoryReads, ImportTransform, InputNorm, KeyValue, LayerConvolutions, MarkovHead,
-    MediaRowAttention, ModelDefinition, Operator, OutputForm, RmsNorm, Rotary, Sublayer, TapPoint,
+    MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection, OutputRotary,
+    QueryProjection, RmsNorm, Rotary, RotaryLayout, Sublayer, TapPoint,
     ValueNorm, ValueSource, WeightDescriptor, CORRECTOR_FEATURES,
 };
 use std::{error, fmt};
@@ -439,15 +440,22 @@ fn rotary_table(m: &Metadata, width: u64) -> Result<Rotary, Error> {
     match m.optional_string("rope.scaling.type")? {
         None => Ok(rotary::table(width, width, base)?),
         Some("yarn") => {
-            let yarn = Yarn::read(m)?;
-            // The header's multiplier on the YaRN amplitude; only the neutral
-            // value is admitted.
-            if yarn.attention_factor != 1.0 {
+            // The drafts' YaRN scales its amplitude by YaRN's mscale, under
+            // the header's multiplier; only the neutral multiplier is
+            // admitted.
+            let amplitude = YarnAmplitude::mscale(m)?;
+            if amplitude != (YarnAmplitude::Mscale { attention_factor: 1.0 }) {
                 return Err(Error::Geometry(
                     "YaRN attention factors other than 1.0 are not admitted".into(),
                 ));
             }
-            Ok(yarn.table(width, width, base)?)
+            Ok(Yarn::read(m, amplitude)?.table(
+                width,
+                width,
+                base,
+                RotaryLayout::HALF_SPLIT_LEADING,
+                OutputRotary::None,
+            )?)
         }
         Some(scaling) => Err(Error::RopeScaling(scaling.to_owned())),
     }
@@ -565,7 +573,7 @@ pub fn inspect(
                 heads,
                 kv_heads,
                 width,
-                query: weight("attn_q", &[query_rows, hidden])?,
+                query: QueryProjection::Full(weight("attn_q", &[query_rows, hidden])?),
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::Rms(rms(weight("attn_q_norm", &[width])?)),
                 key_value: KeyValue::Owned {
@@ -575,12 +583,11 @@ pub fn inspect(
                     value_norm: ValueNorm::None,
                     domain,
                 },
-                rotary: rotary.clone(),
-                scale: 1.0 / (width as f64).sqrt(),
+                rotary: rotary.clone(),                scale: 1.0 / (width as f64).sqrt(),
                 reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
                 sinks,
-                output: weight("attn_output", &[hidden, query_rows])?,
+                output: OutputProjection::Full(weight("attn_output", &[hidden, query_rows])?),
             };
             let feed_forward = DenseFfn {
                 intermediate,

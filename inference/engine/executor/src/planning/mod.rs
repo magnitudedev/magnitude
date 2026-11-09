@@ -60,9 +60,9 @@ pub use resources::{
 };
 pub(crate) use resources::{class_bytes, graph_demand, serial_upload_regions};
 pub use weights::{
-    AttentionBinding, AttentionShape, DenseBinding, DenseBranchBinding, DenseScales,
-    DirectoryForm, EmbeddingBinding, FeaturesBinding, HeadBinding, Holding, HostPeak,
-    HostTablePlan, ModelLoadPlan,
+    AttentionBinding, AttentionShape, AttentionValues, DenseBinding, DenseBranchBinding, DenseScales,
+    DirectoryForm, EmbeddingBinding, FeaturesBinding, GroupedOutputBinding, GroupedOutputShape,
+    HeadBinding, Holding, HostPeak, HostTablePlan, LowRankQueryBinding, ModelLoadPlan,
     NGramBinding, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
     ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoutedBinding, ScalableWeight,
     SelectionBinding, SelectionShape, SublayerTail, TableFill, TableFlights, WeightPlan, WeightScalePlan, WeightStorageIdentity,

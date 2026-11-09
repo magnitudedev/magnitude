@@ -180,7 +180,7 @@ impl CheckedMixerEntries {
     ) -> Result<Self, String> {
         Ok(match slot {
             MixerProgramSlot::Attention(binding) => {
-                Self::Attention(CheckedAttentionEntries::new(binding, lists))
+                Self::Attention(CheckedAttentionEntries::new(binding, backend, lists)?)
             }
             MixerProgramSlot::Recurrent(binding) => {
                 Self::Recurrent(CheckedRecurrentEntries::new(binding, backend)?)

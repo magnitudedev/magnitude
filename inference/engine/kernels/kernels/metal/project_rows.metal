@@ -1,5 +1,8 @@
 // project_rows: the plain projection of the A rows `source`, published in Y
-// (the `attention_output` launch structure with a store epilogue).
+// (the `attention_output` launch structure with a store epilogue). Group g
+// of a grouped weight (grid z, `dense_rows.seismic`) is the projection of
+// the source columns g * K .., through weight rows g * N .., into output
+// columns g * N ..: the same launches over its views (`PROJECT_ROWS_OPERANDS`).
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
@@ -32,28 +35,44 @@ typedef projection::operands<NVFP4> Operands;
     device const float *weight_bound [[buffer(SEISMIC_BUFFER_WEIGHT_BOUND)]],           \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
-// `raw` is the source rows; `in` the rows every form past the GEMV reads.
-#define PROJECT_ROWS_OPERANDS                                                           \
+// The group a launch's grid z names: literally 0 at G = 1 (G is static), so
+// every ungrouped address, split part and tile test compiles to its
+// ungrouped form.
+#define PROJECT_ROWS_GROUP(z) (SEISMIC_DIM_G == 1 ? 0u : uint(z))
+
+// Group `group`'s operands: `raw` is its source columns; `in` the rows every
+// form past the GEMV reads (staged NVFP4 operands only at G = 1); `out` its
+// output columns and `w` its weight rows.
+#define PROJECT_ROWS_OPERANDS(group)                                                    \
     const uint k = uint(SEISMIC_DIM_K);                                                 \
-    const projection::Plain<activation, projection::AllRows> raw{source, SEISMIC_SOURCE_STRIDE_0, \
-        SEISMIC_SOURCE_STRIDE_1, k, {}};                                                \
+    const projection::Plain<activation, projection::AllRows> raw{source                 \
+        + ulong(group) * k * SEISMIC_SOURCE_STRIDE_1 * sizeof(typename activation::storage), \
+        SEISMIC_SOURCE_STRIDE_0, SEISMIC_SOURCE_STRIDE_1, k, {}};                       \
     const projection::Plain<activation, projection::AllRows> in = NVFP4                 \
         ? projection::Plain<activation, projection::AllRows>{staged, k, 1, k, {}}       \
         : raw;                                                                          \
     const auto out = projection::scaling<(SEISMIC_DIM_WS != 0)>::wrap(                  \
-        projection::Store<published>{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0}, \
+        projection::Store<published>{result, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, \
+            ulong(group) * uint(SEISMIC_DIM_N)},                                        \
         projection::scale_factor(weight_scale, SEISMIC_DIM_WS, 0, 0), 1.0f);            \
-    projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k}
+    projection::Weights<packets::W0> w{weight, KERNEL_W0_LAYOUT(k), k, nullptr,          \
+        ulong(group) * uint(SEISMIC_DIM_N)}
+
+// Group `group`'s share of a split's partials: `split` parts of m x n each.
+inline device float *group_partials(device float *partials, uint group, uint split, uint m, uint n) {
+    return partials + ulong(group) * split * m * n;
+}
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_GEMV
 template <uint ROWS, uint LANES>
 kernel void project_rows_gemv(PROJECT_ROWS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
+    uint3 position [[threadgroup_position_in_grid]],
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    PROJECT_ROWS_OPERANDS;
+    PROJECT_ROWS_OPERANDS(PROJECT_ROWS_GROUP(position.z));
+    const uint tile = position.x;
     uint rows = uint(SEISMIC_DIM_M);
     PROJECTION_OPERANDS_SHARED(globals, NVFP4);
     const auto x = Operands::rows(raw, rows, k, globals, simdgroups, sg, lane);
@@ -69,7 +88,7 @@ kernel void project_rows_stage(PROJECT_ROWS_ARGUMENTS,
     uint item [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]) {
     PROJECTION_NORMALIZE_SHARED(maxima);
-    PROJECT_ROWS_OPERANDS;
+    PROJECT_ROWS_OPERANDS(0u);
     projection::operands<true>::form<256>(raw, item, staged, k, maxima, thread_index);
 }
 #endif
@@ -78,11 +97,12 @@ kernel void project_rows_stage(PROJECT_ROWS_ARGUMENTS,
 template <uint BATCH_ROWS, uint BATCH_PARTS, uint MATRIX>
 kernel void project_rows_batch(PROJECT_ROWS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
-    uint tile [[threadgroup_position_in_grid]],
+    uint3 position [[threadgroup_position_in_grid]],
     uint simdgroups [[simdgroups_per_threadgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    PROJECT_ROWS_OPERANDS;
+    PROJECT_ROWS_OPERANDS(PROJECT_ROWS_GROUP(position.z));
+    const uint tile = position.x;
     if constexpr (MATRIX == 1) {
         projection::gemv_matrix<packets::W0, BATCH_PARTS>(in, out, w,
             uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), k, tile, shared, simdgroups, sg, lane);
@@ -94,15 +114,17 @@ kernel void project_rows_batch(PROJECT_ROWS_ARGUMENTS,
 }
 #endif
 
+// Grid z is group * SPLIT + part (the part alone at G = 1).
 #define PROJECT_ROWS_GEMM(TM, TN, SPLIT, PARTIALS)                                      \
     PROJECTION_GEMM_SHARED(shared, TM, TN);                                             \
-    PROJECT_ROWS_OPERANDS;                                                              \
+    const uint group = PROJECT_ROWS_GROUP(tile.z / (SPLIT));                            \
+    PROJECT_ROWS_OPERANDS(group);                                                       \
     const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_N);                        \
     if (SPLIT == 1)                                                                     \
         projection::gemm<packets::W0, TM, TN>(in, out, w, m, n, k, tile.y, tile.x, shared, sg, lane); \
     else                                                                                \
-        projection::gemm_part<packets::W0, TM, TN>(in, PARTIALS, w, m, n, k, SPLIT, tile.z, tile.y, tile.x, \
-            shared, sg, lane)
+        projection::gemm_part<packets::W0, TM, TN>(in, group_partials(PARTIALS, group, SPLIT, m, n), \
+            w, m, n, k, SPLIT, SEISMIC_DIM_G == 1 ? tile.z : tile.z % (SPLIT), tile.y, tile.x, shared, sg, lane)
 
 // 17..64 rows: the fixed small-row tile and split.
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_GEMM_SMALL
@@ -116,10 +138,12 @@ kernel void project_rows_gemm_small(PROJECT_ROWS_ARGUMENTS,
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_FINALIZE_SMALL
 kernel void project_rows_finalize_small(PROJECT_ROWS_ARGUMENTS,
-    uint index [[thread_position_in_grid]]) {
-    PROJECT_ROWS_OPERANDS;
-    projection::gemm_reduce(out, small_partials, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), projection::small_split,
-        index);
+    uint3 position [[thread_position_in_grid]]) {
+    const uint group = PROJECT_ROWS_GROUP(position.z);
+    PROJECT_ROWS_OPERANDS(group);
+    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_N);
+    projection::gemm_reduce(out, group_partials(small_partials, group, projection::small_split, m, n), m, n,
+        projection::small_split, position.x);
 }
 #endif
 
@@ -135,10 +159,11 @@ kernel void project_rows_gemm(PROJECT_ROWS_ARGUMENTS,
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_FINALIZE
 kernel void project_rows_finalize(PROJECT_ROWS_ARGUMENTS,
-    uint index [[thread_position_in_grid]]) {
-    PROJECT_ROWS_OPERANDS;
-    projection::gemm_reduce(out, partials, uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N),
-        uint(SEISMIC_RUNTIME_SPLIT), index);
+    uint3 position [[thread_position_in_grid]]) {
+    const uint group = PROJECT_ROWS_GROUP(position.z);
+    PROJECT_ROWS_OPERANDS(group);
+    const uint m = uint(SEISMIC_DIM_M), n = uint(SEISMIC_DIM_N), split = uint(SEISMIC_RUNTIME_SPLIT);
+    projection::gemm_reduce(out, group_partials(partials, group, split, m, n), m, n, split, position.x);
 }
 #endif
 
@@ -147,7 +172,7 @@ kernel void project_rows_finalize(PROJECT_ROWS_ARGUMENTS,
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_RELAYOUT
 kernel void project_rows_relayout(PROJECT_ROWS_ARGUMENTS,
     uint item [[thread_position_in_grid]]) {
-    PROJECT_ROWS_OPERANDS;
+    PROJECT_ROWS_OPERANDS(0u);
     projection::tall_relayout(in, fragments, uint(SEISMIC_DIM_M), k, item);
 }
 #endif
@@ -159,7 +184,7 @@ kernel void project_rows_tall(PROJECT_ROWS_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     PROJECTION_GEMM_TALL_SHARED(shared, TALL_K);
-    PROJECT_ROWS_OPERANDS;
+    PROJECT_ROWS_OPERANDS(0u);
     projection::gemm_tall<packets::W0, TALL_M, TALL_K, STAGERS>(projection::tall_operand(in, fragments), out, w,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), k, tile.y, tile.x, shared, sg, lane);
 }
@@ -182,7 +207,7 @@ kernel void project_rows_pack(PROJECT_ROWS_ARGUMENTS,
     if constexpr (!projection::packing_path<packets::W0>())
         return;
     threadgroup float4 peaks[8];
-    PROJECT_ROWS_OPERANDS;
+    PROJECT_ROWS_OPERANDS(0u);
     PROJECT_ROWS_PACKING_SCRATCH;
     typedef projection::packing_codes<packets::W0> coded;
     constexpr uint BOUNDS = SEISMIC_DIM_WB != 0 ? 1 : 0;
@@ -201,7 +226,7 @@ kernel void project_rows_pack_coefficients(PROJECT_ROWS_ARGUMENTS,
     if constexpr (!projection::packing_path<packets::W0>())
         return;
     threadgroup float peaks[8];
-    PROJECT_ROWS_OPERANDS;
+    PROJECT_ROWS_OPERANDS(0u);
     PROJECT_ROWS_PACKING_SCRATCH;
     projection::packing_tile_coefficients(w, scratch, k, tile, peaks, thread_index, sg, lane);
 }
@@ -215,7 +240,7 @@ kernel void project_rows_packed(PROJECT_ROWS_ARGUMENTS,
     uint lane [[thread_index_in_simdgroup]]) {
     if constexpr (!projection::packing_path<packets::W0>())
         return;
-    PROJECT_ROWS_OPERANDS;
+    PROJECT_ROWS_OPERANDS(0u);
     PROJECT_ROWS_PACKING_SCRATCH;
     const uint m = uint(SEISMIC_DIM_M);
     projection::gemm_packed<packets::W0, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(out, w, scratch, m,

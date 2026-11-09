@@ -664,7 +664,7 @@ pub(crate) mod tests {
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, Head,
         HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm, HeadReadout,
         HistoryDomain, HistoryReads, InputNorm, KeyValue, MediaRowAttention, Operator, OutputForm,
-        ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, VocabularyProjection,
+        OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, VocabularyProjection,
         WeightDescriptor,
     };
 
@@ -685,7 +685,7 @@ pub(crate) mod tests {
             heads: 1,
             kv_heads: 1,
             width: 2,
-            query: weight(&format!("{p}qg"), &[4, 2]),
+            query: QueryProjection::Full(weight(&format!("{p}qg"), &[4, 2])),
             gate: AttentionGate::Interleaved {
                 function: GateFunction::Sigmoid,
             },
@@ -702,12 +702,11 @@ pub(crate) mod tests {
                 base: 10_000.0,
                 sections: vec![1],
                 axis_pattern: vec![0],
-            },
-            scale: 1.0 / 2f64.sqrt(),
+            },            scale: 1.0 / 2f64.sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
-            output: weight(&format!("{p}o"), &[2, 2]),
+            output: OutputProjection::Full(weight(&format!("{p}o"), &[2, 2])),
         };
         let dense = DenseFfn {
             intermediate: 4,

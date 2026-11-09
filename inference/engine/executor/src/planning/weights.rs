@@ -433,6 +433,18 @@ pub struct EmbeddingBinding {
     pub activation: Element,
 }
 
+/// Where an attention layer's values come from (`ValueSource`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AttentionValues {
+    /// Their own projection (`V` rows). A Shared layer, which projects
+    /// none, reads its source's own values (`admit_shared`).
+    Projected,
+    /// The raw key projection, before key norm and rotary.
+    RawKey,
+    /// The stored key row (`VK = 1`): the history holds no value plane.
+    StoredKey,
+}
+
 /// The static axes the attention entries are specialized to. Optional
 /// parts of the operator are axes of extent 0 or 1 (`attention.seismic`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -454,15 +466,26 @@ pub struct AttentionShape {
     /// `F` ∈ {0, 1}: whether the layer projects and appends its own keys and
     /// values.
     pub fresh: u64,
-    /// `N` ∈ {0, 1}: whether queries and keys are RMS-normalized per head.
-    pub head_norm: u64,
+    /// `NQ` ∈ {0, 1}: whether queries are RMS-normalized per head.
+    pub query_norm: u64,
+    /// `N` ∈ {0, 1}: whether keys are RMS-normalized per head (a Shared
+    /// layer, which projects none, takes its `NQ`).
+    pub key_norm: u64,
     /// `NV` ∈ {0, 1}: whether values are RMS-normalized per head.
     pub value_norm: u64,
-    /// Whether values have their own projection (else they are the raw key).
-    pub projected_value: bool,
+    /// Where the values come from (`VK` for stored keys).
+    pub values: AttentionValues,
     /// `SK` ∈ {0, 1}: whether each query head has a sink logit
     /// (`Attention::sinks`).
     pub sinks: u64,
+    /// `RA` ∈ {0, 1}: rotary pairs of adjacent dimensions, else half-split.
+    pub rotary_adjacent: u64,
+    /// `RT` ∈ {0, 1}: rotary pairs over the trailing `2P` dimensions, else
+    /// the leading ones.
+    pub rotary_trailing: u64,
+    /// `RO` ∈ {0, 1}: whether the attended row is turned back by the inverse
+    /// rotation (`OutputRotary::Inverse`).
+    pub output_rotary: u64,
 }
 
 impl AttentionShape {
@@ -487,11 +510,15 @@ impl AttentionShape {
 
     /// `V`: value projection rows.
     pub fn value_rows(&self) -> u64 {
-        if self.projected_value {
-            self.key_rows()
-        } else {
-            0
+        match self.values {
+            AttentionValues::Projected => self.key_rows(),
+            AttentionValues::RawKey | AttentionValues::StoredKey => 0,
         }
+    }
+
+    /// `VK` ∈ {0, 1}: whether the values are the stored keys.
+    pub fn stored_key(&self) -> u64 {
+        u64::from(self.values == AttentionValues::StoredKey)
     }
 
     /// Unrotated columns of a head.
@@ -520,7 +547,7 @@ impl AttentionShape {
     }
 
     /// The static axes of the fused attention entries.
-    pub fn mix_statics(&self) -> [(&'static str, u64); 10] {
+    pub fn mix_statics(&self) -> [(&'static str, u64); 15] {
         [
             ("KV", self.kv_heads),
             ("G", self.group),
@@ -529,18 +556,30 @@ impl AttentionShape {
             ("I", self.interleaved_gate),
             ("U", self.separate_gate),
             ("F", self.fresh),
-            ("N", self.head_norm),
+            ("NQ", self.query_norm),
+            ("N", self.key_norm),
             ("NV", self.value_norm),
             ("SK", self.sinks),
+            ("RA", self.rotary_adjacent),
+            ("RT", self.rotary_trailing),
+            ("RO", self.output_rotary),
+            ("VK", self.stored_key()),
         ]
     }
 
-    /// Cache publication has no query-head, gate or sink geometry.
+    /// Cache publication has no query-head, gate, query norm, sink or output
+    /// geometry.
     pub fn append_statics(&self) -> Vec<(&'static str, u64)> {
         self.mix_statics()
             .into_iter()
-            .filter(|(name, _)| !matches!(*name, "G" | "I" | "U" | "SK"))
+            .filter(|(name, _)| !Self::unread_by_appends(name))
             .collect()
+    }
+
+    /// Whether the cache-publishing entries lack the fused entries' axis
+    /// `name`.
+    pub fn unread_by_appends(name: &str) -> bool {
+        matches!(name, "G" | "I" | "U" | "SK" | "NQ" | "RO" | "R")
     }
 
     /// The fused entries' dimensions for `rows` rows over `history_rows`
@@ -550,8 +589,8 @@ impl AttentionShape {
         rows: u64,
         history_rows: u64,
         segments: u64,
-    ) -> [(&'static str, u64); 13] {
-        let [kv, g, p, s, i, u, f, n, nv, sk] = self.mix_statics();
+    ) -> [(&'static str, u64); 18] {
+        let [kv, g, p, s, i, u, f, nq, n, nv, sk, ra, rt, ro, vk] = self.mix_statics();
         [
             ("M", rows),
             ("T", history_rows),
@@ -562,9 +601,14 @@ impl AttentionShape {
             i,
             u,
             f,
+            nq,
             n,
             nv,
             sk,
+            ra,
+            rt,
+            ro,
+            vk,
             ("R", segments),
         ]
     }
@@ -579,10 +623,16 @@ pub struct AttentionBinding {
     /// State-only projection omits query and gate segments statically.
     pub key_value_only: bool,
     pub norm: Element,
+    /// The query heads' projection: a full query's, or a low-rank query's
+    /// `up`.
     pub query: Element,
+    /// A low-rank query's `qr` row (`QueryProjection::LowRank`); none for a
+    /// full query.
+    pub low_rank_query: Option<LowRankQueryBinding>,
     pub gate: Element,
     pub key: Element,
     pub value: Element,
+    /// The output projection's (the second, `b`, of a grouped output).
     pub output: Element,
     pub activation: Element,
     /// How the block's history planes encode keys and values.
@@ -591,6 +641,57 @@ pub struct AttentionBinding {
     /// A selected read's indexer (`HistoryReads::Selected`); none for a
     /// read of every visible row.
     pub selection: Option<SelectionBinding>,
+    /// A grouped output's first product (`OutputProjection::GroupedLowRank`'s
+    /// `a`); none for a full output projection.
+    pub grouped: Option<GroupedOutputBinding>,
+}
+
+impl AttentionBinding {
+    /// The output projection's input rows as `attention_output` reads them,
+    /// `(Q, W)`: the attended heads, or a grouped output's `a` products.
+    pub fn output_input(&self) -> (u64, u64) {
+        match self.grouped {
+            None => (self.shape.heads(), self.shape.width),
+            Some(grouped) => (grouped.shape.groups, grouped.shape.rank),
+        }
+    }
+}
+
+/// A grouped attention output's block-diagonal first product
+/// (`project_rows` with G groups) and the element of its weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GroupedOutputBinding {
+    pub shape: GroupedOutputShape,
+    pub element: Element,
+}
+
+/// `project_rows`' axes of a grouped attention output: `groups` (G), each
+/// projecting a run of `inputs` attended columns (K) to `rank` (N).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GroupedOutputShape {
+    pub groups: u64,
+    pub inputs: u64,
+    pub rank: u64,
+}
+
+impl AttentionBinding {
+    /// The weight the projection's query segment reads: the query's, or a
+    /// low-rank query's `down`.
+    pub fn query_segment(&self) -> Element {
+        self.low_rank_query
+            .map_or(self.query, |low_rank| low_rank.down)
+    }
+}
+
+/// A low-rank query's `qr` row: the attention projection's query segment
+/// projects its `rank` rows through `down`; widened to F32
+/// (`widen_rows`), a second `attention_project` normalizes them by `norm`
+/// in its prologue and projects them through the query weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LowRankQueryBinding {
+    pub rank: u64,
+    pub down: Element,
+    pub norm: Element,
 }
 
 /// The indexer of a selected attention read (`indexer_select`): its shape

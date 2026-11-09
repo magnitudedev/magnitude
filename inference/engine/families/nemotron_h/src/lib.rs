@@ -33,7 +33,7 @@ use magnitude_family_contracts::{
     FeedForwardUp, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm,
     HeadReadout, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics, KeyValue,
     LatentExperts, LayerNorm, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
+    OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
     ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, ValueNorm, ValueSource,
     VocabularyProjection, WeightDescriptor, FamilyError, checked_product,
 };
@@ -288,7 +288,9 @@ impl Geometry {
             heads: self.attention_heads,
             kv_heads,
             width,
-            query: binder.bind(&format!("{prefix}attn_q.weight"), &[query_rows, hidden])?,
+            query: QueryProjection::Full(
+                binder.bind(&format!("{prefix}attn_q.weight"), &[query_rows, hidden])?,
+            ),
             gate: AttentionGate::None,
             query_norm: HeadNorm::None,
             key_value: KeyValue::Owned {
@@ -300,15 +302,14 @@ impl Geometry {
                 value_norm: ValueNorm::None,
                 domain: HistoryDomain::Token,
             },
-            rotary: Rotary::None,
-            scale: 1.0 / (width as f64).sqrt(),
+            rotary: Rotary::None,            scale: 1.0 / (width as f64).sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
-            output: binder.bind(
+            output: OutputProjection::Full(binder.bind(
                 &format!("{prefix}attn_output.weight"),
                 &[hidden, query_rows],
-            )?,
+            )?),
         })))
     }
 

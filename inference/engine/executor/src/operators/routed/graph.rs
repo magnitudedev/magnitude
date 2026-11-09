@@ -393,6 +393,7 @@ fn expert_input<'a, G: GraphDraft + 'a>(
             entry,
             &[
                 ("M", rows),
+                ("G", 1),
                 ("K", shape.hidden),
                 ("N", shape.expert_hidden),
                 ("WS", down.operands.scale.extent),

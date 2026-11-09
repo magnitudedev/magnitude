@@ -463,6 +463,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 entries.input,
                 &[
                     ("M", slots),
+                    ("G", 1),
                     ("K", 2 * hidden),
                     ("N", width),
                     ("WS", input.operands.scale.extent),
@@ -746,6 +747,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                         entries.chain,
                         &[
                             ("M", slots),
+                            ("G", 1),
                             ("K", width),
                             ("N", hidden),
                             ("WS", chain.operands.scale.extent),

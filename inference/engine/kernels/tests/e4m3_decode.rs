@@ -267,7 +267,7 @@ fn e4m3_gemv_products_match_the_reference_at_every_code_and_exponent() {
                 &device,
                 &project_rows::native_entry_with(elements()),
                 &statics,
-                &[("K", K as u64), ("N", n as u64), ("WS", 0), ("WB", 0)],
+                &[("G", 1), ("K", K as u64), ("N", n as u64), ("WS", 0), ("WB", 0)],
             );
             let kernel =
                 project_rows::native_for_device_with(&device, elements(), &specialization).unwrap();

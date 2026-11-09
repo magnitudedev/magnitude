@@ -280,9 +280,7 @@ pub struct Attention {
     pub heads: u64,
     pub kv_heads: u64,
     pub width: u64,
-    /// `[heads·W, hidden]`, or `[2·heads·W, hidden]` when the gate is
-    /// interleaved with each head's query rows.
-    pub query: WeightDescriptor,
+    pub query: QueryProjection,
     pub gate: AttentionGate,
     pub query_norm: HeadNorm,
     pub key_value: KeyValue,
@@ -296,8 +294,53 @@ pub struct Attention {
     /// one logit `sinks[h]` (compared with the scaled scores) whose value is
     /// zero, so its output is `Σ e^{s_k}·v_k / (e^{sinks[h]} + Σ e^{s_k})`.
     pub sinks: Option<WeightDescriptor>,
+    pub output: OutputProjection,
+}
+
+/// The projection of the normed input `x` to the query heads (and, when the
+/// gate is interleaved, their gate rows): `Q` rows, `heads·W`, or `2·heads·W`
+/// when the gate is interleaved with each head's query rows.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum QueryProjection {
+    /// `[Q, hidden]`.
+    Full(WeightDescriptor),
+    /// `qr = RMS(down·x)·norm`, then `up·qr`: `down` `[rank, hidden]`, `norm`
+    /// `[rank]`, `up` `[Q, rank]`. The normalized `qr` row is an
+    /// intermediate a later stage may read.
+    LowRank {
+        down: WeightDescriptor,
+        norm: RmsNorm,
+        up: WeightDescriptor,
+    },
+}
+
+/// The projection of the `heads·W` attended (and gated) row back to the
+/// hidden width.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum OutputProjection {
     /// `[hidden, heads·W]`.
-    pub output: WeightDescriptor,
+    Full(WeightDescriptor),
+    /// The attended row splits into `groups` consecutive runs of
+    /// `heads·W / groups` columns; run `g` projects through its own block
+    /// `a[g·rank .. (g+1)·rank]` of `a` `[groups·rank, heads·W / groups]`
+    /// (block-diagonal), and the `groups·rank` row through `b`
+    /// `[hidden, groups·rank]`.
+    GroupedLowRank {
+        groups: u64,
+        rank: u64,
+        a: WeightDescriptor,
+        b: WeightDescriptor,
+    },
+}
+
+/// A rotation of each query head's attended row, before the gate and the
+/// output projection, by its rotary table at the row's own coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OutputRotary {
+    None,
+    /// The inverse rotation (negated angles) of the one applied to queries
+    /// and keys, in the table's layout.
+    Inverse,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,7 +403,7 @@ pub enum KeyValue {
         domain: HistoryDomain,
     },
     /// The layer stores nothing and reads the rows of an earlier attention
-    /// sublayer with equal `kv_heads`, `W` and rotary.
+    /// sublayer with equal `kv_heads`, `W` and key rotary ([`Rotary::of_keys`]).
     Shared { source: SublayerIndex },
 }
 
@@ -369,7 +412,10 @@ pub enum ValueSource {
     /// `[kv_heads·W, hidden]`.
     Projected(WeightDescriptor),
     /// Values are the raw key projection, before key norm and rotary.
-    Key,
+    RawKey,
+    /// Values are the stored key row, after key norm and rotary: the history
+    /// holds one plane, read as both. Takes no value norm.
+    StoredKey,
 }
 
 /// The set of token rows a layer's history keeps (plan §3.3).
@@ -409,8 +455,7 @@ pub enum HistoryReads {
 /// s[t, b] = Σ_h relu(q[h] · K[b]) / sqrt(width)
 /// ```
 ///
-/// The rotary is the attention's own, applied to the first rotary-width
-/// dimensions of each `width`.
+/// The rotary is the attention's own, in its layout over each `width`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Indexer {
     pub heads: u64,
@@ -444,14 +489,65 @@ pub enum Rotary {
         sections: Vec<u64>,
         axis_pattern: Vec<u8>,
     },
-    /// Pair `p` rotates dimensions `(p, p + P)` by `position·frequency_p`
-    /// scaled by `amplitude_p`; dimensions from `2P` pass through.
+    /// Pair `p` rotates its two dimensions (by `layout`) by
+    /// `position·frequency_p` scaled by `amplitude_p`; the other `W − 2P`
+    /// dimensions pass through.
     Table {
         pairs: Vec<RotaryPair>,
+        layout: RotaryLayout,
         /// A stored tensor the frequencies were derived from, which the
         /// importer checks at load.
         divisors: Option<RotaryDivisors>,
+        output: OutputRotary,
     },
+}
+
+impl Rotary {
+    /// The rotary as it rotates queries and keys, without what it does to
+    /// the attended row: what a layer's stored history rows depend on.
+    pub fn of_keys(&self) -> Self {
+        match self {
+            Self::Table { pairs, layout, divisors, .. } => Self::Table {
+                pairs: pairs.clone(),
+                layout: *layout,
+                divisors: divisors.clone(),
+                output: OutputRotary::None,
+            },
+            other => other.clone(),
+        }
+    }
+}
+
+/// Which dimensions of a `W`-wide head a rotary table's `P` pairs rotate:
+/// the rotated `2P` dimensions are the head's first (`Leading`) or last
+/// (`Trailing`) `2P`, and within them pair `p` is `(p, p + P)` (`HalfSplit`)
+/// or `(2p, 2p + 1)` (`Adjacent`). The layout is the checkpoint's own, kept in
+/// the kernels: permuting weight rows at import would move dimensions across
+/// a stored row's rounding blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RotaryLayout {
+    pub pairs: RotaryPairing,
+    pub placement: RotaryPlacement,
+}
+
+impl RotaryLayout {
+    /// Pairs `(p, p + P)` over the first `2P` dimensions.
+    pub const HALF_SPLIT_LEADING: Self = Self {
+        pairs: RotaryPairing::HalfSplit,
+        placement: RotaryPlacement::Leading,
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RotaryPairing {
+    HalfSplit,
+    Adjacent,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RotaryPlacement {
+    Leading,
+    Trailing,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -1178,7 +1274,7 @@ pub(crate) fn validate_blocks(blocks: &[Block], context: &Context) -> Result<(),
             if !matches!(owner.key_value, KeyValue::Owned { .. })
                 || owner.kv_heads != attention.kv_heads
                 || owner.width != attention.width
-                || owner.rotary != attention.rotary
+                || owner.rotary.of_keys() != attention.rotary.of_keys()
             {
                 return Err(DefinitionError::new(
                     "shared attention history disagrees with its source layer",
@@ -1372,7 +1468,22 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
         AttentionGate::Interleaved { .. } => checked_product(&[2, head_rows])?,
         _ => head_rows,
     };
-    expect_shape(&attention.query, &[query_rows, hidden], "attention query")?;
+    match &attention.query {
+        QueryProjection::Full(query) => {
+            expect_shape(query, &[query_rows, hidden], "attention query")?
+        }
+        QueryProjection::LowRank { down, norm, up } => {
+            let [rank, _] = down.shape[..] else {
+                return Err(DefinitionError::new("invalid attention query rank"));
+            };
+            if rank == 0 {
+                return Err(DefinitionError::new("invalid attention query rank"));
+            }
+            expect_shape(down, &[rank, hidden], "attention query down")?;
+            validate_rms(norm, rank, "attention query down norm")?;
+            expect_shape(up, &[query_rows, rank], "attention query up")?;
+        }
+    }
     if let AttentionGate::Separate {
         weight,
         granularity,
@@ -1396,8 +1507,18 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
     {
         let rows = checked_product(&[attention.kv_heads, width])?;
         expect_shape(key, &[rows, hidden], "attention key")?;
-        if let ValueSource::Projected(value) = value {
-            expect_shape(value, &[rows, hidden], "attention value")?;
+        match value {
+            ValueSource::Projected(value) => {
+                expect_shape(value, &[rows, hidden], "attention value")?
+            }
+            ValueSource::RawKey => {}
+            ValueSource::StoredKey => {
+                if !matches!(value_norm, ValueNorm::None) {
+                    return Err(DefinitionError::new(
+                        "stored-key values with a value norm",
+                    ));
+                }
+            }
         }
         validate_head_norm(key_norm, width, "attention key norm")?;
         if let ValueNorm::RmsUnweighted(norm) = value_norm {
@@ -1441,7 +1562,12 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
                 ));
             }
         }
-        Rotary::Table { pairs, divisors } => {
+        Rotary::Table {
+            pairs,
+            layout: _,
+            divisors,
+            output: _,
+        } => {
             let rotated = (pairs.len() as u64).checked_mul(2);
             if pairs.is_empty()
                 || rotated.is_none_or(|rotated| rotated > width)
@@ -1482,7 +1608,19 @@ fn validate_attention(attention: &Attention, context: &Context) -> Result<(), De
     if let Some(sinks) = &attention.sinks {
         expect_shape(sinks, &[attention.heads], "attention sinks")?;
     }
-    expect_shape(&attention.output, &[hidden, head_rows], "attention output")
+    match &attention.output {
+        OutputProjection::Full(output) => {
+            expect_shape(output, &[hidden, head_rows], "attention output")
+        }
+        OutputProjection::GroupedLowRank { groups, rank, a, b } => {
+            if *groups == 0 || *rank == 0 || !attention.heads.is_multiple_of(*groups) {
+                return Err(DefinitionError::new("invalid grouped attention output"));
+            }
+            let low = checked_product(&[*groups, *rank])?;
+            expect_shape(a, &[low, head_rows / groups], "attention output a")?;
+            expect_shape(b, &[hidden, low], "attention output b")
+        }
+    }
 }
 
 fn validate_indexer(

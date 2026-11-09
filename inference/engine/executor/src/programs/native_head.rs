@@ -315,7 +315,7 @@ impl CheckedHeadEntries {
                 ("HN", binding.hidden_norm),
                 ("CW", binding.combine),
             ],
-            attention: CheckedAttentionEntries::new(binding.attention, false),
+            attention: CheckedAttentionEntries::new(binding.attention, backend, false)?,
             feed_forward: match binding.feed_forward {
                 FeedForwardProgramSlot::Dense(binding) => {
                     CheckedHeadFeedForwardEntries::Dense(CheckedDenseEntries::new(binding))

@@ -21,11 +21,11 @@ use super::{
 };
 use crate::operators;
 use crate::operators::attention::graph::{
-    DECODE_ROWS, indexer_project_dimensions, rotary_amplitudes, rotary_components,
-    rotary_frequencies, selected_segments,
+    DECODE_ROWS, indexer_project_dimensions, low_rank_query_dimensions, project_dimensions,
+    rotary_amplitudes, rotary_components, rotary_frequencies, selected_segments,
 };
 use crate::programs::invocation_demand::Launch;
-use crate::{AttentionBinding, AttentionShape, SelectionBinding};
+use crate::{AttentionBinding, AttentionShape, LowRankQueryBinding, SelectionBinding};
 use magnitude_family_contracts::{
     Attention, HeadHistory, HistoryDomain, KeyValue, Operator, WeightKind, WeightScope,
 };
@@ -352,7 +352,7 @@ impl AttentionProjectTuning {
         let b = self.binding;
         attention_project::Elements {
             NW: b.norm,
-            QW: b.query,
+            QW: b.query_segment(),
             GW: b.gate,
             KW: b.key,
             VW: b.value,
@@ -385,7 +385,7 @@ impl EntryTuning for AttentionProjectTuning {
         format!(
             "NW={},QW={},GW={},KW={},VW={},A={}",
             b.norm.name(),
-            b.query.name(),
+            b.query_segment().name(),
             b.gate.name(),
             b.key.name(),
             b.value.name(),
@@ -395,15 +395,18 @@ impl EntryTuning for AttentionProjectTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.binding.shape;
-        let query = operators::attention::query_kind(operator(inputs, &self.scopes)?);
-        if projection_shape(inputs, &self.scopes, query)? != (shape.query_rows(), shape.hidden) {
-            return Err("the query projection disagrees with the binding".into());
-        }
+        let query = operators::attention::query_segment_kind(operator(inputs, &self.scopes)?);
+        let rank = self.binding.low_rank_query.map(|low_rank| low_rank.rank);
         let [_, statics @ ..] = if self.binding.key_value_only {
             shape.key_value_dimensions(0)
         } else {
-            shape.project_dimensions(0)
+            project_dimensions(&shape, rank, 0)
         };
+        if projection_shape(inputs, &self.scopes, query)?
+            != (rank.unwrap_or(shape.query_rows()), shape.hidden)
+        {
+            return Err("the query projection disagrees with the binding".into());
+        }
         let mut statics = statics.to_vec();
         let [query, gate, key, value] = self.operand_kinds(query);
         statics.extend(scale_statics(
@@ -431,7 +434,7 @@ impl EntryTuning for AttentionProjectTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, BuildError> {
         let shape = self.binding.shape;
-        let query_kind = operators::attention::query_kind(operator(inputs, &self.scopes)?);
+        let query_kind = operators::attention::query_segment_kind(operator(inputs, &self.scopes)?);
         let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
@@ -634,12 +637,131 @@ impl EntryTuning for IndexerProjectTuning {
     generated_entry!(attention_project, this => this.elements());
 }
 
+/// `attention_project` as a low-rank query's up projection: the F32 `qr`
+/// rows (`rank` wide) normalized by their norm, then projected to the query
+/// rows, with no gate, key or value rows.
+#[derive(Clone)]
+pub(crate) struct LowRankQueryProjectTuning {
+    pub binding: AttentionBinding,
+    pub low_rank: LowRankQueryBinding,
+    pub scopes: Vec<WeightScope>,
+}
+
+impl LowRankQueryProjectTuning {
+    /// The query weight's kind (`up`) as the only segment.
+    fn operand_kinds(query: WeightKind) -> [Option<WeightKind>; 4] {
+        [Some(query), None, None, None]
+    }
+
+    fn elements(&self) -> attention_project::Elements {
+        let query = self.binding.query;
+        attention_project::Elements {
+            NW: self.low_rank.norm,
+            QW: query,
+            GW: query,
+            KW: query,
+            VW: query,
+            A: self.binding.activation,
+        }
+    }
+}
+
+impl EntryTuning for LowRankQueryProjectTuning {
+    type Entry = attention_project::Entry;
+    type Case = AttentionProjectCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
+    fn bindings(&self) -> String {
+        format!(
+            "NW={},QW={},A={};low-rank query",
+            self.low_rank.norm.name(),
+            self.binding.query.name(),
+            self.binding.activation.name()
+        )
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let shape = self.binding.shape;
+        let rank = self.low_rank.rank;
+        let query = operators::attention::query_kind(operator(inputs, &self.scopes)?);
+        if projection_shape(inputs, &self.scopes, query)? != (shape.query_rows(), rank) {
+            return Err("the low-rank query's up projection disagrees with the binding".into());
+        }
+        let [_, statics @ ..] = low_rank_query_dimensions(&shape, rank, 0);
+        let mut statics = [statics.as_slice(), &[("PT", 1), ("NM", rank)]].concat();
+        let [query, gate, key, value] = Self::operand_kinds(query);
+        statics.extend(scale_statics(
+            inputs,
+            &self.scopes,
+            &[("QS", query), ("GS", gate), ("KS", key), ("VS", value)],
+        )?);
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("QB", query), ("GB", gate), ("KB", key), ("VB", value)],
+        )?);
+        Ok(statics)
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, BuildError> {
+        let rank = self.low_rank.rank;
+        let attention = operator(inputs, &self.scopes)?;
+        let query_kind = operators::attention::query_kind(attention);
+        let (_, epsilon) = operators::attention::low_rank_query(attention)
+            .ok_or("the binding's low-rank query is a full query")?;
+        TuningInputs::rotation_scopes(&self.scopes, point)
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                let query = inputs.weight(scope, query_kind)?;
+                let empty = query
+                    .slice_leading(0, 0)
+                    .map_err(|error| error.to_string())?;
+                Ok(AttentionProjectCase {
+                    gate: empty.clone(),
+                    key: empty.clone(),
+                    value: empty,
+                    hidden: inputs.activation(
+                        Element::f32(),
+                        &[point.rows, rank],
+                        index as u64 + 1,
+                    )?,
+                    input_norm: inputs.weight(scope, WeightKind::QueryDownNorm)?,
+                    query,
+                    epsilon: epsilon as f32,
+                    scales: segment_scales(inputs, scope, Self::operand_kinds(query_kind))?,
+                    bounds: segment_bounds(inputs, scope, Self::operand_kinds(query_kind))?,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> attention_project::Args<'a> {
+        AttentionProjectTuning::args(case)
+    }
+
+    generated_entry!(attention_project, this => this.elements());
+}
+
 /// `attention_output`: output projection plus residual.
 #[derive(Clone)]
 pub(crate) struct AttentionOutputTuning {
     pub output: Element,
     pub activation: Element,
     pub shape: AttentionShape,
+    /// The projection's input rows, `(Q, W)` (`AttentionBinding::output_input`).
+    pub input: (u64, u64),
     pub scopes: Vec<WeightScope>,
 }
 
@@ -675,16 +797,16 @@ impl EntryTuning for AttentionOutputTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
-        let heads = shape.kv_heads * shape.group;
+        let (q, w) = self.input;
         if projection_shape(inputs, &self.scopes, WeightKind::AttentionOutput)?
-            != (shape.hidden, heads * shape.width)
+            != (shape.hidden, q * w)
         {
             return Err("the attention output projection disagrees with the binding".into());
         }
         let mut statics = vec![
             ("D", shape.hidden),
-            ("Q", heads),
-            ("W", shape.width),
+            ("Q", q),
+            ("W", w),
             (
                 "OS",
                 scale_extent(inputs, &self.scopes, WeightKind::AttentionOutput)?,
@@ -725,7 +847,7 @@ impl EntryTuning for AttentionOutputTuning {
                     inject: inputs.activation(Element::f32(), &[point.rows, inject], seed + 3)?,
                     gated: inputs.activation(
                         self.activation,
-                        &[point.rows, shape.kv_heads * shape.group, shape.width],
+                        &[point.rows, self.input.0, self.input.1],
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::AttentionOutput)?,
@@ -759,8 +881,10 @@ pub(crate) struct AttentionMix {
     pub shape: AttentionShape,
     pub scopes: Vec<WeightScope>,
     pub epsilon: f32,
-    /// The row classes this variant serves. Distinct ranges have distinct
-    /// tuning identities and are validated on their own rows.
+    /// The decode row classes this variant serves, of a decode entry or of
+    /// the prefill entry where it attends them (`graph::dense_decodes`);
+    /// none for every class its entry serves by default. Distinct ranges
+    /// have distinct tuning identities and are validated on their own rows.
     pub decode_rows: Option<Range<u64>>,
     /// For the affine prefill: which of the layers' prefill launches the
     /// kernel serves, and whether it lists the history row tiles their rows
@@ -923,6 +1047,9 @@ pub(crate) struct AttentionMixCase<H> {
     /// Visible form).
     selection: Tensor,
     block_slots: Tensor,
+    /// The rotary layout, output rotary and stored-key values
+    /// (`[0, RA, RT, RO, VK]`, no values).
+    form: Tensor,
     history: H,
     slab_rows: u32,
     epsilon: f32,
@@ -950,10 +1077,28 @@ pub(crate) trait MixHistory: Sized {
     fn states(&self) -> Vec<(&'static str, &CaseState)>;
 }
 
-/// Dense key and value planes `[T, KV, W]` in the activation dtype.
+/// Dense key and value planes `[T, KV, W]` in the activation dtype; a
+/// stored-key history (`VK`) has the key plane alone, and its entries bind
+/// zero rows of a value plane.
 pub(crate) struct DenseMixHistory {
     key: CaseState,
-    value: CaseState,
+    value: DenseMixValues,
+}
+
+enum DenseMixValues {
+    Own(CaseState),
+    /// `[0, KV, W]`, never read or written.
+    Key(Tensor),
+}
+
+impl DenseMixValues {
+    /// The tensor the entries' `history_value` binds.
+    fn tensor_mut(&mut self) -> &mut Tensor {
+        match self {
+            Self::Own(state) => state.tensor_mut(),
+            Self::Key(absent) => absent,
+        }
+    }
 }
 
 impl MixHistory for DenseMixHistory {
@@ -975,21 +1120,35 @@ impl MixHistory for DenseMixHistory {
             )?;
             inputs.slab_state(plane, view, appended.clone())
         };
-        Ok(Self {
-            key: plane("history_key", 0x6b)?,
-            value: plane("history_value", 0x76)?,
-        })
+        let key = plane("history_key", 0x6b)?;
+        let value = if shape.stored_key() == 1 {
+            DenseMixValues::Key(inputs.activation(
+                mix.activation,
+                &[0, shape.kv_heads, shape.width],
+                0x76,
+            )?)
+        } else {
+            DenseMixValues::Own(plane("history_value", 0x76)?)
+        };
+        Ok(Self { key, value })
     }
 
     fn share(&self) -> Self {
         Self {
             key: self.key.share(),
-            value: self.value.share(),
+            value: match &self.value {
+                DenseMixValues::Own(state) => DenseMixValues::Own(state.share()),
+                DenseMixValues::Key(absent) => DenseMixValues::Key(absent.clone()),
+            },
         }
     }
 
     fn states(&self) -> Vec<(&'static str, &CaseState)> {
-        vec![("history_key", &self.key), ("history_value", &self.value)]
+        let mut states = vec![("history_key", &self.key)];
+        if let DenseMixValues::Own(value) = &self.value {
+            states.push(("history_value", value));
+        }
+        states
     }
 }
 
@@ -1283,8 +1442,8 @@ impl AttentionMix {
             .map(|(index, scope)| {
                 let seed = 4 * index as u64;
                 // Head norms are the layers' own weights, or none.
-                let mut head_norm = |kind| {
-                    if shape.head_norm > 0 {
+                let mut head_norm = |present: u64, kind| {
+                    if present > 0 {
                         inputs
                             .weight(scope, kind)?
                             .reshape(&[1, width])
@@ -1293,13 +1452,13 @@ impl AttentionMix {
                         inputs.f32s(&[0, width], &[])
                     }
                 };
-                let query_norm = head_norm(WeightKind::QueryNorm)?;
+                let query_norm = head_norm(shape.query_norm, WeightKind::QueryNorm)?;
                 // A Shared layer's unread key norm port takes its query norm
                 // (`graph::attention`).
                 let key_norm = if shape.fresh == 0 {
                     query_norm.clone()
                 } else {
-                    head_norm(WeightKind::KeyNorm)?
+                    head_norm(shape.key_norm, WeightKind::KeyNorm)?
                 };
                 // Sinks are the layers' own logits, or none.
                 let sinks = if shape.sinks > 0 {
@@ -1329,7 +1488,12 @@ impl AttentionMix {
                         seed + 2,
                     )?,
                     key: inputs.activation(self.activation, &fresh_rows, seed + 3)?,
-                    value: inputs.activation(self.activation, &fresh_rows, seed + 4)?,
+                    // Stored-key values take no value of their own (`VK`).
+                    value: inputs.activation(
+                        self.activation,
+                        &[shape.fresh * (1 - shape.stored_key()), rows, shape.kv_heads * width],
+                        seed + 4,
+                    )?,
                     rotary_components: inputs.i32s(&[pairs], &components)?,
                     rotary_frequencies: inputs.f32s(&[pairs], &frequencies)?,
                     rotary_amplitudes: inputs.f32s(&[pairs], &amplitudes)?,
@@ -1359,6 +1523,16 @@ impl AttentionMix {
                         &vec![u32::MAX; (rows * self.words()) as usize],
                     )?,
                     block_slots: inputs.i32s(&[0, self.block_keys()], &[])?,
+                    form: inputs.i32s(
+                        &[
+                            0,
+                            shape.rotary_adjacent,
+                            shape.rotary_trailing,
+                            shape.output_rotary,
+                            shape.stored_key(),
+                        ],
+                        &[],
+                    )?,
                     history: history.share(),
                     slab_rows: u32::try_from(view).map_err(|_| "tuning history rows exceed u32")?,
                     epsilon: self.epsilon,
@@ -1379,7 +1553,7 @@ macro_rules! mix_entry {
         impl $tuning {
             fn served(&self, limits: TuningLimits) -> Vec<PointShape> {
                 let rows = served_row_points(limits, |rows| {
-                    ($serves)(rows)
+                    ($serves)(&self.0, rows)
                         && self
                             .0
                             .decode_rows
@@ -1434,7 +1608,7 @@ macro_rules! mix_entry {
 
             fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
                 let rows = launch.rows;
-                if rows == 0 || !($serves)(rows)
+                if rows == 0 || !($serves)(&self.0, rows)
                     || self.0.decode_rows.as_ref().is_some_and(|range| !range.contains(&rows))
                     || !self.0.listing.serves(launch)
                 {
@@ -1507,6 +1681,7 @@ macro_rules! mix_entry {
                     destinations: &$case.destinations,
                     slab_rows: $case.slab_rows,
                     $($plane: $state,)*
+                    form: &$case.form,
                     epsilon: $case.epsilon,
                     scale: $case.scale,
                     gate_function: $case.gate_function,
@@ -1528,7 +1703,7 @@ mix_entry!(
     AttentionDecodeTuning,
     attention_decode,
     DenseMixHistory,
-    |rows| rows <= DECODE_ROWS,
+    |_: &AttentionMix, rows| rows <= DECODE_ROWS,
     statics |_mix| [],
     |case| {
         history_key: case.history.key.tensor_mut(),
@@ -1540,7 +1715,7 @@ mix_entry!(
     AttentionPrefillTuning,
     attention_prefill,
     DenseMixHistory,
-    |rows| rows > DECODE_ROWS,
+    |mix: &AttentionMix, rows| rows > DECODE_ROWS || mix.decode_rows.is_some(),
     statics |mix| [("B", mix.words()), ("BR", mix.block_keys())],
     |case| {
         selection: &case.selection,
@@ -1553,7 +1728,7 @@ mix_entry!(
     AttentionDecodeK8V4Tuning,
     attention_decode_k8v4,
     AffineMixHistory,
-    |rows| rows <= DECODE_ROWS,
+    |_: &AttentionMix, rows| rows <= DECODE_ROWS,
     statics |_mix| [],
     |case| {
         history_key_codes: case.history.key_codes.tensor_mut(),
@@ -1567,7 +1742,7 @@ mix_entry!(
     AttentionPrefillK8V4Tuning,
     attention_prefill_k8v4,
     AffineMixHistory,
-    |rows| rows > DECODE_ROWS,
+    |mix: &AttentionMix, rows| rows > DECODE_ROWS || mix.decode_rows.is_some(),
     statics |mix| [("B", mix.words()), ("BR", mix.block_keys())],
     |case| {
         selection: &case.selection,
@@ -1653,10 +1828,14 @@ mod tests {
                         interleaved_gate: 256,
                         separate_gate: 0,
                         fresh: 1,
-                        head_norm: 1,
+                        query_norm: 1,
+                        key_norm: 1,
                         value_norm: 0,
-                        projected_value: true,
+                        values: crate::AttentionValues::Projected,
                         sinks: 0,
+                        rotary_adjacent: 0,
+                        rotary_trailing: 0,
+                        output_rotary: 0,
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
@@ -1755,10 +1934,14 @@ mod tests {
                     interleaved_gate: 0,
                     separate_gate: 0,
                     fresh: 1,
-                    head_norm: 1,
+                    query_norm: 1,
+                    key_norm: 1,
                     value_norm: 1,
-                    projected_value: true,
+                    values: crate::AttentionValues::Projected,
                     sinks: 0,
+                    rotary_adjacent: 0,
+                    rotary_trailing: 0,
+                    output_rotary: 0,
                 },
                 scopes: Vec::new(),
                 epsilon: 1.0e-6,
@@ -1847,10 +2030,14 @@ mod tests {
                         interleaved_gate: 0,
                         separate_gate: 0,
                         fresh: 1,
-                        head_norm: 1,
+                        query_norm: 1,
+                        key_norm: 1,
                         value_norm: 0,
-                        projected_value: true,
+                        values: crate::AttentionValues::Projected,
                         sinks: 0,
+                        rotary_adjacent: 0,
+                        rotary_trailing: 0,
+                        output_rotary: 0,
                     },
                     scopes: Vec::new(),
                     epsilon: 1.0e-5,
@@ -1904,7 +2091,9 @@ mod tests {
                 mix.decode_rows = Some(2..DECODE_ROWS + 1);
                 mix.shape.width = 512;
                 mix.codec.key_width = 512;
-                mix.codec.value_width = 512;
+                if let magnitude_state::HistoryValue::Own { width, .. } = &mut mix.codec.value {
+                    *width = 512;
+                }
                 let wide_statics = statics.clone().with_static("S", 448);
                 assert!(
                     decode_starts(
@@ -1960,10 +2149,14 @@ mod tests {
                 interleaved_gate: 256,
                 separate_gate: 0,
                 fresh: 1,
-                head_norm: 1,
+                query_norm: 1,
+                key_norm: 1,
                 value_norm: 0,
-                projected_value: true,
+                values: crate::AttentionValues::Projected,
                 sinks: 0,
+                rotary_adjacent: 0,
+                rotary_trailing: 0,
+                output_rotary: 0,
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,
@@ -2083,10 +2276,14 @@ mod tests {
                 interleaved_gate: 0,
                 separate_gate: 0,
                 fresh: 1,
-                head_norm: 1,
+                query_norm: 1,
+                key_norm: 1,
                 value_norm: 0,
-                projected_value: true,
+                values: crate::AttentionValues::Projected,
                 sinks: 0,
+                rotary_adjacent: 0,
+                rotary_trailing: 0,
+                output_rotary: 0,
             },
             scopes: Vec::new(),
             epsilon: 1.0e-5,

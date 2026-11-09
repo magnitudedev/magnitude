@@ -81,6 +81,8 @@ fn portable(case: &Case, bits: &[u32], words: usize) -> Vec<f32> {
         tensor(DType::I32, vec![0, BLOCK_ROWS], Vec::new()),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_key)),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
+        // Half-split leading rotary pairs, no output rotary, own values.
+        tensor(DType::I32, vec![0, 0, 0, 0, 0], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
@@ -151,6 +153,7 @@ fn native(device: &Device, specialization: &NativeSpecialization, case: &Case, b
             block_slots: &block_slots(device, BLOCK_ROWS),
             history_key: &mut history_key,
             history_value: &mut history_value,
+            form: &half_split_layout(device),
             epsilon: case.epsilon,
             scale: case.scale,
             gate_function: 0,

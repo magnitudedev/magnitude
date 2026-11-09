@@ -3,8 +3,10 @@
 #define ATTENTION_U SEISMIC_DIM_U
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_QUERY_NORM (SEISMIC_DIM_NQ != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define ATTENTION_SINKS (SEISMIC_DIM_SK != 0)
+#define ATTENTION_STORED_KEY (SEISMIC_DIM_VK != 0)
 #define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
 #define PREFILL_DIRECT SEISMIC_TUNE_DIRECT
 #define PREFILL_SELECTED (SEISMIC_DIM_B != 0)
@@ -52,8 +54,8 @@ kernel void attention_prefill_prepare(
     uint group [[threadgroup_position_in_grid]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    attention::prefill_prepare<SEISMIC_TUNE_QT>(attention::dense_history{history_key, history_value,
-        ulong(SEISMIC_PARAM_SLAB_ROWS)},
+    attention::prefill_prepare<SEISMIC_TUNE_QT>(attention::dense_history{history_key,
+        attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)},
         query, key, value, query_norm, key_norm, value_norm, rotary_components, rotary_frequencies,
         rotary_amplitudes, coordinates, destinations, queries, keys, values, SEISMIC_DIM_M,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1,
@@ -87,8 +89,8 @@ kernel void attention_prefill_attend(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
     PREFILL_EXCHANGE(exchange, SEISMIC_TUNE_QT);
-    attention::prefill_attend<SEISMIC_TUNE_QT>(attention::dense_history{history_key, history_value,
-        ulong(SEISMIC_PARAM_SLAB_ROWS)},
+    attention::prefill_attend<SEISMIC_TUNE_QT>(attention::dense_history{history_key,
+        attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)},
         query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
         SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
         SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
@@ -132,4 +134,21 @@ kernel void attention_prefill_list(
         const_cast<device int2 *>(list.lists), const_cast<device uint *>(list.listed), SEISMIC_DIM_M,
         SEISMIC_DIM_R, SEISMIC_DIM_B, int(SEISMIC_DIM_BR), PREFILL_LIST_CAPACITY, shared, group.x,
         thread_index, simd, lane);
+}
+
+// The output rotary (RO = 1, `attention::output_rotary`): threadgroup (row,
+// query head), one thread per rotary pair, after every output is stored.
+kernel void attention_prefill_rotate(
+    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
+    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
+    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
+    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
+    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint pair [[thread_index_in_threadgroup]]) {
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    attention::output_rotary(result, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes,
+        group.x, group.y, pair);
 }

@@ -259,6 +259,7 @@ pub(crate) fn ngram<'a, G: GraphDraft + 'a>(
                 entry,
                 &[
                     ("M", rows),
+                    ("G", 1),
                     ("K", embedding),
                     ("N", outputs),
                     ("WS", projection.operands.scale.extent),

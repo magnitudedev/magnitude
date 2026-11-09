@@ -1056,6 +1056,7 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
                     fusion,
                     &[
                         ("M", class.rows),
+                        ("G", 1),
                         ("K", width),
                         ("N", geometry.hidden),
                         ("WS", scale_extent),

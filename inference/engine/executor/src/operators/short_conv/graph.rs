@@ -276,8 +276,9 @@ mod tests {
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId, FeedForwardUp,
         HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
-        KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm,
-        Rotary, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
+        KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
+        OutputRotary, QueryProjection, ResidualForm, RmsNorm, Rotary, RotaryLayout, RotaryPair,
+        RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
         ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
     };
     use magnitude_state::KvCodec;
@@ -356,7 +357,7 @@ mod tests {
                     heads: 4,
                     kv_heads: 2,
                     width: 64,
-                    query: tensor(name("attn_q"), vec![HIDDEN, HIDDEN]),
+                    query: QueryProjection::Full(tensor(name("attn_q"), vec![HIDDEN, HIDDEN])),
                     gate: AttentionGate::None,
                     query_norm: HeadNorm::Rms(rms(tensor(name("attn_q_norm"), vec![64]))),
                     key_value: KeyValue::Owned {
@@ -373,13 +374,18 @@ mod tests {
                                 amplitude: 1.0,
                             })
                             .collect(),
+                        layout: RotaryLayout::HALF_SPLIT_LEADING,
                         divisors: None,
+                        output: OutputRotary::None,
                     },
                     scale: 1.0 / 8.0,
                     reads: HistoryReads::Visible,
                     media_rows: MediaRowAttention::Causal,
                     sinks: None,
-                    output: tensor(name("attn_output"), vec![HIDDEN, HIDDEN]),
+                    output: OutputProjection::Full(tensor(
+                        name("attn_output"),
+                        vec![HIDDEN, HIDDEN],
+                    )),
                 })),
                 output: OutputForm::Residual,
             }

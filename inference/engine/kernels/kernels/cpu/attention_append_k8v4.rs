@@ -1,10 +1,14 @@
 // Ordered cache publication before causal target attention.
-use lib::attention::attention::{self, Form};
+use lib::attention::attention::{self, Form, Layout};
 use seismic::cpu::slab::SlabTensor;
 
 fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
-    let form = Form::new(cx.dim_kv(), 0, cx.dim_p(), cx.dim_s(), 0, 0, cx.dim_f(), cx.dim_n(), cx.dim_nv()).affine();
+    // The keys' and values' form: no queries, so no query norm or output
+    // rotary.
+    let layout = Layout::new(cx.dim_ra(), cx.dim_rt());
+    let form = Form::new(cx.dim_kv(), 0, cx.dim_p(), cx.dim_s(), 0, 0, cx.dim_f(), 0, cx.dim_n(), cx.dim_nv(), layout, 0, cx.dim_vk())
+        .affine();
     let destination = cx.arg_destinations().get([row]);
     if !form.fresh || destination < 0 { return; }
     let (w, kv) = (form.heads.w, form.heads.kv);
@@ -19,7 +23,7 @@ fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
     let (key_norm, value_norm) = (cx.arg_key_norm(), cx.arg_value_norm());
     let norms = (
         None,
-        form.norm.then(|| key_norm.row([0, 0])),
+        form.key_norm.then(|| key_norm.row([0, 0])),
         form.value_norm.then(|| value_norm.row([0, 0])),
     );
     let (key, value) = (cx.arg_key(), cx.arg_value());

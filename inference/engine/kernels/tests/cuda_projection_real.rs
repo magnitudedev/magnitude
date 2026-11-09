@@ -492,6 +492,7 @@ fn real_12b_physical_f16_projection_operands() {
                 Y: Element::f32(),
             },
             &NativeSpecialization::new()
+                .with_static("G", 1)
                 .with_static("K", intermediate as u64)
                 .with_static("N", hidden as u64)
                 .with_static("WS", 0)
@@ -556,6 +557,7 @@ fn real_12b_physical_f16_projection_operands() {
                     Y: Element::f32(),
                 },
                 &NativeSpecialization::new()
+                    .with_static("G", 1)
                     .with_static("K", intermediate as u64)
                     .with_static("N", hidden as u64)
                     .with_static("WS", 0)

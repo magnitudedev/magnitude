@@ -170,6 +170,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
             entries.down,
             &[
                 ("M", rows),
+                ("G", 1),
                 ("K", features),
                 ("N", hidden),
                 ("WS", down.operands.scale.extent),

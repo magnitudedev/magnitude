@@ -67,12 +67,23 @@ pub enum Codec {
     },
 }
 
+/// What a history row holds as its value, beside its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HistoryValue {
+    /// Its own vector of `width` values per head, encoded by `codec`.
+    Own { codec: Codec, width: usize },
+    /// The stored key row itself (`ValueSource::StoredKey`): the row holds
+    /// the key's planes alone, and attention reads them as both.
+    Key,
+    /// No value: an indexer's keys without coordinates.
+    None,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CodecSpec {
     pub key: Codec,
-    pub value: Codec,
     pub key_width: usize,
-    pub value_width: usize,
+    pub value: HistoryValue,
     pub packing: u8,
 }
 
@@ -115,10 +126,36 @@ impl KvCodec {
         }
     }
 
-    /// `spec` widths are per attention head. Affine K8/V4 splits every
-    /// (history row, head) vector into groups of [`AFFINE_GROUP`] values.
+    /// A history whose values have their own vector, with widths per
+    /// attention head. Affine K8/V4 splits every (history row, head) vector
+    /// into groups of [`AFFINE_GROUP`] values.
     pub const fn spec(self, dense_dtype: DType, key_width: usize, value_width: usize) -> CodecSpec {
-        let (key, value) = match self {
+        let (key, value) = self.codecs(dense_dtype);
+        CodecSpec {
+            key,
+            key_width,
+            value: HistoryValue::Own {
+                codec: value,
+                width: value_width,
+            },
+            packing: 1,
+        }
+    }
+
+    /// A history whose values are its stored keys (`HistoryValue::Key`):
+    /// one key vector of `width` values per head, in the policy's key codec.
+    pub const fn stored_key(self, dense_dtype: DType, width: usize) -> CodecSpec {
+        CodecSpec {
+            key: self.codecs(dense_dtype).0,
+            key_width: width,
+            value: HistoryValue::Key,
+            packing: 1,
+        }
+    }
+
+    /// The policy's key and value codecs.
+    const fn codecs(self, dense_dtype: DType) -> (Codec, Codec) {
+        match self {
             Self::Dense => (
                 Codec::Dense { dtype: dense_dtype },
                 Codec::Dense { dtype: dense_dtype },
@@ -147,13 +184,6 @@ impl KvCodec {
                     scale_dtype: DType::F16,
                 },
             ),
-        };
-        CodecSpec {
-            key,
-            value,
-            key_width,
-            value_width,
-            packing: 1,
         }
     }
 }
@@ -178,38 +208,84 @@ pub struct AffineGeometry {
 }
 
 impl CodecSpec {
+    /// The vectors a row stores, each with its codec and width per head:
+    /// the key, then the value where it has its own.
+    pub fn vectors(self) -> impl Iterator<Item = (VectorKind, Codec, usize)> {
+        let value = match self.value {
+            HistoryValue::Own { codec, width } => Some((VectorKind::Value, codec, width)),
+            HistoryValue::Key | HistoryValue::None => None,
+        };
+        std::iter::once((VectorKind::Key, self.key, self.key_width)).chain(value)
+    }
+
+    /// The codec of `vector`, where the row stores it.
+    pub fn codec(self, vector: VectorKind) -> Option<Codec> {
+        self.vectors()
+            .find(|(kind, _, _)| *kind == vector)
+            .map(|(_, codec, _)| codec)
+    }
+
+    /// The value's width per head: its own, or the key's for stored keys.
+    pub fn value_width(self) -> Option<usize> {
+        match self.value {
+            HistoryValue::Own { width, .. } => Some(width),
+            HistoryValue::Key => Some(self.key_width),
+            HistoryValue::None => None,
+        }
+    }
+
     pub fn encoding(self) -> HistoryEncoding {
         match (self.key, self.value) {
-            (Codec::Dense { .. }, Codec::Dense { .. }) => HistoryEncoding::Dense,
-            (Codec::Affine { .. }, Codec::Affine { .. }) => HistoryEncoding::Affine,
+            (Codec::Dense { .. }, HistoryValue::Own { codec: Codec::Dense { .. }, .. })
+            | (Codec::Dense { .. }, HistoryValue::Key) => HistoryEncoding::Dense,
+            (Codec::Affine { .. }, HistoryValue::Own { codec: Codec::Affine { .. }, .. }) => {
+                HistoryEncoding::Affine
+            }
             _ => HistoryEncoding::Unsupported,
         }
     }
 
     /// The identical physical plane contract used by state allocation and
-    /// every attention producer/consumer, with widths per head.
+    /// every attention producer/consumer, with widths per head: each stored
+    /// vector's planes ([`Self::vectors`]).
     pub fn planes(self) -> Result<Vec<PlaneDescriptor>, LayoutError> {
-        let mut planes = planes_for(VectorKind::Key, self.key, self.key_width)?;
-        planes.extend(planes_for(VectorKind::Value, self.value, self.value_width)?);
+        if self.packing == 0 {
+            return Err(LayoutError::InvalidPacking(self.packing));
+        }
+        let mut planes = Vec::new();
+        for (vector, codec, width) in self.vectors() {
+            planes.extend(planes_for(vector, codec, width)?);
+        }
         Ok(planes)
     }
 
+    /// The affine planes' extents per head, named by vector and plane.
     pub fn affine_geometry(self) -> Result<AffineGeometry, LayoutError> {
         let (
             Codec::Affine { bits: key_bits, .. },
-            Codec::Affine {
-                bits: value_bits, ..
+            HistoryValue::Own {
+                codec: Codec::Affine {
+                    bits: value_bits, ..
+                },
+                ..
             },
         ) = (self.key, self.value)
         else {
             return Err(LayoutError::WrongRepresentation("affine plane geometry"));
         };
         let planes = self.planes()?;
+        let elements = |vector, name| {
+            planes
+                .iter()
+                .find(|plane| plane.vector == vector && plane.name == name)
+                .map(|plane| plane.row_elements)
+                .ok_or(LayoutError::WrongRepresentation("affine plane geometry"))
+        };
         Ok(AffineGeometry {
-            key_codes: planes[0].row_elements,
-            key_coefficients: planes[1].row_elements,
-            value_codes: planes[2].row_elements,
-            value_coefficients: planes[3].row_elements,
+            key_codes: elements(VectorKind::Key, PlaneName::Codes)?,
+            key_coefficients: elements(VectorKind::Key, PlaneName::Coefficients)?,
+            value_codes: elements(VectorKind::Value, PlaneName::Codes)?,
+            value_coefficients: elements(VectorKind::Value, PlaneName::Coefficients)?,
             key_bits,
             value_bits,
         })
@@ -224,21 +300,11 @@ impl CodecSpec {
     }
 
     pub fn dense(dtype: DType, key_width: usize, value_width: usize) -> Self {
-        Self {
-            key: Codec::Dense { dtype },
-            value: Codec::Dense { dtype },
-            key_width,
-            value_width,
-            packing: 1,
-        }
+        KvCodec::Dense.spec(dtype, key_width, value_width)
     }
 
     pub fn validate(self) -> Result<Self, LayoutError> {
-        if self.packing == 0 {
-            return Err(LayoutError::InvalidPacking(self.packing));
-        }
-        planes_for(VectorKind::Key, self.key, self.key_width)?;
-        planes_for(VectorKind::Value, self.value, self.value_width)?;
+        self.planes()?;
         Ok(self)
     }
 }
@@ -270,21 +336,17 @@ impl ComponentDescriptor {
     /// properties of their attention rows; this only declares cache semantics.
     pub fn causal_rows_use_cache(&self) -> bool {
         matches!(self.layer, LayerRef::Target(_))
-            && (matches!(self.codec.key, Codec::Affine { .. })
-                || matches!(self.codec.value, Codec::Affine { .. }))
+            && self
+                .codec
+                .vectors()
+                .any(|(_, codec, _)| matches!(codec, Codec::Affine { .. }))
     }
 
     pub fn new(layer: LayerRef, codec: CodecSpec, heads: usize) -> Result<Self, LayoutError> {
-        let codec = codec.validate()?;
         if heads == 0 {
             return Err(LayoutError::ZeroHeads);
         }
-        let mut planes = planes_for(VectorKind::Key, codec.key, codec.key_width)?;
-        planes.extend(planes_for(
-            VectorKind::Value,
-            codec.value,
-            codec.value_width,
-        )?);
+        let mut planes = codec.planes()?;
         for plane in &mut planes {
             plane.row_extents = vec![heads, plane.row_elements];
             plane.row_elements = plane
@@ -320,20 +382,23 @@ impl ComponentDescriptor {
             ));
         }
         let mut planes = planes_for(VectorKind::Key, Codec::Dense { dtype }, width)?;
-        let value_width = if coordinates { 4 } else { 0 };
         // Its planes are `[rows, elements]`: one vector per row, no heads.
-        if coordinates {
-            planes.push(plane(VectorKind::Value, PlaneName::Dense, DType::I32, value_width)?);
-        }
+        // The coordinates are integers, which no attention codec stores.
+        let value = if coordinates {
+            planes.push(plane(VectorKind::Value, PlaneName::Dense, DType::I32, 4)?);
+            HistoryValue::Own {
+                codec: Codec::Dense { dtype: DType::I32 },
+                width: 4,
+            }
+        } else {
+            HistoryValue::None
+        };
         Ok(Self {
             layer,
             codec: CodecSpec {
                 key: Codec::Dense { dtype },
-                value: Codec::Dense {
-                    dtype: if coordinates { DType::I32 } else { dtype },
-                },
                 key_width: width,
-                value_width,
+                value,
                 packing: 1,
             },
             heads: 1,
@@ -550,13 +615,15 @@ mod tests {
                     group: 32,
                     scale_dtype: DType::F16,
                 },
-                value: Codec::Affine {
-                    bits: 4,
-                    group: 0,
-                    scale_dtype: DType::F16,
-                },
                 key_width: 96,
-                value_width: 96,
+                value: HistoryValue::Own {
+                    codec: Codec::Affine {
+                        bits: 4,
+                        group: 0,
+                        scale_dtype: DType::F16,
+                    },
+                    width: 96,
+                },
                 packing: 2,
             },
             1,
@@ -655,12 +722,51 @@ mod tests {
         ));
     }
 
+    /// DeepSeek V4.1's window history: one KV head of 512, its values the
+    /// stored key row. One key plane, half the bytes of K + V.
+    #[test]
+    fn stored_key_history_holds_the_key_plane_alone() {
+        let stored = ComponentDescriptor::new(
+            LayerRef::Target(0),
+            KvCodec::Dense.stored_key(DType::BF16, 512),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            stored
+                .planes()
+                .iter()
+                .map(|plane| (plane.vector, plane.name, plane.row_extents.clone(), plane.row_bytes))
+                .collect::<Vec<_>>(),
+            [(VectorKind::Key, PlaneName::Dense, vec![1, 512], 1024)]
+        );
+        let both = ComponentDescriptor::new(
+            LayerRef::Target(0),
+            KvCodec::Dense.spec(DType::BF16, 512, 512),
+            1,
+        )
+        .unwrap();
+        assert_eq!(2 * stored.row_bytes().unwrap(), both.row_bytes().unwrap());
+        assert_eq!(stored.codec.encoding(), HistoryEncoding::Dense);
+        assert_eq!(stored.codec.value_width(), Some(512));
+        assert_eq!(stored.codec.codec(VectorKind::Value), None);
+        // A K8/V4 history has no stored-key entry.
+        assert_eq!(
+            KvCodec::AffineK8V4.stored_key(DType::BF16, 512).encoding(),
+            HistoryEncoding::Unsupported
+        );
+        // An indexer without coordinates holds no value, which is not the key.
+        let keys = ComponentDescriptor::indexer(LayerRef::Indexer(0), DType::F32, 64, false).unwrap();
+        assert_eq!(keys.codec.value, HistoryValue::None);
+        assert_eq!(keys.codec.value_width(), None);
+        assert_eq!(keys.planes().len(), 1);
+    }
+
     #[test]
     fn named_codec_policies_bind_the_frozen_constants() {
         let affine = KvCodec::AffineK8V4.spec(DType::BF16, 96, 64);
         assert_eq!(KvCodec::AffineK8V4.identity(), "affine_k8_uniform_v4");
         assert_eq!(affine.key_width, 96);
-        assert_eq!(affine.value_width, 64);
         assert_eq!(
             affine.key,
             Codec::Affine {
@@ -671,10 +777,13 @@ mod tests {
         );
         assert_eq!(
             affine.value,
-            Codec::Affine {
-                bits: 4,
-                group: 32,
-                scale_dtype: DType::F16,
+            HistoryValue::Own {
+                codec: Codec::Affine {
+                    bits: 4,
+                    group: 32,
+                    scale_dtype: DType::F16,
+                },
+                width: 64,
             }
         );
 
@@ -687,7 +796,13 @@ mod tests {
                 sign_seed: 42,
             }
         );
-        assert!(matches!(rotated.value, Codec::Affine { bits: 4, .. }));
+        assert!(matches!(
+            rotated.value,
+            HistoryValue::Own {
+                codec: Codec::Affine { bits: 4, .. },
+                ..
+            }
+        ));
 
         let dense = KvCodec::Dense.spec(DType::BF16, 4, 8);
         assert_eq!(dense, CodecSpec::dense(DType::BF16, 4, 8));
@@ -705,9 +820,11 @@ mod tests {
                     norm_dtype: DType::F16,
                     sign_seed: 42,
                 },
-                value: Codec::Dense { dtype: DType::F16 },
                 key_width: 33,
-                value_width: 8,
+                value: HistoryValue::Own {
+                    codec: Codec::Dense { dtype: DType::F16 },
+                    width: 8,
+                },
                 packing: 2,
             },
             1,
@@ -733,9 +850,11 @@ mod tests {
                         group: 3,
                         scale_dtype: DType::F16
                     },
-                    value: Codec::Dense { dtype: DType::F16 },
                     key_width: 8,
-                    value_width: 8,
+                    value: HistoryValue::Own {
+                        codec: Codec::Dense { dtype: DType::F16 },
+                        width: 8,
+                    },
                     packing: 2,
                 },
                 1,

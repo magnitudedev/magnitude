@@ -241,6 +241,8 @@ struct Bound {
     /// The prefill's absent WorkList bitmap ([M, 0]).
     selection: Tensor,
     block_slots: Tensor,
+    rotary_layout: Tensor,
+    append_layout: Tensor,
     history_tiles: Tensor,
     _history_slabs: SlabTensor,
     key_codes: Tensor,
@@ -361,6 +363,8 @@ impl Bound {
             destinations: i32_tensor(device, &[m], &case.destinations),
             selection: no_selection(device, m),
             block_slots: block_slots(device, 1),
+            rotary_layout: half_split_layout(device),
+            append_layout: half_split_append_layout(device),
             history_tiles: {
                 let tiles = history_tiles(&case.visible);
                 i32_tensor(device, &[1, tiles.len()], &tiles)
@@ -400,6 +404,7 @@ macro_rules! args {
             history_key_coefficients: &mut $bound.key_coefficients,
             history_value_codes: &mut $bound.value_codes,
             history_value_coefficients: &mut $bound.value_coefficients,
+            form: &$bound.append_layout,
             epsilon: $case.epsilon,
             slab_rows: $bound.slab_rows,
         }
@@ -425,6 +430,7 @@ macro_rules! args {
             history_key_coefficients: &mut $bound.key_coefficients,
             history_value_codes: &mut $bound.value_codes,
             history_value_coefficients: &mut $bound.value_coefficients,
+            form: &$bound.rotary_layout,
             epsilon: $case.epsilon,
             scale: $case.scale,
             gate_function: 0,
@@ -460,6 +466,7 @@ macro_rules! prefill_args {
             history_key_coefficients: &mut $bound.key_coefficients,
             history_value_codes: &mut $bound.value_codes,
             history_value_coefficients: &mut $bound.value_coefficients,
+            form: &$bound.rotary_layout,
             epsilon: $case.epsilon,
             scale: $case.scale,
             gate_function: 0,
@@ -1910,6 +1917,8 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
             vec![t, kv, coefficient_elements(w)],
             halves(&planes.value_coefficients),
         ),
+        // Half-split leading rotary pairs, no output rotary, own values.
+        tensor(DType::I32, vec![0, 0, 0, 0, 0], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
@@ -1952,8 +1961,9 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
             .map(|index| tensor.read(index).unwrap())
             .collect::<Vec<_>>()
     };
-    // The planes follow the row tables (and the prefill entry's tiles).
-    let planes = args.len() - 8;
+    // The planes follow the row tables (and the prefill entry's tiles), and
+    // precede the rotary layout and the four scalars.
+    let planes = args.len() - 9;
     let portable = Planes {
         key_codes: read(planes).into_iter().map(|x| x as u32).collect(),
         key_coefficients: read(planes + 1)
@@ -3422,7 +3432,7 @@ fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecial
     specialization
         .statics()
         .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "SK"))
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "SK" | "NQ" | "RO"))
         .fold(NativeSpecialization::new(), |spec, (name, value)| {
             spec.with_static(name, *value)
         })
@@ -3469,6 +3479,7 @@ fn codec_group32_storage_and_single_history_value_match_independent_recipe() {
         bound.key_norm = f32_tensor(&device, &[0, w], &[]);
         bound.query_norm = f32_tensor(&device, &[0, w], &[]);
         let base = specialization_on(&device, geometry, &[])
+            .with_static("NQ", 0)
             .with_static("N", 0)
             .with_static("I", 0);
         let append = attention_append_k8v4::native_for_device_with(
@@ -3501,6 +3512,7 @@ fn codec_group32_storage_and_single_history_value_match_independent_recipe() {
         bound.destinations = i32_tensor(&device, &[1], &[-1]);
         let config = decode_configs(device.backend(), geometry).remove(0);
         let spec = specialization_on(&device, geometry, &config)
+            .with_static("NQ", 0)
             .with_static("N", 0)
             .with_static("I", 0)
             .with_static("F", 0);
@@ -3653,6 +3665,7 @@ fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
                     destinations: &bound.destinations,
                     history_key: &mut dense_key,
                     history_value: &mut dense_value,
+                    form: &half_split_append_layout(&device),
                     epsilon,
                     slab_rows: m as u32,
                 })
@@ -4019,6 +4032,7 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                     destinations: &inputs.destinations,
                     history_key: &mut dk,
                     history_value: &mut dv,
+                    form: &half_split_append_layout(&device),
                     epsilon,
                     slab_rows: m as u32,
                 })
@@ -4127,6 +4141,7 @@ fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
                     specialization_on(&device, geometry, &parameters)
                 }
                 .with_static("I", 0)
+                .with_static("NQ", 0)
                 .with_static("N", 0)
                 .with_static("NV", 0);
                 let actual = if prefill {

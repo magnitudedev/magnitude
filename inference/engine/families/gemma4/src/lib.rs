@@ -29,7 +29,8 @@ use magnitude_family_contracts::{
     BranchOutput, Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm,
     ExpertSelection, FamilyId, FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads,
     ImportTransform, InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition,
-    Operator, OutputForm, PerLayerEntry, PerLayerInput, ResidualForm, RmsNorm, Rotary,
+    Operator, OutputForm, OutputProjection, PerLayerEntry, PerLayerInput,
+    QueryProjection, ResidualForm, RmsNorm, Rotary,
     RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
     ScoreFunction, Sublayer, SublayerIndex,
     UnweightedRms, ValueNorm, ValueSource, WeightDescriptor,
@@ -464,7 +465,7 @@ fn attention(
     let (hidden, width) = (shape.hidden, geometry.width);
     let head_rows = product(&[shape.heads, width])?;
     let kv_rows = product(&[kv_heads, width])?;
-    let query = b.bind(&format!("{p}attn_q.weight"), &[head_rows, hidden])?;
+    let query = QueryProjection::Full(b.bind(&format!("{p}attn_q.weight"), &[head_rows, hidden])?);
     let query_norm =
         HeadNorm::Rms(shape.rms(b.bind(&format!("{p}attn_q_norm.weight"), &[width])?));
     let key_value = match shared {
@@ -477,7 +478,7 @@ fn attention(
                 value: if b.contains(&value_name) {
                     ValueSource::Projected(b.bind(&value_name, &[kv_rows, hidden])?)
                 } else {
-                    ValueSource::Key
+                    ValueSource::RawKey
                 },
                 key_norm: HeadNorm::Rms(
                     shape.rms(b.bind(&format!("{p}attn_k_norm.weight"), &[width])?),
@@ -505,12 +506,13 @@ fn attention(
             gate: AttentionGate::None,
             query_norm,
             key_value,
-            rotary: geometry.rotary.clone(),
-            scale: 1.0,
+            rotary: geometry.rotary.clone(),            scale: 1.0,
             reads: HistoryReads::Visible,
             media_rows: geometry.media_rows,
             sinks: None,
-            output: b.bind(&format!("{p}attn_output.weight"), &[hidden, head_rows])?,
+            output: OutputProjection::Full(
+                b.bind(&format!("{p}attn_output.weight"), &[hidden, head_rows])?,
+            ),
         })),
         output: OutputForm::PostNorm(
             shape.rms(b.bind(&format!("{p}post_attention_norm.weight"), &[hidden])?),

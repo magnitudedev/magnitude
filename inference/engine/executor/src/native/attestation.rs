@@ -154,6 +154,7 @@ fn check_rotary_divisors(
         let magnitude_family_contracts::Rotary::Table {
             pairs,
             divisors: Some(divisors),
+            ..
         } = &attention.rotary
         else {
             continue;

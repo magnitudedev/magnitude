@@ -15,7 +15,7 @@
 
 mod common;
 
-use magnitude_kernels::{attention_decode, attention_prefill};
+use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill};
 use seismic::{
     BackendName, Device, Element, NativeSpecialization, SlabRegion, SlabTensor,
     Tensor,
@@ -56,8 +56,48 @@ struct Form {
     separate: usize,
     softplus: bool,
     fresh: bool,
+    /// A query norm (`NQ = 1`).
+    query_norm: bool,
+    /// A key norm (`N = 1`; a layer without fresh rows takes the query's).
     norm: bool,
     value_norm: bool,
+    rotary: Rotary,
+    /// Values are the stored key row (`VK = 1`): no value input, value norm
+    /// or value plane.
+    stored_key: bool,
+}
+
+/// The rotary layout and output rotary (`RA`, `RT`, `RO`).
+#[derive(Clone, Copy, Debug)]
+struct Rotary {
+    adjacent: bool,
+    trailing: bool,
+    inverse_output: bool,
+}
+
+impl Rotary {
+    const HALF_SPLIT_LEADING: Self = Self {
+        adjacent: false,
+        trailing: false,
+        inverse_output: false,
+    };
+    /// DeepSeek V4.1's: adjacent pairs over the trailing columns, the
+    /// attended row turned back.
+    const ADJACENT_TRAILING_INVERSE: Self = Self {
+        adjacent: true,
+        trailing: true,
+        inverse_output: true,
+    };
+
+    /// The (lo, hi) columns of pair `pair` of `p` in a `w`-column row.
+    fn columns(self, pair: usize, p: usize, w: usize) -> (usize, usize) {
+        let first = if self.trailing { w - 2 * p } else { 0 };
+        if self.adjacent {
+            (first + 2 * pair, first + 2 * pair + 1)
+        } else {
+            (first + pair, first + pair + p)
+        }
+    }
 }
 
 impl Form {
@@ -74,6 +114,25 @@ impl Form {
     fn gates(&self) -> usize {
         self.i().max(self.separate)
     }
+    /// The extents of the entries' empty `form` table: 0, RA, RT, RO, VK.
+    fn extents(&self) -> [usize; 5] {
+        [
+            0,
+            usize::from(self.rotary.adjacent),
+            usize::from(self.rotary.trailing),
+            usize::from(self.rotary.inverse_output),
+            usize::from(self.stored_key),
+        ]
+    }
+    /// The layers of the entries' value input: none for stored-key values.
+    fn value_layers(&self) -> usize {
+        usize::from(self.fresh && !self.stored_key)
+    }
+    /// The value plane's rows of a `rows`-row history: none for stored-key
+    /// values.
+    fn value_rows(&self, rows: usize) -> usize {
+        if self.stored_key { 0 } else { rows }
+    }
 }
 
 /// A row's controls: visible history spans, its fresh span over the batch
@@ -87,6 +146,7 @@ struct Row {
 }
 
 /// One invocation: rows, their controls, projections, weights and history.
+#[derive(Clone)]
 struct Case {
     form: Form,
     rows: usize,
@@ -163,9 +223,9 @@ impl Case {
         let query = values(m * heads * (w + form.i()), 2.0);
         let gate = values(m * heads * form.separate, 2.0);
         let key = values(if form.fresh { m * form.kv * w } else { 0 }, 2.0);
-        let value = values(if form.fresh { m * form.kv * w } else { 0 }, 1.0);
+        let value = values(form.value_layers() * m * form.kv * w, 1.0);
         let history_key = values(history_rows * form.kv * w, 3.0);
-        let history_value = values(history_rows * form.kv * w, 1.0);
+        let history_value = values(form.value_rows(history_rows) * form.kv * w, 1.0);
         let visible = rows
             .iter()
             .flat_map(|row| {
@@ -246,26 +306,26 @@ impl Case {
             }
             None => raw.to_vec(),
         };
-        (0..w)
-            .map(|i| {
-                if i >= 2 * p {
-                    return normalized[i];
-                }
-                let pair = i % p;
-                let coordinate = self.coordinates[row * 4 + self.components[pair] as usize];
-                let angle = coordinate as f32 * self.frequencies[pair];
-                let (c, s) = (
-                    angle.cos() * self.amplitudes[pair],
-                    angle.sin() * self.amplitudes[pair],
-                );
-                if i < p {
-                    normalized[i] * c - normalized[i + p] * s
-                } else {
-                    normalized[i] * c + normalized[i - p] * s
-                }
-            })
-            .map(bf16)
-            .collect()
+        self.turn(normalized, row, p, 1.0).into_iter().map(bf16).collect()
+    }
+
+    /// `row`'s first `p` rotary pairs of `x` turned by their angles times
+    /// `sign` (the portable `rotate_pairs`), in F32.
+    fn turn(&self, mut x: Vec<f32>, row: usize, p: usize, sign: f32) -> Vec<f32> {
+        let w = x.len();
+        for pair in 0..p {
+            let (lo, hi) = self.form.rotary.columns(pair, p, w);
+            let coordinate = self.coordinates[row * 4 + self.components[pair] as usize];
+            let angle = coordinate as f32 * self.frequencies[pair];
+            let (c, s) = (
+                angle.cos() * self.amplitudes[pair],
+                sign * angle.sin() * self.amplitudes[pair],
+            );
+            let (low, high) = (x[lo], x[hi]);
+            x[lo] = low * c - high * s;
+            x[hi] = high * c + low * s;
+        }
+        x
     }
 
     /// The portable body's result and final histories, computed on the host.
@@ -290,27 +350,38 @@ impl Case {
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
-        let fresh_values = (0..if form.fresh { self.rows } else { 0 })
-            .map(|row| {
-                (0..kv)
-                    .map(|head| {
-                        self.prepare(
-                            &self.value[(row * kv + head) * w..][..w],
-                            form.value_norm.then_some(&self.value_norm[..]),
-                            false,
-                            row,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        // A stored-key value is the prepared key.
+        let fresh_values = if form.stored_key {
+            fresh_keys.clone()
+        } else {
+            (0..if form.fresh { self.rows } else { 0 })
+                .map(|row| {
+                    (0..kv)
+                        .map(|head| {
+                            self.prepare(
+                                &self.value[(row * kv + head) * w..][..w],
+                                form.value_norm.then_some(&self.value_norm[..]),
+                                false,
+                                row,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        // History values are read from the key plane for stored keys.
+        let history_values = if form.stored_key {
+            &self.history_key
+        } else {
+            &self.history_value
+        };
         let mut result = vec![0.0; self.rows * kv * g * w];
         for row in 0..self.rows {
             for head in 0..kv * g {
                 let kv_head = head / g;
                 let query = self.prepare(
                     &self.query[(row * kv * g + head) * (w + i)..][..w],
-                    norm(&self.query_norm),
+                    form.query_norm.then_some(&self.query_norm[..]),
                     true,
                     row,
                 );
@@ -320,8 +391,7 @@ impl Case {
                     let hi = self.visible[(row * self.spans + span) * 2 + 1];
                     for token in lo.max(0)..hi {
                         let at = (token as usize * kv + kv_head) * w;
-                        entries
-                            .push((&self.history_key[at..][..w], &self.history_value[at..][..w]));
+                        entries.push((&self.history_key[at..][..w], &history_values[at..][..w]));
                     }
                 }
                 if form.fresh {
@@ -380,6 +450,15 @@ impl Case {
                     };
                     result[(row * kv * g + head) * w + column] = bf16(gated as f32);
                 }
+                // The output rotary (ungated forms only): the published row
+                // turned back and published again.
+                if form.rotary.inverse_output {
+                    let out = &mut result[(row * kv * g + head) * w..][..w];
+                    let turned = self.turn(out.to_vec(), row, form.p, -1.0);
+                    for (target, value) in out.iter_mut().zip(turned) {
+                        *target = bf16(value);
+                    }
+                }
             }
         }
         let mut history_key = self.history_key.clone();
@@ -392,7 +471,9 @@ impl Case {
             for head in 0..kv {
                 let at = (destination as usize * kv + head) * w;
                 history_key[at..at + w].copy_from_slice(&fresh_keys[row][head]);
-                history_value[at..at + w].copy_from_slice(&fresh_values[row][head]);
+                if !form.stored_key {
+                    history_value[at..at + w].copy_from_slice(&fresh_values[row][head]);
+                }
             }
         }
         (result, history_key, history_value)
@@ -438,6 +519,7 @@ fn check_host_model(entry: &str, case: &Case) {
         form.heads(),
     );
     let f = usize::from(form.fresh);
+    let nq = usize::from(form.query_norm);
     let n = usize::from(form.norm);
     let nv = usize::from(form.value_norm);
     let mut interpreter = Interpreter::new(&logical);
@@ -468,8 +550,8 @@ fn check_host_model(entry: &str, case: &Case) {
             floats(&case.gate),
         ),
         tensor(DType::BF16, vec![f, m, kv * w], floats(&case.key)),
-        tensor(DType::BF16, vec![f, m, kv * w], floats(&case.value)),
-        tensor(DType::F32, vec![n, w], rows(&case.query_norm, n)),
+        tensor(DType::BF16, vec![form.value_layers(), m, kv * w], floats(&case.value)),
+        tensor(DType::F32, vec![nq, w], rows(&case.query_norm, nq)),
         tensor(DType::F32, vec![n, w], rows(&case.key_norm, n)),
         tensor(DType::F32, vec![nv, w], rows(&case.value_norm, nv)),
         tensor(DType::F32, vec![case.sink_rows(), heads], floats(&case.sinks)),
@@ -481,7 +563,8 @@ fn check_host_model(entry: &str, case: &Case) {
         tensor(DType::I32, vec![m, 2], ints(&case.fresh)),
         tensor(DType::I32, vec![m], ints(&case.destinations)),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_key)),
-        tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
+        tensor(DType::BF16, vec![form.value_rows(t), kv, w], floats(&case.history_value)),
+        tensor(DType::I32, form.extents().to_vec(), Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(i32::from(form.softplus))),
@@ -618,6 +701,7 @@ struct Bound {
     selection: Tensor,
     /// Its blocks' keys (`[0, 1]`: every key read).
     block_slots: Tensor,
+    form: Tensor,
     _slabs: SlabTensor,
     history_key: Tensor,
     history_value: Tensor,
@@ -633,8 +717,9 @@ impl Bound {
             form.kv,
             form.heads(),
         );
-        let (f, n, nv) = (
+        let (f, nq, n, nv) = (
             usize::from(form.fresh),
+            usize::from(form.query_norm),
             usize::from(form.norm),
             usize::from(form.value_norm),
         );
@@ -643,15 +728,19 @@ impl Bound {
             element: Element::bf16(),
             row_shape: vec![kv as u64, w as u64],
         };
+        // A stored-key history holds the key plane alone; its entries bind
+        // zero rows of a value plane.
+        let stored = [&case.history_key, &case.history_value];
+        let stored = &stored[..if form.stored_key { 1 } else { 2 }];
         let mut slabs =
-            SlabTensor::new(device, slab_rows, t as u64, vec![region(), region()]).unwrap();
+            SlabTensor::new(device, slab_rows, t as u64, vec![region(); stored.len()]).unwrap();
         let row_bytes = kv * w * 2;
-        let planes = [&case.history_key, &case.history_value].map(|values| {
+        let planes = stored.iter().map(|values| {
             values
                 .iter()
                 .flat_map(|v| bf16_bits(*v).to_le_bytes())
                 .collect::<Vec<_>>()
-        });
+        }).collect::<Vec<_>>();
         for index in 0..(t as u64).div_ceil(slab_rows) {
             slabs.add_slab().unwrap();
             let start = index * slab_rows;
@@ -682,8 +771,8 @@ impl Bound {
             query: bf16_tensor(device, &[m, heads, w + form.i()], &case.query),
             gate: bf16_tensor(device, &[m, heads, form.separate], &case.gate),
             key: bf16_tensor(device, &[f, m, kv * w], &case.key),
-            value: bf16_tensor(device, &[f, m, kv * w], &case.value),
-            query_norm: norm(&case.query_norm, n),
+            value: bf16_tensor(device, &[form.value_layers(), m, kv * w], &case.value),
+            query_norm: norm(&case.query_norm, nq),
             key_norm: norm(&case.key_norm, n),
             value_norm: norm(&case.value_norm, nv),
             sinks: f32_tensor(device, &[case.sink_rows(), heads], &case.sinks),
@@ -696,8 +785,19 @@ impl Bound {
             destinations: i32_tensor(device, &[m], &case.destinations),
             selection: Tensor::from_host(device, Element::u32(), &[m as u64, 0], &[]).unwrap(),
             block_slots: Tensor::from_host(device, Element::i32(), &[0, 1], &[]).unwrap(),
+            form: Tensor::from_host(
+                device,
+                Element::i32(),
+                &case.form.extents().map(|extent| extent as u64),
+                &[],
+            )
+            .unwrap(),
             history_key: slabs.logical_region(0).unwrap(),
-            history_value: slabs.logical_region(1).unwrap(),
+            history_value: if form.stored_key {
+                bf16_tensor(device, &[0, kv, w], &[])
+            } else {
+                slabs.logical_region(1).unwrap()
+            },
             _slabs: slabs,
         }
     }
@@ -712,9 +812,14 @@ fn statics(device: &Device, form: Form, sinks: usize) -> NativeSpecialization {
         ("I", form.i()),
         ("U", form.separate),
         ("F", usize::from(form.fresh)),
+        ("NQ", usize::from(form.query_norm)),
         ("N", usize::from(form.norm)),
         ("NV", usize::from(form.value_norm)),
         ("SK", sinks),
+        ("RA", usize::from(form.rotary.adjacent)),
+        ("RT", usize::from(form.rotary.trailing)),
+        ("RO", usize::from(form.rotary.inverse_output)),
+        ("VK", usize::from(form.stored_key)),
     ];
     let gpu = [("KV", form.kv), ("G", form.g)];
     let base = common
@@ -1045,6 +1150,7 @@ fn run(
                     destinations: &bound.destinations,
                     history_key: &mut bound.history_key,
                     history_value: &mut bound.history_value,
+                    form: &bound.form,
                     epsilon: case.epsilon,
                     scale: case.scale,
                     gate_function: i32::from(case.form.softplus),
@@ -1066,23 +1172,89 @@ fn run(
     ))
 }
 
-/// Results agree within bf16 publication plus reduced-precision operands;
-/// histories exactly but keys, which may differ by one bf16 step.
+/// An attended row's bar: bf16 publication plus reduced-precision operands,
+/// `b(x) = 4e-3 + 1.6e-2 |x|` per component.
+fn attended_bar(x: f32) -> f32 {
+    4.0e-3 + 1.6e-2 * x.abs()
+}
+
+/// Each result's bound. An unturned result is an attended row, held to
+/// [`attended_bar`]. A result under the output rotary (RO = 1) is
+/// `bf16(T(P))`: the published attended row `P` turned back by `T`, then
+/// published again. The bound follows its roundings:
+/// - Before the turn, `P` takes the roundings of an attended row and no
+///   others: the stored rows it reads, rounded once on the device and in the
+///   host model (`fresh_key`, attention.seismic:692; `prepare`,
+///   attention_family.rs:309) and twice in V4.1's reference (the norm's
+///   output, then the rotated row, in `v41_reference`), which reach `P`
+///   through its scores and values; and `P`'s own publication
+///   (attention.seismic:640; `bf16(gated)`, attention_family.rs:451; the
+///   reference's `bf16` of `o`). An attended row's bar holds them, at most one bf16 step
+///   (2^-7 |x|) of it the publication's, so `|ΔP_c| <= b(P_c)` for each of the
+///   pair's components, at their own scale, not the turned result's.
+/// - The turn is a rotation scaled by the pair's amplitude `a`: it carries the
+///   pair's error vector unchanged in norm but for `a`, however far it cancels
+///   the pair's components. So `|ΔT| <= a |(b(P_lo), b(P_hi))| <= a (√2 · 4e-3)
+///   + 1.6e-2 |T(P)|` (Minkowski, with `a |P| = |T(P)|`).
+/// - The turn's own F32 arithmetic (two products and a sum per component,
+///   and its cosine and sine) adds under 2^-20 |T(P)|.
+/// - The second publication rounds each side once, half a step (2^-8 |x|)
+///   each: `|bf16(x) - bf16(y)| <= (1 + 2^-8) |x - y| + 2^-7 (1 + 2^-8) |x|`.
+///   It also makes `|T(P)| <= (1 + 2^-8)` times the published pair's norm `r`.
+///
+/// With `u = 1 + 2^-8`, a turned component `e` is held to
+/// `u (√2 · 4e-3 a + (1.6e-2 + 2^-20) u r) + 2^-7 u |e|`.
+///
+/// Each bound is paired with whether its result is turned.
+fn result_bounds(case: &Case, expected: &[f32]) -> Vec<(f32, bool)> {
+    let form = case.form;
+    let (w, p) = (form.w(), form.p);
+    let mut bounds: Vec<(f32, bool)> = expected.iter().map(|e| (attended_bar(*e), false)).collect();
+    if form.rotary.inverse_output {
+        let u = 1.0 + 2f32.powi(-8);
+        for (row, published) in bounds.chunks_mut(w).zip(expected.chunks(w)) {
+            for pair in 0..p {
+                let (lo, hi) = form.rotary.columns(pair, p, w);
+                let r = published[lo].hypot(published[hi]);
+                let turned = 2f32.sqrt() * 4.0e-3 * case.amplitudes[pair].abs()
+                    + (1.6e-2 + 2f32.powi(-20)) * u * r;
+                for column in [lo, hi] {
+                    row[column] = (u * turned + 2f32.powi(-7) * u * published[column].abs(), true);
+                }
+            }
+        }
+    }
+    bounds
+}
+
+/// Results within [`result_bounds`]; histories exactly but keys, which may
+/// differ by one bf16 step.
 fn check(
     label: &str,
     actual: &(Vec<f32>, Vec<f32>, Vec<f32>),
     expected: &(Vec<f32>, Vec<f32>, Vec<f32>),
-    w: usize,
+    case: &Case,
 ) {
+    let w = case.form.w();
+    let bounds = result_bounds(case, &expected.0);
     let mut worst = 0.0f32;
+    // The turned results' largest error and largest share of their bound.
+    let (mut turned_worst, mut turned_used) = (0.0f32, 0.0f32);
     assert_eq!(actual.0.len(), expected.0.len(), "{label}: result shape");
     let outside: Vec<(usize, f32, f32)> = actual
         .0
         .iter()
         .zip(&expected.0)
         .enumerate()
-        .inspect(|(_, (a, e))| worst = worst.max((*a - *e).abs()))
-        .filter(|(_, (a, e))| (*a - *e).abs() > 4.0e-3 + 1.6e-2 * e.abs())
+        .inspect(|(index, (a, e))| {
+            let (error, (bound, turned)) = ((*a - *e).abs(), bounds[*index]);
+            worst = worst.max(error);
+            if turned {
+                turned_worst = turned_worst.max(error);
+                turned_used = turned_used.max(error / bound);
+            }
+        })
+        .filter(|(index, (a, e))| (*a - *e).abs() > bounds[*index].0)
         .map(|(index, (a, e))| (index, *a, *e))
         .collect();
     if !outside.is_empty() {
@@ -1111,7 +1283,10 @@ fn check(
             "{label}: history_value[{index}] device {a} expected {e}"
         );
     }
-    eprintln!("{label}: max |result error| {worst:.2e}");
+    eprintln!(
+        "{label}: max |result error| {worst:.2e}; turned: max |error| {turned_worst:.2e}, \
+         at most {turned_used:.2} of its bound"
+    );
 }
 
 /// Every device's natives of the decode or prefill entry against the host
@@ -1119,7 +1294,19 @@ fn check(
 /// the typed plan-time refusal, allowed only on the backends `rejections`
 /// lists (for some or all of their configurations).
 fn check_natives(name: &str, decode: bool, case: &Case, rejections: &[BackendName]) {
-    let expected = case.expected();
+    check_natives_against(name, decode, case, rejections, false, &case.expected());
+}
+
+/// [`check_natives`] against `expected`; with `required`, every
+/// configuration of a backend `rejections` lists must be refused.
+fn check_natives_against(
+    name: &str,
+    decode: bool,
+    case: &Case,
+    rejections: &[BackendName],
+    required: bool,
+    expected: &(Vec<f32>, Vec<f32>, Vec<f32>),
+) {
     let mut failures = Vec::new();
     for device in devices() {
         for config in configurations(&device, decode, case.form) {
@@ -1131,7 +1318,10 @@ fn check_natives(name: &str, decode: bool, case: &Case, rejections: &[BackendNam
             let label = format!("{name} {:?} {config:?}", device.backend());
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match run(&device, decode, &specialization, case) {
-                    Ok(actual) => check(&label, &actual, &expected, case.form.w()),
+                    Ok(_) if required && rejections.contains(&device.backend()) => {
+                        panic!("{label}: admitted a form its declaration must refuse")
+                    }
+                    Ok(actual) => check(&label, &actual, expected, case),
                     Err(error) if error.contains("violates the native `where` condition") => {
                         assert!(rejections.contains(&device.backend()), "{label}: {error}");
                         eprintln!("{label}: rejected by the declaration's `where`");
@@ -1243,8 +1433,11 @@ const QWEN_SMALL: Form = Form {
     separate: 0,
     softplus: false,
     fresh: true,
+    query_norm: true,
     norm: true,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 /// Nemotron / MiniCPM-style: ungated, no q/k norm, no rotation.
@@ -1257,8 +1450,11 @@ const PLAIN_NOPE: Form = Form {
     separate: 0,
     softplus: false,
     fresh: true,
+    query_norm: false,
     norm: false,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 /// Laguna-style: a softplus gate per head, partial YaRN rotation with amplitude.
@@ -1271,8 +1467,11 @@ const HEAD_SOFTPLUS: Form = Form {
     separate: 1,
     softplus: true,
     fresh: true,
+    query_norm: true,
     norm: true,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 /// Muse-style: a separate sigmoid gate per column, G = 16.
@@ -1285,8 +1484,11 @@ const COLUMN_SIGMOID: Form = Form {
     separate: 32,
     softplus: false,
     fresh: true,
+    query_norm: true,
     norm: true,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 /// Gemma-style: ungated, value norm, scale 1.
@@ -1299,8 +1501,11 @@ const VALUE_NORM: Form = Form {
     separate: 0,
     softplus: false,
     fresh: true,
+    query_norm: true,
     norm: true,
     value_norm: true,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 /// A KV-shared layer: no fresh rows.
@@ -1313,8 +1518,11 @@ const SHARED: Form = Form {
     separate: 0,
     softplus: false,
     fresh: false,
+    query_norm: true,
     norm: true,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 /// A draft block layer: q/k norms, full rotation, ungated.
@@ -1327,8 +1535,11 @@ const DRAFT: Form = Form {
     separate: 0,
     softplus: false,
     fresh: true,
+    query_norm: true,
     norm: true,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 /// (name, decode rows, case, backends whose declarations reject the form).
@@ -1540,8 +1751,11 @@ const WIDE_G8: Form = Form {
     separate: 0,
     softplus: false,
     fresh: true,
+    query_norm: true,
     norm: true,
     value_norm: true,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 const WIDE_G16: Form = Form {
     g: 16,
@@ -1558,8 +1772,11 @@ const MUSE: Form = Form {
     separate: 128,
     softplus: false,
     fresh: true,
+    query_norm: true,
     norm: true,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 /// MiniCPM5-style: W = 128, G = 8, no q/k norm, ungated.
 const PLAIN_G8: Form = Form {
@@ -1571,8 +1788,11 @@ const PLAIN_G8: Form = Form {
     separate: 0,
     softplus: false,
     fresh: true,
+    query_norm: false,
     norm: false,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 /// Wide heads and large groups at decode and prefill rows (host model only).
@@ -1731,8 +1951,11 @@ const BOLT_DRAFT: Form = Form {
     separate: 0,
     softplus: false,
     fresh: true,
+    query_norm: true,
     norm: true,
     value_norm: false,
+    rotary: Rotary::HALF_SPLIT_LEADING,
+    stored_key: false,
 };
 
 #[test]
@@ -1751,5 +1974,540 @@ fn prefill_natives_match_portable_body() {
     }
     for (name, case, rejections) in prefill_cases() {
         check_natives(name, false, &case, rejections);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rotary layouts, the output rotary and a query norm apart from the key norm
+// (`RA`, `RT`, `RO`, `NQ`): computed on CPU and Metal, refused by the CUDA
+// and Vulkan declarations.
+
+const NEW_FORM_REFUSALS: &[BackendName] = &[BackendName::Cuda, BackendName::Vulkan];
+
+/// A small DeepSeek V4.1-style layer: ungated, a key norm without a query
+/// norm, sinks, adjacent pairs over the trailing columns, the attended row
+/// turned back, values the stored key row. W = 64, so each lane of the
+/// Metal forms holds whole pairs.
+const SMALL_V41: Form = Form {
+    kv: 1,
+    g: 4,
+    p: 8,
+    s: 48,
+    interleaved: false,
+    separate: 0,
+    softplus: false,
+    fresh: true,
+    query_norm: false,
+    norm: true,
+    value_norm: false,
+    rotary: Rotary::ADJACENT_TRAILING_INVERSE,
+    stored_key: true,
+};
+
+/// The layouts one axis at a time, each at the head width where a lane of
+/// the Metal forms holds one column (W = 32) or several.
+fn layout_cases() -> Vec<(&'static str, bool, Case)> {
+    let adjacent_leading = Form {
+        kv: 2,
+        g: 2,
+        p: 4,
+        s: 24,
+        rotary: Rotary {
+            adjacent: true,
+            trailing: false,
+            inverse_output: false,
+        },
+        query_norm: true,
+        stored_key: false,
+        ..SMALL_V41
+    };
+    let half_split_trailing = Form {
+        rotary: Rotary {
+            adjacent: false,
+            trailing: true,
+            inverse_output: true,
+        },
+        query_norm: true,
+        norm: false,
+        stored_key: false,
+        ..SMALL_V41
+    };
+    vec![
+        (
+            "v41 small decode",
+            true,
+            Case::new(SMALL_V41, 64, decode_rows(5), 16, 1.0, 0.125, 70).with_sinks(80),
+        ),
+        (
+            "v41 small window prefill",
+            false,
+            Case::new(SMALL_V41, 160, window_rows(20, 30, 8), 16, 1.0, 0.125, 71).with_sinks(81),
+        ),
+        (
+            "adjacent leading decode",
+            true,
+            Case::new(adjacent_leading, 64, decode_rows(5), 16, 1.0, 0.1767767, 72),
+        ),
+        (
+            "half-split trailing inverse prefill",
+            false,
+            Case::new(half_split_trailing, 160, window_rows(20, 30, 8), 16, 1.0, 0.125, 73),
+        ),
+    ]
+}
+
+#[test]
+fn layout_host_model_matches_portable_body() {
+    for (name, decode, case) in layout_cases() {
+        let entry = if decode {
+            "attention_decode"
+        } else {
+            "attention_prefill"
+        };
+        check_host_model(entry, &case);
+        eprintln!("{name}: host model agrees with the portable body");
+    }
+}
+
+#[test]
+fn layout_natives_match_portable_body() {
+    for (name, decode, case) in layout_cases() {
+        check_natives_against(name, decode, &case, NEW_FORM_REFUSALS, true, &case.expected());
+    }
+}
+
+/// DeepSeek V4.1 Flash's window attention (layer 0): 64 query heads over one
+/// 512-wide key/value head, its 32 rotary pairs adjacent over dims 448..511
+/// at θ 10000, a key norm and no query norm, sinks, the attended row turned
+/// back, scale 512^-1/2.
+const V41: Form = Form {
+    kv: 1,
+    g: 64,
+    p: 32,
+    s: 448,
+    ..SMALL_V41
+};
+
+impl Case {
+    /// This case's rotary table as V4.1's window layers derive it: pair i at
+    /// frequency θ^(-2i / 2P) on the position, amplitude 1.
+    fn with_theta(mut self, theta: f64) -> Self {
+        let p = self.form.p;
+        self.components = vec![0; p];
+        self.frequencies = (0..p)
+            .map(|pair| theta.powf(-((2 * pair) as f64) / (2 * p) as f64) as f32)
+            .collect();
+        self.amplitudes = vec![1.0; p];
+        self
+    }
+
+    /// The attention output as DeepSeek V4.1 computes it, in F32 from the
+    /// case's inputs, written apart from the host model. The window KV is
+    /// one row per token: RMS(kv) * norm, rounded, its trailing 2P dims
+    /// turned as P complex numbers (x[S + 2i] + i x[S + 2i + 1]) times
+    /// e^(i t θ_i), rounded to bf16 and stored once. Attention reads that
+    /// one row as key and value (the value as wide as the key):
+    /// softmax(q · kv * scale) over the visible and fresh rows with the
+    /// head's sink logit in the denominator, times the same rows; the output
+    /// rounded to bf16, its trailing dims times e^(-i t θ_i) (the conjugate
+    /// rotation), rounded again. Storing the row as E4M3 is a history
+    /// codec's concern, not this dense history's.
+    fn v41_reference(&self) -> Vec<f32> {
+        let form = self.form;
+        assert!(form.kv == 1 && !form.query_norm && form.norm && form.fresh && form.stored_key);
+        let (g, p, s, w) = (form.g, form.p, form.s, form.w());
+        let twist = |x: &mut [f32], position: i32, sign: f32| {
+            for i in 0..p {
+                let angle = position as f32 * self.frequencies[i];
+                let (re, im) = (angle.cos(), sign * angle.sin());
+                let (a, b) = (x[s + 2 * i], x[s + 2 * i + 1]);
+                x[s + 2 * i] = a * re - b * im;
+                x[s + 2 * i + 1] = a * im + b * re;
+            }
+        };
+        let position = |row: usize| self.coordinates[row * 4];
+        let keys = (0..self.rows)
+            .map(|row| {
+                let raw = &self.key[row * w..][..w];
+                let rms = (raw.iter().map(|x| x * x).sum::<f32>() / w as f32 + self.epsilon).sqrt();
+                let mut k = raw
+                    .iter()
+                    .zip(&self.key_norm)
+                    .map(|(x, n)| bf16(x / rms * n))
+                    .collect::<Vec<_>>();
+                twist(&mut k, position(row), 1.0);
+                k.into_iter().map(bf16).collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut out = vec![0.0; self.rows * g * w];
+        for row in 0..self.rows {
+            // Each visible row, read as both key and value.
+            let mut visible: Vec<(&[f32], &[f32])> = Vec::new();
+            for span in 0..self.spans {
+                let (lo, hi) = (
+                    self.visible[(row * self.spans + span) * 2],
+                    self.visible[(row * self.spans + span) * 2 + 1],
+                );
+                for token in lo.max(0)..hi {
+                    let kv = &self.history_key[token as usize * w..][..w];
+                    visible.push((kv, kv));
+                }
+            }
+            for token in self.fresh[row * 2].max(0)..self.fresh[row * 2 + 1] {
+                let kv = &keys[token as usize][..];
+                visible.push((kv, kv));
+            }
+            for head in 0..g {
+                let mut q = self.query[(row * g + head) * w..][..w].to_vec();
+                twist(&mut q, position(row), 1.0);
+                let q = q.into_iter().map(bf16).collect::<Vec<_>>();
+                let scores = visible
+                    .iter()
+                    .map(|(k, _)| q.iter().zip(k.iter()).map(|(a, b)| a * b).sum::<f32>() * self.scale)
+                    .collect::<Vec<_>>();
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights = scores.iter().map(|score| (score - maximum).exp()).collect::<Vec<_>>();
+                let sink = self.sinks.get(head).map_or(0.0, |sink| (sink - maximum).exp());
+                let denominator = (weights.iter().sum::<f32>() + sink).max(1e-30);
+                let mut o = (0..w)
+                    .map(|column| {
+                        bf16(
+                            visible
+                                .iter()
+                                .zip(&weights)
+                                .map(|((_, v), weight)| weight * v[column])
+                                .sum::<f32>()
+                                / denominator,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                twist(&mut o, position(row), -1.0);
+                for (target, value) in out[(row * g + head) * w..][..w].iter_mut().zip(o) {
+                    *target = bf16(value);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// V4.1's shapes at a decode step (single and verification rows over a
+/// history past the 128-row window's reach) and over window prefill rows.
+fn v41_cases() -> Vec<(&'static str, bool, Case)> {
+    let scale = 1.0 / (512f32).sqrt();
+    vec![
+        (
+            "v41 decode",
+            true,
+            Case::new(V41, 320, decode_rows(260), 128, 1.0, scale, 90)
+                .with_theta(1.0e4)
+                .with_sinks(91),
+        ),
+        (
+            "v41 window prefill",
+            false,
+            Case::new(V41, 256, window_rows(24, 100, 128), 64, 1.0, scale, 92)
+                .with_theta(1.0e4)
+                .with_sinks(93),
+        ),
+    ]
+}
+
+/// The host model of the portable body equals the F32 reference of map §1
+/// at V4.1's shapes, and so stands for it below.
+#[test]
+fn v41_host_model_matches_reference() {
+    for (name, _, case) in v41_cases() {
+        let expected = case.expected();
+        check(name, &(case.v41_reference(), expected.1.clone(), expected.2.clone()), &expected, &case);
+    }
+}
+
+/// At V4.1's shapes the CPU and Metal natives equal the F32 reference: the
+/// decode entry on CPU, and the prefill entry at the decode rows on Metal,
+/// whose decode declaration does not hold G = 64 at W = 512 (the executor
+/// routes those classes through its prefill); prefill rows on both. CUDA
+/// and Vulkan refuse the forms by declaration.
+#[test]
+fn v41_natives_match_reference() {
+    for (name, decode, case) in v41_cases() {
+        let host = case.expected();
+        let expected = (case.v41_reference(), host.1, host.2);
+        if decode {
+            let refusals = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
+            check_natives_against(name, true, &case, &refusals, true, &expected);
+        }
+        check_natives_against(name, false, &case, NEW_FORM_REFUSALS, true, &expected);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stored-key values (`VK = 1`).
+
+/// `rows`, every one appending: a row without a destination takes
+/// `first + its index`, so the history holds every row's prepared key.
+fn appending(rows: Vec<Row>, first: i32) -> Vec<Row> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| Row {
+            destination: if row.destination < 0 {
+                first + index as i32
+            } else {
+                row.destination
+            },
+            ..row
+        })
+        .collect()
+}
+
+impl Case {
+    /// This stored-key case over two planes: its own values the rows'
+    /// prepared keys `keys` (`[M, KV * W]`, which a value without a value
+    /// norm passes through), its value plane a copy of its key plane.
+    fn key_valued(&self, keys: Vec<f32>) -> Self {
+        assert!(self.form.stored_key && !self.form.value_norm);
+        Self {
+            form: Form {
+                stored_key: false,
+                ..self.form
+            },
+            value: keys,
+            history_value: self.history_key.clone(),
+            ..self.clone()
+        }
+    }
+
+    /// Every row's prepared key, from a run's final key plane at the row's
+    /// destination.
+    fn prepared_keys(&self, history_key: &[f32]) -> Vec<f32> {
+        let row = self.form.kv * self.form.w();
+        self.destinations
+            .iter()
+            .flat_map(|destination| {
+                let destination = usize::try_from(*destination).expect("every row appends");
+                history_key[destination * row..][..row].to_vec()
+            })
+            .collect()
+    }
+}
+
+/// Stored-key layers at V4.1's shapes and a small one of its form (decode
+/// rows on Metal's decode entry), and a half-split leading one, a form CUDA
+/// and Vulkan hold but for its stored-key values.
+fn stored_key_cases() -> Vec<(&'static str, bool, Case)> {
+    let scale = 1.0 / (512f32).sqrt();
+    let qwen = Form {
+        stored_key: true,
+        ..QWEN_SMALL
+    };
+    vec![
+        (
+            "small v41 decode",
+            true,
+            Case::new(SMALL_V41, 64, appending(decode_rows(5), 47), 16, 1.0, 0.125, 70)
+                .with_sinks(80),
+        ),
+        (
+            "small v41 window prefill",
+            false,
+            Case::new(SMALL_V41, 160, window_rows(20, 30, 8), 16, 1.0, 0.125, 71).with_sinks(81),
+        ),
+        (
+            "v41 decode",
+            true,
+            Case::new(V41, 320, appending(decode_rows(260), 302), 128, 1.0, scale, 90)
+                .with_theta(1.0e4)
+                .with_sinks(91),
+        ),
+        (
+            "v41 window prefill",
+            false,
+            Case::new(V41, 256, window_rows(24, 100, 128), 64, 1.0, scale, 92)
+                .with_theta(1.0e4)
+                .with_sinks(93),
+        ),
+        (
+            "half-split stored-key decode",
+            true,
+            Case::new(qwen, 64, appending(decode_rows(5), 47), 16, 1.0, 0.1767767, 74),
+        ),
+    ]
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
+}
+
+/// Whether `backend` may refuse `case`'s form by declaration: CUDA and
+/// Vulkan hold no stored-key values, and Metal's decode entry no head group
+/// of V4.1's width.
+fn may_refuse(backend: BackendName, decode: bool, case: &Case) -> bool {
+    matches!(backend, BackendName::Cuda | BackendName::Vulkan)
+        || (backend == BackendName::Metal && decode && case.form.g == 64)
+}
+
+/// Attention over the one key plane equals the same inputs over two planes
+/// whose values are the prepared keys, bit for bit, on every configuration
+/// of the CPU and Metal entries: the result, and the key plane the row's
+/// keys are appended to. The two-plane run's value plane ends equal to its
+/// key plane. CUDA and Vulkan refuse every stored-key form.
+#[test]
+fn stored_key_attention_equals_key_valued_planes() {
+    let mut failures = Vec::new();
+    for (name, decode, case) in stored_key_cases() {
+        for device in devices() {
+            let backend = device.backend();
+            for config in configurations(&device, decode, case.form) {
+                let specialization = |form| {
+                    config
+                        .iter()
+                        .fold(statics(&device, form, case.sink_rows()), |s, (n, v)| {
+                            s.with_param(*n, *v)
+                        })
+                };
+                let label = format!("{name} {backend:?} {config:?}");
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let stored = match run(&device, decode, &specialization(case.form), &case) {
+                        Err(error) if error.contains("violates the native `where` condition") => {
+                            assert!(may_refuse(backend, decode, &case), "{label}: {error}");
+                            return;
+                        }
+                        Err(error) => panic!("{label}: {error}"),
+                        Ok(_) if matches!(backend, BackendName::Cuda | BackendName::Vulkan) => {
+                            panic!("{label}: admitted stored-key values")
+                        }
+                        Ok(stored) => stored,
+                    };
+                    assert!(stored.2.is_empty(), "{label}: a value plane");
+                    let twin = case.key_valued(case.prepared_keys(&stored.1));
+                    let planes = run(&device, decode, &specialization(twin.form), &twin)
+                        .unwrap_or_else(|error| panic!("{label} over two planes: {error}"));
+                    assert_eq!(bits(&stored.0), bits(&planes.0), "{label}: result");
+                    assert_eq!(bits(&stored.1), bits(&planes.1), "{label}: key plane");
+                    assert_eq!(bits(&planes.2), bits(&planes.1), "{label}: value plane");
+                    eprintln!("{label}: one plane equals two");
+                }));
+                if outcome.is_err() {
+                    failures.push(label);
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// The dense append of `case` on `device`: its final key and value planes.
+fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let mut bound = Bound::new(device, case);
+    let form = case.form;
+    let [_, ra, rt, _, vk] = form.extents();
+    let append_form = Tensor::from_host(
+        device,
+        Element::i32(),
+        &[0, ra as u64, rt as u64, vk as u64],
+        &[],
+    )
+    .unwrap();
+    // The appends read no query-head, gate, sink or output-rotary axis.
+    let specialization = statics(device, form, 0)
+        .statics()
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "NQ" | "RO" | "SK"))
+        .fold(NativeSpecialization::new(), |s, (name, value)| {
+            s.with_static(name, *value)
+        });
+    let kernel = attention_append_dense::native_for_device_with(
+        device,
+        attention_append_dense::Elements { A: Element::bf16() },
+        &specialization,
+    )
+    .map_err(|error| error.to_string())?;
+    kernel
+        .call(attention_append_dense::Args {
+            key: &bound.key,
+            value: &bound.value,
+            key_norm: &bound.key_norm,
+            value_norm: &bound.value_norm,
+            rotary_components: &bound.components,
+            rotary_frequencies: &bound.frequencies,
+            rotary_amplitudes: &bound.amplitudes,
+            coordinates: &bound.coordinates,
+            destinations: &bound.destinations,
+            history_key: &mut bound.history_key,
+            history_value: &mut bound.history_value,
+            form: &append_form,
+            epsilon: case.epsilon,
+            slab_rows: case.slab_rows as u32,
+        })
+        .map_err(|error| format!("{error:?}"))?;
+    Ok((bf16_values(&bound.history_key), bf16_values(&bound.history_value)))
+}
+
+/// The dense append of a stored-key layer writes the key plane alone, and
+/// it equals the two-plane append of the same rows with the prepared keys
+/// as values, bit for bit; CUDA and Vulkan refuse it.
+#[test]
+fn stored_key_append_writes_the_key_plane_alone() {
+    let mut failures = Vec::new();
+    for (name, _, case) in stored_key_cases() {
+        for device in devices() {
+            let backend = device.backend();
+            let label = format!("{name} append {backend:?}");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let stored = match run_append(&device, &case) {
+                    Err(error) if error.contains("violates the native `where` condition") => {
+                        assert!(
+                            matches!(backend, BackendName::Cuda | BackendName::Vulkan),
+                            "{label}: {error}"
+                        );
+                        return;
+                    }
+                    Err(error) => panic!("{label}: {error}"),
+                    Ok(_) if matches!(backend, BackendName::Cuda | BackendName::Vulkan) => {
+                        panic!("{label}: admitted stored-key values")
+                    }
+                    Ok(stored) => stored,
+                };
+                assert!(stored.1.is_empty(), "{label}: a value plane");
+                // The appended keys are the host model's, within a bf16 step.
+                let expected = case.expected().1;
+                for (index, (a, e)) in stored.0.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (a - e).abs() <= 8.0e-3 * e.abs().max(1.0),
+                        "{label}: history_key[{index}] {a}, host model {e}"
+                    );
+                }
+                let twin = case.key_valued(case.prepared_keys(&stored.0));
+                let planes = run_append(&device, &twin)
+                    .unwrap_or_else(|error| panic!("{label} over two planes: {error}"));
+                assert_eq!(bits(&stored.0), bits(&planes.0), "{label}: key plane");
+                assert_eq!(bits(&planes.1), bits(&planes.0), "{label}: value plane");
+                eprintln!("{label}: one plane equals two");
+            }));
+            if outcome.is_err() {
+                failures.push(label);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "failed: {failures:?}");
+}
+
+/// The portable bodies of a stored-key layer equal the host model, which
+/// reads the key plane as values and appends the key alone.
+#[test]
+fn stored_key_host_model_matches_portable_body() {
+    for (name, decode, case) in stored_key_cases() {
+        // The interpreter at the small shapes; the host model stands for it
+        // at V4.1's (`v41_host_model_matches_reference`).
+        if case.form.w() > 64 {
+            continue;
+        }
+        let entry = if decode {
+            "attention_decode"
+        } else {
+            "attention_prefill"
+        };
+        check_host_model(entry, &case);
+        eprintln!("{name}: host model agrees with the portable body");
     }
 }

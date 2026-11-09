@@ -18,7 +18,8 @@ use magnitude_family_common::architecture_keys;
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryDomain, HistoryReads, KeyValue, MediaRowAttention,
-    Operator, RecurrentHeadMapping, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router,
+    Operator, OutputProjection, QueryProjection, RecurrentHeadMapping, RmsNorm,
+    Rotary, RouteNormalization, RoutedFfn, Router,
     RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, ValueNorm, ValueSource,
     WeightDescriptor, checked_product,
 };
@@ -400,7 +401,10 @@ impl Geometry {
             heads,
             kv_heads,
             width,
-            query: weight("attn_q.weight", &[product(&[2, heads, width])?, hidden])?,
+            query: QueryProjection::Full(weight(
+                "attn_q.weight",
+                &[product(&[2, heads, width])?, hidden],
+            )?),
             gate: AttentionGate::Interleaved {
                 function: GateFunction::Sigmoid,
             },
@@ -415,12 +419,14 @@ impl Geometry {
                 value_norm: ValueNorm::None,
                 domain: HistoryDomain::Token,
             },
-            rotary: self.rotary.clone(),
-            scale: 1.0 / (width as f64).sqrt(),
+            rotary: self.rotary.clone(),            scale: 1.0 / (width as f64).sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
-            output: weight("attn_output.weight", &[hidden, product(&[heads, width])?])?,
+            output: OutputProjection::Full(weight(
+                "attn_output.weight",
+                &[hidden, product(&[heads, width])?],
+            )?),
         })
     }
 

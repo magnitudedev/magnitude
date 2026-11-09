@@ -15,6 +15,10 @@ pub(crate) struct ProjectRowsTuning {
     pub weight: Element,
     pub activation: Element,
     pub kind: WeightKind,
+    /// The weight's groups (`project_rows`' G): 1 but for a block-diagonal
+    /// weight, whose rows split into `groups` blocks each projecting its own
+    /// run of the input row.
+    pub groups: u64,
     /// The published element: F32 for a post-norm row op, activations for a
     /// latent down projection.
     pub output: Element,
@@ -58,9 +62,16 @@ impl EntryTuning for ProjectRowsTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (outputs, inputs_width) = projection_shape(inputs, &self.scopes, self.kind)?;
+        if self.groups == 0 || !outputs.is_multiple_of(self.groups) {
+            return Err(format!(
+                "{} weight rows do not split into {} groups",
+                outputs, self.groups
+            ));
+        }
         let mut statics = vec![
+            ("G", self.groups),
             ("K", inputs_width),
-            ("N", outputs),
+            ("N", outputs / self.groups),
             ("WS", scale_extent(inputs, &self.scopes, self.kind)?),
         ];
         statics.extend(packing_statics(
@@ -89,7 +100,7 @@ impl EntryTuning for ProjectRowsTuning {
                 Ok(ProjectRowsCase {
                     source: inputs.activation(
                         self.activation,
-                        &[point.rows, width],
+                        &[point.rows, self.groups * width],
                         index as u64 + 1,
                     )?,
                     weight,

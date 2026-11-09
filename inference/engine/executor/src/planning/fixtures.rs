@@ -10,8 +10,8 @@ use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
     EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, HeadNorm,
     HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue, MediaRowAttention,
-    ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm,
-    ValueSource, WeightDescriptor,
+    ModelDefinition, Operator, OutputForm, OutputProjection, QueryProjection,
+    ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
 };
 
 /// The limits the fixture's loads plan with.
@@ -57,7 +57,7 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
         heads: 2,
         kv_heads: 1,
         width: WIDTH,
-        query: descriptor("qg", &[2 * 2 * WIDTH, hidden]),
+        query: QueryProjection::Full(descriptor("qg", &[2 * 2 * WIDTH, hidden])),
         gate: AttentionGate::Interleaved {
             function: GateFunction::Sigmoid,
         },
@@ -74,12 +74,11 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
             base: 10_000.0,
             sections: vec![WIDTH / 4],
             axis_pattern: vec![0],
-        },
-        scale: 1.0 / (WIDTH as f64).sqrt(),
+        },        scale: 1.0 / (WIDTH as f64).sqrt(),
         reads: HistoryReads::Visible,
         media_rows: MediaRowAttention::Causal,
         sinks: None,
-        output: descriptor("o", &[hidden, 2 * WIDTH]),
+        output: OutputProjection::Full(descriptor("o", &[hidden, 2 * WIDTH])),
     };
     let dense = DenseFfn {
         intermediate: FEATURES,
@@ -159,8 +158,13 @@ pub(crate) fn with_mtp_head(mut definition: ModelDefinition) -> ModelDefinition 
         }
         match &mut sublayer.op {
             Operator::Attention(attention) => {
-                rename(&mut attention.query);
-                rename(&mut attention.output);
+                let (QueryProjection::Full(query), OutputProjection::Full(output)) =
+                    (&mut attention.query, &mut attention.output)
+                else {
+                    unreachable!("the fixture projects its queries and output whole")
+                };
+                rename(query);
+                rename(output);
                 if let HeadNorm::Rms(norm) = &mut attention.query_norm {
                     rename(&mut norm.weight);
                 }

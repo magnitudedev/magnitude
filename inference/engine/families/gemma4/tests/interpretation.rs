@@ -9,7 +9,7 @@ use magnitude_family_common::headers;
 use magnitude_family_contracts::{
     ActivationFunction, CellReduction, EmbeddingScale, FeedForwardUp, HistoryDomain,
     ImportTransform, InputNorm, KeyValue, MediaRowAttention, ModelDefinition, ModelInputAdapter,
-    Operator, OutputForm, PositionSampling, Rotary, SublayerIndex, TokenPlan, ValueNorm,
+    Operator, OutputForm, OutputRotary, PositionSampling, QueryProjection, Rotary, RotaryLayout, SublayerIndex, TokenPlan, ValueNorm,
     ValueSource, VisionActivation, VisionAttentionScale, VisionOperator, VisionResize, VisionStem,
     VisionUp,
 };
@@ -136,7 +136,13 @@ fn e2b_feed_forward_doubles_in_its_sharing_layers() {
 fn full_layers_rotate_a_quarter_of_their_pairs_over_the_whole_head() {
     let definition = inspect(&target("e2b")).unwrap();
     let window = attention(&definition, 0);
-    let Rotary::Table { pairs, divisors } = &window.rotary else {
+    let Rotary::Table {
+        pairs,
+        layout: RotaryLayout::HALF_SPLIT_LEADING,
+        divisors,
+        output: OutputRotary::None,
+    } = &window.rotary
+    else {
         panic!("table rotary");
     };
     assert_eq!(pairs.len(), 128);
@@ -145,7 +151,13 @@ fn full_layers_rotate_a_quarter_of_their_pairs_over_the_whole_head() {
     assert!(divisors.is_none());
 
     let full = attention(&definition, 4);
-    let Rotary::Table { pairs, divisors } = &full.rotary else {
+    let Rotary::Table {
+        pairs,
+        layout: RotaryLayout::HALF_SPLIT_LEADING,
+        divisors,
+        output: OutputRotary::None,
+    } = &full.rotary
+    else {
         panic!("table rotary");
     };
     // Pair p rotates dimensions (p, p + 256); only the first 64 turn.
@@ -161,7 +173,10 @@ fn full_layers_rotate_a_quarter_of_their_pairs_over_the_whole_head() {
     let KeyValue::Owned { key, .. } = &full.key_value else {
         panic!("owning layer");
     };
-    assert!(full.query.transforms.is_empty() && key.transforms.is_empty());
+    assert!(
+        matches!(&full.query, QueryProjection::Full(query) if query.transforms.is_empty())
+            && key.transforms.is_empty()
+    );
 }
 
 /// 12B, 26B and 31B take full-layer values from their raw keys.
@@ -180,7 +195,7 @@ fn values_are_keys_on_full_layers_without_a_value_projection() {
             else {
                 panic!("{model}: every layer owns its history");
             };
-            assert_eq!(matches!(value, ValueSource::Key), full, "{model} {layer}");
+            assert_eq!(matches!(value, ValueSource::RawKey), full, "{model} {layer}");
             let expected = if full {
                 HistoryDomain::Token
             } else {

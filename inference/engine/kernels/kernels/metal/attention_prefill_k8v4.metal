@@ -7,6 +7,7 @@
 #define ATTENTION_U SEISMIC_DIM_U
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_QUERY_NORM (SEISMIC_DIM_NQ != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define ATTENTION_SINKS (SEISMIC_DIM_SK != 0)
 #define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
@@ -261,4 +262,21 @@ kernel void attention_prefill_k8v4_list(
         const_cast<device int2 *>(list.lists), const_cast<device uint *>(list.listed), SEISMIC_DIM_M,
         SEISMIC_DIM_R, SEISMIC_DIM_B, int(SEISMIC_DIM_BR), PREFILL_LIST_CAPACITY, shared, group.x,
         thread_index, simd, lane);
+}
+
+// The output rotary (RO = 1, `attention::output_rotary`): threadgroup (row,
+// query head), one thread per rotary pair, after every output is stored.
+kernel void attention_prefill_k8v4_rotate(
+    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
+    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
+    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
+    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
+    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint pair [[thread_index_in_threadgroup]]) {
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    attention::output_rotary(result, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes,
+        group.x, group.y, pair);
 }

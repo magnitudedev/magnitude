@@ -6,7 +6,7 @@ use super::tuning::{
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
         AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
-        IndexerProjectTuning, PrefillListing, history_window,
+        IndexerProjectTuning, LowRankQueryProjectTuning, PrefillListing, history_window,
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
     general_routed::{
@@ -1272,6 +1272,7 @@ impl<'a> Preparation<'a> {
                 weight: taps.fusion,
                 activation,
                 kind: WeightKind::DraftFusion,
+                groups: 1,
                 output: Element::f32(),
                 scopes: vec![WeightScope::Draft],
             },
@@ -1351,6 +1352,30 @@ impl<'a> Preparation<'a> {
                 epsilon: self.epsilon,
             },
         )?;
+        // A low-rank query's widening and up projection, tuned over the
+        // layers' `up` weights.
+        let low_rank_query = match binding.low_rank_query {
+            None => Some(None),
+            Some(low_rank) => {
+                let widen = fixed!(
+                    self.spec,
+                    widen_rows,
+                    format!("A={}", activation.name()),
+                    widen_rows::Elements { A: activation }
+                );
+                let project = self.spec.tuned(
+                    &mut self.tuning,
+                    &LowRankQueryProjectTuning {
+                        binding,
+                        low_rank,
+                        scopes: scopes.clone(),
+                    },
+                )?;
+                widen
+                    .zip(project)
+                    .map(|(widen, project)| Some(LowRankQueryKernels { widen, project }))
+            }
+        };
         let window = history_window(&self.tuning.model(), &scopes).map_err(|outcome| {
             CatalogFailure::Preparation {
                 entry: "attention_decode",
@@ -1387,21 +1412,35 @@ impl<'a> Preparation<'a> {
                         | seismic::BackendName::Vulkan
                         | seismic::BackendName::Cuda
                 ) && self.limits.max_rows >= 2;
-                let mut single = mix();
-                if split_decode {
-                    single.decode_rows = Some(1..2);
-                }
-                let decode = self
-                    .spec
-                    .tuned(&mut self.tuning, &AttentionDecodeTuning(single))?;
-                let verify = if split_decode {
-                    let mut selected = mix();
-                    selected.decode_rows =
-                        Some(2..crate::operators::attention::graph::DECODE_ROWS + 1);
-                    self.spec
-                        .tuned(&mut self.tuning, &AttentionDecodeTuning(selected))?
+                let decode = if crate::operators::attention::graph::dense_decodes(
+                    self.spec.backend(),
+                    binding,
+                )? {
+                    let mut single = mix();
+                    if split_decode {
+                        single.decode_rows = Some(1..2);
+                    }
+                    let single = self
+                        .spec
+                        .tuned(&mut self.tuning, &AttentionDecodeTuning(single))?;
+                    let verify = if split_decode {
+                        let mut selected = mix();
+                        selected.decode_rows =
+                            Some(2..crate::operators::attention::graph::DECODE_ROWS + 1);
+                        self.spec
+                            .tuned(&mut self.tuning, &AttentionDecodeTuning(selected))?
+                    } else {
+                        None
+                    };
+                    single.map(|single| DenseDecodeKernels::Decode { single, verify })
                 } else {
-                    None
+                    // The prefill entry attends the decode row classes, tuned
+                    // on them alone.
+                    let mut rows = visible();
+                    rows.decode_rows = Some(1..crate::operators::attention::graph::DECODE_ROWS + 1);
+                    self.spec
+                        .tuned(&mut self.tuning, &AttentionPrefillTuning(rows))?
+                        .map(DenseDecodeKernels::Prefill)
                 };
                 let prefill = self
                     .spec
@@ -1422,7 +1461,6 @@ impl<'a> Preparation<'a> {
                         |((decode, prefill), append)| AttentionHistoryKernels::Dense {
                             append,
                             decode,
-                            verify,
                             prefill,
                         },
                     )
@@ -1614,6 +1652,25 @@ impl<'a> Preparation<'a> {
                 }
             }
         };
+        // A grouped output's first product publishes the activation rows the
+        // output projection reads.
+        let grouped = match binding.grouped {
+            None => Some(None),
+            Some(grouped) => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &ProjectRowsTuning {
+                        weight: grouped.element,
+                        activation,
+                        kind: WeightKind::AttentionOutputGrouped,
+                        groups: grouped.shape.groups,
+                        output: activation,
+                        scopes: scopes.clone(),
+                    },
+                )?
+                .map(Some),
+        };
         let output = match binding.tail {
             SublayerTail::Residual => self
                 .spec
@@ -1623,6 +1680,7 @@ impl<'a> Preparation<'a> {
                         output,
                         activation,
                         shape,
+                        input: binding.output_input(),
                         scopes,
                     },
                 )?
@@ -1637,14 +1695,23 @@ impl<'a> Preparation<'a> {
                 )?
                 .map(SublayerOutput::PostNorm),
         };
-        Ok(match (project, history, output, selection) {
-            (Some(project), Some(history), Some(output), Some(selection)) => {
+        Ok(match (project, history, output, grouped, selection, low_rank_query) {
+            (
+                Some(project),
+                Some(history),
+                Some(output),
+                Some(grouped),
+                Some(selection),
+                Some(low_rank_query),
+            ) => {
                 Some(AttentionKernels {
                     codec: binding.history,
                     project,
                     history,
                     output,
+                    grouped,
                     selection,
+                    low_rank_query,
                 })
             }
             _ => None,
@@ -1939,6 +2006,7 @@ impl<'a> Preparation<'a> {
             },
             activation: binding.activation,
             kind,
+            groups: 1,
             output: Element::f32(),
             scopes: scopes.clone(),
         };
@@ -2056,6 +2124,7 @@ impl<'a> Preparation<'a> {
                 weight: binding.projection,
                 activation: binding.activation,
                 kind: WeightKind::PerLayerModelProjection,
+                groups: 1,
                 output: Element::f32(),
                 scopes: vec![WeightScope::Target],
             },
@@ -2167,6 +2236,7 @@ impl<'a> Preparation<'a> {
                 weight: dense.down,
                 activation: dense.activation,
                 kind: WeightKind::DenseDown,
+                groups: 1,
                 output: Element::f32(),
                 scopes: dense_scopes,
             },
@@ -2205,6 +2275,7 @@ impl<'a> Preparation<'a> {
                 weight,
                 activation,
                 kind,
+                groups: 1,
                 output: Element::f32(),
                 scopes,
             },
@@ -2351,6 +2422,7 @@ impl<'a> Preparation<'a> {
                         weight: down,
                         activation,
                         kind: WeightKind::LatentDown,
+                        groups: 1,
                         output: activation,
                         scopes: scopes.clone(),
                     },
@@ -3086,6 +3158,7 @@ impl<'a> Preparation<'a> {
                     weight,
                     activation,
                     kind,
+                    groups: 1,
                     output: Element::f32(),
                     scopes: scopes.clone(),
                 },
@@ -3362,6 +3435,7 @@ impl<'a> Preparation<'a> {
                     weight,
                     activation,
                     kind,
+                    groups: 1,
                     output,
                     scopes,
                 },

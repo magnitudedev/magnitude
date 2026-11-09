@@ -245,12 +245,22 @@ impl GraphConstant {
         extents: &[u64],
         constants: &mut Vec<Self>,
     ) -> Result<seismic::WorkflowTensor, GraphError> {
+        Ok(Self::empty_port(graph, element, extents, constants)?.tensor().clone())
+    }
+
+    /// [`Self::empty_of`]'s port, for an entry argument it binds mutably.
+    pub(crate) fn empty_port<G: GraphDraft>(
+        graph: &mut G,
+        element: Element,
+        extents: &[u64],
+        constants: &mut Vec<Self>,
+    ) -> Result<NativePort, GraphError> {
         assert!(extents.contains(&0), "an empty tensor has a zero extent");
         let port = graph.port(element, extents)?;
         let constant = Self::of(Some(port), element, extents.to_vec(), ConstantValue::Bytes(Arc::from([])));
-        let tensor = constant.port().tensor().clone();
+        let port = constant.port().clone();
         constants.push(constant);
-        Ok(tensor)
+        Ok(port)
     }
 
     /// The graph's absent operand: a zero-extent F32 constant, which every

@@ -1,9 +1,11 @@
 use crate::{
-    BankComponent, ComponentDescriptor, ComponentSpec, HistoryDomainLayout, KvCodec, LayerRef,
+    BankComponent, CodecSpec, ComponentDescriptor, ComponentSpec, HistoryDomainLayout, KvCodec,
+    LayerRef,
 };
 use magnitude_family_contracts::{
     ActivationDType, Attention, Block, Decoder, GatedDelta, HistoryDomain, HistoryReads, Indexer,
     KeyValue, NGramInput, Operator, ResidualForm, ShortConv, StateSpace, SublayerIndex,
+    ValueSource,
 };
 use seismic::DType;
 
@@ -311,8 +313,9 @@ fn block_state(block: &Block) -> Result<Vec<Stateful<'_>>, String> {
     let mut mixers = 0;
     for sublayer in &block.sublayers {
         let stateful = match &sublayer.op {
-            // Stored rows hold the key and the value whatever the value's
-            // source: a raw-key value is taken before key norm and rotary.
+            // Stored rows hold the key and, unless the values are the stored
+            // key row, the value (`history_codec`): a raw-key value is taken
+            // before key norm and rotary.
             Operator::Attention(attention) => match &attention.key_value {
                 KeyValue::Owned { domain, .. } => Stateful::History(attention, *domain),
                 KeyValue::Shared { source } => Stateful::Shared(*source),
@@ -355,9 +358,31 @@ fn history_component(
     activation: DType,
 ) -> Result<ComponentDescriptor, String> {
     let kv_heads = host(attention.kv_heads, "attention KV heads")?;
-    let width = host(attention.width, "attention head width")?;
-    ComponentDescriptor::new(layer, codec.spec(activation, width, width), kv_heads)
+    ComponentDescriptor::new(layer, history_codec(attention, codec, activation)?, kv_heads)
         .map_err(|error| error.to_string())
+}
+
+/// The history codec an attention layer reads, under the storage policy
+/// `codec` with dense planes in `activation`: per head, its key and its
+/// value's own vector, or for stored-key values (`ValueSource::StoredKey`)
+/// the key alone. State allocation and the attention entries both take it
+/// from here. A Shared layer reads its source's rows, of its width; the
+/// executor admits no Shared reader of stored keys
+/// (`operators::attention::admit_shared`).
+pub fn history_codec(
+    attention: &Attention,
+    codec: KvCodec,
+    activation: DType,
+) -> Result<CodecSpec, String> {
+    let width = host(attention.width, "attention head width")?;
+    let spec = match &attention.key_value {
+        KeyValue::Owned {
+            value: ValueSource::StoredKey,
+            ..
+        } => codec.stored_key(activation, width),
+        KeyValue::Owned { .. } | KeyValue::Shared { .. } => codec.spec(activation, width, width),
+    };
+    spec.validate().map_err(|error| error.to_string())
 }
 
 fn activation_dtype(dtype: ActivationDType) -> DType {
@@ -495,8 +520,9 @@ mod tests {
     use super::*;
     use magnitude_family_contracts::{
         AttentionGate, EmbeddingScale, EntryForm, ExitForm, ExitNorm, GateFunction, HeadNorm,
-        HistoryReads, InputNorm, MediaRowAttention, OutputForm, RecurrentHeadMapping, ResidualForm,
-        RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
+        HistoryReads, InputNorm, MediaRowAttention, OutputForm, OutputProjection, QueryProjection,
+        RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
+        WeightDescriptor,
     };
 
     #[test]
@@ -576,7 +602,7 @@ mod tests {
     fn window_attention(tokens: u64) -> Operator {
         attention_in(KeyValue::Owned {
             key: weight(&[64, 32]),
-            value: ValueSource::Key,
+            value: ValueSource::RawKey,
             key_norm: HeadNorm::None,
             value_norm: ValueNorm::None,
             domain: HistoryDomain::Window { tokens },
@@ -596,7 +622,7 @@ mod tests {
             heads: 4,
             kv_heads: 2,
             width: 32,
-            query: weight(&[128, 32]),
+            query: QueryProjection::Full(weight(&[128, 32])),
             gate: AttentionGate::None,
             query_norm: HeadNorm::None,
             key_value: KeyValue::Owned {
@@ -616,7 +642,7 @@ mod tests {
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
-            output: weight(&[32, 128]),
+            output: OutputProjection::Full(weight(&[32, 128])),
         }))
     }
 
@@ -717,6 +743,48 @@ mod tests {
             layout.head_history[0].components()[1].codec.key,
             crate::Codec::Dense { dtype: DType::BF16 }
         ));
+    }
+
+    /// A window layer whose values are its stored keys holds the key plane
+    /// alone, half the row bytes of the same layer over K and V; the raw-key
+    /// layer beside it keeps both planes.
+    #[test]
+    fn a_stored_key_layer_holds_one_plane() {
+        let stored = attention_in(KeyValue::Owned {
+            key: weight(&[64, 32]),
+            value: ValueSource::StoredKey,
+            key_norm: HeadNorm::None,
+            value_norm: ValueNorm::None,
+            domain: HistoryDomain::Window { tokens: 16 },
+        });
+        let decoder = decoder(
+            ActivationDType::BF16,
+            vec![block(stored), block(window_attention(16))],
+        );
+        let layout = ModelStateLayout::derive(&decoder, &[], KvCodec::Dense, 0).unwrap();
+        let [domain] = &layout.target_history[..] else {
+            panic!("one window domain");
+        };
+        let [stored, raw] = domain.components() else {
+            panic!("two layers");
+        };
+        assert_eq!(
+            stored
+                .planes()
+                .iter()
+                .map(|plane| (plane.vector, plane.row_extents.clone()))
+                .collect::<Vec<_>>(),
+            [(crate::VectorKind::Key, vec![2, 32])]
+        );
+        assert_eq!(raw.planes().len(), 2);
+        assert_eq!(2 * stored.row_bytes().unwrap(), raw.row_bytes().unwrap());
+        let Operator::Attention(attention) = &decoder.blocks[0].sublayers[0].op else {
+            unreachable!()
+        };
+        assert_eq!(
+            history_codec(attention, KvCodec::Dense, DType::BF16).unwrap(),
+            stored.codec
+        );
     }
 
     /// A block's bank list: its mixer's components, then its n-gram input's

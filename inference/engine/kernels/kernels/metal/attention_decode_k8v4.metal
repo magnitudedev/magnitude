@@ -7,6 +7,7 @@
 #define ATTENTION_U SEISMIC_DIM_U
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_QUERY_NORM (SEISMIC_DIM_NQ != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define ATTENTION_SINKS (SEISMIC_DIM_SK != 0)
 #include "lib/attention/attention.h"
@@ -143,7 +144,7 @@ kernel void attention_decode_k8v4_partial(
     threadgroup attention::Scalar *prepared = reinterpret_cast<threadgroup attention::Scalar *>(columns);
     for (uint g = simd; g < G; g += SIMDS) {
         float x[E];
-        attention::head_rotary<ATTENTION_NORM>(query + (row * KV * G + kv_head * G + g) * ATTENTION_QUERY_STRIDE,
+        attention::head_rotary<ATTENTION_QUERY_NORM>(query + (row * KV * G + kv_head * G + g) * ATTENTION_QUERY_STRIDE,
             query_norm, row_coordinates, rotary_components, rotary_frequencies, rotary_amplitudes, epsilon,
             lane, x);
         ATTENTION_UNROLL
@@ -304,4 +305,21 @@ kernel void attention_decode_k8v4_merge(
     attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS>(query, gate, visible, fresh, result,
         partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y, group.z * 32 + lane, lane,
         SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
+}
+
+// The output rotary (RO = 1, `attention::output_rotary`): threadgroup (row,
+// query head), one thread per rotary pair, after every output is stored.
+kernel void attention_decode_k8v4_rotate(
+    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
+    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
+    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
+    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
+    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint pair [[thread_index_in_threadgroup]]) {
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    attention::output_rotary(result, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes,
+        group.x, group.y, pair);
 }

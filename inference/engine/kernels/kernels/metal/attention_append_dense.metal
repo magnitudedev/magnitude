@@ -4,7 +4,9 @@
 #define ATTENTION_U 0
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_QUERY_NORM 0
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
+#define ATTENTION_STORED_KEY (SEISMIC_DIM_VK != 0)
 #include "lib/attention/attention.h"
 
 
@@ -41,9 +43,12 @@ kernel void attention_append_dense(
     float k[E], v[E];
     attention::head_rotary<ATTENTION_NORM>(key + source, key_norm, coordinates + row * 4,
         rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, k);
-    attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, v);
     attention::append(slab::row<attention::Scalar>(history_key, destination, slab_rows, KV * W),
         0, kv_head, lane, k);
+    // Stored-key values are the key plane.
+    if (ATTENTION_STORED_KEY)
+        return;
+    attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, v);
     attention::append(slab::row<attention::Scalar>(history_value, destination, slab_rows, KV * W),
         0, kv_head, lane, v);
 }

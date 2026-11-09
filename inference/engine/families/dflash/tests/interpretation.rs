@@ -7,7 +7,7 @@ use magnitude_family_common::headers::{self, Header};
 use magnitude_family_contracts::{
     AttentionGate, BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod,
     DraftVariant, HeadNorm, HistoryDomain, ImportTransform, KeyValue, ModelDefinition, ModelFamily,
-    Operator, Rotary, ScaledActivations, SublayerIndex, TapPoint,
+    Operator, OutputRotary, Rotary, RotaryLayout, ScaledActivations, SublayerIndex, TapPoint,
 };
 use magnitude_family_dflash::{inspect, recognize, recognizes, Error};
 use magnitude_family_lfm2::Lfm2Family;
@@ -213,7 +213,9 @@ fn qwen_dflash_taps_eight_layers_with_five_sliding_windows() {
     );
     let Rotary::Table {
         pairs,
+        layout: RotaryLayout::HALF_SPLIT_LEADING,
         divisors: None,
+        output: OutputRotary::None,
     } = &attention.rotary
     else {
         panic!("plain rotary table");
@@ -597,7 +599,9 @@ fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
     };
     let Rotary::Table {
         pairs,
+        layout: RotaryLayout::HALF_SPLIT_LEADING,
         divisors: None,
+        output: OutputRotary::None,
     } = &attention.rotary
     else {
         panic!("plain rotary table");

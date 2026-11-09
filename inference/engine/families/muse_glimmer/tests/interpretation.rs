@@ -5,7 +5,7 @@ use magnitude_artifacts::{
 use magnitude_family_contracts::{
     AttentionGate, CellReduction, ExitNorm, GateFunction, GateGranularity, HeadNorm, HistoryDomain,
     ImportTransform, InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator, OutputForm,
-    PositionSampling, Rotary, TokenPlan, ValueSource, VisionAttentionSpan, VisionNorm,
+    PositionSampling, QueryProjection, Rotary, TokenPlan, ValueSource, VisionAttentionSpan, VisionNorm,
     VisionOperator, VisionResampling, VisionResize, WeightDescriptor,
 };
 use magnitude_family_common::headers;
@@ -129,13 +129,16 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
             let HeadNorm::Rms(query_norm) = &attention.query_norm else {
                 panic!("layer {layer} normalizes its queries");
             };
+            let QueryProjection::Full(query) = &attention.query else {
+                panic!("layer {layer} projects its queries whole");
+            };
             assert!(value.transforms.is_empty());
             // Full layers are the last of every four; they have no rotary
             // and keep the whole history.
             if layer % 4 == 3 {
                 assert_eq!(*domain, HistoryDomain::Token);
                 assert_eq!(attention.rotary, Rotary::None);
-                for weight in [&attention.query, key, &query_norm.weight, &key_norm.weight] {
+                for weight in [query, key, &query_norm.weight, &key_norm.weight] {
                     assert!(weight.transforms.is_empty(), "{}", weight.name);
                 }
             } else {
@@ -149,7 +152,7 @@ fn every_catalog_variant_binds_to_the_released_geometry() {
                     assert_eq!(pair.frequency, 500_000f64.powf(-2.0 * p as f64 / 128.0));
                     assert_eq!(pair.amplitude, 1.0);
                 }
-                for weight in [&attention.query, key, &query_norm.weight, &key_norm.weight] {
+                for weight in [query, key, &query_norm.weight, &key_norm.weight] {
                     assert_eq!(
                         transforms(weight),
                         [ImportTransform::PermuteRows { order: paired() }],
@@ -189,10 +192,11 @@ fn a_per_layer_window_pattern_and_partial_rotary_are_read_from_the_header() {
                 .chain((0..32).map(|i| 2 * i + 1))
                 .chain(64..128)
                 .collect();
-            assert_eq!(
-                attention.query.transforms,
-                [ImportTransform::PermuteRows { order }]
-            );
+            assert!(matches!(
+                &attention.query,
+                QueryProjection::Full(query)
+                    if query.transforms == [ImportTransform::PermuteRows { order }]
+            ));
         } else {
             assert_eq!(attention.rotary, Rotary::None);
         }

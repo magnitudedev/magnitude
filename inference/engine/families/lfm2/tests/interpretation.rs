@@ -8,8 +8,8 @@ use magnitude_artifacts::{
 };
 use magnitude_family_contracts::{
     AttentionGate, Block, ExitNorm, ExpertSelection, HeadNorm, ImportTransform, InputNorm,
-    ModelDefinition, ModelInputAdapter, Operator, OutputForm, Rotary, RowRange, ScoreFunction,
-    TokenPlan,
+    ModelDefinition, ModelInputAdapter, Operator, OutputForm, QueryProjection, Rotary, RowRange,
+    ScoreFunction, TokenPlan,
 };
 use magnitude_family_common::{headers, TextInput};
 use magnitude_family_lfm2::{inspect_components, recognize, Architecture};
@@ -109,7 +109,10 @@ fn check_block(block: &Block, index: usize, expected: &Expected, directory: &Dir
                 (32, 8, 64)
             );
             assert_eq!(attention.gate, AttentionGate::None);
-            assert_eq!(attention.query.shape, [2048, 2048]);
+            assert!(matches!(
+                &attention.query,
+                QueryProjection::Full(query) if query.shape == [2048, 2048]
+            ));
             assert!(matches!(&attention.query_norm, HeadNorm::Rms(norm) if norm.weight.shape == [64]));
             assert_eq!(attention.scale, 1.0 / 8.0);
             let Rotary::Table { pairs, .. } = &attention.rotary else {

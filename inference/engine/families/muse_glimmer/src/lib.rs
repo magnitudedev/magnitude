@@ -29,7 +29,8 @@ use magnitude_family_contracts::{
     Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId, FeedForwardUp,
     GateFunction, GateGranularity, HeadNorm, HistoryDomain, HistoryReads, ImportTransform,
     InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    ResidualForm, RmsNorm, Rotary, Sublayer, UnweightedRms, ValueNorm,
+    OutputProjection, QueryProjection, ResidualForm, RmsNorm, Rotary, Sublayer,
+    UnweightedRms, ValueNorm,
     ValueSource, WeightDescriptor,
 };
 use magnitude_family_common::{rotary, Metadata, Tensors};
@@ -208,7 +209,7 @@ pub fn inspect_components(
             heads,
             kv_heads,
             width,
-            query: paired("attn_q.weight", &[query_rows, hidden])?,
+            query: QueryProjection::Full(paired("attn_q.weight", &[query_rows, hidden])?),
             gate: AttentionGate::Separate {
                 weight: gate,
                 function: GateFunction::Sigmoid,
@@ -230,12 +231,11 @@ pub fn inspect_components(
                 rotary.clone()
             } else {
                 Rotary::None
-            },
-            scale: 1.0 / (width as f64).sqrt(),
+            },            scale: 1.0 / (width as f64).sqrt(),
             reads: HistoryReads::Visible,
             media_rows: MediaRowAttention::Causal,
             sinks: None,
-            output,
+            output: OutputProjection::Full(output),
         };
         blocks.push(Block {
             sublayers: vec![

@@ -5,12 +5,26 @@
 // per (row, kv head) absorbs the row's keys (spans in order, then its fresh
 // span) for the kv head's G query heads and stores their gated outputs.
 
-use lib::attention::attention::{self, Form, Online, BLOCK};
+use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
 use lib::core::activation;
 use seismic::cpu::slab::SlabTensor;
 
 fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
-    Form::new(cx.dim_kv(), cx.dim_g(), cx.dim_p(), cx.dim_s(), cx.dim_i(), cx.dim_u(), cx.dim_f(), cx.dim_n(), cx.dim_nv())
+    Form::new(
+        cx.dim_kv(),
+        cx.dim_g(),
+        cx.dim_p(),
+        cx.dim_s(),
+        cx.dim_i(),
+        cx.dim_u(),
+        cx.dim_f(),
+        cx.dim_nq(),
+        cx.dim_n(),
+        cx.dim_nv(),
+        Layout::new(cx.dim_ra(), cx.dim_rt()),
+        cx.dim_ro(),
+        cx.dim_vk(),
+    )
 }
 
 fn attention_prefill_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
@@ -33,12 +47,13 @@ fn attention_prefill_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gr
     let values = unsafe { cx.scratch_values().slice_mut::<f32>(4 * row * kv * w, kv * w) };
     let (query_norm, key_norm, value_norm) = (cx.arg_query_norm(), cx.arg_key_norm(), cx.arg_value_norm());
     let norms = (
-        form.norm.then(|| query_norm.row([0, 0])),
-        form.norm.then(|| key_norm.row([0, 0])),
+        form.query_norm.then(|| query_norm.row([0, 0])),
+        form.key_norm.then(|| key_norm.row([0, 0])),
         form.value_norm.then(|| value_norm.row([0, 0])),
     );
     let (query, key, value) = (cx.arg_query(), cx.arg_key(), cx.arg_value());
-    let (key, value) = if form.fresh { (key.row([0, row, 0]), value.row([0, row, 0])) } else { (&[][..], &[][..]) };
+    let key = if form.fresh { key.row([0, row, 0]) } else { &[][..] };
+    let value = if form.own_values() { value.row([0, row, 0]) } else { &[][..] };
     attention::prepare_form_row::<E::A>(
         form,
         |head| query.row([row, head, 0]),
@@ -55,18 +70,17 @@ fn attention_prefill_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gr
     let destination = cx.arg_destinations().get([row]);
     if form.fresh && destination >= 0 {
         let slab_rows = cx.arg_slab_rows() as usize;
-        let (history_key, history_value) = (
-            SlabTensor::from_bound(cx.arg_history_key(), slab_rows),
-            SlabTensor::from_bound(cx.arg_history_value(), slab_rows),
-        );
-        for head in 0..kv {
-            // SAFETY: destinations are distinct, freshly reserved history rows
-            // no row of the call reads.
-            let (key_row, value_row) = unsafe {
-                (history_key.row_mut([destination as usize, head, 0]), history_value.row_mut([destination as usize, head, 0]))
-            };
-            activation::store::<E::A>(&keys[head * w..][..w], key_row);
-            activation::store::<E::A>(&values[head * w..][..w], value_row);
+        // SAFETY: destinations are distinct, freshly reserved history rows
+        // no row of the call reads.
+        unsafe {
+            attention::store_dense_row::<E::A>(
+                form,
+                keys,
+                values,
+                &SlabTensor::from_bound(cx.arg_history_key(), slab_rows),
+                &SlabTensor::from_bound(cx.arg_history_value(), slab_rows),
+                destination as usize,
+            );
         }
     }
 }
@@ -83,11 +97,13 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     // A layer without fresh rows sees none (the portable `for layer in 0..F`).
     let fresh = if form.fresh { (fresh.get([row, 0]), fresh.get([row, 1])) } else { (0, 0) };
     let range = 0..attention::total(spans.clone(), fresh);
-    let work = seismic::cpu::tensor::floats(shared, 2 * g + g * w + g * BLOCK + w);
+    let turning = 2 * form.heads.p * usize::from(form.output_rotary);
+    let work = seismic::cpu::tensor::floats(shared, 2 * g + g * w + g * BLOCK + w + turning);
     let (maximum, work) = work.split_at_mut(g);
     let (denominator, work) = work.split_at_mut(g);
     let (accumulator, work) = work.split_at_mut(g * w);
-    let (scores, key_row) = work.split_at_mut(g * BLOCK);
+    let (scores, work) = work.split_at_mut(g * BLOCK);
+    let (key_row, angles) = work.split_at_mut(w);
     let mut state = Online { maximum, denominator, accumulator };
     state.reset();
     // SAFETY: the prepare launch wrote every row before this launch.
@@ -99,10 +115,10 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
         )
     };
     let slab_rows = cx.arg_slab_rows() as usize;
-    let (history_key, history_value) = (
-        SlabTensor::from_bound(cx.arg_history_key(), slab_rows),
-        SlabTensor::from_bound(cx.arg_history_value(), slab_rows),
-    );
+    let history_key = SlabTensor::from_bound(cx.arg_history_key(), slab_rows);
+    let history_value = SlabTensor::from_bound(cx.arg_history_value(), slab_rows);
+    // Stored-key values are read from the key plane.
+    let history_value = if form.stored_key { &history_key } else { &history_value };
     // The WorkList bitmap of the row (none in the Visible form).
     let selection = cx.arg_selection();
     let bitmap: &[u32] = if cx.dim_b() == 0 { &[] } else { selection.row([row, 0]) };
@@ -124,6 +140,14 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
     );
     let (query, gate, result) = (cx.arg_query(), cx.arg_gate(), cx.result_0());
     let softplus = cx.arg_gate_function() != 0;
+    let turned = attention::output_angles(
+        form,
+        cx.arg_coordinates().row([row, 0]),
+        cx.arg_rotary_components().row([0]),
+        cx.arg_rotary_frequencies().row([0]),
+        cx.arg_rotary_amplitudes().row([0]),
+        angles,
+    );
     let sinks = cx.arg_sinks();
     for local in 0..g {
         let head = kv_head * g + local;
@@ -139,5 +163,8 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
         // SAFETY: each work item writes its own query heads of its row.
         let out = unsafe { result.row_mut([row, head, 0]) };
         attention::gate_row::<E::A>(&state.accumulator[local * w..][..w], denominator, gates, softplus, out);
+        if let Some((cosines, sines)) = turned {
+            attention::output_rotary::<E::A>(out, form.layout, cosines, sines);
+        }
     }
 }

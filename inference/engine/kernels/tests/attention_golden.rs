@@ -433,7 +433,18 @@ impl Family {
     /// declarations fix).
     fn statics(device: &Device, geometry: Geometry) -> NativeSpecialization {
         let w = geometry.w() as u64;
-        let form = [("I", w), ("U", 0), ("F", 1), ("N", 1), ("NV", 0)];
+        let form = [
+            ("I", w),
+            ("U", 0),
+            ("F", 1),
+            ("NQ", 1),
+            ("N", 1),
+            ("NV", 0),
+            ("RA", 0),
+            ("RT", 0),
+            ("RO", 0),
+            ("VK", 0),
+        ];
         let base = if device.backend() == BackendName::Cpu {
             NativeSpecialization::new()
                 .with_static("P", geometry.p as u64)
@@ -472,6 +483,8 @@ fn run_family(
     let selection = Tensor::from_host(device, Element::u32(), &[rows, 0], &[]).unwrap();
     let every_key = block_slots(device, 1);
     {
+        // Half-split leading rotary pairs, no output rotary.
+        let layout = half_split_layout(device);
         macro_rules! dense {
             ($module:ident $(, $extra:ident: $value:expr)*) => {{
                 let kernel = $module::native_for_device_with(
@@ -503,6 +516,7 @@ fn run_family(
                         $($extra: $value,)*
                         history_key,
                         history_value,
+                        form: &layout,
                         epsilon: case.epsilon,
                         scale: case.scale,
                         gate_function: 0,
@@ -546,6 +560,7 @@ fn run_family(
                         history_key_coefficients: key_coefficients,
                         history_value_codes: value_codes,
                         history_value_coefficients: value_coefficients,
+                        form: &layout,
                         epsilon: case.epsilon,
                         scale: case.scale,
                         gate_function: 0,

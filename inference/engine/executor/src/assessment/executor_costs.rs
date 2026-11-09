@@ -2497,6 +2497,9 @@ struct AttendCase {
     norms: Tensor,
     /// No sinks (`SK = 0`).
     sinks: Tensor,
+    /// Half-split leading rotary pairs, no output rotary, own values
+    /// (`RA = RT = RO = VK = 0`).
+    form: Tensor,
     rotary_components: Tensor,
     rotary_frequencies: Tensor,
     rotary_amplitudes: Tensor,
@@ -2712,6 +2715,7 @@ impl AttendCase {
         let value = zeros(Element::bf16(), &[1, 1, KV_HEADS * HEAD_WIDTH])?;
         let norms = zeros(Element::f32(), &[0, HEAD_WIDTH])?;
         let sinks = zeros(Element::f32(), &[0, heads])?;
+        let form = zeros(Element::i32(), &[0, 0, 0, 0, 0])?;
         let rotary_components = host(Element::i32(), &[ROTARY_PAIRS], words(&components))?;
         let rotary_frequencies = host(
             Element::f32(),
@@ -2771,6 +2775,7 @@ impl AttendCase {
                     value: value.clone(),
                     norms: norms.clone(),
                     sinks: sinks.clone(),
+                    form: form.clone(),
                     rotary_components: rotary_components.clone(),
                     rotary_frequencies: rotary_frequencies.clone(),
                     rotary_amplitudes: rotary_amplitudes.clone(),
@@ -2808,6 +2813,7 @@ impl AttendCase {
             destinations: &self.destinations,
             history_key: key,
             history_value: value,
+            form: &self.form,
             epsilon: 1e-6,
             scale: 1.0 / (HEAD_WIDTH as f32).sqrt(),
             gate_function: 0,
@@ -2840,6 +2846,7 @@ impl AttendCase {
             history_key_coefficients: key_coefficients,
             history_value_codes: value_codes,
             history_value_coefficients: value_coefficients,
+            form: &self.form,
             epsilon: 1e-6,
             scale: 1.0 / (HEAD_WIDTH as f32).sqrt(),
             gate_function: 0,
@@ -2859,9 +2866,14 @@ fn attention_values(layout: KvCodec) -> Result<Vec<(&'static str, u64)>, Executo
         ("I", 0),
         ("U", 0),
         ("F", 1),
+        ("NQ", 0),
         ("N", 0),
         ("NV", 0),
         ("SK", 0),
+        ("RA", 0),
+        ("RT", 0),
+        ("RO", 0),
+        ("VK", 0),
     ];
     // An affine layout's statics are its planes' widths.
     if let [key_codes, key_coefficients, value_codes, value_coefficients] = planes(layout)?[..] {
@@ -3149,6 +3161,7 @@ fn composition_chain(
     let value = bind(&mut graph, &attend.value)?;
     let norms = bind(&mut graph, &attend.norms)?;
     let sinks = bind(&mut graph, &attend.sinks)?;
+    let form = bind(&mut graph, &attend.form)?;
     let components = bind(&mut graph, &attend.rotary_components)?;
     let frequencies = bind(&mut graph, &attend.rotary_frequencies)?;
     let amplitudes = bind(&mut graph, &attend.rotary_amplitudes)?;
@@ -3219,6 +3232,7 @@ fn composition_chain(
                     destinations: destinations.tensor().into(),
                     history_key: history_key.tensor_mut().into(),
                     history_value: history_value.tensor_mut().into(),
+                    form: form.tensor().into(),
                     epsilon: 1e-6,
                     scale: 1.0 / (HEAD_WIDTH as f32).sqrt(),
                     gate_function: 0,

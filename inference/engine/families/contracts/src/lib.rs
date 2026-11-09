@@ -25,8 +25,9 @@ pub use decoder::{
     FeedForwardUp, GateFunction, GateGranularity, GatedDelta, HeadNorm,
     HistoryDomain, HistoryReads, HyperConnectionMixing, HyperConnectionWeights, HyperConnections,
     Indexer, InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention,
-    NGramHash, NGramInput, Operator, OutputForm, PerLayerEntry, PerLayerInput,
-    RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RotaryDivisors, RotaryPair,
+    NGramHash, NGramInput, Operator, OutputForm, OutputProjection, OutputRotary, PerLayerEntry,
+    PerLayerInput, QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
+    RotaryDivisors, RotaryLayout, RotaryPair, RotaryPairing, RotaryPlacement,
     RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
     SharedExpertGate, ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms, ValueNorm,
     ValueSource,
@@ -513,14 +514,23 @@ pub enum WeightKind {
     HyperConnectionDown,
     HyperConnectionUp,
     HyperConnectionInject,
+    /// The query heads' projection: a full query's, or a low-rank query's
+    /// `up` (`QueryProjection`).
     Query,
     QueryGate,
+    /// A low-rank query's `down` projection and the norm of its `qr` row.
+    QueryDown,
+    QueryDownNorm,
     AttentionGate,
     Key,
     Value,
     QueryNorm,
     KeyNorm,
+    /// The projection to the hidden width: a full output's, or a grouped
+    /// output's `b` (`OutputProjection`).
     AttentionOutput,
+    /// A grouped output's block-diagonal `a`.
+    AttentionOutputGrouped,
     /// An attention's per-head sink logits (`Attention::sinks`).
     AttentionSinks,
     IndexerQuery,
@@ -1067,7 +1077,7 @@ mod tests {
                 heads: 2,
                 kv_heads: 1,
                 width: 2,
-                query: weight(&format!("{name}.q"), &[4, 4]),
+                query: QueryProjection::Full(weight(&format!("{name}.q"), &[4, 4])),
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::None,
                 key_value,
@@ -1076,13 +1086,15 @@ mod tests {
                         frequency: 1.0,
                         amplitude: 1.0,
                     }],
+                    layout: RotaryLayout::HALF_SPLIT_LEADING,
                     divisors: None,
+                    output: OutputRotary::None,
                 },
                 scale: 0.5,
                 reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
                 sinks: None,
-                output: weight(&format!("{name}.o"), &[4, 4]),
+                output: OutputProjection::Full(weight(&format!("{name}.o"), &[4, 4])),
             })),
             output: OutputForm::Residual,
         }
@@ -1149,6 +1161,85 @@ mod tests {
         assert_eq!(
             model.validate().unwrap_err().to_string(),
             "invalid attention query shape for \"a.q\""
+        );
+    }
+
+    /// DeepSeek V4.1's window attention: a low-rank query with its own norm,
+    /// values that are the stored key, adjacent pairs over the trailing
+    /// dimensions, the rotation undone on the output, a grouped low-rank
+    /// output, sinks.
+    #[test]
+    fn low_rank_stored_key_trailing_adjacent_grouped_attention_validates() {
+        let mut model = definition(vec![attention(
+            "a",
+            KeyValue::Owned {
+                key: weight("a.kv", &[2, 4]),
+                value: ValueSource::StoredKey,
+                key_norm: HeadNorm::Rms(rms("a.kv_norm", 2)),
+                value_norm: ValueNorm::None,
+                domain: HistoryDomain::Window { tokens: 4 },
+            },
+        )]);
+        let Operator::Attention(attention) = &mut model.decoder.blocks[0].sublayers[0].op else {
+            unreachable!()
+        };
+        attention.query = QueryProjection::LowRank {
+            down: weight("a.q_a", &[3, 4]),
+            norm: rms("a.q_a_norm", 3),
+            up: weight("a.q_b", &[4, 3]),
+        };
+        let Rotary::Table { layout, output, .. } = &mut attention.rotary else {
+            unreachable!()
+        };
+        *layout = RotaryLayout {
+            pairs: RotaryPairing::Adjacent,
+            placement: RotaryPlacement::Trailing,
+        };
+        *output = OutputRotary::Inverse;
+        attention.sinks = Some(weight("a.sinks", &[2]));
+        attention.output = OutputProjection::GroupedLowRank {
+            groups: 2,
+            rank: 3,
+            a: weight("a.o_a", &[6, 2]),
+            b: weight("a.o_b", &[4, 6]),
+        };
+        model.validate().unwrap();
+
+        let invalid = |change: &dyn Fn(&mut Attention), error: &str| {
+            let mut model = model.clone();
+            let Operator::Attention(attention) = &mut model.decoder.blocks[0].sublayers[0].op
+            else {
+                unreachable!()
+            };
+            change(attention);
+            assert_eq!(model.validate().unwrap_err().to_string(), error);
+        };
+        invalid(
+            &|attention| {
+                let KeyValue::Owned { value_norm, .. } = &mut attention.key_value else {
+                    unreachable!()
+                };
+                *value_norm = ValueNorm::RmsUnweighted(UnweightedRms { epsilon: 1e-6 });
+            },
+            "stored-key values with a value norm",
+        );
+        invalid(
+            &|attention| {
+                let OutputProjection::GroupedLowRank { groups, .. } = &mut attention.output else {
+                    unreachable!()
+                };
+                *groups = 3;
+            },
+            "invalid grouped attention output",
+        );
+        invalid(
+            &|attention| {
+                let QueryProjection::LowRank { up, .. } = &mut attention.query else {
+                    unreachable!()
+                };
+                *up = weight("a.q_b", &[4, 2]);
+            },
+            "invalid attention query up shape for \"a.q_b\"",
         );
     }
 

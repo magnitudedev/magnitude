@@ -746,21 +746,25 @@ struct CheckedMarkovEntries {
 
 impl CheckedDraftEntries {
     /// `landing`: of the block's token table, when it has landing slots.
-    fn new(plan: &DraftProgramPlan, landing: Option<CheckedLandingEntries>) -> Self {
+    fn new(
+        plan: &DraftProgramPlan,
+        backend: BackendName,
+        landing: Option<CheckedLandingEntries>,
+    ) -> Result<Self, String> {
         let activation = plan.activation();
-        Self {
+        Ok(Self {
             landing,
             layers: plan
                 .blocks()
                 .iter()
                 .map(|block| {
-                    (
-                        CheckedAttentionEntries::new(block.attention, false),
-                        CheckedAttentionEntries::new(block.injection, false),
+                    Ok((
+                        CheckedAttentionEntries::new(block.attention, backend, false)?,
+                        CheckedAttentionEntries::new(block.injection, backend, false)?,
                         CheckedDenseEntries::new(block.feed_forward),
-                    )
+                    ))
                 })
-                .collect(),
+                .collect::<Result<_, String>>()?,
             embedding: [("EW", plan.embedding().table), ("A", activation)],
             head: readout::CheckedProjectionEntries::new(
                 plan.projection(),
@@ -783,7 +787,7 @@ impl CheckedDraftEntries {
             corrector: plan
                 .corrector()
                 .map(|binding| CheckedCorrectorEntries::new(plan, binding)),
-        }
+        })
     }
 
     fn entries(&self) -> Result<DraftGraphEntries<'_, NativeGraphMetadata>, String> {
@@ -861,8 +865,9 @@ fn certify_draft_family(
 > {
     let checked = CheckedDraftEntries::new(
         plan,
+        backend,
         CheckedLandingEntries::of(load, token_table(geometry.draft))?,
-    );
+    )?;
     let mut groups: BTreeMap<(u64, u64, bool, bool, bool, RowForm), Vec<DraftGraphClass>> =
         BTreeMap::new();
     for &class in classes {
@@ -947,8 +952,9 @@ pub(crate) fn verify_draft_family_certificates(
     let (resources, layouts) = certify_draft_family(backend, load, plan, geometry, classes)?;
     let checked = CheckedDraftEntries::new(
         plan,
+        backend,
         CheckedLandingEntries::of(load, token_table(geometry.draft))?,
-    );
+    )?;
     let mut exact = CheckedGraphFamilyResources::new();
     for &class in classes {
         let parts = draft_graph(
@@ -1369,6 +1375,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         let block_weights = AttentionWeights {
             input_norm: Some(input_norm),
             query: injection_weights.query.clone(),
+            low_rank_query: injection_weights.low_rank_query.clone(),
             gate: injection_weights.gate.clone(),
             key: injection_weights.key.clone(),
             value: injection_weights.value.clone(),
@@ -1376,6 +1383,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             key_norm: injection_weights.key_norm.clone(),
             sinks: injection_weights.sinks.clone(),
             output: injection_weights.output.clone(),
+            grouped: injection_weights.grouped.clone(),
             post_norm: None,
             operands: injection_weights.operands.clone(),
             indexer: None,
@@ -1839,6 +1847,7 @@ fn project_planned<'a, G: GraphDraft + 'a>(
             entry,
             &[
                 ("M", rows),
+                ("G", 1),
                 ("K", inputs),
                 ("N", outputs),
                 ("WS", operands.scale.extent),
@@ -2056,6 +2065,9 @@ fn convolved_layer<'a, G: GraphDraft + 'a>(
     let (Some(key_weight), Some(value_weight)) = (&attention.key, &attention.value) else {
         return Err("a convolved draft layer projects its keys and values".into());
     };
+    if attention.low_rank_query.is_some() {
+        return Err("a convolved draft layer projects its query whole".into());
+    }
     let query = project_attention(
         graph,
         entries.query,

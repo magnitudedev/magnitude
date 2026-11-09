@@ -177,8 +177,8 @@ use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
     EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp, GateFunction,
     GatedDelta, HeadNorm, HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue,
-    MediaRowAttention, ModelDefinition, Operator, OutputForm, RecurrentHeadMapping, ResidualForm,
-    RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
+    MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
+    QueryProjection, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
     SharedExpert, SharedExpertGate, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
 };
 
@@ -242,11 +242,11 @@ pub(crate) fn declared_model(
                 heads: c.heads,
                 kv_heads: c.kv_heads,
                 width: c.head_width,
-                query: tensor(
+                query: QueryProjection::Full(tensor(
                     name("attn_q"),
                     vec![2 * c.heads * c.head_width, c.hidden],
                     true,
-                ),
+                )),
                 gate: AttentionGate::Interleaved {
                     function: GateFunction::Sigmoid,
                 },
@@ -279,16 +279,15 @@ pub(crate) fn declared_model(
                     base: 10_000_000.0,
                     sections: vec![c.rotary_width / 2],
                     axis_pattern: vec![0],
-                },
-                scale: 1.0 / (c.head_width as f64).sqrt(),
+                },                scale: 1.0 / (c.head_width as f64).sqrt(),
                 reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
                 sinks: None,
-                output: tensor(
+                output: OutputProjection::Full(tensor(
                     name("attn_output"),
                     vec![c.hidden, c.heads * c.head_width],
                     true,
-                ),
+                )),
             }))
         } else {
             Operator::GatedDelta(Box::new(GatedDelta {

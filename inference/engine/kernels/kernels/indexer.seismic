@@ -7,6 +7,8 @@
 #   K[b]  = rotary(rms(mean(raw keys of block b)) * key_norm,
 #                  coordinates(first row of b))
 #   s[b]  = sum_h relu(q[h] . K[b]) / sqrt(W), heads ascending
+# `rotary` turns half-split pairs over the leading 2P columns (`head_rotary`
+# at `half_split`, RA = RT = 0); admission refuses a selected read of any other layout.
 # The projected query and raw key arrive in the activation element A, as
 # every projection's outputs do; from them on everything is F32 (the stored
 # raw and block keys, the prepared queries, the scores) and nothing is
@@ -69,6 +71,7 @@ fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
     selected: i32, epsilon: f32, slab_rows: u32, window_slab_rows: u32, block_slab_rows: u32)
     -> (tensor[M, C, 2] i32, tensor[M, B] u32)
     where P >= 0 and S >= 0 and 2 * P + S >= 1 and H >= 1 and SB >= 1 and C >= 0 and B >= 0:
+    let half_split = tensor[0, 0, 0, 0] i32
     # Raw keys first: a completing row reads raw keys of earlier rows.
     for row in 0..M:
         if window_destinations[row] >= 0:
@@ -108,7 +111,7 @@ fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
                 mean[column] = sum[column] / f32(SB)
             let mut finished = tensor[2 * P + S] f32
             finished[:] = head_rotary(mean, key_norm, window_coordinates[members[0]],
-                rotary_components, rotary_frequencies, rotary_amplitudes, epsilon)
+                rotary_components, rotary_frequencies, rotary_amplitudes, half_split, epsilon)
             block_keys[block_destinations[row]] = finished
     let mut segments = tensor[M, C, 2] i32
     let mut selection = tensor[M, B] u32
@@ -123,7 +126,7 @@ fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
             let mut prepared = tensor[H, 2 * P + S] f32
             for head in 0..H:
                 prepared[head] = head_rotary(query[row, head], query_norm, coordinates[row],
-                    rotary_components, rotary_frequencies, rotary_amplitudes, epsilon)
+                    rotary_components, rotary_frequencies, rotary_amplitudes, half_split, epsilon)
             # The row's complete blocks, in block order, scored.
             let mut complete = 0
             for span in 0..R:

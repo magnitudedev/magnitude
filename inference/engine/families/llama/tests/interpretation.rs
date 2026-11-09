@@ -6,7 +6,8 @@ use magnitude_artifacts::{
 use magnitude_family_common::headers::{self, add_tensor, set as set_metadata};
 use magnitude_family_contracts::{
     ActivationFunction, AttentionGate, FeedForwardUp, HeadNorm, HistoryDomain, ImportTransform,
-    InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator, OutputForm, Rotary,
+    InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator, OutputForm, OutputProjection,
+    QueryProjection, Rotary,
 };
 use magnitude_artifacts::UnsupportedReason;
 use magnitude_family_contracts::FamilyError;
@@ -80,10 +81,13 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
         assert_eq!(*key_norm, HeadNorm::None);
         assert_eq!(*domain, HistoryDomain::Token);
         assert_eq!(key.shape, [256, 2048]);
-        assert_eq!(attention.query.shape, [2048, 2048]);
+        let QueryProjection::Full(query) = &attention.query else {
+            panic!("the query is projected whole");
+        };
+        assert_eq!(query.shape, [2048, 2048]);
         // Query and key rows move from adjacent pairs to half-split pairs;
         // values and outputs are consumed as stored.
-        for descriptor in [&attention.query, key] {
+        for descriptor in [query, key] {
             let [ImportTransform::PermuteRows { order }] = descriptor.transforms.as_slice() else {
                 panic!("{} carries one row permutation", descriptor.name);
             };
@@ -95,7 +99,10 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
                 descriptor.shape
             );
         }
-        assert!(attention.output.transforms.is_empty());
+        assert!(matches!(
+            &attention.output,
+            OutputProjection::Full(output) if output.transforms.is_empty()
+        ));
         let Rotary::Table { pairs, .. } = &attention.rotary else {
             panic!("full-width rotary table");
         };

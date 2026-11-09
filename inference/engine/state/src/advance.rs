@@ -2,7 +2,7 @@
 
 use super::{
     append_ranges, install_commit, ranges_from, BankHandle, Claims, Codec, ComponentDescriptor,
-    Error, HistoryDomainId, KvCodec, LayerRef, PlaneBuffer, SequenceState, StateStore, StoreCopy,
+    Error, HistoryDomainId, HistoryValue, KvCodec, LayerRef, PlaneBuffer, SequenceState, StateStore, StoreCopy,
     Tail, Transaction, VectorKind,
 };
 use seismic::Tensor;
@@ -229,10 +229,14 @@ impl OwnedCodecAdvance {
             ));
         }
         for (before, after) in source_components.iter().zip(&destination_components) {
-            if before.layer != after.layer
-                || before.codec.key_width != after.codec.key_width
-                || before.codec.value_width != after.codec.value_width
-            {
+            let widths = |component: &ComponentDescriptor| {
+                component
+                    .codec
+                    .vectors()
+                    .map(|(vector, _, width)| (vector, width))
+                    .collect::<Vec<_>>()
+            };
+            if before.layer != after.layer || widths(before) != widths(after) {
                 return Err(Error::Request(
                     "codec conversion layers or vector widths differ".into(),
                 ));
@@ -326,12 +330,15 @@ fn identify_codec(components: &[ComponentDescriptor]) -> Result<KvCodec, Error> 
                 Codec::Dense { dtype } => dtype,
                 _ => seismic::DType::F16,
             };
-            let expected = candidate.spec(
-                dense_dtype,
-                component.codec.key_width,
-                component.codec.value_width,
-            );
-            component.codec == expected
+            let width = component.codec.key_width;
+            let expected = match component.codec.value {
+                HistoryValue::Own { width: values, .. } => {
+                    Some(candidate.spec(dense_dtype, width, values))
+                }
+                HistoryValue::Key => Some(candidate.stored_key(dense_dtype, width)),
+                HistoryValue::None => None,
+            };
+            expected == Some(component.codec)
         }) {
             return Ok(candidate);
         }
@@ -371,7 +378,12 @@ fn conversion_steps(
             destination_base += after.planes().len();
             continue;
         }
-        for vector in [VectorKind::Key, VectorKind::Value] {
+        // The vectors the rows store: equal on both sides (`prepare`).
+        for (vector, source_codec, _) in before.codec.vectors() {
+            let destination_codec = after
+                .codec
+                .codec(vector)
+                .expect("codec conversion pairs layers storing the same vectors");
             let source_planes = before
                 .planes()
                 .iter()
@@ -392,16 +404,8 @@ fn conversion_steps(
                 domain: HistoryDomainId(domain),
                 layer: before.layer,
                 vector,
-                source_codec: if vector == VectorKind::Key {
-                    before.codec.key
-                } else {
-                    before.codec.value
-                },
-                destination_codec: if vector == VectorKind::Key {
-                    after.codec.key
-                } else {
-                    after.codec.value
-                },
+                source_codec,
+                destination_codec,
                 source_planes,
                 destination_planes,
                 from: from[domain].clone(),

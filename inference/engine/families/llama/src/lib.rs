@@ -24,7 +24,8 @@ use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
     DefinitionError, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId,
     FeedForwardUp, HeadNorm, HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue,
-    MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Sublayer,
+    MediaRowAttention, ModelDefinition, Operator, OutputForm, OutputProjection,
+    QueryProjection, ResidualForm, RmsNorm, Sublayer,
     ValueNorm, ValueSource, WeightDescriptor, FamilyError,
 };
 use std::{error, fmt};
@@ -384,7 +385,7 @@ pub fn inspect_components(
                 heads,
                 kv_heads,
                 width,
-                query,
+                query: QueryProjection::Full(query),
                 gate: AttentionGate::None,
                 query_norm: HeadNorm::None,
                 key_value: KeyValue::Owned {
@@ -394,12 +395,14 @@ pub fn inspect_components(
                     value_norm: ValueNorm::None,
                     domain: HistoryDomain::Token,
                 },
-                rotary: rotary.clone(),
-                scale: 1.0 / (width as f64).sqrt(),
+                rotary: rotary.clone(),                scale: 1.0 / (width as f64).sqrt(),
                 reads: HistoryReads::Visible,
                 media_rows: MediaRowAttention::Causal,
                 sinks: None,
-                output: weight("attn_output.weight", &[hidden, query_rows])?,
+                output: OutputProjection::Full(weight(
+                    "attn_output.weight",
+                    &[hidden, query_rows],
+                )?),
             };
             let feed_forward = DenseFfn {
                 intermediate,

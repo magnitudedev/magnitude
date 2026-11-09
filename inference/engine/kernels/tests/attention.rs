@@ -34,6 +34,8 @@ struct Bound {
     destinations: Tensor,
     selection: Tensor,
     block_slots: Tensor,
+    rotary_layout: Tensor,
+    append_layout: Tensor,
     _history_key_slabs: SlabTensor,
     _history_value_slabs: SlabTensor,
     history_key: Tensor,
@@ -148,6 +150,8 @@ impl Bound {
             destinations: i32_tensor(device, &[m], &case.destinations),
             selection: no_selection(device, m),
             block_slots: block_slots(device, 1),
+            rotary_layout: half_split_layout(device),
+            append_layout: half_split_append_layout(device),
             _history_key_slabs: history_key_slabs,
             _history_value_slabs: history_value_slabs,
             history_key,
@@ -390,6 +394,7 @@ macro_rules! args {
             destinations: &$bound.destinations,
             history_key: &mut $bound.history_key,
             history_value: &mut $bound.history_value,
+            form: &$bound.append_layout,
             epsilon: $case.epsilon,
             slab_rows: $bound.slab_rows,
         }
@@ -415,6 +420,7 @@ macro_rules! args {
             block_slots: &$bound.block_slots,
             history_key: &mut $bound.history_key,
             history_value: &mut $bound.history_value,
+            form: &$bound.rotary_layout,
             epsilon: $case.epsilon,
             scale: $case.scale,
             gate_function: 0,
@@ -440,6 +446,7 @@ macro_rules! args {
             destinations: &$bound.destinations,
             history_key: &mut $bound.history_key,
             history_value: &mut $bound.history_value,
+            form: &$bound.rotary_layout,
             epsilon: $case.epsilon,
             scale: $case.scale,
             gate_function: 0,
@@ -569,6 +576,8 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         tensor(DType::I32, vec![m], ints(&case.destinations)),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_key)),
         tensor(DType::BF16, vec![t, kv, w], floats(&case.history_value)),
+        // Half-split leading rotary pairs, no output rotary, own values.
+        tensor(DType::I32, vec![0, 0, 0, 0, 0], Vec::new()),
         Arg::Scalar(ReferenceScalar::F32(case.epsilon.to_bits())),
         Arg::Scalar(ReferenceScalar::F32(case.scale.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
@@ -1133,7 +1142,7 @@ fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecial
     specialization
         .statics()
         .iter()
-        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U"))
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U" | "NQ" | "RO"))
         .fold(NativeSpecialization::new(), |spec, (name, value)| {
             spec.with_static(name, *value)
         })

@@ -25,7 +25,8 @@ use magnitude_family_contracts::{
     DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
     FeedForwardUp, GateFunction, GateGranularity, HeadNorm, HistoryDomain, HistoryReads,
     ImportTransform, InputNorm, InputSemantics, KeyValue, MediaRowAttention, ModelDefinition,
-    Operator, OutputForm, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router,
+    Operator, OutputForm, OutputProjection, QueryProjection, ResidualForm, RmsNorm,
+    Rotary, RouteNormalization, RoutedFfn, Router,
     RouterInput, RowRange, ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
     WeightDescriptor,
 };
@@ -375,7 +376,7 @@ pub fn inspect_components(
                     heads,
                     kv_heads,
                     width,
-                    query: weight("attn_q.weight", &[head_rows, hidden])?,
+                    query: QueryProjection::Full(weight("attn_q.weight", &[head_rows, hidden])?),
                     gate: match architecture {
                         Architecture::Dense | Architecture::Routed => AttentionGate::None,
                         Architecture::Lfm3 => AttentionGate::Separate {
@@ -392,12 +393,14 @@ pub fn inspect_components(
                         value_norm: ValueNorm::None,
                         domain: domain.clone(),
                     },
-                    rotary: rotary.clone(),
-                    scale: 1.0 / (width as f64).sqrt(),
+                    rotary: rotary.clone(),                    scale: 1.0 / (width as f64).sqrt(),
                     reads: HistoryReads::Visible,
                     media_rows: MediaRowAttention::Causal,
                     sinks: None,
-                    output: weight("attn_output.weight", &[hidden, head_rows])?,
+                    output: OutputProjection::Full(weight(
+                        "attn_output.weight",
+                        &[hidden, head_rows],
+                    )?),
                 }))
             }
             Mixer::ShortConv => {

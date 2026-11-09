@@ -5,12 +5,26 @@
 // absorbs them; fresh rows attend dense. Head widths are whole affine groups
 // (the declaration's `where`), so every vector has at least one group.
 
-use lib::attention::attention::{self, Form, Online, BLOCK};
+use lib::attention::attention::{self, Form, Layout, Online, BLOCK};
 use seismic::cpu::slab::SlabTensor;
 
 fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
-    Form::new(cx.dim_kv(), cx.dim_g(), cx.dim_p(), cx.dim_s(), cx.dim_i(), cx.dim_u(), cx.dim_f(), cx.dim_n(), cx.dim_nv())
-        .affine()
+    Form::new(
+        cx.dim_kv(),
+        cx.dim_g(),
+        cx.dim_p(),
+        cx.dim_s(),
+        cx.dim_i(),
+        cx.dim_u(),
+        cx.dim_f(),
+        cx.dim_nq(),
+        cx.dim_n(),
+        cx.dim_nv(),
+        Layout::new(cx.dim_ra(), cx.dim_rt()),
+        cx.dim_ro(),
+        cx.dim_vk(),
+    )
+    .affine()
 }
 
 fn attention_decode_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
@@ -33,8 +47,8 @@ fn attention_decode_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>
     let values = unsafe { cx.scratch_values().slice_mut::<f32>(4 * row * kv * w, kv * w) };
     let (query_norm, key_norm, value_norm) = (cx.arg_query_norm(), cx.arg_key_norm(), cx.arg_value_norm());
     let norms = (
-        form.norm.then(|| query_norm.row([0, 0])),
-        form.norm.then(|| key_norm.row([0, 0])),
+        form.query_norm.then(|| query_norm.row([0, 0])),
+        form.key_norm.then(|| key_norm.row([0, 0])),
         form.value_norm.then(|| value_norm.row([0, 0])),
     );
     let (query, key, value) = (cx.arg_query(), cx.arg_key(), cx.arg_value());
@@ -151,7 +165,16 @@ fn attention_decode_k8v4_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, 
             cx.scratch_statistics().slice::<f32>(0, m * kv * parts * 2 * g),
         )
     };
-    let output = seismic::cpu::tensor::floats(shared, w);
+    let work = seismic::cpu::tensor::floats(shared, w + 2 * form.heads.p * usize::from(form.output_rotary));
+    let (output, angles) = work.split_at_mut(w);
+    let turned = attention::output_angles(
+        form,
+        cx.arg_coordinates().row([row, 0]),
+        cx.arg_rotary_components().row([0]),
+        cx.arg_rotary_frequencies().row([0]),
+        cx.arg_rotary_amplitudes().row([0]),
+        angles,
+    );
     let (query, gate, result) = (cx.arg_query(), cx.arg_gate(), cx.result_0());
     let softplus = cx.arg_gate_function() != 0;
     for head in 0..form.heads.queries() {
@@ -177,5 +200,8 @@ fn attention_decode_k8v4_merge<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, 
         // SAFETY: each work item writes its own row of the result.
         let out = unsafe { result.row_mut([row, head, 0]) };
         attention::gate_row::<E::A>(output, denominator, gates, softplus, out);
+        if let Some((cosines, sines)) = turned {
+            attention::output_rotary::<E::A>(out, form.layout, cosines, sines);
+        }
     }
 }

@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::AttentionValues;
 use seismic::{Layout, OperandRecipe};
 
 pub(super) fn qualification(
@@ -157,13 +158,26 @@ pub(super) fn qualify_attention(
     let inject = rows.inject(device, 1, "attention_output", label)?;
     let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, ENTRY, label);
     let input_norm = rows.norm(device, binding.norm, hidden, ENTRY, label)?;
-    let query = zeros(binding.query, &[shape.query_rows(), hidden])?;
+    // The query segment: the query rows, or a low-rank query's `qr` rows.
+    let query_segment_rows = binding
+        .low_rank_query
+        .map_or(shape.query_rows(), |low_rank| low_rank.rank);
+    let query = zeros(binding.query_segment(), &[query_segment_rows, hidden])?;
     let gate = zeros(binding.gate, &[shape.gate_rows(), hidden])?;
     let key = zeros(binding.key, &[shape.key_rows(), hidden])?;
     let value = zeros(binding.value, &[shape.value_rows(), hidden])?;
-    let output = zeros(binding.output, &[hidden, heads * width])?;
-    let query_norm = zeros(Element::f32(), &[shape.head_norm, width])?;
-    let key_norm = zeros(Element::f32(), &[shape.head_norm, width])?;
+    let (output_q, output_w) = binding.output_input();
+    let output = zeros(binding.output, &[hidden, output_q * output_w])?;
+    // A grouped output's zero `a` (G blocks of `rank` rows over `inputs`).
+    let grouped = binding
+        .grouped
+        .map(|grouped| {
+            let shape = grouped.shape;
+            zeros(grouped.element, &[shape.groups * shape.rank, shape.inputs])
+        })
+        .transpose()?;
+    let query_norm = zeros(Element::f32(), &[shape.query_norm, width])?;
+    let key_norm = zeros(Element::f32(), &[shape.key_norm, width])?;
     let value_norm = zeros(Element::f32(), &[shape.value_norm, width])?;
     // The sink logits (zero rows without sinks).
     let sinks = zeros(Element::f32(), &[shape.sinks, heads])?;
@@ -180,6 +194,21 @@ pub(super) fn qualify_attention(
     // The history's prefill reads every visible row: no WorkList bitmap, its
     // blocks of one key.
     let block_slots = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
+    // The rotary layout, output rotary and stored-key values, carried by an
+    // empty table's extents.
+    let form = semantic_i32(
+        device,
+        &[
+            0,
+            shape.rotary_adjacent,
+            shape.rotary_trailing,
+            shape.output_rotary,
+            shape.stored_key(),
+        ],
+        &[],
+        ENTRY,
+        label,
+    )?;
     let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
         .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
     let scale = |name| unit_scale(device, &kernels.project, name, ENTRY, label);
@@ -209,41 +238,92 @@ pub(super) fn qualify_attention(
             .reshape(extents)
             .map_err(|error| qualification_dynamic(ENTRY, label, error))
     };
-    let mixed_query = per_head(&projected.r0, &[1, heads, width + shape.interleaved_gate])?;
+    // A low-rank query's `qr` row, widened, normalized and projected to the
+    // query heads.
+    let query_rows = match (binding.low_rank_query, &kernels.low_rank_query) {
+        (None, None) => projected.r0,
+        (Some(low_rank), Some(low_rank_kernels)) => {
+            let qr = low_rank_kernels
+                .widen
+                .call(widen_rows::Args { rows: &projected.r0 })
+                .map_err(|e| qualification_dynamic("widen_rows", label, e))?
+                .value;
+            let up = zeros(binding.query, &[shape.query_rows(), low_rank.rank])?;
+            let empty = zeros(binding.query, &[0, low_rank.rank])?;
+            let kernel = &low_rank_kernels.project;
+            let scale = |name| unit_scale(device, kernel, name, ENTRY, label);
+            let bound = |name| any_row_bound(device, kernel, name, ENTRY, label);
+            kernel
+                .call(attention_project::Args {
+                    hidden: &qr,
+                    input_norm: &zeros(low_rank.norm, &[low_rank.rank])?,
+                    query_weight: &up,
+                    gate_weight: &empty,
+                    key_weight: &empty,
+                    value_weight: &empty,
+                    epsilon: 1.0e-5,
+                    project_mode: 0,
+                    query_scale: &scale("QS")?,
+                    gate_scale: &scale("GS")?,
+                    key_scale: &scale("KS")?,
+                    value_scale: &scale("VS")?,
+                    query_bound: &bound("QB")?,
+                    gate_bound: &bound("GB")?,
+                    key_bound: &bound("KB")?,
+                    value_bound: &bound("VB")?,
+                })
+                .map_err(|e| qualification_dynamic("attention_project", label, e))?
+                .r0
+        }
+        _ => {
+            return Err(qualification_dynamic(
+                "attention_project",
+                label,
+                "the low-rank query's kernels disagree with the binding",
+            ));
+        }
+    };
+    let mixed_query = per_head(&query_rows, &[1, heads, width + shape.interleaved_gate])?;
     let mixed_gate = per_head(&projected.r1, &[1, heads, shape.separate_gate])?;
     let fresh_rows = [shape.fresh, 1, kv_heads * width];
     let mixed_key = per_head(&projected.r2, &fresh_rows)?;
-    let mixed_value = if shape.projected_value {
-        per_head(&projected.r3, &fresh_rows)?
-    } else {
-        per_head(&projected.r2, &fresh_rows)?
+    let mixed_value = match shape.values {
+        AttentionValues::Projected => per_head(&projected.r3, &fresh_rows)?,
+        AttentionValues::RawKey => per_head(&projected.r2, &fresh_rows)?,
+        // Stored-key values take no value of their own (`VK`).
+        AttentionValues::StoredKey => zeros(binding.activation, &[0, 1, kv_heads * width])?,
     };
     // Every entry takes the same arguments but its history planes, which
-    // start zero (a zero key row and a zero value row).
+    // start zero (a zero key row and a zero value row). A plane of no rows
+    // is a stored-key history's absent value plane.
+    let value_rows = if shape.stored_key() == 1 { 0 } else { 2 };
     macro_rules! mix {
-        ($kernel:expr, $module:ident, $($plane:ident: $element:expr, $elements:expr),*) => {
-            mix!(@call $kernel, $module, {}, $($plane: $element, $elements),*)
+        ($kernel:expr, $module:ident, $($plane:ident: $element:expr, $elements:expr, $rows:expr),*) => {
+            mix!(@call $kernel, $module, {}, $($plane: $element, $elements, $rows),*)
         };
         (@call $kernel:expr, $module:ident, {$($extra:ident: $value:expr),*},
-            $($plane:ident: $element:expr, $elements:expr),*) => {{
+            $($plane:ident: $element:expr, $elements:expr, $rows:expr),*) => {{
             let mut slabs = Vec::new();
             $(
-                let mut slab = seismic::SlabTensor::new(device, 2, 2, vec![
-                    seismic::SlabRegion {
-                        element: $element,
-                        row_shape: vec![kv_heads, $elements],
-                    },
-                ])
-                .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-                slab.add_slab()
+                let mut $plane = if $rows > 0 {
+                    let mut slab = seismic::SlabTensor::new(device, 2, 2, vec![
+                        seismic::SlabRegion {
+                            element: $element,
+                            row_shape: vec![kv_heads, $elements],
+                        },
+                    ])
                     .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
-                slabs.push(slab);
+                    slab.add_slab()
+                        .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
+                    let region = slab
+                        .logical_region(0)
+                        .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
+                    slabs.push(slab);
+                    region
+                } else {
+                    zeros($element, &[0, kv_heads, $elements])?
+                };
             )*
-            let mut planes = slabs.iter().map(|slab| {
-                slab.logical_region(0)
-                    .map_err(|error| qualification_dynamic(ENTRY, label, error))
-            });
-            $(let mut $plane = planes.next().expect("one slab per history plane")?;)*
             $kernel
                 .call($module::Args {
                     query: &mixed_query,
@@ -264,6 +344,7 @@ pub(super) fn qualify_attention(
                     slab_rows: 2,
                     $($extra: $value,)*
                     $($plane: &mut $plane,)*
+                    form: &form,
                     epsilon: 1.0e-5,
                     scale: 1.0 / (width as f32).sqrt(),
                     gate_function: 0,
@@ -277,15 +358,22 @@ pub(super) fn qualify_attention(
         AttentionHistoryKernels::Dense {
             decode, prefill, ..
         } => [
-            (
-                "attention_decode",
-                mix!(decode, attention_decode,
-                    history_key: activation, width, history_value: activation, width),
-            ),
+            match decode {
+                DenseDecodeKernels::Decode { single, .. } => (
+                    "attention_decode",
+                    mix!(single, attention_decode,
+                        history_key: activation, width, 2, history_value: activation, width, value_rows),
+                ),
+                DenseDecodeKernels::Prefill(kernel) => (
+                    "attention_prefill",
+                    mix!(@call kernel, attention_prefill, {selection: &selection, block_slots: &block_slots},
+                        history_key: activation, width, 2, history_value: activation, width, value_rows),
+                ),
+            },
             (
                 "attention_prefill",
                 mix!(@call prefill, attention_prefill, {selection: &selection, block_slots: &block_slots},
-                    history_key: activation, width, history_value: activation, width),
+                    history_key: activation, width, 2, history_value: activation, width, value_rows),
             ),
         ],
         AttentionHistoryKernels::AffineK8V4 {
@@ -299,24 +387,52 @@ pub(super) fn qualify_attention(
                 (
                     "attention_decode_k8v4",
                     mix!(decode, attention_decode_k8v4,
-                        history_key_codes: Element::u32(), geometry.key_codes as u64,
-                        history_key_coefficients: Element::f16(), geometry.key_coefficients as u64,
-                        history_value_codes: Element::u32(), geometry.value_codes as u64,
-                        history_value_coefficients: Element::f16(), geometry.value_coefficients as u64),
+                        history_key_codes: Element::u32(), geometry.key_codes as u64, 2,
+                        history_key_coefficients: Element::f16(), geometry.key_coefficients as u64, 2,
+                        history_value_codes: Element::u32(), geometry.value_codes as u64, 2,
+                        history_value_coefficients: Element::f16(), geometry.value_coefficients as u64, 2),
                 ),
                 (
                     "attention_prefill_k8v4",
                     mix!(@call prefill, attention_prefill_k8v4,
                         {selection: &selection, block_slots: &block_slots, history_tiles: &history_tiles},
-                        history_key_codes: Element::u32(), geometry.key_codes as u64,
-                        history_key_coefficients: Element::f16(), geometry.key_coefficients as u64,
-                        history_value_codes: Element::u32(), geometry.value_codes as u64,
-                        history_value_coefficients: Element::f16(), geometry.value_coefficients as u64),
+                        history_key_codes: Element::u32(), geometry.key_codes as u64, 2,
+                        history_key_coefficients: Element::f16(), geometry.key_coefficients as u64, 2,
+                        history_value_codes: Element::u32(), geometry.value_codes as u64, 2,
+                        history_value_coefficients: Element::f16(), geometry.value_coefficients as u64, 2),
                 ),
             ]
         }
     };
     for (entry, gated) in mixed.iter().map(|(entry, gated)| (*entry, gated)) {
+        // A grouped output's products are the rows its output projection
+        // reads.
+        let products = match (&kernels.grouped, &grouped) {
+            (None, None) => None,
+            (Some(kernel), Some(weight)) => Some(
+                kernel
+                    .call(project_rows::Args {
+                        source: &gated
+                            .reshape(&[1, heads * width])
+                            .map_err(|e| qualification_dynamic("project_rows", label, e))?,
+                        weight,
+                        weight_scale: &unit_scale(device, kernel, "WS", "project_rows", label)?,
+                        weight_bound: &any_row_bound(device, kernel, "WB", "project_rows", label)?,
+                    })
+                    .map_err(|e| qualification_dynamic("project_rows", label, e))?
+                    .value
+                    .reshape(&[1, output_q, output_w])
+                    .map_err(|e| qualification_dynamic("project_rows", label, e))?,
+            ),
+            _ => {
+                return Err(qualification_dynamic(
+                    "project_rows",
+                    label,
+                    "grouped output kernels disagree with the binding",
+                ));
+            }
+        };
+        let gated = products.as_ref().unwrap_or(gated);
         let result = match (&kernels.output, binding.tail) {
             (SublayerOutput::Residual(output_kernel), SublayerTail::Residual) => {
                 output_kernel
@@ -333,7 +449,7 @@ pub(super) fn qualify_attention(
             }
             (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
                 let source = gated
-                    .reshape(&[1, heads * width])
+                    .reshape(&[1, output_q * output_w])
                     .map_err(|e| qualification_dynamic("project_rows", label, e))?;
                 qualify_post_norm(device, tail, &residual, &source, &output, norm, label)?
             }

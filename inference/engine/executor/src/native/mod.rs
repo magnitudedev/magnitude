@@ -28,6 +28,7 @@ use glue::GlueKernels;
 use head::HeadKernels;
 pub(crate) use import::ImportKernels;
 use preparation::NativePreparationCache;
+pub(crate) use specialization::entry_statics;
 pub(crate) use preparation::kernel_requests;
 pub(crate) use qualification::admit_site;
 use qualification::QualificationView;
@@ -35,13 +36,13 @@ pub use readout::ProjectionKernels;
 use shared_head::SharedHeadKernels;
 use target::TargetKernels;
 pub(crate) use target::{
-    AttentionHistoryKernels, AttentionKernels, BankCombine, BankMoves, BankRouteForm, BankRouteKernels, DevicePlacement,
+    AttentionHistoryKernels, AttentionKernels, BankCombine, DenseDecodeKernels, BankMoves, BankRouteForm, BankRouteKernels, DevicePlacement,
     BankSite, SiteAdmission, SiteForm,
     DenseExpansionKernel, DenseKernels, ExpertBankKernels, ExpertKernels, LEADS,
     GeneralRoutedKernels, NGramKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,
     PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
     RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
-    SelectedPrefillKernel, SelectionKernels,
+    LowRankQueryKernels, SelectedPrefillKernel, SelectionKernels,
     ShortConvKernels, StateSpaceKernels, StreamsEntryKernels, StreamsKernels,
     SublayerOutput, TableConversion,
     TapKernels,
@@ -78,7 +79,7 @@ use magnitude_kernels::{
     routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows, shape_rows,
     short_conv_project, short_conv_rows, state_space_chunk, state_space_gate, state_space_step,
     vision_attention, vision_clamp, vision_gated_convolution, vision_linear, vision_norm,
-    vision_patch_stem, vision_pool, vision_position,
+    vision_patch_stem, vision_pool, vision_position, widen_rows,
 };
 use seismic::{BackendName, DType, Device, Element, NativeKernel, Tensor};
 use std::{collections::HashMap, fmt};

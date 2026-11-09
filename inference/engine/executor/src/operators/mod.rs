@@ -770,6 +770,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     // text rows are normalized at entry normalizes its media rows in its
     // projector (Muse's `perception_emb_norm`).
     attention::admit_media(decoder, definition.vision.is_some())?;
+    attention::admit_shared(decoder)?;
     // The final norm, or the exit site's (the contract pairs each with its
     // residual form).
     let exit = match &decoder.exit.norm {

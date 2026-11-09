@@ -99,6 +99,7 @@ fn indexer_select_complete<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
     attention::prepare_head::<seismic::cpu::F32>(
         mean,
         Some(cx.arg_key_norm().row([0, 0])),
+        attention::Layout::HALF_SPLIT_LEADING,
         cosines,
         sines,
         cx.arg_epsilon(),
@@ -134,6 +135,7 @@ fn indexer_select_select<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
         attention::prepare_head::<seismic::cpu::F32>(
             key,
             Some(norm),
+            attention::Layout::HALF_SPLIT_LEADING,
             cosines,
             sines,
             cx.arg_epsilon(),

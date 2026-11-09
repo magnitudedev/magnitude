@@ -395,6 +395,21 @@ fn block_slots(device: &Device, keys: usize) -> Tensor {
     Tensor::from_host(device, Element::i32(), &[0, keys as u64], &[]).unwrap()
 }
 
+/// The mix entries' `form` (`RA`, `RT`, `RO`, `VK`), carried by the extents
+/// of an empty table: half-split pairs over the leading columns, no output
+/// rotary, values of their own.
+#[allow(dead_code)]
+fn half_split_layout(device: &Device) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0, 0], &[]).unwrap()
+}
+
+/// The appends' `form` (`RA`, `RT`, `VK`): half-split leading, values of
+/// their own.
+#[allow(dead_code)]
+fn half_split_append_layout(device: &Device) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, 0, 0, 0], &[]).unwrap()
+}
+
 fn statics(geometry: Geometry) -> NativeSpecialization {
     NativeSpecialization::new()
         .with_static("KV", geometry.kv as u64)
@@ -405,14 +420,20 @@ fn statics(geometry: Geometry) -> NativeSpecialization {
 
 /// The `attention_*` family's statics of Qwen's form (attention.seismic):
 /// gates interleaved after each query head (I = W), no separate gate, one
-/// fresh layer, q/k norms, no value norm.
+/// fresh layer, q/k norms, no value norm, half-split leading rotary pairs,
+/// no output rotary and values of its own.
 fn qwen_form(specialization: NativeSpecialization, geometry: Geometry) -> NativeSpecialization {
     specialization
         .with_static("I", geometry.w() as u64)
         .with_static("U", 0)
         .with_static("F", 1)
+        .with_static("NQ", 1)
         .with_static("N", 1)
         .with_static("NV", 0)
+        .with_static("RA", 0)
+        .with_static("RT", 0)
+        .with_static("RO", 0)
+        .with_static("VK", 0)
 }
 
 /// The declared decode `SLICES` (query-group splits across simdgroups, warps

@@ -174,6 +174,7 @@ pub(crate) fn per_layer_entry<'a, G: GraphDraft + 'a>(
             entries.project,
             &[
                 ("M", rows),
+                ("G", 1),
                 ("K", binding.hidden),
                 ("N", channels),
                 ("WS", scale_extent),

@@ -111,6 +111,7 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
             entries.project,
             &[
                 ("M", out),
+                ("G", 1),
                 ("K", inputs),
                 ("N", outputs),
                 ("WS", weight_scale.extent),

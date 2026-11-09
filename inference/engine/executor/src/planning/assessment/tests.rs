@@ -757,14 +757,21 @@ fn target_reading_head_fixture() -> (ModelDefinition, magnitude_artifacts::Packa
         sublayer.input = InputNorm::Rms(rms(&format!("input_norm_{index}"), WIDTH));
         match &mut sublayer.op {
             Operator::Attention(attention) => {
-                let [rows, _] = attention.query.shape[..] else {
+                let (
+                    magnitude_family_contracts::QueryProjection::Full(query),
+                    magnitude_family_contracts::OutputProjection::Full(output),
+                ) = (&mut attention.query, &mut attention.output)
+                else {
                     unreachable!()
                 };
-                attention.query = descriptor("query", &[rows, WIDTH]);
-                let [_, columns] = attention.output.shape[..] else {
+                let [rows, _] = query.shape[..] else {
                     unreachable!()
                 };
-                attention.output = descriptor("attention_output", &[WIDTH, columns]);
+                *query = descriptor("query", &[rows, WIDTH]);
+                let [_, columns] = output.shape[..] else {
+                    unreachable!()
+                };
+                *output = descriptor("attention_output", &[WIDTH, columns]);
                 if let HeadNorm::Rms(norm) = &mut attention.query_norm {
                     norm.weight = descriptor("query_norm", &norm.weight.shape);
                 }

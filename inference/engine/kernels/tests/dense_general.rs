@@ -850,7 +850,7 @@ fn native_project_rows_matches_host_reference() {
                         },
                     }),
                     |device: &seismic::Device, mapping: &Mapping| {
-                        project_rows_specialization(device, &[("K", k), ("N", n)], mapping)
+                        project_rows_specialization(device, &[("G", 1), ("K", k), ("N", n)], mapping)
                             .with_static("WS", extent as u64)
                     },
                 );

@@ -3,8 +3,10 @@
 #define ATTENTION_U SEISMIC_DIM_U
 #define ATTENTION_FRESH (SEISMIC_DIM_F != 0)
 #define ATTENTION_NORM (SEISMIC_DIM_N != 0)
+#define ATTENTION_QUERY_NORM (SEISMIC_DIM_NQ != 0)
 #define ATTENTION_VALUE_NORM (SEISMIC_DIM_NV != 0)
 #define ATTENTION_SINKS (SEISMIC_DIM_SK != 0)
+#define ATTENTION_STORED_KEY (SEISMIC_DIM_VK != 0)
 #include "lib/attention/attention.h"
 
 // Keys each simdgroup loads before scoring them, so their loads are in flight
@@ -70,14 +72,14 @@ kernel void attention_decode_partial(
     device const int *row_coordinates = coordinates + row * 4;
 
     // Partition 0 appends the rows' keys and values, a simdgroup per (row,
-    // key or value).
+    // key or value); stored-key values are the key plane.
     if (ATTENTION_FRESH && partition == 0) {
         for (uint item = simd; item < 2 * TOKENS; item += SIMDS) {
             const ulong appended = row0 + item / 2;
             if (appended >= SEISMIC_DIM_M)
                 break;
             const int destination = destinations[appended];
-            if (destination < 0)
+            if (destination < 0 || (ATTENTION_STORED_KEY && item % 2 != 0))
                 continue;
             const ulong source = (appended * KV + kv_head) * W;
             float x[E];
@@ -94,8 +96,8 @@ kernel void attention_decode_partial(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
 #if SEISMIC_TUNE_MATRIX
-    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS>(attention::dense_history{history_key, history_value,
-        ulong(SEISMIC_PARAM_SLAB_ROWS)}, query, key, value, query_norm, key_norm, value_norm, rotary_components,
+    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS>(attention::dense_history{history_key,
+        attention::values_plane(history_key, history_value), ulong(SEISMIC_PARAM_SLAB_ROWS)}, query, key, value, query_norm, key_norm, value_norm, rotary_components,
         rotary_frequencies, rotary_amplitudes, coordinates, visible, fresh, partials, statistics,
         reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon, scale * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN,
         kv_head, partition, group.z, thread_index, simd, lane);
@@ -118,7 +120,7 @@ kernel void attention_decode_partial(
     threadgroup attention::Scalar *prepared = reinterpret_cast<threadgroup attention::Scalar *>(columns);
     for (uint g = simd; g < G; g += SIMDS) {
         float x[E];
-        attention::head_rotary<ATTENTION_NORM>(query + (row * KV * G + kv_head * G + g) * ATTENTION_QUERY_STRIDE,
+        attention::head_rotary<ATTENTION_QUERY_NORM>(query + (row * KV * G + kv_head * G + g) * ATTENTION_QUERY_STRIDE,
             query_norm, row_coordinates, rotary_components, rotary_frequencies, rotary_amplitudes, epsilon,
             lane, x);
         ATTENTION_UNROLL
@@ -171,7 +173,7 @@ kernel void attention_decode_partial(
                 const ulong at = ((token - slab_index * slab_rows) * KV + kv_head) * W + lane * E;
                 device const attention::Scalar *key_rows = slab::region<attention::Scalar>(history_key, slab_index) + at;
                 device const attention::Scalar *value_rows =
-                    slab::region<attention::Scalar>(history_value, slab_index) + at;
+                    slab::region<attention::Scalar>(attention::values_plane(history_key, history_value), slab_index) + at;
                 uint t = 0;
                 for (; position + DECODE_BATCH <= part_end; position += DECODE_BATCH, t += DECODE_BATCH) {
                     float k[DECODE_BATCH][E];
@@ -199,11 +201,13 @@ kernel void attention_decode_partial(
             const ulong at = (token * KV + kv_head) * W;
             attention::head_rotary<ATTENTION_NORM>(key + at, key_norm, coordinates + token * 4,
                 rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, k[0]);
-            attention::head_norm<ATTENTION_VALUE_NORM>(value + at, value_norm, epsilon, lane, v[0]);
+            if (!ATTENTION_STORED_KEY)
+                attention::head_norm<ATTENTION_VALUE_NORM>(value + at, value_norm, epsilon, lane, v[0]);
             ATTENTION_UNROLL
             for (uint i = 0; i < E; ++i) {
                 k[0][i] = element::Act::round(k[0][i]);
-                v[0][i] = element::Act::round(v[0][i]);
+                // A stored-key value is the prepared key.
+                v[0][i] = ATTENTION_STORED_KEY ? k[0][i] : element::Act::round(v[0][i]);
             }
             attention::absorb_heads<H, 1>(q, k, v, maximum, denominator, output, lane);
         }
@@ -236,4 +240,21 @@ kernel void attention_decode_merge(
     attention::decode_output<SEISMIC_TUNE_SPAN, SEISMIC_TUNE_PARTS, SEISMIC_TUNE_TOKENS>(query, gate, visible, fresh, result,
         partials, statistics, weights, SEISMIC_DIM_R, SEISMIC_DIM_M, group.x, group.y, group.z * 32 + lane, lane,
         SEISMIC_PARAM_GATE_FUNCTION != 0, sinks);
+}
+
+// The output rotary (RO = 1, `attention::output_rotary`): threadgroup (row,
+// query head), one thread per rotary pair, after every output is stored.
+kernel void attention_decode_rotate(
+    device const int *rotary_components [[buffer(SEISMIC_BUFFER_ROTARY_COMPONENTS)]],
+    device const float *rotary_frequencies [[buffer(SEISMIC_BUFFER_ROTARY_FREQUENCIES)]],
+    device const float *rotary_amplitudes [[buffer(SEISMIC_BUFFER_ROTARY_AMPLITUDES)]],
+    device const int *coordinates [[buffer(SEISMIC_BUFFER_COORDINATES)]],
+    device attention::Scalar *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint pair [[thread_index_in_threadgroup]]) {
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    attention::output_rotary(result, coordinates, rotary_components, rotary_frequencies, rotary_amplitudes,
+        group.x, group.y, pair);
 }

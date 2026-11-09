@@ -167,11 +167,11 @@ native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
 
 # `attention_output`'s bands (GEMV to 16 rows reading the rows in place, the
 # INT8 candidate on either matrix band, split-K to 128 rows) with a store
-# epilogue in Y.
+# epilogue in Y. One group only: a grouped weight is outside its domain.
 native project_rows for cuda from "cuda/project_rows.cu":
-    static (K, N, WS)
+    static (G, K, N, WS)
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
-    where K % 64 == 0 and WS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(W, INT8) == 1)
+    where G == 1 and K % 64 == 0 and WS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(W, INT8) == 1)
     scratch staged bytes (M * K * max(1 + OPERAND, 2 * operands(W))) when (M > 1 and operands(W) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * K / 4) when INT8 == 1 and M > 16
     scratch partials bytes (2 * M * N * 4) when M > 16 and M <= 128

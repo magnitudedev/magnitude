@@ -18,7 +18,7 @@
 // backend is qualified under.
 
 use super::super::core::{activation, reduce};
-use seismic::cpu::{math, Dense, F16};
+use seismic::cpu::{math, slab::SlabTensor, Dense, F16};
 use std::ops::Range;
 
 /// Keys scored together before their values are absorbed.
@@ -68,33 +68,95 @@ pub fn angles(coordinates: &[i32], components: &[i32], frequencies: &[f32], cosi
     }
 }
 
+/// Which two columns of a head row each rotary pair turns (the portable
+/// `rotate_pairs`): pair p turns (p, p + P) or, with `adjacent` (RA = 1),
+/// (2p, 2p + 1), within the leading 2P columns or, with `trailing` (RT = 1),
+/// the trailing ones.
+#[derive(Clone, Copy, Debug)]
+pub struct Layout {
+    pub adjacent: bool,
+    pub trailing: bool,
+}
+
+impl Layout {
+    /// Pairs (p, p + P) over the leading 2P columns.
+    pub const HALF_SPLIT_LEADING: Self = Self { adjacent: false, trailing: false };
+
+    pub fn new(ra: u64, rt: u64) -> Self {
+        Self { adjacent: ra == 1, trailing: rt == 1 }
+    }
+
+    /// The (lo, hi) columns of pair `pair` of `p` in a row of `w` columns.
+    #[inline(always)]
+    pub fn columns(self, pair: usize, p: usize, w: usize) -> (usize, usize) {
+        let first = if self.trailing { w - 2 * p } else { 0 };
+        if self.adjacent {
+            (first + 2 * pair, first + 2 * pair + 1)
+        } else {
+            (first + pair, first + pair + p)
+        }
+    }
+}
+
 /// The structure of an `attention_*` entry (see `attention.seismic`): its
 /// heads, I output gates interleaved after each query head's W columns (0 or
 /// W), U separate gates per query head (0, 1 or W), whether the layer has
-/// fresh keys and values of its own (F = 1), and whether queries and keys
-/// (N = 1) and values (NV = 1) are RMS-normalized. The declarations' `where`
-/// admits only these forms.
+/// fresh keys and values of its own (F = 1), whether queries (NQ = 1), keys
+/// (N = 1) and values (NV = 1) are RMS-normalized, the rotary pairs' layout
+/// (RA, RT), whether attended rows are turned back by the output rotary
+/// (RO = 1), and whether values are the stored keys (VK = 1: the fresh value
+/// is the prepared key, history values are read from the key plane, and no
+/// value is taken, normalized or stored). The declarations' `where` admits
+/// only these forms.
 #[derive(Clone, Copy, Debug)]
 pub struct Form {
     pub heads: Heads,
     pub interleaved: usize,
     pub separate: usize,
     pub fresh: bool,
-    pub norm: bool,
+    pub query_norm: bool,
+    pub key_norm: bool,
     pub value_norm: bool,
+    pub layout: Layout,
+    pub output_rotary: bool,
+    pub stored_key: bool,
 }
 
 impl Form {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(kv: u64, g: u64, p: u64, s: u64, i: u64, u: u64, f: u64, n: u64, nv: u64) -> Self {
+    pub fn new(
+        kv: u64,
+        g: u64,
+        p: u64,
+        s: u64,
+        i: u64,
+        u: u64,
+        f: u64,
+        nq: u64,
+        n: u64,
+        nv: u64,
+        layout: Layout,
+        ro: u64,
+        vk: u64,
+    ) -> Self {
         Self {
             heads: Heads::new(kv, g, p, s),
             interleaved: i as usize,
             separate: u as usize,
             fresh: f == 1,
-            norm: n == 1,
+            query_norm: nq == 1,
+            key_norm: n == 1,
             value_norm: nv == 1,
+            layout,
+            output_rotary: ro == 1,
+            stored_key: vk == 1,
         }
+    }
+
+    /// Whether the row takes a value of its own: a fresh layer whose values
+    /// are not its stored keys.
+    pub fn own_values(self) -> bool {
+        self.fresh && !self.stored_key
     }
 
     /// The form over affine K8/V4 history ([`Heads::affine`]).
@@ -120,11 +182,12 @@ pub fn scaled_angles(
 }
 
 /// The portable `head_rotary` of one head row `x`, published to `A`:
-/// RMS-normalized in F32 with `norm` when present, its first 2P columns
+/// RMS-normalized in F32 with `norm` when present, its pairs (in `layout`)
 /// rotated by the row's (amplitude-scaled) `cosines` and `sines`.
 pub fn prepare_head<A: Dense>(
     x: &[A::Storage],
     norm: Option<&[f32]>,
+    layout: Layout,
     cosines: &[f32],
     sines: &[f32],
     epsilon: f32,
@@ -140,20 +203,56 @@ pub fn prepare_head<A: Dense>(
         }
     }
     for pair in 0..p {
-        let (low, high) = (out[pair], out[pair + p]);
+        let (lo, hi) = layout.columns(pair, p, w);
+        let (low, high) = (out[lo], out[hi]);
         let (cosine, sine) = (cosines[pair], sines[pair]);
-        out[pair] = low * cosine - high * sine;
-        out[pair + p] = high * cosine + low * sine;
+        out[lo] = low * cosine - high * sine;
+        out[hi] = high * cosine + low * sine;
     }
     for value in out.iter_mut() {
         *value = activation::publish::<A>(*value);
     }
 }
 
+/// The row's amplitude-scaled (cosines, sines) for its output rotary, in
+/// `angles` (2P floats), when `form` turns its outputs back (RO = 1); none
+/// otherwise (`angles` is then empty).
+pub fn output_angles<'a>(
+    form: Form,
+    coordinates: &[i32],
+    components: &[i32],
+    frequencies: &[f32],
+    amplitudes: &[f32],
+    angles: &'a mut [f32],
+) -> Option<(&'a [f32], &'a [f32])> {
+    if !form.output_rotary {
+        return None;
+    }
+    let (cosines, sines) = angles.split_at_mut(form.heads.p);
+    scaled_angles(coordinates, components, frequencies, amplitudes, cosines, sines);
+    Some((cosines, sines))
+}
+
+/// The portable `output_rotary` of one query head's published output `out`
+/// (RO = 1, ungated, so the published attended row): its pairs (in
+/// `layout`) turned back by the row's negated angles, the amplitude-scaled
+/// `cosines` and `sines` of [`scaled_angles`], in F32 and published again.
+pub fn output_rotary<A: Dense>(out: &mut [A::Storage], layout: Layout, cosines: &[f32], sines: &[f32]) {
+    let (w, p) = (out.len(), cosines.len());
+    for pair in 0..p {
+        let (lo, hi) = layout.columns(pair, p, w);
+        let (low, high) = (A::widen(out[lo]), A::widen(out[hi]));
+        let (cosine, sine) = (cosines[pair], -sines[pair]);
+        out[lo] = A::narrow(low * cosine - high * sine);
+        out[hi] = A::narrow(high * cosine + low * sine);
+    }
+}
+
 /// Prepares one row of an `attention_*` entry: its KV * G queries (the first
 /// W columns of each `query(head)`) into `queries`, and when the layer has
 /// fresh rows its KV keys into `keys` and its KV values (`head_norm`ed with
-/// `value_norm` when present) into `values`, all F32 values of the activation
+/// `value_norm` when present, or the prepared keys for stored-key values,
+/// whose `value` is empty) into `values`, all F32 values of the activation
 /// element.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_form_row<'q, A: Dense>(
@@ -174,14 +273,46 @@ pub fn prepare_form_row<'q, A: Dense>(
     let w = form.heads.w;
     let (query_norm, key_norm, value_norm) = norms;
     for head in 0..form.heads.queries() {
-        prepare_head::<A>(&query(head)[..w], query_norm, cosines, sines, epsilon, &mut queries[head * w..][..w]);
+        prepare_head::<A>(&query(head)[..w], query_norm, form.layout, cosines, sines, epsilon, &mut queries[head * w..][..w]);
     }
     if !form.fresh {
         return;
     }
     for head in 0..form.heads.kv {
-        prepare_head::<A>(&key[head * w..][..w], key_norm, cosines, sines, epsilon, &mut keys[head * w..][..w]);
-        prepare_head::<A>(&value[head * w..][..w], value_norm, &[], &[], epsilon, &mut values[head * w..][..w]);
+        prepare_head::<A>(&key[head * w..][..w], key_norm, form.layout, cosines, sines, epsilon, &mut keys[head * w..][..w]);
+    }
+    if form.stored_key {
+        values[..form.heads.kv * w].copy_from_slice(&keys[..form.heads.kv * w]);
+        return;
+    }
+    for head in 0..form.heads.kv {
+        prepare_head::<A>(&value[head * w..][..w], value_norm, form.layout, &[], &[], epsilon, &mut values[head * w..][..w]);
+    }
+}
+
+/// Appends one row's prepared keys and values ([`prepare_form_row`]) at
+/// dense history row `destination`: the key plane alone for stored-key
+/// values, whose value plane has no rows.
+///
+/// # Safety
+/// `destination` is a freshly reserved row no other work item of the call
+/// reads or writes.
+pub unsafe fn store_dense_row<A: Dense>(
+    form: Form,
+    keys: &[f32],
+    values: &[f32],
+    history_key: &SlabTensor<'_, A, 3>,
+    history_value: &SlabTensor<'_, A, 3>,
+    destination: usize,
+) {
+    let w = form.heads.w;
+    for head in 0..form.heads.kv {
+        // SAFETY: the caller's.
+        activation::store::<A>(&keys[head * w..][..w], unsafe { history_key.row_mut([destination, head, 0]) });
+        if !form.stored_key {
+            // SAFETY: the caller's.
+            activation::store::<A>(&values[head * w..][..w], unsafe { history_value.row_mut([destination, head, 0]) });
+        }
     }
 }
 
