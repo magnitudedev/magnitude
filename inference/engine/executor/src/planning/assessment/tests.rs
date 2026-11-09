@@ -472,6 +472,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
     };
     let silu = |gate, up| FeedForwardUp::Gated {
         activation: ActivationFunction::Silu,
+        limit: None,
         gate,
         up,
     };
@@ -484,6 +485,7 @@ fn checked_head_family_includes_chained_and_shaped_classes() {
             input: RouterInput::Operator,
             score: ScoreFunction::Softmax,
             selection: ExpertSelection::TopK { bias: None },
+            media_bias: None,
             normalization: RouteNormalization::Sum,
             scale: 1.0,
         },

@@ -5,6 +5,7 @@
 // expands against row m: the `glu` of gs * gate and us * up, the scales the
 // choice's expert's, 1 where a port is absent.
 
+use lib::core::functions;
 use lib::projection::projection;
 use lib::routed::routed;
 
@@ -63,6 +64,7 @@ fn routed_gate_up_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [
         &staged[row * h..(row + 1) * h],
         q8,
         cx.arg_activation(),
+        functions::glu_limit(cx.dim_lb()),
         (
             routed::scale_factor(cx.dim_gs(), |e| gate_scale.get([e]), expert),
             routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert),

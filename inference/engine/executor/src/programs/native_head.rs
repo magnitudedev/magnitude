@@ -954,6 +954,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                                 ("US", up.operands.scale.extent),
                                 ("GB", gate.operands.bound.extent),
                                 ("UB", up.operands.bound.extent),
+                                ("LB", magnitude_family_contracts::GluLimit::word(dense_operator.up.limit())),
                             ],
                         ]
                         .concat(),
@@ -971,6 +972,11 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                             up_scale: (&up.operands.scale.tensor).into(),
                             gate_bound: (&gate.operands.bound.tensor).into(),
                             up_bound: (&up.operands.bound.tensor).into(),
+                            glu_limit: (&operators::glu_limit(
+                                dense_rows.port().tensor(),
+                                dense_operator.up.limit(),
+                            ))
+                                .into(),
                         },
                     )?
                     .value;

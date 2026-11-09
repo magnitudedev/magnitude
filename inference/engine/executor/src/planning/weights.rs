@@ -759,6 +759,8 @@ pub struct DenseBinding {
     pub activation: Element,
     /// The semantic activation code of the expansion (functions.seismic).
     pub function: i32,
+    /// The expansion's `glu` clamp.
+    pub limit: Option<magnitude_family_contracts::GluLimit>,
     pub tail: SublayerTail,
     pub scales: DenseScales,
 }
@@ -800,6 +802,8 @@ pub struct DenseBranchBinding {
     pub down: Element,
     pub activation: Element,
     pub function: i32,
+    /// The expansion's `glu` clamp.
+    pub limit: Option<magnitude_family_contracts::GluLimit>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

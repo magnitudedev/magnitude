@@ -189,6 +189,7 @@ pub fn inspect_components(
             intermediate,
             up: FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
+                limit: None,
                 gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
                 up: weight("ffn_up.weight", &[intermediate, hidden])?,
             },

@@ -12,6 +12,11 @@
 // The block's expert's gate and up accumulators carry its `gate_scale` /
 // `up_scale` entries where those ports are present (static GS, US); the
 // down epilogue's scale stays one.
+// The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
+// clamps at.
+#if SEISMIC_STATIC_LB != 0
+#define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
+#endif
 #if SEISMIC_STATIC_GS + SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
 #endif

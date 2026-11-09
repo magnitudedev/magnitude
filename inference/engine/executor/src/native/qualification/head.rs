@@ -144,6 +144,7 @@ impl<'a> QualificationView<'a> {
                                 "dense_expand",
                                 &label,
                             )?,
+                            glu_limit: &glu_limit(device, binding.limit, "dense_expand", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                         .value;

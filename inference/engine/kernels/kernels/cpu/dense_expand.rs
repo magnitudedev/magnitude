@@ -56,7 +56,7 @@ fn dense_expand_rows<L: Isa, E: Elements>(
     let rows = projection::item_rows(group[0], cx.param_rows(), f);
     let (gate_weight, up_weight, result) =
         (cx.arg_gate_weight(), cx.arg_up_weight(), cx.result_0());
-    let function = cx.arg_activation();
+    let (function, limit) = (cx.arg_activation(), functions::glu_limit(cx.dim_lb()));
     let gate_scale = if cx.dim_gs() == 0 { 1.0 } else { cx.arg_gate_scale().get([0]) };
     let up_scale = if cx.dim_us() == 0 { 1.0 } else { cx.arg_up_scale().get([0]) };
     // SAFETY: the normalize launch wrote every row before this launch.
@@ -75,8 +75,23 @@ fn dense_expand_rows<L: Isa, E: Elements>(
         |row, gate, up| {
             // SAFETY: each work item writes its own columns of every row.
             let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
-            for ((target, gate), up) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
-                *target = E::A::narrow(functions::glu::<E::A>(function, gate_scale * *gate, up_scale * *up));
+            let pairs = out.iter_mut().zip(gate.iter()).zip(up.iter());
+            match limit {
+                None => {
+                    for ((target, gate), up) in pairs {
+                        *target = E::A::narrow(functions::glu::<E::A>(function, gate_scale * *gate, up_scale * *up));
+                    }
+                }
+                Some(limit) => {
+                    for ((target, gate), up) in pairs {
+                        *target = E::A::narrow(functions::clamped_glu::<E::A>(
+                            function,
+                            limit,
+                            gate_scale * *gate,
+                            up_scale * *up,
+                        ));
+                    }
+                }
             }
         },
     );

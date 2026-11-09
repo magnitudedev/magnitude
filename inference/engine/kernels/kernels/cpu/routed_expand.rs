@@ -103,6 +103,7 @@ fn routed_expand_rows<L: Isa, E: Elements>(
             x,
             q8,
             functions::SILU,
+            None,
             (
                 routed::scale_factor(cx.dim_gs(), |e| gate_scale.get([e]), expert),
                 routed::scale_factor(cx.dim_us(), |e| up_scale.get([e]), expert),
@@ -128,6 +129,7 @@ fn routed_expand_rows<L: Isa, E: Elements>(
             &staged[row * h..(row + 1) * h],
             q8,
             functions::SILU,
+            None,
             // The shared expert binds no per-expert scale.
             (1.0, 1.0),
             out,

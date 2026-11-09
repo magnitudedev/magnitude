@@ -84,6 +84,7 @@ pub(crate) fn fixture_definition_of(hidden: u64) -> ModelDefinition {
         intermediate: FEATURES,
         up: FeedForwardUp::Gated {
             activation: ActivationFunction::Silu,
+            limit: None,
             gate: descriptor("gate", &[FEATURES, hidden]),
             up: descriptor("up", &[FEATURES, hidden]),
         },
@@ -481,11 +482,13 @@ pub fn sinkhorn_fixture_definition(blocks: u64) -> ModelDefinition {
                     input: RouterInput::Operator,
                     score: ScoreFunction::Softmax,
                     selection: ExpertSelection::TopK { bias: None },
+                    media_bias: None,
                     normalization: RouteNormalization::Sum,
                     scale: 1.0,
                 },
                 expert_up: FeedForwardUp::Gated {
                     activation: ActivationFunction::Silu,
+                    limit: None,
                     gate: descriptor(&name("ffn_gate_exps"), &[EXPERTS, FEATURES, hidden]),
                     up: descriptor(&name("ffn_up_exps"), &[EXPERTS, FEATURES, hidden]),
                 },
@@ -539,6 +542,7 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
     };
     let silu = |gate: WeightDescriptor, up: WeightDescriptor| FeedForwardUp::Gated {
         activation: ActivationFunction::Silu,
+        limit: None,
         gate,
         up,
     };
@@ -558,6 +562,7 @@ pub fn qwen4exp_fixture_definition_of(attention_blocks: u64, experts: u64) -> Mo
                 input: RouterInput::Operator,
                 score: ScoreFunction::Softmax,
                 selection: ExpertSelection::TopK { bias: None },
+                media_bias: None,
                 normalization: RouteNormalization::Sum,
                 scale: 1.0,
             },
@@ -787,11 +792,13 @@ pub fn routed_fixture_definition(shape: RoutedShape) -> ModelDefinition {
                 input: RouterInput::Operator,
                 score: ScoreFunction::Softmax,
                 selection: ExpertSelection::TopK { bias: None },
+                media_bias: None,
                 normalization: RouteNormalization::Sum,
                 scale: 1.0,
             },
             expert_up: FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
+                limit: None,
                 gate: descriptor(&name("ffn_gate_exps"), &[experts, intermediate, hidden]),
                 up: descriptor(&name("ffn_up_exps"), &[experts, intermediate, hidden]),
             },

@@ -1030,6 +1030,7 @@ mod tests {
             ("F", FEATURES),
             ("GS", 0),
             ("US", 0),
+            ("LB", 0),
             ("SN", 1),
             ("IN", 0),
         ];
@@ -1145,7 +1146,7 @@ mod tests {
                 expert_hidden: HIDDEN,
                 latent: false,
                 // ReLU², up-only.
-                experts_expansion: Expansion { gated: false, activation: 2 },
+                experts_expansion: Expansion { gated: false, activation: 2, limit: None },
                 shared: None,
                 score: 1,
                 normalization: 1,
@@ -1228,7 +1229,11 @@ mod tests {
         });
         let mut kernels = bank_kernels(&device, bank, BankRouteKernels::General(selects));
         if sited {
-            let form = SiteForm { activation: bf16, function: binding.shape.experts_expansion.activation };
+            let form = SiteForm {
+                activation: bf16,
+                function: binding.shape.experts_expansion.activation,
+                limit: binding.shape.experts_expansion.limit,
+            };
             kernels.site = Some(BankSite {
                 request: routed_site_request::native_for_device_with(
                     &device,

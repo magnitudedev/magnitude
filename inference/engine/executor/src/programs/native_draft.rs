@@ -1432,7 +1432,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             &mixed,
             rows,
             epsilon,
-            operators::dense_ffn::activation_code(dense.up.activation()),
+            operators::routed::Expansion::of(&dense.up),
             0.0,
             1.0,
         )?;

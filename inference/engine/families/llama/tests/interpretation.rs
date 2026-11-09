@@ -118,6 +118,7 @@ fn every_minicpm5_variant_binds_the_admitted_feature_set() {
             ffn.up,
             FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
+                limit: None,
                 ..
             }
         ));

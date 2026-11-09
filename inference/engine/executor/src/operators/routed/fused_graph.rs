@@ -719,6 +719,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             ("F", shape.intermediate),
                             ("GS", gate_scale.extent),
                             ("US", up_scale.extent),
+                            ("LB", magnitude_family_contracts::GluLimit::word(None)),
                             reads.dimensions()[0],
                             reads.dimensions()[1],
                         ],
@@ -733,6 +734,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             activation: super::FUSED_ACTIVATION,
                             gate_scale: (&gate_scale.tensor).into(),
                             up_scale: (&up_scale.tensor).into(),
+                            // The fused form's experts are unclamped (`is_fused`).
+                            glu_limit: (&crate::operators::glu_limit(routes.tensor(), None)).into(),
                         },
                     )?
                     .value;
@@ -942,6 +945,7 @@ fn expand<'a, G: GraphDraft + 'a>(
         ("T", TILE_ROWS),
         ("GS", gate_scale.extent),
         ("US", up_scale.extent),
+        ("LB", magnitude_family_contracts::GluLimit::word(None)),
         ("X", reads.mapped),
         ("QS", reads.step_words()),
         ("R", reads.count),
@@ -968,6 +972,8 @@ fn expand<'a, G: GraphDraft + 'a>(
                 activation: super::FUSED_ACTIVATION,
                 gate_scale: (&gate_scale.tensor).into(),
                 up_scale: (&up_scale.tensor).into(),
+                // The fused form's experts are unclamped (`is_fused`).
+                glu_limit: (&crate::operators::glu_limit(first, None)).into(),
             },
         )?
         .value)

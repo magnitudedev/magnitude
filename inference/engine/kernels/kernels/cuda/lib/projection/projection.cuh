@@ -281,15 +281,29 @@ template <class E> struct SiluMul {
     }
 };
 
-// Activation-generic GLU (paired), `function` a `functions::` code (SiLU
-// gives SiluMul's bits):
+// Activation-generic GLU (paired), `glu` (functions.seismic), `function` a
+// `functions::` code (SiLU gives SiluMul's bits):
 // out[m, n] = round(round_A(act(round_A(gate))) * round_A(up)).
+// An entry that defines PROJECTION_GLU_LIMIT (its static LB, nonzero: the F32
+// bits of its expansion's limit L) compiles in the clamp: the rounded gate
+// to (-inf, L] and up to [-L, L], each written `x > L ? L : x` so a NaN stays
+// NaN. Any other entry compiles none.
 template <class E, class Publication = E> struct Glu {
     u8 *out;
     u64 stride;
     int function;
     __device__ __forceinline__ float value(float gate, float up) const {
+#if defined(PROJECTION_GLU_LIMIT)
+        const float limit = __uint_as_float(PROJECTION_GLU_LIMIT);
+        gate = Act::round(gate);
+        up = Act::round(up);
+        gate = gate > limit ? limit : gate;
+        up = up > limit ? limit : up;
+        up = up < -limit ? -limit : up;
+        const float product = Act::round(functions::activate(function, gate)) * up;
+#else
         const float product = Act::round(functions::activate(function, Act::round(gate))) * Act::round(up);
+#endif
         if constexpr (Same<E, Publication>::value)
             return product;
         else

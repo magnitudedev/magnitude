@@ -180,12 +180,13 @@ pub enum BankCombine {
 }
 
 /// What the CPU site's pool computes a layer's choices in: the element its
-/// gate/up products are published in (`A`) and its expansion's function
-/// (the decode entries' `activation`).
+/// gate/up products are published in (`A`), its expansion's function (the
+/// decode entries' `activation`) and clamp (their LB).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SiteForm {
     pub activation: seismic::Element,
     pub function: i32,
+    pub limit: Option<magnitude_family_contracts::GluLimit>,
 }
 
 impl SiteForm {
@@ -193,11 +194,18 @@ impl SiteForm {
     pub(crate) fn of(slot: crate::planning::BankedFeedForward) -> Self {
         use crate::planning::BankedFeedForward;
         match slot {
-            BankedFeedForward::Routed(binding) => Self { activation: binding.activation, function: crate::operators::routed::FUSED_ACTIVATION },
+            BankedFeedForward::Routed(binding) => Self {
+                activation: binding.activation,
+                function: crate::operators::routed::FUSED_ACTIVATION,
+                // The fused form's experts are unclamped (`is_fused`).
+                limit: None,
+            },
             BankedFeedForward::GeneralRouted(binding)
-            | BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => {
-                Self { activation: binding.activation, function: binding.shape.experts_expansion.activation }
-            }
+            | BankedFeedForward::Parallel(crate::ParallelBinding { routed: binding, .. }) => Self {
+                activation: binding.activation,
+                function: binding.shape.experts_expansion.activation,
+                limit: binding.shape.experts_expansion.limit,
+            },
         }
     }
 }

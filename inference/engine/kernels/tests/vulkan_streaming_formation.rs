@@ -43,7 +43,7 @@ fn vulkan_streaming_forms() {
         requests.push(request(
             "routed_gate_up",
             &[("A", b), ("EGW", weight), ("EUW", weight)],
-            &decode.iter().copied().chain([("GS", 0), ("US", 0)]).collect::<Vec<_>>(),
+            &decode.iter().copied().chain([("GS", 0), ("US", 0), ("LB", 0)]).collect::<Vec<_>>(),
         ));
         requests.push(request(
             "routed_up",

@@ -3,6 +3,11 @@
 // small and large matrix row bands share the same operand eligibility.
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
+// The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
+// clamps at.
+#if SEISMIC_STATIC_LB != 0
+#define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
+#endif
 #include "lib/projection/projection.cuh"
 
 using Raw = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;

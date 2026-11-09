@@ -309,7 +309,8 @@ pub fn expansion(
                     .with_static("H", h as u64)
                     .with_static("F", f as u64)
                     .with_static("GS", 0)
-                    .with_static("US", 0),
+                    .with_static("US", 0)
+                    .with_static("LB", 0),
             )
         },
     )

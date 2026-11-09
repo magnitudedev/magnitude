@@ -119,6 +119,18 @@ impl<'t> SublayerInput<'t> {
     }
 }
 
+/// A gated expansion's host port `glu_limit` for `limit`: no values, at
+/// extents `[0, LB]` (`GluLimit::word`, the static its kernels compile the
+/// clamp from), viewed from `table`, any i32 tensor of the call.
+pub(crate) fn glu_limit(
+    table: &seismic::WorkflowTensor,
+    limit: Option<magnitude_family_contracts::GluLimit>,
+) -> seismic::WorkflowTensorView {
+    table
+        .slice_leading(0, 0)
+        .reshape(&[0, magnitude_family_contracts::GluLimit::word(limit)])
+}
+
 /// How a sublayer's consumer entry forms its input row (`form_input`):
 /// the sum of `parts` partial rows, normalized by the sublayer's input norm
 /// when `normalized`.
@@ -916,6 +928,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     // text rows are normalized at entry normalizes its media rows in its
     // projector (Muse's `perception_emb_norm`).
     attention::admit_media(decoder, definition.vision.is_some())?;
+    routed::admit_media(decoder, definition.vision.is_some())?;
     attention::admit_shared(decoder)?;
     // The final norm, or the exit site's (the contract pairs each with its
     // residual form).

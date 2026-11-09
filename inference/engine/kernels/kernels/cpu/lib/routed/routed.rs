@@ -29,9 +29,10 @@ pub fn expert_row(expert: i32, rows: usize) -> usize {
 /// `projection::MAX_BLOCK`) of a paired gate/up operand against the F32
 /// activation row `x` (or its quantized form `q8`), as published F32: the
 /// `glu` of `gate_scale * gate` and `up_scale * up` (functions.seismic;
-/// `functions` code `function`; the scales: the expert's second-level scales
-/// on the accumulators, 1 where a port is absent, which leaves every bit as
-/// it is).
+/// `functions` code `function`, [`functions::clamped_glu`] at `limit` where
+/// the expansion has one; the scales: the expert's second-level scales on
+/// the accumulators, 1 where a port is absent, which leaves every bit as it
+/// is).
 #[inline(always)]
 pub fn expand<A: Dense>(
     gate: &Weights<'_>,
@@ -40,6 +41,7 @@ pub fn expand<A: Dense>(
     x: &[f32],
     q8: Option<&[Q8Block]>,
     function: i32,
+    limit: Option<f32>,
     (gate_scale, up_scale): (f32, f32),
     out: &mut [f32],
 ) {
@@ -47,8 +49,18 @@ pub fn expand<A: Dense>(
     let up_sums = &mut up_sums[..out.len()];
     projection::project_arithmetic(gate, first, x, q8, out);
     projection::project_arithmetic(up, first, x, q8, up_sums);
-    for (target, up) in out.iter_mut().zip(up_sums.iter()) {
-        *target = functions::glu::<A>(function, gate_scale * *target, up_scale * up);
+    let pairs = out.iter_mut().zip(up_sums.iter());
+    match limit {
+        None => {
+            for (target, up) in pairs {
+                *target = functions::glu::<A>(function, gate_scale * *target, up_scale * up);
+            }
+        }
+        Some(limit) => {
+            for (target, up) in pairs {
+                *target = functions::clamped_glu::<A>(function, limit, gate_scale * *target, up_scale * up);
+            }
+        }
     }
 }
 
@@ -61,12 +73,13 @@ pub fn expand_into<A: Dense>(
     x: &[f32],
     q8: Option<&[Q8Block]>,
     function: i32,
+    limit: Option<f32>,
     scales: (f32, f32),
     out: &mut [A::Storage],
 ) {
     let mut values = [0.0f32; projection::MAX_ROWS];
     let values = &mut values[..out.len()];
-    expand::<A>(gate, up, first, x, q8, function, scales, values);
+    expand::<A>(gate, up, first, x, q8, function, limit, scales, values);
     activation::store::<A>(values, out);
 }
 

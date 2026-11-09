@@ -303,6 +303,12 @@ fn f32_tensor(device: &seismic::Device, shape: &[u64], values: &[f32]) -> seismi
     seismic::Tensor::from_host(device, seismic::Element::f32(), shape, &bytes).unwrap()
 }
 
+/// A gated expansion's host port `glu_limit` without a clamp: `[0, LB]` at
+/// LB = 0.
+fn no_limit(device: &seismic::Device) -> seismic::Tensor {
+    i32_tensor(device, &[0, 0], &[])
+}
+
 /// An absent scale port (`[0] f32`): an unscaled weight's.
 fn absent(device: &seismic::Device) -> seismic::Tensor {
     scale_port(device, &[])
@@ -1315,6 +1321,8 @@ impl Block {
                 Input::I32(0),
                 floats(&[self.gate_scale.len()], &self.gate_scale),
                 floats(&[self.up_scale.len()], &self.up_scale),
+                // No clamp.
+                ints(&[0, 0], &[]),
             ],
         );
         let combined = interpret(
@@ -2369,6 +2377,7 @@ fn decode_specialization<E: seismic::Entry>(
         ("ES", 0),
         ("GS", 0),
         ("US", 0),
+        ("LB", 0),
     ];
     let statics = statics
         .iter()
@@ -3017,6 +3026,7 @@ struct GroupedPass {
     inverse: seismic::Tensor,
     table: seismic::Tensor,
     used: seismic::Tensor,
+    glu_limit: seismic::Tensor,
 }
 
 impl GroupedPass {
@@ -3037,6 +3047,7 @@ impl GroupedPass {
             inverse: fill(&[capacity, k64]),
             table: fill(&[blocks]),
             used: fill(&[1]),
+            glu_limit: no_limit(device),
         };
         routed_group::native_for_device(device, &default_group_specialization(device, e as u64, k64))
             .unwrap()
@@ -3071,6 +3082,7 @@ impl GroupedPass {
             records_up: &block.expert_up,
             records_down: &block.expert_down,
             activation: 0,
+            glu_limit: &self.glu_limit,
             gate_scale: &scales[0],
             up_scale: &scales[1],
         }
@@ -3103,7 +3115,7 @@ fn expert_operands(device: &seismic::Device, specialization: seismic::NativeSpec
 
 fn grouped_experts(device: &seismic::Device, block: &PackedBlock, mapping: &[(&'static str, u64)]) -> seismic::NativeKernel<routed_experts::Entry> {
     let (h, f) = (PackedBlock::HIDDEN as u64, block.routed.features as u64);
-    let statics = [[("H", h), ("F", f)].as_slice(), &block.routed.expansion_statics()].concat();
+    let statics = [[("H", h), ("F", f)].as_slice(), &block.routed.expansion_statics(), &[("LB", 0)]].concat();
     let specialization = expert_operands(device, specialization_on(device, &statics, mapping));
     routed_experts::native_for_device_with(
         device,
@@ -3318,7 +3330,7 @@ fn native_grouped_prefill_matches_reference_on(
                 },
                 &{
                     let choice = specialization(
-                        &[[("H", h), ("F", f)].as_slice(), &block.routed.expansion_statics()]
+                        &[[("H", h), ("F", f)].as_slice(), &block.routed.expansion_statics(), &[("LB", 0)]]
                             .concat(),
                     );
                     if device.backend() == seismic::BackendName::Cuda {
@@ -3345,6 +3357,7 @@ fn native_grouped_prefill_matches_reference_on(
                 records_up: &block.expert_up,
                 records_down: &block.expert_down,
                 activation: 0,
+                glu_limit: &no_limit(&device),
                 gate_scale: &gate_scale,
                 up_scale: &up_scale,
             })
@@ -4042,7 +4055,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                     EDW: element(&device, "q5k"),
                 },
                 &specialization(
-                    &[[("H", h), ("F", f)].as_slice(), &block.routed.expansion_statics()].concat(),
+                    &[[("H", h), ("F", f)].as_slice(), &block.routed.expansion_statics(), &[("LB", 0)]].concat(),
                 ),
             )
             .unwrap()
@@ -4062,6 +4075,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
                 records_up: &block.expert_up,
                 records_down: &block.expert_down,
                 activation: 0,
+                glu_limit: &no_limit(&device),
                 gate_scale: &gate_scale,
                 up_scale: &up_scale,
             })
@@ -4326,6 +4340,7 @@ fn native_35b_shared_route_cases(
                     tier_gate: &no_tier(&block.expert_gate),
                     tier_up: &no_tier(&block.expert_up),
                     activation: 0,
+                    glu_limit: &no_limit(&device),
                     gate_scale: &unscaled,
                     up_scale: &unscaled,
                 })
@@ -4421,7 +4436,7 @@ fn native_35b_grouped_capacity_keeps_every_bit_on(device: &seismic::Device) {
                         EUW: element(device, "q4k"),
                         EDW: element(device, "q5k"),
                     },
-                    &specialization(&[("H", h), ("F", f), ("GS", 0), ("US", 0)]),
+                    &specialization(&[("H", h), ("F", f), ("GS", 0), ("US", 0), ("LB", 0)]),
                 )
                 .unwrap()
                 .call(routed_experts::Args {
@@ -4440,6 +4455,7 @@ fn native_35b_grouped_capacity_keeps_every_bit_on(device: &seismic::Device) {
                     records_up: &block.expert_up,
                     records_down: &block.expert_down,
                     activation: 0,
+                    glu_limit: &no_limit(device),
                     gate_scale: &absent(device),
                     up_scale: &absent(device),
                 })
@@ -4915,6 +4931,7 @@ fn streaming_tier_records_serve_as_bank_records() {
                         tier_gate,
                         tier_up,
                         activation: 0,
+                        glu_limit: &no_limit(&device),
                         gate_scale: &absent(&device),
                         up_scale: &absent(&device),
                     })
@@ -5923,7 +5940,7 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
         .unwrap();
     let normalized = bf16_tensor(&device, &[rows, h], &pattern((rows * h) as usize, 93, 1.0));
     let mapping = &grouped_mappings(&device)[0];
-    let specialization = specialization_on(&device, &[("H", h), ("F", f), ("GS", 0), ("US", 0)], mapping);
+    let specialization = specialization_on(&device, &[("H", h), ("F", f), ("GS", 0), ("US", 0), ("LB", 0)], mapping);
     let specialization = match device.backend() {
         seismic::BackendName::Cuda => specialization.with_param("OPERAND", 0),
         _ => specialization,
@@ -5953,6 +5970,7 @@ fn streaming_pass_reads_cold_experts_from_a_scratch_view_in_lent_records() {
                 records_up: records[1],
                 records_down: records[2],
                 activation: 0,
+                glu_limit: &no_limit(&device),
                 gate_scale: &scale,
                 up_scale: &scale,
             })

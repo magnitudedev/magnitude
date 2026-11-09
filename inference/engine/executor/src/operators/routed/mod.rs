@@ -28,19 +28,22 @@ pub(crate) mod streamed;
 use crate::error::PlanError;
 use crate::{DenseScales, RoutedBinding, ScalableWeight};
 use magnitude_family_contracts::{
-    ActivationFunction, ExpertSelection, FeedForwardUp, Operator, RouteNormalization, RoutedFfn,
-    RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, WeightKind,
+    ActivationFunction, Decoder, ExpertSelection, FeedForwardUp, GluLimit, Operator,
+    RouteNormalization, RoutedFfn, RouterInput, ScoreFunction, SharedExpert, SharedExpertGate,
+    WeightKind,
 };
 use seismic::Element;
 
 use super::dense_ffn::activation_code;
 
-/// An expansion's form and activation code.
+/// An expansion's form, activation code and clamp.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Expansion {
     /// Gated (`act(gate) · up`) or up-only (`act(up)`).
     pub gated: bool,
     pub activation: i32,
+    /// The gated expansion's clamp (`glu`'s, its entries' LB).
+    pub limit: Option<GluLimit>,
 }
 
 impl Expansion {
@@ -48,6 +51,7 @@ impl Expansion {
         Self {
             gated: up.gate().is_some(),
             activation: activation_code(up.activation()),
+            limit: up.limit(),
         }
     }
 }
@@ -66,7 +70,7 @@ pub struct GeneralRoutedShape {
     pub experts_expansion: Expansion,
     /// The shared expert's width and expansion.
     pub shared: Option<(u64, Expansion)>,
-    /// `routed_select`'s `score` code: 0 softmax, 1 sigmoid.
+    /// `routed_select`'s `score` code: 0 softmax, 1 sigmoid, 2 sqrt(softplus).
     pub score: i32,
     /// `routed_select`'s `normalization` code: 0 none, 1 sum, 2 sum + ε,
     /// 3 max(sum, ε).
@@ -109,9 +113,7 @@ impl GeneralRoutedShape {
             score: match router.score {
                 ScoreFunction::Softmax => 0,
                 ScoreFunction::Sigmoid => 1,
-                ScoreFunction::SqrtSoftplus => {
-                    return Err(PlanError::Unsupported("sqrt-softplus expert scores"));
-                }
+                ScoreFunction::SqrtSoftplus => 2,
             },
             normalization,
             normalization_epsilon: (epsilon as f32).to_bits(),
@@ -226,6 +228,7 @@ pub(crate) fn is_fused(routed: &RoutedFfn) -> bool {
             up,
             FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
+                limit: None,
                 ..
             }
         )
@@ -265,18 +268,12 @@ pub(crate) fn hint_kinds(routed: &RoutedFfn) -> Vec<WeightKind> {
     }
 }
 
-/// The forms the general routed entries implement: softmax or sigmoid
-/// scores with top-k selection, any normalization and finite scale, a router
-/// input norm of the sublayer's epsilon, gated or up-only experts, and an
-/// ungated shared expert.
+/// The forms the general routed entries implement: every score function
+/// with top-k selection, any normalization and finite scale, a router input
+/// norm of the sublayer's epsilon, gated or up-only experts, and an ungated
+/// shared expert.
 pub(crate) fn admit(routed: &RoutedFfn) -> Result<(), PlanError> {
     let router = &routed.router;
-    if !matches!(
-        router.score,
-        ScoreFunction::Softmax | ScoreFunction::Sigmoid
-    ) {
-        return Err(PlanError::Unsupported("expert score function"));
-    }
     if !router.scale.is_finite() {
         return Err(PlanError::Unsupported("expert router scale"));
     }
@@ -290,6 +287,23 @@ pub(crate) fn admit(routed: &RoutedFfn) -> Result<(), PlanError> {
         ));
     }
     Ok(())
+}
+
+/// Media rows of a decoder whose routers rank them on their own selection
+/// bias (`Router::media_bias`): no selection reads that bias yet, so a
+/// decoder with a vision component and one is refused, rather than ranking
+/// its media rows on the text bias. Without a vision component there are no
+/// media rows, and text rows never read it.
+pub(crate) fn admit_media(decoder: &Decoder, vision: bool) -> Result<(), PlanError> {
+    let media_biased = decoder.sublayers().any(|(_, sublayer)| {
+        routed_ffn(&sublayer.op).is_some_and(|routed| routed.router.media_bias.is_some())
+    });
+    match vision && media_biased {
+        true => Err(PlanError::Unsupported(
+            "media rows ranked on their own expert selection bias",
+        )),
+        false => Ok(()),
+    }
 }
 
 /// The weights the operator binds, in the order its entries consume them.
@@ -467,4 +481,111 @@ pub(super) fn binding(
         activation,
         scales,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planning::fixtures::descriptor;
+    use magnitude_family_contracts::Router;
+
+    /// DeepSeek V4.1 Flash's routed feed-forward (engine map §7): sqrt-softplus
+    /// scores ranked with a selection bias, weights over sum + 1e-20 scaled by
+    /// 1.5, 384 SiLU-gated experts clamped at 10 of which 6 are selected, and
+    /// one ungated shared expert clamped the same.
+    fn deepseek41() -> RoutedFfn {
+        const HIDDEN: u64 = 5120;
+        const EXPERTS: u64 = 384;
+        const FEATURES: u64 = 2304;
+        let silu = |gate, up| FeedForwardUp::Gated {
+            activation: ActivationFunction::Silu,
+            limit: Some(GluLimit::new(10.0).unwrap()),
+            gate,
+            up,
+        };
+        RoutedFfn {
+            experts: EXPERTS,
+            selected: 6,
+            intermediate: FEATURES,
+            router: Router {
+                weight: descriptor("ffn_gate_inp", &[EXPERTS, HIDDEN]),
+                input: RouterInput::Operator,
+                score: ScoreFunction::SqrtSoftplus,
+                selection: ExpertSelection::TopK {
+                    bias: Some(descriptor("exp_probs_b", &[EXPERTS])),
+                },
+                media_bias: None,
+                normalization: RouteNormalization::SumPlusEpsilon(1e-20),
+                scale: 1.5,
+            },
+            expert_up: silu(
+                descriptor("ffn_gate_exps", &[EXPERTS, FEATURES, HIDDEN]),
+                descriptor("ffn_up_exps", &[EXPERTS, FEATURES, HIDDEN]),
+            ),
+            expert_down: descriptor("ffn_down_exps", &[EXPERTS, HIDDEN, FEATURES]),
+            expert_scale: None,
+            latent: None,
+            shared: Some(SharedExpert {
+                intermediate: FEATURES,
+                up: silu(
+                    descriptor("ffn_gate_shexp", &[FEATURES, HIDDEN]),
+                    descriptor("ffn_up_shexp", &[FEATURES, HIDDEN]),
+                ),
+                down: descriptor("ffn_down_shexp", &[HIDDEN, FEATURES]),
+                gate: SharedExpertGate::None,
+            }),
+        }
+    }
+
+    /// Until a selection reads it, a router's media-row bias admits a
+    /// text-only decoder (its text rows never read it) and refuses one with
+    /// a vision component by name: no media row is ranked on the text bias.
+    #[test]
+    fn a_media_row_bias_is_refused_beside_vision_and_ignored_without_it() {
+        let mut definition = crate::planning::fixtures::sinkhorn_fixture_definition(1);
+        let decoder = &mut definition.decoder;
+        assert_eq!(admit_media(decoder, true), Ok(()));
+        let Operator::RoutedFfn(routed) = &mut decoder.blocks[0].sublayers[1].op else {
+            panic!("the fixture's feed-forward is routed");
+        };
+        routed.router.media_bias = Some(descriptor("exp_probs_b_vl", &[routed.experts]));
+        assert_eq!(admit_media(decoder, false), Ok(()));
+        assert_eq!(
+            admit_media(decoder, true),
+            Err(PlanError::Unsupported(
+                "media rows ranked on their own expert selection bias"
+            ))
+        );
+    }
+
+    #[test]
+    fn sqrt_softplus_routing_takes_the_general_path() {
+        let routed = deepseek41();
+        assert!(!is_fused(&routed));
+        let silu_gated = Expansion {
+            gated: true,
+            activation: 0,
+            limit: Some(GluLimit::new(10.0).unwrap()),
+        };
+        assert_eq!(
+            GeneralRoutedShape::of(5120, &routed).unwrap(),
+            GeneralRoutedShape {
+                hidden: 5120,
+                experts: 384,
+                selected: 6,
+                intermediate: 2304,
+                expert_hidden: 5120,
+                latent: false,
+                experts_expansion: silu_gated,
+                shared: Some((2304, silu_gated)),
+                score: 2,
+                normalization: 2,
+                normalization_epsilon: 1e-20_f32.to_bits(),
+                scale: 1.5_f32.to_bits(),
+                bias: true,
+                expert_scale: false,
+                router_norm: false,
+            }
+        );
+    }
 }

@@ -475,11 +475,13 @@ impl Geometry {
                     input: RouterInput::Operator,
                     score: ScoreFunction::Softmax,
                     selection: ExpertSelection::TopK { bias: None },
+                    media_bias: None,
                     normalization: RouteNormalization::Sum,
                     scale: 1.0,
                 },
                 expert_up: FeedForwardUp::Gated {
                     activation: ActivationFunction::Silu,
+                    limit: None,
                     gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, hidden])?,
                     up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, hidden])?,
                 },
@@ -490,6 +492,7 @@ impl Geometry {
                     intermediate: e.shared_intermediate,
                     up: FeedForwardUp::Gated {
                         activation: ActivationFunction::Silu,
+                        limit: None,
                         gate: weight("ffn_gate_shexp.weight", &[e.shared_intermediate, hidden])?,
                         up: weight("ffn_up_shexp.weight", &[e.shared_intermediate, hidden])?,
                     },
@@ -505,6 +508,7 @@ impl Geometry {
                 intermediate,
                 up: FeedForwardUp::Gated {
                     activation: ActivationFunction::Silu,
+                    limit: None,
                     gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
                     up: weight("ffn_up.weight", &[intermediate, hidden])?,
                 },

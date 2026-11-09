@@ -17,6 +17,11 @@
 //   (`projection_gemv`: one bound per pipeline).
 // A choice's gate and up accumulators carry its expert's `gate_scale` /
 // `up_scale` entries where those ports are present (static GS, US).
+// The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
+// clamps at.
+#if SEISMIC_STATIC_LB != 0
+#define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
+#endif
 #if SEISMIC_STATIC_GS + SEISMIC_STATIC_US != 0
 #define PROJECTION_SCALED
 #endif

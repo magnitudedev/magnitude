@@ -18,6 +18,11 @@
 //   the other rows, so every choice gets its one-row bits.
 #define KERNEL_W0 SEISMIC_EXPERT_GATE
 #define KERNEL_W1 SEISMIC_EXPERT_UP
+// The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
+// clamps at.
+#if SEISMIC_STATIC_LB != 0
+#define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
+#endif
 #include "lib/routed/routed.cuh"
 
 // A block's one row, read in place unless the experts take it as NVFP4

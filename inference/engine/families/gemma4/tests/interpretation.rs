@@ -496,6 +496,7 @@ fn feed_forward_up_is_gated_gelu_tanh() {
         dense.up,
         FeedForwardUp::Gated {
             activation: ActivationFunction::GeluTanh,
+            limit: None,
             ..
         }
     ));

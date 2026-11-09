@@ -253,8 +253,8 @@ fn select_mappings(device: &seismic::Device) -> Vec<Vec<(&'static str, u64)>> {
 }
 
 /// One family's routing: hidden H, experts E, selected K, score function,
-/// normalization, post-scale, and whether it has a selection bias, per-expert
-/// scales and its own router norm.
+/// normalization and its ε, post-scale, and whether it has a selection bias,
+/// per-expert scales and its own router norm.
 #[derive(Clone, Copy)]
 struct Routing {
     name: &'static str,
@@ -263,6 +263,7 @@ struct Routing {
     selected: usize,
     score: i32,
     normalization: i32,
+    epsilon: f32,
     scale: f32,
     biased: bool,
     expert_scales: bool,
@@ -271,7 +272,7 @@ struct Routing {
 
 const CLAMP: f32 = 6.103_515_6e-5;
 
-const ROUTINGS: [Routing; 7] = [
+const ROUTINGS: [Routing; 8] = [
     Routing {
         name: "lfm2-moe",
         hidden: 2048,
@@ -279,6 +280,7 @@ const ROUTINGS: [Routing; 7] = [
         selected: 4,
         score: 1,
         normalization: 3,
+        epsilon: CLAMP,
         scale: 1.0,
         biased: true,
         expert_scales: false,
@@ -291,6 +293,7 @@ const ROUTINGS: [Routing; 7] = [
         selected: 10,
         score: 1,
         normalization: 3,
+        epsilon: CLAMP,
         scale: 2.5,
         biased: true,
         expert_scales: false,
@@ -303,6 +306,7 @@ const ROUTINGS: [Routing; 7] = [
         selected: 8,
         score: 0,
         normalization: 3,
+        epsilon: CLAMP,
         scale: 1.0,
         biased: false,
         expert_scales: true,
@@ -315,6 +319,7 @@ const ROUTINGS: [Routing; 7] = [
         selected: 6,
         score: 1,
         normalization: 3,
+        epsilon: CLAMP,
         scale: 2.5,
         biased: true,
         expert_scales: true,
@@ -327,6 +332,7 @@ const ROUTINGS: [Routing; 7] = [
         selected: 22,
         score: 1,
         normalization: 3,
+        epsilon: CLAMP,
         scale: 5.0,
         biased: true,
         expert_scales: false,
@@ -341,6 +347,7 @@ const ROUTINGS: [Routing; 7] = [
         selected: 9,
         score: 1,
         normalization: 3,
+        epsilon: CLAMP,
         scale: 5.0,
         biased: true,
         expert_scales: false,
@@ -355,10 +362,26 @@ const ROUTINGS: [Routing; 7] = [
         selected: 5,
         score: 0,
         normalization: 1,
+        epsilon: CLAMP,
         scale: 1.0,
         biased: false,
         expert_scales: true,
         router_norm: true,
+    },
+    // DeepSeek V4.1 Flash: sqrt-softplus scores ranked with the selection
+    // bias, divided by sum + 1e-20 and scaled by 1.5 (engine map §7).
+    Routing {
+        name: "deepseek41",
+        hidden: 5120,
+        experts: 384,
+        selected: 6,
+        score: 2,
+        normalization: 2,
+        epsilon: 1e-20,
+        scale: 1.5,
+        biased: true,
+        expert_scales: false,
+        router_norm: false,
     },
 ];
 
@@ -453,7 +476,7 @@ fn portable_select(
             Input::F32(1e-6),
             Input::I32(routing.score),
             Input::I32(routing.normalization),
-            Input::F32(CLAMP),
+            Input::F32(routing.epsilon),
             Input::F32(routing.scale),
         ],
     );
@@ -534,8 +557,8 @@ fn host_select(routing: &Routing, case: &SelectCase) -> Selection {
             let divisor = match routing.normalization {
                 0 => 1.0,
                 1 => denominator,
-                2 => denominator + f64::from(CLAMP),
-                3 => denominator.max(f64::from(CLAMP)),
+                2 => denominator + f64::from(routing.epsilon),
+                3 => denominator.max(f64::from(routing.epsilon)),
                 other => panic!("normalization {other}"),
             };
             let expert = routes[row * k + slot] as usize;
@@ -758,7 +781,7 @@ fn native_select_matches_host_reference_at_catalog_shapes() {
                         epsilon: 1e-6,
                         score: routing.score,
                         normalization: routing.normalization,
-                        normalization_epsilon: CLAMP,
+                        normalization_epsilon: routing.epsilon,
                         scale: routing.scale,
                     })
                     .unwrap();
@@ -825,8 +848,10 @@ fn portable_select_ranks_ties_to_the_higher_expert() {
 /// One family's routed experts at its real widths: `hidden` is the experts'
 /// input width (Nemotron Super's latent width), `features` the expert
 /// intermediate width, `selected` K; gated (GLU) or up-only experts with
-/// the `functions` activation code. A latent feed-forward also publishes
-/// its zero-based sum in A (R = A), the latent-up projection's input.
+/// the `functions` activation code, gated ones clamped at `limit` (`glu`;
+/// inf for none) over weights of amplitude `amplitude`. A latent
+/// feed-forward also publishes its zero-based sum in A (R = A), the
+/// latent-up projection's input.
 #[derive(Clone, Copy)]
 struct ExpertShape {
     name: &'static str,
@@ -836,9 +861,25 @@ struct ExpertShape {
     activation: i32,
     gated: bool,
     latent: bool,
+    limit: f32,
+    amplitude: f32,
 }
 
-const EXPERT_SHAPES: [ExpertShape; 5] = [
+impl ExpertShape {
+    /// The gated entries' LB for the shape's clamp: the limit's bits,
+    /// 0 for none (an infinite `limit`).
+    fn limit_word(&self) -> usize {
+        glu_limit_word(self.limit)
+    }
+}
+
+/// The LB of a clamp at `limit` (`GluLimit::word`): its bits, 0 for
+/// none (inf).
+fn glu_limit_word(limit: f32) -> usize {
+    if limit == f32::INFINITY { 0 } else { limit.to_bits() as usize }
+}
+
+const EXPERT_SHAPES: [ExpertShape; 6] = [
     ExpertShape {
         name: "lfm2-moe",
         hidden: 2048,
@@ -847,6 +888,8 @@ const EXPERT_SHAPES: [ExpertShape; 5] = [
         activation: 0,
         gated: true,
         latent: false,
+        limit: f32::INFINITY,
+        amplitude: 0.05,
     },
     ExpertShape {
         name: "laguna",
@@ -856,6 +899,8 @@ const EXPERT_SHAPES: [ExpertShape; 5] = [
         activation: 0,
         gated: true,
         latent: false,
+        limit: f32::INFINITY,
+        amplitude: 0.05,
     },
     ExpertShape {
         name: "gemma4-26b",
@@ -865,6 +910,8 @@ const EXPERT_SHAPES: [ExpertShape; 5] = [
         activation: 1,
         gated: true,
         latent: false,
+        limit: f32::INFINITY,
+        amplitude: 0.05,
     },
     ExpertShape {
         name: "nemotron-lightning",
@@ -874,6 +921,8 @@ const EXPERT_SHAPES: [ExpertShape; 5] = [
         activation: 2,
         gated: false,
         latent: false,
+        limit: f32::INFINITY,
+        amplitude: 0.05,
     },
     ExpertShape {
         name: "nemotron-super",
@@ -883,6 +932,22 @@ const EXPERT_SHAPES: [ExpertShape; 5] = [
         activation: 2,
         gated: false,
         latent: true,
+        limit: f32::INFINITY,
+        amplitude: 0.05,
+    },
+    // DeepSeek V4.1 Flash: 384 experts of which 6 are selected, SiLU-gated
+    // and clamped at its `swiglu_limit` 10, its weights wide enough that gate
+    // sums pass +10 and up sums ±10 (`deepseek41_sums_pass_the_limit`).
+    ExpertShape {
+        name: "deepseek41",
+        hidden: 5120,
+        features: 2304,
+        selected: 6,
+        activation: 0,
+        gated: true,
+        latent: false,
+        limit: 10.0,
+        amplitude: 0.3,
     },
 ];
 
@@ -954,7 +1019,7 @@ impl ExpertBlock {
         let experts = shape.selected + SPARE_EXPERTS;
         let count = experts * shape.features * shape.hidden;
         let weights = |seed| {
-            pattern(count, seed, 0.05)
+            pattern(count, seed, shape.amplitude)
                 .into_iter()
                 .map(registry::bf16_round)
                 .collect::<Vec<_>>()
@@ -982,13 +1047,15 @@ impl ExpertBlock {
         }
     }
 
-    /// A(A(act(A(gs[e] * gate))) * A(us[e] * up)) or A(act(A(us[e] * up)))
-    /// of one normalized row.
+    /// A(A(act(min(A(gs[e] * gate), L))) * clamp(A(us[e] * up), -L, L)) or
+    /// A(act(A(us[e] * up))) of one normalized row: the clamp DeepSeek
+    /// V4.1's, L the shape's limit.
     fn product(&self, x: &[f32], expert: usize) -> Vec<f32> {
-        let (h, f, function) = (
+        let (h, f, function, limit) = (
             self.shape.hidden,
             self.shape.features,
             self.shape.activation,
+            self.shape.limit,
         );
         (0..f)
             .map(|feature| {
@@ -998,10 +1065,11 @@ impl ExpertBlock {
                     Expansion::Gated(gate) => {
                         let gate = registry::bf16_round(
                             self.gate_scale[expert] * dot(x, &gate[row..row + h]),
-                        );
+                        )
+                        .min(limit);
                         registry::bf16_round(
                             registry::bf16_round(activate(function, gate))
-                                * registry::bf16_round(up),
+                                * registry::bf16_round(up).clamp(-limit, limit),
                         )
                     }
                     Expansion::Up => {
@@ -1290,6 +1358,7 @@ fn portable_expert_entries_match_host_reference() {
                         Input::I32(shape.activation),
                         scale(&block.gate_scale),
                         scale(&block.up_scale),
+                        ints(&[0, shape.limit_word()], &[]),
                     ],
                 ),
                 Expansion::Up => interpret(
@@ -1431,6 +1500,7 @@ fn portable_expert_entries_match_host_reference() {
                     Input::I32(shape.activation),
                     scale(&block.gate_scale),
                     scale(&block.up_scale),
+                    ints(&[0, shape.limit_word()], &[]),
                 ],
             ),
             Expansion::Up => interpret(
@@ -1845,6 +1915,7 @@ impl DecodeExpansion {
         reads: DecodeReads<'_>,
         experts: &DeviceExperts,
         activation: i32,
+        glu_limit: &seismic::Tensor,
     ) -> seismic::Tensor {
         let DecodeReads { sources, gate, up, tier_gate, tier_up } = reads;
         match (self, gate, tier_gate) {
@@ -1861,6 +1932,7 @@ impl DecodeExpansion {
                         activation,
                         gate_scale: &experts.gate_scale,
                         up_scale: &experts.up_scale,
+                        glu_limit,
                     })
                     .unwrap()
                     .value
@@ -1937,8 +2009,10 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                     EGW: bf16,
                                     EUW: bf16,
                                 });
+                                let gated_statics =
+                                    [expansion_statics.as_slice(), &[("LB", shape.limit_word())]].concat();
                                 let specialization =
-                                    expansion_specialization(device, &entry, index, &expansion_statics, &mapping, int8);
+                                    expansion_specialization(device, &entry, index, &gated_statics, &mapping, int8);
                                 DecodeExpansion::Gated(entry.prepare(device, &specialization).unwrap())
                             }
                             None => {
@@ -1948,9 +2022,10 @@ fn native_decode_experts_match_host_reference_at_catalog_shapes() {
                                 DecodeExpansion::Up(entry.prepare(device, &specialization).unwrap())
                             }
                         };
+                        let glu_limit = i32_tensor(device, &[0, shape.limit_word()], &[]);
                         let expand = |reads: DecodeReads<'_>| {
                             read_activation(
-                                &expansion.product(&normalized, &routes, reads, &experts, shape.activation),
+                                &expansion.product(&normalized, &routes, reads, &experts, shape.activation, &glu_limit),
                                 DType::BF16,
                             )
                         };
@@ -2158,6 +2233,8 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                 for int8 in arithmetic_variants(device) {
                     let label = format!("{label} {mapping:?} INT8 {int8}");
                     let grouped_statics = [[("H", h), ("F", f)].as_slice(), &block.scale_statics()].concat();
+                    let gated_statics = [grouped_statics.as_slice(), &[("LB", shape.limit_word())]].concat();
+                    let glu_limit = i32_tensor(device, &[0, shape.limit_word()], &[]);
                     // The grouped pass with its experts placed by `map` at
                     // `step` in `records` (gate, up, down), else read in place.
                     let pass = |map: &seismic::Tensor, step: &seismic::Tensor, records: [Option<&seismic::Tensor>; 3]| match &experts.gate {
@@ -2169,7 +2246,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                                 EDW: bf16,
                             });
                             entry
-                                .prepare(device, &grouped_specialization(device, &entry, &grouped_statics, &mapping, int8))
+                                .prepare(device, &grouped_specialization(device, &entry, &gated_statics, &mapping, int8))
                                 .unwrap()
                                 .call(routed_experts::Args {
                                     first: &first,
@@ -2189,6 +2266,7 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                                     activation: shape.activation,
                                     gate_scale: &experts.gate_scale,
                                     up_scale: &experts.up_scale,
+                                    glu_limit: &glu_limit,
                                 })
                                 .unwrap()
                                 .value
@@ -2276,6 +2354,156 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                 }
             }
             eprintln!("{label} grouped: {:.1}s", started.elapsed().as_secs_f64());
+        }
+    }
+}
+
+/// The DeepSeek V4.1 shape's weights reach the clamp: its host products
+/// (the decode rows the native tests check) take gate sums past +10 and up
+/// sums past ±10, and the clamp moves them from the unclamped products.
+#[test]
+fn deepseek41_sums_pass_the_limit() {
+    let shape = EXPERT_SHAPES[5];
+    assert_eq!(shape.name, "deepseek41");
+    let block = ExpertBlock::new(shape);
+    let Expansion::Gated(gate) = &block.expansion else {
+        panic!("DeepSeek V4.1's experts are gated")
+    };
+    let case = ExpertCase::new(&block, 1);
+    let (h, f, k) = (shape.hidden, shape.features, shape.selected);
+    let x = &case.normalized[..h];
+    let (mut gates, mut ups) = (Vec::new(), Vec::new());
+    for &expert in &case.routes[..k] {
+        let expert = expert as usize;
+        for feature in 0..f {
+            let row = (expert * f + feature) * h;
+            gates.push(block.gate_scale[expert] * dot(x, &gate[row..row + h]));
+            ups.push(block.up_scale[expert] * dot(x, &block.up[row..row + h]));
+        }
+    }
+    assert!(gates.iter().any(|gate| *gate > shape.limit), "a gate sum passes +{}", shape.limit);
+    assert!(
+        ups.iter().any(|up| *up > shape.limit) && ups.iter().any(|up| *up < -shape.limit),
+        "up sums pass ±{}",
+        shape.limit
+    );
+    let unclamped = ExpertBlock::new(ExpertShape { limit: f32::INFINITY, ..shape });
+    let moved = case.routes[..k].iter().any(|&expert| {
+        block.product(x, expert as usize) != unclamped.product(x, expert as usize)
+    });
+    assert!(moved, "the clamp moves the products");
+}
+
+/// `glu`'s clamp (functions.seismic; DeepSeek V4.1's `swiglu_limit`: the
+/// gate to (-inf, L], up to [-L, L], before the activation) on every
+/// backend's `Glu` epilogue and in the portable body, through
+/// `routed_gate_up`: gate and up sums at, just inside and beyond ±L, ±inf and
+/// NaN, in every pairing, under L = 10 (LB its bits) and with no limit
+/// (LB = 0, the form every other family compiles). A NaN stays NaN; every
+/// other value is the reference's within one BF16 step of the activation's
+/// `exp`.
+#[test]
+fn glu_clamps_adversarial_sums_as_the_reference() {
+    const H: usize = 256;
+    let (inf, nan) = (f32::INFINITY, f32::NAN);
+    let gates = [-inf, -64.0, -10.0625, -10.0, -9.9375, 0.0, 1.5, 9.9375, 10.0, 10.0625, 64.0, inf, nan];
+    let ups = [-inf, -64.0, -10.0625, -10.0, -9.9375, 0.0, 2.5, 9.9375, 10.0, 10.0625, 64.0, inf, nan];
+    // Every pairing, padded with zeros to F = 192.
+    let mut pairs = gates.iter().flat_map(|g| ups.iter().map(move |u| (*g, *u))).collect::<Vec<_>>();
+    pairs.resize(192, (0.0, 0.0));
+    let f = pairs.len();
+    // One row x = e_0, and gate/up rows (g, 0, ...) and (u, 0, ...): each
+    // sum is its value exactly.
+    let mut x = vec![0.0f32; H];
+    x[0] = 1.0;
+    let weights = |side: fn(&(f32, f32)) -> f32| {
+        pairs
+            .iter()
+            .flat_map(|pair| std::iter::once(side(pair)).chain(std::iter::repeat_n(0.0, H - 1)))
+            .collect::<Vec<_>>()
+    };
+    let (gate, up) = (weights(|pair| pair.0), weights(|pair| pair.1));
+    let reference = |limit: f32| {
+        pairs
+            .iter()
+            .map(|&(g, u)| {
+                let g = if g > limit { limit } else { g };
+                let u = if u > limit { limit } else { u };
+                let u = if u < -limit { -limit } else { u };
+                registry::bf16_round(registry::bf16_round(activate(0, g)) * u)
+            })
+            .collect::<Vec<_>>()
+    };
+    let check = |label: &str, actual: &[f32], expected: &[f32]| {
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            let (g, u) = pairs[index];
+            let agrees = match (actual.is_nan(), expected.is_nan()) {
+                (true, true) => true,
+                (false, false) if expected.is_infinite() || *expected == 0.0 => actual == expected,
+                (false, false) => (actual - expected).abs() <= expected.abs() / 128.0,
+                _ => false,
+            };
+            assert!(agrees, "{label}: gate {g} up {u}: {actual} against the reference's {expected}");
+        }
+    };
+    let module = module();
+    let bf16 = |shape: &[usize], values: &[f32]| floats(DType::BF16, shape, values);
+    let no_scale = || floats(DType::F32, &[0], &[]);
+    for limit in [10.0, inf] {
+        let expected = reference(limit);
+        let word = glu_limit_word(limit);
+        let portable = interpret(
+            &module,
+            "routed_gate_up",
+            &[("A", DType::BF16), ("EGW", DType::BF16), ("EUW", DType::BF16)],
+            vec![
+                bf16(&[1, H], &x),
+                ints(&[1, 1], &[0]),
+                ints(&[0, 1, 1], &[]),
+                bf16(&[1, f, H], &gate),
+                bf16(&[1, f, H], &up),
+                bf16(&[0, f, H], &[]),
+                bf16(&[0, f, H], &[]),
+                Input::I32(0),
+                no_scale(),
+                no_scale(),
+                ints(&[0, word], &[]),
+            ],
+        );
+        let portable = result(&portable, 0).into_iter().map(|value| value as f32).collect::<Vec<_>>();
+        check(&format!("portable L {limit}"), &portable, &expected);
+        for device in &devices() {
+            let bf16 = seismic::Element::bf16();
+            let entry = routed_gate_up::native_entry_with(routed_gate_up::Elements { A: bf16, EGW: bf16, EUW: bf16 });
+            let statics = [("H", H), ("K", 1), ("F", f), ("GS", 0), ("US", 0), ("LB", word)];
+            for (index, mapping) in decode_mappings(device).into_iter().enumerate() {
+                let native = entry
+                    .prepare(device, &expansion_specialization(device, &entry, index, &statics, &mapping, false))
+                    .unwrap();
+                let (gate_stack, up_stack) =
+                    (tensor(device, DType::BF16, &[1, f, H], &gate), tensor(device, DType::BF16, &[1, f, H], &up));
+                let product = native
+                    .call(routed_gate_up::Args {
+                        normalized: &tensor(device, DType::BF16, &[1, H], &x),
+                        routes: &i32_tensor(device, &[1, 1], &[0]),
+                        sources: &i32_tensor(device, &[0, 1, 1], &[]),
+                        expert_gate: &gate_stack,
+                        expert_up: &up_stack,
+                        tier_gate: &no_tier(&gate_stack),
+                        tier_up: &no_tier(&up_stack),
+                        activation: 0,
+                        gate_scale: &tensor(device, DType::F32, &[0], &[]),
+                        up_scale: &tensor(device, DType::F32, &[0], &[]),
+                        glu_limit: &i32_tensor(device, &[0, word], &[]),
+                    })
+                    .unwrap()
+                    .value;
+                check(
+                    &format!("{:?} {mapping:?} L {limit}", device.backend()),
+                    &read_activation(&product, DType::BF16),
+                    &expected,
+                );
+            }
         }
     }
 }

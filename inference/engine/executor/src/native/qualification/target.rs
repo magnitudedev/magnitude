@@ -445,6 +445,7 @@ impl<'a> QualificationView<'a> {
                     up_scale: &scale(binding.scales.up)?,
                     gate_bound: &any_row_bound(device, &kernels.expand, "GB", "dense_expand", &label)?,
                     up_bound: &any_row_bound(device, &kernels.expand, "UB", "dense_expand", &label)?,
+                    glu_limit: &glu_limit(device, binding.limit, "dense_expand", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                 .value;
@@ -943,6 +944,7 @@ pub(super) fn qualify_routed(
                             activation: 0,
                             gate_scale: &unit_scale(device, choices, "GS", "routed_gate_up", &label)?,
                             up_scale: &unit_scale(device, choices, "US", "routed_gate_up", &label)?,
+                            glu_limit: &glu_limit(device, None, "routed_gate_up", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("routed_gate_up", &label, error))?
                         .value;
@@ -1010,6 +1012,7 @@ pub(super) fn qualify_routed(
                     activation: 0,
                     gate_scale: &unit_scale(device, &kernels.experts, "GS", "routed_experts", &label)?,
                     up_scale: &unit_scale(device, &kernels.experts, "US", "routed_experts", &label)?,
+                    glu_limit: &glu_limit(device, None, "routed_experts", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("routed_experts", &label, error))?
                 .value;
@@ -1073,6 +1076,7 @@ fn qualify_parallel(
             up_scale: &unit_scale(device, &kernels.expand, "US", "dense_expand", &label)?,
             gate_bound: &any_row_bound(device, &kernels.expand, "GB", "dense_expand", &label)?,
             up_bound: &any_row_bound(device, &kernels.expand, "UB", "dense_expand", &label)?,
+            glu_limit: &glu_limit(device, dense.limit, "dense_expand", &label)?,
         })
         .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
         .value;
@@ -1167,6 +1171,7 @@ pub(super) fn qualify_general_routed(
                                 up_scale: &scale(scales.shared.up)?,
                                 gate_bound: &any_row_bound(device, kernel, "GB", "dense_expand", &label)?,
                                 up_bound: &any_row_bound(device, kernel, "UB", "dense_expand", &label)?,
+                                glu_limit: &glu_limit(device, expansion_shape.limit, "dense_expand", &label)?,
                             })
                             .map_err(failed!("dense_expand"))?
                             .value
@@ -1268,6 +1273,7 @@ pub(super) fn qualify_general_routed(
                             activation: shape.experts_expansion.activation,
                             gate_scale: &unit_scale(device, decode, "GS", "routed_gate_up", &label)?,
                             up_scale: &unit_scale(device, decode, "US", "routed_gate_up", &label)?,
+                            glu_limit: &glu_limit(device, shape.experts_expansion.limit, "routed_gate_up", &label)?,
                         })
                         .map_err(failed!("routed_gate_up"))?
                         .value
@@ -1350,6 +1356,7 @@ pub(super) fn qualify_general_routed(
                             activation: shape.experts_expansion.activation,
                             gate_scale: &unit_scale(device, grouped, "GS", "routed_experts", &label)?,
                             up_scale: &unit_scale(device, grouped, "US", "routed_experts", &label)?,
+                            glu_limit: &glu_limit(device, shape.experts_expansion.limit, "routed_experts", &label)?,
                         })
                         .map_err(failed!("routed_experts"))?
                         .value

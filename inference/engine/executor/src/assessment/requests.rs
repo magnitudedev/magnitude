@@ -173,7 +173,7 @@ pub struct SiteRequest {
 impl SiteRequest {
     /// The request of `binding`'s site of form `form` under `requirement`.
     pub(crate) fn of(binding: &BankBinding, form: SiteForm, requirement: seismic::NumericalRequirement) -> Self {
-        Self { form: CpuForm::of(binding, form.function), tier: binding.tier, activation: form.activation, requirement }
+        Self { form: CpuForm::of(binding, form), tier: binding.tier, activation: form.activation, requirement }
     }
 
     /// The precision system's verdict is a function of the request, the

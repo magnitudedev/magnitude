@@ -48,7 +48,10 @@
 # tiles). The form needs K a multiple of 128 and has no split-K; where it is
 # admitted it is the default, with the same results as the tiles above.
 # `activation` is the gate's function code (`functions.seismic`: 0 SiLU,
-# 1 GELU-tanh); the product is the `glu` of gate and up.
+# 1 GELU-tanh); the product is the `glu` of gate and up, clamped at the
+# limit whose F32 bits are LB (0 for none, which no limit takes): `glu_limit`
+# holds no values, and its extent LB is static on every GPU backend, which
+# compiles the clamp in only where LB > 0; the CPU reads LB at run time.
 #
 # Second-level weight scales (every entry reading packed weights): one
 # `<weight>_scale` port per weight, after every other argument, in weight
@@ -72,11 +75,11 @@
 # which applies only to weights whose packed entries are 8 bits
 # (`forms::metal_packing`): the declarations admit it only for a bounded
 # weight whose codes take it (`form(W, PACK_RESIDUE)`).
-fn dense_expand[M, O, H, F, GS, US, GB, UB](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
+fn dense_expand[M, O, H, F, GS, US, GB, UB, LB](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
     gate_weight: &tensor[F, H] GW, up_weight: &tensor[F, H] UW,
     out_rows: &tensor[O] i32, eps: f32, activation: i32,
     gate_scale: &tensor[GS] f32, up_scale: &tensor[US] f32, gate_bound: &tensor[GB] f32,
-    up_bound: &tensor[UB] f32) -> tensor[O, F] A where GS >= 0 and US >= 0 and GS <= 1 and US <= 1 and GB >= 0 and UB >= 0 and (GB == 0 or H % GB == 0) and (UB == 0 or H % UB == 0) and operands(GW) == operands(UW):
+    up_bound: &tensor[UB] f32, glu_limit: &host tensor[0, LB] i32) -> tensor[O, F] A where LB >= 0 and GS >= 0 and US >= 0 and GS <= 1 and US <= 1 and GB >= 0 and UB >= 0 and (GB == 0 or H % GB == 0) and (UB == 0 or H % UB == 0) and operands(GW) == operands(UW):
     let mut selected = tensor[O, H] f32
     parallel for row in 0..O:
         parallel for col in 0..H:
@@ -92,11 +95,14 @@ fn dense_expand[M, O, H, F, GS, US, GB, UB](residual: &tensor[M, H] f32, norm: &
     linear(normalized, up_weight, up_sum)
     scale_rows(gate_sum, gate_scale, gate)
     scale_rows(up_sum, up_scale, up)
-    glu(gate, up, product, activation)
+    let mut limit = f32(inf)
+    if LB > 0:
+        limit = bitcast_f32(u32(LB))
+    glu(gate, up, product, activation, limit)
     return product
 
 native dense_expand for metal from "metal/dense_expand.metal":
-    static (H, F, GS, US, GB, UB)
+    static (H, F, GS, US, GB, UB, LB)
     params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5, form TALL in [1, 0] default 1, arithmetic form INT8 in [0, 1] default 0,
         arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
     where GS <= 1 and US <= 1 and (TALL == 0 or H % 128 == 0) and (INT8 == 0 or (TALL == 1 and H % 512 == 0 and F % 32 == 0 and form(GW, INT8) == 1 and form(UW, INT8) == 1 and form(GW, INT8_INTERLEAVED) == form(UW, INT8_INTERLEAVED))) and (PACK == 0 or (TALL == 1 and INT8 == 0 and H % 256 == 0 and H < 1048576 and F % 32 == 0 and form(GW, PACK) == 1 and form(UW, PACK) == 1 and form(GW, PACK_FOLDS) == form(UW, PACK_FOLDS) and form(GW, PACK_RESIDUE) == form(UW, PACK_RESIDUE))) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and ((GB > 0 and form(GW, PACK_RESIDUE) == 1) or (UB > 0 and form(UW, PACK_RESIDUE) == 1)))) and (MATRIX == 0 or (H % 256 == 0 and form(GW, MATRIX) == 1 and form(UW, MATRIX) == 1))
@@ -192,7 +198,7 @@ native dense_expand for metal from "metal/dense_expand.metal":
 # paired gate/up GEMM over TILE_M x TILE_N tiles (cooperative-matrix f16
 # multiplies under SEISMIC_HAS_MATRIX, F32 FMAs otherwise).
 native dense_expand for vulkan from "vulkan/dense_expand.comp":
-    static (H, F, GS, US)
+    static (H, F, GS, US, LB)
     params (SIMDGROUPS in [16, 8, 4, 2, 32] default 16, ROWS in [1, 2, 4] default 1, arithmetic LANES in [16, 32] default 16,
             TILE_M in [128, 64, 32] default 64, TILE_N in [128, 64] default 128, SUB_M in [32, 64] default 32, SUB_N in [32, 64] default 32)
     let GEMV_GROUPS = ceil_div(F, SIMDGROUPS * ROWS * 32 / LANES)

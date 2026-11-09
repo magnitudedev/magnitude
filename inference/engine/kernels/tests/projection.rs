@@ -571,6 +571,15 @@ fn devices() -> Vec<Device> {
         .collect()
 }
 
+/// `specialization` with the clamp's static LB at `word`, on the GPU
+/// backends (the CPU reads LB at run time).
+fn with_glu_limit(device: &Device, specialization: NativeSpecialization, word: u64) -> NativeSpecialization {
+    match is_cpu(device) {
+        true => specialization,
+        false => specialization.with_static("LB", word),
+    }
+}
+
 fn is_cpu(device: &Device) -> bool {
     device.backend() == seismic::BackendName::Cpu
 }
@@ -1177,6 +1186,7 @@ fn dense_expand_specialization_on(
     )
     .with_static("GS", 0)
     .with_static("US", 0);
+    let specialization = with_glu_limit(device, specialization, 0);
     let specialization = with_absent_bounds(device, specialization, &["GB", "UB"]);
     let specialization = with_tall(device, specialization, 6, mapping.tall);
     let specialization = with_gemv_rows(
@@ -1543,11 +1553,12 @@ fn dense_expand_native(
     mapping: Mapping,
 ) -> Vec<f32> {
     dense_expand_native_arithmetic(
-        device, act, gate, up, residual, rows, norm, out_rows, eps, mapping, false,
+        device, act, gate, up, residual, rows, norm, out_rows, eps, None, mapping, false,
     )
 }
 
-/// `dense_expand` on `device`; `int8` selects Metal's INT8 form.
+/// `dense_expand` on `device`, its `glu` clamped at `limit` where there is
+/// one (LB the limit's bits); `int8` selects Metal's INT8 form.
 #[allow(clippy::too_many_arguments)]
 fn dense_expand_native_arithmetic(
     device: &Device,
@@ -1559,11 +1570,14 @@ fn dense_expand_native_arithmetic(
     norm: &[f32],
     out_rows: &[i32],
     eps: f32,
+    limit: Option<f32>,
     mapping: Mapping,
     int8: bool,
 ) -> Vec<f32> {
     let (h, f) = (gate.k, gate.rows);
-    let mut specialization = dense_expand_specialization_on(device, &[("H", h), ("F", f)], mapping);
+    let word = limit.map_or(0, |limit| u64::from(limit.to_bits()));
+    let mut specialization =
+        with_glu_limit(device, dense_expand_specialization_on(device, &[("H", h), ("F", f)], mapping), word);
     if device.backend() == BackendName::Metal {
         specialization = specialization.with_param("INT8", u64::from(int8));
     }
@@ -1597,6 +1611,7 @@ fn dense_expand_native_arithmetic(
             out_rows: &i32_tensor(device, &[out_rows.len()], out_rows),
             eps,
             activation: 0,
+            glu_limit: &i32_tensor(device, &[0, word as usize], &[]),
             gate_scale: &f32_tensor(device, &[0], &[]),
             up_scale: &f32_tensor(device, &[0], &[]),
             gate_bound: &absent_bound(device),
@@ -1615,6 +1630,7 @@ fn dense_expand_reference(
     norm: &[f32],
     out_rows: &[i32],
     eps: f32,
+    limit: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     let (h, f) = (gate.k, gate.rows);
     let mut expected = Vec::new();
@@ -1626,7 +1642,9 @@ fn dense_expand_reference(
         for n in 0..f {
             let (g, gm) = dot(&xg, gate.row(n));
             let (u, um) = dot(&xu, up.row(n));
-            let (g, u) = (act.round(g), act.round(u));
+            // DeepSeek V4.1's clamp: the gate to (-inf, L], up to [-L, L],
+            // before the activation.
+            let (g, u) = (act.round(g).min(limit), act.round(u).clamp(-limit, limit));
             let a = act.round(silu(g));
             let value = act.round(a * u);
             expected.push(value);
@@ -1701,12 +1719,14 @@ fn dense_expand_matches_its_portable_body_on(device: &Device, pairs: &[(Repr, Re
                     // No packing bounds.
                     floats(&[0], &[]),
                     floats(&[0], &[]),
+                    // No clamp.
+                    ints(&[0, 0], &[]),
                 ],
             );
             let oracle = result(&outcome, 0);
             for mapping in MAPPINGS {
                 let (_, bound) = under(out_rows.len(), || {
-                    dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
+                    dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
                 });
                 let native = dense_expand_native(
                     &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping,
@@ -1751,7 +1771,7 @@ fn dense_expand_matches_the_host_reference_across_row_classes_on(device: &Device
                 .collect::<Vec<_>>();
             for mapping in MAPPINGS {
                 let (expected, bound) = under(out_rows.len(), || {
-                    dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
+                    dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
                 });
                 let native = dense_expand_native(
                     &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping,
@@ -1785,7 +1805,7 @@ fn metal_dense_expand_scoped_launches_match_the_host() {
         let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
         let out_rows = (0..rows as i32).collect::<Vec<_>>();
         let (expected, bound) = under(rows, || {
-            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
+            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
         });
         for mapping in [MAPPINGS[0], MAPPINGS[2]] {
             let actual = dense_expand_native(
@@ -1793,6 +1813,62 @@ fn metal_dense_expand_scoped_launches_match_the_host() {
             );
             assert_within(
                 &format!("scoped dense_expand rows {rows} {mapping:?}"),
+                &actual,
+                &expected,
+                &bound,
+            );
+        }
+    }
+}
+
+/// DeepSeek V4.1's shared expert (hidden 5120, intermediate 2304) under its
+/// `swiglu_limit` 10: `dense_expand` on every device matches the f32
+/// reference of the clamp (the gate to (-inf, 10], up to [-10, 10], before
+/// SiLU) at a decode row and a prefill block, over gate sums past +10 and
+/// up sums past both sides, and departs from the unclamped expansion.
+#[test]
+fn dense_expand_clamps_deepseek41s_shared_expert() {
+    const LIMIT: f32 = 10.0;
+    let act = Act::Bf16;
+    let (h, f) = (5120, 2304);
+    let gate = weight(Repr::Bf16, f, h, 71, 16.0);
+    let up = weight(Repr::Bf16, f, h, 72, 16.0);
+    let norm = norm_values(h, 73);
+    for rows in [1usize, 32] {
+        // `Rng::symmetric` draws from [-1, 0) (`fraction` spans [0, 1/2)),
+        // as the weights do; alternating the residual's signs centers the
+        // normalized row, so the sums pass the limit on both sides.
+        let mut rng = Rng::new(rows as u64 + 74);
+        let residual = (0..rows * h)
+            .map(|at| if at % 2 == 0 { rng.symmetric() } else { -rng.symmetric() })
+            .collect::<Vec<_>>();
+        let out_rows = (0..rows as i32).collect::<Vec<_>>();
+        let (x, _) = rms_row(act, &residual[..h], &norm, 1e-6);
+        let sums = |weight: &Weight| {
+            let x = weight.operand_rows(&x);
+            (0..f).map(|n| act.round(dot(&x, weight.row(n)).0)).collect::<Vec<_>>()
+        };
+        let (gates, ups) = (sums(&gate), sums(&up));
+        assert!(gates.iter().any(|gate| *gate > LIMIT), "a gate sum passes +{LIMIT}");
+        assert!(
+            ups.iter().any(|up| *up > LIMIT) && ups.iter().any(|up| *up < -LIMIT),
+            "up sums pass ±{LIMIT}"
+        );
+        let (expected, bound) =
+            under(rows, || dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, LIMIT));
+        let (unclamped, _) = under(rows, || {
+            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
+        });
+        assert!(
+            expected.iter().zip(&unclamped).zip(&bound).any(|((clamped, plain), bound)| (clamped - plain).abs() > *bound),
+            "the clamp moves the expansion past its bound"
+        );
+        for device in devices() {
+            let actual = dense_expand_native_arithmetic(
+                &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, Some(LIMIT), MAPPINGS[0], false,
+            );
+            assert_within(
+                &format!("{:?} DeepSeek V4.1 shared expert rows {rows}", device.backend()),
                 &actual,
                 &expected,
                 &bound,
@@ -1830,7 +1906,7 @@ fn metal_dense_expand_matrix_pair_matches_host() {
                     let residual = uniform_values(rows * h, rows as u64, 1.0);
                     let out_rows = (0..rows as i32).rev().collect::<Vec<_>>();
                     let (expected, bound) = under(rows, || {
-                        dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
+                        dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
                     });
                     for parts in [1, 2, 4] {
                         let mapping = Mapping {
@@ -2010,7 +2086,7 @@ fn metal_tall_gemm_is_bit_identical_to_the_staged_tiles() {
             };
             let (expand_staged, output_staged) = (expand(staged), output(staged));
             let (expand_expected, expand_bound) = under(rows, || {
-                dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
+                dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
             });
             let (output_expected, output_bound) = under(rows, || {
                 dense_output_reference(act, &down, &narrow, &product, &out_rows)
@@ -2761,7 +2837,8 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
             let residual = (0..rows * h).map(|_| rng.symmetric()).collect::<Vec<_>>();
             let out_rows = (0..rows as i32).collect::<Vec<_>>();
             let exact = dense_expand_native_arithmetic(
-                &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, staged, false,
+                &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, None, staged,
+                false,
             );
             let mut first: Option<Vec<f32>> = None;
             let (gate_bound, gate_bound_extent) = gate.bound(&device);
@@ -2817,6 +2894,7 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
                             out_rows: &i32_tensor(&device, &[rows], &out_rows),
                             eps: 1e-6,
                             activation: 0,
+                            glu_limit: &i32_tensor(&device, &[0, 0], &[]),
                             gate_scale: &f32_tensor(&device, &[0], &[]),
                             up_scale: &f32_tensor(&device, &[0], &[]),
                             gate_bound: &gate_bound,
@@ -3236,8 +3314,8 @@ fn metal_int8_dense_expand_agrees_with_the_tall_form() {
             let out_rows = (0..rows as i32).collect::<Vec<_>>();
             let run = |mapping, int8| {
                 dense_expand_native_arithmetic(
-                    &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, mapping,
-                    int8,
+                    &device, act, &gate, &up, &residual, rows, &norm, &out_rows, 1e-6, None,
+                    mapping, int8,
                 )
             };
             let exact = run(staged, false);
@@ -3787,7 +3865,7 @@ fn dense_entries_at_4b_geometry_match_the_host_reference_and_single_rows_on(devi
     for rows in 1..=rows_max {
         let out_rows = (0..rows as i32).collect::<Vec<_>>();
         let (expected, bound) = under(rows, || {
-            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6)
+            dense_expand_reference(act, &gate, &up, &residual, &norm, &out_rows, 1e-6, f32::INFINITY)
         });
         let native = dense_expand_native(
             &device, act, &gate, &up, &residual, rows_max, &norm, &out_rows, 1e-6, mapping,
@@ -6381,7 +6459,7 @@ fn metal_q4_verify_rows_match_host() {
             .collect::<Vec<_>>();
         let out_rows = (0..rows as i32).rev().collect::<Vec<_>>();
         let (expected, bounds) = under(rows, || {
-            dense_expand_reference(act, &gate, &up, &source, &norm, &out_rows, 1e-6)
+            dense_expand_reference(act, &gate, &up, &source, &norm, &out_rows, 1e-6, f32::INFINITY)
         });
         for parts in [1, 4] {
             let mapping = Mapping {

@@ -23,12 +23,29 @@ fn activate[M, N](x: &tensor[M, N] T, result: &mut tensor[M, N] U, function: i32
 # The gated expansion, the one formula of every gate/up pair (dense, routed
 # and shared experts) and of its natives (the projection library's `Glu`
 # epilogue): with `gate` and `up` the F32 accumulators times their scales,
-# published in A, result = A(A(act(gate)) * up) (`activate`'s codes).
-fn glu[M, N](gate: &tensor[M, N] A, up: &tensor[M, N] A, result: &mut tensor[M, N] A, function: i32):
-    activate(gate, result, function)
+# published in A, result = A(A(act(min(gate, L))) * clamp(up, -L, L))
+# (`activate`'s codes; L = `limit`). The clamp is written `x > L ? L : x`
+# (and `x < -L ? -L : x`), so a NaN stays NaN and L = inf is the identity,
+# which every unclamped caller passes (DeepSeek V4.1's `swiglu_limit`: the
+# gate above only, up on both sides, in F32 before the activation).
+fn glu[M, N](gate: &tensor[M, N] A, up: &tensor[M, N] A, result: &mut tensor[M, N] A, function: i32,
+    limit: f32):
+    let mut clamped = tensor[M, N] f32
     parallel for rows in 0..M:
         parallel for cols in 0..N:
-            result[rows, cols] = f32(result[rows, cols]) * f32(up[rows, cols])
+            let mut g = f32(gate[rows, cols])
+            if g > limit:
+                g = limit
+            clamped[rows, cols] = g
+    activate(clamped, result, function)
+    parallel for rows in 0..M:
+        parallel for cols in 0..N:
+            let mut u = f32(up[rows, cols])
+            if u > limit:
+                u = limit
+            if u < -limit:
+                u = -limit
+            result[rows, cols] = f32(result[rows, cols]) * u
 
 # A projection entry's input rows, rounded to the result's element: the
 # RMS-normalized residual (`N = H`, `P = 1`), or the sum in part order of the
@@ -218,4 +235,4 @@ fn route_shared[M, H, PT, NM, E, K, S, ES](residual: &tensor[M, PT * H] f32,
                 up = fma(up_row[source], f32(shared_up[feature, source]), up)
             gates[row, feature] = gate
             ups[row, feature] = up
-    glu(gates, ups, shared_product, 0)
+    glu(gates, ups, shared_product, 0, inf)

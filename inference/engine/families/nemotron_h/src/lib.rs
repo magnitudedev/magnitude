@@ -447,6 +447,7 @@ impl Geometry {
                 selection: ExpertSelection::TopK {
                     bias: Some(binder.bind(&format!("{prefix}exp_probs_b.bias"), &[experts])?),
                 },
+                media_bias: None,
                 // The released model divides by `sum + 1e-20` (llama.cpp
                 // clamps the sum at 6.1e-5 instead); the model definition
                 // governs.

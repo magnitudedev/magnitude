@@ -295,6 +295,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                                 out_rows: &out_rows,
                                 eps: EPSILON,
                                 activation: 0,
+                                glu_limit: &i32_tensor(&device, &[0, 0], &[]),
                                 gate_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[])
                                     .unwrap(),
                                 up_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[])
@@ -385,6 +386,7 @@ fn real_12b_physical_f16_projection_operands() {
         &(0..rows as i32).collect::<Vec<_>>(),
     );
     let absent = f32_tensor(&device, &[0], &[]);
+    let no_limit = i32_tensor(&device, &[0, 0], &[]);
     let kernel = |operand| {
         dense_expand::native_for_device_with(
             &device,
@@ -405,7 +407,8 @@ fn real_12b_physical_f16_projection_operands() {
                     .with_static("H", hidden as u64)
                     .with_static("F", intermediate as u64)
                     .with_static("GS", 0)
-                    .with_static("US", 0),
+                    .with_static("US", 0)
+                    .with_static("LB", 0),
             )
             .with_param("OPERAND", operand),
         )
@@ -419,6 +422,7 @@ fn real_12b_physical_f16_projection_operands() {
         out_rows: &out_rows,
         eps: 1e-6,
         activation: 1,
+        glu_limit: &no_limit,
         gate_scale: &absent,
         up_scale: &absent,
         gate_bound: &absent,
@@ -653,6 +657,7 @@ fn real_26b_grouped_physical_f16_operands() {
                 .with_static("F", f as u64)
                 .with_static("GS", 0)
                 .with_static("US", 0)
+                .with_static("LB", 0)
                 .with_param("OPERAND", operand),
         )
         .unwrap()
@@ -666,6 +671,7 @@ fn real_26b_grouped_physical_f16_operands() {
         Tensor::zeros(&device, Element::i32(), &[0]).unwrap(),
     );
     let first = Tensor::zeros(&device, Element::i32(), &[1]).unwrap();
+    let no_limit = Tensor::zeros(&device, Element::i32(), &[0, 0]).unwrap();
     let args = || magnitude_kernels::routed_experts::Args {
         first: &first,
         rows: &rows,
@@ -682,6 +688,7 @@ fn real_26b_grouped_physical_f16_operands() {
         records_up: &up,
         records_down: &down,
         activation: 1,
+        glu_limit: &no_limit,
         gate_scale: &unscaled,
         up_scale: &unscaled,
     };

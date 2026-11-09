@@ -13,6 +13,7 @@
 // the slot map places them (`routed::expert_weights`).
 
 use lib::core::activation;
+use lib::core::functions;
 use lib::projection::projection;
 use lib::routed::routed;
 
@@ -102,6 +103,7 @@ fn routed_experts_expand<L: Isa, E: Elements>(
             &staged[source * h..(source + 1) * h],
             q8,
             cx.arg_activation(),
+            functions::glu_limit(cx.dim_lb()),
             scales,
             out,
         );

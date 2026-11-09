@@ -398,6 +398,7 @@ mod tests {
                     intermediate: 512,
                     up: FeedForwardUp::Gated {
                         activation: ActivationFunction::Silu,
+                        limit: None,
                         gate: tensor(name("ffn_gate"), vec![512, HIDDEN]),
                         up: tensor(name("ffn_up"), vec![512, HIDDEN]),
                     },
@@ -422,11 +423,13 @@ mod tests {
                         selection: ExpertSelection::TopK {
                             bias: Some(tensor(name("exp_probs_b"), vec![experts])),
                         },
+                        media_bias: None,
                         normalization: RouteNormalization::SumPlusEpsilon(1e-6),
                         scale: 1.0,
                     },
                     expert_up: FeedForwardUp::Gated {
                         activation: ActivationFunction::Silu,
+                        limit: None,
                         gate: tensor(name("ffn_gate_exps"), vec![experts, features, HIDDEN]),
                         up: tensor(name("ffn_up_exps"), vec![experts, features, HIDDEN]),
                     },

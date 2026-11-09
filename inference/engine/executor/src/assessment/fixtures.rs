@@ -230,6 +230,7 @@ pub(crate) fn declared_model(
     };
     let silu = |gate, up| FeedForwardUp::Gated {
         activation: ActivationFunction::Silu,
+        limit: None,
         gate,
         up,
     };
@@ -336,6 +337,7 @@ pub(crate) fn declared_model(
                     input: RouterInput::Operator,
                     score: ScoreFunction::Softmax,
                     selection: ExpertSelection::TopK { bias: None },
+                    media_bias: None,
                     normalization: RouteNormalization::Sum,
                     scale: 1.0,
                 },

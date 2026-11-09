@@ -18,7 +18,7 @@ use super::{
 };
 use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
 use crate::planning::{BankBinding, HINT_LEADS, HintWeight};
-use magnitude_family_contracts::{Operator, RouteNormalization, WeightKind, WeightScope};
+use magnitude_family_contracts::{GluLimit, Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::constants::{
     DECODE_GRIDS, MAP_RECORD, MAP_WORDS, POLICY_PRICED, POLICY_WORDS, SOURCE_ROWS, STEP_LOW, STEP_WORDS,
 };
@@ -1008,6 +1008,8 @@ pub(crate) struct RoutedChoicesCase {
     tier_up: Tensor,
     /// The experts' gate and up scales.
     scales: ExpansionScales,
+    /// No clamp: the host port `[0, LB]` at LB = 0.
+    glu_limit: Tensor,
 }
 
 impl EntryTuning for RoutedChoicesTuning {
@@ -1033,6 +1035,7 @@ impl EntryTuning for RoutedChoicesTuning {
             ("H", shape.hidden),
             ("K", shape.selected),
             ("F", shape.features),
+            ("LB", GluLimit::word(None)),
         ];
         statics.extend(ExpansionScales::statics(inputs, &self.scopes, true)?);
         Ok(statics)
@@ -1068,6 +1071,7 @@ impl EntryTuning for RoutedChoicesTuning {
                     expert_gate,
                     expert_up,
                     scales: ExpansionScales::at(inputs, scope, true)?,
+                    glu_limit: inputs.i32s(&[0, GluLimit::word(None)], &[])?,
                 })
             })
             .collect()
@@ -1082,10 +1086,11 @@ impl EntryTuning for RoutedChoicesTuning {
             expert_up: &case.expert_up,
             tier_gate: &case.tier_gate,
             tier_up: &case.tier_up,
-            // SiLU: the fused Qwen form's experts.
+            // SiLU, unclamped: the fused Qwen form's experts.
             activation: 0,
             gate_scale: &case.scales.gate,
             up_scale: &case.scales.up,
+            glu_limit: &case.glu_limit,
         }
     }
 
@@ -1338,6 +1343,8 @@ pub(crate) struct RoutedExpertsCase {
     expert_down: Tensor,
     /// The experts' gate and up scales.
     scales: ExpansionScales,
+    /// No clamp: the host port `[0, LB]` at LB = 0.
+    glu_limit: Tensor,
 }
 
 impl RoutedExpertsTuning {
@@ -1370,7 +1377,7 @@ impl EntryTuning for RoutedExpertsTuning {
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        let mut statics = vec![("H", self.shape.hidden), ("F", self.shape.features)];
+        let mut statics = vec![("H", self.shape.hidden), ("F", self.shape.features), ("LB", GluLimit::word(None))];
         statics.extend(ExpansionScales::statics(inputs, &self.scopes, true)?);
         Ok(statics)
     }
@@ -1404,6 +1411,7 @@ impl EntryTuning for RoutedExpertsTuning {
                     expert_up: inputs.weight(scope, WeightKind::ExpertUp)?,
                     expert_down: inputs.weight(scope, WeightKind::ExpertDown)?,
                     scales: ExpansionScales::at(inputs, scope, true)?,
+                    glu_limit: inputs.i32s(&[0, GluLimit::word(None)], &[])?,
                 })
             })
             .collect()
@@ -1428,6 +1436,7 @@ impl EntryTuning for RoutedExpertsTuning {
             activation: 0,
             gate_scale: &case.scales.gate,
             up_scale: &case.scales.up,
+            glu_limit: &case.glu_limit,
         }
     }
 

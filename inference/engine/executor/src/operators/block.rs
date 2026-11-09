@@ -27,6 +27,7 @@ use super::routed::graph::{
     CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum,
     general_pass, general_routed,
 };
+use super::routed::Expansion;
 use super::routed::split::{PassPorts, Split};
 use super::routed::streamed::{LayerBank, scratch_fill};
 use super::short_conv::graph::{
@@ -788,7 +789,7 @@ impl BlockSublayers<'_> {
                         mixed,
                         rows,
                         epsilon,
-                        dense_ffn::activation_code(operator.up.activation()),
+                        Expansion::of(&operator.up),
                         post_norm_epsilon(sublayer.output).unwrap_or_default() as f32,
                         output_scales.feed_forward,
                     )?
@@ -882,7 +883,7 @@ impl BlockSublayers<'_> {
                         &GeneralRoutedShape::of(geometry.hidden, branches.routed)
                             .map_err(|error| error.to_string())?,
                         epsilon,
-                        dense_ffn::activation_code(branches.dense.up.activation()),
+                        Expansion::of(&branches.dense.up),
                         output_scales.feed_forward,
                         split,
                     )?;

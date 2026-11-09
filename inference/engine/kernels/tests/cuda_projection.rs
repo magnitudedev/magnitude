@@ -152,6 +152,7 @@ fn dense_expand_matches_host_model(format: Format) {
                     out_rows: &out_rows,
                     eps: EPSILON,
                     activation: 0,
+                    glu_limit: &i32_tensor(&device, &[0, 0], &[]),
                     gate_scale: &f32_tensor(&device, &[0], &[]),
                     up_scale: &f32_tensor(&device, &[0], &[]),
                     gate_bound: &f32_tensor(&device, &[0], &[]),
@@ -300,6 +301,7 @@ fn gemm_row_bands_match_host_model(format: Format) {
                     out_rows: &out_rows,
                     eps: EPSILON,
                     activation: 0,
+                    glu_limit: &i32_tensor(&device, &[0, 0], &[]),
                     gate_scale: &f32_tensor(&device, &[0], &[]),
                     up_scale: &f32_tensor(&device, &[0], &[]),
                     gate_bound: &f32_tensor(&device, &[0], &[]),
@@ -377,6 +379,7 @@ fn tuning_requirement() -> seismic::NumericalRequirement {
 fn cuda_dense_expand_scoped_tuning_is_factored() {
     let Some(device) = cuda() else { return };
     let absent_scale = f32_tensor(&device, &[0], &[]);
+    let no_limit = i32_tensor(&device, &[0, 0], &[]);
     let mut rng = Rng(731);
     let (h, f) = (512usize, 272usize);
     let gate = weight(&device, Format::Q4K, f, h, &mut rng);
@@ -411,6 +414,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
                 out_rows,
                 eps: EPSILON,
                 activation: 0,
+                glu_limit: &no_limit,
                 gate_scale: &absent_scale,
                 up_scale: &absent_scale,
                 gate_bound: &absent_scale,
@@ -431,7 +435,8 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         .with_static("H", h as u64)
         .with_static("F", f as u64)
         .with_static("GS", 0)
-        .with_static("US", 0);
+        .with_static("US", 0)
+        .with_static("LB", 0);
     let result = dense_expand::native_tune_with(
         &device,
         dense_expand::Elements {
@@ -577,6 +582,7 @@ fn cuda_dense_weights_match_host_model() {
                     out_rows: &out_rows,
                     eps: EPSILON,
                     activation: 0,
+                    glu_limit: &i32_tensor(&device, &[0, 0], &[]),
                     gate_scale: &f32_tensor(&device, &[0], &[]),
                     up_scale: &f32_tensor(&device, &[0], &[]),
                     gate_bound: &f32_tensor(&device, &[0], &[]),
@@ -675,6 +681,7 @@ fn gemv_rows_match_single_row_bits(format: Format) {
                     out_rows: &out_rows,
                     eps: EPSILON,
                     activation: 0,
+                    glu_limit: &i32_tensor(&device, &[0, 0], &[]),
                     gate_scale: &f32_tensor(&device, &[0], &[]),
                     up_scale: &f32_tensor(&device, &[0], &[]),
                     gate_bound: &f32_tensor(&device, &[0], &[]),
@@ -1063,11 +1070,12 @@ fn dense_expand_host_model_matches_portable_body(format: Format) {
         Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::I32, vec![o], rows))),
         Arg::Scalar(ReferenceScalar::F32(EPSILON.to_bits())),
         Arg::Scalar(ReferenceScalar::I32(0)),
-        // No scales and no bounds.
+        // No scales, no bounds and no clamp.
         Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
         Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
         Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
         Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::F32, vec![0], vec![]))),
+        Arg::Tensor(interpreter.add_tensor(TensorData::dense(DType::I32, vec![0, 0], vec![]))),
     ];
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {

@@ -712,6 +712,7 @@ pub(crate) mod tests {
             intermediate: 4,
             up: FeedForwardUp::Gated {
                 activation: ActivationFunction::Silu,
+                limit: None,
                 gate: weight(&format!("{p}g"), &[4, 2]),
                 up: weight(&format!("{p}u"), &[4, 2]),
             },

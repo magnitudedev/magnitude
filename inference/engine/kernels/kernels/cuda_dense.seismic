@@ -37,7 +37,7 @@
 # expansion's last blocks (Nemotron 3.5 Bolt decode on GB10: 33.6 -> 25.0 us).
 
 native dense_expand for cuda from "cuda/dense_expand.cu":
-    static (H, F, GS, US)
+    static (H, F, GS, US, LB)
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
     where H % 64 == 0 and GS <= 1 and US <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or (form(GW, INT8) == 1 and form(UW, INT8) == 1))
     scratch staged bytes (O * H * 2) when O > 1

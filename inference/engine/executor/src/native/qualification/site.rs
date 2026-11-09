@@ -101,6 +101,7 @@ pub(crate) fn admit_site(device: &Device, request: &SiteRequest) -> Result<Resul
     // f64 and rounded once.
     let dot = |weights: &[f32], x: &[f32]| weights.iter().zip(x).map(|(w, x)| f64::from(*w) * f64::from(*x)).sum::<f64>() as f32;
     let mut reference = vec![0.0f32; rows * hidden];
+    let glu = crate::experts::gated(request.form.function, request.form.limit);
     for &(row, record, weight, expert) in &entries {
         let x = &values[row * hidden..(row + 1) * hidden];
         fn matrix(held: &Held, record: usize, row: usize, width: usize) -> &[f32] {
@@ -111,11 +112,10 @@ pub(crate) fn admit_site(device: &Device, request: &SiteRequest) -> Result<Resul
             .map(|feature| {
                 let up = scaled(&scales.up, dot(matrix(&held.up, record, feature, hidden), x));
                 match &held.gate {
-                    Some(gate) => functions::glu::<seismic::cpu::F32>(
-                        request.form.function,
-                        scaled(&scales.gate, dot(matrix(gate, record, feature, hidden), x)),
-                        up,
-                    ),
+                    Some(gate) => {
+                        let gate = scaled(&scales.gate, dot(matrix(gate, record, feature, hidden), x));
+                        glu(gate, up)
+                    }
                     None => functions::activate(request.form.function, up),
                 }
             })

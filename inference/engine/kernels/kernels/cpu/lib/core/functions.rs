@@ -50,6 +50,26 @@ pub fn glu<A: Dense>(function: i32, gate: f32, up: f32) -> f32 {
     activation::publish::<A>(A::widen(activated::<A>(function, gate)) * activation::publish::<A>(up))
 }
 
+/// The limit L of an expansion whose LB (`glu_limit`'s extent, functions.seismic's
+/// `glu`) is `word`: the F32 of those bits, or none for 0, which no limit takes.
+#[inline(always)]
+pub fn glu_limit(word: u64) -> Option<f32> {
+    (word != 0).then(|| f32::from_bits(u32::try_from(word).expect("LB is the bits of an F32")))
+}
+
+/// [`glu`] clamped at `limit`: the published gate to (-inf, limit] and the
+/// published up to [-limit, limit], each written `x > L ? L : x` so a NaN
+/// stays NaN.
+#[inline(always)]
+pub fn clamped_glu<A: Dense>(function: i32, limit: f32, gate: f32, up: f32) -> f32 {
+    let gate = activation::publish::<A>(gate);
+    let gate = if gate > limit { limit } else { gate };
+    let up = activation::publish::<A>(up);
+    let up = if up > limit { limit } else { up };
+    let up = if up < -limit { -limit } else { up };
+    activation::publish::<A>(A::widen(A::narrow(activate(function, gate))) * up)
+}
+
 /// A gated delta net's output gate on `z`, by the code the entries take
 /// (`gate_function: i32`): 0 SiLU, 1 sigmoid.
 pub const GATE_SIGMOID: i32 = 1;

@@ -1619,6 +1619,8 @@ pub struct CpuForm {
     pub(crate) experts: u64,
     /// The site's expansion function (`functions::activate`).
     pub(crate) function: i32,
+    /// The site's expansion clamp (`functions::clamped_glu`'s `limit`).
+    pub(crate) limit: Option<magnitude_family_contracts::GluLimit>,
     /// The site table's slots, and the choices of the decode form's widest
     /// launch it holds.
     pub(crate) flight: u64,
@@ -1655,6 +1657,7 @@ impl CpuForm {
             choices: CHOICES,
             experts: 256,
             function: crate::operators::routed::FUSED_ACTIVATION,
+            limit: None,
             flight: crate::planning::FlightDepth::PIPELINED.steps(1),
             widest: CHOICES,
         }))
@@ -1679,13 +1682,14 @@ impl CpuForm {
         Ok(super::cost::CpuLines { expert: super::cost::RowLine { one: scale(lines.expert.one)?, row }, handshake: lines.handshake })
     }
 
-    /// The form of a site over `binding`, expanding by `function`.
-    pub(crate) fn of(binding: &BankBinding, function: i32) -> Self {
+    /// The form of a site over `binding`, expanding as `form`.
+    pub(crate) fn of(binding: &BankBinding, form: crate::native::SiteForm) -> Self {
         Self {
             record: binding.record,
             choices: binding.selected,
             experts: binding.experts,
-            function,
+            function: form.function,
+            limit: form.limit,
             flight: binding.words.site().slots(),
             widest: binding.words.choices,
         }
@@ -1703,6 +1707,11 @@ impl CpuForm {
             ("flight", self.flight),
             ("widest", self.widest),
         ]);
+        // A clamped site's limit as its word; an unclamped site's key is
+        // the one it had before sites clamped.
+        if self.limit.is_some() {
+            configuration.insert("limit".to_owned(), magnitude_family_contracts::GluLimit::word(self.limit));
+        }
         for (name, tensor) in self.record.iter() {
             configuration.insert(format!("{name:?}_{}_n", tensor.resident.name()), tensor.matrix[0]);
             configuration.insert(format!("{name:?}_{}_k", tensor.resident.name()), tensor.matrix[1]);
@@ -2029,6 +2038,7 @@ mod tests {
             choices: 4,
             experts: 16,
             function: 0,
+            limit: None,
             flight: 4,
             widest: 4 * magnitude_kernels::constants::DECODE_ROWS,
         };

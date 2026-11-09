@@ -480,7 +480,7 @@ fn stored_experts(package: &Package, definition: &ModelDefinition) -> Vec<[Stack
 fn site_answers(
     domain: &ExecutorDomain,
     stored: &[[Stack; 3]],
-    function: i32,
+    expansion: crate::operators::routed::Expansion,
     backend: seismic::BackendName,
     step: usize,
 ) -> Vec<(usize, usize, u64)> {
@@ -507,7 +507,7 @@ fn site_answers(
                     (*weight, crate::experts::ExpertValues { gate: Some(gate.as_slice()), up, down, scales: *scales })
                 })
                 .collect::<Vec<_>>();
-            let (expected, bound) = crate::experts::site_reference(function, x, &named);
+            let (expected, bound) = crate::experts::site_reference(expansion.activation, expansion.limit, x, &named);
             for (channel, ((got, want), bound)) in output.iter().zip(&expected).zip(&bound).enumerate() {
                 assert!(
                     (got - want).abs() <= *bound,
@@ -534,17 +534,15 @@ fn scores(
     filled: Filled,
 ) -> Scores {
     let stored = stored_experts(package, definition);
-    let function = definition
+    let expansion = definition
         .decoder
         .sublayers()
         .find_map(|(_, sublayer)| match &sublayer.op {
-            magnitude_family_contracts::Operator::RoutedFfn(routed) => match &routed.expert_up {
-                magnitude_family_contracts::FeedForwardUp::Gated { activation, .. } => Some(*activation),
-                _ => None,
-            },
+            magnitude_family_contracts::Operator::RoutedFfn(routed) => {
+                Some(crate::operators::routed::Expansion::of(&routed.expert_up)).filter(|expansion| expansion.gated)
+            }
             _ => None,
         })
-        .map(crate::operators::dense_ffn::activation_code)
         .expect("the fixture's routed layers are gated");
     let mut scores = Vec::new();
     for banked in [Banked::Resident, banked] {
@@ -599,13 +597,13 @@ fn scores(
         let (outcome, mut returned) =
             run(&mut domain, bindings, scored(forward(request, WorkKind::Prefill, &[5, 1], 0, true)), false, backend);
         // The prompt step's misses reach the site as a decode step's do.
-        let mut sited = site_answers(&domain, &stored, function, backend, 0);
+        let mut sited = site_answers(&domain, &stored, expansion, backend, 0);
         let mut steps = vec![step_bits(&outcome)];
         for position in 2..2 + DECODE_STEPS {
             let token = (position * 37 % 256) as u32;
             let (outcome, next) =
                 run(&mut domain, returned, scored(forward(request, WorkKind::Decode, &[token], position, true)), false, backend);
-            sited.extend(site_answers(&domain, &stored, function, backend, steps.len()));
+            sited.extend(site_answers(&domain, &stored, expansion, backend, steps.len()));
             steps.push(step_bits(&outcome));
             returned = next;
         }
@@ -2212,8 +2210,8 @@ const SINKHORN: (usize, usize, f32, u32) = (4, 128, 1e-6, 20);
 /// 2. the gate (and, beside it, the up) projection in A (decode
 ///    `routed_gate_up` 1139-1181: 1163-1177; prompt `routed_experts`
 ///    625-689: 634-669);
-/// 3. `glu`'s activation in A (`functions.seismic:28`);
-/// 4. `glu`'s product with up in A (`functions.seismic:31`);
+/// 3. `glu`'s activation in A (`functions.seismic:40`);
+/// 4. `glu`'s product with up in A (`functions.seismic:48`);
 /// 5. the down projection in A (decode `decode_down` 1224-1240: 1239;
 ///    prompt `routed_experts` 679).
 ///

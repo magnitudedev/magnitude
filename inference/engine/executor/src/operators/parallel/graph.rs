@@ -12,7 +12,7 @@ use crate::operators::dense_ffn::graph::dimensions as dense_dimensions;
 use crate::operators::routed::graph::{
     CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum, general_routed,
 };
-use crate::operators::routed::{split::Split, streamed::LayerBank};
+use crate::operators::routed::{Expansion, split::Split, streamed::LayerBank};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{WeightPort, packed_weight, weight};
@@ -79,8 +79,8 @@ impl CheckedParallelEntries {
 
 /// The parallel sublayer `sublayer` over `residual` (`[rows, D]` F32): the
 /// new residual, and the sequence input a run of a streamed routed branch
-/// writes (its `bank`, `general_routed`). `activation` is the dense
-/// branch's activation code, `scale` the tail's layer scale. A split
+/// writes (its `bank`, `general_routed`). `expansion` is the dense
+/// branch's, `scale` the tail's layer scale. A split
 /// sublayer's front is its routed branch's, and its back the rest.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
@@ -95,7 +95,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
     rows: u64,
     routed_shape: &GeneralRoutedShape,
     epsilon: f32,
-    activation: i32,
+    expansion: Expansion,
     scale: f32,
     split: Option<Split<'_>>,
 ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
@@ -147,6 +147,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                     ("US", up.operands.scale.extent),
                     ("GB", gate.operands.bound.extent),
                     ("UB", up.operands.bound.extent),
+                    ("LB", magnitude_family_contracts::GluLimit::word(expansion.limit)),
                 ],
             ]
             .concat(),
@@ -157,11 +158,12 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                 up_weight: (&up.weight).into(),
                 out_rows: out_rows.port().tensor().into(),
                 eps: epsilon,
-                activation,
+                activation: expansion.activation,
                 gate_scale: (&gate.operands.scale.tensor).into(),
                 up_scale: (&up.operands.scale.tensor).into(),
                 gate_bound: (&gate.operands.bound.tensor).into(),
                 up_bound: (&up.operands.bound.tensor).into(),
+                glu_limit: (&crate::operators::glu_limit(out_rows.port().tensor(), expansion.limit)).into(),
             },
         )?
         .value;

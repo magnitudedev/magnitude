@@ -18,7 +18,8 @@
 //   Store<E>   y = round_E(acc)
 //   Residual   y = residual[row(m), n] + round_A(acc)                  (F32)
 //   SiluMul    y = round_A(round_A(silu(round_A(gate))) * round_A(up))
-//   Glu        y = round_A(round_A(act(round_A(gate))) * round_A(up))  (act by code)
+//   Glu        y = round_A(round_A(act(round_A(gate))) * round_A(up))  (act by code;
+//              clamped where the entry's LB states a limit)
 //   Activated  y = round_A(act(round_A(acc)))                    (up-only, ReLU²)
 //   Mul        y = gate * up                                   (F32, unrounded)
 //   ActivatedMul y = round_A(round_A(act(round_A(acc))) * external[m, n])
@@ -428,9 +429,13 @@ struct SiluMul {
     }
 };
 
-// Activation-generic GLU (paired):
+// Activation-generic GLU (paired), `glu` (functions.seismic):
 //   y = round_A(round_A(act(round_A(gate))) * round_A(up))
-// with `function` a `functions::` code (SiLU gives SiluMul's bits).
+// with `function` a `functions::` code (SiLU gives SiluMul's bits). An
+// entry that defines PROJECTION_GLU_LIMIT (its static LB, nonzero: the F32
+// bits of its expansion's limit L) compiles in the clamp: the rounded gate
+// to (-inf, L] and up to [-L, L], each written `x > L ? L : x` so a NaN stays
+// NaN. Any other entry compiles none.
 template <typename A>
 struct Glu {
     device uchar *y;
@@ -439,6 +444,12 @@ struct Glu {
     void store_pair(uint m, uint n, float gate_sum, float up_sum) const {
         float gate = A::round(gate_sum);
         float up = A::round(up_sum);
+#if defined(PROJECTION_GLU_LIMIT)
+        const float limit = as_type<float>(uint(PROJECTION_GLU_LIMIT));
+        gate = gate > limit ? limit : gate;
+        up = up > limit ? limit : up;
+        up = up < -limit ? -limit : up;
+#endif
         float activated = A::round(functions::activate(function, gate));
         reinterpret_cast<device typename A::storage *>(y)
             [ulong(m) * stride0 + ulong(n) * stride1] = A::store(activated * up);

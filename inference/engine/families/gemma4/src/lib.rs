@@ -526,6 +526,7 @@ fn dense(b: &mut Tensors, p: &str, hidden: u64, intermediate: u64) -> Result<Ope
         intermediate,
         up: FeedForwardUp::Gated {
             activation: ActivationFunction::GeluTanh,
+            limit: None,
             gate: b.bind(&format!("{p}ffn_gate.weight"), &[intermediate, hidden])?,
             up: b.bind(&format!("{p}ffn_up.weight"), &[intermediate, hidden])?,
         },
@@ -553,6 +554,7 @@ fn routed(b: &mut Tensors, shape: &Shape, p: &str, experts: &Experts) -> Result<
     };
     let expert_up = FeedForwardUp::Gated {
         activation: ActivationFunction::GeluTanh,
+        limit: None,
         gate: half(0)?,
         up: half(experts.intermediate)?,
     };
@@ -572,6 +574,7 @@ fn routed(b: &mut Tensors, shape: &Shape, p: &str, experts: &Experts) -> Result<
             input: RouterInput::Residual(shape.rms(router_input)),
             score: ScoreFunction::Softmax,
             selection: ExpertSelection::TopK { bias: None },
+            media_bias: None,
             // The released router divides the selected probabilities by
             // their plain sum.
             normalization: RouteNormalization::Sum,

@@ -3677,6 +3677,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
         let (features, hidden) = (128, 128);
         let silu = |gate: &str, up: &str, extents: &[u64]| FeedForwardUp::Gated {
             activation: ActivationFunction::Silu,
+            limit: None,
             gate: descriptor(gate, extents),
             up: descriptor(up, extents),
         };
@@ -3691,6 +3692,7 @@ fn a_streamed_load_searches_every_streamed_case_on_the_device() {
                     input: RouterInput::Operator,
                     score,
                     selection: ExpertSelection::TopK { bias: None },
+                    media_bias: None,
                     normalization: RouteNormalization::Sum,
                     scale: 1.0,
                 },

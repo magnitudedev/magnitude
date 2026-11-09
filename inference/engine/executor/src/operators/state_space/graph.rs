@@ -388,6 +388,7 @@ mod tests {
                         selection: ExpertSelection::TopK {
                             bias: Some(tensor(name("exp_probs_b"), vec![experts])),
                         },
+                        media_bias: None,
                         normalization: RouteNormalization::SumPlusEpsilon(1e-20),
                         scale: 2.5,
                     },

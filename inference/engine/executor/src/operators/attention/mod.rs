@@ -741,6 +741,7 @@ mod tests {
                         intermediate: 512,
                         up: FeedForwardUp::Gated {
                             activation: ActivationFunction::Silu,
+                            limit: None,
                             gate: tensor(name("ffn_gate"), vec![512, HIDDEN]),
                             up: tensor(name("ffn_up"), vec![512, HIDDEN]),
                         },

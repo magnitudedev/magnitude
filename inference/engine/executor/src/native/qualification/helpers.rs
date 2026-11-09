@@ -585,6 +585,17 @@ pub(super) fn any_row_bound<E: seismic::Entry>(
     semantic_f32(device, &[extent], &vec![32.0 * 128.0 * 128.0; count], entry, bindings)
 }
 
+/// A gated expansion's host port `glu_limit` for `limit`: no values, at
+/// extents `[0, LB]` (`GluLimit::word`).
+pub(super) fn glu_limit(
+    device: &Device,
+    limit: Option<magnitude_family_contracts::GluLimit>,
+    entry: &'static str,
+    bindings: &str,
+) -> Result<Tensor, CatalogFailure> {
+    semantic_i32(device, &[0, magnitude_family_contracts::GluLimit::word(limit)], &[], entry, bindings)
+}
+
 /// A unit accumulator scale for `kernel`'s scale port whose static is
 /// `name`: ones at its static extent (0, absent, where the native has no
 /// such static), which leave whatever a qualification binds unscaled.

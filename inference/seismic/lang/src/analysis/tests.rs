@@ -131,6 +131,7 @@ fn dense_expand_weights_are_packed_planes_and_its_row_table_is_discrete() {
             ("up_scale", "f32"),
             ("gate_bound", "f32"),
             ("up_bound", "f32"),
+            ("glu_limit", "discrete"),
         ]
     );
     assert_eq!(

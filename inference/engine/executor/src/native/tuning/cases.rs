@@ -4,7 +4,7 @@
 //! resident weights of distinct layers plus case-owned activations.
 
 use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use magnitude_family_contracts::{GluLimit, WeightKind, WeightScope};
 use magnitude_kernels::{dense_expand, dense_output, dense_up};
 use seismic::{Element, Tensor};
 
@@ -117,6 +117,8 @@ pub(crate) struct DenseExpandTuning {
     pub up_kind: WeightKind,
     /// The activation code (`functions.seismic`).
     pub function: i32,
+    /// The `glu` clamp.
+    pub limit: Option<GluLimit>,
     /// Every layer prepared with this specialization.
     pub scopes: Vec<WeightScope>,
     pub epsilon: f32,
@@ -132,6 +134,7 @@ pub(crate) struct DenseExpandCase {
     up_scale: Tensor,
     gate_bound: Tensor,
     up_bound: Tensor,
+    glu_limit: Tensor,
     epsilon: f32,
     function: i32,
 }
@@ -176,6 +179,7 @@ impl EntryTuning for DenseExpandTuning {
             ("F", features),
             ("GS", scale_extent(inputs, &self.scopes, self.gate_kind)?),
             ("US", scale_extent(inputs, &self.scopes, self.up_kind)?),
+            ("LB", GluLimit::word(self.limit)),
         ];
         statics.extend(packing_statics(
             inputs,
@@ -213,6 +217,7 @@ impl EntryTuning for DenseExpandTuning {
                     up_scale: inputs.unit_scale(inputs.scale_extent(scope, self.up_kind)?)?,
                     gate_bound: inputs.bound(scope, self.gate_kind)?,
                     up_bound: inputs.bound(scope, self.up_kind)?,
+                    glu_limit: inputs.i32s(&[0, GluLimit::word(self.limit)], &[])?,
                     gate,
                     epsilon: self.epsilon,
                     function: self.function,
@@ -234,6 +239,7 @@ impl EntryTuning for DenseExpandTuning {
             up_scale: &case.up_scale,
             gate_bound: &case.gate_bound,
             up_bound: &case.up_bound,
+            glu_limit: &case.glu_limit,
         }
     }
 

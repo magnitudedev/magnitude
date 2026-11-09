@@ -86,7 +86,7 @@ use super::AssessmentError;
 use crate::{resident_element, resident_elements, resident_layout, ExecutionPath};
 use magnitude_artifacts::gguf::Encoding;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
-use magnitude_family_contracts::{Rotary, ScaledActivations};
+use magnitude_family_contracts::{GluLimit, Rotary, ScaledActivations};
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, conditioning_overlay, dense_expand, dense_output,
 };
@@ -2347,6 +2347,8 @@ struct ExpandCase {
     out_rows: Tensor,
     scale: Tensor,
     bound: Tensor,
+    /// No clamp: the host port `[0, LB]` at LB = 0.
+    glu_limit: Tensor,
 }
 
 impl ExpandCase {
@@ -2394,6 +2396,7 @@ impl ExpandCase {
         let out_rows = every_row(device, rows)?;
         let scale = zeros(Element::f32(), &[0])?;
         let bound = zeros(Element::f32(), &[bound_extent(weight)])?;
+        let glu_limit = zeros(Element::i32(), &[0, GluLimit::word(None)])?;
         Ok(gates
             .into_iter()
             .zip(ups)
@@ -2405,6 +2408,7 @@ impl ExpandCase {
                 out_rows: out_rows.clone(),
                 scale: scale.clone(),
                 bound: bound.clone(),
+                glu_limit: glu_limit.clone(),
             })
             .collect())
     }
@@ -2422,6 +2426,7 @@ impl ExpandCase {
             up_scale: &self.scale,
             gate_bound: &self.bound,
             up_bound: &self.bound,
+            glu_limit: &self.glu_limit,
         }
     }
 }
@@ -2459,6 +2464,7 @@ fn expand(weight: Element, features: u64) -> Formation<dense_expand::Entry> {
             ("US", 0),
             ("GB", bound),
             ("UB", bound),
+            ("LB", GluLimit::word(None)),
         ],
     )
 }
@@ -3202,6 +3208,7 @@ fn composition_chain(
                     up_scale: scale.tensor().into(),
                     gate_bound: expand_bound.tensor().into(),
                     up_bound: expand_bound.tensor().into(),
+                    glu_limit: (&rows.tensor().slice_leading(0, 0).reshape(&[0, GluLimit::word(None)])).into(),
                 },
             )
             .map_err(|cause| error(&cause))?

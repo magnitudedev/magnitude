@@ -84,7 +84,7 @@ fn site_layer(
     };
     let layer = &layout.layers[index];
     let scales = SiteScales { gate: scales(&layer.expert_scales.gate.clone().flatten())?, up: scales(&layer.expert_scales.up)? };
-    let shape = super::SiteShape::of(&crate::assessment::CpuForm::of(&plan.binding(index)?, form.function))?;
+    let shape = super::SiteShape::of(&crate::assessment::CpuForm::of(&plan.binding(index)?, form))?;
     let storage = SiteStorage {
         table: sited.table.clone(),
         rows: sited.rows.clone(),

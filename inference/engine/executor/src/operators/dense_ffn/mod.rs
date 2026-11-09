@@ -44,7 +44,12 @@ pub(super) fn weights<'a>(dense: &'a DenseFfn, push: &mut WeightPush<'_, 'a>) {
 /// Every numerical parameter of the operator a sealed graph holds apart from
 /// its weights.
 pub(super) fn shape_key(dense: &DenseFfn) -> String {
-    format!("dense {} {:?}", dense.intermediate, dense.up.activation())
+    format!(
+        "dense {} {:?} {:?}",
+        dense.intermediate,
+        dense.up.activation(),
+        dense.up.limit()
+    )
 }
 
 /// The program binding of a dense sublayer with `output`; `lookup` resolves
@@ -65,6 +70,7 @@ pub(super) fn binding(
     Ok(DenseBinding {
         features: dense.intermediate,
         function: activation_code(dense.up.activation()),
+        limit: dense.up.limit(),
         norm: lookup(WeightKind::InputNorm)?,
         gate: gate.element,
         up: up.element,

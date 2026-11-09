@@ -6,6 +6,7 @@
 //! uploads it.
 
 use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
+use crate::operators::routed::Expansion;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{WeightPort, packed_weight, weight};
@@ -101,7 +102,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
     residual: &WorkflowTensor,
     rows: u64,
     epsilon: f32,
-    activation: i32,
+    expansion: Expansion,
     post_norm_epsilon: f32,
     post_norm_scale: f32,
 ) -> Result<WorkflowTensor, GraphError> {
@@ -120,6 +121,7 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
             ("US", up.operands.scale.extent),
             ("GB", gate.operands.bound.extent),
             ("UB", up.operands.bound.extent),
+            ("LB", magnitude_family_contracts::GluLimit::word(expansion.limit)),
         ],
     ]
     .concat();
@@ -139,11 +141,12 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                 up_weight: (&up.weight).into(),
                 out_rows: out_rows.port().tensor().into(),
                 eps: epsilon,
-                activation,
+                activation: expansion.activation,
                 gate_scale: (&gate.operands.scale.tensor).into(),
                 up_scale: (&up.operands.scale.tensor).into(),
                 gate_bound: (&gate.operands.bound.tensor).into(),
                 up_bound: (&up.operands.bound.tensor).into(),
+                glu_limit: (&crate::operators::glu_limit(out_rows.port().tensor(), expansion.limit)).into(),
             },
         )?
         .value;

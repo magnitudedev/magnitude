@@ -593,6 +593,7 @@ pub fn inspect(
                 intermediate,
                 up: FeedForwardUp::Gated {
                     activation: ActivationFunction::Silu,
+                    limit: None,
                     gate: weight("ffn_gate", &[intermediate, hidden])?,
                     up: weight("ffn_up", &[intermediate, hidden])?,
                 },

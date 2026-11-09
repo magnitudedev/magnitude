@@ -65,6 +65,7 @@
 use super::exchange::ExchangeTable;
 pub(in crate::experts) use super::exchange::FAILED;
 use super::source::Records;
+use magnitude_family_contracts::GluLimit;
 use magnitude_kernels::constants;
 use magnitude_kernels::cpu_library::cpu::lib::core::functions;
 use magnitude_kernels::cpu_library::cpu::lib::projection::projection;
@@ -207,6 +208,8 @@ pub(crate) struct SiteShape {
     pub features: usize,
     /// The expansion's function code (`functions::activate`).
     pub function: i32,
+    /// The expansion's clamp (`functions::clamped_glu`'s `limit`).
+    pub limit: Option<GluLimit>,
 }
 
 impl SiteShape {
@@ -221,6 +224,7 @@ impl SiteShape {
             hidden: to(form.record.down.matrix[0])?,
             features: to(form.record.up.matrix[0])?,
             function: form.function,
+            limit: form.limit,
         })
     }
 
@@ -232,6 +236,20 @@ impl SiteShape {
     /// The slot step `step` requests in: `step` mod the flight.
     pub(crate) fn slot(&self, step: u64) -> usize {
         (step % self.table.slots()) as usize
+    }
+}
+
+/// A gated expansion's product of its scaled F32 gate and up sums under
+/// function code `function` (`functions::activate`), as published F32: the
+/// `glu` of functions.seismic, [`functions::clamped_glu`] where the
+/// expansion has a limit and [`functions::glu`] otherwise. The one owner of
+/// that choice for the site and its references.
+#[inline(always)]
+pub(crate) fn gated(function: i32, limit: Option<GluLimit>) -> impl Fn(f32, f32) -> f32 + Copy {
+    let limit = functions::glu_limit(GluLimit::word(limit));
+    move |gate, up| match limit {
+        None => functions::glu::<F32>(function, gate, up),
+        Some(limit) => functions::clamped_glu::<F32>(function, limit, gate, up),
     }
 }
 
@@ -570,7 +588,9 @@ fn slope(function: i32, z: f32, radius: f32) -> f32 {
 ///   step), plus f32 rounding;
 /// - its products depart through the activation by at most
 ///   `L e_g (|up| + e_u) + |act(gate)| e_u` (`L` the activation's slope,
-///   `e` the sums' departures), or `L e_u` up-only;
+///   `e` the sums' departures), or `L e_u` up-only, with `gate` and `up`
+///   clamped at `limit` (`functions::clamped_glu`), which moves neither departure
+///   further;
 /// - the products are q8 per block in turn, their blocks' steps from the
 ///   products' magnitudes plus their departures, and the down sum departs
 ///   by at most `Σ |d_f| (e_f + u_f)`, plus f32 rounding;
@@ -579,7 +599,9 @@ fn slope(function: i32, z: f32, radius: f32) -> f32 {
 /// An expert of another layer's values departs by its whole size, far past
 /// the bound.
 #[cfg(test)]
-pub(crate) fn reference(function: i32, x: &[f32], experts: &[(f32, ExpertValues<'_>)]) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn reference(function: i32, limit: Option<GluLimit>, x: &[f32], experts: &[(f32, ExpertValues<'_>)]) -> (Vec<f32>, Vec<f32>) {
+    let glu = gated(function, limit);
+    let clamp = functions::glu_limit(GluLimit::word(limit)).unwrap_or(f32::INFINITY);
     let hidden = x.len();
     let activations = q8_departures(x);
     // A dot over `x`: its value, and its departure under the site's q8 rows.
@@ -600,10 +622,11 @@ pub(crate) fn reference(function: i32, x: &[f32], experts: &[(f32, ExpertValues<
                 match expert.gate {
                     Some(gate) => {
                         let (gate, e_gate) = sum(&gate[at], gate_scale);
+                        let product = glu(gate, up);
+                        let (gate, up) = (gate.min(clamp), up.clamp(-clamp, clamp));
                         let activated = functions::activate(function, gate);
                         let moved = slope(function, gate, e_gate) * e_gate;
                         let departure = moved * (up.abs() + e_up) + activated.abs() * e_up;
-                        let product = functions::glu::<F32>(function, gate, up);
                         (product, departure + rounding(0) * (activated.abs() + moved) * (up.abs() + e_up))
                     }
                     None => {
@@ -1098,8 +1121,9 @@ impl Work {
         let (gate_scale, up_scale) = expert.scales;
         match &expert.gate {
             Some(_) => {
+                let glu = gated(self.shape.function, self.shape.limit);
                 for (value, up) in out.iter_mut().zip(up) {
-                    *value = functions::glu::<F32>(self.shape.function, gate_scale * *value, up_scale * up);
+                    *value = glu(gate_scale * *value, up_scale * up);
                 }
             }
             None => {

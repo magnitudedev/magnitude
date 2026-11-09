@@ -3,6 +3,11 @@
 // GELU-tanh).
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
+// The expansion's limit as its F32 bits LB (0: none), which the Glu epilogue
+// clamps at.
+#if SEISMIC_STATIC_LB != 0
+#define PROJECTION_GLU_LIMIT SEISMIC_STATIC_LB
+#endif
 #include "lib/projection/projection.h"
 #include "lib/projection/packing.h"
 #if defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV) || defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV_ROWS) || defined(SEISMIC_FORMING_DENSE_EXPAND_GEMV_PAIR)

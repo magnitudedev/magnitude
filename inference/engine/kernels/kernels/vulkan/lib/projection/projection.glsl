@@ -86,7 +86,9 @@
 #define PROJECTION_MIX 11
 
 // Further epilogues (the Metal and CUDA vocabulary):
-//   Glu           y = round_A(round_A(act(round_A(gate))) * round_A(up))  (paired)
+//   Glu           y = round_A(round_A(act(round_A(gate))) * round_A(up))  (paired;
+//                 `glu`, functions.seismic: clamped where the entry's LB
+//                 states a limit, as `projection_put_pair` says)
 //   Activated     y = round_A(act(round_A(acc)))                  (up-only, ReLU²)
 //   Mul           y = gate * up                           (paired; F32, unrounded)
 //   ActivatedMul  y = round_A(round_A(act(round_A(acc))) * external[m, n])
@@ -307,8 +309,23 @@ void projection_put_pair(projection_epilogue out_, uint m, uint n, float gate_su
         element_f32_put(out_.y + at * 4ul, gate_sum * up_sum);
         return;
     }
+#if defined(PROJECTION_GLU_LIMIT)
+    // PROJECTION_GLU_LIMIT, the entry's nonzero LB: the F32 bits of its
+    // expansion's limit L. A Glu clamps the rounded gate to (-inf, L] and up
+    // to [-L, L], each written `x > L ? L : x` so a NaN stays NaN. An entry
+    // without one compiles none.
+    const float limit = uintBitsToFloat(uint(PROJECTION_GLU_LIMIT));
+    float gate = element_round(out_.act, gate_sum);
+    float up = element_round(out_.act, up_sum);
+    if (out_.kind == PROJECTION_GLU) {
+        gate = gate > limit ? limit : gate;
+        up = up > limit ? limit : up;
+        up = up < -limit ? -limit : up;
+    }
+#else
     const float gate = element_round(out_.act, gate_sum);
     const float up = element_round(out_.act, up_sum);
+#endif
     const float activated = out_.kind == PROJECTION_GLU
         ? element_round(out_.act, functions_activate(out_.function, gate))
         : projection_silu_rounded(out_.act, gate);

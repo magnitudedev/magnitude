@@ -22,7 +22,7 @@ mod vision;
 pub use decoder::{
     ActivationFunction, Attention, AttentionGate, Block, Branch, BranchOutput, Decoder,
     DeferredForm, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
-    ExitSite, FeedForwardUp, GateFunction, GateGranularity, GatedDelta, HeadNorm, HistoryDomain,
+    ExitSite, FeedForwardUp, GateFunction, GluLimit, GateGranularity, GatedDelta, HeadNorm, HistoryDomain,
     HistoryReads, HyperConnectionExit, HyperConnectionInput, HyperConnectionMixing,
     HyperConnectionWeights, HyperConnections, LowRankGatedSite,
     Indexer, InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention,
@@ -1042,6 +1042,26 @@ impl error::Error for DefinitionError {}
 mod tests {
     use super::*;
     use magnitude_artifacts::ArtifactIdentity;
+
+    /// A `GluLimit` is positive and finite at F32, and a definition's limit
+    /// deserializes only as one; it serializes as the plain number, and its
+    /// kernels' LB is L's F32 bits, 0 for none.
+    #[test]
+    fn a_glu_limit_is_positive_and_finite_at_f32() {
+        for invalid in [0.0, -0.0, -10.0, 1e-50, 1e39, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            assert!(GluLimit::new(invalid).is_err(), "{invalid} admitted");
+        }
+        for invalid in ["0.0", "-10.0", "1e-50", "1e39"] {
+            assert!(serde_json::from_str::<GluLimit>(invalid).is_err(), "{invalid} deserialized");
+        }
+        let limit = GluLimit::new(10.0).unwrap();
+        assert_eq!(serde_json::to_string(&Some(limit)).unwrap(), "10.0");
+        assert_eq!(serde_json::to_string(&None::<GluLimit>).unwrap(), "null");
+        assert_eq!(serde_json::from_str::<Option<GluLimit>>("10.0").unwrap(), Some(limit));
+        assert_eq!((f64::from(limit), GluLimit::word(Some(limit))), (10.0, u64::from(10.0f32.to_bits())));
+        // No limit's word is 0, the one word no limit takes.
+        assert_eq!(GluLimit::word(None), 0);
+    }
 
     #[test]
     fn direct_dependencies_preserve_the_family_contract_boundary() {

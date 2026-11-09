@@ -10,7 +10,7 @@
 //!
 //! Some forms exist only as interface points for deferred families (plan §9):
 //! hyper-connection residuals, latent attention, block-rate and gathered
-//! history and sqrt-softplus scores. They are legal descriptions;
+//! history. They are legal descriptions;
 //! [`ModelDefinition::deferred_forms`](crate::ModelDefinition::deferred_forms)
 //! names them so an executor rejects them with a typed error.
 
@@ -767,13 +767,71 @@ pub enum ActivationFunction {
     ReluSquared,
 }
 
+/// A gated expansion's clamp L (DeepSeek V4.1's `swiglu_limit`): positive
+/// and finite at F32, the width the kernels clamp at, by construction; a
+/// definition carrying any other value does not deserialize. Equal by bits,
+/// which is equality for these values.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct GluLimit(f64);
+
+impl GluLimit {
+    pub fn new(limit: f64) -> Result<Self, DefinitionError> {
+        let word = limit as f32;
+        if word > 0.0 && word.is_finite() {
+            Ok(Self(limit))
+        } else {
+            Err(DefinitionError::new(format!("invalid expansion limit {limit}")))
+        }
+    }
+
+    /// The static `LB` of the kernels' gated expansions (functions.seismic's
+    /// `glu`) for an expansion's clamp: the bits of L at F32, or 0, which no
+    /// limit takes, for none. A kernel compiles the clamp in only where it is
+    /// nonzero.
+    pub fn word(limit: Option<Self>) -> u64 {
+        limit.map_or(0, |limit| u64::from((limit.0 as f32).to_bits()))
+    }
+}
+
+impl TryFrom<f64> for GluLimit {
+    type Error = DefinitionError;
+
+    fn try_from(limit: f64) -> Result<Self, DefinitionError> {
+        Self::new(limit)
+    }
+}
+
+impl From<GluLimit> for f64 {
+    fn from(limit: GluLimit) -> f64 {
+        limit.0
+    }
+}
+
+impl PartialEq for GluLimit {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for GluLimit {}
+
+impl std::hash::Hash for GluLimit {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.to_bits().hash(state);
+    }
+}
+
 /// The expanding half of a feed-forward. A stored fused gate‖up tensor is
 /// split into `gate` and `up` by import row ranges.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FeedForwardUp {
-    /// `act(gate·x) ⊙ (up·x)`.
+    /// `act(gate·x) ⊙ (up·x)`, or with a `limit` L,
+    /// `act(min(gate·x, L)) ⊙ clamp(up·x, -L, L)` (DeepSeek V4.1's
+    /// `swiglu_limit`: the gate above only, up on both sides).
     Gated {
         activation: ActivationFunction,
+        limit: Option<GluLimit>,
         gate: WeightDescriptor,
         up: WeightDescriptor,
     },
@@ -803,6 +861,15 @@ impl FeedForwardUp {
             Self::Plain { .. } => None,
         }
     }
+
+    /// The gated expansion's clamp (`Gated`'s `limit`); an up-only one has
+    /// none.
+    pub fn limit(&self) -> Option<GluLimit> {
+        match self {
+            Self::Gated { limit, .. } => *limit,
+            Self::Plain { .. } => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -818,7 +885,7 @@ pub struct DenseFfn {
 pub enum ScoreFunction {
     Softmax,
     Sigmoid,
-    /// Deferred (§9).
+    /// `sqrt(softplus(logit))`, in F32.
     SqrtSoftplus,
 }
 
@@ -844,6 +911,10 @@ pub struct Router {
     pub input: RouterInput,
     pub score: ScoreFunction,
     pub selection: ExpertSelection,
+    /// The selection-only bias (`[experts]`) media rows rank on in place of
+    /// the selection's own (DeepSeek V4.1's `bias_vl`); text rows never
+    /// read it.
+    pub media_bias: Option<WeightDescriptor>,
     /// How the selected (unbiased) scores become combine weights, as the
     /// model definition states it.
     pub normalization: RouteNormalization,
@@ -1035,7 +1106,6 @@ pub enum DeferredForm {
     LatentAttention,
     BlockHistory,
     NGramInput,
-    SqrtSoftplusScore,
 }
 
 impl DeferredForm {
@@ -1046,7 +1116,6 @@ impl DeferredForm {
             Self::LatentAttention => "latent attention",
             Self::BlockHistory => "block-rate attention history",
             Self::NGramInput => "n-gram input",
-            Self::SqrtSoftplusScore => "sqrt-softplus expert scores",
         }
     }
 }
@@ -1248,11 +1317,6 @@ fn operator_deferred_forms(op: &Operator, forms: &mut Vec<DeferredForm>) {
         }
         Operator::LatentAttention(_) => forms.push(DeferredForm::LatentAttention),
         Operator::NGramInput(_) => forms.push(DeferredForm::NGramInput),
-        Operator::RoutedFfn(routed) => {
-            if routed.router.score == ScoreFunction::SqrtSoftplus {
-                forms.push(DeferredForm::SqrtSoftplusScore);
-            }
-        }
         Operator::Parallel(branches) => {
             for branch in branches {
                 if matches!(branch.input, InputNorm::HyperConnectionMix(_)) {
@@ -1265,6 +1329,7 @@ fn operator_deferred_forms(op: &Operator, forms: &mut Vec<DeferredForm>) {
         | Operator::ShortConv(_)
         | Operator::StateSpace(_)
         | Operator::DenseFfn(_)
+        | Operator::RoutedFfn(_)
         | Operator::PerLayerInput(_) => {}
     }
 }
@@ -1926,6 +1991,9 @@ fn validate_routed(routed: &RoutedFfn, hidden: u64) -> Result<(), DefinitionErro
     }
     if let ExpertSelection::TopK { bias: Some(bias) } = &router.selection {
         expect_shape(bias, &[routed.experts], "expert selection bias")?;
+    }
+    if let Some(bias) = &router.media_bias {
+        expect_shape(bias, &[routed.experts], "media-row expert selection bias")?;
     }
     let expert_hidden = routed.expert_hidden(hidden);
     validate_up(

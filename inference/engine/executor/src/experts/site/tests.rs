@@ -21,6 +21,11 @@ fn scales() -> SiteScales {
 /// choices, two slots, and the stored values `[gate, up, down]` of every
 /// record.
 fn fixture(device: &seismic::Device) -> (SiteLayer, [Vec<f32>; 3]) {
+    clamped_fixture(device, None)
+}
+
+/// [`fixture`]'s layer with its expansion clamped at `limit`.
+fn clamped_fixture(device: &seismic::Device, limit: Option<GluLimit>) -> (SiteLayer, [Vec<f32>; 3]) {
     let shape = SiteShape {
         table: magnitude_kernels::SlotTable::site(2, 4),
         rows: 2,
@@ -29,6 +34,7 @@ fn fixture(device: &seismic::Device) -> (SiteLayer, [Vec<f32>; 3]) {
         hidden: 64,
         features: 128,
         function: functions::SILU,
+        limit,
     };
     let pattern = |count: usize, seed: u32| {
         (0..count)
@@ -60,8 +66,19 @@ fn rows() -> Vec<f32> {
 }
 
 /// The reference output of `entries` `(row, record, weight, expert)` and
-/// the site's departure bound ([`super::reference`]), row after row.
+/// the site's departure bound ([`super::reference`]), row after row, of the
+/// fixture's experts unclamped.
 fn reference(values: &[Vec<f32>; 3], entries: &[(usize, usize, f32, usize)], x: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    clamped_reference(values, entries, x, None)
+}
+
+/// [`reference`] of the experts clamped at `limit`.
+fn clamped_reference(
+    values: &[Vec<f32>; 3],
+    entries: &[(usize, usize, f32, usize)],
+    x: &[f32],
+    limit: Option<GluLimit>,
+) -> (Vec<f32>, Vec<f32>) {
     let (f, h) = (128, 64);
     let (gate, up) = (scales().gate.unwrap(), scales().up.unwrap());
     let (mut value, mut bound) = (Vec::new(), Vec::new());
@@ -80,7 +97,7 @@ fn reference(values: &[Vec<f32>; 3], entries: &[(usize, usize, f32, usize)], x: 
                 (weight, values)
             })
             .collect::<Vec<_>>();
-        let (row_value, row_bound) = super::reference(functions::SILU, &x[row * h..(row + 1) * h], &experts);
+        let (row_value, row_bound) = super::reference(functions::SILU, limit, &x[row * h..(row + 1) * h], &experts);
         value.extend(row_value);
         bound.extend(row_bound);
     }
@@ -144,6 +161,57 @@ fn the_pool_answers_each_rows_weighted_sum_while_a_flight_is_issued() {
         assert!(layer.output(0).iter().all(|value| *value == 0.0), "{workers} workers: a request of no entries");
         drop(flight);
     }
+}
+
+/// A site of DeepSeek V4.1's form (SiLU clamped at its `swiglu_limit`, 10)
+/// clamps every choice it answers: over rows whose gate sums pass +10 and
+/// whose up sums pass ±10, each of a full request's choices, the answer is
+/// the clamped reference's within its bound, and departs past it from the
+/// unclamped one's.
+#[test]
+fn a_clamped_sites_every_choice_is_clamped() {
+    const LIMIT: f32 = 10.0;
+    let limit = Some(GluLimit::new(LIMIT.into()).unwrap());
+    let device = cpu();
+    let (layer, values) = clamped_fixture(&device, limit);
+    let (f, h) = (128, 64);
+    let x = rows().into_iter().map(|value| value * 64.0).collect::<Vec<_>>();
+    // Every choice of both rows (`rows * choices` entries).
+    let entries = [(0, 0, 0.5, 0), (0, 1, 0.5, 1), (1, 2, 1.0, 2), (1, 1, 0.25, 1)];
+    let (gate_scales, up_scales) = (scales().gate.unwrap(), scales().up.unwrap());
+    let sums = |side: usize, scale: &[f32]| {
+        let (values, x) = (&values, &x);
+        entries
+            .iter()
+            .flat_map(|&(row, record, _, expert)| {
+                let x = &x[row * h..(row + 1) * h];
+                let scale = scale[expert];
+                (0..f).map(move |feature| {
+                    let at = (record * f + feature) * h;
+                    scale * values[side][at..at + h].iter().zip(x).map(|(w, x)| w * x).sum::<f32>()
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let (gates, ups) = (sums(0, &gate_scales), sums(1, &up_scales));
+    assert!(gates.iter().any(|gate| *gate > LIMIT), "a gate sum passes the limit");
+    assert!(ups.iter().any(|up| *up > LIMIT) && ups.iter().any(|up| *up < -LIMIT), "up sums pass both sides");
+    let compute = HostCompute::start(vec![layer], &threads(2)).unwrap();
+    let handle = compute.handle();
+    let layer = &handle.layers()[0];
+    let _flight = handle.flight().unwrap();
+    layer.request(1, &entries, &x);
+    assert_eq!(answer(layer, 1, 1), 1);
+    let output = layer.output(1);
+    let (expected, bound) = clamped_reference(&values, &entries, &x, limit);
+    for (index, ((got, want), bound)) in output.iter().zip(&expected).zip(&bound).enumerate() {
+        assert!((got - want).abs() <= *bound, "value {index}: {got} against the clamped {want} ±{bound}");
+    }
+    let (unclamped, _) = reference(&values, &entries, &x);
+    assert!(
+        output.iter().zip(&unclamped).zip(&bound).any(|((got, want), bound)| (got - want).abs() > *bound),
+        "the answer is not the unclamped expansion's"
+    );
 }
 
 /// An answer only moves its slot's word forward: a late publish for an
@@ -347,6 +415,7 @@ fn packed_shape(rows: usize, choices: usize, experts: usize, h: usize, f: usize)
         hidden: h,
         features: f,
         function: functions::SILU,
+        limit: None,
     }
 }
 

@@ -445,11 +445,13 @@ pub fn inspect_components(
                     selection: ExpertSelection::TopK {
                         bias: Some(weight("exp_probs_b.bias", &[e.count])?),
                     },
+                    media_bias: None,
                     normalization: RouteNormalization::SumPlusEpsilon(1e-6),
                     scale: 1.0,
                 },
                 expert_up: FeedForwardUp::Gated {
                     activation: ActivationFunction::Silu,
+                    limit: None,
                     gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, hidden])?,
                     up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, hidden])?,
                 },
@@ -468,6 +470,7 @@ pub fn inspect_components(
                     intermediate,
                     up: FeedForwardUp::Gated {
                         activation: ActivationFunction::Silu,
+                        limit: None,
                         gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
                         up: weight("ffn_up.weight", &[intermediate, hidden])?,
                     },

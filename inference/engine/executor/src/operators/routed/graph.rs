@@ -24,7 +24,7 @@ use crate::programs::native_target_graph::{
     WeightPart, WeightPort, WeightScale, packed_weight, scaled_weight, weight, weight_port,
 };
 use crate::{GeneralRoutedBinding, GeneralRoutedShape, ModelLoadPlan};
-use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
+use magnitude_family_contracts::{GluLimit, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     dense_expand, dense_output, dense_up, project_rows, routed_down, routed_down_project, routed_down_sited, routed_experts,
     routed_experts_up, routed_gate_up, routed_group, routed_scatter, routed_select,
@@ -474,6 +474,7 @@ impl SumBase {
                                         ("US", up.operands.scale.extent),
                                         ("GB", gate.operands.bound.extent),
                                         ("UB", up.operands.bound.extent),
+                                        ("LB", GluLimit::word(form.limit)),
                                     ],
                                 ]
                                 .concat(),
@@ -489,6 +490,7 @@ impl SumBase {
                                     up_scale: (&up.operands.scale.tensor).into(),
                                     gate_bound: (&gate.operands.bound.tensor).into(),
                                     up_bound: (&up.operands.bound.tensor).into(),
+                                    glu_limit: (&crate::operators::glu_limit(&table, form.limit)).into(),
                                 },
                             )?
                             .value
@@ -630,7 +632,11 @@ fn expand<'a, G: GraphDraft + 'a>(
                     grouped,
                     &[
                         dimensions.as_slice(),
-                        &[("GS", gate_scale.extent), ("US", stacks.up_scale.extent)],
+                        &[
+                            ("GS", gate_scale.extent),
+                            ("US", stacks.up_scale.extent),
+                            ("LB", GluLimit::word(shape.experts_expansion.limit)),
+                        ],
                     ]
                     .concat(),
                     routed_experts::WorkflowArgs {
@@ -651,6 +657,7 @@ fn expand<'a, G: GraphDraft + 'a>(
                         activation,
                         gate_scale: (&gate_scale.tensor).into(),
                         up_scale: (&stacks.up_scale.tensor).into(),
+                        glu_limit: (&crate::operators::glu_limit(first, shape.experts_expansion.limit)).into(),
                     },
                 )?
                 .value
@@ -972,7 +979,11 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     decode,
                     &[
                         dimensions.as_slice(),
-                        &[("GS", gate_scale.extent), ("US", up_scale.extent)],
+                        &[
+                            ("GS", gate_scale.extent),
+                            ("US", up_scale.extent),
+                            ("LB", GluLimit::word(shape.experts_expansion.limit)),
+                        ],
                         &map_dimension,
                     ]
                     .concat(),
@@ -987,6 +998,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         activation,
                         gate_scale: (&gate_scale.tensor).into(),
                         up_scale: (&up_scale.tensor).into(),
+                        glu_limit: (&crate::operators::glu_limit(routes.tensor(), shape.experts_expansion.limit)).into(),
                     },
                 )?
                 .value

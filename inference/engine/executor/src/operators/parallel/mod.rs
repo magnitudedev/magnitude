@@ -144,6 +144,7 @@ pub(super) fn binding(
         dense: DenseBranchBinding {
             features: branches.dense.intermediate,
             function: super::dense_ffn::activation_code(branches.dense.up.activation()),
+            limit: branches.dense.up.limit(),
             norm: lookup(dense, WeightKind::InputNorm)?,
             gate: scalable(dense, WeightKind::DenseGate)?.element,
             up: scalable(dense, WeightKind::DenseUp)?.element,
