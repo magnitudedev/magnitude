@@ -30,7 +30,7 @@ describe("native tray menu", () => {
     const callbacks = actions()
     const menu = buildTrayMenu({ service: "Ready", model, updateReady: true }, callbacks)
     for (const item of menu) if ("click" in item) item.click?.()
-    expect(callbacks.open.mock.calls).toEqual([[], ["discover"], ["settings"]])
+    expect(callbacks.open.mock.calls).toEqual([[], ["models"], ["settings"]])
     expect(callbacks.stopModel).toHaveBeenCalledOnce()
     expect(callbacks.quit).toHaveBeenCalledOnce()
     expect(callbacks.restartUpdate).toHaveBeenCalledOnce()

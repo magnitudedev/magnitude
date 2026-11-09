@@ -42,6 +42,10 @@ const RegenerateNetworkApiKey = mutation(Rpcs.regenerateNetworkApiKey, (client) 
   synchronize: () => QueryClient.invalidate(GetNetworkAccess.match({})),
 });
 const GetServerMachine = query(Rpcs.getServerMachine, (client) => client.configuration.getServerMachine);
+const GetOnboarding = query(Rpcs.getOnboarding, (client) => client.configuration.getOnboarding);
+const CompleteOnboarding = mutation(Rpcs.completeOnboarding, (client) => client.configuration.completeOnboarding, {
+  synchronize: () => QueryClient.invalidate(GetOnboarding.match({})),
+});
 
 export const Configuration = Group.make({
   GetProviderAuth,
@@ -55,4 +59,6 @@ export const Configuration = Group.make({
   SetNetworkAccess,
   RegenerateNetworkApiKey,
   GetServerMachine,
+  GetOnboarding,
+  CompleteOnboarding,
 });

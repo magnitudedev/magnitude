@@ -3,10 +3,7 @@ import { Option } from "effect"
 import { formatLocalModelDisplayName, localModelEstimatedTokensPerSecond, localModelFacts, localModelIsInstalled, useLocalModelCommandStatus, useLocalModelMutations, type ApplicationPage } from "@magnitudedev/client-common"
 import type { CustomLocalModel, CustomModelAcquisitionState, LocalModel } from "@magnitudedev/sdk"
 import { HiddenModels, UnhideButton } from "./local-model-lists"
-import { ErrorNotice, NoticeAction } from "./error-notice"
-import { NoRecommendations } from "./discover-custom"
 import { modelLab, type ModelLab } from "./model-logo"
-import type { AddDialogRequest } from "./add-model-dialog"
 
 /** A catalog or added model's download and the one-time optimization that follows it. */
 export const acquiring = (acquisition: CustomModelAcquisitionState) =>
@@ -51,10 +48,6 @@ export const selectModels = ({ library, hidden, filter, lab, search, sort }: {
   return { selected, visible }
 }
 
-/** Find other versions on Hugging Face: only a Catalog page's catalog cards, searching for the model's name. */
-export const otherVersionsRequest = (page: ApplicationPage, model: LocalModel): Option.Option<AddDialogRequest> =>
-  (page === "catalog" || page === "discover") && model._tag === "Catalog" ? Option.some({ _tag: "Search", query: model.presentation.displayName }) : Option.none()
-
 /** Adding a model closes the dialog and shows it in My Models, where its download progresses. */
 export const afterModelAdded = (closeDialog: () => void, navigate: (page: ApplicationPage) => void) => () => {
   closeDialog()
@@ -81,25 +74,5 @@ export function ModelsListing({ filter, models, card, empty, footer }: {
     <div className="grid items-start gap-3">{models.map(card)}</div>
     {models.length === 0 && empty}
     {footer}
-  </>
-}
-
-/** Whether Discover's recommendations are still coming, ranked, none fit, or can't be ranked without the hardware. */
-export type DiscoverRecommendationState = "pending" | "ranked" | "none" | "unavailable" | "failed"
-
-/** Recommendations share Discover's header, hardware summary and Add action with All models. */
-export function DiscoverSections({ preference, recommendations, state, onAdd, onExplore }: {
-  preference: ReactNode
-  recommendations: ReactNode
-  state: DiscoverRecommendationState
-  onAdd: () => void
-  onExplore: () => void
-}) {
-  return <>
-    {preference}
-    {recommendations}
-    {state === "none" && <NoRecommendations onExplore={onExplore} onAdd={onAdd} />}
-    {state === "failed" && <ErrorNotice title="Couldn’t assess model recommendations" description="Some model assessments failed. Browse all models to see their individual status." actions={<NoticeAction onClick={onExplore}>Browse all models</NoticeAction>} />}
-    {state === "unavailable" && <p className="mb-6 text-sm text-slate-500">Browse all models while hardware recommendations are unavailable.</p>}
   </>
 }

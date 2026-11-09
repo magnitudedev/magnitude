@@ -1,16 +1,9 @@
-import { useDiscoverScroll } from "./components/discover-scroll"
-import { DiscoverHeader } from "./components/discover-header"
-import { FoundModelsBanner } from "./components/discover-custom"
 import { ChatPage } from "./components/chat"
 import { ErrorNotice, NoticeAction } from "./components/error-notice"
-import { LoadModelButton, fitNotice, loadRefusal } from "./components/model-fit"
-import { ModelLoadFailureIndicator, ModelLoadNotice, modelRemovalNotice, downloadNotice, modelCommandNotice } from "./components/model-error"
-import { SkeletonLine, ModelsSkeleton, ModelCardsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton } from "./components/page-skeletons"
+import { SkeletonLine, ModelsSkeleton, ConnectionsSkeleton } from "./components/page-skeletons"
 import { pageLayout } from "./components/page-layout"
-import { RecommendationPreference } from "./components/model-preference-slider"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
-import { ActionTooltip, TooltipProvider } from "./components/ui/tooltip"
 import { Button, buttonVariants } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select"
@@ -19,59 +12,57 @@ import {
   ChatCircleIcon,
   SidebarSimpleIcon,
   ArrowUpRightIcon,
-  StackIcon,
   CubeIcon,
   PlugIcon,
   ChartBarIcon,
   SlidersIcon,
-  DownloadSimpleIcon,
-  CircleNotchIcon,
-  SquareIcon,
   XIcon,
   MonitorIcon,
   SunIcon,
   MoonIcon,
   FolderOpenIcon,
   BuildingsIcon,
-  ArrowRightIcon,
   BookOpenIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
-import { Fragment, useMemo, useRef, useState, type ReactNode } from "react"
+import { Fragment, useMemo, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
-import { type ProviderModelId, type CatalogLocalModel, type CustomModelAcquisitionState, type LocalModel, type ModelOptimizationProgress } from "@magnitudedev/sdk"
+import { type ProviderModelId, type CatalogLocalModel, type LocalModel } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker, choosePath, useNativeOpenPath } from "./components/folder-picker"
 import { SettingsGroup, SettingsRow } from "./components/settings-row"
 import {
-  activeLocalModel, useAgentClient, type ApplicationPage,
-  useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, useLocalInferenceHardware, formatLocalModelDisplayName,
-  describeModelOptimization,
-  formatStorageSize, formatTransferRate, localModelIsInstalled, localModelProviderModelId, localModelConnectionOptions, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory, MODEL_OPTIMIZATION_PENDING, MODEL_OPTIMIZATION_PENDING_DETAIL, modelOptimizationPendingIdle,
-  useCustomModels, useHiddenLocalModels, useUnsupportedLocalModels,
-  LOCAL_MODEL_RANKING_SCALE_VALUES,
+  activeLocalModel,
+  useAgentClient,
+  type ApplicationPage,
+  useCatalogModels,
+  useLocalModelStopStatus,
+  useLocalModels,
+  useLocalInferenceHardware,
+  formatLocalModelDisplayName,
+  formatStorageSize,
+  localModelConnectionOptions,
+  useCustomModels,
+  useHiddenLocalModels,
+  useUnsupportedLocalModels,
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
 import { useNavigate, useServerPlatform, useSession } from "./session"
 import { useReconnectAttempt, useServiceObservation, type ServiceObservation } from "./service-view"
-import { ConfirmDialog } from "./components/confirm-dialog"
 import { signOut, useDisconnectWarning, useRemoteAccess, viewerPlatform } from "./remote-access"
 import { useNarrowViewport } from "./lib/viewport"
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "./components/ui/alert-dialog"
-import { HardwareOverview, ModelRadar, QuantizationAwareInfo } from "./components/discovery-visuals"
 import { SettingsStatus } from "./components/settings-status"
 import { HarnessConnections, type CommandModel } from "./components/harness-connections"
 import { HarnessSetupList } from "./components/harness-setup"
 import { OtherApps } from "./components/other-apps"
-import { HuggingFaceLogo, LabLogo, ModelLogo, modelLab, modelLabs, type ModelLab } from "./components/model-logo"
+import { HuggingFaceLogo, LabLogo, modelLab, modelLabs, type ModelLab } from "./components/model-logo"
 import { ModelsHeader } from "./components/models-header"
 import { AddModelDialog, type AddDialogRequest } from "./components/add-model-dialog"
-import { drafterUpdateAvailable } from "./components/custom-model-details"
-import { ModelRemoveAction } from "./components/model-remove-action"
 import { UnsupportedModels } from "./components/local-model-lists"
-import { DiscoverSections, ModelsListing, acquiring, afterModelAdded, otherVersionsRequest, selectModels, type DiscoverRecommendationState } from "./components/models-page"
+import { ModelsListing, afterModelAdded, selectModels } from "./components/models-page"
 import { ModelLocationsRow } from "./components/model-locations"
 import { HuggingFaceRow } from "./components/hugging-face"
 import { HostNotices } from "./components/host-notices"
@@ -83,208 +74,13 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
-const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Discover", chat: "Chat", models: "My Models", connections: "Connections", usage: "Usage", settings: "Settings" }
-const pageIcons = { discover: StackIcon, catalog: StackIcon, models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
+const pageNames: Record<ApplicationPage, string> = { onboarding: "Welcome", chat: "Chat", models: "Models", connections: "Connections", usage: "Usage", settings: "Settings" }
+const pageIcons = { models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
 
-const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" : `About ${Math.ceil(seconds / 60)} min`
-/** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
-function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
-  const baseline = useRef<{ at: number; completed: number } | null>(null)
-  if (progress === null || progress.stage !== "tuning") {
-    baseline.current = null
-    return "—"
-  }
-  const now = Date.now()
-  if (baseline.current === null || progress.completed < baseline.current.completed) baseline.current = { at: now, completed: progress.completed }
-  const elapsed = (now - baseline.current.at) / 1000
-  const done = progress.completed - baseline.current.completed
-  return elapsed < 5 || done <= 0 ? "Estimating…" : minutesRemaining((progress.total - progress.completed) * elapsed / done)
-}
-/**
- * One card from the first byte to the model being ready: once the download is verified it turns into
- * the optimization in place. Every line keeps its place, and the finished download's bar fades into
- * tuning progress rather than jumping back.
- */
-function DownloadProgress({ acquisition, modelName, onCancel, pending = false, layout = "panel" }: { acquisition: CustomModelAcquisitionState; modelName: string; onCancel?: () => void; pending?: boolean; layout?: "panel" | "row" }) {
-  const hardware = useLocalInferenceHardware()
-  const optimization = acquisition._tag === "Optimizing" ? acquisition.progress : null
-  const tuningEstimate = useTuningEstimate(optimization)
-  if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating" && acquisition._tag !== "Optimizing") return null
-  const stages = { queued: "Queued", resolving: "Preparing download", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying download", publishing: "Finishing download" }
-  const bar = "absolute inset-y-0 left-0 rounded-md bg-blue-700 transition-[width,opacity] duration-500 ease-out dark:bg-blue-500"
-  let heading: string, title: ReactNode, detail: string, percent: number | null, downloadWidth: number, pulse: boolean, stat: { label: string; value: string }, remaining: string, cancelLabel: string
-  if (acquisition._tag === "Optimizing") {
-    const { stage, completed, total } = acquisition.progress
-    heading = describeModelOptimization(acquisition.progress, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())
-    title = <span className="min-w-0 flex-1 truncate">{heading}</span>
-    detail = "One-time setup for this device"
-    percent = stage === "tuning" && total > 0 ? Math.min(100, completed * 100 / total) : null
-    downloadWidth = 100
-    pulse = percent === null
-    stat = { label: "Model", value: modelName }
-    remaining = tuningEstimate
-    cancelLabel = "Skip optimization"
-  } else {
-    const { progress } = acquisition
-    const downloading = progress.stage === "downloading"
-    const rate = downloading ? Option.getOrNull(progress.bytesPerSecond) : null
-    heading = stages[progress.stage]
-    title = downloading ? <><span className="shrink-0">Downloading</span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{heading}</span>
-    detail = `${formatStorageSize(progress.completedBytes)} / ${progress.totalBytes > 0 ? formatStorageSize(progress.totalBytes) : "Unknown total"}`
-    percent = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : null
-    downloadWidth = percent ?? 100
-    pulse = percent === null
-    stat = { label: "Download speed", value: rate !== null ? formatTransferRate(rate) : "—" }
-    remaining = downloading && rate !== null && rate > 0 && progress.totalBytes > 0
-      ? minutesRemaining((progress.totalBytes - progress.completedBytes) / rate)
-      : downloading ? "Estimating…" : "—"
-    cancelLabel = "Cancel download"
-  }
-  const tuning = optimization !== null && percent !== null
-  const phase = acquisition._tag === "Optimizing" ? "optimizing" : "download"
-  const fade = "motion-safe:animate-[fade-in_400ms_ease-out]"
-  const spinner = <CircleNotchIcon aria-hidden="true" className="size-3.5 shrink-0 text-blue-700 motion-safe:animate-spin dark:text-blue-400" />
-  const percentText = percent !== null ? `${Math.floor(percent)}%` : "—"
-  const cancelButton = (className: string, size?: "sm") => onCancel && <Button variant="ghost" size={size} className={`hover:bg-transparent hover:text-red-600 dark:hover:bg-transparent dark:hover:text-red-400 ${className}`} disabled={pending} onClick={onCancel}><XIcon />{cancelLabel}</Button>
-  const progressBar = <div role="progressbar" aria-label={optimization ? "Optimization progress" : "Download progress"} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent ?? undefined} aria-valuetext={detail} className="relative h-2 w-full overflow-hidden rounded-md bg-slate-100 dark:bg-slate-800">
-    <div className={`${bar} ${pulse ? "motion-safe:animate-pulse" : ""}`} style={{ width: `${downloadWidth}%`, opacity: tuning ? 0 : 1 }} />
-    <div className={bar} style={{ width: `${tuning ? percent : 0}%`, opacity: tuning ? 1 : 0 }} />
-  </div>
-  // A model row already names the model: one status line over the bar, one line of detail under it.
-  if (layout === "row") {
-    const facts = [optimization === null ? stat.value : null, remaining].filter(fact => fact !== null && fact !== "—").join(" · ")
-    return <div className="w-full min-w-0" aria-label="Model download">
-      <div className="flex h-7 items-center gap-2 text-sm">
-        {spinner}
-        <span key={phase} className={`min-w-0 flex-1 truncate font-medium ${fade}`}>{heading}</span>
-        <span className="shrink-0 tabular-nums text-slate-600 dark:text-slate-300">{percent !== null ? percentText : null}</span>
-        {cancelButton("-mr-2.5 ml-2", "sm")}
-      </div>
-      <div className="mt-2">{progressBar}</div>
-      <div className="mt-2 flex items-baseline justify-between gap-3 text-xs tabular-nums text-slate-500 dark:text-slate-400"><span className="min-w-0 truncate">{detail}</span><span className="shrink-0">{facts}</span></div>
-    </div>
-  }
-  return <div className="w-full min-w-0" aria-label="Model download">
-    <h3 className="mb-6 flex items-center gap-2 text-sm font-medium">
-      <span key={phase} className={`flex min-w-0 flex-1 items-center gap-2 ${fade}`}>{title}</span>
-      {spinner}
-    </h3>
-    {progressBar}
-    <div className="mt-3 flex items-baseline justify-between gap-3 text-sm tabular-nums text-slate-600 dark:text-slate-300"><span className="min-w-0 truncate">{detail}</span><span>{percentText}</span></div>
-    <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div className="min-w-0"><dt className="text-xs text-slate-500 dark:text-slate-400">{stat.label}</dt><dd className="mt-1 truncate font-medium tabular-nums text-slate-800 dark:text-slate-200" title={stat.value}>{stat.value}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400">Time remaining</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{remaining}</dd></div></dl>
-    {onCancel && <div className="mt-7 flex justify-center">{cancelButton("")}</div>}
-  </div>
-}
-const updateLabel = (model: LocalModel) => model._tag === "Catalog"
-  ? "New files are available for this model, usually an updated drafter for faster responses."
-  : model.acquisitionState._tag === "UpdateAvailable" ? "The repository has a newer version of this model."
-  : "A newer version of this model’s drafter is available, for faster responses."
-/** `inlineLoadFailure` false leaves a failed load to the caller's own presentation and keeps the Load action available. */
-function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadFailure = true }: { model: LocalModel; replacing?: string; children?: ReactNode; onConnectAgent?: () => void; inlineLoadFailure?: boolean }) {
-  const { install, load, stop, cancel, remove, hide, dismissFailure: dismiss } = useLocalModelMutations()
-  const command = useLocalModelCommandStatus(model.modelId)
-  const stopping = useLocalModelStopStatus()
-  const acquisition = model.acquisitionState
-  const pending = command.pending || stopping.pending || acquisition._tag === "Removing"
-  const supported = model._tag === "Custom" || model.catalogData.support._tag === "Supported"
-  const installed = "residencyState" in acquisition
-  const residency = installed ? acquisition.residencyState : undefined
-  const stoppedForMemory = residency !== undefined && modelStoppedForMemory(residency)
-  const canStop = residency !== undefined && ["Ready", "Loading", "Requested", "Stopping"].includes(residency._tag)
-  const transferring = acquiring(acquisition)
-  const fit = supported ? fitNotice(model) : null
-  const loadFailure = residency?._tag === "Failed" && !command.pendingOperations.includes("load") ? residency.failure : null
-  const doesNotFit = loadRefusal(model) !== null
-  const loadNotice = inlineLoadFailure && !doesNotFit ? loadFailure : null
-  const downloadFailure = (acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && !command.pendingOperations.includes("install") ? acquisition.failure : null
-  const canDownload = supported && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
-  const [confirmingLoad, setConfirmingLoad] = useState(false)
-  const requestLoad = () => { if (replacing) setConfirmingLoad(true); else load(model.modelId) }
-  const removeAction = <ModelRemoveAction model={model} running={canStop} disabled={pending} onRemove={() => remove(model.modelId)} onHide={() => hide(model.modelId)} />
-
-  return <TooltipProvider><div className="contents">
-    <div className="flex flex-wrap items-center justify-end gap-2">{children}
-      {transferring ? null : acquisition._tag === "Unavailable" ? removeAction : !installed ? downloadFailure ? null : <Button disabled={pending || !canDownload} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {supported && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : loadNotice ? null : <LoadModelButton model={model} pending={pending} onLoad={requestLoad} />)}
-        {!onConnectAgent && removeAction}
-        {supported && (acquisition._tag === "UpdateAvailable" || drafterUpdateAvailable(model)) && <ActionTooltip label={updateLabel(model)} trigger={<Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>} />}
-      </>}
-
-    </div>
-    {modelOptimizationPendingIdle(acquisition) && <ErrorNotice severity="info" title={MODEL_OPTIMIZATION_PENDING} description={MODEL_OPTIMIZATION_PENDING_DETAIL} className="col-span-full mt-3" />}
-    {transferring && <div className="col-span-full mt-1"><DownloadProgress layout="row" modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /></div>}
-    {fit !== null && (doesNotFit || !loadFailure) && !downloadFailure && <ErrorNotice severity="info" title={fit} className="col-span-full mt-3" />}
-    {stoppedForMemory && !command.pendingOperations.includes("load") && <ErrorNotice severity="warning" title={MODEL_STOPPED_FOR_MEMORY_MESSAGE} description="It was stopped to keep your other apps running. Quit apps you aren’t using before loading it again." className="col-span-full mt-3" />}
-    {model._tag === "Catalog" && model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title="This model is unavailable" description="Choose another model from Discover." className="col-span-full mt-3" />}
-    {acquisition._tag === "Unavailable" && <ErrorNotice severity="warning" title="This model’s files can’t be read" description="Check that the file is still there and its drive is connected." className="col-span-full mt-3" />}
-    {downloadFailure && <ErrorNotice {...downloadNotice(downloadFailure)} className="col-span-full mt-3" actions={<>
-      {canDownload && <NoticeAction disabled={pending} onClick={() => install(model.modelId)}>Retry download</NoticeAction>}
-      <NoticeAction disabled={pending} onClick={() => dismiss(model.modelId)}>Dismiss</NoticeAction>
-    </>} />}
-    {acquisition._tag === "RemoveFailed" && <ErrorNotice {...modelRemovalNotice(acquisition.failure)} className="col-span-full mt-3" />}
-    {loadNotice && <div className="col-span-full mt-3"><ModelLoadNotice failure={loadNotice} actions={supported && loadNotice.retryable && !onConnectAgent ? <NoticeAction disabled={pending} onClick={requestLoad}>Load again</NoticeAction> : undefined} /></div>}
-    {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
-    {replacing && <ConfirmDialog open={confirmingLoad} onOpenChange={setConfirmingLoad} title={`Load ${formatLocalModelDisplayName(model)}?`}
-      description={`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}.`} confirmLabel="Load model" onConfirm={() => load(model.modelId)} />}
-  </div></TooltipProvider>
-}
-function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; active: ReturnType<typeof activeLocalModel> }) {
-  const navigate = useNavigate()
-  const connectAgent = () => navigate("connections")
-  const { cancel } = useLocalModelMutations()
-  const command = useLocalModelCommandStatus(model.modelId)
-  const transferring = acquiring(model.acquisitionState)
-  return <div className={`relative ${pageLayout.recommendationPane}`} aria-label="Selected model profile">
-    <div className={transferring ? "invisible" : undefined} inert={transferring} aria-hidden={transferring}>
-    <div className="mb-4 flex flex-wrap items-center justify-end gap-3">
-      {transferring ? <Button disabled><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <ModelControls model={model} inlineLoadFailure={false} onConnectAgent={() => connectAgent()} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />}
-    </div>
-    <div className="min-h-72"><ModelRadar model={model} /></div>
-    </div>
-    {transferring && <div className="absolute inset-5 flex items-center justify-center overflow-y-auto" aria-label="Download panel">
-      <div className="w-full max-w-sm px-3 py-4">
-        <DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} pending={command.pending} onCancel={() => cancel(model.modelId)} />
-        {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="mt-3" />)}
-      </div>
-    </div>}
-  </div>
-}
-function Recommendations({ models, active }: { models: readonly CatalogLocalModel[]; active: ReturnType<typeof activeLocalModel> }) {
-  const session = useSession()
-  const discovery = useAtomValue(session.discover)
-  const select = useAtomSet(useMemo(() => Atom.fn((model: CatalogLocalModel) => session.updateDiscover({ selectedModel: Option.some(model.modelId) })), [session]))
-  const selectedId = Option.getOrNull(discovery.selectedModel)
-  const downloads = models.filter(model => acquiring(model.acquisitionState))
-  const selectable = downloads.length > 0 ? downloads : models
-  const selected = selectable.find(model => model.modelId === selectedId) ?? selectable[0]
-  if (!selected) return null
-  return <section aria-label="Top recommendations" className="mb-8">
-    <TooltipProvider><div className={pageLayout.recommendations}>
-      <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => select(model)} className={`${pageLayout.recommendationRow} focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
-        <span className="w-4 shrink-0 text-sm tabular-nums text-slate-500">{rank + 1}</span>
-        <ModelLogo model={model} className="size-7" />
-        <span className="flex min-w-0 flex-1 items-center text-sm font-medium">
-          <span className="min-w-0 truncate"
-            onMouseEnter={({ currentTarget }) => {
-              if (currentTarget.scrollWidth > currentTarget.clientWidth) currentTarget.title = currentTarget.textContent?.trimEnd() ?? ""
-            }}
-            onMouseLeave={({ currentTarget }) => currentTarget.removeAttribute("title")}
-          >{model.presentation.displayName}{"\u00a0"}</span>
-          <span className="shrink-0 whitespace-nowrap text-xs font-normal text-slate-500">{model.presentation.variantLabel}</span>
-          <QuantizationAwareInfo model={model} className="ml-1" />
-        </span>
-        {"residencyState" in model.acquisitionState && model.acquisitionState.residencyState._tag === "Failed" && <ModelLoadFailureIndicator failure={model.acquisitionState.residencyState.failure} />}
-      </button>)}</div>
-      <SelectedRecommendation model={selected} active={active} />
-    </div></TooltipProvider>
-  </section>
-}
 function LabOption({ lab }: { lab: ModelLab | null }) {
   return <span className="flex items-center gap-2">{lab ? <LabLogo lab={lab} className="size-4" /> : <BuildingsIcon aria-hidden="true" className="size-4 text-slate-500" />}{lab ? lab.name : "Any lab"}</span>
 }
-function Models({ page }: { page: "discover" | "catalog" | "models" }) {
-  const installedOnly = page === "models"
-  const discover = !installedOnly
+function Models() {
   const catalog = useCatalogModels()
   const customModels = useCustomModels()
   const unsupportedModels = useUnsupportedLocalModels()
@@ -294,67 +90,33 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const stopResult = useLocalModelStopStatus()
   const hardware = useLocalInferenceHardware()
   const navigate = useNavigate()
-  const [mySearch, setMySearch] = useState("")
-  const filterOptions = installedOnly
-    ? [{ value: "all", label: "All models" }, { value: "downloaded", label: "Downloaded" }, { value: "downloading", label: "Downloading" }, { value: "hidden", label: "Hidden" }]
-    : [{ value: "all", label: "All models" }, { value: "fits", label: "Fits my machine" }]
+  const [search, setSearch] = useState("")
+  const filterOptions = [{ value: "all", label: "All models" }, { value: "downloaded", label: "Downloaded" }, { value: "downloading", label: "Downloading" }, { value: "hidden", label: "Hidden" }]
   const sortOptions = [
-    ...(!installedOnly ? [{ value: "recommended", label: "Recommended" }] : []),
     { value: "name", label: "Name A–Z" }, { value: "fastest", label: "Fastest (estimated)" }, { value: "smartest", label: "Most intelligent" }, { value: "smallest", label: "Smallest download" }, { value: "largest", label: "Largest download" },
   ]
-  const [myFilter, setMyFilter] = useState("all")
-  const [myLab, setMyLab] = useState<ModelLab | null>(null)
-  const [mySort, setMySort] = useState("name")
+  const [filter, setFilter] = useState("all")
+  const [lab, setLab] = useState<ModelLab | null>(null)
+  const [sort, setSort] = useState("name")
   const session = useSession()
-  const discovery = useAtomValue(session.discover)
-  const foundModelsNoticeDismissed = useAtomValue(session.foundModelsNoticeDismissed)
-  const dismissFoundModelsNotice = useAtomSet(session.dismissFoundModelsNotice)
-  const noticeDismissal = useAtomValue(session.dismissFoundModelsNotice)
-  const updateDiscovery = useAtomSet(useMemo(() => Atom.fn((update: Parameters<typeof session.updateDiscover>[0]) => session.updateDiscover(update)), [session]))
-  const search = installedOnly ? mySearch : discovery.search
-  const filter = installedOnly ? myFilter : discovery.filter
-  const lab = installedOnly ? myLab : modelLabs.find(lab => Option.contains(discovery.lab, lab.name)) ?? null
-  const sort = installedOnly ? mySort : discovery.sort
-  const view = discovery.view
-  const setSearch = (search: string) => installedOnly ? setMySearch(search) : updateDiscovery({ search, view: "all" })
-  const setFilter = (filter: string) => {
-    if (installedOnly) setMyFilter(filter)
-    else if (filter === "all" || filter === "fits") updateDiscovery({ filter })
-  }
-  const setLab = (lab: ModelLab | null) => installedOnly ? setMyLab(lab) : updateDiscovery({ lab: Option.fromNullable(lab?.name) })
-  const setSort = (sort: string) => {
-    if (installedOnly) setMySort(sort)
-    else if (sort === "recommended" || sort === "name" || sort === "fastest" || sort === "smartest" || sort === "smallest" || sort === "largest") updateDiscovery({ sort })
-  }
-  const setView = (view: "recommended" | "all") => updateDiscovery({ view, search: view === "recommended" ? "" : discovery.search })
-  const preference = useAtomValue(session.rankingPreference)
-  const setPreference = useAtomSet(useMemo(() => Atom.fn((index: number) => session.setRankingPreference(index).pipe(Effect.zipRight(session.updateDiscover({ selectedModel: Option.none() })))), [session]))
-  const scrollRef = useDiscoverScroll(view, discover && Result.isSuccess(catalog))
   const linkedRequest = useAtomValue(session.addModelRequest)
   const clearLinkedRequest = useAtomSet(useMemo(() => Atom.fn((_: void) => session.clearAddModelRequest), [session]))
   const [pageRequest, setPageRequest] = useState(Option.none<AddDialogRequest>())
   const request: Option.Option<AddDialogRequest> = Option.isSome(linkedRequest) ? linkedRequest : pageRequest
   const openDialog = (next: AddDialogRequest) => setPageRequest(Option.some(next))
   const closeDialog = () => { setPageRequest(Option.none()); if (Option.isSome(linkedRequest)) clearLinkedRequest() }
-  if (Result.isFailure(catalog)) return <><h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1><ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service in Settings." className="mt-5" /></>
-  if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
-  const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
+  if (Result.isFailure(catalog)) return <><h1 className={pageLayout.pageTitle}>{pageNames.models}</h1><ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service in Settings." className="mt-5" /></>
+  if (!Result.isSuccess(catalog)) return <ModelsSkeleton />
+  const models = catalog.value.models.filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const custom = Result.isSuccess(customModels) ? customModels.value : []
   const allModels: readonly LocalModel[] = [...models, ...custom]
   const hidden = Result.isSuccess(hiddenModels) ? hiddenModels.value : []
-  const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).map(option => option.model) : []
-  const assessment = Result.isSuccess(catalog) ? catalog.value.preparation.assessment : undefined
-  const recommendationsPending = !Result.isFailure(hardware) && (Result.isInitial(hardware) || !assessment?.complete)
-  const rankedIds = new Set(ranked.map(model => model.modelId))
-  const ordered: readonly LocalModel[] = installedOnly ? allModels : [...ranked, ...models.filter(model => !rankedIds.has(model.modelId))]
-  // Deprecated and disabled models are listed only where installed; custom models only in My Models.
-  const library = ordered.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled"
-    || !installedOnly && model.catalogData.support._tag === "Supported")
+  const assessment = catalog.value.preparation.assessment
+  // Deprecated and disabled models are listed only where installed.
+  const library = allModels.filter(model => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled")
   const labOptions = modelLabs.filter(entry => library.some(model => modelLab(model) === entry))
   const { selected, visible } = selectModels({ library, hidden, filter, lab, search, sort })
-  const openAddFromHuggingFace = () => openDialog({ _tag: "Search", query: "" })
   const stopFailure = Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />
-  const recommendationState: DiscoverRecommendationState = recommendationsPending ? "pending" : ranked.length > 0 ? "ranked" : models.some(model => model.servingState._tag === "Failed") ? "failed" : Result.isSuccess(hardware) ? "none" : "unavailable"
   const dialog = <AddModelDialog request={request} models={allModels} onClose={closeDialog} onAdded={afterModelAdded(closeDialog, navigate)} />
   const filterControls = <>
     <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
@@ -370,45 +132,17 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     <SelectTrigger aria-label="Sort models"><span className="text-slate-500">Sort:</span><SelectValue /></SelectTrigger>
     <SelectContent>{sortOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
   </Select>
-  const listing = <ModelsListing filter={filter} models={visible}
-    card={model => <ModelCard key={model.modelId} model={model} models={allModels} hardware={Result.value(hardware)} page={installedOnly ? "models" : "catalog"}
-      {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})}
-      {...Option.match(otherVersionsRequest(installedOnly ? "models" : "discover", model), { onNone: () => ({}), onSome: request => ({ onFindOtherVersions: () => openDialog(request) }) })} />}
-    empty={<p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
-    footer={installedOnly && <UnsupportedModels models={Result.isSuccess(unsupportedModels) ? unsupportedModels.value : []} />} />
-  if (discover) return <div ref={scrollRef} className="contents">
-    <DiscoverHeader view={view} count={Result.isSuccess(catalog) ? visible.length : null} search={search} onView={setView} onSearch={setSearch}
-      action={<Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
-      hardware={<HardwareOverview />}
-      notice={!foundModelsNoticeDismissed && <>
-        <FoundModelsBanner models={custom} onView={() => navigate("models")} onDismiss={() => dismissFoundModelsNotice()} dismissing={noticeDismissal.waiting} />
-        {Result.isFailure(noticeDismissal) && <ErrorNotice className="mb-6" title="Couldn’t dismiss the model notice" description="Your preference wasn’t saved. Try dismissing it again." />}
-      </>} />
-    {stopFailure}
-    {view === "recommended" ? <section aria-label="Recommended models">
-      <DiscoverSections preference={<RecommendationPreference value={preference} onChange={setPreference} />}
-        recommendations={recommendationsPending ? <RecommendationsSkeleton assessment={assessment} waitingForHardware={Result.isInitial(hardware)} /> : <Recommendations models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />}
-        state={recommendationState} onAdd={openAddFromHuggingFace} onExplore={() => setView("all")} />
-      {recommendationState === "ranked" && <div className="mt-4 flex flex-wrap items-center justify-between gap-3 text-sm text-slate-500"><span>Want to compare more models?</span><Button variant="ghost" onClick={() => setView("all")}>Browse all {models.filter(model => model.catalogData.support._tag === "Supported").length} models<ArrowRightIcon /></Button></div>}
-    </section> : <section aria-label="All models">
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex flex-wrap items-center gap-2">{filterControls}
-          {(search || filter !== "all" || lab !== null) && <button className="px-2 text-xs text-slate-500 hover:text-slate-900 dark:hover:text-slate-200" onClick={() => updateDiscovery({ search: "", filter: "all", lab: Option.none() })}>Clear filters</button>}
-        </div>
-        {sortControl}
-      </div>
-      {assessment && !assessment.complete && <p role="status" className="mb-4 text-sm text-slate-500">{assessment.totalModels > 0 ? `Assessing models · ${assessment.settledModels} of ${assessment.totalModels}` : "Preparing models for assessment…"}</p>}
-      {!Result.isSuccess(catalog) ? <ModelCardsSkeleton /> : listing}
-    </section>}
-    {dialog}
-  </div>
   return <>
-    <ModelsHeader title={pageNames[page]} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
-      action={installedOnly ? null : <Button variant="outline" onClick={openAddFromHuggingFace}><HuggingFaceLogo />Add from Hugging Face</Button>}
+    <ModelsHeader title={pageNames.models} selectedCount={selected.length} matchingCount={visible.length} search={search} onSearch={setSearch}
+      action={<Button variant="outline" onClick={() => openDialog({ _tag: "Search", query: "" })}><HuggingFaceLogo />Add from Hugging Face</Button>}
       controls={<>{filterControls}{sortControl}</>} />
     {stopFailure}
-    {assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">{assessment.totalModels > 0 ? `Assessing models · ${assessment.settledModels} of ${assessment.totalModels}` : "Preparing models for assessment…"}</p>}
-    {listing}
+    {!assessment.complete && <p className="mb-4 text-sm text-slate-500">{assessment.totalModels > 0 ? `Assessing models · ${assessment.settledModels} of ${assessment.totalModels}` : "Preparing models for assessment…"}</p>}
+    <ModelsListing filter={filter} models={visible}
+      card={model => <ModelCard key={model.modelId} model={model} models={allModels} hardware={Result.value(hardware)} page="models"
+        {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />}
+      empty={<p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : "No models downloaded yet. Add one from Hugging Face."}</p>}
+      footer={<UnsupportedModels models={Result.isSuccess(unsupportedModels) ? unsupportedModels.value : []} />} />
     {dialog}
   </>
 }
@@ -434,7 +168,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
   return <>
     {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Check the service in Settings before connecting a harness." : "Check the service in Settings before setting up an agent."}</p>}
-    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service in Settings." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}>Discover models</NoticeAction>} />}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service in Settings." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("models")}>Open Models</NoticeAction>} />}
     {desktop
       ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
       : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
@@ -703,6 +437,7 @@ export function App() {
   const navigate = useNavigate()
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
+  if (page === "onboarding") return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><div /></>
   return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
       {page === "settings" ? <SettingsPage observation={observation} />
       : service?._tag === "Unreachable" ? <CannotReachMagnitude />
@@ -710,8 +445,8 @@ export function App() {
       : page === "chat" ? <ChatPage />
       : page === "usage" ? <ServingUsage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("settings")}>Open Settings</NoticeAction>} /></> : <ModelsSkeleton page={page} startingService />)
-      : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <><h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1><ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("settings")}>Open Settings</NoticeAction>} /></> : <ModelsSkeleton startingService />)
+      : page === "models" ? <Models />
       : null}
   </AppShell></>
 }
@@ -759,7 +494,7 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
     {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
     <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={narrow && open}>
       <div data-page-content className={page === "chat" ? `mx-auto flex h-full w-full max-w-[min(100%,72rem)] flex-col px-4 pb-0 pt-5 md:px-10 ${platform === "win32" ? "md:pt-14" : "md:pt-9"}` : narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
-        {page !== "discover" && page !== "catalog" && page !== "models" && page !== "chat" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
+        {page !== "models" && page !== "chat" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
         {children}
       </div>
     </main>
@@ -768,13 +503,13 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
 }
 function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
-    {(["discover", "chat", "models", "connections", "usage", "settings"] as const).map(key => {
+    {(["models", "chat", "connections", "usage", "settings"] as const).map(key => {
       const Icon = pageIcons[key]
       return <Fragment key={key}>
         {key === "settings" && <a href="https://docs.magnitude.dev" target="_blank" rel="noreferrer" onClick={onNavigate} className={`${buttonVariants({ variant: "ghost" })} mt-auto h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start hover:bg-slate-100 dark:hover:bg-slate-800`}>
           <BookOpenIcon className="size-4 shrink-0" />Docs<ArrowUpRightIcon aria-hidden="true" className="ml-auto size-3.5 shrink-0 text-slate-400" />
         </a>}
-        <Button variant="ghost" disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={(page === "catalog" ? "discover" : page) === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${(page === "catalog" ? "discover" : page) === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+        <Button variant="ghost" disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
           <Icon className="size-4 shrink-0" />{pageNames[key]}
         </Button>
       </Fragment>

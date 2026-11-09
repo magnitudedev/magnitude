@@ -8,8 +8,8 @@ describe("application routes", () => {
     for (const page of ApplicationPage.literals) expect(pageFromPath(pagePath(page))).toEqual(Option.some(page))
   })
   it("treats the root and trailing slashes as the same route", () => {
-    expect(pageFromPath("/")).toEqual(Option.some("discover"))
-    expect(pageFromPath("/catalog/")).toEqual(Option.some("catalog"))
+    expect(pageFromPath("/")).toEqual(Option.some("models"))
+    expect(pageFromPath("/onboarding/")).toEqual(Option.some("onboarding"))
   })
   it("rejects paths that are not pages", () => {
     expect(pageFromPath("/inference/v1")).toEqual(Option.none())

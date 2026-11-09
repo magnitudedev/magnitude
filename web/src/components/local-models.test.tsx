@@ -4,10 +4,9 @@ import { Option } from "effect"
 import { HiddenModels, SourceTag, UnhideButton, UnsupportedModels, unsupportedSummary } from "./local-model-lists"
 import { removalKind } from "@magnitudedev/client-common"
 import { ModelRemoveAction, keepsExternalCopy, removalConfirmation } from "./model-remove-action"
-import { FoundModelsBanner, HuggingFaceLink, NoRecommendations, foundModelsSummary } from "./discover-custom"
 import { ModelsHeader, matchStatus, searchPlaceholder } from "./models-header"
 import { ModelLogo, labForName, modelLab, modelLogoLab, variantLab } from "./model-logo"
-import { added, catalogId, catalogModel, customModel, doesNotFit, foundIn, inFolder, unsupportedLocal } from "../../test/models/fixtures"
+import { added, catalogId, catalogModel, customModel, foundIn, inFolder, unsupportedLocal } from "../../test/models/fixtures"
 
 describe("models header", () => {
   it("puts the add action beside the title and the count in the search placeholder", () => {
@@ -52,7 +51,6 @@ describe("model labs", () => {
     expect(renderToStaticMarkup(<ModelLogo model={model} />)).toMatch(/>H<\/span>/)
     expect(renderToStaticMarkup(<ModelLogo model={model} />)).not.toContain("Qwen logo")
     expect(renderToStaticMarkup(<ModelLogo model={catalogModel()} />)).toContain("Qwen logo")
-    expect(renderToStaticMarkup(<FoundModelsBanner models={[customModel(inFolder, { presentation: model.presentation })]} onView={() => {}} />)).not.toContain("Qwen logo")
   })
 })
 
@@ -177,43 +175,5 @@ describe("hidden filter", () => {
   })
   it("tags where files came from", () => {
     expect(renderToStaticMarkup(<SourceTag label="Hugging Face" />)).toContain(">Hugging Face<")
-  })
-})
-
-describe("discover", () => {
-  const found = [
-    customModel(foundIn({ _tag: "Ollama" })),
-    customModel(foundIn({ _tag: "LmStudio" })),
-    customModel(foundIn({ _tag: "HuggingFaceCache" })),
-  ]
-  it("summarizes found models that fit, where they were found, and their labs", () => {
-    expect(foundModelsSummary(found)).toEqual(Option.some(expect.objectContaining({ count: 3, places: "Ollama, LM Studio, and your Hugging Face cache" })))
-    const html = renderToStaticMarkup(<FoundModelsBanner models={found} onView={() => {}} />)
-    expect(html).toContain("You already have 3 models that run here.")
-    expect(html).toContain("Found in Ollama, LM Studio, and your Hugging Face cache.")
-    expect(html).toContain("View in My Models")
-    expect(html).toContain("Qwen logo")
-  })
-  it("counts only found models that fit", () => {
-    const tooLarge = customModel(foundIn({ _tag: "Ollama" }), { servingState: { ...found[0]!.servingState, _tag: "Assessed", assessment: doesNotFit } as typeof found[0]["servingState"] })
-    expect(renderToStaticMarkup(<FoundModelsBanner models={[customModel(added), tooLarge]} onView={() => {}} />)).toBe("")
-    expect(renderToStaticMarkup(<FoundModelsBanner models={[customModel(foundIn({ _tag: "Folder", path: "/Volumes/External/models" }), { presentation: { ...found[0]!.presentation, sourceLabel: "models" } })]} onView={() => {}} />))
-      .toContain("You already have 1 model that runs here.</span> <span class=\"text-slate-600 dark:text-slate-300\">Found in your models folder.")
-  })
-  it("offers an accessible dismiss action without changing the existing model summary", () => {
-    const html = renderToStaticMarkup(<FoundModelsBanner models={found} onView={() => {}} onDismiss={() => {}} dismissing />)
-    expect(html).toContain('aria-label="Dismiss found models notice"')
-    expect(html).toContain("You already have 3 models that run here.")
-    expect(html).toMatch(/<button[^>]*aria-label="Dismiss found models notice"[^>]*disabled/)
-  })
-  it("adds one Hugging Face line under the recommendations, and offers it beside Browse all models when nothing fits", () => {
-    const link = renderToStaticMarkup(<HuggingFaceLink onAdd={() => {}} />)
-    expect(link).toContain("Looking for a specific version, finetune, or uncensored model?")
-    expect(link).toContain("Add from Hugging Face")
-    expect(link).not.toContain("border-dashed")
-    const empty = renderToStaticMarkup(<NoRecommendations onExplore={() => {}} onAdd={() => {}} />)
-    expect(empty).toContain("No fitting recommendations right now.")
-    expect(empty).toContain("Browse all models")
-    expect(empty).toContain("Add from Hugging Face")
   })
 })

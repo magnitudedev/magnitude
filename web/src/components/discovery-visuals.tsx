@@ -1,16 +1,10 @@
-import { HardwarePending } from "./page-skeletons"
-import { ErrorNotice } from "./error-notice"
 import { pageLayout } from "./page-layout"
 import { Option } from "effect"
-import { useMemo } from "react"
-import { Atom, Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { InfoIcon } from "@phosphor-icons/react"
-import { useAgentClient, localModelQuantizationAware, localModelRadarAxes, localModelSpeedTooltip, quantizationAwareTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { localModelQuantizationAware, localModelRadarAxes, localModelSpeedTooltip, quantizationAwareTooltip } from "@magnitudedev/client-common"
 import { ActionTooltip } from "./ui/tooltip"
 import { MemoryBreakdownInfo } from "./memory-breakdown-info"
 import { type HardwarePhoto } from "./hardware-photos"
-import { HardwareSummary } from "./machine-summary"
-import { useSession } from "../session"
 export { HardwareSummary } from "./machine-summary"
 import type { LocalModel } from "@magnitudedev/sdk"
 
@@ -63,17 +57,6 @@ export function ModelRadar({ model }: { model: LocalModel }) {
   </div>
 }
 
-export function HardwareOverview() {
-  const client = useAgentClient()
-  const session = useSession()
-  const state = useAtomValue(session.discover)
-  const setExpanded = useAtomSet(useMemo(() => Atom.fn((expanded: boolean) => session.updateDiscover({ machineExpanded: expanded })), [session]))
-  const machine = useAtomValue(client.Configuration.GetServerMachine({})).result
-  const hardware = useLocalInferenceHardware()
-  if (Result.isFailure(hardware)) return <ErrorNotice title="Couldn’t read your hardware" description="Recommendations will return when hardware information is available." className="mb-5" />
-  if (!Result.isSuccess(hardware) || Result.isInitial(machine)) return <HardwarePending identifying={Result.isSuccess(hardware)} />
-  return <HardwareSummary identity={Result.isSuccess(machine) ? machine.value.identity : null} value={hardware.value} expanded={state.machineExpanded} onExpandedChange={setExpanded} />
-}
 export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
   const frame = photo.framing
   return <figure className={`${pageLayout.hardwarePhoto} aspect-[4/3] p-[6%]`}>

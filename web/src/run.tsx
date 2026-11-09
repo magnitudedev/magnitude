@@ -45,7 +45,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
   const boot = Effect.gen(function* () {
     const appearance = yield* entry.host.appearance.read.pipe(Effect.either)
     initializeAppearance(Either.isRight(appearance) ? appearance.right : "system")
-    root.render(<AppShell page="discover" platform={platform}><ModelsSkeleton page="discover" /></AppShell>)
+    root.render(<AppShell page="models" platform={platform}><ModelsSkeleton /></AppShell>)
     const origin = yield* entry.origin
     // A browser on another device signs in before it connects. If the service can't be reached yet,
     // the app shows that, and asks for the key once the service answers again.

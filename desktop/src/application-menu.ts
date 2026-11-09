@@ -21,9 +21,8 @@ export const buildApplicationMenu = (platform: NodeJS.Platform, actions: {
       : { label: "File", submenu: [quit] },
     { label: "Edit", submenu: [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }] },
     { label: "View", submenu: [
-      { label: "Discover Models", click: () => actions.open("discover") },
+      { label: "Models", click: () => actions.open("models") },
       { label: "Chat", click: () => actions.open("chat") },
-      { label: "My Models", click: () => actions.open("models") },
       { label: "Connections", click: () => actions.open("connections") },
       { label: "Usage", click: () => actions.open("usage") },
       { label: "Settings", click: () => actions.open("settings") },

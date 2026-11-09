@@ -105,7 +105,7 @@ export function Badge({ children, tone = "slate" }: { children: ReactNode; tone?
   const tones = {
     slate: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
     blue: "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400",
-    amber: "bg-orange-50 text-orange-700 dark:bg-slate-800 dark:text-orange-300",
+    amber: "border border-orange-300 text-orange-700 dark:bg-slate-800 dark:text-orange-300",
   }
   return <span className={cn("inline-flex items-center gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[11px] font-medium leading-4", tones[tone])}>{children}</span>
 }

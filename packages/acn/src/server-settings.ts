@@ -12,6 +12,7 @@ import {
   type NetworkAccessChange,
   type NetworkAccessSettings,
   type NetworkInterfaceAddress,
+  type OnboardingSettings,
   type ServerMachine,
 } from "@magnitudedev/acn-protocol"
 import {
@@ -50,6 +51,8 @@ export interface ServerSettingsApi {
   readonly setNetworkAccess: (change: NetworkAccessChange) => Effect.Effect<void, ServerSettingsFailed>
   readonly regenerateNetworkApiKey: Effect.Effect<void, ServerSettingsFailed>
   readonly machine: Effect.Effect<ServerMachine>
+  readonly onboarding: Effect.Effect<OnboardingSettings, ServerSettingsFailed>
+  readonly completeOnboarding: Effect.Effect<void, ServerSettingsFailed>
 }
 export class ServerSettings extends Context.Tag("ServerSettings")<ServerSettings, ServerSettingsApi>() {}
 
@@ -108,6 +111,13 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
   const containerManaged = Option.isSome(host.container)
     ? Effect.fail(new ServerSettingsFailed({ message: "A container keeps network access on with a key. Set the key with MAGNITUDE_NETWORK_KEY and host names with MAGNITUDE_ALLOWED_HOSTS, then recreate the container." }))
     : Effect.void
+
+  const readOnboarding = readStructuredFile(storage.paths.configFile, MagnitudeConfigSchema.pick("onboarding")).pipe(
+    Effect.provideService(FileSystem.FileSystem, fs),
+    Effect.flatMap(result => result._tag === "Invalid" ? Effect.fail(result.error) : Effect.succeed(result._tag === "Missing" ? Option.none<OnboardingSettings["onboarding"]>() : result.value.onboarding)),
+    Effect.map((saved): OnboardingSettings => ({ onboarding: Option.getOrElse(saved, () => "Pending" as const) })),
+    Effect.mapError(() => new ServerSettingsFailed({ message: "The onboarding state could not be read. Check access to the Magnitude configuration and try again." })),
+  )
 
   const machine = yield* Effect.cached(readMachineIdentity(() => createRequire(import.meta.url)(nativeHostPath())).pipe(
     Effect.map((identity): ServerMachine => ({ platform: process.platform, identity })),
@@ -198,5 +208,10 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
       Effect.zipRight(poke(Configuration.getNetworkAccess._tag)),
     ))),
     machine,
+    onboarding: readOnboarding,
+    completeOnboarding: writes.withPermits(1)(config.update(current => ({ ...current, onboarding: Option.some("Completed" as const) }))).pipe(
+      Effect.mapError(() => new ServerSettingsFailed({ message: "Onboarding could not be saved. Check access to the Magnitude configuration and try again." })),
+      Effect.zipRight(poke(Configuration.getOnboarding._tag)),
+    ),
   })
 }))

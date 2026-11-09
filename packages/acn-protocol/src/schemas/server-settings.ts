@@ -44,6 +44,12 @@ export const NetworkAccessSettings = Schema.Struct({
 })
 export type NetworkAccessSettings = typeof NetworkAccessSettings.Type
 
+/** Whether first-run onboarding has been finished; absent from configuration means `Pending`. */
+export const Onboarding = Schema.Literal("Pending", "Completed")
+export type Onboarding = typeof Onboarding.Type
+export const OnboardingSettings = Schema.Struct({ onboarding: Onboarding })
+export type OnboardingSettings = typeof OnboardingSettings.Type
+
 /** All interfaces, or one IP address of the machine running Magnitude. */
 export const NetworkBind = Schema.Union(
   Schema.TaggedStruct("AllInterfaces", {}),

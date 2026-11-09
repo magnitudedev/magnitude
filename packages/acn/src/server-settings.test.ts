@@ -146,3 +146,29 @@ describe("directory browsing", () => {
     expect(listing.parent).toEqual(Option.none())
   })
 })
+
+describe("onboarding", () => {
+  it("is pending when the configuration doesn't record it, even with other settings saved", async () => {
+    const dataDir = fresh()
+    writeFileSync(join(dataDir, "config.json"), JSON.stringify({ appearance: "dark" }))
+    const settings = await run(dataDir, Effect.flatMap(ServerSettings, service => service.onboarding))
+    expect(settings).toEqual({ onboarding: "Pending" })
+  })
+
+  it("stays completed once completed and tells other clients", async () => {
+    const dataDir = fresh()
+    const [settings, pokes] = await run(dataDir, Effect.gen(function* () {
+      const changes = yield* AcnChanges
+      const service = yield* ServerSettings
+      const received = yield* changes.stream.pipe(Stream.take(1), Stream.runCollect, Effect.fork)
+      yield* Effect.sleep("10 millis")
+      yield* service.completeOnboarding
+      yield* service.completeOnboarding
+      return [yield* service.onboarding, Chunk.toReadonlyArray(yield* received.await.pipe(Effect.flatten))] as const
+    }))
+    expect(settings).toEqual({ onboarding: "Completed" })
+    expect(pokes).toEqual([{ operation: "GetOnboarding" }])
+    const reopened = await run(dataDir, Effect.flatMap(ServerSettings, service => service.onboarding))
+    expect(reopened).toEqual({ onboarding: "Completed" })
+  })
+})

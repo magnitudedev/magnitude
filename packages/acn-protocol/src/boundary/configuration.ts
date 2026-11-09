@@ -14,6 +14,7 @@ import {
   ModelStorageSettings,
   NetworkAccessChange,
   NetworkAccessSettings,
+  OnboardingSettings,
   ServerMachine,
   ServerSettingsFailed,
 } from "../schemas/server-settings"
@@ -100,6 +101,19 @@ const GetServerMachine = Rpc.make("GetServerMachine", {
   success: ServerMachine,
 }).pipe(replaySafe)
 
+const GetOnboarding = Rpc.make("GetOnboarding", {
+  payload: Schema.Struct({}),
+  success: OnboardingSettings,
+  error: ServerSettingsFailed,
+}).pipe(replaySafe)
+
+/** Marks first-run onboarding finished; completing it again changes nothing. */
+const CompleteOnboarding = Rpc.make("CompleteOnboarding", {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({}),
+  error: ServerSettingsFailed,
+}).pipe(replaySafe)
+
 export const Configuration = {
   getProviderAuth: GetProviderAuth,
   listProviderAuth: ListProviderAuth,
@@ -112,4 +126,6 @@ export const Configuration = {
   setNetworkAccess: SetNetworkAccess,
   regenerateNetworkApiKey: RegenerateNetworkApiKey,
   getServerMachine: GetServerMachine,
+  getOnboarding: GetOnboarding,
+  completeOnboarding: CompleteOnboarding,
 }

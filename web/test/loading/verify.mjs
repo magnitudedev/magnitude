@@ -11,7 +11,7 @@ for(const theme of ['light','dark']) for(const width of (process.env.FIXTURE_WID
  await page.goto('http://127.0.0.1:6091/loading.html'+(process.env.FIXTURE_QUERY ?? ''))
  await page.locator('main').waitFor()
  await page.evaluate(theme=>document.documentElement.dataset.theme=theme,theme)
- for(const name of (process.argv.length>2 ? process.argv.slice(2) : ['discover','catalog','models','connections','usage','status','settings'])) {
+ for(const name of (process.argv.length>2 ? process.argv.slice(2) : ['models','connections','usage','status','settings'])) {
   await page.evaluate(name=>{window.loadingFixture.setPhase('loading');window.loadingFixture.navigate(name)},name)
   await page.waitForTimeout(100)
   assert.ok(await page.locator('[data-slot="skeleton"]').count(),`${name}: skeleton missing`)
@@ -22,8 +22,7 @@ for(const theme of ['light','dark']) for(const width of (process.env.FIXTURE_WID
    if(name==='usage') nodes=[main.querySelector('[aria-label="Token activity"]'),...main.querySelectorAll('[data-usage]')];
    if(name==='status') nodes=[...main.querySelectorAll('section')];
    if(name==='settings') nodes=[...main.querySelectorAll('h2')].map(n=>n.closest('section,[aria-busy]'));
-   if(name==='catalog'||name==='models'||name==='connections') nodes=[main.querySelector('article')];
-   if(name==='discover') nodes=[main.querySelector('[aria-label="Your hardware"],[aria-label="Loading your hardware"],[aria-label="Detecting your hardware"]'),main.querySelector('[aria-label="Top recommendations"] > div,[aria-label="Loading recommendations"] > div')];
+   if(name==='models'||name==='connections') nodes=[main.querySelector('article')];
    return nodes.filter(Boolean).map(n=>{const b=n.getBoundingClientRect();return {x:b.x,y:b.y,width:b.width,height:b.height}})
   },name)
   const before=await stableFrames()
@@ -40,7 +39,6 @@ for(const theme of ['light','dark']) for(const width of (process.env.FIXTURE_WID
   assert.equal(before.length,after.length,`${name}: missing loaded frame`)
   for(let i=0;i<before.length;i++) for(const dimension of ['x','y','width','height']) {
    // Discover content height depends on specifications unavailable during loading.
-   if(name === "discover" && (dimension === "height" || dimension === "y")) continue
    // Below md, wrapped model names make loaded heights content-dependent.
    if(width < 768 && (dimension === "height" || dimension === "y")) continue
    const tolerance=1
@@ -59,15 +57,6 @@ for(const theme of ['light','dark']) for(const width of (process.env.FIXTURE_WID
   assert.equal(await page.locator('[data-slot="skeleton"]').count(),0,`${name}: failure retains placeholders`)
   results.push({theme,width,page:name,loading,loaded})
  }
- await page.evaluate(()=>{window.loadingFixture.navigate('discover');window.loadingFixture.setPhase('hardware-loading')})
- await page.getByLabel('Loading recommendations').waitFor()
- assert.equal(await page.getByText('No fitting recommendations right now.',{exact:false}).count(),0,'Pending hardware shown as empty recommendations')
- await page.evaluate(()=>window.loadingFixture.setPhase('loaded'))
- await page.getByLabel('Top recommendations').waitFor()
- // Failure must replace placeholders, not trap the user in loading.
- await page.evaluate(()=>window.loadingFixture.setPhase('error'))
- await page.waitForTimeout(100)
- assert.equal(await page.locator('[data-slot="skeleton"]').count(),0,'Failure retains skeleton')
  await page.close()
 }
 await browser.close()

@@ -1,9 +1,10 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
-import { Context, Effect, Layer, Option, Schema, Stream } from "effect"
-import { CatalogFormModelIdSchema, localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
+import { Context, Effect, Layer, Option, Stream } from "effect"
+import { Mutation } from "@magnitudedev/effect-query"
+import { localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { LocalModels } from "../local-models/service"
-import { LOCAL_MODEL_RANKING_SCALE_VALUES } from "../local-models/options"
+import { ClientEffectQuery } from "../state/client-effect-query"
 import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { formatModelLoadPercentage, formatModelLoadStage, formatModelMemory, isMeasuredModelLoadStage } from "../utils/model-load"
 import { ApplicationHost, ApplicationHostFailed } from "./host"
@@ -65,20 +66,6 @@ export const modelTrayPresentation = (models: LocalModelsState): typeof ModelTra
   }
 }
 
-/** Connection-lifetime presentation state for Discover, independent of live model observations. */
-export const DiscoverState = Schema.Struct({
-  view: Schema.Literal("recommended", "all"),
-  search: Schema.String,
-  filter: Schema.Literal("all", "fits"),
-  lab: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
-  sort: Schema.Literal("recommended", "name", "fastest", "smartest", "smallest", "largest"),
-  machineExpanded: Schema.Boolean,
-  selectedModel: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
-  recommendedScroll: Schema.Number,
-  allScroll: Schema.Number,
-})
-export type DiscoverState = typeof DiscoverState.Type
-
 const unavailable = new ApplicationHostFailed({ message: "This action isn't available here." })
 
 const makeApplicationSession = Effect.gen(function* () {
@@ -86,29 +73,24 @@ const makeApplicationSession = Effect.gen(function* () {
   const host = yield* ApplicationHost
   const router = yield* ApplicationRouter
   const models = yield* LocalModels
-  const noticeDismissed = yield* host.foundModelsNotice.readDismissed.pipe(Effect.catchAll(error => Effect.logWarning(error.message).pipe(Effect.as(false))))
-  const foundModelsNoticeDismissed = Atom.keepAlive(Atom.make(noticeDismissed))
-  const dismissFoundModelsNotice = Atom.fn((_: void) => host.foundModelsNotice.dismiss.pipe(
-    Effect.tap(() => Effect.sync(() => registry.set(foundModelsNoticeDismissed, true))),
-  ))
-  const discover = Atom.keepAlive(Atom.make<DiscoverState>({
-    view: registry.get(router.page) === "catalog" ? "all" : "recommended", search: "", filter: "all", lab: Option.none(), sort: "recommended",
-    machineExpanded: false, selectedModel: Option.none(), recommendedScroll: 0, allScroll: 0,
+  const effectQuery = yield* ClientEffectQuery
+  const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
+  const onboarding = effectQuery.Configuration.GetOnboarding({})
+  // Pending onboarding is the start page wherever navigation points; once completed the router decides.
+  const page = Atom.keepAlive(Atom.make((get): ApplicationPage => {
+    const state = get(onboarding).result
+    return Result.isSuccess(state) && state.value.onboarding === "Pending" ? "onboarding" : get(router.page)
   }))
-  const updateDiscover = (changes: Partial<DiscoverState>) => Effect.sync(() => registry.set(discover, { ...registry.get(discover), ...changes }))
-  // Catalog links and native menu actions open the All models view of Discover.
-  const navigate = (page: ApplicationPage) => page === "catalog"
-    ? updateDiscover({ view: "all" }).pipe(Effect.zipRight(router.navigate("discover")))
-    : router.navigate(page)
-  const rankingPreference = Atom.keepAlive(Atom.make(2))
-  const setRankingPreference = (index: number) => Effect.sync(() => {
-    if (Number.isInteger(index) && index >= 0 && index < LOCAL_MODEL_RANKING_SCALE_VALUES.length) registry.set(rankingPreference, index)
-  })
+  const navigate = router.navigate
+  const completeOnboarding = Atom.fn((_: void) => Mutation.execute(effectQuery.Configuration.CompleteOnboarding, {}).pipe(
+    provideRegistry,
+    Effect.zipRight(router.navigate("models")),
+  ))
   const notices = Atom.keepAlive(Atom.make<ReadonlyArray<HostNotice>>([]))
   const dismissNotice = (notice: HostNotice) => Effect.sync(() => registry.set(notices, registry.get(notices).filter(entry => entry !== notice)))
   const quitFailed = Atom.keepAlive(Atom.make(false))
   const addModelRequest = Atom.keepAlive(Atom.make(Option.none<AddModelRequest>()))
-  const requestAddModel = (request: AddModelRequest) => navigate("discover").pipe(
+  const requestAddModel = (request: AddModelRequest) => navigate("models").pipe(
     Effect.zipRight(Effect.sync(() => registry.set(addModelRequest, Option.some(request)))))
   const clearAddModelRequest = Effect.sync(() => registry.set(addModelRequest, Option.none()))
 
@@ -143,14 +125,9 @@ const makeApplicationSession = Effect.gen(function* () {
   const application = Atom.keepAlive(Atom.make(Option.match(host.shell, { onNone: () => Stream.fail(unavailable), onSome: shell => shell.application })))
 
   return {
-    page: router.page,
+    page: page as Atom.Atom<ApplicationPage>,
     navigate,
-    discover: discover as Atom.Atom<DiscoverState>,
-    updateDiscover,
-    foundModelsNoticeDismissed: foundModelsNoticeDismissed as Atom.Atom<boolean>,
-    dismissFoundModelsNotice,
-    rankingPreference: rankingPreference as Atom.Atom<number>,
-    setRankingPreference,
+    completeOnboarding,
     notices: notices as Atom.Atom<ReadonlyArray<HostNotice>>,
     dismissNotice,
     quitFailed: quitFailed as Atom.Atom<boolean>,

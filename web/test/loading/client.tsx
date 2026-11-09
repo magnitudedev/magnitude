@@ -9,7 +9,7 @@ import { useSyncExternalStore } from "react"
 
 const params = new URLSearchParams(location.search)
 let phase = params.get('phase') ?? 'loading'
-let page = params.get('page') ?? 'discover'
+let page = params.get('page') ?? 'models'
 const listeners = new Set<() => void>()
 const models = ['Qwen3.6 35B-A3B','Gemma 4 26B-A4B','Nemotron 3.5 Lightning 30B-A3B','Qwen3.5 4B','Gemma 4 12B'].map((name,index) => ({...makeSetupModel(true), modelId: `${['qwen','gemma','nemotron','qwen','gemma'][index]}-${index}:gguf:q4`, presentation:{...makeSetupModel(true).presentation,displayName:name}, storageBytes:17800000000, servingState:{...makeSetupModel(false).servingState,assessment:{...makeSetupModel(false).servingState.assessment,residency:{_tag:'Resident' as const,performance:{_tag:'Estimated' as const,samples:[{contextTokens:25000,estimatedTokensPerSecond:66},{contextTokens:50000,estimatedTokensPerSecond:59},{contextTokens:75000,estimatedTokensPerSecond:54},{contextTokens:100000,estimatedTokensPerSecond:49}]}}}}}))
 const preferenceModels = models.map((model, index) => ({ ...model,
@@ -42,9 +42,9 @@ const action = () => Atom.fn(() => Effect.void)
 const errorPhase = params.get('phase')
 const fixtureSettings = <A,>(value: A) => Atom.keepAlive(Atom.make(errorPhase === 'error' ? Result.fail('PRIVATE host diagnostics') : Result.success(value)))
 export const service: any = {
- page:Atom.keepAlive(Atom.make(page)),rankingPreference:Atom.keepAlive(Atom.make(2)),
+ page:Atom.keepAlive(Atom.make(page)),
  navigate:(value:string)=>Effect.sync(()=>{page=value;registry.set(service.page,value)}),
- setRankingPreference:(value:number)=>Effect.sync(()=>registry.set(service.rankingPreference,value)),
+ completeOnboarding:action(),addModelRequest:Atom.keepAlive(Atom.make(Option.none())),clearAddModelRequest:Effect.void,
  notices:Atom.keepAlive(Atom.make([])),dismissNotice:()=>Effect.void,quitFailed:Atom.keepAlive(Atom.make(false)),resolveQuitFailure:action(),retryService:action(),
  readAppearance:Effect.succeed('system'),saveAppearance:()=>Effect.void,clientWindow:params.get('entry') === 'browser' ? Option.none() : Option.some({platform:'darwin'}),openPathDialog:Option.none(),serverPlatform:Option.some('darwin'),
  application:Atom.keepAlive(Atom.make(Result.success({version:1,pid:1,endpoint:'http://127.0.0.1:1',service:{_tag:'Ready',health:{service:'magnitude-acn',version:'0.0.14',revision:1,id:'fixture',pid:1,state:{_tag:'Ready'},rpcVersion:1}},owner:{_tag:'Desktop',tray:{_tag:'Registered'}}}))),

@@ -3,7 +3,7 @@ import type { ReactElement } from "react"
 import { describe, expect, it, vi } from "vitest"
 import { Option } from "effect"
 import type { ModelId } from "@magnitudedev/sdk"
-import { DiscoverSections, HiddenModelUnhide, ModelsListing, afterModelAdded, otherVersionsRequest, selectModels } from "./models-page"
+import { HiddenModelUnhide, ModelsListing, afterModelAdded, selectModels } from "./models-page"
 import { ModelsHeader } from "./models-header"
 import { modelLabs } from "./model-logo"
 import { added, catalogModel, customModel, doesNotFit, foundIn } from "../../test/models/fixtures"
@@ -42,7 +42,7 @@ describe("catalog search placeholder", () => {
 })
 
 describe("hidden filter", () => {
-  const card = (model: Parameters<typeof otherVersionsRequest>[1]) => <article key={model.modelId}>card {model.modelId}</article>
+  const card = (model: Parameters<Parameters<typeof ModelsListing>[0]["card"]>[0]) => <article key={model.modelId}>card {model.modelId}</article>
   it("routes to the hidden list, with Unhide disabled while that model's command is pending", () => {
     commands.pending.clear()
     commands.pending.add(gemma.modelId)
@@ -72,42 +72,10 @@ describe("hidden filter", () => {
   })
 })
 
-describe("find other versions", () => {
-  it("is offered only on Catalog page catalog cards and searches for the model's name", () => {
-    expect(otherVersionsRequest("catalog", qwen)).toEqual(Option.some({ _tag: "Search", query: "Qwen3.6 35B-A3B" }))
-    expect(otherVersionsRequest("models", qwen)).toEqual(Option.none())
-    expect(otherVersionsRequest("discover", qwen)).toEqual(Option.some({ _tag: "Search", query: "Qwen3.6 35B-A3B" }))
-    expect(otherVersionsRequest("catalog", gemma)).toEqual(Option.none())
-  })
-})
-
 describe("adding a model", () => {
   it("closes the dialog, then shows My Models", () => {
     const calls: string[] = []
     afterModelAdded(() => calls.push("close"), page => calls.push(page))()
     expect(calls).toEqual(["close", "models"])
-  })
-})
-
-describe("discover", () => {
-  const discover = (state: Parameters<typeof DiscoverSections>[0]["state"]) => renderToStaticMarkup(<DiscoverSections
-    preference={<p>preference</p>} recommendations={<p>recommendations</p>} state={state} onAdd={() => {}} onExplore={() => {}} />)
-  it("keeps the preference above the recommendations without a duplicate Add action or model-details view", () => {
-    const html = discover("ranked")
-    expect(html.indexOf("preference")).toBeLessThan(html.indexOf("recommendations"))
-    expect(html).not.toContain("Add from Hugging Face")
-    expect(html).not.toContain("Details")
-    expect(html).not.toContain("No fitting recommendations")
-  })
-  it("offers All models and Add when nothing fits, and does not mistake missing hardware for no fit", () => {
-    expect(discover("pending")).not.toContain("No fitting recommendations")
-    expect(discover("unavailable")).toContain("hardware recommendations are unavailable")
-    expect(discover("unavailable")).not.toContain("No fitting recommendations")
-    expect(discover("failed")).toContain("Couldn’t assess model recommendations")
-    expect(discover("failed")).not.toContain("No fitting recommendations")
-    const none = discover("none")
-    expect(none).toContain("No fitting recommendations right now.")
-    expect(none).toContain("Browse all models")
-    expect(none).toContain("Add from Hugging Face")
   })
 })

@@ -8,7 +8,7 @@ export interface ApplicationRouter {
 }
 export const ApplicationRouter = Context.GenericTag<ApplicationRouter>("client/ApplicationRouter")
 
-const DEFAULT_PAGE: ApplicationPage = "discover"
+const DEFAULT_PAGE: ApplicationPage = "models"
 const isPage = Schema.is(ApplicationPage)
 
 export const pagePath = (page: ApplicationPage) => page === DEFAULT_PAGE ? "/" : `/${page}`

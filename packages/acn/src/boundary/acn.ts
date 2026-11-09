@@ -194,6 +194,8 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       SetNetworkAccess: change => observeRpcDefects("SetNetworkAccess", serverSettings.setNetworkAccess(change).pipe(Effect.as({}))),
       RegenerateNetworkApiKey: () => observeRpcDefects("RegenerateNetworkApiKey", serverSettings.regenerateNetworkApiKey.pipe(Effect.as({}))),
       GetServerMachine: () => observeRpcDefects("GetServerMachine", serverSettings.machine),
+      GetOnboarding: () => observeRpcDefects("GetOnboarding", serverSettings.onboarding),
+      CompleteOnboarding: () => observeRpcDefects("CompleteOnboarding", serverSettings.completeOnboarding.pipe(Effect.as({}))),
 
       GetHuggingFaceAccount: () => observeRpcDefects("GetHuggingFaceAccount", huggingFace.account),
       StartHuggingFaceSignIn: () => observeRpcDefects("StartHuggingFaceSignIn", huggingFace.startBrowserSignIn),
