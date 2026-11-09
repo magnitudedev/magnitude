@@ -442,6 +442,16 @@ native indexer_keys for metal from "metal/indexer_keys.metal":
         threadgroups (ceil_div(M, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# CUDA: as Metal, a warp per row (8 a block), each rotating through its own
+# W floats of shared memory (`rotary::layout::rotate`).
+native indexer_keys for cuda from "cuda/indexer_keys.cu":
+    static (P, S, RA, RT)
+    where RA <= 1 and RT <= 1 and (2 * P + S) % 32 == 0
+    launch indexer_keys:
+        threadgroups (ceil_div(M, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (8 * (2 * P + S) * 4)
+
 # CPU: one work item per row.
 native indexer_keys for cpu from "cpu/indexer_keys.rs":
     static (P, S, RA, RT)
@@ -458,6 +468,16 @@ native indexer_keys for cpu from "cpu/indexer_keys.rs":
 native indexer_score for metal from "metal/indexer_score.metal":
     static (H, P, S, NQ, HW, RA, RT)
     where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) <= 7168 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    launch indexer_score:
+        threadgroups (ceil_div(N, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (H * (2 * P + S) * 4)
+
+# CUDA: as Metal, each head's warp rotating through the head's own shared
+# row before it holds the prepared head.
+native indexer_score for cuda from "cuda/indexer_score.cu":
+    static (H, P, S, NQ, HW, RA, RT)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) * 4 <= 98304 and (2 * P + S) % 32 == 0
     launch indexer_score:
         threadgroups (ceil_div(N, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
@@ -482,6 +502,14 @@ native indexer_score for cpu from "cpu/indexer_score.rs":
 # Threadgroup memory: the bins [256], the scans' 8 simdgroup sums and the
 # select state [4].
 native rows_topk for metal from "metal/rows_topk.metal":
+    scratch spans bytes (M * (R + 1) * 4)
+    launch rows_topk:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((256 + 8 + 4) * 4)
+
+# CUDA: Metal's form, a block of 256 threads per row.
+native rows_topk for cuda from "cuda/rows_topk.cu":
     scratch spans bytes (M * (R + 1) * 4)
     launch rows_topk:
         threadgroups (M, 1, 1)
@@ -610,6 +638,12 @@ native candidate_blocks for metal from "metal/candidate_blocks.metal":
         threadgroups (ceil_div(NB, 256), M, 1)
         threads_per_threadgroup (256, 1, 1)
 
+# CUDA: as Metal.
+native candidate_blocks for cuda from "cuda/candidate_blocks.cu":
+    launch candidate_blocks:
+        threadgroups (ceil_div(NB, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
 # CPU: one work item per row, walking its picked blocks and its spans once.
 native candidate_rows for cpu from "cpu/candidate_rows.rs":
     launch candidate_rows:
@@ -619,6 +653,12 @@ native candidate_rows for cpu from "cpu/candidate_rows.rs":
 # Metal: a thread per row, walking its picked blocks and its spans once, as
 # the CPU native does.
 native candidate_rows for metal from "metal/candidate_rows.metal":
+    launch candidate_rows:
+        threadgroups (ceil_div(M, 64), 1, 1)
+        threads_per_threadgroup (64, 1, 1)
+
+# CUDA: as Metal, a thread per row.
+native candidate_rows for cuda from "cuda/candidate_rows.cu":
     launch candidate_rows:
         threadgroups (ceil_div(M, 64), 1, 1)
         threads_per_threadgroup (64, 1, 1)

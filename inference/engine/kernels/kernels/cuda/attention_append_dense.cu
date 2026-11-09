@@ -21,6 +21,10 @@ extern "C" __global__ void attention_append_dense(SEISMIC_KERNEL_PARAMS) {
     if (!attention::FRESH || row >= SEISMIC_DIM_M || ATTENTION_DESTINATION(in, row) < 0) return;
     extern __shared__ float shared[];
     float k[attention::DPL];
-    attention::prepared_key(in, row, kv, k, shared + (threadIdx.x / 32) * attention::W, lane);
+    // The stored key prepared and rounded as the attention entries do.
+    attention::prepared_key(in, row, kv, k, shared + (threadIdx.x / 32) * attention::W, lane,
+                            attention::key_rounding(SEISMIC_DIM_KR != 0, SEISMIC_PARAM_KEY_BLOCK,
+                                                    SEISMIC_PARAM_KEY_ELEMENT, SEISMIC_PARAM_KEY_SCALE,
+                                                    SEISMIC_PARAM_KEY_AMAX_FLOOR));
     attention::append(in, history, row, kv, k, lane);
 }

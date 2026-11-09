@@ -167,40 +167,47 @@ native per_layer_gate for cuda from "cuda/per_layer_gate.cu":
 
 # `attention_output`'s bands (GEMV to 16 rows reading the rows in place, the
 # INT8 candidate on either matrix band, split-K to 128 rows) with a store
-# epilogue in Y. One group only: a grouped weight is outside its domain.
+# epilogue in Y.
+#
+# Groups: every launch but the stage runs group g at grid z (z = g in the
+# GEMV and finalize launches, z = g * split + part in the GEMMs), over the
+# group's source columns, weight rows and output columns, and its own G-th
+# of the split partials. A group's weight rows start on a whole 16-row tile
+# (N % 16 == 0). The staged forms (INT8, OPERAND, NVFP4 operands) stage the
+# whole source row and run only G = 1.
 native project_rows for cuda from "cuda/project_rows.cu":
     static (G, K, N, WS)
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
-    where G == 1 and K % 64 == 0 and WS <= 1 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(W, INT8) == 1)
+    where K % 64 == 0 and WS <= 1 and (G == 1 or (N % 16 == 0 and INT8 == 0 and OPERAND == 0 and operands(W) == 0)) and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(W, INT8) == 1)
     scratch staged bytes (M * K * max(1 + OPERAND, 2 * operands(W))) when (M > 1 and operands(W) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * K / 4) when INT8 == 1 and M > 16
-    scratch partials bytes (2 * M * N * 4) when M > 16 and M <= 128
+    scratch partials bytes (2 * G * M * N * 4) when M > 16 and M <= 128
     launch project_rows_stage when (M > 1 and operands(W) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1)):
         reads (INT8, OPERAND)
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch project_rows_gemv when M <= 8:
         params (arithmetic KSPLIT in [4, 2, 8] default 4)
-        threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, 1)
+        threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, G)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (operands(W) * (1 - min(1, M - 1)) * K * 2)
     launch project_rows_gemv16 when M > 8 and M <= 16:
         params (arithmetic KSPLIT in [4, 2, 8] default 4)
-        threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, 1)
+        threadgroups (ceil_div(ceil_div(N, 16), 8 / KSPLIT), 1, G)
         threads_per_threadgroup (256, 1, 1)
     launch project_rows_gemm_small when M > 16 and M <= 64:
         reads (INT8, OPERAND)
-        threadgroups (ceil_div(ceil_div(N, 16), 8), 1, 1 + min(1, 128 / M))
+        threadgroups (ceil_div(ceil_div(N, 16), 8), 1, G * (1 + min(1, 128 / M)))
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch project_rows_gemm when M > 64:
         params (ROTATE in [2, 1, 4] default 2)
         reads (INT8, OPERAND)
-        threadgroups (ceil_div(ceil_div(N, 16), 8), ceil_div(M, 128), 1 + min(1, 128 / M))
+        threadgroups (ceil_div(ceil_div(N, 16), 8), ceil_div(M, 128), G * (1 + min(1, 128 / M)))
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (2 * (128 * 144 + 10240) + 2048)
     launch project_rows_finalize when M > 16 and M <= 128:
-        threadgroups (ceil_div(M * N, 256), 1, 1)
+        threadgroups (ceil_div(M * N, 256), 1, G)
         threads_per_threadgroup (256, 1, 1)
 
 native dense_output for cuda from "cuda/dense_output.cu":

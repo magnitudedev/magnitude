@@ -1392,9 +1392,9 @@ pub(crate) mod tests {
         /// A grouped low-rank output plans as its grouped `a` product
         /// (`project_rows` over two groups of 128 attended columns, rank 32)
         /// then `b` as the output projection over those products, and its
-        /// graphs certify on the CPU and Metal at every row class. CUDA's
-        /// and Vulkan's `project_rows` take one group: their graphs refuse
-        /// the call by its entry and statics.
+        /// graphs certify on the CPU, Metal and CUDA at every row class.
+        /// Vulkan's `project_rows` takes one group: its graphs refuse the
+        /// call by its entry and statics.
         #[test]
         fn grouped_output_plans_its_grouped_product_and_certifies_where_natives_take_groups() {
             let (definition, manifest) = selected(false, true);
@@ -1448,10 +1448,10 @@ pub(crate) mod tests {
                     limits,
                 );
                 match backend {
-                    BackendName::Cpu | BackendName::Metal => {
+                    BackendName::Cpu | BackendName::Metal | BackendName::Cuda => {
                         certified.unwrap_or_else(|error| panic!("{backend:?}: {error}"));
                     }
-                    BackendName::Cuda | BackendName::Vulkan => match certified {
+                    BackendName::Vulkan => match certified {
                         Err(crate::programs::graph::GraphError::KernelDomain(violation)) => {
                             assert_eq!(violation.entry, "project_rows");
                             assert!(violation.statics.contains(&("G".to_owned(), 2)));

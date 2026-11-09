@@ -12,7 +12,7 @@ using Raw = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows
 using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw>;
 using Source = projection::GemvSource<Pro>;
 using Scaling = projection::scaling<(SEISMIC_DIM_DS != 0)>;
-using Epi = Scaling::type<projection::Residual<projection::SelectedRows>>;
+using Epi = Scaling::type<projection::Residual<projection::Act, projection::SelectedRows>>;
 
 #define PRODUCT Pro{Raw{SEISMIC_PTR(SEISMIC_BUFFER_PRODUCT), SEISMIC_PRODUCT_STRIDE_0, projection::AllRows{}}}
 // The rows a GEMM reads: staged, or the product rows in place.
@@ -24,7 +24,7 @@ using Epi = Scaling::type<projection::Residual<projection::SelectedRows>>;
 #define PARTIALS reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PARTIALS))
 #define EPILOGUE                                                                                          \
     Scaling::wrap(                                                                                        \
-        projection::Residual<projection::SelectedRows>{                                                   \
+        projection::Residual<projection::Act, projection::SelectedRows>{                                  \
             reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)), SEISMIC_RESIDUAL_STRIDE_0, \
             projection::SelectedRows{reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS))},    \
             reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)), SEISMIC_RESULT_0_STRIDE_0},     \

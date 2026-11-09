@@ -1190,6 +1190,10 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
             configurations
         }
         (BackendName::Cuda, false) => {
+            // The split configuration's block: two warps of two column
+            // groups, or for a query group wider than their 32 rows
+            // (G <= WARPS * 16) four warps of one.
+            let (warps, columns) = if form.g <= 32 { (2, 2) } else { (4, 1) };
             let mut configurations = vec![
                 vec![
                     ("WARPS", 4),
@@ -1199,10 +1203,10 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
                     ("QREG", 0),
                 ],
                 vec![
-                    ("WARPS", 2),
+                    ("WARPS", warps),
                     ("SPLIT_GROUPS", 256),
                     ("STAGES", 2),
-                    ("COLUMNS", 2),
+                    ("COLUMNS", columns),
                     ("QREG", 0),
                 ],
             ];
@@ -2146,10 +2150,21 @@ fn prefill_natives_match_portable_body() {
 
 // ---------------------------------------------------------------------------
 // Rotary layouts, the output rotary and a query norm apart from the key norm
-// (`RA`, `RT`, `RO`, `NQ`): computed on CPU and Metal, refused by the CUDA
-// and Vulkan declarations.
+// (`RA`, `RT`, `RO`, `NQ`): computed on CPU and Metal and by CUDA's prefill
+// entry, refused by CUDA's decode declaration and by Vulkan's.
 
-const NEW_FORM_REFUSALS: &[BackendName] = &[BackendName::Cuda, BackendName::Vulkan];
+/// The backends whose decode entry refuses these forms: CUDA's and
+/// Vulkan's.
+const DECODE_REFUSALS: &[BackendName] = &[BackendName::Cuda, BackendName::Vulkan];
+
+/// The backends whose prefill entry and dense append refuse these forms:
+/// Vulkan's.
+const PREFILL_REFUSALS: &[BackendName] = &[BackendName::Vulkan];
+
+/// The backends whose `decode` (else prefill) entry refuses these forms.
+fn new_form_refusals(decode: bool) -> &'static [BackendName] {
+    if decode { DECODE_REFUSALS } else { PREFILL_REFUSALS }
+}
 
 /// A small DeepSeek V4.1-style layer: ungated, a key norm without a query
 /// norm, sinks, adjacent pairs over the trailing columns, the attended row
@@ -2239,7 +2254,7 @@ fn layout_host_model_matches_portable_body() {
 #[test]
 fn layout_natives_match_portable_body() {
     for (name, decode, case) in layout_cases() {
-        check_natives_against(name, decode, &case, NEW_FORM_REFUSALS, true, &case.expected());
+        check_natives_against(name, decode, &case, new_form_refusals(decode), true, &case.expected());
     }
 }
 
@@ -2401,8 +2416,8 @@ fn v41_host_model_matches_reference() {
 /// At V4.1's shapes the CPU and Metal natives equal the F32 reference: the
 /// decode entry on CPU, and the prefill entry at the decode rows on Metal,
 /// whose decode declaration does not hold G = 64 at W = 512 (the executor
-/// routes those classes through its prefill); prefill rows on both. CUDA
-/// and Vulkan refuse the forms by declaration.
+/// routes those classes through its prefill); prefill rows on both, and on
+/// CUDA, whose decode declaration refuses the forms as Vulkan's do.
 #[test]
 fn v41_natives_match_reference() {
     for (name, decode, case) in v41_cases() {
@@ -2412,7 +2427,7 @@ fn v41_natives_match_reference() {
             let refusals = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan];
             check_natives_against(name, true, &case, &refusals, true, &expected);
         }
-        check_natives_against(name, false, &case, NEW_FORM_REFUSALS, true, &expected);
+        check_natives_against(name, false, &case, PREFILL_REFUSALS, true, &expected);
     }
 }
 
@@ -2533,19 +2548,20 @@ fn bits(values: &[f32]) -> Vec<u32> {
     values.iter().map(|value| value.to_bits()).collect()
 }
 
-/// Whether `backend` may refuse `case`'s form by declaration: CUDA and
-/// Vulkan hold no stored-key values, and Metal's decode entry no head group
-/// of V4.1's width.
+/// Whether `backend` may refuse `case`'s form by declaration: Vulkan holds
+/// no stored-key values, nor CUDA's decode entry, and Metal's decode entry
+/// no head group of V4.1's width.
 fn may_refuse(backend: BackendName, decode: bool, case: &Case) -> bool {
-    matches!(backend, BackendName::Cuda | BackendName::Vulkan)
+    new_form_refusals(decode).contains(&backend)
         || (backend == BackendName::Metal && decode && case.form.g == 64)
 }
 
 /// Attention over the one key plane equals the same inputs over two planes
 /// whose values are the prepared keys, bit for bit, on every configuration
-/// of the CPU and Metal entries: the result, and the key plane the row's
-/// keys are appended to. The two-plane run's value plane ends equal to its
-/// key plane. CUDA and Vulkan refuse every stored-key form.
+/// of the CPU and Metal entries and CUDA's prefill entry: the result, and
+/// the key plane the row's keys are appended to. The two-plane run's value
+/// plane ends equal to its key plane. Vulkan and CUDA's decode entry refuse
+/// every stored-key form.
 #[test]
 fn stored_key_attention_equals_key_valued_planes() {
     let mut failures = Vec::new();
@@ -2568,7 +2584,7 @@ fn stored_key_attention_equals_key_valued_planes() {
                             return;
                         }
                         Err(error) => panic!("{label}: {error}"),
-                        Ok(_) if matches!(backend, BackendName::Cuda | BackendName::Vulkan) => {
+                        Ok(_) if new_form_refusals(decode).contains(&backend) => {
                             panic!("{label}: admitted stored-key values")
                         }
                         Ok(stored) => stored,
@@ -2647,7 +2663,7 @@ fn run_append(device: &Device, case: &Case) -> Result<(Vec<f32>, Vec<f32>), Stri
 
 /// The dense append of a stored-key layer writes the key plane alone, and
 /// it equals the two-plane append of the same rows with the prepared keys
-/// as values, bit for bit; CUDA and Vulkan refuse it.
+/// as values, bit for bit; Vulkan refuses it.
 #[test]
 fn stored_key_append_writes_the_key_plane_alone() {
     let mut failures = Vec::new();
@@ -2658,14 +2674,11 @@ fn stored_key_append_writes_the_key_plane_alone() {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let stored = match run_append(&device, &case) {
                     Err(error) if error.contains("violates the native `where` condition") => {
-                        assert!(
-                            matches!(backend, BackendName::Cuda | BackendName::Vulkan),
-                            "{label}: {error}"
-                        );
+                        assert!(PREFILL_REFUSALS.contains(&backend), "{label}: {error}");
                         return;
                     }
                     Err(error) => panic!("{label}: {error}"),
-                    Ok(_) if matches!(backend, BackendName::Cuda | BackendName::Vulkan) => {
+                    Ok(_) if PREFILL_REFUSALS.contains(&backend) => {
                         panic!("{label}: admitted stored-key values")
                     }
                     Ok(stored) => stored,
@@ -2754,12 +2767,12 @@ fn small_two_source_cases() -> Vec<(&'static str, bool, Case)> {
 }
 
 /// The backends whose declarations refuse an index-list source or a key
-/// rounding: CUDA and Vulkan everywhere, Metal's decode entry too.
+/// rounding: Vulkan everywhere, the CUDA and Metal decode entries too.
 fn two_source_refusals(decode: bool) -> &'static [BackendName] {
     if decode {
         &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
     } else {
-        NEW_FORM_REFUSALS
+        PREFILL_REFUSALS
     }
 }
 
@@ -2905,9 +2918,9 @@ fn small_key_rounding_cases() -> Vec<(&'static str, bool, Case)> {
 /// prepared key in BF16 after its norm and after its rotation and rounds it
 /// with the independent rounding model, and their appended keys lie on the
 /// rounding's grid; the holds move some rounded key. The CPU and Metal
-/// natives (and the dense append) store the host model's rounded keys, and
-/// their results are the host model's over the keys they stored; the other
-/// declarations refuse the form.
+/// natives, and the CPU, Metal and CUDA dense appends, store the host
+/// model's rounded keys, and the natives' results are the host model's over
+/// the keys they stored; the other declarations refuse the form.
 #[test]
 fn key_rounding_matches_portable_body() {
     let (mut failures, mut moved) = (Vec::new(), 0);
@@ -2947,7 +2960,7 @@ fn key_rounding_matches_portable_body() {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match run_append(&device, &case) {
                     Err(error) if error.contains("violates the native `where` condition") => {
-                        assert!(NEW_FORM_REFUSALS.contains(&backend), "{label}: {error}");
+                        assert!(PREFILL_REFUSALS.contains(&backend), "{label}: {error}");
                     }
                     Err(error) => panic!("{label}: {error}"),
                     Ok(appended) => rounded_keys_agree(&label, &case.prepared_keys(&appended.0), &keys),
@@ -2988,9 +3001,11 @@ fn v41_compressed_cases() -> Vec<(&'static str, bool, Case)> {
     ]
 }
 
-/// At V4.1's shapes each CPU and Metal native stores the host model's
-/// rounded keys (on the rounding's grid), and its result is the host
-/// model's over the keys it stored and its picks.
+/// At V4.1's shapes each CPU, Metal and CUDA native its declaration admits
+/// stores the host model's rounded keys (on the rounding's grid), and its
+/// result is the host model's over the keys it stored and its picks; so does
+/// each dense append its declaration admits (a window run of 32 spans two
+/// lanes of a 512-wide row).
 #[test]
 fn v41_compressed_natives_round_and_attend() {
     let mut failures = Vec::new();
@@ -3024,6 +3039,19 @@ fn v41_compressed_natives_round_and_attend() {
                         failures.push(label);
                     }
                 }
+            }
+            let label = format!("{name} append {backend:?}");
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match run_append(&device, &case) {
+                    Err(error) if error.contains("violates the native `where` condition") => {
+                        assert!(PREFILL_REFUSALS.contains(&backend), "{label}: {error}");
+                    }
+                    Err(error) => panic!("{label}: {error}"),
+                    Ok(appended) => rounded_keys_agree(&label, &case.prepared_keys(&appended.0), &rounded),
+                }
+            }));
+            if outcome.is_err() {
+                failures.push(label);
             }
         }
     }

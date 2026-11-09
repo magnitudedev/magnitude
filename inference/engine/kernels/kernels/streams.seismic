@@ -421,10 +421,17 @@ native stream_mix_up for cpu from "cpu/stream_mix_up.rs":
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (S * H * 4)
 
-# Metal: one threadgroup per row reduces its squares and every mix in fixed
-# order; its first thread forms the coefficients, and every thread mixes
-# the input columns. CUDA and Vulkan have no native yet (build.rs).
+# Metal and CUDA: one threadgroup per row reduces its squares and every mix
+# in fixed order; its first thread forms the coefficients, and every thread
+# mixes the input columns. Vulkan has no native yet (build.rs).
 native stream_mix_sinkhorn for metal from "metal/stream_mix_sinkhorn.metal":
+    static (H, S)
+    where S <= 8
+    launch stream_mix_sinkhorn:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_mix_sinkhorn for cuda from "cuda/stream_mix_sinkhorn.cu":
     static (H, S)
     where S <= 8
     launch stream_mix_sinkhorn:
@@ -440,8 +447,14 @@ native stream_mix_sinkhorn for cpu from "cpu/stream_mix_sinkhorn.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Metal: one threadgroup per row, its threads over the columns.
+# Metal and CUDA: one threadgroup per row, its threads over the columns.
 native stream_collapse for metal from "metal/stream_collapse.metal":
+    static (H, S)
+    launch stream_collapse:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_collapse for cuda from "cuda/stream_collapse.cu":
     static (H, S)
     launch stream_collapse:
         threadgroups (M, 1, 1)
@@ -453,10 +466,17 @@ native stream_collapse for cpu from "cpu/stream_collapse.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
-# Metal: the projection library's output epilogue (`projection::OutputOf`,
-# the `Scatter` of every output entry's join) over the F32 rows, one thread
-# per column of a row. CUDA and Vulkan have no native yet (build.rs).
+# Metal and CUDA: the projection library's output epilogue
+# (`projection::OutputOf`, the `Scatter` of every output entry's join) over
+# the F32 rows, one thread per column of a row. Vulkan has no native yet
+# (build.rs).
 native stream_join for metal from "metal/stream_join.metal":
+    static (H, SN, IN)
+    launch stream_join:
+        threadgroups (ceil_div(M * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stream_join for cuda from "cuda/stream_join.cu":
     static (H, SN, IN)
     launch stream_join:
         threadgroups (ceil_div(M * H, 256), 1, 1)

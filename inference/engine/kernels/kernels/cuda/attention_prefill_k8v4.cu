@@ -48,7 +48,8 @@ extern "C" __global__ void __launch_bounds__(256)
         ATTENTION_INPUTS(), HISTORY(),
         reinterpret_cast<attention::u16 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_QUERIES)),
         reinterpret_cast<attention::u16 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_KEYS)),
-        reinterpret_cast<attention::u16 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES)));
+        reinterpret_cast<attention::u16 *>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_VALUES)),
+        rounding::none());
 }
 
 // A launch's WorkList selection (none when B is 0) and its list scratch:

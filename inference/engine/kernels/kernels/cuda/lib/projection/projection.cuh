@@ -58,6 +58,7 @@
 #include "../core/functions.cuh"
 #include <seismic/packets.cuh>
 #include "../core/reduce.cuh"
+#include "join.cuh"
 
 namespace projection {
 
@@ -167,7 +168,8 @@ using GemmOperandsOf = typename Pick<FP4_MMA && (packets::nvfp4_operands<W>::val
 
 // ---------------------------------------------------------------------------
 // Epilogues: called once per (m, n) with the F32 projection (and, paired, the
-// second stream's projection of the same n).
+// second stream's projection of the same n). The joins onto the residual are
+// `join.cuh`'s.
 
 // y[m, offset + n] rounded to the stored element E.
 template <class E> struct Store {
@@ -179,90 +181,6 @@ template <class E> struct Store {
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
         element::put2<E>(out, m * stride + offset + n, first, second);
-    }
-};
-
-// out[m, n] = residual[rows(m), n] + round_A(projection).
-template <class Rows> struct Residual {
-    const float *residual;
-    u64 residual_stride;
-    Rows rows;
-    float *out;
-    u64 stride;
-    __device__ __forceinline__ void operator()(u32 m, u64 n, float value, float) const {
-        out[m * stride + n] = residual[rows(m) * residual_stride + n] + Act::round(value);
-    }
-    __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
-        const u64 source = rows(m) * residual_stride + n;
-        const u64 target = m * stride + n;
-        if (source % 2 != 0 || target % 2 != 0) {
-            (*this)(m, n, first, 0.0f);
-            (*this)(m, n + 1, second, 0.0f);
-            return;
-        }
-        const float2 base = reinterpret_cast<const float2 *>(residual)[source / 2];
-        reinterpret_cast<float2 *>(out)[target / 2] = make_float2(base.x + Act::round(first), base.y + Act::round(second));
-    }
-};
-
-// `scatter`: each of the STREAMS hyper-connection streams of the residual
-// plus the projection times the stream's inject value,
-//   out[m, s * width + n] = residual[rows(m), s * width + n] + round_A(projection) * inject[m, s],
-// or with INJECTED false (one stream) `Residual`'s sum.
-template <class Rows, u32 STREAMS, bool INJECTED> struct Scatter {
-    const float *residual;
-    u64 residual_stride;
-    Rows rows;
-    float *out;
-    u64 stride;
-    const float *inject;
-    u64 inject_stride;
-    u64 width;
-    __device__ __forceinline__ void operator()(u32 m, u64 n, float value, float) const {
-        const float y = Act::round(value);
-#pragma unroll
-        for (u32 s = 0; s < STREAMS; ++s) {
-            const float base = residual[rows(m) * residual_stride + s * width + n];
-            out[m * stride + s * width + n] = INJECTED ? base + y * inject[m * inject_stride + s] : base + y;
-        }
-    }
-    __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
-        (*this)(m, n, first, 0.0f);
-        (*this)(m, n + 1, second, 0.0f);
-    }
-};
-
-// A routed sublayer's column n joining its row's residual (`routed_output`,
-// `routed_combine`): residual + selected + shared, in that order, or (INJECTED)
-// for each of the STREAMS streams residual[s] + (selected + shared) * inject[s].
-// `out` and `residual` point at the row, `inject` at its inject values.
-template <u32 STREAMS, bool INJECTED>
-__device__ __forceinline__ void routed_join(float *out, const float *residual, const float *inject, u64 width, u64 n,
-                                            float selected, float shared) {
-    if constexpr (!INJECTED) {
-        out[n] = residual[n] + selected + shared;
-    } else {
-#pragma unroll
-        for (u32 s = 0; s < STREAMS; ++s)
-            out[s * width + n] = residual[s * width + n] + (selected + shared) * inject[s];
-    }
-}
-
-// An output entry's epilogue: `Residual`, or `Scatter` over STREAMS streams
-// when the entry takes inject values. `make` forms either from every field
-// (`Residual` reads the leading ones).
-template <class Rows, u32 STREAMS, bool INJECTED> struct OutputOf {
-    using type = Scatter<Rows, STREAMS, INJECTED>;
-    __device__ static __forceinline__ type make(const float *residual, u64 residual_stride, Rows rows, float *out,
-                                                u64 stride, const float *inject, u64 inject_stride, u64 width) {
-        return type{residual, residual_stride, rows, out, stride, inject, inject_stride, width};
-    }
-};
-template <class Rows> struct OutputOf<Rows, 1, false> {
-    using type = Residual<Rows>;
-    __device__ static __forceinline__ type make(const float *residual, u64 residual_stride, Rows rows, float *out,
-                                                u64 stride, const float *, u64, u64) {
-        return type{residual, residual_stride, rows, out, stride};
     }
 };
 
@@ -2433,19 +2351,27 @@ __device__ __forceinline__ void split_finalize(const float *partials, u64 parts,
     apply(m, column, first, second);
 }
 
-// One GEMM block of a single-stream entry with few output columns: its K
-// share's partials when the launch is split (grid z = SPLIT shares up to
-// SPLIT_ROWS rows, summed by the finalize launch), else published through
+// One GEMM block of a single-stream entry with few output columns: K share
+// `part` of `parts`, its partials when the launch is split (SPLIT shares up
+// to SPLIT_ROWS rows, summed by the finalize launch), else published through
 // `epi`.
 template <class Shape, bool S8, class Operands = SemanticGemmOperands, class W, class Epi>
 __device__ __forceinline__ void gemm_run_split(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
                                                u64 K, u64 nblock, u64 rows, const W &w, const Epi &epi,
-                                               float *partials) {
-    if (gridDim.z > 1)
+                                               float *partials, u64 part, u64 parts) {
+    if (parts > 1)
         gemm_run<Shape, S8, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{},
-                            PartialStore<1>{partials, M, rows, 0, blockIdx.z}, blockIdx.z, gridDim.z);
+                            PartialStore<1>{partials, M, rows, 0, part}, part, parts);
     else
         gemm_run<Shape, S8, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{}, epi);
+}
+// The split over grid z (z = the K share).
+template <class Shape, bool S8, class Operands = SemanticGemmOperands, class W, class Epi>
+__device__ __forceinline__ void gemm_run_split(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
+                                               u64 K, u64 nblock, u64 rows, const W &w, const Epi &epi,
+                                               float *partials) {
+    gemm_run_split<Shape, S8, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, epi, partials,
+                                        blockIdx.z, gridDim.z);
 }
 
 } // namespace projection

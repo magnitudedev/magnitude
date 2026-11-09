@@ -27,48 +27,48 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "pool_rows",
-        &[BackendName::Cpu, BackendName::Metal],
-        "pooled history rows (DeepSeek V4.1's compressed history), which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "pooled history rows (DeepSeek V4.1's compressed history), which no Vulkan model runs yet",
     ),
     (
         "stream_mix_sinkhorn",
-        &[BackendName::Cpu, BackendName::Metal],
-        "the Sinkhorn mix site (DeepSeek V4.1's single-pass hyper-connections), which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "the Sinkhorn mix site (DeepSeek V4.1's single-pass hyper-connections), which no Vulkan model runs yet",
     ),
     (
         "stream_collapse",
-        &[BackendName::Cpu, BackendName::Metal],
-        "the exit of Sinkhorn hyper-connection streams, which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "the exit of Sinkhorn hyper-connection streams, which no Vulkan model runs yet",
     ),
     (
         "stream_join",
-        &[BackendName::Cpu, BackendName::Metal],
-        "the streams' join of a general routed feed-forward's branch, which only Sinkhorn streams read and no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "the streams' join of a general routed feed-forward's branch, which only Sinkhorn streams read and no Vulkan model runs yet",
     ),
     (
         "indexer_keys",
-        &[BackendName::Cpu, BackendName::Metal],
-        "the general indexer's keys (DeepSeek V4.1's compressed history), which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "the general indexer's keys (DeepSeek V4.1's compressed history), which no Vulkan model runs yet",
     ),
     (
         "indexer_score",
-        &[BackendName::Cpu, BackendName::Metal],
-        "the general indexer's scores over a row list, which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "the general indexer's scores over a row list, which no Vulkan model runs yet",
     ),
     (
         "rows_topk",
-        &[BackendName::Cpu, BackendName::Metal],
-        "the general indexer's selection of rows, which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "the general indexer's selection of rows, which no Vulkan model runs yet",
     ),
     (
         "candidate_blocks",
-        &[BackendName::Cpu, BackendName::Metal],
-        "the candidate pool's block scores (DeepSeek V4.1's restricted indexers), which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "the candidate pool's block scores (DeepSeek V4.1's restricted indexers), which no Vulkan model runs yet",
     ),
     (
         "candidate_rows",
-        &[BackendName::Cpu, BackendName::Metal],
-        "the candidate pool's rows (DeepSeek V4.1's restricted indexers), which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "the candidate pool's rows (DeepSeek V4.1's restricted indexers), which no Vulkan model runs yet",
     ),
     (
         "gated_delta_project_convolved",
@@ -165,6 +165,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "query and visibility ABI macros are separate from CUDA shared attention helpers so cache-publication entries bind only K/V state inputs",
     ),
     (
+        "lib/projection/join",
+        &[BackendName::Cuda],
+        "the residual and stream joins and their row maps are separate from CUDA's projection header, which requires an activation element, so `stream_join` (which binds none) joins through the same epilogues; Metal keeps them in `projection.h`",
+    ),
+    (
         "lib/attention/decode_merge",
         &[BackendName::Cuda],
         "decode output helpers are separate from CUDA's shared attention header so append-only entries do not require output bindings",
@@ -196,13 +201,13 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     ),
     (
         "lib/indexer/indexer",
-        &[BackendName::Metal],
-        "the general indexer's simdgroup head preparation and threadgroup scan, shared by Metal's `indexer_keys`, `indexer_score` and `rows_topk`; the CPU natives prepare a row in their own work item",
+        &[BackendName::Metal, BackendName::Cuda],
+        "the general indexer's lane helpers (Metal: the simdgroup head preparation and threadgroup scan; CUDA: the warp head norm, rotating through `rotary` and scanning through `reduce`), shared by `indexer_keys`, `indexer_score` and `rows_topk`; the CPU natives prepare a row in their own work item",
     ),
     (
         "lib/core/rounding",
-        &[BackendName::Cpu, BackendName::Metal],
-        "trained block roundings of stored rows (the compressed history and its indexer), which no CUDA or Vulkan model runs yet",
+        &[BackendName::Cpu, BackendName::Metal, BackendName::Cuda],
+        "trained block roundings of stored rows (the compressed history and its indexer), which no Vulkan model runs yet",
     ),
     (
         "lib/readout/progressive",
@@ -225,9 +230,14 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the projection family's GEMV row classes, apart from `projection.h` so a library that runs no GEMV (a GEMM's, a batched GEMV's) compiles none of them: Metal compiles a launch's library whole",
     ),
     (
+        "lib/core/head",
+        &[BackendName::Cuda],
+        "a warp-held head row's RMS norm, shared by CUDA's attention, pooled rows and indexers; inside each family's library elsewhere",
+    ),
+    (
         "lib/core/rotary",
-        &[BackendName::Metal, BackendName::Vulkan],
-        "rotary sin/cos and the lane rotation shared by attention, vision and (Metal) the pooled rows and indexers; inside `attention.cuh` on CUDA",
+        &[BackendName::Metal, BackendName::Cuda, BackendName::Vulkan],
+        "rotary layouts and the lane rotation shared by attention, vision and (Metal, CUDA) the pooled rows and indexers; the CPU rotates in `attention.rs`",
     ),
     (
         "lib/recurrent/convolution",

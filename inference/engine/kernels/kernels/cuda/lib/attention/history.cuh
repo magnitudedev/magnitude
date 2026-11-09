@@ -25,7 +25,9 @@ struct DenseHistory {
         return slab::row(key, token, slab_rows, key_row * Act::bytes)
             + static_cast<u64>(kv_head) * key_head * Act::bytes;
     }
+    // A stored-key history's values are its key plane (it has no value plane).
     __device__ __forceinline__ u8 *value_vector(int token, int kv_head) const {
+        if constexpr (STORED_KEY) return key_vector(token, kv_head);
         return slab::row(value, token, slab_rows, value_row * Act::bytes)
             + static_cast<u64>(kv_head) * value_head * Act::bytes;
     }
@@ -37,7 +39,7 @@ struct DenseHistory {
 #pragma unroll
         for (int d = 0; d < DPL; ++d) {
             element::put<Act>(k_row, lane * DPL + d, k[d]);
-            element::put<Act>(v_row, lane * DPL + d, v[d]);
+            if constexpr (!STORED_KEY) element::put<Act>(v_row, lane * DPL + d, v[d]);
         }
     }
 };
@@ -220,7 +222,8 @@ struct AffineHistory {
 #endif
 
 // Append row `row`'s prepared key `k` and raw value for `kv_head` at its
-// destination through `history`, when it has one. One warp.
+// destination through `history`, when it has one: the key alone for
+// stored-key values. One warp.
 template <class History>
 __device__ __forceinline__ void append(const Inputs &in, const History &history, u64 row,
                                        int kv_head, const float (&k)[DPL], int lane) {
@@ -228,7 +231,7 @@ __device__ __forceinline__ void append(const Inputs &in, const History &history,
     const int destination = ATTENTION_DESTINATION(in, row);
     if (destination < 0) return;
     float v[DPL];
-    fresh_value(in, row, kv_head, v, lane);
+    if constexpr (!STORED_KEY) fresh_value(in, row, kv_head, v, lane);
     history.append(destination, kv_head, k, v, lane);
 }
 #ifdef ATTENTION_HISTORY_STAGING

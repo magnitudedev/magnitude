@@ -12,9 +12,11 @@ using Raw = projection::Plain<ELEMENT_OF(SEISMIC_ELEMENT_A), projection::AllRows
 using Pro = projection::Operands<projection::OperandRecipe<packets::W0_OPERANDS_NVFP4>::NVFP4, Raw>;
 using Source = projection::GemvSource<Pro>;
 // The residual join: the residual add, or (hyper-connection streams) the
-// scatter of the projection into each stream, after the weight's
-// second-level scale where it has one.
-using Output = projection::OutputOf<projection::AllRows, SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>;
+// scatter of the projection into each stream (mixed by the comb when the
+// inject row carries one), after the weight's second-level scale where it
+// has one.
+using Output = projection::OutputOf<projection::Act, projection::AllRows, SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0),
+                                    (SEISMIC_DIM_IN > SEISMIC_DIM_SN)>;
 using Scaling = projection::scaling<(SEISMIC_DIM_OS != 0)>;
 using Epi = Scaling::type<Output::type>;
 

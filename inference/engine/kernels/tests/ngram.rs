@@ -245,14 +245,14 @@ impl GateCase {
 #[test]
 fn gate_natives_match_the_portable_body() {
     let cases = [(1, 4, 64, false, 1), (5, 4, 160, false, 2), (17, 2, 300, false, 3)]
-        // The stored product, at V4.1's streams (CPU and Metal).
+        // The stored product, at V4.1's streams (every backend but Vulkan).
         .into_iter()
         .chain([(1, 4, 64, true, 4), (9, 4, 160, true, 5)]);
     for (rows, streams, hidden, product, seed) in cases {
         let case = GateCase::new(rows, streams, hidden, product, seed);
         let oracle = case.oracle();
         for device in devices() {
-            if product && !matches!(device.backend().as_str(), "cpu" | "metal") {
+            if product && device.backend().as_str() == "vulkan" {
                 continue;
             }
             check_close(
@@ -348,7 +348,7 @@ fn product_gate_then_add_equal_the_reference_engram_at_v41s_shape() {
     let (m, s, h) = (rows as u64, streams as u64, hidden as u64);
     for device in devices() {
         let backend = device.backend().as_str();
-        if !matches!(backend, "cpu" | "metal") {
+        if backend == "vulkan" {
             continue;
         }
         let gate = at_defaults(

@@ -7,13 +7,13 @@
 mod common;
 
 use magnitude_kernels::{
-    dense_expand, dense_output, embedding_rows, readout_features_rows, readout_head_rows,
-    readout_project_rows, readout_selected_rows, sample_rows, shape_rows,
+    dense_expand, dense_output, embedding_rows, project_rows, readout_features_rows,
+    readout_head_rows, readout_project_rows, readout_selected_rows, sample_rows, shape_rows,
 };
 mod cuda_common;
 
 use cuda_common::*;
-use seismic::{Device, Element, Layout, NativeSpecialization, Tensor};
+use seismic::{Device, Element, Layout, NativeSpecialization, OperandRecipe, Tensor};
 use seismic_lang::registry::bf16_round;
 
 /// O output rows gathered through `out_rows` from M = O + 2 residual rows.
@@ -235,6 +235,85 @@ fn dense_output_cases(device: &Device, format: Format, h: usize, f: usize, rng: 
                 .value;
             check(
                 &format!("output {format:?} O={o} {mapping:?}"),
+                &read_f32(&result),
+                &expected,
+                &tolerance,
+            );
+        }
+    }
+}
+
+/// A grouped `project_rows` (three groups of 48 weight rows over 512
+/// columns each: a GEMV tile-group tail and a GEMM block-column tail per
+/// group) at every row class: output column g * N + j of a row is its run g
+/// projected through weight row g * N + j. The staged operand paths (INT8,
+/// NVFP4 operand rows) run one group only and are refused.
+fn grouped_project_rows_match_host_model(format: Format) {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(29);
+    let (groups, n, k) = (3usize, 48usize, 512usize);
+    let weight = weight(&device, format, groups * n, k, &mut rng);
+    let projection = Mapped::new(
+        project_rows::native_entry_with(project_rows::Elements {
+            A: Element::bf16(),
+            W: format.resident(),
+            Y: Element::f32(),
+        }),
+        move |_: &Device, mapping: Mapping| {
+            mapping.projection_params(
+                NativeSpecialization::new()
+                    .with_static("G", groups as u64)
+                    .with_static("K", k as u64)
+                    .with_static("N", n as u64)
+                    .with_static("WS", 0),
+            )
+        },
+    );
+    for o in ROWS {
+        let source: Vec<f32> = (0..o * groups * k)
+            .map(|_| bf16_round(rng.uniform(-1.0, 1.0)))
+            .collect();
+        let source_tensor = bf16_tensor(&device, &[o as u64, (groups * k) as u64], &source);
+        let mappings = mappings(o, |mapping| projection.admits(&device, mapping));
+        assert_eq!(
+            mappings.is_empty(),
+            format.operands == OperandRecipe::Nvfp4Rows,
+            "{format:?} O={o}: grouped mappings"
+        );
+        for mapping in mappings {
+            let mut expected = vec![0.0; o * groups * n];
+            let mut tolerance = vec![0.0; o * groups * n];
+            for group in 0..groups {
+                let run: Vec<f32> = (0..o * k)
+                    .map(|i| source[i / k * groups * k + group * k + i % k])
+                    .collect();
+                let rows = &weight.values[group * n * k..(group + 1) * n * k];
+                let (projected, magnitude) = project(&run, rows, o, n, k);
+                // F32 accumulation and the GEMM's weight dequantization (none
+                // for a scaled-GEMM format's exact weights).
+                let dequant = if format.resident().cuda_gemm_fold() {
+                    vec![0.0; o * n]
+                } else {
+                    dequant_bound(&run, rows, o, n, k, mapping)
+                };
+                for i in 0..o * n {
+                    let at = i / n * groups * n + group * n + i % n;
+                    expected[at] = projected[i];
+                    tolerance[at] = magnitude[i] * 2e-5 + dequant[i] + 1e-6;
+                }
+            }
+            let result = projection
+                .kernel(&device, mapping)
+                .call(project_rows::Args {
+                    source: &source_tensor,
+                    weight: &weight.tensor,
+                    weight_scale: &f32_tensor(&device, &[0], &[]),
+                    weight_bound: &f32_tensor(&device, &[0], &[]),
+                })
+                .unwrap()
+                .value;
+            check(
+                &format!("grouped project_rows {format:?} O={o} {mapping:?}"),
                 &read_f32(&result),
                 &expected,
                 &tolerance,
@@ -1281,6 +1360,7 @@ gguf_format_tests! {
     every: [
         dense_expand_matches_host_model
         dense_output_matches_host_model
+        grouped_project_rows_match_host_model
         gemm_row_bands_match_host_model
         gemv_rows_match_single_row_bits
         head_rows_match_host_model

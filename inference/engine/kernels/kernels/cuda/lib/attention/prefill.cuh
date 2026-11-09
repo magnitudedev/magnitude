@@ -121,6 +121,7 @@ static_assert(!Q_REGISTERS || PIECES == 1 || SPLIT_SCORES,
 // m16n8k16 product with F32 accumulation.
 struct Bf16Operands {
     __device__ static __forceinline__ u16 operand(float value) { return seismic_f32_to_bf16(value); }
+    __device__ static __forceinline__ float value(u16 operand) { return seismic_bf16_to_f32(operand); }
     __device__ static __forceinline__ u32 pair(float lo, float hi) {
         return seismic_pack_bf16x2(lo, hi);
     }
@@ -130,6 +131,7 @@ struct Bf16Operands {
 };
 struct F16Operands {
     __device__ static __forceinline__ u16 operand(float value) { return seismic_f32_to_f16(value); }
+    __device__ static __forceinline__ float value(u16 operand) { return seismic_f16_to_f32(operand); }
     __device__ static __forceinline__ u32 pair(float lo, float hi) {
         return seismic_pack_f16x2(lo, hi);
     }
@@ -557,6 +559,12 @@ struct Split {
     float *partials;    // [parts][M][KV * G][W]
     float *statistics;  // [parts][M][KV * G][2]
     u32 *counts;        // [query tiles]
+    // An index-list source's state (KS > 0, `picked`): the partition after
+    // the key partitions', [M][KV * G][W] and [M][KV * G][2]. Every tile
+    // then publishes partials and the merge folds this state in.
+    float *picked_partials;
+    float *picked_statistics;
+    __device__ __forceinline__ bool picked() const { return picked_partials != nullptr; }
 };
 
 // A prefill launch's WorkList selection (`indexer_select`'s per-row block
@@ -612,7 +620,7 @@ struct PrefillRows {
     }
 
     __device__ __forceinline__ void partitioned(Block block, int active) const {
-        if (block.parts > 1 && block.partition == 0 && block.kv == 0 && threadIdx.x == 0)
+        if ((block.parts > 1 || split.picked()) && block.partition == 0 && block.kv == 0 && threadIdx.x == 0)
             split.counts[block.tile] = active;
     }
 
@@ -649,7 +657,7 @@ struct PrefillRows {
                                           float denominator) const {
         [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
         const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
-        if (active > 1) {
+        if (active > 1 || split.picked()) {
             // A partition's partial: the output relative to its row maximum,
             // and (maximum, denominator).
             const u64 slot =
@@ -790,7 +798,7 @@ struct DecodeRows {
 // W], [M, KV, W] and [M, KV, W]).
 template <class History>
 __device__ __forceinline__ void prepare(const Inputs &in, const History &history, u16 *queries,
-                                        u16 *keys, u16 *values) {
+                                        u16 *keys, u16 *values, rounding::Rounding trained) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     typedef Operands<History> Ops;
     __shared__ float exchange[8][W];
@@ -813,8 +821,14 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
     const int kv = head - KV * G;
     float k[DPL];
     float v[DPL];
-    prepared_key(in, row, kv, k, exchange[warp], lane);
-    fresh_value(in, row, kv, v, lane);
+    prepared_key(in, row, kv, k, exchange[warp], lane, trained);
+    // A stored-key value is the prepared key.
+    if constexpr (STORED_KEY) {
+#pragma unroll
+        for (int d = 0; d < DPL; ++d) v[d] = k[d];
+    } else {
+        fresh_value(in, row, kv, v, lane);
+    }
     const u64 at = (row * KV + kv) * W + lane * DPL;
 #pragma unroll
     for (int d = 0; d < DPL; ++d) {
@@ -1487,17 +1501,27 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
     const int query_head = static_cast<int>(blockIdx.y);
     const int column = static_cast<int>(threadIdx.x);
     const int count = static_cast<int>(split.counts[tile]);
-    if (count <= 1) return;
+    if (count <= 1 && !split.picked()) return;
     const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
     const u64 heads = KV * G;
     for (long long token = static_cast<long long>(tile) * QT;
          token < min(static_cast<long long>(tile + 1) * QT, rows_total); ++token) {
         const u64 slot = static_cast<u64>(token) * heads + query_head;
         float denominator, accumulated;
-        const float maximum =
+        float maximum =
             merge(split.statistics + slot * 2, static_cast<u64>(rows_total) * heads * 2,
                   split.partials + slot * W + column, static_cast<u64>(rows_total) * heads * W, count,
                   denominator, accumulated);
+        // The index-list source's state, after the key partitions'.
+        if (split.picked() && split.picked_statistics[slot * 2 + 1] > 0.0f) {
+            const float picked = split.picked_statistics[slot * 2];
+            const float next = fmaxf(maximum, picked);
+            const float carry = seismic_ex2_approx(maximum - next);
+            const float weight = seismic_ex2_approx(picked - next);
+            denominator = __fmaf_rn(split.picked_statistics[slot * 2 + 1], weight, denominator * carry);
+            accumulated = __fmaf_rn(split.picked_partials[slot * W + column], weight, accumulated * carry);
+            maximum = next;
+        }
         element::put<Act>(gated,
                           static_cast<u64>(token) * SEISMIC_RESULT_0_STRIDE_0 +
                               static_cast<u64>(query_head) * SEISMIC_RESULT_0_STRIDE_1 +
@@ -1505,6 +1529,69 @@ __device__ __forceinline__ void merge_partitions(const Inputs &in, const Split &
                           attention::gated(in, token, query_head, column,
                                            accumulated / normalizer(in, query_head, maximum, denominator)));
     }
+}
+
+// The index-list source (KS > 0): one warp per (row `row`, query head
+// `head`), after L1 put the queries in `queries` as `Ops` operands. Its
+// softmax state over the row's `picks` picks (`picks_at(pick)`, -1 for none;
+// each the kv head's vector `vector(picked)` of the source's plane, read as
+// key and value) at `scale` (the exp2 domain) is `split`'s picked state.
+template <class Ops, class Picks, class Vector>
+__device__ __forceinline__ void picked(const u16 *queries, const Split &split, Picks picks_at, int picks,
+                                       Vector vector, float scale, u64 row, int head, int lane) {
+    const u64 state = row * KV * G + head;
+    float q[DPL];
+    float accumulated[DPL];
+#pragma unroll
+    for (int d = 0; d < DPL; ++d) {
+        q[d] = Ops::value(queries[state * W + lane * DPL + d]);
+        accumulated[d] = 0.0f;
+    }
+    float maximum = -__int_as_float(0x7f800000);
+    float denominator = 0.0f;
+    for (int pick = 0; pick < picks; ++pick) {
+        const int at = picks_at(pick);
+        if (at < 0) continue;
+        float x[DPL];
+        element::span<Act, DPL, true>(vector(at, head / G), lane * DPL, x);
+        float dot = 0.0f;
+#pragma unroll
+        for (int d = 0; d < DPL; ++d) dot = __fmaf_rn(q[d], x[d], dot);
+        const float score = seismic_warp_sum_f32(dot) * scale;
+        const float next = fmaxf(maximum, score);
+        const float carry = seismic_ex2_approx(maximum - next);
+        const float weight = seismic_ex2_approx(score - next);
+        denominator = __fmaf_rn(denominator, carry, weight);
+#pragma unroll
+        for (int d = 0; d < DPL; ++d) accumulated[d] = __fmaf_rn(accumulated[d], carry, weight * x[d]);
+        maximum = next;
+    }
+#pragma unroll
+    for (int d = 0; d < DPL; ++d) split.picked_partials[state * W + lane * DPL + d] = accumulated[d];
+    if (lane == 0) {
+        split.picked_statistics[state * 2] = maximum;
+        split.picked_statistics[state * 2 + 1] = denominator;
+    }
+}
+
+// The output rotary (RO = 1) of one published output column pair, run as its
+// own launch after the entry has stored every query head's output: block
+// (row, query head), thread `pair` turns its pair back by the row's negated
+// angles (`output_rotary`), in F32, and publishes it again.
+__device__ __forceinline__ void output_rotary(const Inputs &in, u8 *gated, u64 row, int head, int pair) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    if (pair >= P) return;
+    float cosine, sine;
+    row_table(in, row).turn(pair, cosine, sine);
+    const int lo = head_layout::leading(pair);
+    const int hi = head_layout::partner(lo);
+    const u64 out_at = row * SEISMIC_RESULT_0_STRIDE_0 + static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1;
+    const u64 lo_at = out_at + static_cast<u64>(lo) * SEISMIC_RESULT_0_STRIDE_2;
+    const u64 hi_at = out_at + static_cast<u64>(hi) * SEISMIC_RESULT_0_STRIDE_2;
+    const float low = element::at<Act>(gated, lo_at);
+    const float high = element::at<Act>(gated, hi_at);
+    element::put<Act>(gated, lo_at, low * cosine + high * sine);
+    element::put<Act>(gated, hi_at, high * cosine - low * sine);
 }
 
 }  // namespace prefill

@@ -12,7 +12,10 @@
 // innermost stride); rows and heads are addressed through their ABI strides.
 
 #include "../core/activation.cuh"
+#include "../core/head.cuh"
 #include "../core/reduce.cuh"
+#include "../core/rotary.cuh"
+#include "../core/rounding.cuh"
 #include <seismic/slab.cuh>
 
 namespace attention {
@@ -41,6 +44,13 @@ constexpr int U = static_cast<int>(ATTENTION_SEPARATE);
 constexpr bool FRESH = SEISMIC_DIM_F != 0;
 constexpr bool NORM = SEISMIC_DIM_N != 0;
 constexpr bool VALUE_NORM = SEISMIC_DIM_NV != 0;
+// Stored-key values (VK = 1): a row's value is its prepared key, and the
+// history holds the key plane alone.
+constexpr bool STORED_KEY = SEISMIC_DIM_VK != 0;
+// The rotated 2P columns: the leading ones, or the trailing ones (RT = 1,
+// from S); half-split pairs, or adjacent ones (RA = 1).
+typedef rotary::layout<W, P, SEISMIC_DIM_RT != 0 ? static_cast<int>(SEISMIC_DIM_S) : 0, SEISMIC_DIM_RA != 0>
+    head_layout;
 static_assert(I == 0 || I == W, "interleaved gates are one per column");
 static_assert(U == 0 || U == 1 || U == W, "separate gates are one per head or per column");
 static_assert(I == 0 || U == 0, "a head's gates are interleaved or separate");
@@ -391,71 +401,54 @@ __device__ __forceinline__ float normalizer(const Inputs &in, int query_head, fl
 template <bool NORM>
 __device__ __forceinline__ void head_norm(float (&x)[DPL], const float *weight, u64 weight_stride,
                                           float epsilon, int lane) {
-    if constexpr (NORM) {
-        float squares = 0.0f;
-#pragma unroll
-        for (int d = 0; d < DPL; ++d) squares = __fmaf_rn(x[d], x[d], squares);
-        squares = seismic_warp_sum_f32(squares);
-        const float inverse = rsqrtf(squares / static_cast<float>(W) + epsilon);
-        const int first = lane * DPL;
-#pragma unroll
-        for (int d = 0; d < DPL; ++d) {
-            x[d] = x[d] * inverse * weight[static_cast<u64>(first + d) * weight_stride];
-        }
-    }
+    if constexpr (NORM) head::rms_norm(x, weight, weight_stride, epsilon, lane);
 }
 
-// norm_rotary of one W-vector held by a warp: `head_norm`, then the rotation
-// of the first 2P dimensions by the row's rotary table (pair p by coordinate
-// axis components[p] at frequencies[p], its cosine and sine scaled by
-// amplitudes[p]). `exchange` is W floats of shared memory private to the warp.
+// The dense entries' trained key rounding from their `KR` and four `key_*`
+// scalars (`rounding.seismic`): the scalars under KR = 1, none (block 0)
+// under KR = 0. Each entry that declares KR passes its own.
+__device__ __forceinline__ rounding::Rounding key_rounding(bool kr, u64 block, u64 element, u64 scale,
+                                                           u64 amax_floor) {
+    return rounding::Rounding{kr ? static_cast<int>(static_cast<u32>(block)) : 0,
+                              static_cast<int>(static_cast<u32>(element)),
+                              static_cast<int>(static_cast<u32>(scale)), element::word_f32(amax_floor)};
+}
+
+// The rotary tables of batch row `row`.
+__device__ __forceinline__ rotary::table row_table(const Inputs &in, u64 row) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    return rotary::table{in.coordinates + row * SEISMIC_COORDINATES_STRIDE_0, SEISMIC_COORDINATES_STRIDE_1,
+                         in.components, SEISMIC_ROTARY_COMPONENTS_STRIDE_0,
+                         in.frequencies, SEISMIC_ROTARY_FREQUENCIES_STRIDE_0,
+                         in.amplitudes, SEISMIC_ROTARY_AMPLITUDES_STRIDE_0};
+}
+
+// norm_rotary of one W-vector held by a warp: `head_norm`, then its pairs
+// rotated by the row's tables (`head_layout`), held in the activation
+// element after each where `trained` rounds the row (the portable
+// `rounded_head_rotary`), then rounded by it. `exchange` is W floats of
+// shared memory private to the warp.
 template <bool NORM>
 __device__ __forceinline__ void norm_rotary(float (&x)[DPL], const float *weight,
                                             u64 weight_stride, const Inputs &in, u64 row,
-                                            float *exchange, int lane) {
-    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+                                            float *exchange, int lane,
+                                            rounding::Rounding trained = rounding::none()) {
     head_norm<NORM>(x, weight, weight_stride, in.epsilon, lane);
-    const int first = lane * DPL;
-    if (first < 2 * P) {
-#pragma unroll
-        for (int d = 0; d < DPL; ++d) exchange[first + d] = x[d];
-    }
-    __syncwarp();
-    if (first < 2 * P) {
-#pragma unroll
-        for (int d = 0; d < DPL; ++d) {
-            const int i = first + d;
-            if (i < 2 * P) {
-                const int pair = i % (P > 0 ? P : 1);
-                const int component =
-                    in.components[static_cast<u64>(pair) * SEISMIC_ROTARY_COMPONENTS_STRIDE_0];
-                const int coordinate =
-                    in.coordinates[row * SEISMIC_COORDINATES_STRIDE_0 +
-                                   static_cast<u64>(component) * SEISMIC_COORDINATES_STRIDE_1];
-                const float angle =
-                    static_cast<float>(coordinate) *
-                    in.frequencies[static_cast<u64>(pair) * SEISMIC_ROTARY_FREQUENCIES_STRIDE_0];
-                float sine, cosine;
-                sincosf(angle, &sine, &cosine);
-                const float amplitude =
-                    in.amplitudes[static_cast<u64>(pair) * SEISMIC_ROTARY_AMPLITUDES_STRIDE_0];
-                cosine *= amplitude;
-                sine *= amplitude;
-                x[d] = i < P ? x[d] * cosine - exchange[i + P] * sine
-                             : x[d] * cosine + exchange[i - P] * sine;
-            }
-        }
-    }
-    __syncwarp();
+    rounding::hold_lanes<Act>(x, trained);
+    head_layout::rotate(x, row_table(in, row), exchange, lane);
+    rounding::hold_lanes<Act>(x, trained);
+    rounding::round_lanes<DPL>(x, trained);
 }
 
-// The prepared key of batch row `row`, kv head `kv_head`, rounded to the
+// The prepared key of batch row `row`, kv head `kv_head`, rounded by the
+// `trained` rounding (none unless the entry's KR says so) and to the
 // activation element exactly as history stores it.
 __device__ __forceinline__ void prepared_key(const Inputs &in, u64 row, int kv_head,
-                                             float (&k)[DPL], float *exchange, int lane) {
+                                             float (&k)[DPL], float *exchange, int lane,
+                                             rounding::Rounding trained = rounding::none()) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     element::span<Act, DPL, true>(in.key, ATTENTION_KEY_AT(row, kv_head) + lane * DPL, k);
-    norm_rotary<NORM>(k, in.key_norm, SEISMIC_KEY_NORM_STRIDE_1, in, row, exchange, lane);
+    norm_rotary<NORM>(k, in.key_norm, SEISMIC_KEY_NORM_STRIDE_1, in, row, exchange, lane, trained);
 #pragma unroll
     for (int d = 0; d < DPL; ++d) k[d] = Act::round(k[d]);
 }
@@ -467,7 +460,7 @@ __device__ __forceinline__ void prepared_query(const Inputs &in, u64 row, int qu
                                                float (&q)[DPL], float *exchange, int lane) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     element::span<Act, DPL, true>(in.query, ATTENTION_QUERY_AT(row, query_head) + lane * DPL, q);
-    norm_rotary<NORM>(q, in.query_norm, ATTENTION_QUERY_NORM_STRIDE, in, row, exchange, lane);
+    norm_rotary<ATTENTION_QUERY_NORM>(q, in.query_norm, ATTENTION_QUERY_NORM_STRIDE, in, row, exchange, lane);
 #pragma unroll
     for (int d = 0; d < DPL; ++d) q[d] = Act::round(q[d]);
 }

@@ -189,7 +189,7 @@ native attention_output for metal from "metal/attention_output.metal":
 native attention_output for cuda from "cuda/attention_output.cu":
     static (D, SN, IN, Q, W, OS)
     params (arithmetic INT8 in [0, 1] default 0, arithmetic OPERAND in [0, 1] default 0)
-    where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(OW, INT8) == 1) and IN <= SN
+    where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0) and (INT8 == 0 or form(OW, INT8) == 1)
     scratch staged bytes (M * Q * W * max(1 + OPERAND, 2 * operands(OW))) when (M > 1 and operands(OW) == 1) or (M > 16 and (INT8 == 1 or OPERAND == 1))
     scratch groups bytes (M * Q * W / 4) when INT8 == 1 and M > 16
     scratch partials bytes (2 * M * D * 4) when M > 16 and M <= 128
@@ -1091,17 +1091,21 @@ native attention_prefill for metal from "metal/attention_prefill.metal":
 # values with its last piece (WARPS = 4 fits W = 512). As on Metal, a query tile's key
 # tiles split over up to SPLIT_GROUPS / (tiles x KV) partitions of at least
 # 16 tiles (so long histories fill the device) and a merge launch combines
-# them; SPLIT_GROUPS = 1 never splits.
+# them; SPLIT_GROUPS = 1 never splits. An index-list source (KS > 0) is one
+# more state per (row, query head), the partition after the key partitions'
+# (`attention_prefill_picks`, one warp over the row's picks), which the merge
+# folds in, so every tile publishes partials then. The output rotary (RO = 1)
+# is its own launch over the published rows, as on Metal.
 native attention_prefill for cuda from "cuda/attention_prefill.cu":
     static (KV, G, P, S, I, U, F, NQ, N, NV, B, SK, RA, RT, RO, VK, KR, KS)
     params (arithmetic WARPS in [4, 2, 8, 1] default 4, arithmetic SPLIT_GROUPS in [1, 256, 512] default 1, arithmetic STAGES in [2, 3] default 2,
         arithmetic COLUMNS in [1, 2] default 1, QREG in [0, 1] default 0)
-    where KR == 0 and KS == 0 and NQ == N and RA == 0 and RT == 0 and RO == 0 and VK == 0 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 <= 98304
+    where KR <= 1 and (KS == 0 or B == 0) and NQ <= 1 and RA <= 1 and RT <= 1 and RO <= 1 and (RO == 0 or (P > 0 and I == 0 and U == 0)) and VK <= 1 and SK <= 1 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 <= 98304
     scratch queries bytes (M * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
-    scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) * M * KV * G * (2 * P + S) * 4)
-    scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) * M * KV * G * 8)
+    scratch partials bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) + min(1, KS)) * M * KV * G * (2 * P + S) * 4)
+    scratch statistics bytes ((max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) + min(1, KS)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, WARPS * 16 / G) * 4)
     scratch worklist bytes (ceil_div(M, (WARPS * 16 / G)) * ((WARPS * 16 / G) * (ceil_div(32 * B * BR, (32 - 16 * min(1, (2 * P + S) / 257))) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_prepare:
@@ -1115,9 +1119,15 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
         threadgroups (ceil_div(M, WARPS * 16 / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)))
         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
         shared_bytes (((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 + (R + 1) * 16)
-    launch attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV) > 1:
+    launch attention_prefill_picks when KS > 0:
+        threadgroups (M, KV * G, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch attention_prefill_merge when ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV) > 1 or KS > 0:
         threadgroups (ceil_div(M, WARPS * 16 / G), KV * G, 1)
         threads_per_threadgroup (2 * P + S, 1, 1)
+    launch attention_prefill_rotate when RO == 1:
+        threadgroups (M, KV * G, 1)
+        threads_per_threadgroup (P, 1, 1)
 
 # Vulkan (`vulkan/lib/attention/prefill.glsl`): L1 prepares queries/keys (f16
 # scratch) and appends K/V; L2 streams 32-key K/V tiles per (tile of ROWS / G
@@ -1331,7 +1341,7 @@ native attention_append_dense for metal from "metal/attention_append_dense.metal
 
 native attention_append_dense for cuda from "cuda/attention_append_dense.cu":
     static (KV, P, S, F, N, NV, RA, RT, VK, KR)
-    where KR == 0 and RA == 0 and RT == 0 and VK == 0 and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0
+    where KR <= 1 and RA <= 1 and RT <= 1 and VK <= 1 and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0
     launch attention_append_dense:
         threadgroups (ceil_div(M * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)

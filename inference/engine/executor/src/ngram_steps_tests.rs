@@ -1584,7 +1584,7 @@ fn a_chain_of_prompt_chunks_equals_its_chunks_one_step_at_a_time() {
     std::fs::remove_dir_all(&directory).ok();
 }
 
-/// On Metal and on the CPU: an Engram input (DeepSeek V4.1's form: mapped
+/// On CUDA, Metal and the CPU: an Engram input (DeepSeek V4.1's form: mapped
 /// ids, a fill and no boundary, the stored product gate, no convolution)
 /// ending an attention block over Sinkhorn streams adds `gate · value`, so
 /// at a zero value projection it adds exactly nothing. Two prompt chunks,
@@ -1609,7 +1609,7 @@ fn a_zero_valued_engram_input_leaves_its_attention_decoder_unchanged() {
         chunks: 2,
         rows: CHUNK_ROWS,
     };
-    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
+    let backends = [seismic::BackendName::Cuda, seismic::BackendName::Metal, seismic::BackendName::Cpu];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
         let (added, _) = chained_prompts(&catalog, &with, &package, backend, prompts, 1, Banked::Resident);
         let (plain, _) = chained_prompts(&catalog, &without, &package, backend, prompts, 1, Banked::Resident);
@@ -1686,7 +1686,7 @@ fn engram_requests_decode_together_as_each_alone() {
 /// most 46), so no selection there hinges on a near-tie of its scores.
 const WIDE_POOL: CompressedForm = CompressedForm::Reindexed { blocks: 32, block_units: 2, top: 64 };
 
-/// Decode equals prefill, on Metal and on the CPU: slice C's layer forms
+/// Decode equals prefill, on Metal, CUDA and the CPU: slice C's layer forms
 /// (a window, a pooled source of rate 2 with its own indexer, and a layer
 /// reusing that source and its picks) give each of the 8 rows after a
 /// prompt the same distribution whether they run one row a forward after
@@ -1716,7 +1716,7 @@ fn compressed_layers_decode_equals_prefill() {
     let unit = |name: &str| name.ends_with("norm").then_some(1.0);
     let limits = ResourceLimits { conversations: std::num::NonZeroUsize::new(2).unwrap(), ..limits(32, false, 1, 32) };
     let mut differing = Vec::new();
-    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
+    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cuda, seismic::BackendName::Cpu];
     let forms = [
         ("unrounded", definition.clone(), &manifest),
         ("slice-c", slice_c_numerics(definition), &manifest),
@@ -2690,7 +2690,7 @@ fn routed_reference(tensor: &dyn Fn(&str) -> Rc<Vec<f32>>, block: usize, input: 
     y
 }
 
-/// On Metal and on the CPU, the Sinkhorn fixture (two blocks of attention
+/// On CUDA, Metal and the CPU, the Sinkhorn fixture (two blocks of attention
 /// and a general routed feed-forward over four Sinkhorn streams) equals
 /// its host reference (`sinkhorn_reference`, rounding where the device
 /// rounds) at every row of a prompt
@@ -2759,7 +2759,7 @@ fn a_sinkhorn_decoder_matches_its_host_reference() {
         }
         [error(faithful.clone()), error(reference(SinkhornHost::FirstPre)), error(reference(SinkhornHost::UnscaledJoin))]
     };
-    let backends = [seismic::BackendName::Metal, seismic::BackendName::Cpu];
+    let backends = [seismic::BackendName::Cuda, seismic::BackendName::Metal, seismic::BackendName::Cpu];
     for backend in backends.into_iter().filter(|&backend| available(&catalog, backend)) {
         let prompts = Prompts { requests: 1, chunks: 2, rows: CHUNK_ROWS };
         let (alone, _) = chained_prompts(&catalog, &definition, &package, backend, prompts, 1, Banked::Resident);

@@ -1106,12 +1106,12 @@ mod sinkhorn_graph_tests {
         }
     }
 
-    /// The Sinkhorn fixture's block graphs check on the CPU and Metal,
+    /// The Sinkhorn fixture's block graphs check on the CPU, Metal and CUDA,
     /// whole at decode and prompt rows and as a split block's front and
-    /// back; CUDA and Vulkan declare no Sinkhorn site, so their plans refuse
-    /// it by declaration.
+    /// back; Vulkan declares no Sinkhorn site, so its plans refuse it by
+    /// declaration.
     #[test]
-    fn sinkhorn_block_graphs_check_on_cpu_and_metal_only() {
+    fn sinkhorn_block_graphs_check_on_every_backend_but_vulkan() {
         let definition = sinkhorn_fixture_definition(2);
         let manifest = fixture_manifest(&definition);
         let codec = KvCodec::Dense;
@@ -1136,7 +1136,9 @@ mod sinkhorn_graph_tests {
                 let checked = checked_block_graph_draft(NativeGraphMetadata::new(backend), plan.target().blocks()[index], None, inputs);
                 let label = format!("{backend:?} block {index} {rows} rows {stage:?}");
                 match backend {
-                    BackendName::Cpu | BackendName::Metal => drop(checked.unwrap_or_else(|error| panic!("{label}: {error}"))),
+                    BackendName::Cpu | BackendName::Metal | BackendName::Cuda => {
+                        drop(checked.unwrap_or_else(|error| panic!("{label}: {error}")))
+                    }
                     _ => {
                         let error = checked.err().unwrap_or_else(|| panic!("{label} checks")).to_string();
                         assert!(error.contains("stream_mix_sinkhorn"), "{label}: {error}");

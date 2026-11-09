@@ -2670,10 +2670,17 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
     }
 #define PACKETS_PACKED_MATRIX(P, pointer, index)                                                         \
     ((const packets::u8 *)(pointer) + (packets::u64)(index) * PACKETS_PACKED_MATRIX_BYTES(P))
+// The bytes of one row of a rank-2 [rows, K] tensor: dense, its row stride
+// (stride 0, elements); packed, the layout's row stride. Row r's decoder
+// value is `KERNEL_Wn_AT` at r rows' bytes from the base, for a packed r on a
+// whole row tile (`_TILE_ROWS`).
+#define PACKETS_DENSE_ROW_BYTES(P) PACKETS_DENSE_MATRIX_BYTES(P)
+#define PACKETS_PACKED_ROW_BYTES(P) ((packets::u64)ELEMENT_CAT(P, _ROW_STRIDE_BYTES))
 
 // Slot bindings. Each bound slot must name a dense tensor or a tensor in the
 // mma16 layout. `KERNEL_Wn_MATRIX(pointer, index)` is the decoder value of
-// matrix `index` of a stacked [B, N, K] tensor bound to slot n.
+// matrix `index` of a stacked [B, N, K] tensor bound to slot n, and
+// `KERNEL_Wn_ROW_BYTES` the bytes of one row of a rank-2 tensor bound to it.
 // A slot's admission to the int8 GEMM (`form(W, INT8)`, `_FORM_INT8`; 0 for
 // dense weights, which have no forms), as a constant expression of the slot
 // `KERNEL_Wn`.
@@ -2696,9 +2703,11 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W0) W0; }
 #if ELEMENT_HAS(KERNEL_W0, _KIND_DENSE)
 #define KERNEL_W0_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W0, pointer, index)
 #define KERNEL_W0_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W0)
+#define KERNEL_W0_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W0)
 #else
 #define KERNEL_W0_MATRIX(pointer, index) KERNEL_W0_AT(PACKETS_PACKED_MATRIX(KERNEL_W0, pointer, index))
 #define KERNEL_W0_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W0)
+#define KERNEL_W0_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W0)
 #endif
 // The slot's operand recipe (`operands(W)`): whether products over it take
 // NVFP4 operand rows.
@@ -2722,9 +2731,11 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W1) W1; }
 #if ELEMENT_HAS(KERNEL_W1, _KIND_DENSE)
 #define KERNEL_W1_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W1, pointer, index)
 #define KERNEL_W1_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W1)
+#define KERNEL_W1_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W1)
 #else
 #define KERNEL_W1_MATRIX(pointer, index) KERNEL_W1_AT(PACKETS_PACKED_MATRIX(KERNEL_W1, pointer, index))
 #define KERNEL_W1_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W1)
+#define KERNEL_W1_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W1)
 #endif
 namespace packets { constexpr bool W1_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W1, _OPERANDS_NVFP4); }
 #endif
@@ -2746,9 +2757,11 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W2) W2; }
 #if ELEMENT_HAS(KERNEL_W2, _KIND_DENSE)
 #define KERNEL_W2_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W2, pointer, index)
 #define KERNEL_W2_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W2)
+#define KERNEL_W2_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W2)
 #else
 #define KERNEL_W2_MATRIX(pointer, index) KERNEL_W2_AT(PACKETS_PACKED_MATRIX(KERNEL_W2, pointer, index))
 #define KERNEL_W2_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W2)
+#define KERNEL_W2_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W2)
 #endif
 namespace packets { constexpr bool W2_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W2, _OPERANDS_NVFP4); }
 #endif
@@ -2770,9 +2783,11 @@ namespace packets { typedef PACKETS_DECODER(KERNEL_W3) W3; }
 #if ELEMENT_HAS(KERNEL_W3, _KIND_DENSE)
 #define KERNEL_W3_MATRIX(pointer, index) PACKETS_DENSE_MATRIX(KERNEL_W3, pointer, index)
 #define KERNEL_W3_MATRIX_BYTES PACKETS_DENSE_MATRIX_BYTES(KERNEL_W3)
+#define KERNEL_W3_ROW_BYTES PACKETS_DENSE_ROW_BYTES(KERNEL_W3)
 #else
 #define KERNEL_W3_MATRIX(pointer, index) KERNEL_W3_AT(PACKETS_PACKED_MATRIX(KERNEL_W3, pointer, index))
 #define KERNEL_W3_MATRIX_BYTES PACKETS_PACKED_MATRIX_BYTES(KERNEL_W3)
+#define KERNEL_W3_ROW_BYTES PACKETS_PACKED_ROW_BYTES(KERNEL_W3)
 #endif
 namespace packets { constexpr bool W3_OPERANDS_NVFP4 = ELEMENT_HAS(KERNEL_W3, _OPERANDS_NVFP4); }
 #endif

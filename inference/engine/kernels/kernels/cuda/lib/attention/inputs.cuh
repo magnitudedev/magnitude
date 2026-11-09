@@ -40,3 +40,5 @@
                 static_cast<attention::u64>(bound) * SEISMIC_FRESH_STRIDE_1])
 
 #define ATTENTION_QUERY_NORM_STRIDE SEISMIC_QUERY_NORM_STRIDE_1
+// Whether each query head is RMS-normalized (NQ = 1), apart from the keys' N.
+#define ATTENTION_QUERY_NORM (SEISMIC_DIM_NQ != 0)

@@ -1,16 +1,5 @@
 // stage shared projection mechanisms; included at the original declaration point.
 // ---------------------------------------------------------------------------
-// Row maps: which input row feeds projected row m.
-
-struct AllRows {
-    __device__ __forceinline__ u64 operator()(u32 m) const { return m; }
-};
-struct SelectedRows {
-    const int *rows;
-    __device__ __forceinline__ u64 operator()(u32 m) const { return (u64)rows[m]; }
-};
-
-// ---------------------------------------------------------------------------
 // Prologues. Each forms x[m, k] rounded to A from FACTORS per-row factors:
 //   prepare_row(shared, m, tmp) whole block: factors of row m at shared[0..]
 //   value(factors, m, k)        x[m, k]

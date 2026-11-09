@@ -156,6 +156,19 @@ native pool_rows for metal from "metal/pool_rows.metal":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (32, 1, 1)
 
+# CUDA: Metal's launches, a warp each; the rotation exchanges partners
+# through the warp's W floats of shared memory (`rotary::layout::rotate`).
+native pool_rows for cuda from "cuda/pool_rows.cu":
+    static (P, S, GT, RA, RT, RATE)
+    where RA <= 1 and RT <= 1 and (2 * P + S) % 32 == 0 and RATE <= 16
+    launch pool_rows_append:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch pool_rows_complete:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+        shared_bytes ((2 * P + S) * 4)
+
 # CPU: `append` per row, then `complete` per row (the portable math in F32,
 # its rotation `attention::prepare_rounded_head`'s).
 native pool_rows for cpu from "cpu/pool_rows.rs":

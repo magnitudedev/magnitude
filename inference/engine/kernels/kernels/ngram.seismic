@@ -242,14 +242,14 @@ native ngram_gate for metal from "metal/ngram_gate.metal":
         threadgroups (S, M, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# CUDA and Vulkan: the Metal items over the two norms only (PR = 0).
+# CUDA: the Metal items, the y grid visiting the rows with a stride.
 native ngram_gate for cuda from "cuda/ngram_gate.cu":
     static (H, S, PR)
-    where PR == 0
     launch ngram_gate:
         threadgroups (S, min(M, 65535), 1)
         threads_per_threadgroup (256, 1, 1)
 
+# Vulkan: CUDA's items over the two norms only (PR = 0).
 native ngram_gate for vulkan from "vulkan/ngram_gate.comp":
     static (H, S, PR)
     where PR == 0
