@@ -90,6 +90,14 @@ pub trait ModelFamily: Send + Sync {
     /// what it does not admit instead of disowning the file.
     fn architectures(&self) -> &'static [&'static str];
 
+    /// Why Magnitude withholds this family from serving, when it does: a
+    /// defect that makes its output wrong although its packages interpret.
+    /// Recognition and inspection are unaffected, so the engine still runs
+    /// the family; the service refuses to serve it, with this reason.
+    fn withheld(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Whether this family claims the target's architecture.
     fn recognizes(&self, target: &Directory) -> bool {
         target

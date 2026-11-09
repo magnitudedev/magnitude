@@ -20,11 +20,14 @@ const DRAFTER_ARCHITECTURES: &[&str] = &[
 
 /// The `general.architecture` values the engine recognizes, as targets and
 /// as separate drafters. Recognition is not admission: a recognized file
-/// may still be refused for its feature set.
+/// may still be refused for its feature set. `withheld` are the target
+/// architectures whose family is withheld from serving, each with why
+/// ([`ModelFamily::withheld`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Architectures {
     pub targets: Vec<&'static str>,
     pub drafters: Vec<&'static str>,
+    pub withheld: Vec<(&'static str, &'static str)>,
 }
 
 pub fn architectures() -> Architectures {
@@ -34,6 +37,15 @@ pub fn architectures() -> Architectures {
             .flat_map(|family| family.architectures().iter().copied())
             .collect(),
         drafters: DRAFTER_ARCHITECTURES.to_vec(),
+        withheld: FAMILIES
+            .iter()
+            .filter_map(|family| Some((family.architectures(), family.withheld()?)))
+            .flat_map(|(architectures, reason)| {
+                architectures
+                    .iter()
+                    .map(move |architecture| (*architecture, reason))
+            })
+            .collect(),
     }
 }
 

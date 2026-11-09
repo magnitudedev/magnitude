@@ -386,6 +386,7 @@ pub struct ManagedModelCandidates {
 pub fn engine_architectures() -> RecognizedArchitectures {
     let architectures = magnitude_engine::families::architectures();
     RecognizedArchitectures::new(architectures.targets, architectures.drafters)
+        .withholding(architectures.withheld)
 }
 
 impl ManagedModelCandidates {

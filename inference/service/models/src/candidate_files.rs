@@ -9,16 +9,19 @@ use magnitude_artifacts::gguf::{Directory, PROJECTOR_ARCHITECTURE, Value};
 use magnitude_service_contracts::InventoryError;
 use serde::{Deserialize, Serialize};
 
-/// The `general.architecture` values the engine recognizes as targets and as separate drafters.
-/// The service holds no list of its own; the server supplies the engine's.
+/// The `general.architecture` values the engine recognizes as targets and as separate drafters,
+/// and the target architectures whose family is withheld from serving, each with why. The service
+/// holds no list of its own; the server supplies the engine's.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecognizedArchitectures {
     pub targets: BTreeSet<String>,
     pub drafters: BTreeSet<String>,
+    pub withheld: BTreeMap<String, String>,
 }
 
 impl RecognizedArchitectures {
-    /// A stable key for these sets, for caches of results that depend on them.
+    /// A stable key for the recognized sets, for caches of results that depend on them. Withheld
+    /// families change no file's classification, so they aren't part of it.
     #[must_use]
     pub fn key(&self) -> String {
         format!(
@@ -36,7 +39,27 @@ impl RecognizedArchitectures {
         Self {
             targets: targets.into_iter().map(ToOwned::to_owned).collect(),
             drafters: drafters.into_iter().map(ToOwned::to_owned).collect(),
+            withheld: BTreeMap::new(),
         }
+    }
+
+    /// These sets with `withheld` target architectures, each with why its family is withheld.
+    #[must_use]
+    pub fn withholding<'a>(
+        mut self,
+        withheld: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Self {
+        self.withheld = withheld
+            .into_iter()
+            .map(|(architecture, reason)| (architecture.to_owned(), reason.to_owned()))
+            .collect();
+        self
+    }
+
+    /// Why a model declaring `architecture` is withheld from serving, when it is.
+    #[must_use]
+    pub fn withheld(&self, architecture: &str) -> Option<&str> {
+        self.withheld.get(architecture).map(String::as_str)
     }
 
     /// Whether search keeps a repository whose Hub-level architecture is `architecture`. The Hub

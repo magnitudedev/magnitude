@@ -147,6 +147,16 @@ struct AssessmentPoolCurrent {
     failed_reads: std::collections::BTreeSet<AssessmentDomain>,
 }
 
+/// The entry state of a model with `assessment` as its verdict.
+fn assessed_state(assessment: &CachedModelAssessment) -> ModelAssessmentEntryState {
+    ModelAssessmentEntryState::Assessed {
+        capabilities: assessment.capabilities.clone(),
+        template_fingerprint: assessment.template_fingerprint.clone(),
+        fingerprint: assessment.fingerprint.clone(),
+        profiles: vec![assessment.profile.clone()],
+    }
+}
+
 fn assessment_domain_entries(domain: &ModelAssessmentDomainSnapshot) -> &[ModelAssessmentEntry] {
     match domain {
         ModelAssessmentDomainSnapshot::Available { entries, .. } => entries,
@@ -451,12 +461,7 @@ impl AssessmentPoolCurrent {
                         Err(failure) => Some(failure.clone()),
                     };
                     entry.state = match (&outcome.result, &dropped) {
-                        (Ok(assessment), None) => ModelAssessmentEntryState::Assessed {
-                            capabilities: assessment.capabilities.clone(),
-                            template_fingerprint: assessment.template_fingerprint.clone(),
-                            fingerprint: assessment.fingerprint.clone(),
-                            profiles: vec![assessment.profile.clone()],
-                        },
+                        (Ok(assessment), None) => assessed_state(assessment),
                         _ => ModelAssessmentEntryState::Dropped,
                     };
                     applied.changed = true;
@@ -701,22 +706,37 @@ impl ManagedModelAssessments {
             };
         }
         let environment = self.assessor.environment();
-        let work = self
-            .assessor
-            .configuration_for(&subject)
-            .map(|configuration| {
+        match self.assessor.configuration_for(&subject) {
+            Ok(configuration) => {
                 let preparation = self.preparations.prepare(&environment, &configuration);
-                ModelAssessor::work_for(&environment, configuration, profile, preparation)
-            });
-        match work {
-            Ok(work) => AssessmentTarget {
-                entry: ModelAssessmentEntry {
-                    subject,
-                    state: ModelAssessmentEntryState::Assessing,
-                },
-                key: work.key.clone(),
-                work: Some(work),
-            },
+                let work =
+                    ModelAssessor::work_for(&environment, configuration, profile, preparation);
+                AssessmentTarget {
+                    entry: ModelAssessmentEntry {
+                        subject,
+                        state: ModelAssessmentEntryState::Assessing,
+                    },
+                    key: work.key.clone(),
+                    work: Some(work),
+                }
+            }
+            // A custom model the service refuses to serve (its family is withheld) has an
+            // unsupported verdict with the refusal's reasons, and is never assessed.
+            Err(InventoryError::ModelUnsupported { message, reasons })
+                if matches!(domain, AssessmentDomain::Custom) =>
+            {
+                AssessmentTarget {
+                    key: AssessmentWorkKey(
+                        serde_json::to_string(&(&subject, &profile, "refused"))
+                            .expect("assessment target identity is serializable"),
+                    ),
+                    entry: ModelAssessmentEntry {
+                        subject,
+                        state: assessed_state(&assessor::refused_assessment(reasons, message)),
+                    },
+                    work: None,
+                }
+            }
             Err(error) => {
                 let failure = inventory_model_failure(error);
                 if matches!(domain, AssessmentDomain::Catalog) {

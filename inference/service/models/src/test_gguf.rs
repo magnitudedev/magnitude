@@ -120,13 +120,18 @@ pub(crate) fn write_projector(path: &Path, name: &str) {
     );
 }
 
+/// The reason the engine's DeepSeek V4.1 family is withheld from serving.
+pub(crate) const DEEPSEEK41_WITHHELD: &str = "DeepSeek V4.1 Flash is withheld: its output diverges \
+     from the reference on long non-repeating text (an unresolved precision defect)";
+
 /// Architecture sets shaped like the engine's: the service never holds its own, so tests supply
 /// these the way the server supplies the engine's.
 pub(crate) fn engine_architectures() -> crate::candidate_files::RecognizedArchitectures {
     crate::candidate_files::RecognizedArchitectures::new(
-        ["llama", "qwen35", "qwen35moe", "qwen4exp", "nemotron_h_moe", "gemma4"],
+        ["llama", "qwen35", "qwen35moe", "qwen4exp", "nemotron_h_moe", "gemma4", "deepseek41"],
         ["dflash", "gemma4-assistant", "qwen4exp"],
     )
+    .withholding([("deepseek41", DEEPSEEK41_WITHHELD)])
 }
 
 /// The engine's assessment fixtures, found through the crate directory cargo

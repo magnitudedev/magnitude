@@ -875,7 +875,7 @@
       "description": "Multimodal MoE model with a causal encoder-decoder, Engram memory and low active compute.",
       "releaseDate": "2026-10-17",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 552000000000, "activeParameters": 16000000000 },
-      "support": { "level": "disabled", "reason": "The DeepSeek V4.1 Flash model family is not implemented yet." },
+      "support": { "level": "disabled", "reason": "DeepSeek V4.1 Flash is withheld: its output diverges from the reference on long non-repeating text (an unresolved precision defect)" },
       "sources": [
         {
           "repository": "magnitudedev/DeepSeek-V4.1-Flash-1017-GGUF",

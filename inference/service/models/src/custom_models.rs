@@ -31,6 +31,7 @@ use magnitude_service_contracts::{
     ExternalOrigin, HubFile, InventoryError, ModelLocation, ModelSource,
 };
 
+use crate::candidate_files::RecognizedArchitectures;
 use crate::catalog_models::catalog_id;
 use crate::gguf::{GgufBaseModel, GgufRole};
 use crate::inventory::{
@@ -548,6 +549,14 @@ impl ModelDomainResolver {
             .chain(projection.hidden)
             .find(|projected| projected.model.model_id == *model_id)
             .ok_or_else(|| InventoryError::NotFound(model_id.to_string()))?;
+        if let Some(Withheld { architecture, reason }) = projected.withheld {
+            return Err(InventoryError::ModelUnsupported {
+                message: reason,
+                reasons: vec![UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                    architecture,
+                })],
+            });
+        }
         projected
             .configuration
             .map_err(|failure| InventoryError::ModelOperation {
@@ -590,9 +599,17 @@ struct ProjectedModel {
     lineage_repository: Option<String>,
     candidate_drafters: Vec<ModelPackageId>,
     configuration: Result<ModelServingConfiguration, ModelFailure>,
+    withheld: Option<Withheld>,
     managed_packages: Vec<ModelPackageId>,
     drafter_pending: bool,
     awaited_drafter: Option<ModelPackageId>,
+}
+
+/// A model whose family is withheld from serving: the architecture its target declares, and the
+/// family's reason. It is never served, whatever its configuration.
+struct Withheld {
+    architecture: String,
+    reason: String,
 }
 
 /// The Hub file a copy in a location that records its Hub origin (the Hugging Face cache,
@@ -978,6 +995,7 @@ fn project(
     let hidden = configuration.hidden.iter().collect::<BTreeSet<_>>();
     let context = ModelContext {
         configuration,
+        architectures,
         catalog,
         catalog_drafters,
         enrichment,
@@ -1078,6 +1096,7 @@ fn unreadable_reason(occurrence: &Occurrence<'_>) -> KnownUnsupportedReason {
 /// occurrence (drafters resolve among them) and the installed packages by identity.
 struct ModelContext<'a> {
     configuration: &'a LocalModelsConfiguration,
+    architectures: &'a RecognizedArchitectures,
     catalog: &'a RecommendableModelCatalog,
     catalog_drafters: &'a CatalogDrafterRevisions,
     enrichment: &'a dyn CustomModelEnrichment,
@@ -1095,6 +1114,7 @@ impl ModelContext<'_> {
     ) -> Option<ProjectedModel> {
         let ModelContext {
             configuration: _,
+            architectures,
             catalog,
             catalog_drafters,
             enrichment,
@@ -1153,6 +1173,12 @@ impl ModelContext<'_> {
         };
         let enriched = enrichment.enrich(&facts);
         let enrichment_known = enrichment.knows(&facts);
+        let withheld = evidence.architecture.as_deref().and_then(|architecture| {
+            Some(Withheld {
+                architecture: architecture.to_owned(),
+                reason: architectures.withheld(architecture)?.to_owned(),
+            })
+        });
 
         let choice = self.choice(&model_id);
         let resolve = |reference: DrafterReference, method: SpeculativeMethod| {
@@ -1304,7 +1330,8 @@ impl ModelContext<'_> {
         // Only a model that serves is enriched; one that can't serve has no drafter to await.
         let drafter_pending = (matches!(choice, DrafterChoice::Auto) && !enrichment_known
             || chosen_pending)
-            && configuration.is_ok();
+            && configuration.is_ok()
+            && withheld.is_none();
         Some(ProjectedModel {
             locations: group
                 .occurrences
@@ -1348,6 +1375,7 @@ impl ModelContext<'_> {
                 update_commit: None,
             },
             configuration,
+            withheld,
         })
     }
 }
@@ -1442,6 +1470,7 @@ impl ModelContext<'_> {
                 message: format!("{model_id} has not finished downloading"),
                 retryable: true,
             }),
+            withheld: None,
             managed_packages: Vec::new(),
             drafter_pending: false,
             awaited_drafter,
@@ -5909,6 +5938,42 @@ mod tests {
                     path: folder.clone()
                 }
             }
+        );
+    }
+
+    /// A model of a family the engine withholds from serving, found outside the catalog (so no
+    /// catalog support check sees it), is refused as unsupported with the family's reason.
+    #[tokio::test]
+    async fn a_found_model_of_a_withheld_family_is_refused_with_its_reason() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        fs::create_dir_all(&folder).unwrap();
+        crate::test_gguf::write_gguf(
+            &folder.join("DeepSeek-V4.1-Flash-Q4_K_M.gguf"),
+            &[
+                ("general.architecture", Meta::Str("deepseek41")),
+                ("general.name", Meta::Str("DeepSeek V4.1 Flash")),
+            ],
+            &["token_embd.weight", "blk.0.attn_q.weight"],
+        );
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+
+        assert_eq!(listed.models.len(), 1);
+        let model_id = &listed.models[0].model_id;
+        let Err(InventoryError::ModelUnsupported { message, reasons }) =
+            fixture.resolver.serving_configuration(model_id)
+        else {
+            panic!("a withheld family's model is refused as unsupported");
+        };
+        assert_eq!(message, crate::test_gguf::DEEPSEEK41_WITHHELD);
+        assert_eq!(
+            reasons,
+            [UnsupportedReason::Known(KnownUnsupportedReason::Architecture {
+                architecture: "deepseek41".to_owned(),
+            })]
         );
     }
 

@@ -18,6 +18,13 @@ impl ModelFamily for DeepSeek41Family {
         &[FAMILY_ID]
     }
 
+    fn withheld(&self) -> Option<&'static str> {
+        Some(
+            "DeepSeek V4.1 Flash is withheld: its output diverges from the reference on long \
+             non-repeating text (an unresolved precision defect)",
+        )
+    }
+
     fn inspect(
         &self,
         target: &Directory,

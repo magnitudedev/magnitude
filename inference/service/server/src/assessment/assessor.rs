@@ -699,12 +699,18 @@ fn unsupported_model(
 /// A file whose header or bytes cannot be read: refused before the engine sees it, without a
 /// serving profile.
 pub(crate) fn unreadable_assessment(detail: String) -> CachedModelAssessment {
-    unsupported_assessment(
-        None,
+    refused_assessment(
         vec![UnsupportedReason::Known(KnownUnsupportedReason::Unreadable)],
         detail,
-        None,
     )
+}
+
+/// A model refused for `reasons` before the engine sees it, without a serving profile.
+pub(crate) fn refused_assessment(
+    reasons: Vec<UnsupportedReason>,
+    detail: String,
+) -> CachedModelAssessment {
+    unsupported_assessment(None, reasons, detail, None)
 }
 
 fn unsupported_assessment(
