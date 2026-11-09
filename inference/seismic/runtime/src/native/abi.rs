@@ -552,12 +552,10 @@ fn render_source_with(
                     "#define SEISMIC_DIM_{name} {}\n",
                     literal(dialect, value)
                 ));
-                // GLSL's preprocessor evaluates no typed literal: an `#if`
-                // guard on a static extent reads it as a plain integer.
-                #[cfg(any(not(target_os = "macos"), test, feature = "coverage"))]
-                if matches!(dialect, Dialect::Vulkan(_)) {
-                    prefix.push_str(&format!("#define SEISMIC_STATIC_{name} {value}\n"));
-                }
+                // No preprocessor evaluates the typed literal (GLSL's reads
+                // no suffix, C++'s no cast): an `#if` guard on a static
+                // extent reads it as a plain integer.
+                prefix.push_str(&format!("#define SEISMIC_STATIC_{name} {value}\n"));
             }
             None => prefix.push_str(&format!(
                 "#define SEISMIC_DIM_{name} (seismic_words[{word}])\n"

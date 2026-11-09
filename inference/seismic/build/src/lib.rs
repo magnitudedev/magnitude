@@ -771,14 +771,12 @@ mod internals {
                 [format!("SEISMIC_DIM_{}", native_macro(dimension))],
             )?;
         }
-        // A static extent as a plain integer, for Vulkan's `#if` guards.
-        if dialect == SourceDialect::Vulkan {
-            for dimension in &definition.statics {
-                abi.define(
-                    AbiMeaning::Dimension(dimension.clone()),
-                    [format!("SEISMIC_STATIC_{}", native_macro(dimension))],
-                )?;
-            }
+        // A static extent as a plain integer, for `#if` guards.
+        for dimension in &definition.statics {
+            abi.define(
+                AbiMeaning::Dimension(dimension.clone()),
+                [format!("SEISMIC_STATIC_{}", native_macro(dimension))],
+            )?;
         }
         for element in &entry.element_parameters {
             let mut symbols = HashSet::new();
