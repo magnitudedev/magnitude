@@ -1170,6 +1170,14 @@ pub enum TuningEvent {
         bindings: String,
         points: usize,
     },
+    /// A development survey of a unit (feature `tuning-survey`) came this
+    /// far through its configurations: reported once they are counted,
+    /// before any is formed, and as each batch is formed and measured.
+    Surveyed {
+        entry: &'static str,
+        bindings: String,
+        progress: seismic::SurveyProgress,
+    },
     /// A unit's mandatory work is done: when the units' canonical compiles
     /// began on the tuning clock (what the count walk took), what forming
     /// its canonical artifact took (its own compile, which ran beside the
@@ -4485,7 +4493,9 @@ impl<'a> Tuner<'a> {
                 bindings: bindings.clone(),
                 points: shapes.len(),
             });
-            let result = self.survey(case, statics, &shapes, plan).map_err(failure)?;
+            let result = self
+                .survey(case, entry, &bindings, statics, &shapes, plan)
+                .map_err(failure)?;
             // A surveyed unit takes no part in the division of the tuning
             // time: the most a search of it could be given is all of it.
             survey::record(&key, self.budget(), &result).map_err(failure)?;
@@ -4672,6 +4682,8 @@ impl<'a> Tuner<'a> {
     fn survey<T: EntryTuning>(
         &mut self,
         case: &T,
+        entry: &'static str,
+        bindings: &str,
         statics: &NativeSpecialization,
         shapes: &[PointShape],
         plan: seismic::SurveyPlan,
@@ -4682,15 +4694,21 @@ impl<'a> Tuner<'a> {
             guard: None,
         };
         let device = self.device;
+        let observer = self.context.observer;
         let result = case
             .tune(
                 device,
                 statics,
-                &mut UnitPoints {
-                    case,
-                    shapes,
-                    inputs: self.inputs(),
-                    cases: &mut cases,
+                &mut SurveyedPoints {
+                    points: UnitPoints {
+                        case,
+                        shapes,
+                        inputs: self.inputs(),
+                        cases: &mut cases,
+                    },
+                    observer,
+                    entry,
+                    bindings,
                 },
                 requirement,
                 Strategy::Survey(plan),
@@ -4722,6 +4740,45 @@ impl<'a> Tuner<'a> {
             limits: self.limits,
             load: self.weights.load(),
         }
+    }
+}
+
+/// A surveyed unit's points, which report the survey's progress to the
+/// tuning's observer ([`TuningEvent::Surveyed`]).
+#[cfg(feature = "tuning-survey")]
+struct SurveyedPoints<'s, P> {
+    points: P,
+    observer: &'s dyn TuningObserver,
+    entry: &'static str,
+    bindings: &'s str,
+}
+
+#[cfg(feature = "tuning-survey")]
+impl<E: seismic::Entry, P: seismic::PointSource<'static, E>> seismic::PointSource<'static, E>
+    for SurveyedPoints<'_, P>
+{
+    fn release(&mut self, point: usize) {
+        self.points.release(point);
+    }
+
+    fn points(&self) -> Vec<seismic::PointSpec> {
+        self.points.points()
+    }
+
+    fn served(&self) -> Vec<BTreeMap<String, u64>> {
+        self.points.served()
+    }
+
+    fn build(&mut self, point: usize) -> Result<seismic::PointInputs<'static>, BuildError> {
+        self.points.build(point)
+    }
+
+    fn surveyed(&mut self, progress: seismic::SurveyProgress) {
+        self.observer.event(&TuningEvent::Surveyed {
+            entry: self.entry,
+            bindings: self.bindings.to_owned(),
+            progress,
+        });
     }
 }
 

@@ -221,6 +221,8 @@ impl TuningTrace {
             }),
             // Ephemeral UI activity; completed pieces remain the trace's evidence.
             TuningEvent::WorkStarted { .. } => return,
+            // A survey's progress; its record is the survey's evidence.
+            TuningEvent::Surveyed { .. } => return,
             TuningEvent::Started {
                 entry,
                 bindings,

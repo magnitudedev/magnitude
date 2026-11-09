@@ -173,6 +173,22 @@ pub trait PointSource<'a> {
     }
     /// Build point `point`'s inputs, or say why they cannot be built.
     fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError>;
+    /// A survey ([`Strategy::Survey`]) came this far: reported once its
+    /// configurations are counted, before it forms any, and as each batch
+    /// of them is formed and measured.
+    fn surveyed(&mut self, _progress: SurveyProgress) {}
+}
+
+/// How far a survey has come through the configurations it forms and
+/// measures ([`PointSource::surveyed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SurveyProgress {
+    /// Every configuration the survey forms and measures.
+    pub configurations: usize,
+    /// Those whose formation ran (some may have been excluded by it).
+    pub formed: usize,
+    /// Those whose measurement ran (or which their formation excluded).
+    pub measured: usize,
 }
 
 /// Why a point's inputs were not built.
@@ -5372,7 +5388,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             default: &self.default,
             ground: &ground,
         };
-        let (configurations, overall, method, time) = tuned.survey(&points, plan)?;
+        let (configurations, overall, method, time) =
+            tuned.survey(&points, plan, &mut |progress| source.surveyed(progress))?;
         let mut result =
             self.unit.result(configurations, &overall, method, time, ground.kernel.launch_programs());
         result.points = records;
@@ -7366,7 +7383,12 @@ struct Tuned<'s> {
 type Tuning = (Records, NativeSpecialization, TuningMethod, TuningTime);
 
 impl Tuned<'_> {
-    fn survey(&self, points: &[PreparedPoint<'_>], plan: SurveyPlan) -> Result<Tuning, TuneError> {
+    fn survey(
+        &self,
+        points: &[PreparedPoint<'_>],
+        plan: SurveyPlan,
+        report: &mut dyn FnMut(SurveyProgress),
+    ) -> Result<Tuning, TuneError> {
         let options = Sampling {
             samples: plan.samples,
             min_sample_seconds: plan.min_sample_seconds,
@@ -7391,12 +7413,26 @@ impl Tuned<'_> {
         } else {
             Programs::Whole(WholePrograms::default())
         };
+        // What the walk visits, counted before anything is formed.
+        let mut progress = SurveyProgress {
+            configurations: 0,
+            formed: 0,
+            measured: 0,
+        };
+        self.domain.walk(self.statics, self.default, |_| {
+            progress.configurations += 1;
+            true
+        })?;
+        report(progress);
         // One batch of the walk: its programs formed together, then each
         // measured. A batch is as many as form at once.
         let mut survey = |batch: Vec<NativeSpecialization>| -> Result<(), TuneError> {
             let began = Instant::now();
             let kernels = programs.form(self.formation, &batch, &[])?;
             time.forming_seconds += began.elapsed().as_secs_f64();
+            progress.formed += batch.len();
+            report(progress);
+            let batched = batch.len();
             for (specialization, kernel) in batch.into_iter().zip(kernels) {
                 let began = Instant::now();
                 let launches = kernel.as_ref().map(|kernel| kernel.launch_programs()).unwrap_or_default();
@@ -7435,6 +7471,8 @@ impl Tuned<'_> {
                     outcome,
                 });
             }
+            progress.measured += batched;
+            report(progress);
             Ok(())
         };
         // The configurations that run work of their own at the points, in
@@ -7456,7 +7494,9 @@ impl Tuned<'_> {
         if let Some(error) = failed {
             return Err(error);
         }
-        survey(batch)?;
+        if !batch.is_empty() {
+            survey(batch)?;
+        }
         let measured = |record: &ConfigurationRecord| match &record.outcome {
             Outcome::Measured { points, .. } => Some(points.clone()),
             Outcome::Excluded(_) => None,

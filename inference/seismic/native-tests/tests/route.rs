@@ -3996,9 +3996,27 @@ fn a_ranged_kernel_forms_and_serves_only_its_range() {
 /// A survey of a unit whose launches are formed separately forms them as its
 /// search does, from held launch programs, and measures and validates every
 /// admissible configuration: each launch's own choices, at a point where each
-/// launch works.
+/// launch works. It reports how many configurations it forms before it forms
+/// any, and its progress through them as it goes.
 #[test]
 fn a_survey_times_every_configuration_of_launches_formed_separately() {
+    /// The survey's points, and the progress it reported.
+    struct Reporting<'p> {
+        points: Vec<TuningPoint<'p, scoped_scale::Entry>>,
+        reports: Vec<seismic::SurveyProgress>,
+    }
+    impl<'p> seismic::PointSource<'p, scoped_scale::Entry> for Reporting<'p> {
+        fn points(&self) -> Vec<seismic::PointSpec> {
+            seismic::PointSource::points(&self.points)
+        }
+        fn build(&mut self, point: usize) -> Result<seismic::PointInputs<'p>, seismic::BuildError> {
+            seismic::PointSource::build(&mut self.points, point)
+        }
+        fn surveyed(&mut self, progress: seismic::SurveyProgress) {
+            self.reports.push(progress);
+        }
+    }
+
     let devices = Devices::discover(&[]).unwrap();
     let Ok(device) = devices.open_backend(BackendName::Metal) else {
         return;
@@ -4020,10 +4038,14 @@ fn a_survey_times_every_configuration_of_launches_formed_separately() {
             written: Default::default(),
         })
         .collect::<Vec<_>>();
+    let mut points = Reporting {
+        points,
+        reports: Vec::new(),
+    };
     let survey = scoped_scale::native_tune(
         &device,
         &NativeSpecialization::new(),
-        points,
+        &mut points,
         NumericalRequirement::BitExact,
         Strategy::Survey(SurveyPlan {
             samples: 3,
@@ -4034,6 +4056,19 @@ fn a_survey_times_every_configuration_of_launches_formed_separately() {
     .unwrap();
     // Two widths by two row counts for each of the two launches.
     assert_eq!(survey.configurations.len(), 16);
+    let progress = |formed, measured| seismic::SurveyProgress {
+        configurations: 16,
+        formed,
+        measured,
+    };
+    assert_eq!(points.reports.first(), Some(&progress(0, 0)));
+    assert_eq!(points.reports.last(), Some(&progress(16, 16)));
+    assert!(points.reports.windows(2).all(|pair| {
+        pair[0].configurations == pair[1].configurations
+            && pair[0].formed <= pair[1].formed
+            && pair[0].measured <= pair[1].measured
+            && pair[1].measured <= pair[1].formed
+    }));
     for record in &survey.configurations {
         let Outcome::Measured { points, .. } = &record.outcome else {
             panic!("{:?}", record.outcome)

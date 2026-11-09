@@ -146,7 +146,7 @@ pub use seismic_runtime::native::tune::{
     Exclusion, FormationRecord, Formed, GoverningStep, Grounded, Narrowed, NumericalObservation,
     NumericalRequirement, Outcome, Performed, PieceMemory, PointInputs, PointMeasurement,
     PointRecord, PointSpec, ProcessMemory, Reselection, SearchPlan, Spent, Stage,
-    Standing, StepPower, Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan, TuneError,
+    Standing, StepPower, Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan, SurveyProgress, TuneError,
     TuningDisposition, TuningInitializer, TuningMethod, TuningResult, TuningTime, UnitPlan,
     Violation, Work, Workers, WorkloadRotation, WrittenRows, COMPARISON_VERSION, GOVERNING_STEP,
 };
@@ -2175,6 +2175,10 @@ pub trait PointSource<'a, E: Entry> {
     /// [`TensorError`] or [`CallError`] of allocation capacity converts to),
     /// which the tuner prices and offers again rather than failing the unit.
     fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError>;
+    /// A survey ([`Strategy::Survey`]) came this far: reported once its
+    /// configurations are counted, before it forms any, and as each batch
+    /// of them is formed and measured.
+    fn surveyed(&mut self, _progress: SurveyProgress) {}
 }
 
 impl<'a, E: Entry, S: PointSource<'a, E> + ?Sized> PointSource<'a, E> for &mut S {
@@ -2191,6 +2195,10 @@ impl<'a, E: Entry, S: PointSource<'a, E> + ?Sized> PointSource<'a, E> for &mut S
 
     fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError> {
         (**self).build(point)
+    }
+
+    fn surveyed(&mut self, progress: SurveyProgress) {
+        (**self).surveyed(progress);
     }
 }
 
@@ -2211,6 +2219,10 @@ impl<'a, E: Entry> seismic_runtime::native::tune::PointSource<'a> for TypedPoint
 
     fn build(&mut self, point: usize) -> Result<PointInputs<'a>, BuildError> {
         self.0.build(point)
+    }
+
+    fn surveyed(&mut self, progress: SurveyProgress) {
+        self.0.surveyed(progress);
     }
 }
 

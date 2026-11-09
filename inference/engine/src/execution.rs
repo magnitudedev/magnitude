@@ -1802,6 +1802,21 @@ impl TuningObserver for TuningReport {
                 bindings,
                 points,
             } => tracing::info!("tuning {entry} [{bindings}] at {points} points"),
+            TuningEvent::Surveyed {
+                entry,
+                bindings,
+                progress,
+            } => match progress.formed {
+                0 => tracing::info!(
+                    "surveying {entry} [{bindings}]: forming and measuring {} configurations",
+                    progress.configurations
+                ),
+                formed => tracing::info!(
+                    "surveying {entry} [{bindings}]: {formed} of {} configurations formed, {} measured",
+                    progress.configurations,
+                    progress.measured
+                ),
+            },
             // Each unit's mandatory work, each piece of optional work and
             // each record published when the optional work stops are in
             // the tuning trace, the latter two with their forecasts.
