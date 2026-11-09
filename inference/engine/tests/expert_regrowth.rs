@@ -2,15 +2,15 @@
 //! service owner and the controlled domain's fake expert bank
 //! (`magnitude_executor::fixtures`): another program's hold takes the store
 //! below its planning reserve, the owner's release ladder shrinks the bank
-//! for Reclaim, the hold lets go, and the bank grows back once memory has
-//! stayed free for the recovery time, not before. The fixture's heap reads
+//! for Reclaim, the hold lets go, and the bank grows back at a later
+//! reading's settle, whose supply holds the reserve derived from the host's
+//! measured motion, with no wait beside it. The fixture's heap reads
 //! the host's memory as first sampled, moved only by what the process takes
 //! and gives back and by the test's press (`StillHost`). Each runs on every
 //! backend discovery reports available (`bank_backends`).
 
 use magnitude_executor::{
     fixtures::{bank_backends, bank_row, banked, misses_at, press, price_growth, shrink_settled, TestFamily},
-    platform::RECOVERY_STABLE_TIME,
     BankResize, ExpertResidency, ShrinkCause,
 };
 use magnitude_scheduler::{owner::Owner, ServiceLimits};
@@ -20,7 +20,7 @@ use owner_host::Host;
 mod owner_host;
 
 /// The memory observations, one every observation interval, that a shrink
-/// and the growth after the recovery time finish within.
+/// and the growth after it finish within.
 const OBSERVATIONS: usize = 200;
 
 fn limits() -> ServiceLimits {
@@ -66,11 +66,10 @@ fn read(host: &Host<TestFamily>, store: seismic::StoreId) -> magnitude_executor:
 
 /// A press half a slot below the planning reserve of the bank's store puts
 /// it in Reclaim, and the ladder's bank rung gives back a slot for it. The
-/// press lets go at once, yet the bank grows back only once memory has
-/// stayed free for the recovery time since the shrink: to the four slots
-/// the load's misses stop falling at.
+/// press lets go at once, and a later reading's settle grows the bank back
+/// to the four slots the load's misses stop falling at.
 #[test]
-fn a_bank_shrunk_for_a_press_regrows_once_memory_has_stayed_free() {
+fn a_bank_shrunk_for_a_press_regrows_once_the_press_lets_go() {
     for backend in bank_backends() {
         let (mut domain, mut bindings) = banked(backend, 4, 4);
         let row = bank_row(&domain);
@@ -92,8 +91,7 @@ fn a_bank_shrunk_for_a_press_regrows_once_memory_has_stayed_free() {
         press.release();
         let grew = |resize: &BankResize| matches!(resize, BankResize::Grew { .. });
         let grown = observe_until(&mut host, press.store(), grew, &format!("{backend:?} growth"));
-        let waited = std::time::Duration::from_nanos(grown - shrunk);
-        assert!(waited >= RECOVERY_STABLE_TIME, "{backend:?}: grown {waited:?} after the shrink, within the recovery time");
+        assert!(grown > shrunk, "{backend:?}: grown before the shrink");
         assert_eq!(experts(&host).slots, 4, "{backend:?}: grown to where the misses stop falling");
     }
 }

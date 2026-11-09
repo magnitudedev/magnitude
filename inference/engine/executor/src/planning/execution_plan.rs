@@ -1795,7 +1795,7 @@ mod tests {
     /// whose prefill is no slower than 512-row passes'. Every pass ties
     /// beside the whole bank, so the plan holds the largest one whose prompt
     /// group's class of the places it merges fits beside it, the largest
-    /// of all with a GiB more.
+    /// of all where the room holds that one's class.
     #[test]
     fn gemma_q4_on_a_3090_keeps_its_bank_resident_beside_a_merged_pass() {
         use crate::planning::fixtures::{LIMITS, gemma_moe_fixture_definition, gemma_moe_fixture_manifest};
@@ -1879,9 +1879,10 @@ mod tests {
             let with_class = allocated_at(next);
             assert!(with_class > bound, "{next:?} and its class ({with_class} bytes) fit the room ({bound}) beside the whole bank");
         }
-        // With a GiB more, the class fits beside the whole bank: the largest
-        // pass is held.
-        let wider = bound + (1 << 30);
+        // With room for the largest pass and its class beside the whole
+        // bank, the largest pass is held.
+        let largest = *ladder.last().unwrap();
+        let wider = allocated_at(largest).max(bound);
         let (wide, ()) = draft
             .with_held_experts(&definition, HeldBound::room(wider), &prices, crate::Unmeasured::Waits, &mut HeldCharges::<AssessmentMemoryCharge>::default(), |mandatory: u64| {
                 let left = wider.saturating_sub(mandatory);
