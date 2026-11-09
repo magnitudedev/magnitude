@@ -65,7 +65,7 @@ fn a_step_whose_wait_outlasted_a_still_pulse_is_interrupted_and_the_load_goes_on
     let step = harness.prompt_step();
     for index in 0..harness.layers.len() {
         harness.scratch(&step, index, if index == 0 { &[3, 4] } else { &[] });
-        harness.commit_seeds(&step);
+        harness.commit_seeds(&step, index);
     }
     let before = pulse.late_beats();
     pulse.beat_after(Duration::from_millis(4 * constants::PULSE_SPINS as u64 * 70 / 1_000_000));
@@ -119,8 +119,8 @@ fn a_failed_steps_experts_are_the_next_routing_steps() {
     let mut converted = lists.concat().into_iter().map(|(_, expert)| expert).collect::<Vec<_>>();
     converted.sort_unstable();
     assert_eq!(converted, [0, 1]);
-    let seeds = listed(&harness.load.2);
-    assert_eq!(harness.load.2.load(constants::LIST_SEQUENCE as usize), low_word(steps[1].sequence()));
+    let seeds = listed(&harness.seeds[0]);
+    assert_eq!(harness.seeds[0].load(constants::LIST_SEQUENCE as usize), low_word(steps[1].sequence()));
     assert!(!seeds.is_empty() && seeds.iter().all(|&(expert, _)| expert != 7), "expert 7 is not seeded");
     let mut steps = steps.into_iter();
     assert!(matches!(steps.next().unwrap().complete(), Err(StepFailure::Read { .. })));

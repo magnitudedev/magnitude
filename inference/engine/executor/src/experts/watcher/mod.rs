@@ -599,12 +599,7 @@ impl Watcher {
         let homes = (0..layers.len())
             .map(|layer| i32::try_from(directory.home(layer)).map_err(|_| "a layer's map words exceed i32".to_owned()))
             .collect::<Result<Vec<_>, _>>()?;
-        let LoadWords {
-            flags,
-            lists,
-            tiered,
-            seeds,
-        } = load;
+        let LoadWords { flags, lists } = load;
         let count = layers.len();
         let core = Core {
             table: Arc::new(ReadTable::new(source, pools, &layers)),
@@ -699,7 +694,7 @@ impl Watcher {
             prefetch: Prefetch::new(staging, count),
             scratch: Scratch::new(
                 count,
-                ScratchWords { flags, lists, tiered, seeds },
+                ScratchWords { flags, lists },
                 Conveyor::new(form_of, &experts, carrier),
             ),
             promotions: Promotions::new(),

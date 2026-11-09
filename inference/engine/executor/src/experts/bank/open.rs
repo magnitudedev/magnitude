@@ -385,6 +385,8 @@ fn watch(
                 let binding = plan.binding(index)?;
                 ListRecords { bank: binding.records, tier: binding.tier, conveyor: binding.conveyor }
             },
+            tiered: words(&layer.tiered, 0)?,
+            seeds: words(&layer.seeds, 0)?,
         });
     }
     // A staging or conveyor record is one contiguous range of its pool's,
@@ -543,8 +545,6 @@ fn watch(
                 .iter()
                 .map(|list| words(list, 0))
                 .collect::<Result<Vec<_>, String>>()?,
-            tiered: words(&layout.load.tiered, 0)?,
-            seeds: words(&layout.load.seeds, 0)?,
         },
         pools,
         extents: Extents {
