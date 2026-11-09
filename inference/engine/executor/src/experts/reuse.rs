@@ -141,6 +141,23 @@ impl Logged {
     const NONE: Self = Self { score: Score::NEVER, last: None, routed: 0, order: 0 };
 }
 
+/// A read the ranking has not logged yet: its step, and the choices that
+/// routed to the expert in it (none known for a decode landing's read;
+/// for a running prompt group, its steps' choices so far). Later reads
+/// order after earlier ones, and of one step, the more routed after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Unlogged {
+    pub step: Step,
+    pub routed: u32,
+}
+
+impl Unlogged {
+    /// A read at `step` whose choices are unknown.
+    pub fn at(step: Step) -> Self {
+        Self { step, routed: 0 }
+    }
+}
+
 /// An expert's rank, least first: its score, its last read, the choices
 /// that read routed to it (of a prompt group's union, how much of the
 /// prompt used it), then its place in the order of logging, which no two
@@ -557,15 +574,16 @@ impl Reuse {
         decayed(logged.score) + pending
     }
 
-    /// `layer`'s `expert`'s rank ([`Rank`]), beside a read at step `read`
-    /// the log may not have brought yet (a step still running among them):
+    /// `layer`'s `expert`'s rank ([`Rank`]), beside a read the log may not
+    /// have brought yet (`read`, of a step still running among them):
     /// counted as a read where it is past the last logged one, and then its
-    /// last, the choices it routed unknown (none).
-    pub fn rank(&self, layer: usize, expert: usize, read: Option<Step>) -> Rank {
+    /// last, with the choices it routed (a running prompt group's so far,
+    /// so its reads rank by the prompt's use of them before the group ends).
+    pub fn rank(&self, layer: usize, expert: usize, read: Option<Unlogged>) -> Rank {
         let measure = self.measure();
         let logged = measure.rank(layer, expert);
-        match read.filter(|&read| Some(read) > logged.last) {
-            Some(read) => Rank { score: logged.score.sum(Score::at(read), measure.half_life), last: Some(read), routed: 0, ..logged },
+        match read.filter(|read| Some(read.step) > logged.last) {
+            Some(Unlogged { step, routed }) => Rank { score: logged.score.sum(Score::at(step), measure.half_life), last: Some(step), routed, ..logged },
             None => logged,
         }
     }
@@ -684,8 +702,8 @@ pub(super) mod tests {
         assert_eq!(log(&mut reuse, read(6, &[0])), [1], "one expert read since");
         assert_eq!(reuse.half_life(), 0.);
         assert_eq!(reuse.rank(0, 0, None).score(), Score(6.));
-        assert_eq!(reuse.rank(0, 0, Some(3)).score(), Score(6.), "a stamp the log has passed adds nothing");
-        assert_eq!(reuse.rank(0, 2, Some(7)).score(), Score(7.), "a stamp past the log is a later read");
+        assert_eq!(reuse.rank(0, 0, Some(Unlogged::at(3))).score(), Score(6.), "a stamp the log has passed adds nothing");
+        assert_eq!(reuse.rank(0, 2, Some(Unlogged::at(7))).score(), Score(7.), "a stamp past the log is a later read");
         assert_eq!(reuse.rank(0, 2, None).score(), Score::NEVER);
         assert_eq!(reuse.last(0, 1), Some(5));
     }

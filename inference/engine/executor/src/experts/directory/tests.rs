@@ -158,7 +158,7 @@ fn a_prompt_group_is_lent_its_bank_records_and_returns_them_free() {
     directory.lend(2, &lent.lock());
     assert_eq!(directory.held(0, 0), None);
     assert!((0..2).all(|record| directory.bank.records(0)[record] == Record::Lent { from: 2 }));
-    directory.read_pending(1, 3, 2);
+    directory.read_pending(1, 3, 2, 1);
     // Seeds take the records the group does not hold.
     let (seeds, evicted) = directory.seed(at(2, 1), 1, &[(5, 2), (6, 2), (7, 2)], &[], |_| true);
     assert_eq!((seeds.iter().map(|&(_, record)| record).collect::<Vec<_>>(), evicted), (vec![BankRecord(2), BankRecord(3)], vec![]));
@@ -755,4 +755,155 @@ fn misses_evict_the_least_recently_read_records_but_the_requests_own() {
         directory.place(at(6, 1), 1, &[], &[4, 5, 6], |record| reads[record]),
         None
     );
+}
+
+/// A one-store directory of one group of `records` records over `layers`
+/// layers of `experts` experts each, every record ready, nothing read.
+fn one_store(records: u32, layers: usize, experts: u64) -> Directory {
+    let map = || LandingMap::Bank {
+        map: std::sync::Arc::new(StampedMap::new(cpu_words(&[experts, magnitude_kernels::constants::MAP_WORDS], 0))),
+        steps: std::sync::Arc::new(steps()),
+    };
+    Directory::new(&[0], &vec![0; layers], &vec![experts as usize; layers], HostTier {
+        records: vec![records],
+        lent: vec![0],
+        placement: Placement::Bank { landing_maps: (0..layers).map(|_| map()).collect() },
+    })
+}
+
+/// A running prompt group's reads rank by the prompt's use of each expert
+/// before the group ends and the ranking logs them: the store's fill
+/// takes the experts the prompt routed most first, never their indices'
+/// order, though every one of them was read at the same step.
+#[test]
+fn the_fill_follows_a_running_prompts_use_of_each_expert() {
+    let mut directory = one_store(4, 1, 16);
+    let use_of = [(3, 1), (11, 9), (5, 4), (14, 6), (0, 2)];
+    for &(expert, routed) in &use_of {
+        directory.read_pending(0, expert, 1, routed);
+    }
+    let order = directory.fill_order(0, 5, |_| false).into_iter().map(|(_, expert)| expert).collect::<Vec<_>>();
+    assert_eq!(order, [11, 14, 5, 0, 3], "by the prompt's use, most first");
+}
+
+/// Of two experts the store keeps, a seed displaces the one the running
+/// group has not read, though the one it read sorts first by index, and
+/// the displaced record is owed back to the reserve however full it is.
+#[test]
+fn a_seed_displaces_what_the_running_group_has_not_read() {
+    let mut directory = one_store(3, 1, 16);
+    for expert in [0, 1] {
+        let record = directory.land(0, expert, 0).expect("a ready record");
+        directory.landed(0, record, expert, None);
+    }
+    directory.read_pending(0, 0, 1, 1);
+    directory.read_pending(0, 2, 1, 4);
+    let seeded = directory.seed_store(0, &[(2, 1)]);
+    assert_eq!(seeded.iter().map(|&(expert, _)| expert).collect::<Vec<_>>(), [2]);
+    let owed = directory.refill_victims(0, false)[0].iter().map(|&(_, staged)| staged).collect::<Vec<_>>();
+    assert_eq!(owed, [(0, 1)], "the expert the group has not read, however full the reserve");
+}
+
+/// The post-prompt ramp, from a routing trace: a prompt routes each layer
+/// with a skewed use of its experts, and decode keeps routing by the same
+/// use. The store the prompt leaves (the fill after its reads, ranked
+/// while it runs) misses decode's first steps at a fraction of the
+/// start-up fill's index-ordered store, which knew no read.
+#[test]
+fn the_store_a_prompt_leaves_misses_decode_far_less_than_an_index_ordered_one() {
+    const EXPERTS: usize = 64;
+    const RECORDS: usize = 16;
+    const LAYERS: usize = 2;
+    // A deterministic trace: expert e of a layer is used in proportion to
+    // 1 / (1 + rank(e)), its rank a fixed permutation unrelated to e.
+    let rank = |layer: usize, expert: usize| (expert * 37 + layer * 11) % EXPERTS;
+    let weight = |layer: usize, expert: usize| 1. / (1. + rank(layer, expert) as f64);
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut draw = |layer: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let total: f64 = (0..EXPERTS).map(|expert| weight(layer, expert)).sum();
+        let mut at = (state >> 11) as f64 / (1u64 << 53) as f64 * total;
+        (0..EXPERTS).find(|&expert| { at -= weight(layer, expert); at <= 0. }).unwrap_or(EXPERTS - 1)
+    };
+    let prompt = (0..LAYERS).map(|layer| (0..2048).map(|_| draw(layer)).collect::<Vec<_>>()).collect::<Vec<_>>();
+    let decode = (0..LAYERS).map(|layer| (0..400).map(|_| draw(layer)).collect::<Vec<_>>()).collect::<Vec<_>>();
+    let mut directory = one_store((RECORDS * LAYERS) as u32, LAYERS, EXPERTS as u64);
+    for (layer, routes) in prompt.iter().enumerate() {
+        let mut routed = vec![0u32; EXPERTS];
+        routes.iter().for_each(|&expert| routed[expert] += 1);
+        for (expert, &count) in routed.iter().enumerate().filter(|(_, count)| **count > 0) {
+            directory.read_pending(layer, expert, 1, count);
+        }
+    }
+    let filled = directory.fill_order(0, RECORDS * LAYERS, |_| false);
+    let misses = |held: &dyn Fn(usize, usize) -> bool| -> usize {
+        decode.iter().enumerate().map(|(layer, routes)| routes.iter().filter(|&&expert| !held(layer, expert)).count()).sum()
+    };
+    let by_use = misses(&|layer, expert| filled.contains(&(layer, expert)));
+    let by_index = misses(&|_, expert| expert < RECORDS);
+    assert!(filled.iter().all(|&(layer, _)| layer < LAYERS) && filled.len() == RECORDS * LAYERS);
+    assert!(by_use * 2 < by_index, "the prompt's store misses {by_use}, the index-ordered one {by_index}");
+}
+
+/// A one-store directory as [`one_store`], its maps' steps begun through
+/// `begun` so a landing maps from the step after it, and the views a
+/// running group's steps resolve through.
+fn one_store_begun(records: u32, layers: usize, experts: u64, begun: Step) -> (Directory, Vec<crate::experts::map::MapView>) {
+    let steps = std::sync::Arc::new(steps());
+    steps.begin_through(begun);
+    let maps = (0..layers)
+        .map(|_| std::sync::Arc::new(StampedMap::new(cpu_words(&[experts, magnitude_kernels::constants::MAP_WORDS], 0))))
+        .collect::<Vec<_>>();
+    let views = maps.iter().map(|map| map.view().clone()).collect();
+    let directory = Directory::new(&[0], &vec![0; layers], &vec![experts as usize; layers], HostTier {
+        records: vec![records],
+        lent: vec![0],
+        placement: Placement::Bank { landing_maps: maps.into_iter().map(|map| LandingMap::Bank { map, steps: steps.clone() }).collect() },
+    });
+    (directory, views)
+}
+
+/// A running prompt group's planned hits keep their records: its step 500
+/// plans hits on the store's experts 0, 1 and 3, the group having read
+/// only 0; a seed of 2 displaces 1, the least ranked, and the reserve
+/// refills while the group still holds the lent records; a step begun
+/// after it reads whatever the store no longer keeps cold, which seeds it
+/// again in place of 3, which the group has not read either.
+/// Step 500's planned hits still resolve to records: the invariant a
+/// prompt round's rounds rest on (`Scratch::fix_rounds`), where a hit with
+/// neither a record nor a scratch slot would read a slot no round filled.
+#[test]
+fn a_running_groups_planned_hits_keep_their_records_through_its_seeds_and_refills() {
+    let (mut directory, views) = one_store_begun(6, 1, 16, 1000);
+    // Landed before the group: mapped for its steps.
+    for expert in [0, 1, 3] {
+        let Claim::Taken(grant) = directory.claim_landing(0, expert, 0) else { panic!("a ready record for {expert}") };
+        grant.map(Some(0));
+        directory.landed(0, HostRecord(grant.record()), expert, None);
+    }
+    let planned = [0, 1, 3].map(|expert| (expert, views[0].resolve(expert, 500).expect("a hit the group's step plans")));
+    directory.read_pending(0, 0, 500, 3);
+    directory.read_pending(0, 2, 500, 5);
+    let seed = |directory: &mut Directory, expert: usize| {
+        for (expert, grant) in directory.seed_store(0, &[(expert, 1001)]) {
+            grant.map(None);
+            directory.landed(0, HostRecord(grant.record()), expert, None);
+        }
+    };
+    seed(&mut directory, 2);
+    let at = Unbegun::at(1001);
+    let victims = directory.refill_victims(2, false);
+    directory.refill(victims, false, &at, (500, 1000));
+    // Step 1001 reads cold what the store no longer keeps, and seeds it.
+    for expert in [0, 1, 3] {
+        if views[0].resolve(expert, 1001).is_none() {
+            directory.read_pending(0, expert, 1001, 1);
+            seed(&mut directory, expert);
+        }
+    }
+    for (expert, record) in planned {
+        assert_eq!(views[0].resolve(expert, 500), Some(record), "step 500's planned hit on expert {expert} lost its record");
+    }
 }

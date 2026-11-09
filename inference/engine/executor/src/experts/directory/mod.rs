@@ -30,7 +30,7 @@ mod stack;
 use super::host_records::{Claim, Demand, Grant, HostRecords, InboundTable, Kept, Located, Resolution};
 use super::map::{LandingMap, StampedMap};
 use super::records::{BankRecords, Lent, Record};
-use super::reuse::{Rank, Ranking, Reuse};
+use super::reuse::{Rank, Ranking, Reuse, Unlogged};
 use super::staging::Staged;
 use super::watcher::{Lending, LentRecords, Step, Steps, Unbegun};
 use std::collections::{BTreeSet, HashMap};
@@ -162,10 +162,12 @@ pub(super) struct Directory {
     /// decision until its last slot joined ([`Self::host_growth`]): the
     /// tier's planned records exceed those it holds and fills.
     host_growing: bool,
-    /// The running prompt group's reads the ranking has not logged yet
-    /// (its hits and seeds, each read at its last step, [`Self::read_pending`]),
-    /// which every taking ranks beside.
-    prompt_reads: HashMap<Staged, Step>,
+    /// The running prompt group's reads the ranking has not logged yet:
+    /// every expert its steps routed, each at its last step with the
+    /// choices routed to it so far ([`Self::read_pending`]), which every
+    /// taking ranks beside, so the store's fill and seeds follow the
+    /// prompt's use of each expert as its passes resolve.
+    prompt_reads: HashMap<Staged, Unlogged>,
     /// Who places into the bank: where the host does (the one store), a
     /// prompt group's scratch and seeds are its host records'.
     placer: crate::planning::Placer,
@@ -236,18 +238,20 @@ impl BankRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HostRecord(pub u32);
 
-/// The later of `read`, a read of `staged` the log may not have brought
-/// yet, and the running prompt group's read of it
-/// ([`Directory::read_pending`]): what every taking ranks it beside.
-fn beside(prompt_reads: &HashMap<Staged, Step>, staged: Staged, read: Option<Step>) -> Option<Step> {
-    read.max(prompt_reads.get(&staged).copied())
+/// The later of `read`, a read of `staged` at a step the log may not have
+/// brought yet (a landing's, whose choices are unknown), and the running
+/// prompt group's read of it with the choices its steps routed to it so
+/// far ([`Directory::read_pending`]): what every taking ranks it beside.
+/// Of one step the prompt's read, which knows its choices, wins.
+fn beside(prompt_reads: &HashMap<Staged, Unlogged>, staged: Staged, read: Option<Step>) -> Option<Unlogged> {
+    read.map(Unlogged::at).max(prompt_reads.get(&staged).copied())
 }
 
 /// How the host records rank what they keep, by `reuse`, one hold of the
 /// ranking for the whole choice: an expert's whole rank beside its reads
 /// ([`beside`]), so experts the reads tie keep the order earlier reads gave
 /// them, never their indices'.
-fn store_rank<'a>(reuse: &'a Reuse, prompt_reads: &'a HashMap<Staged, Step>) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
+fn store_rank<'a>(reuse: &'a Reuse, prompt_reads: &'a HashMap<Staged, Unlogged>) -> impl Fn(Staged, Option<Step>) -> Rank + Copy + 'a {
     move |staged @ (layer, expert): Staged, read: Option<Step>| reuse.rank(layer, expert, beside(prompt_reads, staged, read))
 }
 
@@ -599,8 +603,12 @@ impl Directory {
     /// pass over (another read carries them), in the order each tier lands
     /// them ([`HostRecords::lacking`], by this one order) across the groups:
     /// those each layer's ranked share holds first (`Reuse::in_top`), then
-    /// the most reused, then by expert, then by layer: a
-    /// tie every layer's alike, whatever batches the fill lands in. So a tier with a
+    /// by rank, most first: reuse, then a running prompt group's use of
+    /// each expert it has routed so far ([`Self::read_pending`]), so once a
+    /// prompt's pass has resolved a layer its experts fill by that use.
+    /// Only experts nothing has read or routed tie on every key, with no
+    /// fact to order them: those go by expert, then by layer, every
+    /// layer's alike, whatever batches the fill lands in. So a tier with a
     /// record for every expert is filled to every expert, and a smaller
     /// one's records beyond the reserve with each layer's ranked share.
     pub fn fill_order(&self, keep: usize, count: usize, skip: impl Fn(Staged) -> bool) -> Vec<Staged> {
@@ -952,7 +960,7 @@ impl Directory {
             .filter(|&(_, record)| self.bank.usable(group, record, lending))
             .collect::<Vec<_>>();
         let mut released = held.iter().map(|&((layer, expert), record)| (self.ranked(reuse, layer, expert, None), record)).collect::<Vec<_>>();
-        let mut floor = held.iter().map(|&(staged @ (layer, expert), _)| reuse.weighed(layer, expert, beside(&self.prompt_reads, staged, None), stay)).collect::<Vec<_>>();
+        let mut floor = held.iter().map(|&(staged @ (layer, expert), _)| reuse.weighed(layer, expert, beside(&self.prompt_reads, staged, None).map(|read| read.step), stay)).collect::<Vec<_>>();
         if held.len() > most {
             released.select_nth_unstable(most);
             released.truncate(most);
@@ -973,7 +981,7 @@ impl Directory {
     /// their reads, [`beside`]). What a copy costs and a hit saves are the
     /// cost function's (`ExpertLines::copy_hits`).
     fn earning(&self, reuse: &Reuse, group: usize, wanted: Vec<Staged>, floor: &[f64], lending: &Lending, stay: Option<f64>) -> Earning {
-        let weighed = |staged @ (layer, expert): Staged| reuse.weighed(layer, expert, beside(&self.prompt_reads, staged, None), stay);
+        let weighed = |staged @ (layer, expert): Staged| reuse.weighed(layer, expert, beside(&self.prompt_reads, staged, None).map(|read| read.step), stay);
         // A layer whose hit saves nothing earns no promotion at any read:
         // its wants wait for no read, so none is withheld; its lines'
         // repricing asks them again (`Self::price_copies`).
@@ -1308,12 +1316,13 @@ impl Directory {
         (seeded.into_iter().zip(placed.records).collect(), evicted)
     }
 
-    /// A prompt group in flight reads `layer`'s `expert` at its last step
-    /// `read`, which the ranking logs when the group ends: until then every
-    /// taking, on either placer, ranks it beside that read.
-    pub fn read_pending(&mut self, layer: usize, expert: usize, read: Step) {
-        let pending = self.prompt_reads.entry((layer, expert)).or_insert(read);
-        *pending = (*pending).max(read);
+    /// A prompt group in flight routes `layer`'s `expert` at step `read`,
+    /// `routed` choices of its steps to it so far, which the ranking logs
+    /// when the group ends: until then every taking, on either placer,
+    /// ranks it beside that read and its use.
+    pub fn read_pending(&mut self, layer: usize, expert: usize, read: Step, routed: u32) {
+        let pending = self.prompt_reads.entry((layer, expert)).or_insert(Unlogged { step: read, routed });
+        *pending = (*pending).max(Unlogged { step: read, routed });
     }
 
     /// The device is at `progress`: every seed placed before it whose step

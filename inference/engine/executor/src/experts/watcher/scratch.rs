@@ -639,11 +639,13 @@ impl Scratch {
                 None => cold.push(expert),
             }
         }
-        // The group reads its hits at this step, which the ranking logs once
-        // the group ends: until then every taking ranks each beside it, so
-        // none while the group runs prefers it to what no prompt read.
-        for &(expert, _) in &hits {
-            core.directory.read_pending(layer, expert, sequence);
+        // The group routes these experts at this step, which the ranking
+        // logs once the group ends: until then every taking ranks each beside
+        // this read and the choices the group has routed to it so far, so the
+        // fill and the seeds rank the layer's experts by the prompt's use as
+        // its pass resolves, never by index.
+        for &expert in &routed {
+            core.directory.read_pending(layer, expert, sequence, tier.routed[expert]);
         }
         for &expert in &cold {
             tier.assign(expert, sequence, self.conveyor.state(layer, expert).is_some());
