@@ -18,6 +18,8 @@
 // ```
 #![allow(dead_code)]
 
+mod declared;
+
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_prefill, attention_prefill_k8v4,
 };
@@ -491,12 +493,19 @@ fn run_family(
             no_picks(device, rows as usize, case.geometry.kv, case.geometry.w());
         macro_rules! dense {
             ($module:ident $(, $extra:ident: $value:expr)*) => {{
-                let kernel = $module::native_for_device_with(
+                let entry = $module::native_entry_with($module::Elements { A: elements });
+                let prepare = |error: &dyn std::fmt::Display| {
+                    format!("prepare {}: {error}", stringify!($module))
+                };
+                let configured = declared::declared_at(
                     device,
-                    $module::Elements { A: elements },
+                    &entry,
                     &dense_statics(specialization.clone().with_static("SK", 0)),
                 )
-                .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
+                .map_err(|error| prepare(&error))?;
+                let kernel = entry
+                    .prepare(device, &configured)
+                    .map_err(|error| prepare(&error))?;
                 let [history_key, history_value] = &mut *history else {
                     panic!("dense history has two planes")
                 };
@@ -539,12 +548,19 @@ fn run_family(
         }
         macro_rules! affine {
             ($module:ident $(, $extra:ident: $value:expr)*) => {{
-                let kernel = $module::native_for_device_with(
+                let entry = $module::native_entry_with($module::Elements { A: elements });
+                let prepare = |error: &dyn std::fmt::Display| {
+                    format!("prepare {}: {error}", stringify!($module))
+                };
+                let configured = declared::declared_at(
                     device,
-                    $module::Elements { A: elements },
+                    &entry,
                     &specialization.clone().with_static("SK", 0),
                 )
-                .map_err(|error| format!("prepare {}: {error}", stringify!($module)))?;
+                .map_err(|error| prepare(&error))?;
+                let kernel = entry
+                    .prepare(device, &configured)
+                    .map_err(|error| prepare(&error))?;
                 let [key_codes, key_coefficients, value_codes, value_coefficients] = &mut *history
                 else {
                     panic!("affine history has four planes")

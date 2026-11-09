@@ -3517,18 +3517,19 @@ fn dense_up_gguf_formats_match_their_portable_body() {
                     UW: repr.resident(&device),
                     A: act.element(),
                 });
-                let mut specialization = declared::declared_default(&device, &entry, |name| match name {
+                // The bound models the exact F32 path, so bind INT8 = 0
+                // where the backend declares the Q8-activation form,
+                // whatever the device's default.
+                let exact: &[(&str, u64)] = match device.backend() {
+                    BackendName::Cpu | BackendName::Cuda => &[("INT8", 0)],
+                    _ => &[],
+                };
+                let specialization = declared::declared(&device, &entry, |name| match name {
                     "H" => h as u64,
                     "F" => f as u64,
                     "US" => 0,
                     _ => panic!("unexpected static {name}"),
-                });
-                // The bound models the exact F32 path, so bind INT8 = 0
-                // where the backend declares the Q8-activation form,
-                // whatever the device's default.
-                if matches!(device.backend(), BackendName::Cpu | BackendName::Cuda) {
-                    specialization = specialization.with_param("INT8", 0);
-                }
+                }, exact).unwrap();
                 let native = entry.prepare(&device, &specialization).unwrap()
                 .call(dense_up::Args {
                     residual: &f32_tensor(&device, &[rows, h], &residual),
@@ -5241,7 +5242,7 @@ fn head_logits_match_the_host(
                 OW: repr.resident(device),
             });
             let specialization = if is_cpu(device) {
-                declared::declared_default(device, &entry, |_| 0).with_param("INT8", 0)
+                declared::declared(device, &entry, |_| 0, &[("INT8", 0)]).unwrap()
             } else {
                 prepared_projection_specialization_on(device, &[("V", v), ("D", d)], mapping)
             };

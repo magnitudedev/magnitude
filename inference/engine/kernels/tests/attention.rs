@@ -4,6 +4,7 @@
 // (Metal, or Vulkan elsewhere) and the CPU.
 
 mod common;
+mod declared;
 
 use magnitude_kernels::{attention_append_dense, attention_decode, attention_prefill};
 use seismic::{
@@ -364,25 +365,30 @@ fn decode_kernel(
     device: &Device,
     specialization: &NativeSpecialization,
 ) -> seismic::NativeKernel<attention_decode::Entry> {
-    // Without sinks (`attention_family.rs` covers them).
-    attention_decode::native_for_device_with(
+    // Without sinks (`attention_family.rs` covers them); every parameter a
+    // case leaves unpinned at its declared default.
+    let entry = attention_decode::native_entry_with(attention_decode::Elements { A: Element::bf16() });
+    let specialization = declared::declared_at(
         device,
-        attention_decode::Elements { A: Element::bf16() },
+        &entry,
         &dense_statics(specialization.clone().with_static("SK", 0)),
     )
-    .unwrap()
+    .unwrap();
+    entry.prepare(device, &specialization).unwrap()
 }
 
 fn prefill_kernel(
     device: &Device,
     specialization: &NativeSpecialization,
 ) -> seismic::NativeKernel<attention_prefill::Entry> {
-    attention_prefill::native_for_device_with(
+    let entry = attention_prefill::native_entry_with(attention_prefill::Elements { A: Element::bf16() });
+    let specialization = declared::declared_at(
         device,
-        attention_prefill::Elements { A: Element::bf16() },
+        &entry,
         &visible_prefill(device, dense_statics(specialization.clone().with_static("SK", 0))),
     )
-    .unwrap()
+    .unwrap();
+    entry.prepare(device, &specialization).unwrap()
 }
 
 /// The family entries' arguments of a bound case.

@@ -40,7 +40,7 @@ fn packed_stages_on(device: &seismic::Device) {
         device: &seismic::Device,
         entry: seismic::BoundEntry<E>,
     ) -> seismic::NativeKernel<E> {
-        let specialization = declared::declared_default(device, &entry, |name| match name {
+        let specialization = declared::declared(device, &entry, |name| match name {
             "H" | "D" | "NM" => HIDDEN,
             "W" => WIDTH,
             "NK" => KEYS,
@@ -49,7 +49,7 @@ fn packed_stages_on(device: &seismic::Device) {
             "C" => 2,
             "IN" | "QB" | "ZB" | "OB" | "OS" => 0,
             _ => panic!("unexpected static {name}"),
-        });
+        }, &[]).unwrap();
         entry.prepare(device, &specialization).unwrap()
     }
     let resident = |shape: &[u64]| {

@@ -161,13 +161,13 @@ fn at_defaults<E: seismic::Entry>(
     entry: seismic::BoundEntry<E>,
     statics: &[(&str, u64)],
 ) -> Result<seismic::NativeKernel<E>, seismic::LoadError> {
-    let specialization = declared::declared_default(device, &entry, |name| {
+    let specialization = declared::declared(device, &entry, |name| {
         statics
             .iter()
             .find(|(given, _)| *given == name)
             .unwrap_or_else(|| panic!("static {name} is given"))
             .1
-    });
+    }, &[]).unwrap();
     entry.prepare(device, &specialization)
 }
 

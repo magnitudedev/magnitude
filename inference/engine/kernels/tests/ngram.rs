@@ -60,13 +60,13 @@ fn at_defaults<E: seismic::Entry>(
     entry: seismic::BoundEntry<E>,
     statics: &[(&str, u64)],
 ) -> Result<seismic::NativeKernel<E>, seismic::LoadError> {
-    let specialization = declared::declared_default(device, &entry, |name| {
+    let specialization = declared::declared(device, &entry, |name| {
         statics
             .iter()
             .find(|(given, _)| *given == name)
             .unwrap_or_else(|| panic!("static {name} is given"))
             .1
-    });
+    }, &[]).unwrap();
     entry.prepare(device, &specialization)
 }
 
@@ -774,6 +774,17 @@ struct RowRule {
 }
 
 impl RowRule {
+    /// `ngram_rows`'s statics for the rule: its predecessors, its heads per
+    /// order, its map's entries and its boundary tokens.
+    fn statics(&self) -> [(&'static str, u64); 4] {
+        [
+            ("C", self.context as u64),
+            ("P", self.per_order as u64),
+            ("V", self.map.len() as u64),
+            ("NB", u64::from(self.boundary.is_some())),
+        ]
+    }
+
     /// Qwen4's form: raw ids, token 7 both the boundary and the fill.
     fn sample() -> Self {
         let sizes = vec![101, 103, 1_000_003, 107, 109, 50_000_017];
@@ -1063,10 +1074,7 @@ impl RowsCase {
         let kernel = at_defaults(
             device,
             ngram_rows::native_entry(),
-            &[
-                ("C", self.rule.context as u64),
-                ("P", self.rule.per_order as u64),
-            ],
+            &self.rule.statics(),
         )
         .unwrap();
         let result = kernel

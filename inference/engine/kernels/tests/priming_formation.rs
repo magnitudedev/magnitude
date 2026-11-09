@@ -1,15 +1,31 @@
 use seismic::coverage::{form_requests, InProcess, Progress, Toolchain};
-use seismic::{BackendName, Element, KernelRequest};
-fn request(
-    entry: &'static str,
-    elements: &[(&str, Element)],
-    statics: &[(&str, u64)],
-) -> KernelRequest {
+use seismic::{BackendName, Element, Entry, KernelRequest};
+/// The Vulkan request of `E` at `elements`, binding every static its own
+/// declaration names from `form`: a declared static the form has no value
+/// for fails by name, so the requests follow the declarations as they grow.
+fn request<E: Entry>(elements: &[(&str, Element)], form: &[(&str, u64)]) -> KernelRequest {
+    let implementation =
+        seismic::generated::native_implementation_for_backend::<E>(BackendName::Vulkan)
+            .unwrap()
+            .unwrap_or_else(|| panic!("{} has a Vulkan implementation", E::NAME));
+    let statics = implementation
+        .statics
+        .iter()
+        .map(|name| {
+            let (_, value) = form
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .unwrap_or_else(|| {
+                    panic!("{} declares `{name}` static, which the form does not bind", E::NAME)
+                });
+            (name.clone(), *value)
+        })
+        .collect();
     KernelRequest {
         backend: BackendName::Vulkan,
-        entry,
+        entry: E::NAME,
         elements: elements.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-        statics: statics.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        statics,
     }
 }
 /// The K8/V4 history plane widths for a `width`-column head, as the engine's
@@ -33,26 +49,33 @@ fn vulkan_priming_abi_forms() {
     let mut requests = Vec::new();
     // Qwen 4B fixture geometry; cover all normalization/presence branches.
     let (p, s) = (32, 192);
-    for (entry, planes) in [
-        ("attention_append_dense", &[][..]),
-        ("attention_append_k8v4", &k8v4_planes(2 * p + s)[..]),
-    ] {
+    for planes in [&[][..], &k8v4_planes(2 * p + s)[..]] {
         for f in [0, 1] {
             for n in [0, 1] {
                 for nv in [0, 1] {
-                    let statics = [
-                        ("KV", 4),
-                        ("P", p),
-                        ("S", s),
-                        ("F", f),
-                        ("N", n),
-                        ("NV", nv),
-                    ];
-                    requests.push(request(
-                        entry,
-                        &[("A", Element::bf16())],
-                        &[&statics[..], planes].concat(),
-                    ));
+                    // Rotary halves split, own values, keys unrounded.
+                    let form = [
+                        &[
+                            ("KV", 4),
+                            ("P", p),
+                            ("S", s),
+                            ("F", f),
+                            ("N", n),
+                            ("NV", nv),
+                            ("RA", 0),
+                            ("RT", 0),
+                            ("VK", 0),
+                            ("KR", 0),
+                        ][..],
+                        planes,
+                    ]
+                    .concat();
+                    let elements = [("A", Element::bf16())];
+                    requests.push(if planes.is_empty() {
+                        request::<magnitude_kernels::attention_append_dense::Entry>(&elements, &form)
+                    } else {
+                        request::<magnitude_kernels::attention_append_k8v4::Entry>(&elements, &form)
+                    });
                 }
             }
         }
@@ -63,8 +86,7 @@ fn vulkan_priming_abi_forms() {
             Element::bf16(),
             Element::stored("q8g32s", seismic_lang::registry::Layout::Rows16).unwrap(),
         ] {
-            requests.push(request(
-                "attention_project",
+            requests.push(request::<magnitude_kernels::attention_project::Entry>(
                 &[
                     ("A", Element::bf16()),
                     ("Y", Element::bf16()),

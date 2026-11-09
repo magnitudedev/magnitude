@@ -185,6 +185,7 @@ fn attention_project_classifies_each_weight_by_its_own_representation() {
             ("KW", "iq4g32s"),
             ("VW", "bf16"),
             ("A", "bf16"),
+            ("Y", "bf16"),
         ],
     );
     let analysis = analyze(&entry);
@@ -349,15 +350,17 @@ fn assert_affine_history(analysis: &EntryAnalysis) {
 #[test]
 fn attention_decode_k8v4_has_one_grid_per_code_plane() {
     let analysis = analyze(&kernel("attention_decode_k8v4", &[("A", "bf16")]));
-    assert_eq!(analysis.parameters.len(), 19);
+    // The host form table among them.
+    assert_eq!(analysis.parameters.len(), 20);
     assert_affine_history(&analysis);
 }
 
 #[test]
 fn attention_prefill_k8v4_decodes_history_it_has_already_appended_to() {
     let analysis = analyze(&kernel("attention_prefill_k8v4", &[("A", "bf16")]));
-    // The WorkList bitmap and its block keys' extent-only table among them.
-    assert_eq!(analysis.parameters.len(), 22);
+    // The WorkList bitmap, its block keys' extent-only table and the host
+    // form table among them.
+    assert_eq!(analysis.parameters.len(), 23);
     assert_eq!(stored(&analysis, "history_tiles"), &Stored::Discrete);
     assert_affine_history(&analysis);
 }
@@ -383,8 +386,11 @@ fn dense_attention_history_is_floating_and_has_no_grid() {
             ("visible", "discrete"),
             ("fresh", "discrete"),
             ("destinations", "discrete"),
+            ("selected_rows", "discrete"),
+            ("selected", "bf16"),
             ("history_key", "bf16"),
             ("history_value", "bf16"),
+            ("form", "discrete"),
         ]
     );
     assert!(analysis.grids.is_empty());

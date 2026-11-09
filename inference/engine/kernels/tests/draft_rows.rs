@@ -203,7 +203,7 @@ fn q8_weight(
 /// elements form it; it has no statics.
 fn at_defaults<E: seismic::Entry>(device: &Device, entry: seismic::BoundEntry<E>) -> NativeKernel<E> {
     let specialization =
-        declared::declared_default(device, &entry, |name| panic!("unexpected static {name}"));
+        declared::declared(device, &entry, |name| panic!("unexpected static {name}"), &[]).unwrap();
     entry.prepare(device, &specialization).unwrap()
 }
 
@@ -216,10 +216,10 @@ fn draft_rows_at(
     int8: bool,
 ) -> NativeKernel<draft_rows::Entry> {
     let entry = draft_rows::native_entry_with(elements);
-    let mut specialization = declared::declared_default(device, &entry, |name| {
+    let mut specialization = declared::declared(device, &entry, |name| {
         assert_eq!(name, "D", "draft_rows may only fix D");
         width as u64
-    });
+    }, &[]).unwrap();
     if device.backend() == seismic::BackendName::Cpu {
         specialization = specialization.with_param("INT8", u64::from(int8));
     }
