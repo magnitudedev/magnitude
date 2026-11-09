@@ -667,7 +667,7 @@ mod tests {
 
     /// CUDA's GEMM recipe of every representation it imports, as main's
     /// library derived it (`ScaledGemm`), and for q4g32, q2k, q2g256,
-    /// q1g128, iq2s, iq1s, iq1m, q3k, iq4xs and iq3s as the same
+    /// q2g64, q1g128, iq2s, iq1s, iq1m, q3k, iq4xs and iq3s as the same
     /// choice takes them.
     #[test]
     fn cuda_folds_are_mains() {
@@ -689,7 +689,7 @@ mod tests {
             "iq3s",
         ];
         let rounded = [
-            "q4k", "q5k", "q6k", "q8g32s", "q2k", "q2g256", "q1g128", "q3k", "iq4xs",
+            "q4k", "q5k", "q6k", "q8g32s", "q2k", "q2g256", "q2g64", "q1g128", "q3k", "iq4xs",
         ];
         let expected = folded
             .map(|storage| (storage, true))
@@ -716,7 +716,7 @@ mod tests {
     fn cuda_int8_is_mains() {
         let admitted = [
             "q4k", "q5k", "q6k", "q8g32s", "q4g32s", "iq4g32s", "q5g32s", "q5g32", "mxfp4g32",
-            "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs", "q4g32", "q2k", "q2g256", "q1g128", "iq2s",
+            "nvfp4g16", "iq2xs", "iq3xxs", "iq2xxs", "q4g32", "q2k", "q2g256", "q2g64", "q1g128", "iq2s",
             "iq1s", "iq1m", "q3k", "iq4xs", "iq3s",
         ];
         let excluded = ["nvfp4g16a4", "mxfp8g32"];
@@ -781,6 +781,7 @@ mod tests {
             "q4g32@rows16",
             "q2k@rows16",
             "q2g256@rows16",
+            "q2g64@rows16",
             "q1g128@rows16",
             "iq2s@rows16",
             "iq1s@rows16",
@@ -925,6 +926,12 @@ mod tests {
             ("q2k", None, None, None),
             (
                 "q2g256",
+                pack(1, 4, 4, false),
+                None,
+                Some(MetalMatrix::Symmetric),
+            ),
+            (
+                "q2g64",
                 pack(1, 4, 4, false),
                 None,
                 Some(MetalMatrix::Symmetric),

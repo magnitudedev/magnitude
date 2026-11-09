@@ -1654,6 +1654,24 @@ pub(crate) const REPRS: &[Repr] = &[
             },
         },
     },
+    // GGUF Q2_0: 2-bit codes offset by 1 (-1, 0, +1 or +2), one f16 scale
+    // per 64: ggml's `(q - 1) d` exactly, 18 bytes per 64 values as in GGUF.
+    Repr {
+        name: "q2g64",
+        packing_axis: PackingAxisRule::Last,
+        group: 64,
+        coding: Coding::Direct {
+            codes: CodeStorage::Fields {
+                bits: 2,
+                interpretation: CodeInterpretation::Offset(1),
+            },
+            scales: Scales::Stored {
+                dtype: DType::F16,
+                bias: false,
+                packet_group: 64,
+            },
+        },
+    },
     // GGUF Q1_0: one-bit codes `2 c - 1`, -1 or +1, one f16 scale per 128:
     // ggml's `±d` exactly, 18 bytes per 128 values as in GGUF.
     Repr {
@@ -3173,6 +3191,7 @@ mod tests {
             ("q5k", 176),
             ("q6k", 210),
             ("q1g128", 18 * 2),
+            ("q2g64", 18 * 4),
             ("iq2s", 82),
         ] {
             let r = lookup(name).unwrap();

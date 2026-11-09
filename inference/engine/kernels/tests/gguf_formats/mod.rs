@@ -169,6 +169,8 @@ impl Format {
             Encoding::Tq2_0 => f16(64, factor / 2.0),
             // d: digits - 1 reach 1.
             Encoding::Tq1_0 => f16(52, factor),
+            // d: codes - 1 reach 2.
+            Encoding::Q2_0 => f16(0, factor / 2.0),
             // d: values are ±d.
             Encoding::Q1_0 => f16(0, factor),
             // d: values reach d (2 s + 1) 9 / 8.

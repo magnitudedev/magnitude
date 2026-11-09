@@ -31,9 +31,8 @@ BLOCKS = 16
 # writes as tensors, and the dense and integer types.
 NOT_WEIGHTS = {T.Q8_1, T.Q8_K, T.F64, T.I8, T.I16, T.I32, T.I64, T.F32, T.F16, T.BF16}
 # Weight types without vectors of their own: F8_E4M3, which the engine imports
-# only under a UE8M0 scale grid (`import_residency.rs` assembles those blocks),
-# and Q2_0, which it does not import.
-NOT_VECTORED = {T.F8_E4M3, T.Q2_0}
+# only under a UE8M0 scale grid (`import_residency.rs` assembles those blocks).
+NOT_VECTORED = {T.F8_E4M3}
 
 
 def reference(data, qtype):

@@ -852,6 +852,8 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
         ),
         // Codes 2 (value 2 - 1) and d = 1.
         "q2g256" => unit_packet(size, &[(0, &[0xaa; 64]), (64, &[0x00, 0x3c])]),
+        // d = 1 and codes 2 (value 2 - 1).
+        "q2g64" => unit_packet(size, &[(0, &[0x00, 0x3c]), (2, &[0xaa; 16])]),
         // d = 1 and every bit set: `+d`.
         "q1g128" => unit_packet(size, &[(0, &[0x00, 0x3c]), (2, &[0xff; 16])]),
         // Grid point 0 (every magnitude 8), no signs, scale codes 0 and

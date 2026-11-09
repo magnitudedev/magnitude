@@ -2023,7 +2023,7 @@ const fn gguf_source_spec(
     }
 }
 
-const GGUF_SOURCES: [GgufSource; 25] = [
+const GGUF_SOURCES: [GgufSource; 26] = [
     gguf_source_spec(Encoding::Q3K, "gguf_q3_k", "q3k"),
     gguf_source_spec(Encoding::Iq3S, "gguf_iq3_s", "iq3s"),
     gguf_source_spec(Encoding::Q4K, "gguf_q4_k", "q4k"),
@@ -2044,6 +2044,7 @@ const GGUF_SOURCES: [GgufSource; 25] = [
     gguf_source_spec(Encoding::Q2K, "gguf_q2_k", "q2k"),
     gguf_source_spec(Encoding::Tq2_0, "gguf_tq2_0", "q2g256"),
     gguf_source_spec(Encoding::Q1_0, "gguf_q1_0", "q1g128"),
+    gguf_source_spec(Encoding::Q2_0, "gguf_q2_0", "q2g64"),
     gguf_source_spec(Encoding::Iq2S, "gguf_iq2_s", "iq2s"),
     gguf_source_spec(Encoding::Iq1S, "gguf_iq1_s", "iq1s"),
     gguf_source_spec(Encoding::Iq1M, "gguf_iq1_m", "iq1m"),
@@ -3641,6 +3642,18 @@ pub(crate) mod internals {
             "gguf_q1_0" => {
                 // block_q1_0: d (f16) | qs[16]: value p is bit p % 8 of
                 // qs[p / 8], ggml's `±d`.
+                push(plane(
+                    "words",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(2, 16)),
+                ));
+                push(plane(
+                    "scale",
+                    PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
+                ));
+            }
+            "gguf_q2_0" => {
+                // block_q2_0: d (f16) | qs[16]: value p is bits 2 (p % 4) of
+                // qs[p / 4], ggml's `(q - 1) d`.
                 push(plane(
                     "words",
                     PlaneRepackRecipe::BitRoutes(direct_bits(2, 16)),
