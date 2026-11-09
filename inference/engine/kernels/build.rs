@@ -41,6 +41,31 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "the streams' join of a general routed feed-forward's branch, which only Sinkhorn streams read and no CUDA or Vulkan model runs yet",
     ),
     (
+        "indexer_keys",
+        &[BackendName::Cpu, BackendName::Metal],
+        "the general indexer's keys (DeepSeek V4.1's compressed history), which no CUDA or Vulkan model runs yet",
+    ),
+    (
+        "indexer_score",
+        &[BackendName::Cpu, BackendName::Metal],
+        "the general indexer's scores over a row list, which no CUDA or Vulkan model runs yet",
+    ),
+    (
+        "rows_topk",
+        &[BackendName::Cpu, BackendName::Metal],
+        "the general indexer's selection of rows, which no CUDA or Vulkan model runs yet",
+    ),
+    (
+        "candidate_blocks",
+        &[BackendName::Cpu, BackendName::Metal],
+        "the candidate pool's block scores (DeepSeek V4.1's restricted indexers), which no CUDA or Vulkan model runs yet",
+    ),
+    (
+        "candidate_rows",
+        &[BackendName::Cpu, BackendName::Metal],
+        "the candidate pool's rows (DeepSeek V4.1's restricted indexers), which no CUDA or Vulkan model runs yet",
+    ),
+    (
         "gated_delta_project_convolved",
         &[BackendName::Metal],
         "the convolved recurrent decode form's projection, which also convolves and publishes the windows; the other backends run `gated_delta_project`, then `gated_delta_step`, until the form is measured there",
@@ -163,6 +188,16 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/core/gumbel",
         &[BackendName::Metal, BackendName::Cuda],
         "the sampler's Gumbel noise, shared by `sample_rows` and the certified selection's bounds",
+    ),
+    (
+        "lib/indexer/indexer",
+        &[BackendName::Metal],
+        "the general indexer's simdgroup head preparation and threadgroup scan, shared by Metal's `indexer_keys`, `indexer_score` and `rows_topk`; the CPU natives prepare a row in their own work item",
+    ),
+    (
+        "lib/core/rounding",
+        &[BackendName::Cpu, BackendName::Metal],
+        "trained block roundings of stored rows (the compressed history and its indexer), which no CUDA or Vulkan model runs yet",
     ),
     (
         "lib/readout/progressive",

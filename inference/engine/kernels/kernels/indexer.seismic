@@ -311,3 +311,317 @@ native indexer_select for cpu from "cpu/indexer_select.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes ((2 * P + (H + 1) * (2 * P + S)) * 4)
+
+# The general indexer (`Selection::Own(Indexer)`), as three entries over the
+# key plane of a pooled source: `indexer_keys` writes the keys of the rows a
+# producer completes, `indexer_score` scores a row list, `rows_topk` selects
+# from it. With W = 2P + S, H query heads and the rotary of the reading
+# attention in its layout (RA, RT; `rotate_pairs`):
+#   K[u]    = rounding(rotary(RMS(key[u]) * key_norm, coordinates(u)))
+#   q[h]    = rounding(rotary(norm(query[h]), coordinates(t)))
+#   s[t, j] = scale * sum_h relu(q[h] . K[row j]) * w[h], heads ascending
+# with w[h] = head_weights[t, h] (HW = H) or 1 (HW = 0, Uniform), each dot an
+# ascending F32 FMA chain. Everything from the projections on is F32; the
+# rounding is the indexer's trained one (rounding.seismic's four scalars).
+# The key plane holds F32 keys: an unrounded indexer's keys (Qwen4's) are
+# its F32 reference's, and a rounded one's codes are exact in it. (A plane
+# read by `indexer_score` alone cannot take a generic dense element: an
+# element only read is a weight operand's.)
+
+# The key of each row that completes a unit (`latent_rows[row] >= 0`, the
+# key-plane row written: the pooled source's row, whose Block domain the key
+# plane shares), from its projected key `key[row]` (the key projection of the
+# producer's pre-rotary latent), normed by `key_norm`, rotated at
+# `coordinates[row]` (those of the unit's first token) and rounded.
+fn indexer_keys[M, TB, P, S, RA, RT](key: &tensor[M, 2 * P + S] A,
+    key_norm: &tensor[1, 2 * P + S] f32, latent_rows: &tensor[M] i32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
+    keys: &mut tensor[TB, 2 * P + S] f32, form: &host tensor[0, RA, RT] i32,
+    epsilon: f32, block: i32, element: i32, scale: i32, amax_floor: f32, slab_rows: u32)
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1:
+    let layout = tensor[0, RA, RT, 0] i32
+    for row in 0..M:
+        if latent_rows[row] >= 0:
+            let mut prepared = tensor[2 * P + S] f32
+            prepared[:] = block_round(head_rotary(key[row], key_norm, coordinates[row],
+                rotary_components, rotary_frequencies, rotary_amplitudes, layout, epsilon),
+                block, element, scale, amax_floor)
+            keys[latent_rows[row]] = prepared
+
+# Each row's scores over its row list: score j is the j-th key-plane row of
+# its spans `spans[row]` (in span order; S4's narrowed lists are row lists
+# too), the rest of its N scores -inf. The query heads are normed with
+# `query_norm` (NQ = 1, or none) before their rotary at the row's
+# coordinates. `score_slots` holds no values: its extent is the scores N.
+fn indexer_score[M, H, P, S, NQ, HW, TB, R, N, RA, RT](query: &tensor[M, H, 2 * P + S] A,
+    query_norm: &tensor[NQ, 2 * P + S] f32, head_weights: &tensor[M, HW] A,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
+    keys: &tensor[TB, 2 * P + S] f32, spans: &tensor[M, R, 2] i32,
+    score_slots: &tensor[0, N] i32, form: &host tensor[0, RA, RT] i32,
+    scale: f32, epsilon: f32, block: i32, element: i32, rounding_scale: i32, amax_floor: f32,
+    slab_rows: u32) -> tensor[M, N] f32
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and H >= 1 and NQ >= 0 and NQ <= 1 and HW >= 0 and (HW == 0 or HW == H) and N >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1:
+    let layout = tensor[0, RA, RT, 0] i32
+    let mut scores = tensor[M, N] f32
+    for row in 0..M:
+        for j in 0..N:
+            scores[row, j] = -inf
+        let mut prepared = tensor[H, 2 * P + S] f32
+        for head in 0..H:
+            prepared[head] = block_round(head_rotary(query[row, head], query_norm, coordinates[row],
+                rotary_components, rotary_frequencies, rotary_amplitudes, layout, epsilon),
+                block, element, rounding_scale, amax_floor)
+        let mut ordinal = 0
+        for span in 0..R:
+            let first = spans[row, span, 0]
+            let last = spans[row, span, 1]
+            if first >= 0 and last >= first:
+                for at in first..last:
+                    if ordinal < N:
+                        let mut score = f32(0.0)
+                        for head in 0..H:
+                            let mut dot = f32(0.0)
+                            for column in 0..2 * P + S:
+                                dot = fma(prepared[head, column], keys[at, column], dot)
+                            let mut weight = f32(1.0)
+                            if HW > 0:
+                                weight = f32(head_weights[row, head])
+                            score = score + max(dot, 0.0) * weight
+                        scores[row, ordinal] = scale * score
+                    ordinal = ordinal + 1
+    return scores
+
+# Each row's picks from its scores: the key-plane rows (of its spans, as in
+# `indexer_score`) it reads, ascending by position (span order), -1 padded.
+# A row with `complete[row]` complete units at most K reads every row of its
+# spans (the first K); past it, the K best of its scored rows, score
+# descending with ties to the lower ordinal (the lower unit). A row's scored
+# rows are the first min(N, rows of its spans). Rows are indexed by class
+# row. `top_slots` holds no values: its extent is the picks K.
+fn rows_topk[M, N, R, K](scores: &tensor[M, N] f32, complete: &tensor[M] i32,
+    spans: &tensor[M, R, 2] i32, top_slots: &tensor[0, K] i32) -> tensor[M, K] i32
+    where N >= 0 and K >= 0:
+    let mut selected = tensor[M, K] i32
+    for row in 0..M:
+        for pick in 0..K:
+            selected[row, pick] = -1
+        let mut count = 0
+        for span in 0..R:
+            if spans[row, span, 1] > spans[row, span, 0]:
+                count = count + spans[row, span, 1] - spans[row, span, 0]
+        let scored = min(count, i32(N))
+        let dense = complete[row] <= i32(K)
+        let mut picks = 0
+        let mut ordinal = 0
+        for span in 0..R:
+            let first = spans[row, span, 0]
+            let last = spans[row, span, 1]
+            if first >= 0 and last >= first:
+                for at in first..last:
+                    if ordinal < scored:
+                        let mut read = 1
+                        if not dense:
+                            let mut better = 0
+                            for other in 0..N:
+                                if i32(other) < scored:
+                                    if scores[row, other] > scores[row, ordinal] or (scores[row, other] == scores[row, ordinal] and i32(other) < ordinal):
+                                        better = better + 1
+                            if better >= i32(K):
+                                read = 0
+                        if read == 1 and picks < i32(K):
+                            selected[row, picks] = i32(at)
+                            picks = picks + 1
+                    ordinal = ordinal + 1
+    return selected
+
+# Metal: a simdgroup per row, lane l holding columns [l E, (l + 1) E)
+# (E = W / 32), normed, rotated and rounded across the simdgroup.
+native indexer_keys for metal from "metal/indexer_keys.metal":
+    static (P, S, RA, RT)
+    where RA <= 1 and RT <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    launch indexer_keys:
+        threadgroups (ceil_div(M, 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row.
+native indexer_keys for cpu from "cpu/indexer_keys.rs":
+    static (P, S, RA, RT)
+    where RA <= 1 and RT <= 1
+    launch indexer_keys:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * P + 2 * (2 * P + S)) * 4)
+
+# Metal: a threadgroup per (256 scores, row). Its simdgroups prepare the
+# row's H query heads into threadgroup memory (as `indexer_keys` prepares a
+# key), then each thread scores one row of the list, every head's dot an
+# ascending FMA chain over the columns it streams once.
+native indexer_score for metal from "metal/indexer_score.metal":
+    static (H, P, S, NQ, HW, RA, RT)
+    where RA <= 1 and RT <= 1 and NQ <= 1 and H <= 64 and H * (2 * P + S) <= 7168 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (RA == 0 or (2 * P + S) % 64 == 0 or 2 * P + S == 32)
+    launch indexer_score:
+        threadgroups (ceil_div(N, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (H * (2 * P + S) * 4)
+
+# CPU: one work item per (256 scores, row), each preparing the row's query
+# heads.
+native indexer_score for cpu from "cpu/indexer_score.rs":
+    static (H, P, S, NQ, HW, RA, RT)
+    where RA <= 1 and RT <= 1 and NQ <= 1
+    launch indexer_score:
+        threadgroups (ceil_div(N, 256), M, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * P + (H + 1) * (2 * P + S)) * 4)
+
+# Metal: a threadgroup of 256 threads per row. A selecting row finds its
+# K-th best score T by a radix select over the scores' order keys
+# (`ordered_key`), takes every score above T and the first equal ones in
+# ordinal order, then emits its picks in ordinal order: each thread counts
+# the picks of its share of the ordinals, a scan places them, and a walk of
+# the row's span offsets (scanned into scratch) maps each to its row.
+# Threadgroup memory: the bins [256], the scans' 8 simdgroup sums and the
+# select state [4].
+native rows_topk for metal from "metal/rows_topk.metal":
+    scratch spans bytes (M * (R + 1) * 4)
+    launch rows_topk:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((256 + 8 + 4) * 4)
+
+# CPU: one work item per row, a partial sort of its scored ordinals.
+native rows_topk for cpu from "cpu/rows_topk.rs":
+    launch rows_topk:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# The candidate pool (`Candidates::Produce`): per row, the blocks of BU
+# consecutive units that a restricted indexer over the same rows scores
+# (`Candidates::Restrict`), from the row's own scores over its list
+# (`indexer_score`). A row's list over a Block read holds its c complete
+# units in order (`complete[row]`), so ordinal j is unit j, and block b
+# holds the units [b BU, (b + 1) BU):
+#   score(b)           = max over b's units j < c of s[j]
+#   score((c - 1) / BU) = +inf     (the newest block, which may be partial)
+# then the B best blocks, ties to the lower block: `rows_topk` over each
+# row's block list [0, ceil(c / BU)) with the row's complete units c (a row
+# with c <= B takes every block). `candidate_rows` lists the picked blocks'
+# rows.
+#
+# `candidate_blocks` scores the blocks: `blocks` [M, NB], -inf past the
+# row's ceil(c / BU) blocks, and the row's block list [M, 1, 2],
+# [0, ceil(c / BU)). `block_slots` holds no values: its extent is the
+# blocks NB; `form` carries BU, which no tensor extent determines.
+fn candidate_blocks[M, N, NB, BU](scores: &tensor[M, N] f32, complete: &tensor[M] i32,
+    block_slots: &tensor[0, NB] i32, form: &host tensor[0, BU] i32)
+    -> (tensor[M, NB] f32, tensor[M, 1, 2] i32)
+    where BU >= 1 and NB >= 1 and NB * BU >= N:
+    let mut blocks = tensor[M, NB] f32
+    let mut lists = tensor[M, 1, 2] i32
+    for row in 0..M:
+        let units = max(min(complete[row], i32(N)), 0)
+        let count = (units + i32(BU) - 1) / i32(BU)
+        lists[row, 0, 0] = 0
+        lists[row, 0, 1] = count
+        for block in 0..NB:
+            let mut score = -inf
+            if i32(block) < count:
+                for unit in block * BU..(block + 1) * BU:
+                    if unit < N:
+                        if i32(unit) < units:
+                            score = max(score, scores[row, unit])
+                if i32(block) == count - 1:
+                    score = inf
+            blocks[row, block] = score
+    return blocks, lists
+
+# The candidate rows of each row: the units of its picked blocks
+# `blocks[row]` (`rows_topk`'s picks over its block list: ascending, -1
+# padded) below its c listed units, and while those are fewer than
+# min(K, c), the lowest other units up to min(K, c). A restricted indexer
+# with top K masks every score outside the picked blocks to -inf and takes
+# its K best, the equal ones by the lower unit, so a pool of fewer than K
+# rows is filled with the lowest rows outside it; listing them makes its K
+# best of the list exactly those. Units are the list's ordinals (its spans
+# `spans[row]`, as in `indexer_score`), emitted as spans of the same plane
+# rows in unit order: each maximal run of taken units within one span, then
+# [-1, -1]. The picked blocks and the fill form at most B + 1 runs (the
+# fill exists only when B blocks are picked: fewer take every unit), split
+# further only where a list span ends, so B + R spans hold them. `form`
+# carries BU and K, which no tensor extent determines.
+fn candidate_rows[M, R, B, BU, K](blocks: &tensor[M, B] i32, spans: &tensor[M, R, 2] i32,
+    form: &host tensor[0, BU, K] i32) -> tensor[M, B + R, 2] i32
+    where BU >= 1:
+    let mut pool = tensor[M, B + R, 2] i32
+    for row in 0..M:
+        for entry in 0..B + R:
+            pool[row, entry, 0] = -1
+            pool[row, entry, 1] = -1
+        let mut units = 0
+        for span in 0..R:
+            if spans[row, span, 0] >= 0 and spans[row, span, 1] > spans[row, span, 0]:
+                units = units + spans[row, span, 1] - spans[row, span, 0]
+        let mut pooled = 0
+        for pick in 0..B:
+            let block = blocks[row, pick]
+            if block >= 0:
+                pooled = pooled + max(min(units, (block + 1) * i32(BU)) - block * i32(BU), 0)
+        let fill = max(min(i32(K), units) - pooled, 0)
+        let mut outside = 0
+        let mut count = 0
+        let mut ordinal = 0
+        for span in 0..R:
+            let first = spans[row, span, 0]
+            let last = spans[row, span, 1]
+            if first >= 0 and last >= first:
+                let mut open = 0
+                for at in first..last:
+                    let mut taken = 0
+                    for pick in 0..B:
+                        if blocks[row, pick] >= 0 and blocks[row, pick] == ordinal / i32(BU):
+                            taken = 1
+                    if taken == 0:
+                        if outside < fill:
+                            taken = 1
+                        outside = outside + 1
+                    # At most B + R runs (above): the guards only bound
+                    # the indices.
+                    if taken == 1:
+                        if open == 0:
+                            if count >= 0 and count < B + R:
+                                pool[row, count, 0] = i32(at)
+                            count = count + 1
+                            open = 1
+                        if count >= 1 and count <= B + R:
+                            pool[row, count - 1, 1] = i32(at) + 1
+                    else:
+                        open = 0
+                    ordinal = ordinal + 1
+    return pool
+
+# CPU: one work item per row.
+native candidate_blocks for cpu from "cpu/candidate_blocks.rs":
+    launch candidate_blocks:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal: a threadgroup per (256 blocks, row), a thread per block.
+native candidate_blocks for metal from "metal/candidate_blocks.metal":
+    launch candidate_blocks:
+        threadgroups (ceil_div(NB, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row, walking its picked blocks and its spans once.
+native candidate_rows for cpu from "cpu/candidate_rows.rs":
+    launch candidate_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal: a thread per row, walking its picked blocks and its spans once, as
+# the CPU native does.
+native candidate_rows for metal from "metal/candidate_rows.metal":
+    launch candidate_rows:
+        threadgroups (ceil_div(M, 64), 1, 1)
+        threads_per_threadgroup (64, 1, 1)

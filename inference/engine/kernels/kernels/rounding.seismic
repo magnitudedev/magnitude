@@ -1,0 +1,76 @@
+# Trained block roundings of stored rows (`RowRounding::Block`), the model's
+# own numerics: each run of `block` consecutive values x is rounded to
+#   code(clamp(x / s, -m, m)) * s,   s = scale(max(max|x|, amax_floor))
+# with `code` the nearest value of the element's codes (ties to even) and m
+# its largest finite code, in F32 and in exactly this order: the quotient is
+# a division, as DeepSeek's reference computes it.
+#
+# A rounding is four scalars, which every entry that rounds takes in this
+# order:
+#   block       the run length (it divides the row); 0 rounds nothing;
+#   element     0 E4M3 (m = 448), 1 E2M1 (m = 6);
+#   scale       0 UE8M0, s = 2^ceil(log2(a * f32(1 / m)));
+#               1 E4M3,  s = e4m3(a / m), the nearest code (unsaturated);
+#   amax_floor  the model's floor on a run's largest magnitude, which keeps
+#               every scale a normal F32 power of two or E4M3 value.
+# Every rounded value is exact in BF16 (E4M3 x 2^k has 4 significant bits,
+# E2M1 x E4M3 at most 5). Natives evaluate the same expressions
+# (`<backend>/lib/core/rounding.*`).
+
+# v to the nearest code of a float format with `mantissa` mantissa bits and
+# smallest normal exponent `min_exponent` (below it, the subnormal step
+# 2^(min_exponent - mantissa)), ties to even, unbounded above: the step of
+# v's binade divides it, the quotient is rounded to an integer and scaled
+# back, each exactly. A NaN stays NaN.
+fn round_codes(v: f32, mantissa: i32, min_exponent: i32) -> f32:
+    let biased = (bitcast_u32(v) >> 23) & u32(255)
+    let step = bitcast_f32((max(biased, u32(min_exponent + 127)) - u32(mantissa)) << 23)
+    return rint(v / step) * step
+
+# The least power of two at or above v, a positive normal F32.
+fn power_of_two_ceil(v: f32) -> f32:
+    let bits = bitcast_u32(v)
+    let exponent = (bits >> 23) + select((bits & u32(8388607)) != u32(0), u32(1), u32(0))
+    return bitcast_f32(exponent << 23)
+
+# The element's mantissa bits, smallest normal exponent and largest code.
+fn element_mantissa(element: i32) -> i32:
+    return select(element == 0, 3, 1)
+
+fn element_min_exponent(element: i32) -> i32:
+    return select(element == 0, -6, 0)
+
+fn element_max(element: i32) -> f32:
+    return select(element == 0, 448.0, 6.0)
+
+# The scale of a run whose largest magnitude is `amax`.
+fn block_scale(amax: f32, element: i32, scale: i32, amax_floor: f32) -> f32:
+    let m = element_max(element)
+    let a = max(amax, amax_floor)
+    let mut s = power_of_two_ceil(a * (1.0 / m))
+    if scale == 1:
+        s = round_codes(a / m, 3, -6)
+    return s
+
+# One value of a run with scale `s`: code(clamp(x / s, -m, m)) * s. The
+# clamp is written `q > m ? m : q`, so a NaN stays NaN.
+fn round_element(x: f32, s: f32, element: i32) -> f32:
+    let m = element_max(element)
+    let q = x / s
+    let clamped = select(q > m, m, select(q < -m, -m, q))
+    return round_codes(clamped, element_mantissa(element), element_min_exponent(element)) * s
+
+# A row of N values rounded run by run (`block` 0: unchanged).
+fn block_round[N](x: &tensor[N] f32, block: i32, element: i32, scale: i32,
+    amax_floor: f32) -> tensor[N] f32 where N >= 0:
+    let mut rounded = zeros_like(x, dtype=f32)
+    for i in 0..N:
+        rounded[i] = x[i]
+    if block > 0:
+        for i in 0..N:
+            let first = i32(i) - i32(i) % block
+            let mut amax = f32(0.0)
+            for j in 0..block:
+                amax = max(amax, abs(x[first + j]))
+            rounded[i] = round_element(x[i], block_scale(amax, element, scale, amax_floor), element)
+    return rounded
