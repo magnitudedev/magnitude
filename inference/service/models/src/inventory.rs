@@ -1628,6 +1628,8 @@ fn scan_managed(
     cache: &ModelCache,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
+    #[cfg(test)]
+    tests::failing_scan(&config.root)?;
     let managed = config.root.join("hub");
     if !managed.is_dir() {
         return Ok(());
@@ -4022,22 +4024,31 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// The store roots whose managed scan fails, so a test can fail a scan by a means no
+    /// privilege bypasses (a directory's mode does not stop root). Keyed by root, so tests
+    /// running in parallel never see each other's failures.
+    static FAILING_SCANS: std::sync::Mutex<BTreeSet<PathBuf>> = std::sync::Mutex::new(BTreeSet::new());
+
+    pub(super) fn failing_scan(root: &Path) -> Result<(), InventoryError> {
+        if FAILING_SCANS.lock().unwrap().contains(root) {
+            return Err(InventoryError::Io("a managed scan failed by its test".to_owned()));
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn startup_reconciliation_retries_after_a_scan_failure() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let temporary = tempfile::tempdir().unwrap();
         let store = temporary.path().join("store");
-        let snapshots = store.join("hub/models--owner--model/snapshots");
-        fs::create_dir_all(&snapshots).unwrap();
-        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::create_dir_all(store.join("hub/models--owner--model/snapshots")).unwrap();
+        FAILING_SCANS.lock().unwrap().insert(store.clone());
 
-        let config = InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
+        let config =
+            InventoryConfig::with_roots(store.clone(), temporary.path().join("cache")).unwrap();
         let manager = ManagedModelStore::open_unbounded(config).await.unwrap();
 
-        // Leave the invalid tree in place beyond the first retry boundary. A one-shot startup
-        // reconciliation would have exited permanently before the tree is repaired.
+        // Keep the scan failing beyond the first retry boundary. A one-shot startup
+        // reconciliation would have exited permanently before the scan recovers.
         tokio::time::sleep(BACKGROUND_RECONCILIATION_RETRY_DELAY.saturating_mul(2)).await;
         assert!(
             !manager
@@ -4045,7 +4056,7 @@ mod tests {
                 .unwrap()
                 .reconciliation_complete
         );
-        fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o755)).unwrap();
+        FAILING_SCANS.lock().unwrap().remove(&store);
 
         tokio::time::timeout(
             BACKGROUND_RECONCILIATION_RETRY_DELAY.saturating_mul(3),
