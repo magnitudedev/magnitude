@@ -48,7 +48,7 @@ E4M3 = Format("E4M3", 8, True, 0x7E)  # FN: 0x7F and 0xFF are NaN; 448 is 0x7E
 E2M1 = Format("E2M1", 4, True, 0x7)  # 0, 0.5, 1, 1.5, 2, 3, 4, 6
 E8M0 = Format("E8M0", 8, False, 254)  # 2^(b - 127); 255 is NaN (OCP MX)
 # An FP8 weight's UE8M0 tile exponent, within the range where its products are exact in float32
-# (precision.md, "UE8M0-scaled FP8 weights"): a file holds no byte above 246.
+# (precision.md, "Block-scaled FP8 weights"): a file holds no byte above 246.
 UE8M0 = Format("UE8M0", 8, False, 246)
 
 ELEMENTS = {Q.F32: (F32, np.uint32), Q.F16: (F16, np.uint16), Q.BF16: (BF16, np.uint16), Q.F8_E4M3: (E4M3, np.uint8)}

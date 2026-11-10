@@ -17,7 +17,7 @@ from magnitude_references.checks import check_hf
 from magnitude_references.families.deepseek41 import (E2M1, E4M3, DeepSeek41Reference, Roundings, power_of_two_ceil,
                                                       round_codes)
 from magnitude_references.gguf import Package, Value, Writer, quantize
-from magnitude_references.model import SCALE_ENCODING, Weights
+from magnitude_references.model import Weights
 from magnitude_references.perturbation import Perturbation
 
 CPU = torch.device("cpu")
@@ -88,7 +88,9 @@ def write_tiny_deepseek41(path: Path, seed: int = 0) -> None:
         "ple.head_vocab_sizes": array(V.UINT64, sizes), "engram.pad_token_id": u32(2),
         "engram.token_map": array(V.INT32, token_map),
     }
-    metadata = {"general.architecture": Value(V.STRING, "deepseek41"), SCALE_ENCODING: Value(V.STRING, "ue8m0")}
+    # The converter's file-wide declaration, which no reader reads: each grid's I8 type names its UE8M0 bytes.
+    metadata = {"general.architecture": Value(V.STRING, "deepseek41"),
+                "magnitude.scale_encoding": Value(V.STRING, "ue8m0")}
     metadata |= {f"deepseek41.{key}": value for key, value in keys.items()}
     tensors: list[tuple[str, np.ndarray, Q, tuple[int, ...]]] = []  # name, stored bytes, type, NumPy shape
 
