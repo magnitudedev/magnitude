@@ -135,7 +135,7 @@ impl CallSchema {
     /// Whether a call parks: it has an awaited port (`&await`), whose
     /// words its host writes while the call waits for them.
     pub fn parks(&self) -> bool {
-        self.parameters.iter().any(|parameter| parameter.awaited)
+        self.parameters.iter().any(|parameter| parameter.binding == PortBinding::Awaited)
     }
     pub fn parameter(&self, id: ParameterId) -> &Parameter {
         assert_eq!(
@@ -523,9 +523,22 @@ pub struct Parameter {
     pub kind: ParameterKind,
     /// The semantic value this parameter binds in the root function.
     pub value: SemanticValueId,
-    /// An awaited port (`&await`): the entry parks on the host's writes to
-    /// it, so its launches wait for the host's answer ([`CallSchema::parks`]).
-    pub awaited: bool,
+    /// How the parameter's binding reaches its elements.
+    pub binding: PortBinding,
+}
+
+/// How a parameter's binding reaches its elements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum PortBinding {
+    /// Its binding is its elements.
+    Ordinary,
+    /// An awaited port (`&await`): its elements, which the host writes while
+    /// the entry's launches wait for them ([`CallSchema::parks`]).
+    Awaited,
+    /// A slab port (`&slab`): a slab view, whose binding is the address
+    /// table of the slabs holding its rows. A tensor of no elements has no
+    /// row to address, and binds as any tensor does.
+    Slab,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2209,9 +2222,8 @@ pub struct FunctionParameter {
     pub name: String,
     pub value: SemanticValueId,
     pub access: ParameterAccess,
-    /// An awaited port (`&await`): the launch parks on the host's writes
-    /// to it.
-    pub awaited: bool,
+    /// How the parameter's binding reaches its elements.
+    pub binding: PortBinding,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

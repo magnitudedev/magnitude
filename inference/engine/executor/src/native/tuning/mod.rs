@@ -888,6 +888,25 @@ impl CaseState {
 
 type Restorer = Box<dyn FnMut() -> Result<(), TensorError>>;
 
+/// A tuning case's binding of a slab port (`&slab`) it only reads
+/// ([`TuningInputs::slab_view`]).
+pub(crate) struct SlabView {
+    tensor: Tensor,
+    /// The rows of each of its slabs, the port's `slab_rows` scalar.
+    rows_per_slab: u32,
+    _slab: Option<Arc<seismic::SlabTensor>>,
+}
+
+impl SlabView {
+    pub fn tensor(&self) -> &Tensor {
+        &self.tensor
+    }
+
+    pub fn rows_per_slab(&self) -> u32 {
+        self.rows_per_slab
+    }
+}
+
 /// Restores every writable state in every argument rotation of a point:
 /// completely at the guard point, their written rows elsewhere.
 fn initializer(
@@ -2413,23 +2432,10 @@ impl TuningInputs<'_, '_> {
         view: u64,
         written: Range<u64>,
     ) -> Result<CaseState, BuildError> {
-        let extents = source.extents();
-        let rows = *extents.first().ok_or("slab tuning state has no row axis")?;
-        if view == 0 || view > rows || written.start >= written.end || written.end > view {
+        if written.start >= written.end || written.end > view {
             return Err("slab tuning state has invalid row bounds".into());
         }
-        let mut slab = seismic::SlabTensor::new(
-            self.device,
-            view,
-            view,
-            vec![seismic::SlabRegion {
-                element: source.element(),
-                row_shape: extents[1..].to_vec(),
-            }],
-        )?;
-        slab.add_slab()?;
-        let bytes = source.slice_leading(0, view)?.read_to_host()?;
-        slab.region_rows(0, 0, view)?.write_from_host(&bytes)?;
+        let slab = self.slab(&source, view)?;
         let region = slab.region_rows(0, written.start, written.end - written.start)?;
         let tensor = slab.logical_region(0)?;
         Ok(CaseState {
@@ -2440,6 +2446,43 @@ impl TuningInputs<'_, '_> {
             backing: slab.region_rows(0, 0, view)?,
             _slab: Some(Arc::new(slab)),
         })
+    }
+
+    /// A slab port's binding of `source` (`&slab`), which the entry only
+    /// reads: one slab of its rows, or `source` itself when it has none,
+    /// which a slab port takes as any tensor.
+    pub fn slab_view(&self, source: Tensor) -> Result<SlabView, BuildError> {
+        let rows = *source.extents().first().ok_or("slab tuning input has no row axis")?;
+        if source.extents().contains(&0) {
+            return Ok(SlabView { tensor: source, rows_per_slab: 1, _slab: None });
+        }
+        let slab = self.slab(&source, rows)?;
+        Ok(SlabView {
+            tensor: slab.logical_region(0)?,
+            rows_per_slab: u32::try_from(rows).map_err(|_| "slab tuning input rows exceed u32")?,
+            _slab: Some(Arc::new(slab)),
+        })
+    }
+
+    /// One slab holding the first `rows` rows of `source`.
+    fn slab(&self, source: &Tensor, rows: u64) -> Result<seismic::SlabTensor, BuildError> {
+        let extents = source.extents();
+        if rows == 0 || extents.first().is_none_or(|&held| rows > held) {
+            return Err("a tuning slab has invalid row bounds".into());
+        }
+        let mut slab = seismic::SlabTensor::new(
+            self.device,
+            rows,
+            rows,
+            vec![seismic::SlabRegion {
+                element: source.element(),
+                row_shape: extents[1..].to_vec(),
+            }],
+        )?;
+        slab.add_slab()?;
+        let bytes = source.slice_leading(0, rows)?.read_to_host()?;
+        slab.region_rows(0, 0, rows)?.write_from_host(&bytes)?;
+        Ok(slab)
     }
 
     /// The tensor `name` shared by the points of the entry being tuned,

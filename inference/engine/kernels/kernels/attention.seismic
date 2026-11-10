@@ -875,9 +875,9 @@ fn attention_decode[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, SK, RA, RT, RO, VK
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
-    selected_rows: &tensor[M, KS] i32, selected: &tensor[TS, KV, 2 * P + S] A,
-    history_key: &mut tensor[T, KV, 2 * P + S] A,
-    history_value: &mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, RO, VK, KR] i32,
+    selected_rows: &tensor[M, KS] i32, selected: &slab tensor[TS, KV, 2 * P + S] A,
+    history_key: &slab mut tensor[T, KV, 2 * P + S] A,
+    history_value: &slab mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, RO, VK, KR] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32, selected_slab_rows: u32,
     key_block: i32, key_element: i32, key_scale: i32, key_amax_floor: f32)
     -> tensor[M, KV * G, 2 * P + S] A
@@ -1045,9 +1045,9 @@ fn attention_prefill[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, SK, RA, RT
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
     selection: &tensor[M, B] u32, block_slots: &tensor[0, BR] i32,
-    selected_rows: &tensor[M, KS] i32, selected: &tensor[TS, KV, 2 * P + S] A,
-    history_key: &mut tensor[T, KV, 2 * P + S] A,
-    history_value: &mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, RO, VK, KR] i32,
+    selected_rows: &tensor[M, KS] i32, selected: &slab tensor[TS, KV, 2 * P + S] A,
+    history_key: &slab mut tensor[T, KV, 2 * P + S] A,
+    history_value: &slab mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, RO, VK, KR] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32, selected_slab_rows: u32,
     key_block: i32, key_element: i32, key_scale: i32, key_amax_floor: f32)
     -> tensor[M, KV * G, 2 * P + S] A
@@ -1324,8 +1324,8 @@ fn attention_append_dense[M, T, KV, P, S, F, N, NV, RA, RT, VK, KR](
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, destinations: &tensor[M] i32,
-    history_key: &mut tensor[T, KV, 2 * P + S] A,
-    history_value: &mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, VK, KR] i32,
+    history_key: &slab mut tensor[T, KV, 2 * P + S] A,
+    history_value: &slab mut tensor[T * (1 - VK), KV, 2 * P + S] A, form: &host tensor[0, RA, RT, VK, KR] i32,
     epsilon: f32, slab_rows: u32, key_block: i32, key_element: i32, key_scale: i32,
     key_amax_floor: f32)
     where P >= 0 and S >= 0 and 2 * P + S >= 1 and F >= 0 and N >= 0 and NV >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and VK >= 0 and VK <= 1 and (VK == 0 or NV == 0) and KR >= 0 and KR <= 1 and (KR == 0 or VK == 1):
@@ -1386,10 +1386,10 @@ fn attention_append_k8v4[M, T, KV, P, S, F, N, NV, KC, KP, VC, VP, RA, RT, VK](
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, destinations: &tensor[M] i32,
-    history_key_codes: &mut tensor[T, KV, KC] u32,
-    history_key_coefficients: &mut tensor[T, KV, KP] f16,
-    history_value_codes: &mut tensor[T, KV, VC] u32,
-    history_value_coefficients: &mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, VK] i32,
+    history_key_codes: &slab mut tensor[T, KV, KC] u32,
+    history_key_coefficients: &slab mut tensor[T, KV, KP] f16,
+    history_value_codes: &slab mut tensor[T, KV, VC] u32,
+    history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, VK] i32,
     epsilon: f32, slab_rows: u32)
     where P >= 0 and S >= 0 and 2 * P + S >= 32 and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and VK >= 0 and VK == 0:
     # Publication has no output rotary.
@@ -1468,10 +1468,10 @@ fn attention_decode_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, KC, KP, VC, V
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
-    history_key_codes: &mut tensor[T, KV, KC] u32,
-    history_key_coefficients: &mut tensor[T, KV, KP] f16,
-    history_value_codes: &mut tensor[T, KV, VC] u32,
-    history_value_coefficients: &mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
+    history_key_codes: &slab mut tensor[T, KV, KC] u32,
+    history_key_coefficients: &slab mut tensor[T, KV, KP] f16,
+    history_value_codes: &slab mut tensor[T, KV, VC] u32,
+    history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
     where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0:
@@ -1508,10 +1508,10 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, NQ, N, NV, R, B, BR, L, HT
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
     selection: &tensor[M, B] u32, block_slots: &tensor[0, BR] i32,
     history_tiles: &tensor[L, HT] i32,
-    history_key_codes: &mut tensor[T, KV, KC] u32,
-    history_key_coefficients: &mut tensor[T, KV, KP] f16,
-    history_value_codes: &mut tensor[T, KV, VC] u32,
-    history_value_coefficients: &mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
+    history_key_codes: &slab mut tensor[T, KV, KC] u32,
+    history_key_coefficients: &slab mut tensor[T, KV, KP] f16,
+    history_value_codes: &slab mut tensor[T, KV, VC] u32,
+    history_value_coefficients: &slab mut tensor[T, KV, VP] f16, form: &host tensor[0, RA, RT, RO, VK] i32,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
     where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and NQ >= 0 and N >= 0 and NV >= 0 and L >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and B >= 0 and BR >= 1 and SK >= 0 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1 and RO >= 0 and RO <= 1 and VK >= 0 and VK == 0:

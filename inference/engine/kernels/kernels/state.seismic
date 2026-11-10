@@ -3,7 +3,7 @@
 # accepted by the native implementation. Each row moves as one same-element
 # tensor store, so every plane element (integer planes included) is copied
 # bit for bit rather than decoded and re-encoded.
-fn copy_rows[N, T, KV, W](rows: &mut tensor[T, KV, W] A, from: &tensor[N] i32,
+fn copy_rows[N, T, KV, W](rows: &slab mut tensor[T, KV, W] A, from: &tensor[N] i32,
     to: &tensor[N] i32, slab_rows: u32):
     for item in 0..N:
         parallel for head in 0..KV:

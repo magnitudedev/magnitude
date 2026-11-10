@@ -2119,6 +2119,12 @@ impl NativePrepared {
         })
     }
 
+    /// Whether tensor parameter `ordinal` is a slab port (`&slab`), whose
+    /// binding the kernel reads as a slab address table.
+    pub(crate) fn addresses_slab(&self, ordinal: usize) -> bool {
+        self.schema().parameters()[ordinal].binding == seismic_lang::entry::PortBinding::Slab
+    }
+
     /// The buffers the kernel's argument table binds: every one but its
     /// host ports.
     pub(crate) fn bound_buffers(&self) -> usize {
@@ -2736,6 +2742,11 @@ impl NativePrepared {
             };
             if port.is_ok_and(|ordinal| self.reads_grid(ordinal)) && tensor.is_slab_view() {
                 return Err(CallError::Invocation(InvocationError::SlabGrid { parameter: name() }));
+            }
+            if port.is_ok_and(|ordinal| self.addresses_slab(ordinal)) && !tensor.binds_slab_port() {
+                return Err(CallError::Workflow(crate::api::WorkflowError::PlainSlabBinding {
+                    parameter: name(),
+                }));
             }
             let buffer = buffers.len();
             if record_ports[buffer] {

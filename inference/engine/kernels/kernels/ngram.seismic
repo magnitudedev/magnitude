@@ -43,7 +43,7 @@ fn ngram_rows[M, B, N, C, P, T, V, NB](tokens: &tensor[M, 2] i32,
     map: &tensor[V] u32, boundary: &tensor[NB] i32,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
-    window: &mut tensor[N, C + T, 1] u32,
+    window: &slab mut tensor[N, C + T, 1] u32,
     fill: i32, slab_banks: u32) -> tensor[M * C * P, 2] i32 where C >= 1 and P >= 1 and T >= 0 and V >= 0 and NB >= 0 and NB <= 1:
     let mut rows = tensor[M * C * P, 2] i32
     for row in 0..M:
@@ -163,7 +163,7 @@ fn ngram_inject[M, B, N, R, S, H, K](hidden: &tensor[M, S * H] f32,
     convolution: &tensor[S * H, K] f32,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
-    window: &mut tensor[N, R, S * H] f32,
+    window: &slab mut tensor[N, R, S * H] f32,
     dilation: i32, slab_banks: u32) -> tensor[M, S * H] f32 where S >= 1 and K >= 2:
     let reach = dilation * (K - 1)
     let mut u = tensor[M, S * H] f32

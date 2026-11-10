@@ -92,9 +92,8 @@ pub(crate) enum Ownership {
 pub(crate) struct Param {
     pub name: String,
     pub ownership: Ownership,
-    /// An awaited port (`&await`): the launch parks on the host's writes
-    /// to it.
-    pub awaited: bool,
+    /// How the parameter's binding reaches its elements.
+    pub binding: crate::entry::PortBinding,
     pub ty: ValueType,
     pub local: LocalId,
     pub span: Span,

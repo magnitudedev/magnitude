@@ -823,7 +823,7 @@ pub(crate) fn check_program(
             .map(|(i, p)| ir::Param {
                 name: p.name.clone(),
                 ownership: p.ownership.clone(),
-                awaited: p.awaited,
+                binding: p.binding,
                 ty: p.ty.clone(),
                 local: LocalId::new(
                     u32::try_from(i).expect("definition has more than u32::MAX parameters"),

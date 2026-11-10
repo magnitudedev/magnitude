@@ -2095,9 +2095,16 @@ impl<'a> Checker<'a> {
         // Logical ownership is checked at the static call boundary.
         let mut arguments = Vec::new();
         for (parameter, ordinal) in params.iter().zip(&order) {
-            if parameter.awaited {
+            // Only a binding reaches an awaited or slab port: a definition
+            // passes a logical tensor.
+            let port = match parameter.binding {
+                crate::entry::PortBinding::Ordinary => None,
+                crate::entry::PortBinding::Awaited => Some("awaited"),
+                crate::entry::PortBinding::Slab => Some("slab"),
+            };
+            if let Some(port) = port {
                 self.error(DiagnosticRule::Ownership, args[*ordinal].span,
-                    "a function with awaited ports is an entry, which no definition calls");
+                    format!("a function with {port} ports is an entry, which no definition calls"));
                 return None;
             }
             super::ownership::argument_leaves(

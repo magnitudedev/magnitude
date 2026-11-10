@@ -183,6 +183,11 @@ pub enum WorkflowError {
     ChunkedBinding {
         parameter: String,
     },
+    /// A tensor with elements other than a slab view bound to a slab port
+    /// (`&slab`): its natives read its binding as a slab address table.
+    PlainSlabBinding {
+        parameter: String,
+    },
     /// A graph's record port bound other than to whole records of a
     /// canonical view of a tensor bound per run or of the graph's
     /// workspace: its table would be formed per run.
@@ -324,6 +329,10 @@ impl fmt::Display for CallError {
             Self::Workflow(WorkflowError::NativePortSlabGrid { port }) => {
                 write!(f, "native graph port {port} is a launch grid, which binds no slab view")
             }
+            Self::Workflow(WorkflowError::PlainSlabBinding { parameter }) => write!(
+                f,
+                "`{parameter}` is a slab port, which binds a slab view or no elements"
+            ),
             Self::Workflow(WorkflowError::ChunkedBinding { parameter }) => write!(
                 f,
                 "`{parameter}`: chunked reserved storage binds only to a native record port"
@@ -1486,6 +1495,13 @@ pub mod tensor {
         /// not its elements.
         pub(crate) fn is_slab_view(&self) -> bool {
             self.slabs.is_some()
+        }
+
+        /// Whether the tensor may bind a slab port (`&slab`,
+        /// [`seismic_lang::entry::PortBinding::Slab`]): a slab view, or a
+        /// tensor of no elements, which has no row to address.
+        pub(crate) fn binds_slab_port(&self) -> bool {
+            self.is_slab_view() || self.extents.contains(&0)
         }
 
         /// Whether a call bound to this view must hold it until its

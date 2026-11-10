@@ -311,6 +311,8 @@ impl Printer {
                     ShapedHead::HostTensor { write: true } => "&host mut tensor",
                     ShapedHead::AwaitTensor { write: false } => "&await tensor",
                     ShapedHead::AwaitTensor { write: true } => "&await mut tensor",
+                    ShapedHead::SlabTensor { write: false } => "&slab tensor",
+                    ShapedHead::SlabTensor { write: true } => "&slab mut tensor",
                 });
                 self.shape_and_elem(shape, elem);
             }

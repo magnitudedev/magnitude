@@ -33,6 +33,59 @@ fn native_vulkan_reads_two_row_slabs() {
     native_reads_rows_with_slab_size(BackendName::Vulkan, 2);
 }
 
+#[test]
+fn native_cpu_slab_port_refuses_a_plain_tensor() {
+    slab_port_refuses_a_plain_tensor(BackendName::Cpu);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_metal_slab_port_refuses_a_plain_tensor() {
+    slab_port_refuses_a_plain_tensor(BackendName::Metal);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a CUDA host"]
+fn native_cuda_slab_port_refuses_a_plain_tensor() {
+    slab_port_refuses_a_plain_tensor(BackendName::Cuda);
+}
+
+/// A slab port (`&slab`) binds a slab view: its natives read its binding as
+/// a slab address table, so a plain tensor's elements would be taken for
+/// slab addresses. A call refuses one, as a native graph's port binding
+/// does, before anything is encoded.
+fn slab_port_refuses_a_plain_tensor(backend: BackendName) {
+    let device = Devices::discover(&[])
+        .unwrap()
+        .open_backend(backend)
+        .unwrap();
+    let kernel = slab_scale::native_for_device(&device, &NativeSpecialization::new()).unwrap();
+    let plain = Tensor::from_host(&device, Element::f32(), &[4, 1], &[0; 16]).unwrap();
+    let refused = seismic::WorkflowError::PlainSlabBinding { parameter: "x".into() };
+    match kernel.call(slab_scale::Args { x: &plain, slab_rows: 4, factor: 2.0, delay_ms: 0 }) {
+        Err(seismic::CallError::Workflow(error)) => assert_eq!(error, refused),
+        other => panic!("a plain tensor at a slab port: {:?}", other.map(|_| ())),
+    }
+
+    let mut graph = device.native_graph();
+    let port = graph.port(Element::f32(), &[4, 1]).unwrap();
+    let scaled = graph
+        .enqueue(
+            &kernel,
+            slab_scale::WorkflowArgs { x: port.tensor().into(), slab_rows: 4, factor: 2.0, delay_ms: 0 },
+        )
+        .unwrap()
+        .value;
+    graph.export(&scaled).unwrap();
+    let plan = graph.seal().unwrap();
+    let mut bindings = plan.bindings();
+    assert_eq!(
+        bindings.set(&port, &plain),
+        Err(seismic::WorkflowError::PlainSlabBinding { parameter: "port 0".into() })
+    );
+}
+
 fn native_reads_rows_across_slab_boundary(backend: BackendName) {
     native_reads_rows_with_slab_size(backend, 256);
 }

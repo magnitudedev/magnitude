@@ -66,8 +66,8 @@ fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
     visible: &tensor[M, R, 2] i32,
     block_slots: &tensor[0, SB] i32, segment_slots: &tensor[0, C] i32,
     bitmap_words: &tensor[0, B] u32,
-    window_keys: &mut tensor[TW, 2 * P + S] f32, window_coordinates: &mut tensor[TW, 4] i32,
-    block_keys: &mut tensor[TB, 2 * P + S] f32,
+    window_keys: &slab mut tensor[TW, 2 * P + S] f32, window_coordinates: &slab mut tensor[TW, 4] i32,
+    block_keys: &slab mut tensor[TB, 2 * P + S] f32,
     selected: i32, epsilon: f32, slab_rows: u32, window_slab_rows: u32, block_slab_rows: u32)
     -> (tensor[M, C, 2] i32, tensor[M, B] u32)
     where P >= 0 and S >= 0 and 2 * P + S >= 1 and H >= 1 and SB >= 1 and C >= 0 and B >= 0:
@@ -332,7 +332,7 @@ fn indexer_keys[M, TB, P, S, RA, RT](key: &tensor[M, 2 * P + S] A,
     key_norm: &tensor[1, 2 * P + S] f32, latent_rows: &tensor[M] i32,
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
-    keys: &mut tensor[TB, 2 * P + S] f32, form: &host tensor[0, RA, RT] i32,
+    keys: &slab mut tensor[TB, 2 * P + S] f32, form: &host tensor[0, RA, RT] i32,
     epsilon: f32, block: i32, element: i32, scale: i32, amax_floor: f32, slab_rows: u32)
     where P >= 0 and S >= 0 and 2 * P + S >= 1 and RA >= 0 and RA <= 1 and RT >= 0 and RT <= 1:
     let layout = tensor[0, RA, RT, 0] i32
@@ -354,7 +354,7 @@ fn indexer_score[M, H, P, S, NQ, HW, TB, R, N, RA, RT](query: &tensor[M, H, 2 * 
     query_norm: &tensor[NQ, 2 * P + S] f32, head_weights: &tensor[M, HW] A,
     rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
     rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
-    keys: &tensor[TB, 2 * P + S] f32, spans: &tensor[M, R, 2] i32,
+    keys: &slab tensor[TB, 2 * P + S] f32, spans: &tensor[M, R, 2] i32,
     score_slots: &tensor[0, N] i32, form: &host tensor[0, RA, RT] i32,
     scale: f32, epsilon: f32, block: i32, element: i32, rounding_scale: i32, amax_floor: f32,
     slab_rows: u32) -> tensor[M, N] f32
