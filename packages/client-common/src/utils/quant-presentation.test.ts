@@ -1,6 +1,20 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { formatQuantLabel, ladderBitWidths, quantBitWidth } from "./quant-presentation"
+import type { LocalModelFitsAssessment } from "@magnitudedev/sdk"
+import { AssessmentEnvironmentIdSchema, ModelAssessmentIdSchema } from "@magnitudedev/sdk"
+import { fitPlacementPhrase, formatQuantLabel, ladderBitWidths, quantBitWidth } from "./quant-presentation"
+
+const GB = 1_000_000_000
+const resident = (deviceBytes: number, hostBytes: number): LocalModelFitsAssessment => ({
+  _tag: "Fits",
+  assessmentId: ModelAssessmentIdSchema.make("assessment"),
+  environmentId: AssessmentEnvironmentIdSchema.make("environment"),
+  profile: { contextLength: 32_768 },
+  served: { contextLength: 32_768 },
+  memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 10 * GB, contextBytes: 2 * GB, overheadBytes: GB } },
+  placement: { deviceBytes, hostBytes, diskBytes: 0 },
+  residency: { _tag: "Resident", performance: { _tag: "Estimated", samples: [{ contextTokens: 32_768, estimatedTokensPerSecond: 40 }] } },
+})
 
 describe("quant presentation", () => {
   it.each([
@@ -32,5 +46,11 @@ describe("quant presentation", () => {
     expect(ladderBitWidths(["UD-IQ3_XXS", "UD-Q3_K_XL", "UD-Q4_K_XL", "UD-Q6_K_XL"]))
       .toEqual([Option.some(3), Option.some(3.5), Option.some(4), Option.some(6)])
     expect(ladderBitWidths(["Q2_0", "IQ3_S", "custom"])).toEqual([Option.some(2), Option.some(3), Option.none()])
+  })
+
+  it("says a discrete GPU's model is split only when its weights and conversation don't all fit in GPU memory", () => {
+    expect(fitPlacementPhrase(resident(12 * GB, GB), false)).toBe("Fits in GPU")
+    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), false)).toBe("GPU and RAM")
+    expect(fitPlacementPhrase(resident(9 * GB, 4 * GB), true)).toBe("Fits in memory")
   })
 })

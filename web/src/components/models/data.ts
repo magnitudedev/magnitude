@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import type { CustomLocalModel, LocalModel, LocalModelAssessment, LocalModelDeveloper, LocalModelFamily, RecommendedModel, SpeculativeMethod, UnsupportedLocalModel } from "@magnitudedev/sdk"
-import { ladderBitWidths, localModelSizeBytes, quantBitWidth } from "@magnitudedev/client-common"
+import { fitPlacementPhrase, ladderBitWidths, localModelSizeBytes, quantBitWidth } from "@magnitudedev/client-common"
 import { labForDeveloper } from "../model-logo"
 import type { DiscoveredModel } from "./onboarding"
 import type { OfferedModel } from "./expanding-model"
@@ -31,9 +31,7 @@ const assessmentOf = (model: LocalModel): LocalModelAssessment | null =>
   model.servingState._tag === "Assessed" ? model.servingState.assessment : null
 
 export const phraseOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, unified: boolean): PlacementPhrase =>
-  assessment.residency._tag === "Resident"
-    ? unified ? "Fits in memory" : assessment.placement.hostBytes > 0 ? "GPU and RAM" : "Fits in GPU"
-    : assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts === "disk" ? "Streams from SSD" : "Streams from RAM"
+  fitPlacementPhrase(assessment, unified)
 
 const tiersOf = (assessment: Extract<LocalModelAssessment, { _tag: "Fits" }>, unified: boolean): readonly PlacementTier[] => [
   { kind: unified ? "Unified" : "Device", bytes: assessment.placement.deviceBytes },

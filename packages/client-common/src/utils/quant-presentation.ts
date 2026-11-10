@@ -31,13 +31,18 @@ export const formatQuantLabel = (name: string, repository: Option.Option<string>
   name,
 ].join(" ")
 
+export type FitPlacementPhrase = "Fits in GPU" | "GPU and RAM" | "Fits in memory" | "Streams from RAM" | "Streams from SSD"
+
 /**
  * How a fitting quant runs on this machine, from its placement: held whole in memory (on a discrete GPU, in its memory
- * alone or split with host RAM), or its experts streamed from RAM or disk.
+ * alone or split with host RAM), or its experts streamed from RAM or disk. A discrete GPU's model is split when its
+ * weights and conversation don't all fit in GPU memory; host RAM always holds some tables and the process beside it.
  */
-export const fitPlacementPhrase = (assessment: LocalModelFitsAssessment, unifiedMemory: boolean): string =>
-  assessment.residency._tag === "Resident"
-    ? unifiedMemory ? "Fits in memory" : assessment.placement.hostBytes > 0 ? "GPU and RAM" : "Fits in GPU"
-    : assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts === "disk"
-      ? "Streams from SSD"
-      : "Streams from RAM"
+export const fitPlacementPhrase = (assessment: LocalModelFitsAssessment, unifiedMemory: boolean): FitPlacementPhrase => {
+  if (assessment.residency._tag === "Streamed") {
+    return assessment.placement.diskBytes > 0 && assessment.residency.bank.coldExperts === "disk" ? "Streams from SSD" : "Streams from RAM"
+  }
+  if (unifiedMemory) return "Fits in memory"
+  const { weightsBytes, contextBytes } = assessment.memory.breakdown
+  return assessment.placement.deviceBytes < weightsBytes + contextBytes ? "GPU and RAM" : "Fits in GPU"
+}

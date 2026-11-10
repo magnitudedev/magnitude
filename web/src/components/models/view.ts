@@ -1,3 +1,4 @@
+import type { FitPlacementPhrase } from "@magnitudedev/client-common"
 import type { HardwarePhoto } from "../hardware-photos"
 
 /** Where part of a model sits while it runs: fast memory, host RAM beside a discrete GPU, or the disk it streams from. */
@@ -8,7 +9,7 @@ export interface PlacementTier {
   readonly bytes: number
 }
 
-export type PlacementPhrase = "Fits in GPU" | "GPU and RAM" | "Fits in memory" | "Streams from RAM" | "Streams from SSD"
+export type PlacementPhrase = FitPlacementPhrase
 
 /** One quant of a model as this machine would run it. */
 export interface QuantView {
