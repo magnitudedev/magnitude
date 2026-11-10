@@ -76,10 +76,12 @@ const makeApplicationSession = Effect.gen(function* () {
   const effectQuery = yield* ClientEffectQuery
   const provideRegistry = Effect.provideService(Registry.AtomRegistry, registry)
   const onboarding = effectQuery.Configuration.GetOnboarding({})
-  // Pending onboarding is the start page wherever navigation points; once completed the router decides.
-  const page = Atom.keepAlive(Atom.make((get): ApplicationPage => {
+  // No page until onboarding is known; pending onboarding is the start page wherever navigation points, and once
+  // completed (or unreadable) the router decides.
+  const page = Atom.keepAlive(Atom.make((get): Option.Option<ApplicationPage> => {
     const state = get(onboarding).result
-    return Result.isSuccess(state) && state.value.onboarding === "Pending" ? "onboarding" : get(router.page)
+    if (Result.isInitial(state)) return Option.none()
+    return Option.some(Result.isSuccess(state) && state.value.onboarding === "Pending" ? "onboarding" : get(router.page))
   }))
   const navigate = router.navigate
   const completeOnboarding = Atom.fn((_: void) => Mutation.execute(effectQuery.Configuration.CompleteOnboarding, {}).pipe(
@@ -125,7 +127,7 @@ const makeApplicationSession = Effect.gen(function* () {
   const application = Atom.keepAlive(Atom.make(Option.match(host.shell, { onNone: () => Stream.fail(unavailable), onSome: shell => shell.application })))
 
   return {
-    page: page as Atom.Atom<ApplicationPage>,
+    page: page as Atom.Atom<Option.Option<ApplicationPage>>,
     navigate,
     completeOnboarding,
     notices: notices as Atom.Atom<ReadonlyArray<HostNotice>>,

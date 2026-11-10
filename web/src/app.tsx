@@ -9,6 +9,7 @@ import { Button, buttonVariants } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select"
 import { MagnitudeMark } from "./components/magnitude-mark"
+import { BootScreen } from "./components/brand-header"
 import {
   ChatCircleIcon,
   SidebarSimpleIcon,
@@ -378,10 +379,12 @@ function SettingsPage({ observation }: { observation: ServiceObservation }) {
 export function App() {
   const session = useSession()
   const observation = useServiceObservation()
-  const page = useAtomValue(session.page)
+  const decided = useAtomValue(session.page)
   const navigate = useNavigate()
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
+  if (Option.isNone(decided)) return <BootScreen />
+  const page = decided.value
   if (page === "onboarding") return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><OnboardingScreen /></>
   return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
       {page === "settings" ? <SettingsPage observation={observation} />

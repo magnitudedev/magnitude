@@ -3,7 +3,7 @@ import { CaretDownIcon, CaretRightIcon, CheckIcon, CircleNotchIcon, DownloadSimp
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { HuggingFaceLogo, type ModelLab } from "../model-logo"
-import { MagnitudeMark } from "../magnitude-mark"
+import { BrandHeader } from "../brand-header"
 import { cn } from "@/lib/utils"
 import { cardClass, LabMark, MachineCard, Section } from "./parts"
 import { MachineCardSkeleton, OfferedModelsSkeleton } from "./skeletons"
@@ -71,10 +71,7 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
   const picked = recommendations.find(entry => entry.model.key === selected)?.model
   const pickedQuant = picked ? picked.quants.find(quant => quant.key === quantChoice) ?? picked.quants.find(quant => quant.key === picked.recommended) : undefined
   return <div className="h-screen overflow-y-auto bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
-    <header className="mt-14 flex h-8 items-center justify-between pl-7 pr-8">
-      <span className="flex items-center gap-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
-      <Button variant="ghost" size="sm" onClick={onFinish}>Skip</Button>
-    </header>
+    <BrandHeader><Button variant="ghost" size="sm" onClick={onFinish}>Skip</Button></BrandHeader>
     <div className="mx-auto w-full max-w-3xl px-8 pb-24 pt-10">
       <h1 className="font-heading text-[28px] font-semibold tracking-tight">Choose a model</h1>
       <div className="mt-6">{machine ? <MachineCard machine={machine} /> : <MachineCardSkeleton />}</div>

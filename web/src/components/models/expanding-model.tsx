@@ -29,7 +29,7 @@ export function ExpandingModel({ model, note, expanded, onToggle, quantChoice, o
       <span className="font-medium text-slate-700 dark:text-slate-300">{current.bits}-bit</span>
       {" · "}{current.repository ? <RepositoryLink repository={current.repository}>{quantSource(current)}</RepositoryLink> : quantSource(current)}
       {model.fineTuneOf ? ` · Fine-tune of ${model.fineTuneOf}` : ""}
-      {model.drafter ? ` · ${model.drafter.method} drafter` : ""}
+      {model.drafter ? ` · ${model.drafter.method}` : ""}
       {current.servedContext !== null && <>{" · "}<ContextText quant={current} limit={model.contextLimit} modelName={model.name} /></>}
       {model.country === "US" ? " · 🇺🇸" : ""}
     </>}>

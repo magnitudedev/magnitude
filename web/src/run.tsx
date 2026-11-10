@@ -13,8 +13,8 @@ import { initializeAppearance } from "./stores/appearance-store"
 import { appearanceReadError } from "./appearance"
 import { SessionProvider } from "./session"
 import { ServiceConnectionProvider } from "./service-view"
-import { App, AppShell } from "./app"
-import { ModelsSkeleton } from "./components/models/skeletons"
+import { App } from "./app"
+import { BootScreen } from "./components/brand-header"
 import { ErrorNotice } from "./components/error-notice"
 import { RemoteAccessProvider, SignIn } from "./remote-access"
 
@@ -34,7 +34,7 @@ function SessionGate() {
   const session = useAtomValue(useMemo(() => client.runtime.atom(ApplicationSession), [client]))
   if (Result.isSuccess(session)) return <SessionProvider session={session.value}><App /></SessionProvider>
   if (Result.isFailure(session)) return <div className="p-6"><ErrorNotice title="Magnitude couldn’t open" description="Reload this window. If it still won’t open, restart Magnitude." /></div>
-  return null
+  return <BootScreen />
 }
 
 /** Renders the app into `#root` for one host; this is the entry's single Effect boundary. */
@@ -45,7 +45,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
   const boot = Effect.gen(function* () {
     const appearance = yield* entry.host.appearance.read.pipe(Effect.either)
     initializeAppearance(Either.isRight(appearance) ? appearance.right : "system")
-    root.render(<AppShell page="models" platform={platform}><ModelsSkeleton /></AppShell>)
+    root.render(<BootScreen />)
     const origin = yield* entry.origin
     // A browser on another device signs in before it connects. If the service can't be reached yet,
     // the app shows that, and asks for the key once the service answers again.
