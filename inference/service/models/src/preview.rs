@@ -13,7 +13,7 @@ use magnitude_service_contracts::{
     ComponentRelationship, ComponentRole, ContentIdentity, HuggingFaceCredential,
     HuggingFaceModelCatalog,
     HuggingFaceBaseRelation, HuggingFaceModelBase, HuggingFaceModelSearchRequest,
-    HuggingFaceModelSearchResult, HuggingFaceModelSearchResults, HuggingFaceRecommendedVersion,
+    HuggingFaceModelSearchResult, HuggingFaceModelSearchResults,
     HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot,
     Integrity, InventoryEntryId, InventoryError, ModelComponent, ModelLocation, ModelPreviewSource,
     ModelSource, ResolvedComponent, ResolvedModel,
@@ -2604,7 +2604,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use magnitude_service_contracts::LocalDeclaration;
+    use magnitude_service_contracts::{HuggingFaceRecommendedVersion, LocalDeclaration};
 
     #[test]
     fn a_pasted_reference_searches_for_its_repository() {

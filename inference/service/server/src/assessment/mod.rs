@@ -17,8 +17,8 @@ use futures_util::{StreamExt, future::BoxFuture, stream::BoxStream};
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModels,
-    CustomModel, CustomModelState, EffectiveModel, LocalModels, MeasurementState, ModelAssessment,
-    ModelAssessmentDomainSnapshot, ModelAssessmentEntry, ModelAssessmentEntryState,
+    CatalogSupport, CustomModel, CustomModelState, EffectiveModel, LocalModels, MeasurementState,
+    ModelAssessment, ModelAssessmentDomainSnapshot, ModelAssessmentEntry, ModelAssessmentEntryState,
     ModelAssessmentSubject, ModelAssessments, ModelAssessmentsInvalidation,
     ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure, ModelId,
     ModelServingConfiguration, ServingProfile,
@@ -88,9 +88,12 @@ enum AssessmentDomain {
     Custom,
 }
 
+/// The catalog models to assess and the profile each is assessed at. A disabled or deprecated
+/// model is never installed or loaded, so no verdict on it answers anything.
 fn catalog_candidates(models: Vec<CatalogModel>) -> Vec<(ModelAssessmentSubject, ServingProfile)> {
     models
         .into_iter()
+        .filter(|model| matches!(model.support, CatalogSupport::Supported { .. }))
         .filter_map(|model| {
             let (selection, profile) = match model.local_state {
                 CatalogModelState::NotInstalled => {
