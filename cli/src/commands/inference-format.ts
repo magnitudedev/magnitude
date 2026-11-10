@@ -2,7 +2,7 @@ import { Option } from "effect"
 import {
   deriveHardwareRoles,
   formatLocalInferenceBackend,
-  formatMemorySize,
+  formatMemoryCapacity,
 } from "@magnitudedev/client-common"
 
 export { formatContext } from "@magnitudedev/client-common"
@@ -25,13 +25,13 @@ export const describeLocalHardware = (
       name: roles.machineName,
       details: [
         `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
-        `${formatMemorySize(hardware.totalSystemMemoryBytes)} ${roles.unifiedMemory ? "unified" : "system"} memory${unifiedGpu === undefined ? "" : ` · ${formatLocalInferenceBackend(unifiedGpu.backend)} GPU acceleration · in use`}`,
+        `${formatMemoryCapacity(hardware.totalSystemMemoryBytes)} ${roles.unifiedMemory ? "unified" : "system"} memory${unifiedGpu === undefined ? "" : ` · ${formatLocalInferenceBackend(unifiedGpu.backend)} GPU acceleration · in use`}`,
       ],
     },
     accelerators: roles.devices.slice(unifiedGpu === undefined ? 0 : 1).map(({ accelerator, role, dedicatedMemoryBytes }) => ({
       name: accelerator.name.trim() || "GPU",
       details: [
-        Option.match(dedicatedMemoryBytes, { onNone: () => "shares system memory", onSome: bytes => `${formatMemorySize(bytes)} VRAM` }),
+        Option.match(dedicatedMemoryBytes, { onNone: () => "shares system memory", onSome: bytes => `${formatMemoryCapacity(bytes)} VRAM` }),
         ...(role._tag === "InUse" ? [`${formatLocalInferenceBackend(role.backend)} acceleration`, "in use"] : ["available"]),
       ].join(" · "),
     })),

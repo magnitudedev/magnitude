@@ -485,7 +485,7 @@ const catalogFields = (model: CatalogLocalModel): readonly (readonly [string, st
   ["Released", formatReleaseDate(model.catalogData.releaseDate)],
   ["Parameters", formatModelParameters(model.catalogData.parameterization)],
   ["Intelligence", Option.match(localModelIntelligence(model), { onNone: () => "Not rated", onSome: (score) => `${score}%` })],
-  ...(model.presentation.sourceUrls[0] === undefined ? [] : [["Hugging Face", model.presentation.sourceUrls[0]] as const]),
+  ["Hugging Face", `https://huggingface.co/${model.catalogData.quant.repository}`],
 ]
 
 /** The quants of the catalog model a catalog model is one rung of, smallest first; none for a custom model. */

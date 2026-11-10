@@ -323,9 +323,9 @@ describe("recommendations, families, and assessment progress", () => {
       memoryDomains: [{ memoryDomainId: system, kind: "System" as const, totalBytes: base.totalSystemMemoryBytes, availableBytes: Option.none() }, ...base.memoryDomains] }
     const model = makeCatalogModel()
     const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware, developerCountry: Option.none(), recommended: [model].map(recommendedModel) }).split("\n")
-    expect(lines[1]).toBe("Workstation · Test CPU - 68.7 GB")
+    expect(lines[1]).toBe("Workstation · Test CPU - 64 GB")
     expect(describeLocalHardware(hardware).accelerators).toEqual([
-      { name: "Test GPU", details: "25.8 GB VRAM · CUDA acceleration · in use" },
+      { name: "Test GPU", details: "24 GB VRAM · CUDA acceleration · in use" },
       { name: "Integrated graphics", details: "shares system memory · available" },
     ])
   })
@@ -357,11 +357,10 @@ describe("recommendations, families, and assessment progress", () => {
     const large = makeCatalogModel({ modelId: CatalogFormModelIdSchema.make("qwen-test:gguf:q8"), storageBytes: small.storageBytes * 2 })
     const lines = renderModelDetail({ model: small, models: [small, large], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false }).split("\n")
     const placement = lines.indexOf("Placement - Fits in GPU")
-    expect(lines.slice(placement, placement + 9)).toEqual([
+    expect(lines.slice(placement, placement + 8)).toEqual([
       "Placement - Fits in GPU",
-      "  GPU memory      19.3 GB",
-      "  Host RAM        2.1 GB",
-      "  Read from disk  0 MB",
+      "  GPU memory  19.3 GB",
+      "  Host RAM    2.1 GB",
       "",
       "Estimated decode speed",
       "  25K context           ~28 tok/s",
@@ -422,7 +421,7 @@ describe("candidate inspection", () => {
   it("prints the repository step with verdicts, drafters, and the download command", () => {
     const output = renderInspection({ inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [makeCatalogModel()], unifiedMemory: false })
     const lines = output.split("\n")
-    expect(lines.slice(0, 22)).toEqual([
+    expect(lines.slice(0, 21)).toEqual([
       "Qwen Test Uncensored",
       "Variant of Qwen Test · apache-2.0 · pinned to 4f1c2e9",
       "",
@@ -435,9 +434,8 @@ describe("candidate inspection", () => {
       "How Q4_K_P runs on this computer",
       "",
       "Placement - Fits in GPU",
-      "  GPU memory      19.3 GB",
-      "  Host RAM        2.1 GB",
-      "  Read from disk  0 MB",
+      "  GPU memory  19.3 GB",
+      "  Host RAM    2.1 GB",
       "",
       "Estimated decode speed",
       "  25K context           ~28 tok/s",
@@ -446,9 +444,9 @@ describe("candidate inspection", () => {
       expect.stringMatching(/^DRAFTER\s+SIZE\s+VERDICT\s+NOTE\s+USE$/),
       expect.stringMatching(/^ {2}HauhauCS\/Qwen-Test-Uncensored-GGUF\/dflash\.gguf\s+1\.2 GB\s+Can't be used: Its drafter wasn't built for this model\s+In this repository\s+/),
     ])
-    expect(lines[22]).toMatch(/^\* Magnitude DFlash for Qwen Test\s+900 MB\s+Works · DFlash\s+Recommended · Trained for Qwen Test\s+qwen-test:gguf:q4$/)
-    expect(lines[23]).toMatch(/^ {2}MTP heads\s+Included\s+Works · MTP\s+Built into this model\s+built-in$/)
-    expect(lines[24]).toMatch(/^ {2}None\s+—\s+—\s+Run without a drafter\s+none$/)
+    expect(lines[21]).toMatch(/^\* Magnitude DFlash for Qwen Test\s+900 MB\s+Works · DFlash\s+Recommended · Trained for Qwen Test\s+qwen-test:gguf:q4$/)
+    expect(lines[22]).toMatch(/^ {2}MTP heads\s+Included\s+Works · MTP\s+Built into this model\s+built-in$/)
+    expect(lines[23]).toMatch(/^ {2}None\s+—\s+—\s+Run without a drafter\s+none$/)
     expect(lines.at(-3)).toBe("Download size: 24.3 GB (model 23.4 GB + drafter 900 MB)")
     expect(lines.at(-2)).toBe(`Download: magnitude models pull ${TEST_REPOSITORY}:Q4_K_P`)
   })

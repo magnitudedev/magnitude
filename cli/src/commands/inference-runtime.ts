@@ -3,6 +3,7 @@ import {
   deriveHardwareRoles,
   formatLocalInferenceBackend,
   formatLocalModelDisplayName,
+  formatMemoryCapacity,
   formatMemorySize,
   formatStorageSize,
   localModelAllocation,
@@ -243,7 +244,7 @@ export function renderRecommendations({
   ].join("\n"))
   return ensureTrailingNewline([
     `Recommended for this computer${scope}`,
-    `${system} - ${formatMemorySize(hardware.totalSystemMemoryBytes)}`,
+    `${system} - ${formatMemoryCapacity(hardware.totalSystemMemoryBytes)}`,
     "",
     recommended.map(renderRecommendation(hardware)).join("\n\n"),
     ...(notice.length > 0 ? ["", ...notice] : []),

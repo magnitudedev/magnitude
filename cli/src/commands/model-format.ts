@@ -248,8 +248,8 @@ export const fitDetailSections = (assessment: Option.Option<LocalModelAssessment
       `Placement - ${fitPlacementPhrase(value, unifiedMemory)}`,
       renderFields([
         [unifiedMemory ? "Unified memory" : "GPU memory", formatMemorySize(value.placement.deviceBytes)],
-        ...(unifiedMemory ? [] : [["Host RAM", formatMemorySize(value.placement.hostBytes)] as const]),
-        ["Read from disk", formatMemorySize(value.placement.diskBytes)],
+        ...(unifiedMemory || value.placement.hostBytes === 0 ? [] : [["Host RAM", formatMemorySize(value.placement.hostBytes)] as const]),
+        ...(value.placement.diskBytes === 0 ? [] : [["Read from disk", formatMemorySize(value.placement.diskBytes)] as const]),
       ]),
       "",
       "Estimated decode speed",
