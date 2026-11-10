@@ -1,5 +1,5 @@
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react"
-import { CaretDownIcon, CaretRightIcon, CheckIcon, DotsThreeIcon, EyeSlashIcon, FunnelSimpleIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
+import { CaretDownIcon, CaretRightIcon, CheckIcon, DotsThreeIcon, EyeIcon, EyeSlashIcon, FunnelSimpleIcon, MagnifyingGlassIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { Input } from "../ui/input"
@@ -136,10 +136,28 @@ export function Unrunnable({ files, title = "Doesn’t run in Magnitude yet" }: 
   </div>
 }
 
+function Hidden({ models, onUnhide }: { models: readonly OwnedModel[]; onUnhide: (model: OwnedModel) => void }) {
+  const [open, setOpen] = useState(false)
+  if (models.length === 0) return null
+  return <div className="mt-3">
+    <button type="button" onClick={() => setOpen(value => !value)} className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-800 dark:hover:text-slate-200">
+      {open ? <CaretDownIcon className="size-3" /> : <CaretRightIcon className="size-3" />}Hidden ({models.length})
+    </button>
+    {open && <div className="mt-2 divide-y divide-slate-200 overflow-hidden rounded-xl border border-slate-200 bg-white dark:divide-slate-750 dark:border-slate-750 dark:bg-slate-850">
+      {models.map(model => <div key={model.modelId} className="flex items-center gap-4 px-4 py-2.5">
+        <LabMark lab={model.lab} className="size-7" />
+        <span className="min-w-0 flex-1"><span className="block truncate text-[13px] font-medium text-slate-600 dark:text-slate-400">{model.name}</span>{model.location && <span className="block truncate text-xs text-slate-500">{model.location}</span>}</span>
+        <Button size="sm" variant="outline" onClick={() => onUnhide(model)}><EyeIcon />Show</Button>
+      </div>)}
+    </div>}
+  </div>
+}
+
 /** The user's models: one row each, opened in place, with search and filters for this list only. */
-export function YourModels({ models, unrunnable, action, onExploreQuants, onRemove, onAddDrafter }: {
-  models: readonly OwnedModel[]; unrunnable: readonly UnrunnableFile[]
-  action: (model: OwnedModel) => ReactNode; onExploreQuants: (model: OwnedModel) => void; onRemove: (model: OwnedModel) => void; onAddDrafter: (model: OwnedModel) => void
+export function YourModels({ models, hidden, unrunnable, action, onExploreQuants, onRemove, onUnhide, onAddDrafter }: {
+  models: readonly OwnedModel[]; hidden: readonly OwnedModel[]; unrunnable: readonly UnrunnableFile[]
+  action: (model: OwnedModel) => ReactNode; onExploreQuants: (model: OwnedModel) => void; onRemove: (model: OwnedModel) => void
+  onUnhide: (model: OwnedModel) => void; onAddDrafter: (model: OwnedModel) => void
 }) {
   const [open, setOpen] = useState<string | null>(null)
   const [find, setFind] = useState("")
@@ -171,6 +189,7 @@ export function YourModels({ models, unrunnable, action, onExploreQuants, onRemo
         </div>
       })}
     </div>}
+    <Hidden models={hidden} onUnhide={onUnhide} />
     <Unrunnable files={unrunnable} />
   </Section>
 }

@@ -45,6 +45,7 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
   const onComputer = models.value.models.filter(model => !removed.has(model.modelId) && (model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled"))
   const byId = new Map<string, LocalModel>(onComputer.map(model => [model.modelId, model]))
   const owned = onComputer.map(model => ownedModel(model, unified))
+  const hidden = models.value.hidden.map(model => ownedModel(model, unified))
   const action = (view: OwnedModel) => {
     const model = byId.get(view.modelId)
     if (!model) return null
@@ -88,6 +89,12 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
     else mutations.remove(model.modelId)
     setRemoved(current => new Set([...current, view.modelId]))
   }
+  const unhide = (view: OwnedModel) => {
+    const model = models.value.hidden.find(hiddenModel => hiddenModel.modelId === view.modelId)
+    if (!model) return
+    mutations.unhide(model.modelId)
+    setRemoved(current => new Set([...current].filter(modelId => modelId !== view.modelId)))
+  }
   const addDrafter = (view: OwnedModel) => {
     const model = byId.get(view.modelId)
     if (model?._tag !== "Custom") return
@@ -99,9 +106,9 @@ export function ModelsScreen({ onExplore }: { onExplore: (query: string) => void
   return <div>
     <div className="mb-5 flex items-end justify-between gap-4"><h1 className={pageLayout.pageTitle}>Models</h1><Button onClick={() => onExplore("")}><MagnifyingGlassIcon />Explore models</Button></div>
     <MachineCard machine={machineView(hardware.value, Result.isSuccess(machine) ? machine.value.identity : null)} />
-    {owned.length === 0 && models.value.unsupported.length === 0
+    {owned.length === 0 && hidden.length === 0 && models.value.unsupported.length === 0
       ? <div className={cn("mt-8 rounded-xl border border-slate-200 bg-white px-5 py-6 text-[13px] text-slate-500 dark:border-slate-750 dark:bg-slate-850")}>No models yet. <button type="button" onClick={() => onExplore("")} className="text-blue-700 hover:underline dark:text-blue-400">Explore models</button> to download one.</div>
-      : <YourModels models={owned} unrunnable={models.value.unsupported.map(unrunnableFile)} action={action}
-        onExploreQuants={view => onExplore(quantSearch(view))} onRemove={remove} onAddDrafter={addDrafter} />}
+      : <YourModels models={owned} hidden={hidden} unrunnable={models.value.unsupported.map(unrunnableFile)} action={action}
+        onExploreQuants={view => onExplore(quantSearch(view))} onRemove={remove} onUnhide={unhide} onAddDrafter={addDrafter} />}
   </div>
 }
