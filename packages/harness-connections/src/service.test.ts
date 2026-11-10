@@ -1529,6 +1529,39 @@ describe("HarnessConnection model-set behavior", () => {
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
 
+  it("treats bracketed lines inside multi-line Codex values as content, not tables", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-codex-multiline-" })
+      const paths = fixturePaths(root)
+      const original = [
+        'developer_instructions = """',
+        "Follow the team conventions:",
+        "[style guide](https://example.com/style)",
+        '"""',
+        'model_provider = "custom"',
+        'model = "user/model"',
+        "",
+        "[mcp_servers.docs]",
+        'command = "docs-mcp"',
+        "",
+      ].join("\n")
+      yield* writeFixtures({ [paths.codexUser]: original })
+      const service = yield* installedService(paths)
+
+      yield* service.connect(HarnessIdSchema.make("codex"), { model: Option.some(model) })
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toMatchObject({
+        developer_instructions: (Bun.TOML.parse(original) as Record<string, unknown>).developer_instructions,
+        model_provider: "magnitude",
+        model: codexLocalModelId(model),
+        mcp_servers: { docs: { command: "docs-mcp" } },
+      })
+
+      yield* service.disconnect(HarnessIdSchema.make("codex"))
+      expect(Bun.TOML.parse(yield* fs.readFileString(paths.codexUser))).toEqual(Bun.TOML.parse(original))
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
   it("preserves user-edited Codex endpoint and catalog while still disconnecting", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
