@@ -55,7 +55,7 @@ describe("Magnitude documentation", () => {
     expect(result.output).toContain("Artificial Analysis Intelligence Index")
     expect(result.output).toContain("estimated to decode at 20 tokens per second or more")
     expect(result.output).toContain("`--country US` recommends only")
-    expect(result.output).toContain("shorter and longer contexts")
+    expect(result.output).toContain("each assessed context")
     expect(result.output).toContain("useful reference points")
     expect(result.output).toContain("magnitude docs speculative-methods")
     expect(result.output).toContain("GPT-5.6 Sol")
@@ -71,7 +71,7 @@ describe("Magnitude documentation", () => {
 
     expect(result._tag).toBe("Success")
     if (result._tag === "Failure") return
-    for (const command of ["catalog search", "catalog inspect", "catalog pull", "models drafter", "models hide", "models folders"]) {
+    for (const command of ["models search", "models show", "models pull", "models rm", "models drafter", "models hide", "models folders"]) {
       expect(result.output).toContain(command)
     }
     const cli = resolveDocumentationCommand("cli")

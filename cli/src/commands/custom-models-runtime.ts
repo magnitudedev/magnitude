@@ -33,7 +33,7 @@ const requirePath = (input: string, what: string): Effect.Effect<string, ModelCo
 }
 
 export const catalogDrafterRefusal = (modelId: string): string =>
-  `${modelId} is a catalog model. Catalog models keep the drafter Magnitude ships with them; it changes only when you update with \`magnitude catalog pull ${modelId}\`.`
+  `${modelId} is a catalog model. Catalog models keep the drafter Magnitude ships with them; it changes only when you update with \`magnitude models pull ${modelId}\`.`
 
 export const SetDrafterResultSchema = Schema.extend(
   Schema.Struct({ modelId: CustomFormModelIdSchema }),
@@ -48,7 +48,7 @@ export const renderSetDrafter = (result: SetDrafterResult, requested: DrafterArg
   onSome: (drafter) => ensureTrailingNewline([
     `Drafter for ${result.modelId}: ${drafter.name}.`,
     ...(result.drafterDownloadStarted
-      ? ["Downloading the drafter.", `Check progress: magnitude models status ${result.modelId}`]
+      ? ["Downloading the drafter.", `Check progress: magnitude models show ${result.modelId}`]
       : []),
   ].join("\n")),
 })
@@ -161,7 +161,7 @@ const folderJson = jsonDocument(FolderJsonSchema, (path: string) => ({ path }))
 export const addModelFolder = (pathInput: string, options: JsonOption = {}) => commandEffect({
   effect: requirePath(pathInput, "a folder path").pipe(Effect.flatMap((path) =>
     withClient((client) => client.models.addModelFolder({ path }).pipe(Effect.as(path))))),
-  render: (path) => `Added ${path}. Magnitude watches it for GGUF files.\nSee them: magnitude models status\n`,
+  render: (path) => `Added ${path}. Magnitude watches it for GGUF files.\nSee them: magnitude models list\n`,
   json: asJson(options, folderJson),
 })
 

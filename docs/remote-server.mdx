@@ -79,12 +79,12 @@ On the server:
 
 ```sh
 magnitude hardware
-magnitude catalog recommendations --limit 5
-magnitude catalog pull "MODEL_ID"
-magnitude models status "MODEL_ID"
+magnitude models recommend --limit 5
+magnitude models pull "MODEL_ID"
+magnitude models show "MODEL_ID"
 ```
 
-If recommendations are not ready, run `magnitude catalog status` to check preparation, then request recommendations again. Magnitude loads the model on the first inference request. To load it ahead of time, run `magnitude models load "MODEL_ID"`.
+If recommendations are not ready, run `magnitude models list` to check assessment progress, then request recommendations again. Magnitude loads the model on the first inference request. To load it ahead of time, run `magnitude models load "MODEL_ID"`.
 
 Or do all of this from the browser app on your laptop.
 

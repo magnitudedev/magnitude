@@ -298,7 +298,7 @@ it("reports whether a catalog sync installs, updates, or finds the model current
   expect(await Effect.runPromise(sync("Installed", "Current"))).toBe("AlreadyCurrent")
 })
 
-/** `catalog pull` and the desktop's Download agree: ACN refuses a catalog model that doesn't fit before anything downloads (QA mac-m4). */
+/** `models pull` and the desktop's Download agree: ACN refuses a catalog model that doesn't fit before anything downloads (QA mac-m4). */
 it("refuses to download a catalog model that does not fit, and still updates an installed one or starts an unassessed one", async () => {
   const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
   const { ModelIdSchema, ModelVersionNotRunnable } = await import("@magnitudedev/acn-protocol")

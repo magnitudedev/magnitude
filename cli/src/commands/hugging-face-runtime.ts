@@ -1,5 +1,8 @@
 import {
   candidateDownloadBytes,
+  deriveHardwareRoles,
+  formatQuantLabel,
+  quantBitWidth,
   catalogComponentName,
   catalogVariantOfName,
   formatStorageSize,
@@ -19,7 +22,6 @@ import {
   CustomFormModelIdSchema,
   DrafterCandidateSchema,
   HuggingFaceRepositoryIdSchema,
-  HuggingFaceSearchResponseSchema,
   LocalModelSyncOutcomeSchema,
   Models,
   ModelVersionNotRunnable,
@@ -30,18 +32,19 @@ import {
   type DrafterCandidate,
   type DrafterChoice,
   type DrafterTarget,
+  type HuggingFaceRecommendedVersion,
   type HuggingFaceSearchResponse,
+  type HuggingFaceSearchResult,
   type LocalModel,
   type LocalModelSyncOutcome,
   type UnsupportedReason,
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema, Stream } from "effect"
 import { renderDrafterChoices } from "./drafter-output"
-import { catalogProducts, readCatalog, withClient, type CliModelsClient } from "./inference-client"
-import { CandidateInspectionJsonSchema } from "./json-schemas"
+import { catalogProducts, readCatalog, readHardware, withClient, type CliModelsClient } from "./inference-client"
+import { CandidateInspectionJsonSchema, HuggingFaceSearchResponseJsonSchema } from "./json-schemas"
 import {
   absolutePath,
-  isLocalPathReference,
   ModelCommandError,
   parseDrafterArgument,
   parsePullReference,
@@ -49,10 +52,8 @@ import {
   type HuggingFaceReference,
   type PullReference,
 } from "./model-references"
+import { assessmentContext, assessmentPlacement, assessmentSpeed, fitDetailSections } from "./model-format"
 import { ensureTrailingNewline, jsonDocument, renderTable, commandEffect, asJson, type JsonOption } from "./output"
-
-const plural = (count: number, singular: string, pluralForm = `${singular}s`) =>
-  `${count} ${count === 1 ? singular : pluralForm}`
 
 const quoted = (value: string) => JSON.stringify(value)
 
@@ -63,18 +64,33 @@ export const formatDownloads = (count: number): string => {
   return compact(count / 1_000_000, "M")
 }
 
-const variantOfLabel = (models: readonly LocalModel[], variantOf: Option.Option<CatalogFormModelId>): string =>
-  Option.getOrElse(catalogVariantOfName(models, variantOf), () => Option.getOrElse(variantOf, () => "—"))
+const baseLabel = (result: HuggingFaceSearchResult): string => Option.match(result.base, {
+  onNone: () => "—",
+  onSome: ({ repository, relation }) => {
+    switch (relation) {
+      case "Quantized": return `Quant of ${repository}`
+      case "Finetune": return `Fine-tune of ${repository}`
+      case "Merge": return `Merge of ${repository}`
+      case "Adapter": return `Adapter for ${repository}`
+      case "Unknown": return `Based on ${repository}`
+    }
+  },
+})
 
 export interface SearchView {
   readonly query: string
   readonly response: HuggingFaceSearchResponse
-  readonly models: readonly LocalModel[]
+  readonly unifiedMemory: boolean
 }
 
 const reasonsLine = (reasons: readonly UnsupportedReason[]) => unsupportedReasonMessages(reasons).join(". ")
 
-export const renderSearch = ({ query, response, models }: SearchView): string => {
+const recommendedFact = (
+  result: HuggingFaceSearchResult,
+  fact: (version: HuggingFaceRecommendedVersion) => string,
+): string => Option.match(result.recommended, { onNone: () => "—", onSome: fact })
+
+export const renderSearch = ({ query, response, unifiedMemory }: SearchView): string => {
   const supported = response.results.filter(({ unsupported }) => Option.isNone(unsupported))
   const unsupported = response.results.flatMap((result) => Option.match(result.unsupported, {
     onNone: () => [],
@@ -87,8 +103,11 @@ export const renderSearch = ({ query, response, models }: SearchView): string =>
         "",
         renderTable(supported, [
           { heading: "MODEL", value: ({ displayName, gated }) => gated ? `${displayName} · ${GATED_SEARCH_RESULT_LABEL}` : displayName },
-          { heading: "UPLOADER", value: ({ uploader }) => uploader },
-          { heading: "VARIANT OF", value: ({ variantOf }) => variantOfLabel(models, variantOf) },
+          { heading: "BASE MODEL", value: baseLabel },
+          { heading: "QUANT", value: (result) => recommendedFact(result, ({ label }) => formatQuantLabel(label, Option.some(result.repository))) },
+          { heading: "SIZE", value: (result) => recommendedFact(result, ({ sizeBytes }) => formatStorageSize(sizeBytes)) },
+          { heading: "SPEED", value: (result) => recommendedFact(result, ({ assessment }) => assessmentSpeed(Option.some(assessment))) },
+          { heading: "PLACEMENT", value: (result) => recommendedFact(result, ({ assessment }) => assessmentPlacement(Option.some(assessment), unifiedMemory)) },
           { heading: "DOWNLOADS", value: ({ downloads }) => formatDownloads(downloads) },
           { heading: "REPOSITORY", value: ({ repository }) => repository },
         ]).trimEnd(),
@@ -99,6 +118,7 @@ export const renderSearch = ({ query, response, models }: SearchView): string =>
     "",
     renderTable(unsupported, [
       { heading: "MODEL", value: ({ result }) => result.displayName },
+      { heading: "ARCHITECTURE", value: ({ result }) => Option.getOrElse(result.architecture, () => "—") },
       { heading: "REASON", value: ({ reasons }) => searchResultUnsupportedMessage(reasons) },
       { heading: "REPOSITORY", value: ({ result }) => result.repository },
     ]).trimEnd(),
@@ -106,11 +126,11 @@ export const renderSearch = ({ query, response, models }: SearchView): string =>
   return ensureTrailingNewline([
     ...supportedSection,
     ...unsupportedSection,
-    ...(supported.length > 0 ? ["", "Inspect one: magnitude catalog inspect <repository>"] : []),
+    ...(supported.length > 0 ? ["", "See every quant: magnitude models show <repository>"] : []),
   ].join("\n"))
 }
 
-export const searchJson = jsonDocument(HuggingFaceSearchResponseSchema, ({ response }: SearchView) => response)
+export const searchJson = jsonDocument(HuggingFaceSearchResponseJsonSchema, ({ response }: SearchView) => response)
 
 export const SEARCH_LIMIT_MAXIMUM = 100
 
@@ -128,8 +148,12 @@ export const readSearch = (
   limit: Option.Option<number>,
 ) => Effect.all({
   response: client.models.searchHuggingFaceModels({ query, limit }),
-  catalog: readCatalog(client),
-}).pipe(Effect.map(({ response, catalog }): SearchView => ({ query, response, models: catalogProducts(catalog) })))
+  hardware: readHardware(client),
+}).pipe(Effect.map(({ response, hardware }): SearchView => ({
+  query,
+  response,
+  unifiedMemory: deriveHardwareRoles(hardware).unifiedMemory,
+})))
 
 export const searchHuggingFace = (
   query: string,
@@ -190,13 +214,21 @@ export interface InspectionView {
   readonly inspection: CandidateInspection
   readonly drafters: readonly DrafterCandidate[]
   readonly models: readonly LocalModel[]
+  readonly unifiedMemory: boolean
 }
+
+const variantOfLabel = (models: readonly LocalModel[], variantOf: CatalogFormModelId): string =>
+  Option.getOrElse(catalogVariantOfName(models, Option.some(variantOf)), () => variantOf)
 
 const inspectionHeader = (inspection: CandidateInspection, models: readonly LocalModel[]): string[] => {
   const details = [
+    ...Option.match(inspection.developer, {
+      onNone: () => [],
+      onSome: ({ name, country }) => [`${name} (${country})`],
+    }),
     ...Option.match(inspection.variantOf, {
       onNone: () => [],
-      onSome: () => [`Variant of ${variantOfLabel(models, inspection.variantOf)}`],
+      onSome: (variantOf) => [`Variant of ${variantOfLabel(models, variantOf)}`],
     }),
     ...Option.toArray(inspection.license),
     ...(inspection.source._tag === "HuggingFace" ? [`pinned to ${inspection.source.commit.slice(0, 7)}`] : []),
@@ -205,7 +237,7 @@ const inspectionHeader = (inspection: CandidateInspection, models: readonly Loca
 }
 
 const acquireCommand = (repository: string, version: CandidateVersion, force = false): string =>
-  `magnitude catalog pull ${repository}:${version.label}${force ? " --force" : ""}`
+  `magnitude models pull ${repository}:${version.label}${force ? " --force" : ""}`
 
 /** The repository a Hugging Face inspection pinned; the CLI inspects nothing else. */
 const inspectedRepository = (inspection: CandidateInspection): string =>
@@ -214,7 +246,7 @@ const inspectedRepository = (inspection: CandidateInspection): string =>
 const acquireLine = (inspection: CandidateInspection, version: CandidateVersion): string =>
   Option.match(version.catalogModel, {
     onNone: () => `Download: ${acquireCommand(inspectedRepository(inspection), version)}`,
-    onSome: (catalogModel) => `This is the catalog model ${catalogModel}, which comes with its drafter. Download: magnitude catalog pull ${catalogModel}`,
+    onSome: (catalogModel) => `This is the catalog model ${catalogModel}, which comes with its drafter. Download: magnitude models pull ${catalogModel}`,
   })
 
 /** Why the version a reference named doesn't run here: its own verdict, never a statement about the whole repository. */
@@ -250,7 +282,7 @@ export const acquisitionHint = (inspection: CandidateInspection): string => {
     ].join("\n")
   }
   if (inspection.versions.some(isRunnable)) {
-    return `Choose a version from the table: magnitude catalog pull ${inspectedRepository(inspection)}:<VERSION>`
+    return `Choose a version from the table: magnitude models pull ${inspectedRepository(inspection)}:<VERSION>`
   }
   return ["No version of this model runs on this computer.", ...Option.toArray(noRunnableVersionReason(inspection.versions))].join(" ")
 }
@@ -275,7 +307,7 @@ export const downloadSizeLine = (
     : `${total} (${present.map(([part, bytes]) => `${part} ${formatStorageSize(bytes)}`).join(" + ")})`
 }
 
-export const renderInspection = ({ inspection, drafters, models }: InspectionView): string => {
+export const renderInspection = ({ inspection, drafters, models, unifiedMemory }: InspectionView): string => {
   const header = inspectionHeader(inspection, models)
   if (Option.isSome(inspection.unsupportedArchitecture)) return ensureTrailingNewline([
     ...header,
@@ -291,7 +323,11 @@ export const renderInspection = ({ inspection, drafters, models }: InspectionVie
   const selectedLabel = Option.getOrUndefined(inspection.selectedVersion)
   const versions = renderTable(inspection.versions, [
     { heading: "VERSION", value: ({ label }) => label },
+    { heading: "BITS", value: ({ label }) => Option.match(quantBitWidth(label), { onNone: () => "—", onSome: (bits) => `${bits}-bit` }) },
     { heading: "SIZE", value: ({ sizeBytes }) => formatStorageSize(sizeBytes) },
+    { heading: "SPEED", value: ({ assessment }) => assessmentSpeed(assessment) },
+    { heading: "CONTEXT", value: ({ assessment }) => assessmentContext(assessment) },
+    { heading: "PLACEMENT", value: ({ assessment }) => assessmentPlacement(assessment, unifiedMemory) },
     { heading: "ON THIS COMPUTER", value: (version) => versionVerdict(version, version.label === selectedLabel) },
   ]).trimEnd()
   const runnable = chosen !== undefined && isRunnable(chosen)
@@ -299,10 +335,15 @@ export const renderInspection = ({ inspection, drafters, models }: InspectionVie
     "",
     renderDrafterChoices(drafters, Option.map(preselectedDrafterCandidate(drafters), ({ reference }) => reference)),
   ]
+  const chosenFit = chosen === undefined ? [] : fitDetailSections(chosen.assessment, unifiedMemory)
+  const chosenSections = chosen === undefined || chosenFit.length === 0
+    ? []
+    : ["", `How ${chosen.label} runs on this computer`, ...chosenFit]
   return ensureTrailingNewline([
     ...header,
     "",
     versions,
+    ...chosenSections,
     ...drafterSection,
     "",
     ...(runnable ? [downloadSizeLine(inspection, chosen, drafters)] : []),
@@ -347,24 +388,18 @@ const inspectCandidateReference = (client: CliModelsClient, reference: string) =
   )
 
 export const readInspection = (client: CliModelsClient, reference: string) => Effect.gen(function* () {
-  const [inspection, catalog] = yield* Effect.all([
+  const [inspection, catalog, hardware] = yield* Effect.all([
     inspectCandidateReference(client, reference),
     readCatalog(client),
+    readHardware(client),
   ])
   const drafters = yield* listCandidateDrafters(client, inspection)
-  return { inspection, drafters, models: catalogProducts(catalog) } satisfies InspectionView
-})
-
-export const inspectCandidate = (input: string, options: JsonOption = {}) => commandEffect({
-  effect: Effect.gen(function* () {
-    const reference = input.trim()
-    if (reference.length === 0 || isLocalPathReference(reference)) {
-      return yield* new ModelCommandError({ message: "Expected a Hugging Face link or owner/repo[:QUANT]" })
-    }
-    return yield* withClient((client) => readInspection(client, reference))
-  }),
-  render: renderInspection,
-  json: asJson(options, inspectionJson),
+  return {
+    inspection,
+    drafters,
+    models: catalogProducts(catalog),
+    unifiedMemory: deriveHardwareRoles(hardware).unifiedMemory,
+  } satisfies InspectionView
 })
 
 /** The drafter choice an argument names without asking the service. */
@@ -460,7 +495,7 @@ const syncStarted = (modelId: string, outcome: Exclude<LocalModelSyncOutcome, "A
     Updating: `Updating ${modelId}.`,
     DownloadingDrafter: `Downloading the drafter for ${modelId}.`,
   }[outcome]
-  return `${started}\nCheck progress: magnitude models status ${modelId}\n`
+  return `${started}\nCheck progress: magnitude models show ${modelId}\n`
 }
 
 export const renderPull = (result: PullResult): string => {
@@ -473,7 +508,7 @@ export const renderPull = (result: PullResult): string => {
   if (result._tag === "Component") {
     const name = catalogComponentName(result.component).toLowerCase()
     return result.started
-      ? `Downloading only the ${name} for ${result.modelId}.\nCheck progress: magnitude models status ${result.modelId}\n`
+      ? `Downloading only the ${name} for ${result.modelId}.\nCheck progress: magnitude models show ${result.modelId}\n`
       : `${result.modelId} already has its ${name}. Nothing to download.\n`
   }
   const { added } = result
@@ -483,7 +518,7 @@ export const renderPull = (result: PullResult): string => {
     ? [
         `${name}${choice} is the catalog model ${added.modelId}, so Magnitude installs that model with its drafter.`,
         `Model ID: ${added.modelId}`,
-        `Check progress: magnitude models status ${added.modelId}`,
+        `Check progress: magnitude models show ${added.modelId}`,
       ].join("\n")
     : [
         `${name}${choice} is the catalog model ${added.modelId}, which is already on this computer. Nothing to download.`,
@@ -491,7 +526,7 @@ export const renderPull = (result: PullResult): string => {
         `Load it: magnitude models load ${added.modelId}`,
       ].join("\n"))
   const drafter = `Drafter: ${Option.match(added.drafter, { onNone: () => "none", onSome: ({ name }) => name })}`
-  const progress = `Check progress: magnitude models status ${added.modelId}`
+  const progress = `Check progress: magnitude models show ${added.modelId}`
   if (added.outcome === "Started") return ensureTrailingNewline([
     `Downloading ${name}${choice}.`,
     drafter,
@@ -511,7 +546,7 @@ export const pullJson = jsonDocument(PullResultSchema, (result: PullResult) => r
 /** A refused version in the CLI's words; one that only lacks memory can be forced. */
 const versionRefusal = (error: ModelVersionNotRunnable): ModelCommandError => new ModelCommandError({
   message: error.verdict._tag === "DoesNotFit"
-    ? `${modelVersionNotRunnableMessage(error)} Download it anyway with: magnitude catalog pull ${error.reference} --force`
+    ? `${modelVersionNotRunnableMessage(error)} Download it anyway with: magnitude models pull ${error.reference} --force`
     : modelVersionNotRunnableMessage(error),
 })
 
@@ -539,7 +574,7 @@ const addHuggingFaceModel = (
   }
   const version = yield* Option.match(chosenVersion(inspection), {
     onNone: () => Effect.fail(new ModelCommandError({
-      message: `No version of ${reference.repository} runs on this computer. See: magnitude catalog inspect ${reference.repository}`,
+      message: `No version of ${reference.repository} runs on this computer. See: magnitude models show ${reference.repository}`,
     })),
     onSome: Effect.succeed,
   })

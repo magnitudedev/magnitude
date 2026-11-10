@@ -20,6 +20,8 @@ import {
   preselectedDrafterCandidate,
   removalKind,
   acquiringCatalogParts,
+  deriveHardwareRoles,
+  formatModelParameters,
   unsupportedLocalModelSourceTag,
   unsupportedReasonMessages,
   type RemovalKind,
@@ -29,15 +31,20 @@ import {
   DrafterCandidateSchema,
   ModelIdSchema,
   UnsupportedLocalModelSchema,
+  LocalModelPreparationSchema,
   localModelDeprecation,
+  localModelIntelligence,
   installedAcquisition,
   type CatalogComponent,
+  type CatalogLocalModel,
   type CatalogMissingComponent,
   type CustomLocalModel,
   type DrafterCandidate,
   type DrafterReference,
   type LocalInferenceHardware,
   type LocalModel,
+  type LocalModelPreparation,
+  type ModelCatalogState,
   type ModelId,
   type UnsupportedLocalModel,
 } from "@magnitudedev/sdk"
@@ -48,7 +55,7 @@ import {
   addressableModels,
   catalogProducts,
   readCatalog,
-  readHardwareNaming,
+  readHardware,
   withClient,
   type CliModelsClient,
 } from "./inference-client"
@@ -78,6 +85,13 @@ import {
   UNLOADED,
   residencyLabel,
   percent,
+  requireLocalModels,
+  modelAssessment,
+  modelQuant,
+  modelSource,
+  assessmentSpeed,
+  fitDetailSections,
+  renderQuantLadder,
 } from "./model-format"
 
 export const ModelIdJsonSchema = Schema.Struct({ modelId: ModelIdSchema })
@@ -215,8 +229,6 @@ const modelStatus = (model: LocalModel): string => {
   }
 }
 
-const sourceLabel = (model: LocalModel): string => model._tag === "Catalog" ? "Catalog" : model.presentation.sourceLabel
-
 const DRAFTER_TURNED_OFF = "Turned off"
 
 /** The catalog model a custom model is a variant of, by name when the catalog lists it. */
@@ -249,28 +261,44 @@ const modelsForStatus = (models: readonly LocalModel[]): LocalModel[] => models
   .filter((model) => model._tag === "Custom" || model.acquisitionState._tag !== "NotInstalled")
   .sort((a, b) => formatLocalModelDisplayName(a).localeCompare(formatLocalModelDisplayName(b)) || a.modelId.localeCompare(b.modelId))
 
-export interface ModelsStatusView {
+export interface ModelsListView {
   readonly models: readonly LocalModel[]
   readonly unsupported: readonly UnsupportedLocalModel[]
   readonly hidden: readonly LocalModel[]
   readonly all: boolean
+  readonly preparation: LocalModelPreparation
+  readonly warnings: readonly string[]
 }
 
 const unsupportedReasonLine = (model: UnsupportedLocalModel): string =>
   unsupportedReasonMessages(model.reasons).join(". ")
 
-export const renderModelsStatus = ({ models, unsupported, hidden, all }: ModelsStatusView): string => {
-  const catalogModels = [...models, ...hidden]
+/** How far the service is in assessing the models it offers on this computer. */
+export const renderPreparation = ({ assessment }: LocalModelPreparation): string => {
+  const progress = `${assessment.settledModels} of ${plural(assessment.totalModels, "model")} assessed`
+  const status = assessment.complete
+    ? `Complete - ${progress}`
+    : assessment.totalModels === 0
+      ? "Not complete - no assessment targets reported"
+      : `In progress - ${progress}`
+  return `Assessment: ${status}`
+}
+
+export const renderModelsList = ({ models, unsupported, hidden, all, preparation, warnings }: ModelsListView): string => {
   const visible = modelsForStatus(models)
   const listed = all ? [...visible, ...hidden] : visible
   const isHidden = (model: LocalModel) => hidden.some(({ modelId }) => modelId === model.modelId)
-  const footer = all ? [] : [
-    ...catalogComponentHints(visible),
-    ...(unsupported.length > 0
-      ? [`${plural(unsupported.length, "other model")} on this computer can't run in Magnitude.`]
-      : []),
-    ...(hidden.length > 0 ? [`${plural(hidden.length, "hidden model")}.`] : []),
-    ...(unsupported.length > 0 || hidden.length > 0 ? ["List them: magnitude models status --all"] : []),
+  const footer = [
+    ...(all ? [] : [
+      ...catalogComponentHints(visible),
+      ...(unsupported.length > 0
+        ? [`${plural(unsupported.length, "other model")} on this computer can't run in Magnitude.`]
+        : []),
+      ...(hidden.length > 0 ? [`${plural(hidden.length, "hidden model")}.`] : []),
+      ...(unsupported.length > 0 || hidden.length > 0 ? ["List them: magnitude models list --all"] : []),
+    ]),
+    ...warnings.map((message) => `Catalog warning: ${message}`),
+    renderPreparation(preparation),
   ]
   const unsupportedSection = all && unsupported.length > 0 ? [
     "",
@@ -284,40 +312,47 @@ export const renderModelsStatus = ({ models, unsupported, hidden, all }: ModelsS
   ] : []
   if (listed.length === 0) return ensureTrailingNewline([
     "No local models are on this computer.",
-    ...(footer.length > 0 ? ["", ...footer] : []),
+    "Find one: magnitude models recommend",
+    "",
+    ...footer,
     ...unsupportedSection,
   ].join("\n"))
   return ensureTrailingNewline([
-    "Local models",
+    "Models on this computer",
     "",
     renderTable(listed, [
-      { heading: "MODEL", value: formatLocalModelDisplayName },
-      { heading: "SOURCE", value: sourceLabel },
-      { heading: "VARIANT OF", value: (model) => Option.getOrElse(variantOfLabel(model, catalogModels), () => "—") },
-      { heading: "DRAFTER", value: (model) => model._tag === "Catalog" ? "—" : Option.getOrElse(drafterSummary(model), () => "—") },
-      { heading: "MEMORY", value: modelMemory },
+      { heading: "MODEL", value: ({ presentation }) => presentation.displayName },
+      { heading: "QUANT", value: modelQuant },
+      { heading: "SIZE", value: (model) => formatStorageSize(model.storageBytes) },
+      { heading: "SPEED", value: (model) => assessmentSpeed(modelAssessment(model)) },
       { heading: "CONTEXT", value: modelContext },
+      { heading: "SOURCE", value: modelSource },
       { heading: "STATUS", value: (model) => isHidden(model) ? "Hidden" : modelStatus(model) },
       { heading: "MODEL ID", value: ({ modelId }) => modelId },
     ]).trimEnd(),
-    ...(footer.length > 0 ? ["", ...footer] : []),
+    "",
+    ...footer,
     ...unsupportedSection,
     ...(all && hidden.length > 0 ? ["", "Unhide a model: magnitude models unhide <model-id>"] : []),
   ].join("\n"))
 }
 
-export const ModelsStatusJsonSchema = Schema.Struct({
+export const ModelsListJsonSchema = Schema.Struct({
   initializing: Schema.Boolean,
+  preparation: optional(LocalModelPreparationSchema),
   models: Schema.Array(LocalModelJsonSchema),
   unsupported: Schema.Array(UnsupportedLocalModelSchema),
   hidden: Schema.Array(LocalModelJsonSchema),
+  warnings: Schema.Array(Schema.String),
 })
 
-export const modelsStatusJson = jsonDocument(ModelsStatusJsonSchema, (view: ModelsStatusView) => ({
+export const modelsListJson = jsonDocument(ModelsListJsonSchema, (view: ModelsListView) => ({
   initializing: false,
+  preparation: Option.some(view.preparation),
   models: modelsForStatus(view.models),
   unsupported: view.unsupported,
   hidden: view.hidden,
+  warnings: view.warnings,
 }))
 
 const installationFields = (model: LocalModel): readonly (readonly [string, string])[] => {
@@ -351,7 +386,7 @@ const installationFields = (model: LocalModel): readonly (readonly [string, stri
 }
 
 const componentCommand = (model: LocalModel, { component }: CatalogMissingComponent): string =>
-  `magnitude catalog pull ${model.modelId} --only ${component.toLowerCase()}`
+  `magnitude models pull ${model.modelId} --only ${component.toLowerCase()}`
 
 const componentSize = ({ downloadBytes }: CatalogMissingComponent): string =>
   downloadBytes > 0 ? ` (${formatStorageSize(downloadBytes)})` : ""
@@ -406,8 +441,7 @@ export type DrafterChoices =
 export interface ModelDetailView {
   readonly model: LocalModel
   readonly models: readonly LocalModel[]
-  /** The machine the model's memory domains are on; read only when its facts name them. */
-  readonly hardware: Option.Option<LocalInferenceHardware>
+  readonly hardware: LocalInferenceHardware
   readonly drafters: DrafterChoices
   readonly hidden: boolean
 }
@@ -417,7 +451,7 @@ const customFields = (model: CustomLocalModel, models: readonly LocalModel[]): r
   ...Option.match(variantOfLabel(model, models), { onNone: () => [], onSome: (label) => [["Variant of", label]] as const }),
   ["Drafter", attachedDrafterLabel(model)],
   ...(drafterUpdateAvailable(model)
-    ? [["Update", `A newer drafter is available - magnitude catalog pull ${model.modelId}`]] as const
+    ? [["Update", `A newer drafter is available - magnitude models pull ${model.modelId}`]] as const
     : []),
   ...Option.match(unsupportedAssessmentReason(model), { onNone: () => [], onSome: (reason) => [["Can't run", reason]] as const }),
 ]
@@ -438,14 +472,48 @@ const drafterSection = (view: ModelDetailView): string[] => {
   }
 }
 
+const formatReleaseDate = (value: string): string => {
+  const date = new Date(`${value.length === 7 ? `${value}-01` : value}T00:00:00Z`)
+  return Number.isNaN(date.valueOf())
+    ? value
+    : new Intl.DateTimeFormat("en", { month: "long", year: "numeric", timeZone: "UTC" }).format(date)
+}
+
+const catalogFields = (model: CatalogLocalModel): readonly (readonly [string, string])[] => [
+  ["Source", modelSource(model)],
+  ["Developer", `${model.catalogData.developer.name} (${model.catalogData.developer.country})`],
+  ["Released", formatReleaseDate(model.catalogData.releaseDate)],
+  ["Parameters", formatModelParameters(model.catalogData.parameterization)],
+  ["Intelligence", Option.match(localModelIntelligence(model), { onNone: () => "Not rated", onSome: (score) => `${score}%` })],
+  ...(model.presentation.sourceUrls[0] === undefined ? [] : [["Hugging Face", model.presentation.sourceUrls[0]] as const]),
+]
+
+/** The quants of the catalog model a catalog model is one rung of, smallest first; none for a custom model. */
+const catalogLadder = (model: LocalModel, models: readonly LocalModel[]): readonly LocalModel[] => {
+  if (model._tag !== "Catalog") return []
+  const base = (modelId: string) => modelId.slice(0, modelId.indexOf(":"))
+  return models
+    .filter((candidate) => candidate._tag === "Catalog" && base(candidate.modelId) === base(model.modelId))
+    .sort((left, right) => left.storageBytes - right.storageBytes)
+}
+
+export const otherVersionsCommand = (model: LocalModel): string =>
+  `magnitude models search ${JSON.stringify(model.presentation.displayName)}`
+
 export const renderModelDetail = (view: ModelDetailView): string => {
   const { model, models } = view
+  const unifiedMemory = deriveHardwareRoles(view.hardware).unifiedMemory
+  const ladder = catalogLadder(model, models)
+  const description = model._tag === "Catalog" ? model.presentation.description.trim() : ""
   return ensureTrailingNewline([
     formatLocalModelDisplayName(model),
+    ...(description.length > 0 ? [description] : []),
     renderFields([
       ["Model ID", model.modelId],
+      ["Quant", modelQuant(model)],
+      ["Size", formatStorageSize(model.storageBytes)],
       ...(view.hidden ? [["Hidden", `Yes - unhide it: magnitude models unhide ${model.modelId}`]] as const : []),
-      ...(model._tag === "Custom" ? customFields(model, models) : [["Source", "Catalog"] as const]),
+      ...(model._tag === "Custom" ? customFields(model, models) : catalogFields(model)),
       ...Option.match(model.presentation.license, { onNone: () => [], onSome: (license) => [["License", license] as const] }),
       ...supportFields(model, models),
       ...installationFields(model),
@@ -454,12 +522,16 @@ export const renderModelDetail = (view: ModelDetailView): string => {
       ...Option.match(localModelAllocation(model), { onNone: () => [], onSome: (allocation) => [promptGroupPlacesFact(allocation)] }),
       ...Option.match(doesNotFitLabel(model), { onNone: () => [], onSome: (label) => [["Fit", label]] as const }),
       ...(modelMemoryBytes(model) === undefined ? [] : [["Memory", modelMemory(model)]] as const),
-      ...localModelExpertFacts(model, view.hardware),
+      ["Speed", assessmentSpeed(modelAssessment(model))],
+      ...localModelExpertFacts(model, Option.some(view.hardware)),
       ...memoryBreakdownFields(model),
       ...(modelContext(model) === "—" ? [] : [["Context", modelContext(model)]] as const),
       ...(model._tag === "Catalog" ? [["Acceleration", accelerationLabel(model)]] as const : []),
     ]),
+    ...fitDetailSections(modelAssessment(model), unifiedMemory),
+    ...(ladder.length > 1 ? ["", "Quants", renderQuantLadder(ladder, Option.some(model.modelId), unifiedMemory).trimEnd()] : []),
     ...drafterSection(view),
+    ...(model._tag === "Catalog" ? ["", `Other versions: ${otherVersionsCommand(model)}`] : []),
   ].join("\n"))
 }
 
@@ -508,75 +580,81 @@ const unsupportedModelDetailJson = jsonDocument(
   (unsupportedModel: UnsupportedLocalModel) => ({ unsupportedModel }),
 )
 
-export type ModelsStatusResult =
-  | { readonly _tag: "Initializing" }
-  | { readonly _tag: "List"; readonly view: ModelsStatusView }
+export type ModelDetailResult =
   | { readonly _tag: "Detail"; readonly view: ModelDetailView }
   | { readonly _tag: "Unsupported"; readonly model: UnsupportedLocalModel }
 
-export const modelsStatusResultJson: JsonDocument<ModelsStatusResult> = {
-  encode: (result) => {
-    switch (result._tag) {
-      case "Initializing": return Schema.encode(ModelsStatusJsonSchema)({ initializing: true, models: [], unsupported: [], hidden: [] })
-      case "List": return modelsStatusJson.encode(result.view)
-      case "Detail": return modelDetailJson.encode(result.view)
-      case "Unsupported": return unsupportedModelDetailJson.encode(result.model)
-    }
-  },
+export const modelDetailResultJson: JsonDocument<ModelDetailResult> = {
+  encode: (result) => result._tag === "Detail"
+    ? modelDetailJson.encode(result.view)
+    : unsupportedModelDetailJson.encode(result.model),
 }
 
-export const readModelsStatus = (
-  client: CliModelsClient,
-  modelId: Option.Option<ModelId>,
-  all: boolean,
-): Effect.Effect<ModelsStatusResult, unknown> => Effect.gen(function* () {
+export const renderModelDetailResult = (result: ModelDetailResult): string => result._tag === "Detail"
+  ? renderModelDetail(result.view)
+  : renderUnsupportedModelDetail(result.model)
+
+/** A model on this computer or in the catalog by ID, with its drafter choices; or a file Magnitude found but can't run. */
+export const readModelDetail = (client: CliModelsClient, modelId: ModelId): Effect.Effect<ModelDetailResult, unknown> => Effect.gen(function* () {
   const catalog = yield* readCatalog(client)
-  if (catalog._tag === "Initializing") return { _tag: "Initializing" as const }
-  if (Option.isNone(modelId)) return {
-    _tag: "List" as const,
-    view: { models: catalogProducts(catalog), unsupported: catalog.unsupportedLocalModels, hidden: catalog.hiddenLocalModels, all },
-  }
-  const unsupported = catalog.unsupportedLocalModels.find((candidate) => Option.contains(candidate.modelId, modelId.value))
+  const models = yield* requireLocalModels(catalog)
+  const unsupported = catalog._tag === "Initializing"
+    ? undefined
+    : catalog.unsupportedLocalModels.find((candidate) => Option.contains(candidate.modelId, modelId))
   if (unsupported !== undefined) return { _tag: "Unsupported" as const, model: unsupported }
-  const models = addressableModels(catalog)
-  const model = yield* findModel(models, modelId.value)
+  const model = yield* findModel(models, modelId)
   const { hardware, drafters } = yield* Effect.all(
-    { hardware: readHardwareNaming(client, model), drafters: listModelDrafters(client, model) },
+    { hardware: readHardware(client), drafters: listModelDrafters(client, model) },
     { concurrency: "unbounded" },
   )
   return {
     _tag: "Detail" as const,
-    view: {
-      model,
-      models,
-      hardware,
-      drafters,
-      hidden: catalog.hiddenLocalModels.some((hidden) => hidden.modelId === model.modelId),
-    },
+    view: { model, models, hardware, drafters, hidden: isHiddenModel(catalog, model) },
   }
 })
 
-export const renderModelsStatusResult = (result: ModelsStatusResult): string => {
-  switch (result._tag) {
-    case "Initializing": return "Local models are initializing.\n"
-    case "List": return renderModelsStatus(result.view)
-    case "Detail": return renderModelDetail(result.view)
-    case "Unsupported": return renderUnsupportedModelDetail(result.model)
-  }
+const isHiddenModel = (catalog: ModelCatalogState, model: LocalModel): boolean =>
+  catalog._tag !== "Initializing" && catalog.hiddenLocalModels.some((hidden) => hidden.modelId === model.modelId)
+
+export type ModelsListResult =
+  | { readonly _tag: "Initializing" }
+  | { readonly _tag: "List"; readonly view: ModelsListView }
+
+export const modelsListResultJson: JsonDocument<ModelsListResult> = {
+  encode: (result) => result._tag === "List"
+    ? modelsListJson.encode(result.view)
+    : Schema.encode(ModelsListJsonSchema)({ initializing: true, preparation: Option.none(), models: [], unsupported: [], hidden: [], warnings: [] }),
 }
 
-export const showModelsStatus = (modelInput?: string, options: JsonOption & { readonly all?: boolean } = {}) => commandEffect({
-  effect: (modelInput === undefined ? Effect.succeed(Option.none<ModelId>()) : decodeModelId(modelInput).pipe(Effect.map(Option.some))).pipe(
-    Effect.flatMap((modelId) => withClient((client) => readModelsStatus(client, modelId, options.all === true))),
-  ),
-  render: renderModelsStatusResult,
-  json: asJson(options, modelsStatusResultJson),
+export const readModelsList = (client: CliModelsClient, all: boolean): Effect.Effect<ModelsListResult, unknown> =>
+  readCatalog(client).pipe(Effect.map((catalog): ModelsListResult => catalog._tag === "Initializing"
+    ? { _tag: "Initializing" }
+    : {
+        _tag: "List",
+        view: {
+          models: catalogProducts(catalog),
+          unsupported: catalog.unsupportedLocalModels,
+          hidden: catalog.hiddenLocalModels,
+          all,
+          preparation: catalog.localModelPreparation,
+          warnings: [...new Set(catalog.failures.map(({ message }) => message.trim()).filter(Boolean))],
+        },
+      }))
+
+export const renderModelsListResult = (result: ModelsListResult): string => result._tag === "List"
+  ? renderModelsList(result.view)
+  : "Local models are initializing.\n"
+
+export const listModels = (options: JsonOption & { readonly all?: boolean } = {}) => commandEffect({
+  effect: withClient((client) => readModelsList(client, options.all === true)),
+  render: renderModelsListResult,
+  json: asJson(options, modelsListResultJson),
 })
 
 export const loadInstance = (modelInput: string, options: JsonOption = {}) => modelMutation(
   modelInput,
   (client, modelId) => client.models.load({ modelId }),
-  (modelId) => `Load requested for ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`,
+  (modelId) => `Load requested for ${modelId}.\nCheck progress: magnitude models show ${modelId}\n`,
   options,
 )
 

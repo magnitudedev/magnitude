@@ -76,24 +76,24 @@ const run = Effect.scoped(Effect.gen(function* () {
         let catalogStatus = "(no status observed)"
         const ranking = yield* Effect.gen(function* () {
           for (;;) {
-            const status = yield* query("catalog", "status")
+            const status = yield* query("models", "list")
             if (status !== catalogStatus) yield* Effect.logInfo(`Catalog status after ${Math.round((Date.now() - assessmentStarted) / 1000)} s:\n${status.trim()}`)
             catalogStatus = status
             const counts = /Assessment: Complete - (\d+) of (\d+) models? assessed/.exec(status)
             if (counts && Number(counts[1]) > 0 && counts[1] === counts[2]) {
               yield* diagnosticWrite("catalog-status.txt", status)
-              return yield* query("catalog", "recommendations")
+              return yield* query("models", "recommend")
             }
             yield* Effect.sleep("500 millis")
           }
         }).pipe(Effect.timeoutFail({ duration: "16 minutes", onTimeout: () => new AcceptanceFailed({
-          message: `Catalog assessment did not complete within 16 minutes; last catalog status:\n${catalogStatus}`,
+          message: `Catalog assessment did not complete within 16 minutes; last models list:\n${catalogStatus}`,
         }) }), Effect.catchAll(error => Effect.gen(function* () {
           const diagnostics = yield* fs.readFileString(assessmentDiagnostics).pipe(Effect.orElseSucceed(() => "(unavailable)"))
           return yield* new AcceptanceFailed({ message: `${error instanceof AcceptanceFailed ? error.message : String(error)}\nAssessment diagnostics:\n${diagnostics}` })
         })))
         yield* Effect.logInfo(`Catalog assessed after ${Math.round((Date.now() - assessmentStarted) / 1000)} s`)
-        if (!ranking.includes("Local model recommendations -") && !ranking.includes("No compatible recommendations are available")) {
+        if (!ranking.includes("Recommended for this computer") && !ranking.includes("run on this computer.")) {
           return yield* new AcceptanceFailed({ message: "Catalog completed without a settled recommendation result" })
         }
         yield* diagnosticWrite("recommendations.txt", ranking)

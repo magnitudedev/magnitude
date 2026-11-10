@@ -79,11 +79,11 @@ test "$(code -H 'Host: magnitude:10100' -H "Authorization: Bearer $key" "$origin
   || fail 'a service name with the key is not 200'
 log "Key and Host checks passed"
 
-docker exec "$name" magnitude catalog pull "$model" || fail "catalog pull $model failed"
+docker exec "$name" magnitude models pull "$model" || fail "models pull $model failed"
 for ((i = 0; ; i++)); do
   curl --silent --fail --max-time 30 -H "Authorization: Bearer $key" "$origin/inference/v1/models" | grep -q "\"$model\"" && break
   test "$i" -lt 360 || fail "$model was not installed within 30 minutes"
-  if ((i % 12 == 0)); then docker exec "$name" magnitude models status "$model" 2>&1 | head -n 5 | sed 's/^/  /' || true; fi
+  if ((i % 12 == 0)); then docker exec "$name" magnitude models show "$model" 2>&1 | head -n 5 | sed 's/^/  /' || true; fi
   sleep 5
 done
 log "Downloaded $model"

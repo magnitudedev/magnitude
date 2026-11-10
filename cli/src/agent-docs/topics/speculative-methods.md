@@ -47,7 +47,7 @@ evidence over the method name alone.
 ## What Magnitude handles
 
 For a catalog model, Magnitude's reviewed configuration declares the exact speculative method and
-any required draft material. `magnitude catalog pull` acquires a separate draft artifact when the
+any required draft material. `magnitude models pull` acquires a separate draft artifact when the
 configuration needs one. Assessment and loading validate the target, draft, method, hardware fit,
 and serving configuration; Magnitude then activates the method automatically during inference.
 

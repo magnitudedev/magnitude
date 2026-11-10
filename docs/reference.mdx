@@ -19,7 +19,7 @@ Running `magnitude` without a subcommand prints help. No npm installation is req
 | `magnitude serve` | Run the service in the foreground without opening Desktop. |
 | `magnitude status` | Check whether Magnitude is running and inspect service and model status. |
 
-Model, catalog, hardware, and connection setup commands require a running Desktop or `magnitude serve`.
+Model, hardware, and connection setup commands require a running Desktop or `magnitude serve`.
 Stop a foreground server with Ctrl+C. Opening Desktop takes over from a foreground server.
 Only one Desktop or `serve` instance can run under the same user account. Fully quit Desktop or stop the existing `serve` command before starting another server. See [Remote server](/remote-server) for setup.
 
@@ -32,18 +32,18 @@ Assessment and downloads run in the background. Use status commands to check pro
 | Command | Purpose |
 | --- | --- |
 | `hardware` | Inspect detected hardware and memory. |
-| `catalog status` | Check catalog preparation and assessment. |
-| `catalog list` | List compatible catalog models. |
-| `catalog show <model-id>` | Read model details. |
-| `catalog recommendations` | Show the tested models recommended for this computer, each at the quant chosen for it; a limit of 10 by default. |
-| `catalog pull <model-id>` | Download or update a catalog model. |
-| `catalog cancel <model-id>` | Cancel a download or model update. |
-| `catalog remove <model-id>` | Remove an installed model. |
-| `models status [model-id]` | Inspect downloaded models and loading state. |
+| `models list` | List the models on this computer with their quant, size, speed, context, source and status, and assessment progress. `--all` adds models that can't run and hidden ones. |
+| `models recommend` | Show the tested models recommended for this computer, each at the quant chosen for it with its ladder of quants; a limit of 10 by default. |
+| `models search <query>` | Search Hugging Face, with each result's base model and how its recommended quant runs here. |
+| `models show <model>` | For a model ID, Hugging Face link or `owner/repo[:QUANT]`, show every quant with its size, speed, context and placement, and for the chosen quant where its bytes go and its speed at each context depth. |
+| `models pull <model>` | Download or update a model by ID, or add one from Hugging Face by link or `owner/repo[:QUANT]`. |
+| `models cancel <model-id>` | Cancel a download or model update. |
 | `models load <model-id>` | Load a downloaded model into memory. |
 | `models stop [model-id]` | Stop a model, or the active one, without deleting it. |
+| `models rm <model-id>` | Remove a model Magnitude downloaded; a model found in another app's folder is hidden instead. |
+| `models families` | List the model families Magnitude runs. |
 
-Prefix each command with `magnitude`. Use `--country US` to recommend only models from developers in one country, and `--limit` to show fewer.
+Prefix each command with `magnitude`. Use `--country US` with `models recommend` to recommend only models from developers in one country, and `--limit` to show fewer.
 
 ## Connections
 

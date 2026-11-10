@@ -113,13 +113,13 @@ const baseRelation: Record<Native.HuggingFaceBaseRelation, HuggingFaceBaseRelati
 
 const catalogHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
   code: "catalog_model_not_hideable",
-  message: `${modelId} is a catalog model. Remove it with \`magnitude catalog remove ${modelId}\` instead.`,
+  message: `${modelId} is a catalog model. Remove it with \`magnitude models rm ${modelId}\` instead.`,
   retryable: false,
 })
 
 const managedHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
   code: "managed_model_not_hideable",
-  message: `${modelId} was added to Magnitude, so it can't be hidden. Remove it with \`magnitude catalog remove ${modelId}\` instead.`,
+  message: `${modelId} was added to Magnitude, so it can't be hidden. Remove it with \`magnitude models rm ${modelId}\` instead.`,
   retryable: false,
 })
 

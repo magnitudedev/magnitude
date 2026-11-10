@@ -1047,7 +1047,7 @@ describe("removal by origin", () => {
     }))
     expect(result.added).toMatchObject({
       code: "managed_model_not_hideable",
-      message: `${addedId} was added to Magnitude, so it can't be hidden. Remove it with \`magnitude catalog remove ${addedId}\` instead.`,
+      message: `${addedId} was added to Magnitude, so it can't be hidden. Remove it with \`magnitude models rm ${addedId}\` instead.`,
     })
     expect(result.hidden).toEqual([foundId])
   })
@@ -1421,7 +1421,7 @@ describe("catalog models found elsewhere", () => {
     expect(result.files).toEqual(Option.some({ path: cachePath, location: Option.some("HuggingFaceCache") }))
     expect(result.hidden).toEqual([external])
     expect(result.afterAliasUnhide).toEqual([])
-    expect(result.refused.message).toBe(`${owned} is a catalog model. Remove it with \`magnitude catalog remove ${owned}\` instead.`)
+    expect(result.refused.message).toBe(`${owned} is a catalog model. Remove it with \`magnitude models rm ${owned}\` instead.`)
     expect(result.afterUnhide).toEqual([])
   })
 

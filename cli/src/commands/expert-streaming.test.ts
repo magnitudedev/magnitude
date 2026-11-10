@@ -10,10 +10,8 @@ import {
   makeInstalledCatalogModel,
   recommendedModel,
 } from "./fixtures/inference"
-import { readHardwareNaming } from "./inference-client"
 import {
   hardwareJson,
-  renderCatalogDetail,
   renderHardware,
   renderModelDetail,
   renderRecommendations,
@@ -44,7 +42,7 @@ const streamedLoad = () => {
 describe("expert streaming", () => {
   it("states a streamed fit's share, floor and floor speed in its details and recommendation", () => {
     const model = streamedFit()
-    const detail = renderCatalogDetail({ model, models: [model] })
+    const detail = renderModelDetail({ model, models: [model], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false })
     expect(detail).toMatch(/Experts this machine allows\s+60%, the rest read from disk/)
     expect(detail).toMatch(/Expert floor\s+1%/)
     expect(detail).toMatch(/Speed at the floor\s+~5 tok\/s/)
@@ -57,7 +55,7 @@ describe("expert streaming", () => {
 
   it("says nothing about streaming for a resident fit", () => {
     const model = makeCatalogModel()
-    expect(renderCatalogDetail({ model, models: [model] })).not.toContain("Expert")
+    expect(renderModelDetail({ model, models: [model], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false })).not.toContain("Expert")
   })
 
   it("states a loaded model's prompt group places and where its experts are", () => {
@@ -76,7 +74,7 @@ describe("expert streaming", () => {
   it("states a loaded streamed model's bank once in its detail, in place of its fit", () => {
     const model = streamedLoad()
     const detail = renderModelDetail({
-      model, models: [model], hardware: Option.some(servingHardware("Discrete")), drafters: { _tag: "NotApplicable" }, hidden: false,
+      model, models: [model], hardware: servingHardware("Discrete"), drafters: { _tag: "NotApplicable" }, hidden: false,
     })
     expect(detail).toMatch(/Prompt group places\s+1 of 8/)
     expect(detail.match(/Experts in memory/g)).toHaveLength(1)
@@ -88,17 +86,6 @@ describe("expert streaming", () => {
     })
     expect(recommendation).toContain("   Experts in memory 40%, floor 1%, ceiling 60% - Experts in Test GPU · GPU 1 300 MB")
     expect(recommendation).not.toContain("Experts this machine allows")
-  })
-
-  it("reads the hardware only for a model whose facts name its memory", async () => {
-    let reads = 0
-    const client = { models: { getLocalEnvironment: () => Effect.sync(() => { reads += 1; return servingHardware("Discrete") }) } }
-    const unloaded = await Effect.runPromise(readHardwareNaming(client as never, streamedFit()))
-    expect(Option.isNone(unloaded)).toBe(true)
-    expect(reads).toBe(0)
-    const loaded = await Effect.runPromise(readHardwareNaming(client as never, streamedLoad()))
-    expect(Option.isSome(loaded)).toBe(true)
-    expect(reads).toBe(1)
   })
 
   it("encodes a loaded model's streaming status without memory-domain identities", () => {

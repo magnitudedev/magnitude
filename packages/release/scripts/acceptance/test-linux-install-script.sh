@@ -72,7 +72,7 @@ for ((attempt=0; attempt<300; attempt++)); do
 done
 grep -Eq 'Runtime[[:space:]]+Ready' "$root/status.txt"
 grep -Eq 'Owner[[:space:]]+Headless' "$root/status.txt"
-/usr/bin/magnitude models status > "$root/models.txt"
+/usr/bin/magnitude models list > "$root/models.txt"
 /usr/bin/magnitude hardware > "$root/hardware.txt"
 kill -TERM "$owner_pid"
 wait "$owner_pid"

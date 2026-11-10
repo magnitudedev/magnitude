@@ -1,23 +1,22 @@
 import {
-  catalogSupportLabel,
   deriveHardwareMemoryView,
+  deriveHardwareRoles,
   formatLocalInferenceBackend,
   formatLocalModelDisplayName,
   formatMemorySize,
   formatStorageSize,
   localModelAllocation,
   localModelExpertFacts,
-  localModelFitFacts,
-  localModelRadarAxes,
   modelServingFacts,
 } from "@magnitudedev/client-common"
 import {
   CountryCodeSchema,
-  LocalModelPreparationSchema,
-  localModelDeprecation,
+  LocalModelFamilySchema,
+  ModelIdSchema,
   localModelIntelligence,
   type CatalogLocalModel,
   type CountryCode,
+  type LocalModelFamily,
   type RecommendedModel,
   type Recommendations,
   type LocalInferenceHardware,
@@ -33,31 +32,37 @@ import {
   withClient,
 } from "./inference-client"
 import { describeLocalHardware, formatContext } from "./inference-format"
+import { inspectionJson, readInspection, renderInspection, type InspectionView } from "./hugging-face-runtime"
 import { CatalogModelJsonSchema, LocalInferenceHardwareJsonSchema, LocalModelJsonSchema } from "./json-schemas"
-import { decodeCatalogId, ModelCommandError } from "./model-references"
+import { isLocalPathReference, ModelCommandError, parseHuggingFaceReference } from "./model-references"
+import {
+  modelDetailResultJson,
+  readModelDetail,
+  renderModelDetailResult,
+  type ModelDetailResult,
+} from "./models-status-runtime"
 import {
   ensureTrailingNewline,
   jsonDocument,
-  renderFields,
   renderTable,
   commandEffect,
   asJson,
+  type JsonDocument,
   type JsonOption,
 } from "./output"
 import {
   optional,
   plural,
-  findModel,
-  isCatalogModel,
   residencyState,
-  modelContext,
-  memoryBreakdownFields,
-  modelMemory,
-  supportFields,
   accelerationLabel,
+  assessmentContext,
+  assessmentPlacement,
+  assessmentSpeed,
   capabilityLabels,
+  modelAssessment,
+  modelQuant,
+  renderQuantLadder,
   residencyLabel,
-  requireLocalModels,
 } from "./model-format"
 export * from "./hugging-face-runtime"
 
@@ -71,134 +76,18 @@ export * from "./models-status-runtime"
 const catalogModels = (catalog: ModelCatalogState): readonly CatalogLocalModel[] =>
   catalogProducts(catalog).flatMap((model) => model._tag === "Catalog" ? [model] : [])
 
-export const renderCatalogStatus = (catalog: ModelCatalogState): string => {
-  if (catalog._tag === "Initializing") return ensureTrailingNewline([
-    "Model catalog preparation",
-    "Assessment: In progress",
-  ].join("\n"))
-
-  const { assessment } = catalog.localModelPreparation
-  const progress = `${assessment.settledModels} of ${plural(assessment.totalModels, "model")} assessed`
-  const status = assessment.complete
-    ? `Complete - ${progress}`
-    : assessment.totalModels === 0
-      ? "Not complete - no assessment targets reported"
-      : `In progress - ${progress}`
-  return ensureTrailingNewline([
-    "Model catalog preparation",
-    `Assessment: ${status}`,
-  ].join("\n"))
-}
-
-export const CatalogStatusJsonSchema = Schema.Struct({ preparation: optional(LocalModelPreparationSchema) })
-
-export const catalogStatusJson = jsonDocument(CatalogStatusJsonSchema, (catalog: ModelCatalogState) => ({
-  preparation: catalog._tag === "Initializing" ? Option.none() : Option.some(catalog.localModelPreparation),
-}))
-
-export const showCatalogStatus = (options: JsonOption = {}) => commandEffect({
-  effect: withClient(readCatalog),
-  render: renderCatalogStatus,
-  json: asJson(options, catalogStatusJson),
-})
-
-const assessmentSummary = (models: readonly CatalogLocalModel[]): { assessing: number; failed: number } => ({
+const assessingCount = (models: readonly CatalogLocalModel[]): { assessing: number; failed: number } => ({
   assessing: models.filter((model) => model.servingState._tag === "Assessing").length,
   failed: models.filter((model) => model.servingState._tag === "Failed").length,
 })
 
-const assessmentNotice = (
-  models: readonly CatalogLocalModel[],
-  subject: "list" | "recommendations",
-): string[] => {
-  const { assessing, failed } = assessmentSummary(models)
+const assessmentNotice = (models: readonly CatalogLocalModel[]): string[] => {
+  const { assessing, failed } = assessingCount(models)
   return [
-    ...(assessing > 0 ? [`Assessing ${plural(assessing, "additional catalog model")}; ${
-      subject === "list" ? "this list may grow" : "recommendations may change"
-    }.`] : []),
+    ...(assessing > 0 ? [`Assessing ${plural(assessing, "additional catalog model")}; recommendations may change.`] : []),
     ...(failed > 0 ? [`Assessment failed for ${plural(failed, "catalog model")}.`] : []),
   ]
 }
-
-const catalogFailureMessages = (catalog: ModelCatalogState): string[] => catalog._tag === "Initializing"
-  ? []
-  : [...new Set(catalog.failures.map(({ message }) => message.trim()).filter(Boolean))]
-
-const catalogWarnings = (catalog: ModelCatalogState): string[] =>
-  catalogFailureMessages(catalog).map((message) => `Catalog warning: ${message}`)
-
-const fittingCatalogModels = (models: readonly CatalogLocalModel[]): CatalogLocalModel[] => models
-  .filter(model => Option.isNone(localModelDeprecation(model))
-    && model.servingState._tag === "Assessed"
-    && model.servingState.assessment._tag === "Fits")
-  .sort((left, right) => left.presentation.displayName.localeCompare(right.presentation.displayName)
-    || String(left.presentation.variantLabel).localeCompare(String(right.presentation.variantLabel))
-    || left.modelId.localeCompare(right.modelId))
-
-const radarDetail = (model: CatalogLocalModel, label: string): string =>
-  Option.getOrUndefined(localModelRadarAxes(model))?.find((axis) => axis.label === label)?.detail ?? "—"
-
-const speedLabel = (model: CatalogLocalModel): string => radarDetail(model, "SPEED")
-
-const intelligenceLabel = (model: CatalogLocalModel): string =>
-  Option.match(localModelIntelligence(model), { onNone: () => "not rated", onSome: (score) => `${score}%` })
-
-const labeledModelName = (model: CatalogLocalModel): string => Option.match(
-  catalogSupportLabel(model.catalogData.support), {
-    onNone: () => formatLocalModelDisplayName(model),
-    onSome: (label) => `${formatLocalModelDisplayName(model)} [${label}]`,
-  })
-
-export const renderCatalog = (catalog: ModelCatalogState): string => {
-  if (catalog._tag === "Initializing") return "The local model catalog is initializing.\n"
-  const models = catalogModels(catalog)
-  const compatible = fittingCatalogModels(models)
-  const notice = [...assessmentNotice(models, "list"), ...catalogWarnings(catalog)]
-  if (compatible.length === 0) {
-    const lead = notice.length > 0
-      ? "No compatible catalog models are available yet."
-      : "No catalog models are compatible with this computer."
-    return ensureTrailingNewline([lead, ...notice].join("\n"))
-  }
-  const table = renderTable(compatible, [
-    { heading: "MODEL", value: labeledModelName },
-    { heading: "MEMORY", value: modelMemory },
-    { heading: "SPEED", value: speedLabel },
-    { heading: "CONTEXT", value: modelContext },
-    { heading: "ACCELERATION", value: accelerationLabel },
-    { heading: "MODEL ID", value: ({ modelId }) => modelId },
-  ])
-  return ensureTrailingNewline([
-    `Local model catalog - ${plural(compatible.length, "compatible model")}`,
-    "",
-    table.trimEnd(),
-    ...(notice.length > 0 ? ["", ...notice] : []),
-  ].join("\n"))
-}
-
-export const CatalogListJsonSchema = Schema.Struct({
-  initializing: Schema.Boolean,
-  models: Schema.Array(CatalogModelJsonSchema),
-  assessing: Schema.Int,
-  failed: Schema.Int,
-  warnings: Schema.Array(Schema.String),
-})
-
-export const catalogListJson = jsonDocument(CatalogListJsonSchema, (catalog: ModelCatalogState) => {
-  const models = catalogModels(catalog)
-  return {
-    initializing: catalog._tag === "Initializing",
-    models: fittingCatalogModels(models),
-    ...assessmentSummary(models),
-    warnings: catalogFailureMessages(catalog),
-  }
-})
-
-export const showModelCatalog = (options: JsonOption = {}) => commandEffect({
-  effect: withClient(readCatalog),
-  render: renderCatalog,
-  json: asJson(options, catalogListJson),
-})
 
 const parseCountry = (input: string | undefined) => input === undefined
   ? Effect.succeed(Option.none<CountryCode>())
@@ -220,32 +109,40 @@ export const parseLimit = (input: string, maximum = Number.MAX_SAFE_INTEGER) => 
       }))
 }
 
-/** A recommended model with the catalog model of its chosen rung and the quant name of each rung. */
+/** A recommended model with the catalog model of its chosen rung and of every rung of its ladder. */
 export interface RecommendedCatalogModel {
   readonly recommendation: RecommendedModel
   readonly chosen: CatalogLocalModel
-  readonly quants: readonly string[]
+  readonly rungs: readonly CatalogLocalModel[]
 }
 
+const intelligenceLabel = (model: CatalogLocalModel): string =>
+  Option.match(localModelIntelligence(model), { onNone: () => "not rated", onSome: (score) => `${score}%` })
+
+const indent = (text: string, prefix: string): string =>
+  text.trimEnd().split("\n").map((line) => `${prefix}${line}`).join("\n")
+
 const renderRecommendation = (hardware: LocalInferenceHardware) => (
-  { recommendation, chosen: model, quants }: RecommendedCatalogModel,
+  { recommendation, chosen: model, rungs }: RecommendedCatalogModel,
   index: number,
 ): string => {
+  const unifiedMemory = deriveHardwareRoles(hardware).unifiedMemory
+  const assessment = modelAssessment(model)
   const capabilities = capabilityLabels(model)
   const expertFields = localModelExpertFacts(model, Option.some(hardware))
+  const { developer } = recommendation
   return [
-    `${index + 1}. ${labeledModelName(model)}`,
-    `   ID: ${model.modelId}`,
-    `   ${speedLabel(model)} - ${modelMemory(model)} memory - ${modelContext(model)} context`,
-    `   Intelligence ${intelligenceLabel(model)} - Fidelity ${radarDetail(model, "FIDELITY")} - Acceleration ${accelerationLabel(model)}`,
-    `   Quants: ${quants.join(", ")}${recommendation.meetsTarget ? "" : " - below 20 tok/s on this computer"}`,
+    `${index + 1}. ${formatLocalModelDisplayName(model)} - ${developer.name} (${developer.country}) - Intelligence ${intelligenceLabel(model)}`,
+    `   ${modelQuant(model)} - ${formatStorageSize(model.storageBytes)} - ${assessmentSpeed(assessment)} - ${assessmentContext(assessment)} context - ${assessmentPlacement(assessment, unifiedMemory)}`,
+    `   Model ID: ${model.modelId}${recommendation.meetsTarget ? "" : " - below 20 tok/s on this computer"}`,
     ...(expertFields.length > 0 ? [`   ${expertFields.map(([label, value]) => `${label} ${value}`).join(" - ")}`] : []),
-    ...(capabilities.length > 0 ? [`   ${capabilities.join(", ")}`] : []),
+    `   Acceleration ${accelerationLabel(model)}${capabilities.length > 0 ? ` - ${capabilities.join(", ")}` : ""}`,
+    indent(renderQuantLadder(rungs, Option.some(model.modelId), unifiedMemory), "   "),
   ].join("\n")
 }
 
 export const HUGGING_FACE_HINT =
-  "Looking for a specific version, finetune, or uncensored model? magnitude catalog search \"<model name>\""
+  "Looking for a specific version, finetune, or uncensored model? magnitude models search \"<model name>\""
 
 export interface RecommendationsView {
   readonly catalog: ModelCatalogState
@@ -279,7 +176,7 @@ export const recommendationsJson = jsonDocument(RecommendationsJsonSchema, (view
   })),
 }))
 
-/** The recommendations with a chosen rung, in order, each with its chosen catalog model. */
+/** The recommendations with a chosen rung, in order, each with its chosen catalog model and its ladder's. */
 export const recommendedCatalogModels = (
   recommendations: Recommendations,
   models: readonly CatalogLocalModel[],
@@ -292,10 +189,7 @@ export const recommendedCatalogModels = (
       onSome: (chosen) => [{
         recommendation,
         chosen,
-        quants: recommendation.rungs.map((id) => Option.match(Option.fromNullable(byId.get(id)), {
-          onNone: () => String(id),
-          onSome: (rung) => String(rung.catalogData.quant.name),
-        })),
+        rungs: recommendation.rungs.flatMap((id) => Option.toArray(Option.fromNullable(byId.get(id)))),
       }],
     })).slice(0, limit)
 }
@@ -326,6 +220,10 @@ export const showRecommendations = (
   json: asJson(options, recommendationsJson),
 })
 
+const catalogWarnings = (catalog: ModelCatalogState): string[] => catalog._tag === "Initializing"
+  ? []
+  : [...new Set(catalog.failures.map(({ message }) => message.trim()).filter(Boolean))].map((message) => `Catalog warning: ${message}`)
+
 export function renderRecommendations({
   catalog,
   models,
@@ -335,7 +233,7 @@ export function renderRecommendations({
 }: RecommendationsView): string {
   if (catalog._tag === "Initializing") return "The local model catalog is initializing.\n"
   const system = describeLocalHardware(hardware).system.name
-  const notice = [...assessmentNotice(models, "recommendations"), ...catalogWarnings(catalog)]
+  const notice = [...assessmentNotice(models), ...catalogWarnings(catalog)]
   const scope = Option.match(developerCountry, { onNone: () => "", onSome: (country) => ` from ${country} developers` })
   if (recommended.length === 0) return ensureTrailingNewline([
     `No models${scope} run on this computer.`,
@@ -350,95 +248,71 @@ export function renderRecommendations({
     recommended.map(renderRecommendation(hardware)).join("\n\n"),
     ...(notice.length > 0 ? ["", ...notice] : []),
     "",
+    "* the quant chosen for this computer. Speeds are estimates in a long agent conversation.",
     "Learn more: magnitude docs recommendations",
     HUGGING_FACE_HINT,
   ].join("\n"))
 }
 
-const formatParameters = (model: CatalogLocalModel): string => {
-  const format = (value: number) => value >= 1_000_000_000
-    ? `${Number((value / 1_000_000_000).toPrecision(3))}B`
-    : `${Number((value / 1_000_000).toPrecision(3))}M`
-  const parameters = model.catalogData.parameterization
-  return parameters.architecture === "dense"
-    ? `Dense - ${format(parameters.totalParameters)}`
-    : `MoE - ${format(parameters.totalParameters)} total / ${format(parameters.activeParameters)} active`
+const familyStatus = (status: LocalModelFamily["status"]): string => status === "ComingSoon" ? "Coming soon" : "Supported"
+
+export const renderFamilies = (families: readonly LocalModelFamily[]): string => families.length === 0
+  ? "Magnitude lists no model families.\n"
+  : ensureTrailingNewline([
+      "Model families Magnitude runs; their fine-tunes run too",
+      "",
+      renderTable(families, [
+        { heading: "FAMILY", value: ({ name }) => name },
+        { heading: "DEVELOPER", value: ({ developer }) => developer.name },
+        { heading: "COUNTRY", value: ({ developer }) => developer.country },
+        { heading: "ARCHITECTURES", value: ({ architectures }) => architectures.join(", ") },
+        { heading: "STATUS", value: ({ status }) => familyStatus(status) },
+      ]).trimEnd(),
+    ].join("\n"))
+
+export const FamiliesJsonSchema = Schema.Struct({ families: Schema.Array(LocalModelFamilySchema) })
+
+export const familiesJson = jsonDocument(FamiliesJsonSchema, (families: readonly LocalModelFamily[]) => ({ families }))
+
+export const showFamilies = (options: JsonOption = {}) => commandEffect({
+  effect: withClient((client) => readRecommendations(client, Option.none())).pipe(Effect.map(({ families }) => families)),
+  render: renderFamilies,
+  json: asJson(options, familiesJson),
+})
+
+/** What `models show` names: a model by ID, or a Hugging Face repository to inspect. */
+export type ShowResult =
+  | { readonly _tag: "Model"; readonly result: ModelDetailResult }
+  | { readonly _tag: "Repository"; readonly view: InspectionView }
+
+export const showResultJson: JsonDocument<ShowResult> = {
+  encode: (result) => result._tag === "Model"
+    ? modelDetailResultJson.encode(result.result)
+    : inspectionJson.encode(result.view),
 }
 
-const formatReleaseDate = (value: string): string => {
-  const date = new Date(`${value.length === 7 ? `${value}-01` : value}T00:00:00Z`)
-  return Number.isNaN(date.valueOf())
-    ? value
-    : new Intl.DateTimeFormat("en", { month: "long", year: "numeric", timeZone: "UTC" }).format(date)
-}
+export const renderShowResult = (result: ShowResult): string => result._tag === "Model"
+  ? renderModelDetailResult(result.result)
+  : renderInspection(result.view)
 
-export interface CatalogDetailView {
-  readonly model: CatalogLocalModel
-  readonly models: readonly LocalModel[]
-}
+const SHOW_REFERENCE = "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]"
 
-export const otherVersionsCommand = (model: CatalogLocalModel): string =>
-  `magnitude catalog search ${JSON.stringify(model.presentation.displayName)}`
-
-export const renderCatalogDetail = ({ model, models }: CatalogDetailView): string => {
-  const serving = model.servingState
-  const header = [
-    formatLocalModelDisplayName(model),
-    ...(model.presentation.description.trim().length > 0 ? [model.presentation.description.trim()] : []),
-    renderFields([
-      ["Model ID", model.modelId],
-      ...supportFields(model, models),
-      ["Released", formatReleaseDate(model.catalogData.releaseDate)],
-      ["Architecture", formatParameters(model)],
-      ["Context", modelContext(model)],
-      ...(serving._tag === "Assessed" ? [["Capabilities", capabilityLabels(model).join(", ") || "Text"]] as const : []),
-    ]),
-  ]
-  const performance = (() => {
-    if (serving._tag === "Assessing") return ["Assessment", renderFields([["Status", "Assessing memory and speed…"]])]
-    if (serving._tag === "Failed") return ["Assessment", renderFields([["Status", "Assessment failed."], ["Reason", serving.failure.message]])]
-    if (serving.assessment._tag === "DoesNotFit") return ["Performance on this machine", renderFields([
-      ["Status", "Does not fit"],
-      ["Memory required", formatMemorySize(serving.assessment.totalRequiredBytes)],
-      ["Additional memory", formatMemorySize(serving.assessment.deficitBytes)],
-    ])]
-    return ["Performance on this machine", renderFields([
-      ["Speed", speedLabel(model)],
-      ["Fit", radarDetail(model, "FIT")],
-      ...localModelFitFacts(model),
-      ...memoryBreakdownFields(model),
-      ["Intelligence", intelligenceLabel(model)],
-      ["Fidelity", radarDetail(model, "FIDELITY")],
-      ["Acceleration", accelerationLabel(model)],
-    ])]
-  })()
-  return ensureTrailingNewline([
-    ...header,
-    "",
-    ...performance,
-    "",
-    "Distribution",
-    renderFields([
-      ["Download size", formatStorageSize(model.storageBytes)],
-      ...(Option.isSome(model.presentation.license) ? [["License", model.presentation.license.value]] as const : []),
-      ...(model.presentation.sourceUrls[0] === undefined ? [] : [["Source", model.presentation.sourceUrls[0]]] as const),
-    ]),
-    "",
-    `Other versions: ${otherVersionsCommand(model)}`,
-  ].join("\n"))
-}
-
-export const CatalogDetailJsonSchema = Schema.Struct({ model: CatalogModelJsonSchema })
-
-export const catalogDetailJson = jsonDocument(CatalogDetailJsonSchema, ({ model }: CatalogDetailView) => ({ model }))
-
-export const showCatalogModel = (modelInput: string, options: JsonOption = {}) => commandEffect({
-  effect: decodeCatalogId(modelInput).pipe(Effect.flatMap(modelId => withClient((client) => Effect.gen(function* () {
-    const models = yield* requireLocalModels(yield* readCatalog(client))
-    return { model: yield* findModel(models, modelId, "catalog model", isCatalogModel), models }
-  })))),
-  render: renderCatalogDetail,
-  json: asJson(options, catalogDetailJson),
+export const showModel = (input: string, options: JsonOption = {}) => commandEffect({
+  effect: Effect.gen(function* () {
+    const reference = input.trim()
+    if (reference.length === 0 || isLocalPathReference(reference)) {
+      return yield* new ModelCommandError({ message: `${SHOW_REFERENCE}: ${reference}` })
+    }
+    if (Schema.is(ModelIdSchema)(reference)) {
+      return { _tag: "Model" as const, result: yield* withClient((client) => readModelDetail(client, reference)) }
+    }
+    if (Option.isNone(parseHuggingFaceReference(reference))) {
+      return yield* new ModelCommandError({ message: `${SHOW_REFERENCE}: ${reference}` })
+    }
+    return { _tag: "Repository" as const, view: yield* withClient((client) => readInspection(client, reference)) }
+  }),
+  render: renderShowResult,
+  json: asJson(options, showResultJson),
 })
 
 const activePlan = (model: LocalModel) => {

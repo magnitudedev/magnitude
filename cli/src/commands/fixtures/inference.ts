@@ -30,6 +30,7 @@ import {
   type LocalModelAcquisitionState,
   type LocalModelAssessment,
   type ModelCatalogState,
+  type LocalModelPreparation,
   type ModelLocation,
   type ModelReleaseDate,
   type UnsupportedLocalModel,
@@ -108,7 +109,7 @@ export const fitsAssessment = (): Extract<LocalModelAssessment, { readonly _tag:
   assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
   environmentId: ENVIRONMENT_ID,
   memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0, breakdown: { weightsBytes: 0, contextBytes: 0, overheadBytes: 0 } },
-  placement: { deviceBytes: 0, hostBytes: 0, diskBytes: 0 },
+  placement: { deviceBytes: 18 * GIB, hostBytes: 2 * GIB, diskBytes: 0 },
   residency: { _tag: "Resident", performance: performance(CONTEXT_LENGTH) },
 })
 
@@ -342,6 +343,11 @@ export const makeUnsupportedLocalModel = (overrides: Partial<UnsupportedLocalMod
 
 type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initializing" }>
 
+export const makePreparation = (settledModels = 1, totalModels = 1): LocalModelPreparation => ({
+  discovery: { complete: true, modelsFound: totalModels },
+  assessment: { complete: settledModels === totalModels, settledModels, totalModels },
+})
+
 export const catalogState = (
   models: readonly LocalModel[] = [],
   unsupported: readonly UnsupportedLocalModel[] = [],
@@ -351,10 +357,7 @@ export const catalogState = (
   providers: [],
   models: models.map((product) => ({ _tag: "Local", product, offering: Option.none() })),
   failures: [],
-  localModelPreparation: {
-    discovery: { complete: true, modelsFound: models.length },
-    assessment: { complete: true, settledModels: models.length, totalModels: models.length },
-  },
+  localModelPreparation: makePreparation(models.length, models.length),
   unsupportedLocalModels: unsupported,
   hiddenLocalModels: hidden,
 })
@@ -372,8 +375,14 @@ export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse>
       unsupported: Option.none(),
       gated: false,
       versionCount: Option.none(),
-      base: Option.none(),
-      recommended: Option.none(),
+      base: Option.some({ repository: HuggingFaceRepositoryIdSchema.make("Qwen/Qwen-Test"), relation: "Finetune" }),
+      recommended: Option.some({
+        label: "Q4_K_P",
+        modelId: ADDED_MODEL_ID,
+        sizeBytes: 23_400_000_000,
+        downloadBytes: 23_400_000_000,
+        assessment: fitsAssessment(),
+      }),
     },
     {
       repository: HuggingFaceRepositoryIdSchema.make("huihui-ai/Qwen-Test-abliterated-GGUF"),
@@ -472,6 +481,6 @@ export const recommendedModel = (model: CatalogLocalModel): RecommendedCatalogMo
       meetsOnboardingFloor: true,
     },
     chosen: model,
-    quants: [model.catalogData.quant.name],
+    rungs: [model],
   }
 }

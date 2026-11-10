@@ -44,7 +44,7 @@ stops and removes the service and keeps its data.
   `resources\magnitude.exe`.
 
 Without the service, run `magnitude serve` on the remote computer and leave that terminal running.
-Use another SSH session for commands such as `magnitude models status` and
+Use another SSH session for commands such as `magnitude models list` and
 `magnitude models load <model-id>`. Ctrl+C stops it. Opening Magnitude Desktop on that computer
 takes over from a hand-run `serve` and ends it; while a server set up with `magnitude server setup`
 runs, Desktop instead offers to keep the server or stop it.

@@ -4,12 +4,12 @@ Magnitude runs any GGUF whose model family the engine has kernels for, not only 
 other quantizations, finetunes, merges, and abliterated or uncensored versions. Models come from
 two places:
 
-- **Hugging Face, through Magnitude.** `catalog pull owner/repo[:QUANT]` downloads into Magnitude's
-  own store. `catalog remove` deletes that copy.
+- **Hugging Face, through Magnitude.** `models pull owner/repo[:QUANT]` downloads into Magnitude's
+  own store. `models rm` deletes that copy.
 - **Found on this computer.** The Hugging Face cache, LM Studio, the llama.cpp cache, Ollama, and
   folders you add are scanned for GGUFs. These files belong to their apps; `models hide` hides a
-  found model without touching its files. Models added from Hugging Face can't be hidden;
-  `catalog remove` removes them.
+  found model without touching its files, and so does `models rm` for a found model. Models added
+  from Hugging Face can't be hidden; `models rm` removes them.
 
 Model IDs are `hf:<owner>/<repo>/<file>` for a model added from Hugging Face or found in the Hugging
 Face cache, and `local:<name>-<quant>:<hash>` otherwise, such as
@@ -19,24 +19,27 @@ part is for reading and may change. Each copy's ID comes from that copy alone.
 ## Find and add a model
 
 ```text
-magnitude catalog search "Qwen3.6 35B-A3B"
-magnitude catalog inspect HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive
-magnitude catalog pull HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:Q4_K_P
-magnitude models status <model-id>
+magnitude models search "Qwen3.6 35B-A3B"
+magnitude models show HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive
+magnitude models pull HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:Q4_K_P
+magnitude models show <model-id>
 magnitude models load <model-id>
 ```
 
-`catalog search` lists repositories with the uploader, the catalog model each is a variant of, and
-downloads. Results whose architecture Magnitude doesn't run follow in their own table with that
-reason. `catalog show <model-id>` prints the search that finds other versions
-of a catalog model.
+`models search` lists repositories with the base model each derives from (fine-tune, merge, adapter
+or quant of it), the recommended quant with its size, estimated speed and placement on this
+computer, and downloads. Results whose architecture Magnitude doesn't run follow in their own table
+with the architecture and the reason. `models show <model-id>` of a catalog model lists its other
+quants and prints the search that finds other versions.
 
-`catalog inspect` accepts a huggingface.co link, `owner/repo`, `owner/repo:QUANT`, or a local GGUF
-path, and changes nothing. It lists every version with its size and the engine's verdict for this
-computer (`Fits`, `Too large`, or `Unsupported:` with the reason), marks the recommended version and
-any version already on this computer, then lists drafter choices and the exact command to download.
+`models show` with a huggingface.co link, `owner/repo`, or `owner/repo:QUANT` changes nothing. It
+lists every version with its bit width, size, estimated speed, served context, placement, and the
+engine's verdict for this computer (`Fits`, `Too large`, or `Unsupported:` with the reason), marks
+the recommended version and any version already on this computer, then shows where the chosen
+version's bytes go (device memory, host RAM, read from disk) and its speed at each assessed context
+depth, the drafter choices, and the exact command to download.
 
-`catalog pull` with no quant picks the recommended version and says so. It pins the repository's
+`models pull` with no quant picks the recommended version and says so. It pins the repository's
 current commit and prints the model ID. If that version is already on this computer, only the
 drafter downloads. A version Magnitude can't run is refused with the reason; one that needs more
 memory than this computer can provide is refused unless you pass `--force`. A gated repository
@@ -60,7 +63,7 @@ Within one source, methods go DFlash2, DSpark, DFlash, a separate MTP file, then
 and ties go to the smaller download. Magnitude never searches Hugging Face for drafters. A drafter
 you name is checked like the others but is never chosen automatically.
 
-`--drafter` on `catalog pull`, and `models drafter <model-id> <drafter>`, take:
+`--drafter` on `models pull`, and `models drafter <model-id> <drafter>`, take:
 
 - `auto`: the preselected drafter (the default);
 - `none`: no drafter;
@@ -71,19 +74,21 @@ you name is checked like the others but is never chosen automatically.
 
 A drafter the engine rejects for the model is refused with the reason. One whose lineage doesn't
 match is allowed and marked untested. Catalog models keep the drafter Magnitude ships with them, so
-`models drafter` refuses them. `models status <model-id>` shows the drafter in use and every choice
+`models drafter` refuses them. `models show <model-id>` shows the drafter in use and every choice
 with its label, its verdict, and the argument that selects it. A found or added model whose
 recommended drafter isn't on this computer shows "Faster with a drafter · Add"; `models drafter
 <model-id> auto` downloads only the drafter. A drafter whose bytes are already in any location, another
 app's included, is used where it is and never downloaded. When a catalog drafter gets a new revision,
-`models status` shows Update for every model using it; `catalog pull <model-id>` downloads it.
+`models list` shows Update for every model using it; `models pull <model-id>` downloads it.
 
 ## What's on this computer
 
-`models status` lists catalog models on this computer and every custom model with its source, then
-counts the models that can't run in Magnitude and hidden models. `--all` lists both: models that
+`models list` lists catalog models on this computer and every custom model with its quant, size,
+estimated speed, served context (marked when below the model's own), source (Magnitude, HF cache,
+LM Studio, llama.cpp, Ollama, or folder) and status, then counts the models that can't run in
+Magnitude and hidden models, and ends with the assessment progress. `--all` lists both: models that
 can't run with a plain reason, such as "No kernels for the deepseek4 architecture" or "Uses IQ1_M
-weights, which Magnitude doesn't support yet", and hidden models marked `Hidden`. `models status <model-id>`
+weights, which Magnitude doesn't support yet", and hidden models marked `Hidden`. `models show <model-id>`
 of a model that can't run shows where it is and why. `models unhide` shows a hidden model again.
 
 `models folders list` shows the automatic locations and your own folders, each directory with its

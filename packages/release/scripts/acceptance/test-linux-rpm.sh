@@ -44,7 +44,7 @@ if sudo -n dnf -y upgrade "$next_rpm" > "$test_root/refused-upgrade.log" 2>&1; t
   echo 'Upgrade unexpectedly succeeded while serving.' >&2; exit 1
 fi
 test "$(rpm -q magnitude-desktop)" = "$base_identity"
-/usr/bin/magnitude models status
+/usr/bin/magnitude models list
 stop_server
 sudo -n dnf -y upgrade "$next_rpm" > "$test_root/upgrade.log" 2>&1
 test "$(rpm -q magnitude-desktop)" != "$base_identity"
@@ -53,7 +53,7 @@ if sudo -n dnf -y remove magnitude-desktop > "$test_root/refused-removal.log" 2>
   echo 'Removal unexpectedly succeeded while serving.' >&2; exit 1
 fi
 test -f /var/lib/magnitude-desktop/installing
-/usr/bin/magnitude models status
+/usr/bin/magnitude models list
 stop_server
 if /usr/bin/magnitude serve > "$test_root/repair-guidance.log" 2>&1; then
   echo 'Startup unexpectedly succeeded after interrupted package removal.' >&2; exit 1

@@ -1,6 +1,6 @@
 # Model recommendations
 
-`magnitude catalog recommendations` lists the models Magnitude has tested, in the order it
+`magnitude models recommend` lists the models Magnitude has tested, in the order it
 recommends them for this computer. Each tested model has a ladder of quants, smallest to largest,
 and each recommendation names the quant chosen for this computer: the largest one that fits in
 memory, has room on disk and is estimated to decode at 20 tokens per second or more in a long agent
@@ -13,13 +13,19 @@ a starting point for choosing with the user, not a claim that one model is best 
 
 ## What the displayed properties tell you
 
-- **Speed** is Magnitude's estimate of generation throughput on this computer. The displayed range
-  shows how performance may change between shorter and longer contexts; it is not a confidence
-  interval. It is a hardware-aware prediction rather than a benchmark run of the downloaded model,
-  and real speed can vary with workload and system activity.
-- **Memory** is the estimated memory needed while the model is running, not its download size. A
-  model that normally fits can still need other memory-intensive applications to be closed before
-  it loads.
+- **Quant** names the chosen quant by bit width, publisher and quant name, such as
+  "4-bit unsloth UD-Q4_K_XL". Fewer bits mean a smaller, faster model that preserves the source
+  model less faithfully.
+- **Size** is the quant's download size.
+- **Speed** is Magnitude's estimate of decode throughput on this computer in a long agent
+  conversation, or at the served context when that is shorter. It is a hardware-aware prediction
+  rather than a benchmark run of the downloaded model, and real speed can vary with workload and
+  system activity. `magnitude models show <model-id>` gives the estimate at each assessed context
+  depth.
+- **Placement** says how the quant runs here: whole in GPU or unified memory, or with its experts
+  streamed from host RAM or from disk. `magnitude models show <model-id>` gives the bytes on the
+  device, in host RAM and read from disk. A model that normally fits can still need other
+  memory-intensive applications to be closed before it loads.
 - **Context** is the longest conversation this computer serves the model at. It is the model's own
   context when that fits in memory, and otherwise the largest power of two below it, down to 32K, that
   does, shown as "64K of 256K". Below 32K a model is reported as not fitting, since a coding agent's
@@ -30,24 +36,22 @@ a starting point for choosing with the user, not a claim that one model is best 
   it with a percent sign, but it is an index score—not a probability or the percentage of questions
   the model answers correctly. Quantized variants of the same source model generally share this
   model-level score.
-- **Fidelity** describes how faithfully the local artifact is expected to preserve the source model
-  after quantization, from its quant's bit width. It does not mean factual accuracy and is separate
-  from Intelligence.
-- **Quants** lists the model's tested ladder by quant name, smallest to largest.
+- **Quants** is the model's tested ladder, smallest to largest, each rung with its size, speed,
+  context, placement and model ID; `*` marks the chosen one.
 - **Acceleration** identifies the speculative-decoding method Magnitude has prepared for that
   configuration. See `magnitude docs speculative-methods` for what `None`, `MTP`, `DFlash`,
   `DSpark`, and `LiLiCorr` mean and how Magnitude sets them up.
 - **Capabilities** identify supported features such as vision, tool use, structured output, and
   reasoning. These can matter more than a small speed or intelligence difference when the user has
   a specific task in mind.
-- **ID** is the exact configuration identifier required by later commands. Preserve it exactly;
+- **Model ID** is the exact configuration identifier required by later commands. Preserve it exactly;
   the friendly model name is not a command argument.
 
 Use these signals together. A faster model may feel better for quick iteration, while a more
-intelligent model may be worth waiting for on difficult coding or reasoning tasks. Memory and
-context determine whether the model is practical on this computer, artifact fidelity indicates how
-much quality the local format may give up, and capabilities determine whether it can do the job at
-all.
+intelligent model may be worth waiting for on difficult coding or reasoning tasks. Placement and
+context determine whether the model is practical on this computer, the quant's bit width indicates
+how much quality the local format may give up, and capabilities determine whether it can do the job
+at all.
 
 ## Artificial Analysis intelligence and reference points
 

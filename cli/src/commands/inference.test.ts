@@ -8,6 +8,8 @@ import {
   LocalInferenceDeviceIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelVersionNotRunnable,
+  CountryCodeSchema,
+  LabIdSchema,
   type CustomLocalModel,
   type ModelCatalogState,
 } from "@magnitudedev/sdk"
@@ -29,6 +31,7 @@ import {
   makeInspection,
   makeInstalledCatalogModel,
   makeLocations,
+  makePreparation,
   makeSearchResponse,
   makeUnsupportedLocalModel,
   makeUnsupportedSearchResult,
@@ -47,28 +50,26 @@ import { describeLocalHardware } from "./inference-format"
 import {
   addModelFolder,
   cancelDownload,
-  catalogStatusJson,
+  familiesJson,
   hardwareJson,
   hideModel,
-  inspectCandidate,
   inspectionJson,
+  listModels,
   loadInstance,
   modelDetailJson,
-  modelsStatusJson,
+  modelsListJson,
   pullJson,
   pullModel,
   removeModel,
   removeModelFolder,
-  renderCatalog,
-  renderCatalogDetail,
-  renderCatalogStatus,
+  renderFamilies,
   renderInspection,
+  renderPreparation,
   downloadSizeLine,
   execute,
   renderModelDetail,
   parseAutomaticLocation,
   renderModelLocations,
-  renderModelsStatus,
   renderPull,
   renderRecommendations,
   renderSearch,
@@ -77,22 +78,23 @@ import {
   searchHuggingFace,
   searchJson,
   setModelDrafter,
-  showCatalogModel,
-  showModelsStatus,
+  showModel,
   showRecommendations,
   unhideModel,
   versionVerdict,
   ModelLocationsJsonSchema,
-  modelsStatusResultJson,
-  catalogDetailJson,
-  catalogListJson,
+  modelDetailResultJson,
+  modelsListResultJson,
   recommendationsJson,
   pull,
-  readModelsStatus,
+  readModelDetail,
+  readModelsList,
   readSearch,
-  renderModelsStatusResult,
+  renderModelDetailResult,
+  renderModelsList,
+  renderModelsListResult,
   setDrafter,
-  type ModelsStatusView,
+  type ModelsListView,
 } from "./inference-runtime"
 
 afterEach(() => {
@@ -120,11 +122,13 @@ const inspected = (inspection: unknown) => () =>
 
 const run = <A>(effect: Effect.Effect<A, unknown>) => Effect.runPromise(Effect.either(effect))
 
-const statusView = (overrides: Partial<ModelsStatusView> = {}): ModelsStatusView => ({
+const statusView = (overrides: Partial<ModelsListView> = {}): ModelsListView => ({
   models: [],
   unsupported: [],
   hidden: [],
   all: false,
+  preparation: makePreparation(),
+  warnings: [],
   ...overrides,
 })
 
@@ -142,8 +146,8 @@ describe("inference argument validation", () => {
   it.each([
     [() => showRecommendations("USA", "10"), "Country must be a two-letter ISO 3166-1 code, such as US"],
     [() => showRecommendations(undefined, "0"), "Limit must be a positive integer"],
-    [() => showCatalogModel(""), "Invalid catalog model ID: "],
-    [() => showCatalogModel("hf:test/model/model.gguf"), "Invalid catalog model ID: hf:test/model/model.gguf"],
+    [() => showModel(""), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: "],
+    [() => showModel("not a model"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: not a model"],
     [() => pullModel(""), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: "],
     [() => pullModel("not a model"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: not a model"],
     [() => pullModel("https://example.com/owner/repo"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: https://example.com/owner/repo"],
@@ -151,15 +155,13 @@ describe("inference argument validation", () => {
     [() => pullModel("owner/repo", { drafter: " " }), "Drafter must be auto, none, built-in, a model ID, a Hugging Face reference, or a GGUF path"],
     [() => cancelDownload(""), "Invalid model ID: "],
     [() => removeModel("nonsense"), "Invalid model ID: nonsense"],
-    [() => showModelsStatus(""), "Invalid model ID: "],
     [() => loadInstance("local:not-a-digest"), "Invalid model ID: local:not-a-digest"],
     [() => searchHuggingFace("  "), "Search query must not be empty"],
     [() => searchHuggingFace("qwen", { limit: "101" }), "Limit must be an integer from 1 to 100"],
     [() => searchHuggingFace("qwen", { limit: "0" }), "Limit must be an integer from 1 to 100"],
-    [() => inspectCandidate(" "), "Expected a Hugging Face link or owner/repo[:QUANT]"],
-    [() => inspectCandidate("/models/qwen.gguf"), "Expected a Hugging Face link or owner/repo[:QUANT]"],
+    [() => showModel("/models/qwen.gguf"), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: /models/qwen.gguf"],
     [() => setModelDrafter("test:gguf:q4", "auto"),
-      "test:gguf:q4 is a catalog model. Catalog models keep the drafter Magnitude ships with them; it changes only when you update with `magnitude catalog pull test:gguf:q4`."],
+      "test:gguf:q4 is a catalog model. Catalog models keep the drafter Magnitude ships with them; it changes only when you update with `magnitude models pull test:gguf:q4`."],
     [() => setModelDrafter("garbage", "auto"), "Invalid model ID: garbage"],
     [() => hideModel("nope"), "Invalid model ID: nope"],
     [() => unhideModel("nope"), "Invalid model ID: nope"],
@@ -174,22 +176,20 @@ describe("inference argument validation", () => {
 })
 
 describe("inference command surface", () => {
-  it("exposes finding and downloading under catalog and this computer under models", () => {
+  it("puts finding, downloading, and running models under models", () => {
     const root = program()
-    expect(root.commands.map((command) => command.name())).toEqual(["hardware", "catalog", "models"])
-    expect(root.commands[1]!.commands.map((command) => command.name())).toEqual([
-      "status", "list", "show", "recommendations", "search", "inspect", "pull", "cancel", "remove",
+    expect(root.commands.map((command) => command.name())).toEqual(["hardware", "models"])
+    const models = root.commands[1]!
+    expect(models.commands.map((command) => command.name())).toEqual([
+      "list", "recommend", "search", "show", "pull", "cancel", "load", "stop", "rm", "drafter", "hide", "unhide", "folders", "families",
     ])
-    expect(root.commands[2]!.commands.map((command) => command.name())).toEqual([
-      "status", "load", "stop", "drafter", "hide", "unhide", "folders",
-    ])
-    expect(root.commands[2]!.commands[6]!.commands.map((command) => command.name())).toEqual(["list", "add", "remove", "enable", "disable"])
-    expect(root.commands[2]!.commands[2]!.registeredArguments.map((argument) => argument.required)).toEqual([false])
+    expect(models.commands[12]!.commands.map((command) => command.name())).toEqual(["list", "add", "remove", "enable", "disable"])
+    expect(models.commands[7]!.registeredArguments.map((argument) => argument.required)).toEqual([false])
   })
 
   it("accepts --json on every inference command", () => {
     const leaves = leafCommands(program())
-    expect(leaves.length).toBe(21)
+    expect(leaves.length).toBe(19)
     for (const command of leaves) {
       expect(command.options.map(({ long }) => long), command.name()).toContain("--json")
     }
@@ -205,18 +205,15 @@ describe("inference command surface", () => {
     ]))
     expect(shape).toEqual({
       "magnitude hardware": { arguments: [], options: [] },
-      "catalog status": { arguments: [], options: [] },
-      "catalog list": { arguments: [], options: [] },
-      "catalog show": { arguments: ["<model-id>"], options: [] },
-      "catalog recommendations": { arguments: [], options: ["--country", "--limit"] },
-      "catalog search": { arguments: ["<query>"], options: ["--limit"] },
-      "catalog inspect": { arguments: ["<reference>"], options: [] },
-      "catalog pull": { arguments: ["<model>"], options: ["--drafter", "--force", "--only"] },
-      "catalog cancel": { arguments: ["<model-id>"], options: [] },
-      "catalog remove": { arguments: ["<model-id>"], options: [] },
-      "models status": { arguments: ["[model-id]"], options: ["--all"] },
+      "models list": { arguments: [], options: ["--all"] },
+      "models recommend": { arguments: [], options: ["--country", "--limit"] },
+      "models search": { arguments: ["<query>"], options: ["--limit"] },
+      "models show": { arguments: ["<model>"], options: [] },
+      "models pull": { arguments: ["<model>"], options: ["--drafter", "--force", "--only"] },
+      "models cancel": { arguments: ["<model-id>"], options: [] },
       "models load": { arguments: ["<model-id>"], options: [] },
       "models stop": { arguments: ["[model-id]"], options: [] },
+      "models rm": { arguments: ["<model-id>"], options: [] },
       "models drafter": { arguments: ["<model-id>", "<drafter>"], options: [] },
       "models hide": { arguments: ["<model-id>"], options: [] },
       "models unhide": { arguments: ["<model-id>"], options: [] },
@@ -225,6 +222,7 @@ describe("inference command surface", () => {
       "folders remove": { arguments: ["<path>"], options: [] },
       "folders enable": { arguments: ["<location>"], options: [] },
       "folders disable": { arguments: ["<location>"], options: [] },
+      "models families": { arguments: [], options: [] },
     })
   })
 
@@ -237,9 +235,10 @@ describe("inference command surface", () => {
   })
 
   it.each([
-    [["catalog", "search"]],
-    [["catalog", "inspect"]],
-    [["catalog", "pull"]],
+    [["models", "search"]],
+    [["models", "show"]],
+    [["models", "pull"]],
+    [["models", "rm"]],
     [["models", "drafter", "hf:a/b/c.gguf"]],
     [["models", "hide"]],
     [["models", "unhide"]],
@@ -252,7 +251,7 @@ describe("inference command surface", () => {
   })
 
   it.each([
-    [["catalog", "search", "qwen", "--quant", "Q4"]],
+    [["models", "search", "qwen", "--quant", "Q4"]],
     [["models", "folders", "list", "--all"]],
     [["models", "stop", "--force"]],
   ])("rejects unknown options: %j", async (args) => {
@@ -260,35 +259,50 @@ describe("inference command surface", () => {
   })
 })
 
-describe("catalog renderers", () => {
+describe("recommendations, families, and assessment progress", () => {
   it("renders assessment progress", () => {
-    const active: ModelCatalogState = {
-      ...catalogState(),
-      localModelPreparation: {
-        discovery: { complete: true, modelsFound: 4 },
-        assessment: { complete: false, settledModels: 3, totalModels: 4 },
-      },
-    }
-    expect(renderCatalogStatus(active)).toBe("Model catalog preparation\nAssessment: In progress - 3 of 4 models assessed\n")
-    expect(renderCatalogStatus({ _tag: "Initializing" })).toBe("Model catalog preparation\nAssessment: In progress\n")
+    expect(renderPreparation(makePreparation(3, 4))).toBe("Assessment: In progress - 3 of 4 models assessed")
+    expect(renderPreparation(makePreparation(4, 4))).toBe("Assessment: Complete - 4 of 4 models assessed")
   })
 
-  it("renders only fitting catalog evidence and exact model IDs", () => {
+  it("says recommendations may change while catalog models are still assessed", () => {
     const model = makeCatalogModel()
-    const output = renderCatalog(catalogState([model, makeFoundModel()]))
-    expect(output).toContain("Local model catalog - 1 compatible model")
-    expect(output).toContain(model.modelId)
-    expect(output).not.toContain(FOUND_MODEL_ID)
-    expect(output).not.toContain("assessmentId")
-  })
-
-  it("summarizes outstanding and failed assessment without placeholder rows", () => {
     const assessing = makeCatalogModel({
       modelId: CatalogFormModelIdSchema.make("assessing:gguf:q4"),
       servingState: { _tag: "Assessing", profile: { contextLength: 32_768 } },
     })
-    expect(renderCatalog(catalogState([makeCatalogModel(), assessing]))).toContain("Assessing 1 additional catalog model; this list may grow.")
-    expect(renderCatalog(catalogState())).toBe("No catalog models are compatible with this computer.\n")
+    const models = [model, assessing]
+    expect(renderRecommendations({ catalog: catalogState(models), models, hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel) }))
+      .toContain("Assessing 1 additional catalog model; recommendations may change.")
+  })
+
+  it("shows each recommendation's chosen quant with its speed, context and placement, and its ladder", () => {
+    const model = makeCatalogModel()
+    const lines = renderRecommendations({ catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none(), recommended: [model].map(recommendedModel) }).split("\n")
+    expect(lines.slice(3, 9)).toEqual([
+      "1. Qwen Test (Q4) - Alibaba (CN) - Intelligence 75%",
+      "   4-bit unsloth UD-Q4_K_XL - 17.2 GB - ~24 tok/s - 32K context - Fits in GPU",
+      "   Model ID: qwen-test:gguf:q4",
+      "   Acceleration DFlash - tools, structured output",
+      "   QUANT                       SIZE     SPEED      CONTEXT  PLACEMENT    MODEL ID",
+      "   4-bit unsloth UD-Q4_K_XL *  17.2 GB  ~24 tok/s  32K      Fits in GPU  qwen-test:gguf:q4",
+    ])
+  })
+
+  it("lists the families Magnitude runs", () => {
+    const families = [
+      { name: "Qwen", developer: { lab: LabIdSchema.make("qwen"), name: "Alibaba", country: CountryCodeSchema.make("CN") }, architectures: ["qwen3", "qwen3moe"] as const, status: "Supported" as const },
+      { name: "DeepSeek", developer: { lab: LabIdSchema.make("deepseek"), name: "DeepSeek", country: CountryCodeSchema.make("CN") }, architectures: ["deepseek4"] as const, status: "ComingSoon" as const },
+    ]
+    expect(renderFamilies(families)).toBe([
+      "Model families Magnitude runs; their fine-tunes run too",
+      "",
+      "FAMILY    DEVELOPER  COUNTRY  ARCHITECTURES    STATUS",
+      "Qwen      Alibaba    CN       qwen3, qwen3moe  Supported",
+      "DeepSeek  DeepSeek   CN       deepseek4        Coming soon",
+      "",
+    ].join("\n"))
+    expect(Effect.runSync(familiesJson.encode(families))).toMatchObject({ families: [{ name: "Qwen", status: "Supported" }, { name: "DeepSeek" }] })
   })
 
   it("ends recommendations with the methodology and Hugging Face hints", () => {
@@ -296,8 +310,8 @@ describe("catalog renderers", () => {
     const view = { catalog: catalogState([model]), models: [model], hardware: makeHardware(), developerCountry: Option.none() }
     const lines = renderRecommendations({ ...view, recommended: [model].map(recommendedModel) }).trimEnd().split("\n")
     expect(lines.at(-2)).toBe("Learn more: magnitude docs recommendations")
-    expect(lines.at(-1)).toBe("Looking for a specific version, finetune, or uncensored model? magnitude catalog search \"<model name>\"")
-    expect(renderRecommendations({ ...view, recommended: [] }).trimEnd().split("\n").at(-1)).toContain("magnitude catalog search")
+    expect(lines.at(-1)).toBe("Looking for a specific version, finetune, or uncensored model? magnitude models search \"<model name>\"")
+    expect(renderRecommendations({ ...view, recommended: [] }).trimEnd().split("\n").at(-1)).toContain("magnitude models search")
   })
 
   it("heads recommendations with the machine, and lists the device in use before available ones", () => {
@@ -316,7 +330,7 @@ describe("catalog renderers", () => {
     ])
   })
 
-  it("breaks a fitting model's memory into weights, context and overhead in catalog and model details", () => {
+  it("breaks a fitting model's memory into weights, context and overhead in model details", () => {
     const GB = 1_000_000_000
     const fitting = (served: number) => {
       const model = makeCatalogModel()
@@ -332,79 +346,111 @@ describe("catalog renderers", () => {
     }
     const full = fitting(1_048_576)
     const line = /Breakdown +Weights 36 GB · 1M context 7\.1 GB · Overhead 2\.3 GB\n/
-    expect(renderCatalogDetail({ model: full, models: [full] })).toMatch(line)
-    expect(renderModelDetail({ model: full, models: [full], hardware: Option.none(), drafters: { _tag: "NotApplicable" }, hidden: false })).toMatch(line)
+    expect(renderModelDetail({ model: full, models: [full], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false })).toMatch(line)
     const reduced = fitting(262_144)
-    expect(renderCatalogDetail({ model: reduced, models: [reduced] })).toContain("256K context 7.1 GB · Overhead 2.3 GB (full 1M doesn’t fit)")
+    expect(renderModelDetail({ model: reduced, models: [reduced], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false }))
+      .toContain("256K context 7.1 GB · Overhead 2.3 GB (full 1M doesn’t fit)")
+  })
+
+  it("shows every quant of a catalog model, and where the chosen one's bytes are and its speed at each depth", () => {
+    const small = makeCatalogModel()
+    const large = makeCatalogModel({ modelId: CatalogFormModelIdSchema.make("qwen-test:gguf:q8"), storageBytes: small.storageBytes * 2 })
+    const lines = renderModelDetail({ model: small, models: [small, large], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false }).split("\n")
+    const placement = lines.indexOf("Placement - Fits in GPU")
+    expect(lines.slice(placement, placement + 9)).toEqual([
+      "Placement - Fits in GPU",
+      "  GPU memory      19.3 GB",
+      "  Host RAM        2.1 GB",
+      "  Read from disk  0 MB",
+      "",
+      "Estimated decode speed",
+      "  25K context           ~28 tok/s",
+      "  32K context (served)  ~24 tok/s",
+      "",
+    ])
+    const quants = lines.indexOf("Quants")
+    expect(lines[quants + 1]).toMatch(/^QUANT\s+SIZE\s+SPEED\s+CONTEXT\s+PLACEMENT\s+MODEL ID$/)
+    expect(lines[quants + 2]).toMatch(/^4-bit unsloth UD-Q4_K_XL \*\s+17\.2 GB\s+~24 tok\/s\s+32K\s+Fits in GPU\s+qwen-test:gguf:q4$/)
+    expect(lines[quants + 3]).toMatch(/qwen-test:gguf:q8$/)
   })
 
   it("prints the search command for other versions in catalog details", () => {
     const model = makeCatalogModel()
-    expect(renderCatalogDetail({ model, models: [model] }).trimEnd().split("\n").at(-1))
-      .toBe("Other versions: magnitude catalog search \"Qwen Test\"")
+    expect(renderModelDetail({ model, models: [model], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false }).trimEnd().split("\n").at(-1))
+      .toBe("Other versions: magnitude models search \"Qwen Test\"")
   })
 })
 
 describe("Hugging Face search", () => {
-  it("lists repositories with the catalog model each is a variant of", () => {
-    const output = renderSearch({ query: "qwen test", response: makeSearchResponse(), models: [makeCatalogModel()] })
+  it("lists repositories with their base model and how their recommended quant runs here", () => {
+    const output = renderSearch({ query: "qwen test", response: makeSearchResponse(), unifiedMemory: false })
     expect(output).toBe([
       "Hugging Face models matching \"qwen test\"",
       "",
-      "MODEL                  UPLOADER   VARIANT OF  DOWNLOADS  REPOSITORY",
-      "Qwen Test Uncensored   HauhauCS   Qwen Test   48K        HauhauCS/Qwen-Test-Uncensored-GGUF",
-      "Qwen Test abliterated  huihui-ai  —           912        huihui-ai/Qwen-Test-abliterated-GGUF",
+      "MODEL                  BASE MODEL                   QUANT                  SIZE     SPEED      PLACEMENT    DOWNLOADS  REPOSITORY",
+      "Qwen Test Uncensored   Fine-tune of Qwen/Qwen-Test  4-bit HauhauCS Q4_K_P  23.4 GB  ~24 tok/s  Fits in GPU  48K        HauhauCS/Qwen-Test-Uncensored-GGUF",
+      "Qwen Test abliterated  —                            —                      —        —          —            912        huihui-ai/Qwen-Test-abliterated-GGUF",
       "",
-      "Inspect one: magnitude catalog inspect <repository>",
+      "See every quant: magnitude models show <repository>",
       "",
     ].join("\n"))
   })
 
   it("labels a repository whose files need access on Hugging Face", () => {
     const [first, ...rest] = makeSearchResponse().results
-    const output = renderSearch({ query: "qwen test", response: makeSearchResponse({ results: [{ ...first!, gated: true }, ...rest] }), models: [makeCatalogModel()] })
+    const output = renderSearch({ query: "qwen test", response: makeSearchResponse({ results: [{ ...first!, gated: true }, ...rest] }), unifiedMemory: false })
     expect(output).toContain("Qwen Test Uncensored · Requires access on Hugging Face")
   })
 
   it("lists results of architectures Magnitude doesn't run apart, with why", () => {
     const response = makeSearchResponse({ results: [...makeSearchResponse().results, makeUnsupportedSearchResult()] })
-    const output = renderSearch({ query: "qwen test", response, models: [makeCatalogModel()] })
+    const output = renderSearch({ query: "qwen test", response, unifiedMemory: false })
     expect(output).toContain([
       "Can't run in Magnitude",
       "",
-      "MODEL              REASON                               REPOSITORY",
-      "DeepSeek V4 Flash  Magnitude doesn't run deepseek4 yet  unsloth/DeepSeek-V4-Flash-GGUF",
+      "MODEL              ARCHITECTURE  REASON                               REPOSITORY",
+      "DeepSeek V4 Flash  deepseek4     Magnitude doesn't run deepseek4 yet  unsloth/DeepSeek-V4-Flash-GGUF",
     ].join("\n"))
     expect(output.split("Can't run in Magnitude")[0]).not.toContain("DeepSeek")
-    const only = renderSearch({ query: "deepseek", response: makeSearchResponse({ results: [makeUnsupportedSearchResult()] }), models: [] })
+    const only = renderSearch({ query: "deepseek", response: makeSearchResponse({ results: [makeUnsupportedSearchResult()] }), unifiedMemory: false })
     expect(only).toContain("No Hugging Face models that run in Magnitude match \"deepseek\".")
-    expect(only).not.toContain("Inspect one")
+    expect(only).not.toContain("See every quant")
   })
 })
 
 describe("candidate inspection", () => {
   it("prints the repository step with verdicts, drafters, and the download command", () => {
-    const output = renderInspection({ inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [makeCatalogModel()] })
+    const output = renderInspection({ inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [makeCatalogModel()], unifiedMemory: false })
     const lines = output.split("\n")
-    expect(lines.slice(0, 9)).toEqual([
+    expect(lines.slice(0, 22)).toEqual([
       "Qwen Test Uncensored",
       "Variant of Qwen Test · apache-2.0 · pinned to 4f1c2e9",
       "",
-      "VERSION  SIZE     ON THIS COMPUTER",
-      "Q8_K_P   43.6 GB  Too large",
-      "Q6_K_P   30.6 GB  Fits · already on this computer",
-      "Q4_K_P   23.4 GB  Fits (recommended)",
-      "Q2_K_P   15 GB    Unsupported: Q2_K weights",
+      "VERSION  BITS   SIZE     SPEED        CONTEXT  PLACEMENT    ON THIS COMPUTER",
+      "Q8_K_P   8-bit  43.6 GB  Doesn't fit  —        —            Too large",
+      "Q6_K_P   6-bit  30.6 GB  ~24 tok/s    32K      Fits in GPU  Fits · already on this computer",
+      "Q4_K_P   4-bit  23.4 GB  ~24 tok/s    32K      Fits in GPU  Fits (recommended)",
+      "Q2_K_P   2-bit  15 GB    Can't run    —        —            Unsupported: Q2_K weights",
       "",
+      "How Q4_K_P runs on this computer",
+      "",
+      "Placement - Fits in GPU",
+      "  GPU memory      19.3 GB",
+      "  Host RAM        2.1 GB",
+      "  Read from disk  0 MB",
+      "",
+      "Estimated decode speed",
+      "  25K context           ~28 tok/s",
+      "  32K context (served)  ~24 tok/s",
+      "",
+      expect.stringMatching(/^DRAFTER\s+SIZE\s+VERDICT\s+NOTE\s+USE$/),
+      expect.stringMatching(/^ {2}HauhauCS\/Qwen-Test-Uncensored-GGUF\/dflash\.gguf\s+1\.2 GB\s+Can't be used: Its drafter wasn't built for this model\s+In this repository\s+/),
     ])
-    expect(lines[9]).toMatch(/^DRAFTER\s+SIZE\s+VERDICT\s+NOTE\s+USE$/)
-    expect(lines[10]).toContain("Can't be used: Its drafter wasn't built for this model")
-    expect(lines[10]).toMatch(/^ {2}HauhauCS\/Qwen-Test-Uncensored-GGUF\/dflash\.gguf\s+1\.2 GB\s+Can't be used.*\s+In this repository\s+/)
-    expect(lines[11]).toMatch(/^\* Magnitude DFlash for Qwen Test\s+900 MB\s+Works · DFlash\s+Recommended · Trained for Qwen Test\s+qwen-test:gguf:q4$/)
-    expect(lines[12]).toMatch(/^ {2}MTP heads\s+Included\s+Works · MTP\s+Built into this model\s+built-in$/)
-    expect(lines[13]).toMatch(/^ {2}None\s+—\s+—\s+Run without a drafter\s+none$/)
+    expect(lines[22]).toMatch(/^\* Magnitude DFlash for Qwen Test\s+900 MB\s+Works · DFlash\s+Recommended · Trained for Qwen Test\s+qwen-test:gguf:q4$/)
+    expect(lines[23]).toMatch(/^ {2}MTP heads\s+Included\s+Works · MTP\s+Built into this model\s+built-in$/)
+    expect(lines[24]).toMatch(/^ {2}None\s+—\s+—\s+Run without a drafter\s+none$/)
     expect(lines.at(-3)).toBe("Download size: 24.3 GB (model 23.4 GB + drafter 900 MB)")
-    expect(lines.at(-2)).toBe(`Download: magnitude catalog pull ${TEST_REPOSITORY}:Q4_K_P`)
+    expect(lines.at(-2)).toBe(`Download: magnitude models pull ${TEST_REPOSITORY}:Q4_K_P`)
   })
 
   it("totals the download with the projector and the preselected drafter, omitting what is already here", () => {
@@ -425,9 +471,9 @@ describe("candidate inspection", () => {
 
   it("uses a selected version for the drafter list and hint", () => {
     const inspection = makeInspection({ selectedVersion: Option.some("Q6_K_P") })
-    const output = renderInspection({ inspection, drafters: [], models: [] })
+    const output = renderInspection({ inspection, drafters: [], models: [], unifiedMemory: false })
     expect(output).toContain("Fits (selected) · already on this computer")
-    expect(output.trimEnd().split("\n").at(-1)).toBe(`Download: magnitude catalog pull ${TEST_REPOSITORY}:Q6_K_P`)
+    expect(output.trimEnd().split("\n").at(-1)).toBe(`Download: magnitude models pull ${TEST_REPOSITORY}:Q6_K_P`)
   })
 
   it("explains an unsupported architecture instead of listing versions", () => {
@@ -435,6 +481,7 @@ describe("candidate inspection", () => {
       inspection: makeInspection({ versions: [], unsupportedArchitecture: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]) }),
       drafters: [],
       models: [],
+      unifiedMemory: false,
     })
     expect(output).toContain("Magnitude can't run this model: No kernels for the deepseek4 architecture.")
     expect(output).not.toContain("VERSION")
@@ -445,9 +492,9 @@ describe("candidate inspection", () => {
     const tooLarge = makeInspection({
       versions: makeInspection().versions.map((version) => ({ ...version, recommended: false, assessment: Option.some(doesNotFitAssessment()) })),
     })
-    expect(renderInspection({ inspection: tooLarge, drafters: [], models: [] })).toContain("No version of this model runs on this computer. Every version is too large for this machine.")
+    expect(renderInspection({ inspection: tooLarge, drafters: [], models: [], unifiedMemory: false })).toContain("No version of this model runs on this computer. Every version is too large for this machine.")
     const nothingRuns = makeInspection({ versions: [makeInspection().versions[0]!, makeInspection().versions[3]!] })
-    expect(renderInspection({ inspection: nothingRuns, drafters: [], models: [] })).toContain(
+    expect(renderInspection({ inspection: nothingRuns, drafters: [], models: [], unifiedMemory: false })).toContain(
       "No version of this model runs on this computer. Some versions are too large for this machine, and Magnitude can't run the others: Uses Q2_K weights, which Magnitude doesn't support yet.",
     )
   })
@@ -480,7 +527,7 @@ describe("pull and model mutations", () => {
       `Downloading ${TEST_REPOSITORY}:Q4_K_P (the recommended version).`,
       "Drafter: Magnitude DFlash for Qwen Test",
       `Model ID: ${ADDED_MODEL_ID}`,
-      `Check progress: magnitude models status ${ADDED_MODEL_ID}`,
+      `Check progress: magnitude models show ${ADDED_MODEL_ID}`,
       "",
     ].join("\n"))
   })
@@ -499,11 +546,11 @@ describe("pull and model mutations", () => {
     const modelId = CatalogFormModelIdSchema.make("qwen-test:gguf:q4")
     expect(renderPull({ _tag: "Catalog", modelId, outcome: "AlreadyCurrent" })).toBe(`${modelId} is already installed and up to date.\n`)
     expect(renderPull({ _tag: "Catalog", modelId, outcome: "Installing" }))
-      .toBe(`Downloading ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`)
+      .toBe(`Downloading ${modelId}.\nCheck progress: magnitude models show ${modelId}\n`)
     expect(renderPull({ _tag: "Catalog", modelId, outcome: "Updating" }))
-      .toBe(`Updating ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`)
+      .toBe(`Updating ${modelId}.\nCheck progress: magnitude models show ${modelId}\n`)
     expect(renderPull({ _tag: "Custom", modelId: ADDED_MODEL_ID, outcome: "Installing" }))
-      .toBe(`Downloading ${ADDED_MODEL_ID}.\nCheck progress: magnitude models status ${ADDED_MODEL_ID}\n`)
+      .toBe(`Downloading ${ADDED_MODEL_ID}.\nCheck progress: magnitude models show ${ADDED_MODEL_ID}\n`)
     expect(renderPull({ _tag: "Custom", modelId: ADDED_MODEL_ID, outcome: "DownloadingDrafter" }))
       .toContain(`Downloading the drafter for ${ADDED_MODEL_ID}.`)
     expect(renderPull({ _tag: "Custom", modelId: ADDED_MODEL_ID, outcome: "AlreadyCurrent" })).toBe(`${ADDED_MODEL_ID} is up to date.\n`)
@@ -521,7 +568,7 @@ describe("pull and model mutations", () => {
     expect(renderRemoval(ADDED_MODEL_ID, Option.some("delete")))
       .toContain("Magnitude deleted only its own copy")
     expect(renderSetDrafter({ modelId, drafter: Option.some(makeDrafterCandidate()), drafterDownloadStarted: true }))
-      .toContain(`Downloading the drafter.\nCheck progress: magnitude models status ${modelId}`)
+      .toContain(`Downloading the drafter.\nCheck progress: magnitude models show ${modelId}`)
     const onDisk = renderSetDrafter({ modelId, drafter: Option.some(makeDrafterCandidate({ onThisComputer: false })), drafterDownloadStarted: false })
     expect(onDisk).toBe(`Drafter for ${modelId}: ${makeDrafterCandidate().name}.\n`)
     expect(onDisk).not.toContain("Downloading")
@@ -556,7 +603,7 @@ describe("pull and model mutations", () => {
     })
     const refused = await run(pull(tooLarge.client, reference, pullReference(reference), drafterArgument("auto")))
     expect(refused._tag === "Left" && (refused.left as { message: string }).message).toBe(
-      `Q8_0 needs 6.5 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${reference} --force`,
+      `Q8_0 needs 6.5 GB more memory than this computer can provide. Download it anyway with: magnitude models pull ${reference} --force`,
     )
     const unsupported = fakeClient({
       addHuggingFaceModel: () => Effect.fail(new ModelVersionNotRunnable({
@@ -569,7 +616,7 @@ describe("pull and model mutations", () => {
       .toBe("Magnitude can't run Q2_K: Uses Q2_K weights, which Magnitude doesn't support yet.")
   })
 
-  it("keeps catalog pull on the catalog sync", async () => {
+  it("keeps models pull of a catalog model on the catalog sync", async () => {
     const { client, models } = fakeClient({ syncLocalModel: () => Effect.succeed({ outcome: "Installing" }) })
     const result = await run(pull(client, "qwen-test:gguf:q4", pullReference("qwen-test:gguf:q4"), drafterArgument("auto")))
     expect(models.syncLocalModel).toHaveBeenCalledWith({ modelId: "qwen-test:gguf:q4" })
@@ -680,13 +727,13 @@ describe("pull and model mutations", () => {
   })
 })
 
-describe("model status", () => {
+describe("models list and show", () => {
   it("keeps acquisition and residency in model status", () => {
     const downloading = makeAcquiringModel({
       _tag: "Installing",
       progress: { stage: "downloading", completedBytes: 50, totalBytes: 100, bytesPerSecond: Option.none() },
     })
-    const output = renderModelsStatus(statusView({ models: [downloading, makeInstalledCatalogModel({ modelId: CatalogFormModelIdSchema.make("other:gguf:q8") })] }))
+    const output = renderModelsList(statusView({ models: [downloading, makeInstalledCatalogModel({ modelId: CatalogFormModelIdSchema.make("other:gguf:q8") })] }))
     expect(output).toContain("Downloading 50%")
     expect(output).toContain("Unloaded")
     expect(output).toContain(downloading.modelId)
@@ -696,41 +743,41 @@ describe("model status", () => {
     const installed = makeInstalledCatalogModel()
     if (installed.servingState._tag !== "Assessed") throw new Error("Expected an assessed fixture")
     const tooLarge = { ...installed, servingState: { ...installed.servingState, assessment: { ...doesNotFitAssessment(), totalRequiredBytes: 11.8e9 } } } as typeof installed
-    const row = renderModelsStatus(statusView({ models: [tooLarge] })).split("\n").find((line) => line.includes(tooLarge.modelId))
-    expect(row).toMatch(/11\.8 GB at 32K\s+—\s+Doesn't fit - needs 8\.6 GB more, even at 32K/)
-    const detail = renderModelDetail({ model: tooLarge, models: [tooLarge], drafters: { _tag: "NotApplicable" }, hidden: false })
+    const row = renderModelsList(statusView({ models: [tooLarge] })).split("\n").find((line) => line.includes(tooLarge.modelId))
+    expect(row).toMatch(/Doesn't fit\s+—\s+Magnitude\s+Doesn't fit - needs 8\.6 GB more, even at 32K/)
+    const detail = renderModelDetail({ model: tooLarge, models: [tooLarge], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false })
     expect(detail).toMatch(/Fit\s+Doesn't fit - needs 8\.6 GB more, even at 32K/)
     expect(detail).toMatch(/Memory\s+11\.8 GB at 32K/)
     expect(detail).not.toMatch(/Context\s/)
   })
 
   it("lists every visible custom model with its source and a footer for what can't run", () => {
-    const output = renderModelsStatus(statusView({
+    const output = renderModelsList(statusView({
       models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), makeFolderModel()],
       unsupported: [makeUnsupportedLocalModel(), makeUnsupportedLocalModel({ displayName: "Other" })],
       hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })],
     }))
-    expect(output).toMatch(/MODEL\s+SOURCE\s+VARIANT OF\s+DRAFTER\s+MEMORY\s+CONTEXT\s+STATUS\s+MODEL ID/)
+    expect(output).toMatch(/MODEL\s+QUANT\s+SIZE\s+SPEED\s+CONTEXT\s+SOURCE\s+STATUS\s+MODEL ID/)
     expect(output).not.toMatch(/qwen-test:gguf:q4$/m)
-    expect(output).toContain("Qwen Test (qwen-test:gguf:q4)")
-    expect(output).toContain("Hugging Face cache")
-    expect(output.split("\n").find((line) => line.includes(makeFolderModel().modelId))).toMatch(/\smodels\s/)
+    expect(output).toContain("HF cache")
+    expect(output.split("\n").find((line) => line.includes(makeFolderModel().modelId))).toMatch(/\sfolder\s/)
     expect(output).toContain("Unavailable - The file was moved or deleted")
     expect(output).not.toContain("hf:a/b/c.gguf")
-    expect(output.trimEnd().split("\n").slice(-3)).toEqual([
+    expect(output.trimEnd().split("\n").slice(-4)).toEqual([
       "2 other models on this computer can't run in Magnitude.",
       "1 hidden model.",
-      "List them: magnitude models status --all",
+      "List them: magnitude models list --all",
+      "Assessment: Complete - 1 of 1 model assessed",
     ])
   })
 
   it("reports a projector a found catalog target lacks as image input, never as an update, with the command that downloads only it", () => {
     const lacking = makeInstalledCatalogModel({ missingComponents: [{ component: "Projector", downloadBytes: 1_034_945_421 }] })
-    const command = `magnitude catalog pull ${lacking.modelId} --only projector`
-    const list = renderModelsStatus(statusView({ models: [lacking] }))
+    const command = `magnitude models pull ${lacking.modelId} --only projector`
+    const list = renderModelsList(statusView({ models: [lacking] }))
     expect(list).not.toContain("Update available")
     expect(list).toContain(`Image input for Qwen Test (Q4) isn't downloaded (1.03 GB): ${command}`)
-    const detail = renderModelDetail({ model: lacking, models: [lacking], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
+    const detail = renderModelDetail({ model: lacking, models: [lacking], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(detail).toMatch(new RegExp(`Image input\\s+Not downloaded \\(1\\.03 GB\\) - ${command}`))
     expect(detail).toMatch(/Installation\s+Installed/)
     expect(detail).not.toMatch(/Update\s+Available/)
@@ -738,12 +785,12 @@ describe("model status", () => {
       missingComponents: lacking.missingComponents,
       acquisitionState: { ...lacking.acquisitionState, _tag: "Optimizing", progress: { stage: "preparing", completed: 0, total: 0, device: Option.none() } } as never,
     })
-    expect(renderModelDetail({ model: downloading, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })).not.toContain("Image input")
+    expect(renderModelDetail({ model: downloading, models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false })).not.toContain("Image input")
   })
 
   it("lists unsupported models with reasons and hidden models under --all", () => {
     const hiddenId = CustomFormModelIdSchema.make("hf:a/b/c.gguf")
-    const output = renderModelsStatus(statusView({
+    const output = renderModelsList(statusView({
       models: [makeFoundModel()],
       unsupported: [makeUnsupportedLocalModel()],
       hidden: [makeFoundModel({ modelId: hiddenId })],
@@ -757,14 +804,14 @@ describe("model status", () => {
 
   it("lists a hidden catalog model found in an external location under --all", () => {
     const hidden = makeInstalledCatalogModel()
-    const output = renderModelsStatus(statusView({ hidden: [hidden], all: true }))
+    const output = renderModelsList(statusView({ hidden: [hidden], all: true }))
     expect(output).toMatch(new RegExp(`Hidden\\s+${hidden.modelId}`))
-    expect(encode(modelsStatusJson, statusView({ hidden: [hidden] }))).toMatchObject({ hidden: [{ modelId: hidden.modelId }] })
+    expect(encode(modelsListJson, statusView({ hidden: [hidden] }))).toMatchObject({ hidden: [{ modelId: hidden.modelId }] })
   })
 
   it("renders explicit empty states", () => {
-    expect(renderModelsStatus(statusView())).toBe("No local models are on this computer.\n")
-    expect(renderModelsStatus(statusView({ unsupported: [makeUnsupportedLocalModel()] })))
+    expect(renderModelsList(statusView())).toBe("No local models are on this computer.\nFind one: magnitude models recommend\n\nAssessment: Complete - 1 of 1 model assessed\n")
+    expect(renderModelsList(statusView({ unsupported: [makeUnsupportedLocalModel()] })))
       .toContain("1 other model on this computer can't run in Magnitude.")
   })
 
@@ -773,7 +820,7 @@ describe("model status", () => {
     const output = renderModelDetail({
       model,
       models: [makeCatalogModel(), model],
-      hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false,
+      hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false,
     })
     expect(output).toContain(`Source        Hugging Face · ${TEST_REPOSITORY}`)
     expect(output).toContain("Variant of    Qwen Test (qwen-test:gguf:q4)")
@@ -801,7 +848,7 @@ describe("model status", () => {
         lineage: "None", verdict, onThisComputer: true, method: Option.some({ _tag: "DSpark" }),
       }),
     ]
-    const output = renderModelDetail({ model, models: [model], hardware: Option.none(), drafters: { _tag:"Listed", candidates }, hidden: false })
+    const output = renderModelDetail({ model, models: [model], hardware: makeHardware(), drafters: { _tag:"Listed", candidates }, hidden: false })
     expect(output).toMatch(/^\* hand-dspark\.gguf\s+5 MB, no download\s+Works · DSpark\s+.*\/drafters\/hand-dspark\.gguf$/m)
     expect(output).toMatch(/^ {2}Magnitude DFlash for Qwen Test\s/m)
   })
@@ -810,7 +857,7 @@ describe("model status", () => {
     const output = renderModelDetail({
       model: makeFoundModel(),
       models: [],
-      hardware: Option.none(), drafters: { _tag:"Unavailable", message: "Hugging Face is unreachable" }, hidden: false,
+      hardware: makeHardware(), drafters: { _tag:"Unavailable", message: "Hugging Face is unreachable" }, hidden: false,
     })
     expect(output).toContain("Drafter     None · Faster with a drafter · Add (900 MB)")
     expect(output).toContain("Drafter choices are unavailable: Hugging Face is unreachable")
@@ -827,9 +874,9 @@ describe("model status", () => {
         assessment: unsupportedAssessment("IQ1_M"),
       },
     })
-    const output = renderModelDetail({ model: unsupported, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
+    const output = renderModelDetail({ model: unsupported, models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(output).toContain("Can't run     Uses IQ1_M weights, which Magnitude doesn't support yet")
-    expect(renderModelsStatus(statusView({ models: [unsupported] }))).toContain("Can't run - Uses IQ1_M weights")
+    expect(renderModelsList(statusView({ models: [unsupported] }))).toContain("Can't run - Uses IQ1_M weights")
   })
 
   it("lists the drafter candidates for an addressed custom model", async () => {
@@ -839,11 +886,11 @@ describe("model status", () => {
       getLocalEnvironment: () => Effect.succeed(makeHardware()),
       listDrafterCandidates: () => Effect.succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     })
-    const detail = await run(readModelsStatus(client, Option.some(model.modelId), false))
+    const detail = await run(readModelDetail(client, model.modelId))
     expect(models.listDrafterCandidates).toHaveBeenCalledWith({ target: { _tag: "Model", modelId: model.modelId }, other: Option.none() })
-    expect(detail._tag === "Right" && renderModelsStatusResult(detail.right)).toContain("Built into this model")
-    const list = await run(readModelsStatus(client, Option.none(), true))
-    expect(list._tag === "Right" && renderModelsStatusResult(list.right)).toContain("No kernels for the deepseek4 architecture")
+    expect(detail._tag === "Right" && renderModelDetailResult(detail.right)).toContain("Built into this model")
+    const list = await run(readModelsList(client, true))
+    expect(list._tag === "Right" && renderModelsListResult(list.right)).toContain("No kernels for the deepseek4 architecture")
   })
 
   it("does not list drafter candidates for catalog models and reports unknown IDs", async () => {
@@ -852,10 +899,10 @@ describe("model status", () => {
       getCatalog: () => Effect.succeed(catalogState([catalog])),
       getLocalEnvironment: () => Effect.succeed(makeHardware()),
     })
-    const detail = await run(readModelsStatus(client, Option.some(catalog.modelId), false))
+    const detail = await run(readModelDetail(client, catalog.modelId))
     expect(models.listDrafterCandidates).toBeUndefined()
-    expect(detail._tag === "Right" && renderModelsStatusResult(detail.right)).toContain("Source        Catalog")
-    expect(await run(readModelsStatus(client, Option.some(FOUND_MODEL_ID), false)))
+    expect(detail._tag === "Right" && renderModelDetailResult(detail.right)).toMatch(/Source\s+Magnitude\n/)
+    expect(await run(readModelDetail(client, FOUND_MODEL_ID)))
       .toMatchObject({ _tag: "Left", left: { message: `Unknown model: ${FOUND_MODEL_ID}` } })
   })
 
@@ -869,16 +916,16 @@ describe("model status", () => {
       reasons: [{ _tag: "Architecture", architecture: "qwen3" }],
     })
     const { client, models } = fakeClient({ getCatalog: () => Effect.succeed(catalogState([], [unsupported])) })
-    const detail = await run(readModelsStatus(client, Option.some(FOUND_MODEL_ID), false))
+    const detail = await run(readModelDetail(client, FOUND_MODEL_ID))
     expect(models.listDrafterCandidates).toBeUndefined()
     expect(detail).toMatchObject({ _tag: "Right", right: { _tag: "Unsupported", model: unsupported } })
-    const output = detail._tag === "Right" ? renderModelsStatusResult(detail.right) : ""
+    const output = detail._tag === "Right" ? renderModelDetailResult(detail.right) : ""
     expect(output).toContain("Qwen3 0.6B")
     expect(output).toContain(`Model ID   ${FOUND_MODEL_ID}`)
     expect(output).toContain("Source     Hugging Face cache")
     expect(output).toContain(`File       ${unsupported.path}`)
     expect(output).toContain("Can't run  No kernels for the qwen3 architecture")
-    expect(detail._tag === "Right" && encode(modelsStatusResultJson, detail.right))
+    expect(detail._tag === "Right" && encode(modelDetailResultJson, detail.right))
       .toMatchObject({ unsupportedModel: { modelId: FOUND_MODEL_ID, displayName: "Qwen3 0.6B" } })
   })
 })
@@ -938,7 +985,7 @@ const encode = <A>(document: { readonly encode: (value: A) => Effect.Effect<unkn
 describe("--json output", () => {
 
   it("encodes Option fields as present or absent keys", () => {
-    const search = encode(searchJson, { query: "q", all: false, response: makeSearchResponse(), models: [] })
+    const search = encode(searchJson, { query: "q", response: makeSearchResponse(), unifiedMemory: false })
     const results = search.results as Record<string, unknown>[]
     expect(results[0]).toMatchObject({ repository: TEST_REPOSITORY, variantOf: "qwen-test:gguf:q4", downloads: 48_213 })
     expect(results[1]).not.toHaveProperty("variantOf")
@@ -947,7 +994,7 @@ describe("--json output", () => {
   })
 
   it("includes structured unsupported reasons and drafter verdicts", () => {
-    const document = encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [] })
+    const document = encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [], unifiedMemory: false })
     const versions = (document.inspection as { versions: Record<string, unknown>[] }).versions
     expect(versions[3]!.assessment).toMatchObject({
       _tag: "Unsupported",
@@ -963,21 +1010,21 @@ describe("--json output", () => {
     const inspection = makeInspection({
       versions: [recommended!, { ...recommended!, label: "Q3_K_M", recommended: false, assessment: Option.some(unreadableAssessment()) }],
     })
-    const output = renderInspection({ inspection, drafters: [], models: [] })
+    const output = renderInspection({ inspection, drafters: [], models: [], unifiedMemory: false })
     expect(output).toMatch(/Q3_K_M.*Unsupported: Magnitude can't read this file/)
-    const document = encode(inspectionJson, { inspection, drafters: [], models: [] })
+    const document = encode(inspectionJson, { inspection, drafters: [], models: [], unifiedMemory: false })
     const unreadable = (document.inspection as { versions: Record<string, unknown>[] }).versions[1]!.assessment
     expect(unreadable).toMatchObject({ _tag: "Unsupported", reasons: [{ _tag: "Unreadable" }] })
     expect(unreadable).not.toHaveProperty("profile")
   })
 
   it("encodes status, detail, pull, catalog, and hardware documents", () => {
-    const status = encode(modelsStatusJson, statusView({ models: [makeFoundModel(), makeCatalogModel()], unsupported: [makeUnsupportedLocalModel()] }))
+    const status = encode(modelsListJson, statusView({ models: [makeFoundModel(), makeCatalogModel()], unsupported: [makeUnsupportedLocalModel()] }))
     expect(status.initializing).toBe(false)
     expect((status.models as Record<string, unknown>[]).map(({ modelId }) => modelId)).toEqual([FOUND_MODEL_ID])
     expect((status.unsupported as Record<string, unknown>[])[0]).toMatchObject({ reasons: [{ _tag: "Architecture", architecture: "deepseek4" }] })
 
-    const detail = encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    const detail = encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(detail.drafterCandidates).toHaveLength(3)
     expect(detail).not.toHaveProperty("drafterCandidatesUnavailable")
 
@@ -994,7 +1041,6 @@ describe("--json output", () => {
       added: { _tag: "Custom", modelId: ADDED_MODEL_ID, version: "Q4_K_P", outcome: "Started", drafterDownloadStarted: false },
     })
 
-    expect(encode(catalogStatusJson, { _tag: "Initializing" })).toEqual({})
     const hardware = encode(hardwareJson, { hardware: makeHardware(), models: [makeFoundModel()] })
     expect(hardware).not.toHaveProperty("currentModel")
     expect((hardware.hardware as Record<string, unknown>).processor).toBe("Test CPU")
@@ -1003,7 +1049,7 @@ describe("--json output", () => {
   it("prints one JSON document in place of the text output", async () => {
     const { client } = fakeClient({
       searchHuggingFaceModels: () => Effect.succeed(makeSearchResponse()),
-      getCatalog: () => Effect.succeed(catalogState()),
+      getLocalEnvironment: () => Effect.succeed(makeHardware()),
     })
     const effect = readSearch(client, "qwen", Option.some(5))
     const json = await capture(() => runCommand({ effect, render: renderSearch, json: asJson({ json: true }, searchJson) }))
@@ -1014,11 +1060,11 @@ describe("--json output", () => {
     expect(text.stdout).toContain("Hugging Face models matching \"qwen\"")
   })
 
-  it("encodes models status results for every form", () => {
-    expect(encode(modelsStatusResultJson, { _tag: "Initializing" })).toEqual({ initializing: true, models: [], unsupported: [], hidden: [] })
-    expect(encode(modelsStatusResultJson, { _tag: "List", view: statusView({ models: [makeFoundModel()] }) }))
-      .toMatchObject({ initializing: false, models: [{ _tag: "Custom", modelId: FOUND_MODEL_ID }] })
-    expect(encode(modelsStatusResultJson, { _tag: "Detail", view: { model: makeFoundModel(), models: [], hardware: Option.none(), drafters: { _tag:"Unavailable", message: "offline" }, hidden: false } }))
+  it("encodes models list and show results for every form", () => {
+    expect(encode(modelsListResultJson, { _tag: "Initializing" })).toEqual({ initializing: true, models: [], unsupported: [], hidden: [], warnings: [] })
+    expect(encode(modelsListResultJson, { _tag: "List", view: statusView({ models: [makeFoundModel()] }) }))
+      .toMatchObject({ initializing: false, preparation: { assessment: { complete: true } }, models: [{ _tag: "Custom", modelId: FOUND_MODEL_ID }] })
+    expect(encode(modelDetailResultJson, { _tag: "Detail", view: { model: makeFoundModel(), models: [], hardware: makeHardware(), drafters: { _tag:"Unavailable", message: "offline" }, hidden: false } }))
       .toMatchObject({ model: { modelId: FOUND_MODEL_ID }, drafterCandidatesUnavailable: "offline" })
   })
 
@@ -1028,7 +1074,7 @@ describe("--json output", () => {
   })
 
   it.each([
-    [() => showModelsStatus("bad", { json: true }), "Invalid model ID: bad"],
+    [() => showModel("bad", { json: true }), "Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: bad"],
     [() => removeModel("nonsense", { json: true }), "Invalid model ID: nonsense"],
     [() => loadInstance("local:not-a-digest", { json: true }), "Invalid model ID: local:not-a-digest"],
     [() => searchHuggingFace("  ", { json: true }), "Search query must not be empty"],
@@ -1071,8 +1117,8 @@ describe("custom model license", () => {
   it("shows a custom model's license in its details when it is known", () => {
     const base = makeFoundModel()
     const licensed = makeFoundModel({ presentation: { ...base.presentation, license: Option.some("apache-2.0") } })
-    expect(renderModelDetail({ model: licensed, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })).toMatch(/License\s+apache-2\.0/)
-    expect(renderModelDetail({ model: makeFoundModel({ presentation: { ...base.presentation, license: Option.none() } }), models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false }))
+    expect(renderModelDetail({ model: licensed, models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false })).toMatch(/License\s+apache-2\.0/)
+    expect(renderModelDetail({ model: makeFoundModel({ presentation: { ...base.presentation, license: Option.none() } }), models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false }))
       .not.toContain("License")
   })
 })
@@ -1082,13 +1128,13 @@ describe("hidden models", () => {
     const hiddenId = CustomFormModelIdSchema.make("hf:a/b/c.gguf")
     const hidden = makeFoundModel({ modelId: hiddenId })
     const { client } = fakeClient({ getCatalog: () => Effect.succeed(catalogState([makeAddedModel()], [], [hidden])) })
-    const list = await run(readModelsStatus(client, Option.none(), false))
-    const listed = list._tag === "Right" ? renderModelsStatusResult(list.right) : ""
+    const list = await run(readModelsList(client, false))
+    const listed = list._tag === "Right" ? renderModelsListResult(list.right) : ""
     expect(listed).toContain("1 hidden model.")
     expect(listed).not.toContain(hiddenId)
-    const all = await run(readModelsStatus(client, Option.none(), true))
-    expect(all._tag === "Right" && renderModelsStatusResult(all.right)).toMatch(new RegExp(`Hidden\\s+${hiddenId}`))
-    expect(all._tag === "Right" && encode(modelsStatusResultJson, all.right)).toMatchObject({ hidden: [{ modelId: hiddenId }] })
+    const all = await run(readModelsList(client, true))
+    expect(all._tag === "Right" && renderModelsListResult(all.right)).toMatch(new RegExp(`Hidden\\s+${hiddenId}`))
+    expect(all._tag === "Right" && encode(modelsListResultJson, all.right)).toMatchObject({ hidden: [{ modelId: hiddenId }] })
   })
 })
 
@@ -1097,22 +1143,22 @@ describe("drafter updates", () => {
     const base = makeAddedModel()
     const drafter = Option.getOrThrow(base.drafter)
     const found = makeFoundModel({ recommendedDrafter: Option.none(), drafter: Option.some({ ...drafter, updateAvailable: true }) })
-    expect(renderModelsStatus(statusView({ models: [found] }))).toContain("Update available")
-    expect(renderModelDetail({ model: found, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false }))
-      .toContain(`Update      A newer drafter is available - magnitude catalog pull ${FOUND_MODEL_ID}`)
+    expect(renderModelsList(statusView({ models: [found] }))).toContain("Update available")
+    expect(renderModelDetail({ model: found, models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false }))
+      .toContain(`Update      A newer drafter is available - magnitude models pull ${FOUND_MODEL_ID}`)
     const downloading = makeFoundModel({ drafter: Option.some({ ...drafter, updateAvailable: true, availability: { _tag: "Downloading", progress: { stage: "downloading", completedBytes: 1, totalBytes: 4, bytesPerSecond: Option.none() } } }) })
-    expect(renderModelsStatus(statusView({ models: [downloading] }))).not.toContain("Update available")
-    expect(renderModelsStatus(statusView({ models: [base] }))).not.toContain("Update available")
+    expect(renderModelsList(statusView({ models: [downloading] }))).not.toContain("Update available")
+    expect(renderModelsList(statusView({ models: [base] }))).not.toContain("Update available")
   })
 
-  it("syncs a custom model when catalog pull names its ID", async () => {
+  it("syncs a custom model when models pull names its ID", async () => {
     expect(Effect.runSync(parsePullReference(FOUND_MODEL_ID))).toEqual({ _tag: "Custom", modelId: FOUND_MODEL_ID })
     const { client, models } = fakeClient({ syncLocalModel: () => Effect.succeed({ outcome: "Updating" }) })
     const result = await run(pull(client, FOUND_MODEL_ID, Effect.runSync(parsePullReference(FOUND_MODEL_ID)), { _tag: "Auto" }))
     expect(models.syncLocalModel).toHaveBeenCalledWith({ modelId: FOUND_MODEL_ID })
     expect(result).toMatchObject({ _tag: "Right", right: { _tag: "Custom", modelId: FOUND_MODEL_ID, outcome: "Updating" } })
     expect(renderPull({ _tag: "Custom", modelId: FOUND_MODEL_ID, outcome: "Updating" }))
-      .toBe(`Updating ${FOUND_MODEL_ID}.\nCheck progress: magnitude models status ${FOUND_MODEL_ID}\n`)
+      .toBe(`Updating ${FOUND_MODEL_ID}.\nCheck progress: magnitude models show ${FOUND_MODEL_ID}\n`)
     expect(renderPull({ _tag: "Custom", modelId: FOUND_MODEL_ID, outcome: "AlreadyCurrent" })).toBe(`${FOUND_MODEL_ID} is up to date.\n`)
     expect(encode(pullJson, { _tag: "Custom", modelId: FOUND_MODEL_ID, outcome: "AlreadyCurrent" }))
       .toEqual({ _tag: "Custom", modelId: FOUND_MODEL_ID, outcome: "AlreadyCurrent" })
@@ -1136,13 +1182,11 @@ describe("--json internal identities", () => {
     const unrunnable = makeFolderModel({ servingState: { ...assessed, assessment: unsupportedAssessment("IQ1_M") } })
     const catalog = catalogState([makeCatalogModel(), makeFoundModel(), makeAddedModel()], [makeUnsupportedLocalModel()], [unrunnable])
     const documents = [
-      encode(catalogListJson, catalog),
-      encode(catalogDetailJson, { model: makeCatalogModel(), models: [] }),
       encode(recommendationsJson, { catalog, models: [makeCatalogModel()], hardware: makeHardware(), developerCountry: Option.none(), recommended: [makeCatalogModel()].map(recommendedModel) }),
-      encode(modelsStatusJson, statusView({ models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), unrunnable], hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })] })),
-      encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }),
-      encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false }),
-      encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [] }),
+      encode(modelsListJson, statusView({ models: [makeCatalogModel(), makeFoundModel(), makeAddedModel(), unrunnable], hidden: [makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") })] })),
+      encode(modelDetailJson, { model: makeAddedModel(), models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }),
+      encode(modelDetailJson, { model: makeInstalledCatalogModel(), models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false }),
+      encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: [], unifiedMemory: false }),
       encode(hardwareJson, { hardware: makeHardware(), models: [loading(makeFoundModel())] }),
     ]
     for (const document of documents) expect(JSON.stringify(document)).not.toMatch(internal)
@@ -1150,12 +1194,12 @@ describe("--json internal identities", () => {
   })
 
   it("keeps the product facts of each assessment", () => {
-    const status = encode(modelsStatusJson, statusView({ models: [makeFoundModel()] }))
+    const status = encode(modelsListJson, statusView({ models: [makeFoundModel()] }))
     expect((status.models as { servingState: { assessment: Record<string, unknown> } }[])[0]!.servingState.assessment)
       .toMatchObject({ _tag: "Fits", profile: { contextLength: expect.any(Number) }, served: { contextLength: expect.any(Number) }, memory: { totalRequiredBytes: expect.any(Number) } })
     const hardware = encode(hardwareJson, { hardware: makeHardware(), models: [loading(makeFoundModel())] })
     expect(hardware.currentModel).toMatchObject({ _tag: "Custom", modelId: FOUND_MODEL_ID, servingState: { _tag: "Assessed" } })
-    const inspection = encode(inspectionJson, { inspection: makeInspection(), drafters: [], models: [] })
+    const inspection = encode(inspectionJson, { inspection: makeInspection(), drafters: [], models: [], unifiedMemory: false })
     expect((inspection.inspection as { versions: { assessment?: Record<string, unknown> }[] }).versions[3]!.assessment)
       .toMatchObject({ _tag: "Unsupported", reasons: [{ _tag: "WeightTypes" }] })
   })

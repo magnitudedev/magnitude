@@ -9,21 +9,21 @@ import { fitsAssessment, makeInspection, TEST_REPOSITORY } from "./fixtures/infe
 const catalogModel = CatalogFormModelIdSchema.make("qwen-test:gguf:q4")
 const [tooLarge, onDisk, recommended, unsupported] = makeInspection().versions
 
-describe("catalog inspect with a named version that doesn't run here", () => {
+describe("models show with a named version that doesn't run here", () => {
   it("explains a too-large version, how to force it, and the recommended version", () => {
     const inspection = makeInspection({ selectedVersion: Option.some("Q8_K_P") })
     expect(acquisitionHint(inspection)).toBe([
-      `Q8_K_P needs 8.6 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${TEST_REPOSITORY}:Q8_K_P --force`,
-      `The recommended version is Q4_K_P. Download: magnitude catalog pull ${TEST_REPOSITORY}:Q4_K_P`,
+      `Q8_K_P needs 8.6 GB more memory than this computer can provide. Download it anyway with: magnitude models pull ${TEST_REPOSITORY}:Q8_K_P --force`,
+      `The recommended version is Q4_K_P. Download: magnitude models pull ${TEST_REPOSITORY}:Q4_K_P`,
     ].join("\n"))
-    expect(renderInspection({ inspection, drafters: [], models: [] })).not.toContain("No version of this model runs")
+    expect(renderInspection({ inspection, drafters: [], models: [], unifiedMemory: false })).not.toContain("No version of this model runs")
   })
 
   it("explains an unsupported version with its reasons and points to the recommended version", () => {
     const hint = acquisitionHint(makeInspection({ selectedVersion: Option.some("Q2_K_P") }))
     expect(hint).toBe([
       "Magnitude can't run Q2_K_P: Uses Q2_K weights, which Magnitude doesn't support yet.",
-      `The recommended version is Q4_K_P. Download: magnitude catalog pull ${TEST_REPOSITORY}:Q4_K_P`,
+      `The recommended version is Q4_K_P. Download: magnitude models pull ${TEST_REPOSITORY}:Q4_K_P`,
     ].join("\n"))
   })
 
@@ -35,34 +35,34 @@ describe("catalog inspect with a named version that doesn't run here", () => {
     expect(acquisitionHint(withoutRecommendation).split("\n").at(-1)).toBe("Other versions run here; see the table above.")
     const nothingRuns = makeInspection({ selectedVersion: Option.some("Q8_K_P"), versions: [tooLarge!, unsupported!] })
     expect(acquisitionHint(nothingRuns).split("\n")).toEqual([
-      `Q8_K_P needs 8.6 GB more memory than this computer can provide. Download it anyway with: magnitude catalog pull ${TEST_REPOSITORY}:Q8_K_P --force`,
+      `Q8_K_P needs 8.6 GB more memory than this computer can provide. Download it anyway with: magnitude models pull ${TEST_REPOSITORY}:Q8_K_P --force`,
       "No version of this model runs on this computer.",
     ])
   })
 
   it("never marks a named version that can't run as selected", () => {
     for (const label of ["Q8_K_P", "Q2_K_P"]) {
-      const output = renderInspection({ inspection: makeInspection({ selectedVersion: Option.some(label) }), drafters: [], models: [] })
+      const output = renderInspection({ inspection: makeInspection({ selectedVersion: Option.some(label) }), drafters: [], models: [], unifiedMemory: false })
       expect(output).not.toContain("(selected)")
       expect(output).toMatch(/^Q4_K_P .*Fits \(recommended\)$/m)
     }
-    expect(renderInspection({ inspection: makeInspection({ selectedVersion: Option.some("Q6_K_P") }), drafters: [], models: [] }))
+    expect(renderInspection({ inspection: makeInspection({ selectedVersion: Option.some("Q6_K_P") }), drafters: [], models: [], unifiedMemory: false }))
       .toMatch(/^Q6_K_P .*Fits \(selected\) · already on this computer$/m)
   })
 
   it("keeps the download hint for a named version that fits", () => {
     expect(acquisitionHint(makeInspection({ selectedVersion: Option.some("Q6_K_P") })))
-      .toBe(`Download: magnitude catalog pull ${TEST_REPOSITORY}:Q6_K_P`)
+      .toBe(`Download: magnitude models pull ${TEST_REPOSITORY}:Q6_K_P`)
   })
 })
 
 describe("a version that is exactly a catalog model", () => {
-  it("points catalog inspect at the catalog model", () => {
+  it("points models show at the catalog model", () => {
     const inspection = makeInspection({
       versions: [{ ...recommended!, catalogModel: Option.some(catalogModel), assessment: Option.some(fitsAssessment()) }],
     })
     expect(acquisitionHint(inspection))
-      .toBe(`This is the catalog model ${catalogModel}, which comes with its drafter. Download: magnitude catalog pull ${catalogModel}`)
+      .toBe(`This is the catalog model ${catalogModel}, which comes with its drafter. Download: magnitude models pull ${catalogModel}`)
   })
 
   const routed = (outcome: "Started" | "AlreadyOnThisComputer"): PullResult => ({
@@ -72,11 +72,11 @@ describe("a version that is exactly a catalog model", () => {
     added: { _tag: "Catalog", modelId: catalogModel, version: "Q4_K_P", outcome },
   })
 
-  it("says catalog pull installed the catalog model instead of adding a Hugging Face model", () => {
+  it("says models pull installed the catalog model instead of adding a Hugging Face model", () => {
     expect(renderPull(routed("Started"))).toBe([
       `${TEST_REPOSITORY}:Q4_K_P (the recommended version) is the catalog model ${catalogModel}, so Magnitude installs that model with its drafter.`,
       `Model ID: ${catalogModel}`,
-      `Check progress: magnitude models status ${catalogModel}`,
+      `Check progress: magnitude models show ${catalogModel}`,
       "",
     ].join("\n"))
     expect(renderPull(routed("AlreadyOnThisComputer"))).toBe([
@@ -115,7 +115,7 @@ describe("downloading one catalog component", () => {
     expect(syncLocalModel).not.toHaveBeenCalled()
     expect(renderPull(result)).toBe([
       `Downloading only the image input for ${catalogModel}.`,
-      `Check progress: magnitude models status ${catalogModel}`,
+      `Check progress: magnitude models show ${catalogModel}`,
       "",
     ].join("\n"))
     expect(await Effect.runPromise(pullJson.encode(result)))

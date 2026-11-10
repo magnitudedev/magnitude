@@ -28,6 +28,7 @@ import {
   makeInspection,
   makeInstalledCatalogModel,
   makeLocations,
+  makePreparation,
   makeSearchResponse,
   TEST_COMMIT,
   TEST_REPOSITORY,
@@ -39,15 +40,14 @@ import { asJson, commandEffect } from "./output"
 import {
   addModelFolder,
   cancelDownload,
-  catalogDetailJson,
-  catalogListJson,
   hardwareJson,
   hideModel,
   inspectionJson,
   listModelLocations,
   loadInstance,
+  listModels,
   modelDetailJson,
-  modelsStatusJson,
+  modelsListJson,
   pull,
   pullJson,
   readInspection,
@@ -57,15 +57,14 @@ import {
   removeModel,
   removeModelFolder,
   renderModelDetail,
-  renderModelsStatus,
+  renderModelsList,
   searchJson,
   setModelDrafter,
   setModelLocationEnabled,
-  showCatalogModel,
-  showModelsStatus,
+  showModel,
   stopInstance,
   unhideModel,
-  type ModelsStatusView,
+  type ModelsListView,
 } from "./inference-runtime"
 
 type Handler = (payload: never) => Effect.Effect<unknown, unknown> | Stream.Stream<unknown, unknown>
@@ -125,7 +124,7 @@ const MODEL_IDS = [
 ] as const
 
 describe("model mutations accept hf: and local: IDs", () => {
-  it.each(MODEL_IDS)("catalog cancel with a %s ID", async (_, modelId) => {
+  it.each(MODEL_IDS)("models cancel with a %s ID", async (_, modelId) => {
     const { text, json, models } = await runBoth({ cancelLocalModelSync: succeed() }, (options) => cancelDownload(modelId, options))
     expect(models.cancelLocalModelSync).toHaveBeenCalledWith({ modelId })
     expect(text).toBe(`Cancelled work for ${modelId}.\n`)
@@ -135,7 +134,7 @@ describe("model mutations accept hf: and local: IDs", () => {
   it.each([
     ["hf:owner/repo/selector", makeAddedModel(), `Removed ${ADDED_MODEL_ID}.\nMagnitude deleted only its own copy; files other apps manage are untouched.\n`],
     ["local:<label>:<hash>", makeFolderModel(), `Hid ${FOLDER_MODEL_ID} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${FOLDER_MODEL_ID}\n`],
-  ] as const)("catalog remove with a %s ID", async (_, model, expected) => {
+  ] as const)("models rm with a %s ID", async (_, model, expected) => {
     const { text, json, models } = await runBoth({
       getCatalog: succeed(catalogState([model])),
       removeLocalModel: succeed({ keptComponents: [] }),
@@ -148,7 +147,7 @@ describe("model mutations accept hf: and local: IDs", () => {
   it.each(MODEL_IDS)("models load with a %s ID", async (_, modelId) => {
     const { text, json, models } = await runBoth({ load: succeed() }, (options) => loadInstance(modelId, options))
     expect(models.load).toHaveBeenCalledWith({ modelId })
-    expect(text).toBe(`Load requested for ${modelId}.\nCheck progress: magnitude models status ${modelId}\n`)
+    expect(text).toBe(`Load requested for ${modelId}.\nCheck progress: magnitude models show ${modelId}\n`)
     expect(json).toEqual({ modelId })
   })
 
@@ -179,7 +178,7 @@ describe("model mutations accept hf: and local: IDs", () => {
     expect(json).toEqual({ modelId: ADDED_MODEL_ID, stopped: false })
   })
 
-  it("catalog remove of a found catalog model deletes only the parts Magnitude stores, and hides it without any", async () => {
+  it("models rm of a found catalog model deletes only the parts Magnitude stores, and hides it without any", async () => {
     const weightsPath = "/home/ada/.cache/huggingface/hub/models--unsloth--Qwen3.5-4B-MTP-GGUF/snapshots/c/Qwen3.5-4B-UD-Q4_K_XL.gguf"
     const found = (storedComponents: readonly ("Projector" | "Drafter")[]) => makeInstalledCatalogModel({
       acquisitionState: {
@@ -296,7 +295,7 @@ describe("model mutations accept hf: and local: IDs", () => {
     expect(text).toBe([
       `Drafter for ${modelId}: ${drafter.name}.`,
       "Downloading the drafter.",
-      `Check progress: magnitude models status ${modelId}`,
+      `Check progress: magnitude models show ${modelId}`,
       "",
     ].join("\n"))
     expect(json).toMatchObject({ modelId, drafter: { name: drafter.name, reference: { _tag: "Catalog" } }, drafterDownloadStarted: true })
@@ -307,7 +306,7 @@ describe("model folders", () => {
   it("adds and removes a folder", async () => {
     const added = await runBoth({ addModelFolder: succeed() }, (options) => addModelFolder("/Volumes/External/models", options))
     expect(added.models.addModelFolder).toHaveBeenCalledWith({ path: "/Volumes/External/models" })
-    expect(added.text).toBe("Added /Volumes/External/models. Magnitude watches it for GGUF files.\nSee them: magnitude models status\n")
+    expect(added.text).toBe("Added /Volumes/External/models. Magnitude watches it for GGUF files.\nSee them: magnitude models list\n")
     expect(added.json).toEqual({ path: "/Volumes/External/models" })
 
     const removed = await runBoth({ removeModelFolder: succeed() }, (options) => removeModelFolder("/Volumes/External/models", options))
@@ -359,7 +358,7 @@ describe("model folders", () => {
 })
 
 describe("adding models with a drafter", () => {
-  it("catalog pull --drafter none sends the choice and prints the model ID", async () => {
+  it("models pull --drafter none sends the choice and prints the model ID", async () => {
     const added = { _tag: "Custom", modelId: ADDED_MODEL_ID, version: "Q4_K_P", drafter: Option.none(), outcome: "Started", drafterDownloadStarted: false }
     const { text, json, models } = await runBoth({ addHuggingFaceModel: succeed(added) },
       (options) => commandEffect({
@@ -385,11 +384,25 @@ describe("adding models with a drafter", () => {
     })
   })
 
-  it("catalog inspect passes a huggingface.co link through and prints the repository step", async () => {
+  it("models show passes a huggingface.co link through and prints the repository step", async () => {
     const link = `https://huggingface.co/${TEST_REPOSITORY}`
     const { text, json, models } = await runBoth({
       streamModelCandidateInspection: inspected(makeInspection()),
       getCatalog: succeed(catalogState([makeCatalogModel()])),
+      getLocalEnvironment: succeed(makeHardware()),
+      listDrafterCandidates: succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
+    }, (options) => showModel(link, options))
+    expect(models.streamModelCandidateInspection).toHaveBeenCalledWith({ reference: link })
+    expect(text.split("\n")[0]).toBe("Qwen Test Uncensored")
+    expect(json).toMatchObject({ inspection: { displayName: "Qwen Test Uncensored" } })
+  })
+
+  it("reads an inspection with its drafters and the download command", async () => {
+    const link = `https://huggingface.co/${TEST_REPOSITORY}`
+    const { text, json, models } = await runBoth({
+      streamModelCandidateInspection: inspected(makeInspection()),
+      getCatalog: succeed(catalogState([makeCatalogModel()])),
+      getLocalEnvironment: succeed(makeHardware()),
       listDrafterCandidates: succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
     }, (options) => commandEffect({
       effect: withClient((client) => readInspection(client, link)),
@@ -402,7 +415,7 @@ describe("adding models with a drafter", () => {
       other: Option.none(),
     })
     expect(text.split("\n")[0]).toBe("Qwen Test Uncensored")
-    expect(text.trimEnd().split("\n").at(-1)).toBe(`Download: magnitude catalog pull ${TEST_REPOSITORY}:Q4_K_P`)
+    expect(text.trimEnd().split("\n").at(-1)).toBe(`Download: magnitude models pull ${TEST_REPOSITORY}:Q4_K_P`)
     expect(json).toMatchObject({ inspection: { displayName: "Qwen Test Uncensored", versions: expect.any(Array) }, drafters: expect.any(Array) })
   })
 })
@@ -415,10 +428,10 @@ describe("hidden models are addressable", () => {
       getCatalog: succeed(catalogState([makeAddedModel()], [], [hidden])),
       getLocalEnvironment: succeed(makeHardware()),
       listDrafterCandidates: succeed({ candidates: makeDrafterCandidates(), entered: Option.none() }),
-    }, (options) => showModelsStatus(hidden.modelId, options))
+    }, (options) => showModel(hidden.modelId, options))
     expect(models.listDrafterCandidates).toHaveBeenCalledWith({ target: { _tag: "Model", modelId: hidden.modelId }, other: Option.none() })
-    expect(text).toContain(`Model ID    ${hidden.modelId}`)
-    expect(text).toContain(`Hidden      Yes - unhide it: magnitude models unhide ${hidden.modelId}`)
+    expect(text).toMatch(new RegExp(`Model ID\\s+${hidden.modelId}`))
+    expect(text).toMatch(new RegExp(`Hidden\\s+Yes - unhide it: magnitude models unhide ${hidden.modelId}`))
     expect(json).toMatchObject({ model: { modelId: hidden.modelId }, hidden: true })
   })
 
@@ -427,7 +440,7 @@ describe("hidden models are addressable", () => {
       getCatalog: succeed(catalogState([makeAddedModel()], [], [hidden])),
       getLocalEnvironment: succeed(makeHardware()),
       listDrafterCandidates: succeed({ candidates: [], entered: Option.none() }),
-    }, (options) => showModelsStatus(ADDED_MODEL_ID, options))
+    }, (options) => showModel(ADDED_MODEL_ID, options))
     expect(json).toMatchObject({ model: { modelId: ADDED_MODEL_ID }, hidden: false })
   })
 
@@ -442,58 +455,70 @@ describe("hidden models are addressable", () => {
 
   it("shows a hidden catalog model's catalog details", async () => {
     const catalog = makeInstalledCatalogModel()
-    const { text, json } = await runBoth({ getCatalog: succeed(catalogState([], [], [catalog])) },
-      (options) => showCatalogModel(catalog.modelId, options))
-    expect(text).toContain(`Model ID      ${catalog.modelId}`)
-    expect(json).toMatchObject({ model: { modelId: catalog.modelId } })
+    const { text, json } = await runBoth({
+      getCatalog: succeed(catalogState([], [], [catalog])),
+      getLocalEnvironment: succeed(makeHardware()),
+    }, (options) => showModel(catalog.modelId, options))
+    expect(text).toMatch(new RegExp(`Model ID\\s+${catalog.modelId}`))
+    expect(text).toMatch(/Released\s+/)
+    expect(json).toMatchObject({ model: { modelId: catalog.modelId }, hidden: true })
   })
 })
 
-const statusView = (overrides: Partial<ModelsStatusView> = {}): ModelsStatusView => ({
+const statusView = (overrides: Partial<ModelsListView> = {}): ModelsListView => ({
   models: [],
   unsupported: [],
   hidden: [],
   all: false,
+  preparation: makePreparation(),
+  warnings: [],
   ...overrides,
 })
 
 const rowOf = (output: string, modelId: string): string => output.split("\n").find((line) => line.endsWith(modelId)) ?? ""
 
-describe("models status variant and drafter columns", () => {
+describe("models list and model details", () => {
   const turnedOff = makeFoundModel({
     modelId: CustomFormModelIdSchema.make("hf:z/off/off.gguf"),
     drafterChoice: { _tag: "None" },
   })
 
-  it("shows what each model is a variant of and its drafter", () => {
+  it("lists each model with its quant, size, speed, context, source, and status", () => {
     const catalog = makeInstalledCatalogModel()
-    const output = renderModelsStatus(statusView({
+    const output = renderModelsList(statusView({
       models: [catalog, makeAddedModel(), makeFoundModel(), makeFolderModel(), turnedOff],
     }))
-    expect(output).toMatch(/^MODEL\s+SOURCE\s+VARIANT OF\s+DRAFTER\s+MEMORY\s+CONTEXT\s+STATUS\s+MODEL ID$/m)
-    expect(rowOf(output, ADDED_MODEL_ID)).toMatch(/Hugging Face\s+Qwen Test \(qwen-test:gguf:q4\)\s+Magnitude DFlash for Qwen Test\s/)
-    expect(rowOf(output, FOUND_MODEL_ID)).toMatch(/Qwen Test \(qwen-test:gguf:q4\)\s+Faster with a drafter · Add \(900 MB\)\s/)
-    expect(rowOf(output, FOLDER_MODEL_ID)).toMatch(/\smodels\s+—\s+—\s/)
-    expect(rowOf(output, turnedOff.modelId)).toMatch(/Turned off\s/)
-    expect(rowOf(output, turnedOff.modelId)).not.toContain("Faster with a drafter")
-    expect(rowOf(output, catalog.modelId)).toMatch(/Catalog\s+—\s+—\s/)
+    expect(output).toMatch(/^MODEL\s+QUANT\s+SIZE\s+SPEED\s+CONTEXT\s+SOURCE\s+STATUS\s+MODEL ID$/m)
+    expect(rowOf(output, ADDED_MODEL_ID)).toMatch(/\sMagnitude\s/)
+    expect(rowOf(output, FOUND_MODEL_ID)).toMatch(/\sHF cache\s/)
+    expect(rowOf(output, FOLDER_MODEL_ID)).toMatch(/\sfolder\s/)
+    expect(rowOf(output, catalog.modelId)).toMatch(/\sMagnitude\s/)
+    expect(output.trimEnd().split("\n").at(-1)).toBe("Assessment: Complete - 1 of 1 model assessed")
+  })
+
+  it("shows what a model is a variant of and its drafter in its details", () => {
+    const catalog = makeInstalledCatalogModel()
+    const detail = (model: CustomLocalModel) => renderModelDetail({ model, models: [catalog], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false })
+    expect(detail(makeAddedModel())).toMatch(/^ {2}Variant of\s+Qwen Test \(qwen-test:gguf:q4\)$/m)
+    expect(detail(makeAddedModel())).toMatch(/^ {2}Drafter\s+Magnitude DFlash for Qwen Test/m)
+    expect(detail(makeFoundModel())).toMatch(/^ {2}Drafter\s+None · Faster with a drafter · Add \(900 MB\)$/m)
+    expect(detail(turnedOff)).toMatch(/^ {2}Drafter\s+Turned off$/m)
   })
 
   it("shows an automatic drafter that isn't worked out yet as being found, never as none", () => {
     const pending = makeFoundModel({ drafterPending: true, recommendedDrafter: Option.none() })
-    expect(rowOf(renderModelsStatus(statusView({ models: [pending] })), FOUND_MODEL_ID)).toMatch(/qwen-test:gguf:q4\s+Finding drafter…\s/)
-    const output = renderModelDetail({ model: pending, models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: [] }, hidden: false })
+    const output = renderModelDetail({ model: pending, models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: [] }, hidden: false })
     expect(output).toMatch(/^ {2}Drafter\s+Finding drafter…$/m)
     expect(output).not.toMatch(/^ {2}Drafter\s+None/m)
   })
 
   it("names the variant by its ID when the catalog doesn't list it", () => {
-    const output = renderModelsStatus(statusView({ models: [makeFoundModel()] }))
-    expect(rowOf(output, FOUND_MODEL_ID)).toMatch(/Hugging Face cache\s+qwen-test:gguf:q4\s/)
+    const output = renderModelDetail({ model: makeFoundModel(), models: [], hardware: makeHardware(), drafters: { _tag: "NotApplicable" }, hidden: false })
+    expect(output).toMatch(/^ {2}Variant of\s+qwen-test:gguf:q4$/m)
   })
 
   it("shows a turned-off drafter in details and marks none as the current choice", () => {
-    const output = renderModelDetail({ model: turnedOff, models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    const output = renderModelDetail({ model: turnedOff, models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(output).toMatch(/^ {2}Drafter\s+Turned off$/m)
     expect(output).not.toContain("Faster with a drafter")
     expect(output).toMatch(/^\* None\s+—/m)
@@ -501,7 +526,7 @@ describe("models status variant and drafter columns", () => {
   })
 
   it("marks the preselected drafter as current for an automatic choice with nothing attached yet", () => {
-    const output = renderModelDetail({ model: makeFoundModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    const output = renderModelDetail({ model: makeFoundModel(), models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(output).toMatch(/^\* Magnitude DFlash for Qwen Test/m)
     expect(output).toMatch(/^ {2}None\s+—/m)
   })
@@ -511,12 +536,12 @@ describe("models status variant and drafter columns", () => {
       acquisitionState: { _tag: "Installing", progress: { stage: "downloading", completedBytes: 1, totalBytes: 4, bytesPerSecond: Option.none() } },
       servingState: { _tag: "Assessing", profile: { contextLength: 100_000 } },
     })
-    const detail = renderModelDetail({ model: downloading, models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
+    const detail = renderModelDetail({ model: downloading, models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })
     expect(detail).not.toMatch(/^ {2}Context/m)
     expect(detail).not.toContain("100K")
-    expect(rowOf(renderModelsStatus(statusView({ models: [downloading] })), ADDED_MODEL_ID)).not.toContain("100K")
+    expect(rowOf(renderModelsList(statusView({ models: [downloading] })), ADDED_MODEL_ID)).not.toContain("100K")
 
-    expect(renderModelDetail({ model: makeAddedModel(), models: [], hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }))
+    expect(renderModelDetail({ model: makeAddedModel(), models: [], hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false }))
       .toMatch(/^ {2}Context\s+32K$/m)
   })
 
@@ -525,7 +550,7 @@ describe("models status variant and drafter columns", () => {
     const downloading = makeAddedModel({
       drafter: Option.some({ ...base, updateAvailable: true, availability: { _tag: "Downloading", progress: { stage: "downloading", completedBytes: 1, totalBytes: 2, bytesPerSecond: Option.none() } } }),
     })
-    expect(rowOf(renderModelsStatus(statusView({ models: [downloading] })), ADDED_MODEL_ID)).not.toContain("Update available")
+    expect(rowOf(renderModelsList(statusView({ models: [downloading] })), ADDED_MODEL_ID)).not.toContain("Update available")
   })
 })
 
@@ -598,18 +623,16 @@ describe("--json never leaks internals", () => {
     for (const model of all) expect(JSON.stringify(model), model.modelId).toMatch(internalKey)
 
     const documents: Record<string, unknown>[] = [
-      encode(catalogListJson, state),
-      encode(catalogDetailJson, { model: catalog, models: all }),
       encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog, ...catalogs].map(recommendedModel) }),
-      encode(modelsStatusJson, statusView({ models: all, hidden: [withEvidence(makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") }))] })),
-      ...all.map((model) => encode(modelDetailJson, { model, models: all, hardware: Option.none(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })),
+      encode(modelsListJson, statusView({ models: all, hidden: [withEvidence(makeFoundModel({ modelId: CustomFormModelIdSchema.make("hf:a/b/c.gguf") }))] })),
+      ...all.map((model) => encode(modelDetailJson, { model, models: all, hardware: makeHardware(), drafters: { _tag:"Listed", candidates: makeDrafterCandidates() }, hidden: false })),
       encode(hardwareJson, { hardware: makeHardware(), models: [loadingFound] }),
       encode(hardwareJson, { hardware: makeHardware(), models: [catalogs[1]!] }),
-      encode(searchJson, { query: "q", all: true, response: makeSearchResponse(), models: all }),
-      encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: all }),
+      encode(searchJson, { query: "q", response: makeSearchResponse(), unifiedMemory: false }),
+      encode(inspectionJson, { inspection: makeInspection(), drafters: makeDrafterCandidates(), models: all, unifiedMemory: false }),
     ]
 
-    const status = await runBoth({ getCatalog: succeed(state) }, (options) => showModelsStatus(undefined, { ...options, all: true }))
+    const status = await runBoth({ getCatalog: succeed(state) }, (options) => listModels({ ...options, all: true }))
     const locations = await runBoth({ listModelLocations: succeed({ locations: makeLocations() }) }, (options) => listModelLocations(options))
     const commandDocuments = [status.json, locations.json]
     for (const document of [...documents, ...commandDocuments]) expect(JSON.stringify(document)).not.toMatch(internalKey)
@@ -619,8 +642,6 @@ describe("--json never leaks internals", () => {
     const { catalog, catalogs } = leakyModels()
     const state = catalogState([catalog, ...catalogs])
     const documents = [
-      encode(catalogListJson, state),
-      encode(catalogDetailJson, { model: catalog, models: [catalog] }),
       encode(recommendationsJson, { catalog: state, models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog].map(recommendedModel) }),
     ]
     for (const document of documents) expect(JSON.stringify(document)).not.toMatch(/"(acquisitionState|residencyState|installation)"/)
@@ -640,12 +661,12 @@ describe("--json never leaks internals", () => {
         residencyState: { _tag: "Ready", allocation: { contextWindowTokens: 4096, memoryDomains: [{ modelBytes: 8, contextBytes: 1 }] } },
       },
     })
-    const loading = encode(modelDetailJson, { model: catalogs[0]!, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
+    const loading = encode(modelDetailJson, { model: catalogs[0]!, models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(loading.model).toMatchObject({ acquisitionState: { residencyState: { plannedAllocation: { device: { backend: "cuda" } } } } })
-    const detail = encode(modelDetailJson, { model: tooLarge, models: [], hardware: Option.none(), drafters: { _tag:"NotApplicable" }, hidden: false })
+    const detail = encode(modelDetailJson, { model: tooLarge, models: [], hardware: makeHardware(), drafters: { _tag:"NotApplicable" }, hidden: false })
     expect(detail.model).toMatchObject({ servingState: { assessment: { _tag: "DoesNotFit", totalRequiredBytes: 10, deficitBytes: 4 } } })
-    const shown = encode(catalogDetailJson, { model: catalog, models: [] })
-    expect(shown.model).toMatchObject({
+    const shown = encode(recommendationsJson, { catalog: catalogState([catalog]), models: [catalog], hardware: makeHardware(), developerCountry: Option.none(), recommended: [catalog].map(recommendedModel) }).models as Record<string, unknown>[]
+    expect(shown[0]!.model).toMatchObject({
       catalogData: { intelligence: 75, quantizationAware: false },
       servingState: { assessment: { _tag: "Fits", memory: { totalRequiredBytes: 10, breakdown: { weightsBytes: 7, contextBytes: 2, overheadBytes: 1 } } } },
     })

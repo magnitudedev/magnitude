@@ -39,14 +39,12 @@ magnitude serve
 magnitude server setup|remove
 magnitude status
 magnitude hardware
-magnitude catalog status
-magnitude catalog list
-magnitude catalog show|cancel|remove <model-id>
-magnitude catalog recommendations [--country <code>] [--limit <count>]
-magnitude catalog search <query> [--limit <count>]
-magnitude catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
-magnitude catalog pull <model-id | owner/repo[:QUANT] | huggingface-url> [--drafter auto|none|<drafter>] [--force]
-magnitude models status [model-id] [--all]
+magnitude models list [--all]
+magnitude models recommend [--country <code>] [--limit <count>]
+magnitude models search <query> [--limit <count>]
+magnitude models show <model-id | owner/repo[:QUANT] | huggingface-url>
+magnitude models pull <model-id | owner/repo[:QUANT] | huggingface-url> [--drafter auto|none|<drafter>] [--force] [--only projector|drafter]
+magnitude models cancel|rm <model-id>
 magnitude models load <model-id>
 magnitude models stop [model-id]
 magnitude models drafter <model-id> <auto | none | drafter>
@@ -54,6 +52,7 @@ magnitude models hide|unhide <model-id>
 magnitude models folders list
 magnitude models folders add|remove <path>
 magnitude models folders enable|disable <huggingface-cache | lm-studio | llama-cpp | ollama>
+magnitude models families
 magnitude connections list
 magnitude connections connect <harness> [--set-model <model-id>] [--install-skill]
 magnitude connections sync [harness]
@@ -65,7 +64,7 @@ magnitude docs [topic-id]
 Run `magnitude serve` to host inference in the foreground, or open the desktop app. On Linux and
 macOS, `magnitude server setup` runs Magnitude as a service that starts at boot, with Network access
 on; `magnitude server remove` removes it and keeps its data. See `magnitude docs remote-access`.
-Model, catalog, hardware, and connection setup commands require an existing service; they do not
+Model, hardware, and connection setup commands require an existing service; they do not
 start one. `magnitude status` reports service and model status without starting anything. Stop a
 foreground server with Ctrl+C. Desktop launch-at-login and Quit are available in the desktop app.
 
@@ -82,17 +81,21 @@ Each command prints only the product information relevant to that operation. Col
 use borderless tables when the rows are directly comparable; detail commands use labeled fields.
 Exact model and harness IDs are always printed so their output can be used in later commands.
 
-Every `hardware`, `catalog`, `models`, and `hf` command accepts `--json` and then prints one JSON document
+Every `hardware`, `models`, and `hf` command accepts `--json` and then prints one JSON document
 of the same facts instead of text, with exact IDs, structured reasons a model can't run (with the
 engine's developer `detail`), and drafter verdicts. Optional fields are omitted when absent. Errors
 stay on stderr with a nonzero exit in both modes; with `--json` an error is one JSON document,
 `{"error": {"message": "...", "code": "..."}}`, whose `code` is a stable snake_case identifier. No command prompts or reads standard input: where
 a choice is needed it takes the desktop's default and prints what it chose.
 
-`catalog` finds and downloads models: catalog assessment progress, reviewed model choices,
-recommendation evidence, Hugging Face search and inspection, and downloads. `models` owns what is on
-this computer: catalog models, models added from Hugging Face or as a file, models found in other
-apps' folders, drafters, hidden models, model locations, and runtime state. Catalog assessment,
+`models` finds, downloads, and runs models. `models recommend` lists the tested models for this
+computer at the quant chosen for each, with every quant of its ladder; `models search` searches
+Hugging Face, with each result's base model and how its recommended quant runs here; `models show`
+shows every quant of a model with its bit width, size, speed, served context and placement, and for
+the chosen quant the bytes it holds on the device, in host RAM and reads from disk, and its decode
+speed at each assessed context depth. `models list` shows what is on this computer (catalog models,
+models added from Hugging Face or as a file, and models found in other apps' folders) with the
+assessment progress, and `models families` the model families Magnitude runs. Assessment,
 downloads, and model loading are background work: observation commands return the current state and
 never wait for any of them to settle.
 

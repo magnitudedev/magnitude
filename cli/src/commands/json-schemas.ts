@@ -5,6 +5,8 @@ import {
   CustomLocalModelSchema,
   CustomLocalModelServingStateSchema,
   CustomModelAcquisitionStateSchema,
+  HuggingFaceRecommendedVersionSchema,
+  HuggingFaceSearchResultSchema,
   LocalInferenceAcceleratorSchema,
   LocalInferenceHardwareSchema,
   LocalInferenceMemoryDomainSchema,
@@ -187,4 +189,14 @@ const CandidateVersionJsonSchema = Schema.Struct({
 export const CandidateInspectionJsonSchema = Schema.Struct({
   ...CandidateInspectionSchema.from.fields,
   versions: Schema.Array(CandidateVersionJsonSchema),
+})
+
+export const HuggingFaceSearchResponseJsonSchema = Schema.Struct({
+  results: Schema.Array(Schema.Struct({
+    ...HuggingFaceSearchResultSchema.fields,
+    recommended: optional(Schema.Struct({
+      ...HuggingFaceRecommendedVersionSchema.fields,
+      assessment: LocalModelAssessmentJsonSchema,
+    })),
+  })),
 })

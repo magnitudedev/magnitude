@@ -90,7 +90,7 @@ export const awaitPiDevelopmentModel = <E, R>(
   ))
   return poll.pipe(Effect.timeoutFail({
     duration: "30 seconds",
-    onTimeout: () => new PiDevelopmentFailed({ message: "No installed Magnitude model became available within 30 seconds. Check `magnitude models status` or install a model before starting Pi development." }),
+    onTimeout: () => new PiDevelopmentFailed({ message: "No installed Magnitude model became available within 30 seconds. Check `magnitude models list` or install a model before starting Pi development." }),
   }))
 }
 

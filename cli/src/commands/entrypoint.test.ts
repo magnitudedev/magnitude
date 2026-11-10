@@ -24,7 +24,7 @@ describe("headless CLI entrypoint", () => {
     const result = await invoke([])
     expect(result.code).toBe(0)
     expect(result.stdout).toContain("Usage: magnitude")
-    expect(result.stdout).toContain("catalog")
+    expect(result.stdout).toContain("models")
     expect(result.stdout).not.toMatch(/\x1b\[/)
     expect(result.stderr).toBe("")
   })
@@ -34,7 +34,7 @@ describe("headless CLI entrypoint", () => {
     expect(result.stderr).toContain(argument.startsWith("--") ? "unknown option" : "too many arguments")
     expect(result.stdout).toBe("")
   })
-  it.each(["", "catalog", "models", "connections", "hf", "status", "serve", "docs", "update"])("supports finite help for %s", async (command) => {
+  it.each(["", "models", "connections", "hf", "status", "serve", "docs", "update"])("supports finite help for %s", async (command) => {
     const result = await invoke([...(command ? [command] : []), "--help"])
     expect(result.code).toBe(0)
     expect(result.stdout).toContain("Usage:")
@@ -56,10 +56,9 @@ describe("headless CLI entrypoint", () => {
   })
   it.each([
     ["hardware"],
-    ["catalog", "status"], ["catalog", "list"], ["catalog", "recommendations"],
-    ["catalog", "show", "test:gguf:q4"], ["catalog", "pull", "test:gguf:q4"],
-    ["catalog", "cancel", "test:gguf:q4"], ["catalog", "remove", "test:gguf:q4"],
-    ["models", "status"], ["models", "status", "test:gguf:q4"],
+    ["models", "list"], ["models", "recommend"], ["models", "families"],
+    ["models", "show", "test:gguf:q4"], ["models", "pull", "test:gguf:q4"],
+    ["models", "cancel", "test:gguf:q4"], ["models", "rm", "test:gguf:q4"],
     ["models", "load", "test:gguf:q4"], ["models", "stop"],
     ["connections", "connect", "pi"], ["connections", "sync", "pi"],
     ["hf", "login"], ["hf", "status"], ["hf", "logout"],
