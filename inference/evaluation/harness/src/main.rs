@@ -156,19 +156,17 @@ enum Command {
         /// Decode from the fixture's first N tokens: a pressured decode's
         /// prompt, as it printed it (`decode_prompt_tokens`), for the same
         /// decode resident.
-        #[arg(long, value_name = "N", requires = "decode", conflicts_with = "pressure")]
+        #[arg(long, value_name = "N", requires = "decode", conflicts_with = "pressure_store")]
         decode_prompt_tokens: Option<usize>,
-        /// Another process presses the load BYTES below its planning line
-        /// over a window of the decode.
-        #[arg(long, value_name = "BYTES", requires_all = ["decode", "pressure_store"])]
-        pressure: Option<u64>,
+        /// Another process presses this physical store below the load's
+        /// planning line, past its prompt groups' surplus into its bank, over
+        /// a window of the decode; device resolves every allocation placement.
+        #[arg(long, requires = "decode")]
+        pressure_store: Option<memory::PressureStore>,
         /// The pressure starts once the request is admitted, so its prompt's
         /// groups run under it.
-        #[arg(long, requires = "pressure")]
+        #[arg(long, requires = "pressure_store")]
         pressure_prompt: bool,
-        /// Physical store to press; device resolves every allocation placement.
-        #[arg(long, requires = "pressure")]
-        pressure_store: Option<memory::PressureStore>,
         /// Keep the loaded worker until standard input closes.
         #[arg(long)]
         hold: bool,
@@ -199,9 +197,6 @@ enum Command {
     Occupy {
         #[arg(long)]
         device: String,
-        /// Bytes below the planning line.
-        #[arg(long)]
-        deficit: u64,
         #[arg(long)]
         pressure_store: memory::PressureStore,
     },
@@ -734,7 +729,6 @@ fn run(command: Command) -> Result<(), String> {
             decode,
             decode_tokens,
             decode_prompt_tokens,
-            pressure,
             pressure_prompt,
             pressure_store,
             hold,
@@ -753,12 +747,7 @@ fn run(command: Command) -> Result<(), String> {
                 tokens,
                 prompt_tokens: decode_prompt_tokens,
             }),
-            // Clap requires each of `--pressure` and `--pressure-store` with the other.
-            pressure: pressure.zip(pressure_store).map(|(deficit, store)| memory::Pressing {
-                store,
-                deficit,
-                from_prompt: pressure_prompt,
-            }),
+            pressure: pressure_store.map(|store| memory::Pressing { store, from_prompt: pressure_prompt }),
             hold,
         }),
         Command::Recommit { device, gigabytes } => {
@@ -772,7 +761,7 @@ fn run(command: Command) -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()?;
             memory::recommit(memory::backend(&device)?, &commitments)
         }
-        Command::Occupy { device, deficit, pressure_store } => memory::occupy(memory::backend(&device)?, pressure_store, deficit),
+        Command::Occupy { device, pressure_store } => memory::occupy(memory::backend(&device)?, pressure_store),
         Command::Draft {
             run,
             engine,

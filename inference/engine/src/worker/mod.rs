@@ -26,7 +26,7 @@ pub use client::{
     connect_worker, EngineClient, EngineRequest, RequestEvent, RequestOptions, WorkerConnection,
 };
 pub use preparation::{
-    load_prepared, prepare, start_worker_process, ChildTransport, Preparation, WorkerProcess,
+    load_prepared, observe_worker_process, prepare, start_worker_process, ChildTransport, Preparation, WorkerProcess,
     WorkerReport,
 };
 
