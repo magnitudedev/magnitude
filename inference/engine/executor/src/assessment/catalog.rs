@@ -4,9 +4,10 @@
 //! its kernel's domain; where its experts stream on a backend, the same of
 //! its load with them in an expert bank at its floor. A form the executor
 //! does not run is refused with a typed reason before any term is derived;
-//! a served target past admission whose terms or graphs fail, or whose
-//! experts a backend that streams experts refuses to stream, is a failure.
-//! A target that need not serve may lack a form on any backend: its failed
+//! a required target (one the catalog serves, or `REQUIRED` names) past
+//! admission whose terms or graphs fail, or whose experts a backend that
+//! streams experts refuses to stream, is a failure. Any other target may
+//! lack a form on any backend: its failed
 //! inspection, load or bank is listed as refused, and its terms only where
 //! the backend has no native of an entry the load prepares; any other
 //! failure of its terms fails.
@@ -35,14 +36,23 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Catalog models whose target's load must derive whatever their catalog
-/// support level: DeepSeek V4.1 Flash is disabled for users until it passes
-/// on real text, but its loads plan on every backend, so a call outside a
+/// support level. Only the derivation test reads it: what the catalog serves
+/// ([`serves`]), with its drafts and projectors, is the support level's
+/// alone. DeepSeek V4.1 Flash is disabled for users until it passes on real
+/// text, but its loads plan on every backend, so a call outside a
 /// declaration's domain at its shapes fails here, not at a device's load.
 const REQUIRED: [&str; 2] = ["qwen3.8-flash-next:gguf:q4", "deepseek-v4.1-flash:gguf:mxfp4"];
 
+/// Whether the catalog serves a model: its support level
+/// (`catalog/models.json`) is neither disabled nor deprecated.
+pub(super) fn serves() -> impl Fn(&str) -> bool + Sync {
+    let levels = support_levels();
+    move |name| !matches!(levels.get(name).map(String::as_str), Some("disabled" | "deprecated"))
+}
+
 /// Each catalog model's support level (`catalog/models.json`), by catalog
 /// model ID.
-pub(super) fn support_levels() -> BTreeMap<String, String> {
+fn support_levels() -> BTreeMap<String, String> {
     let catalog: serde_json::Value =
         serde_json::from_slice(include_bytes!("../../../../catalog/models.json")).unwrap();
     catalog["models"]
@@ -81,17 +91,15 @@ pub(super) const LIMITS: ResourceLimits = ResourceLimits {
     conversations: std::num::NonZeroUsize::MIN,
 };
 
-/// Every catalog target that must serve (its catalog model neither disabled
-/// nor deprecated, or named in `REQUIRED`) and the executor admits, by
-/// catalog model ID, with its definition and its package alone.
+/// Every catalog target the catalog serves ([`serves`]) and the executor
+/// admits, by catalog model ID, with its definition and its package alone.
 pub(super) fn served_targets() -> Vec<(String, magnitude_family_contracts::ModelDefinition, PackageManifest)> {
     let identity = PackageIdentity { target: ArtifactIdentity([7; 32]), projector: None };
-    let levels = support_levels();
+    let served = serves();
     let mut targets = Vec::new();
     for component in headers::index() {
         let name = component.model.as_str();
-        let served = REQUIRED.contains(&name) || !matches!(levels.get(name).map(String::as_str), Some("disabled" | "deprecated"));
-        if component.role != ComponentRole::Target || !served {
+        if component.role != ComponentRole::Target || !served(name) {
             continue;
         }
         let target = headers::component(component);
@@ -114,7 +122,8 @@ pub(super) fn served_targets() -> Vec<(String, magnitude_family_contracts::Model
 /// backend's test names it (`…_on_vulkan`), so a run selects its backend,
 /// and its targets cost the slowest target's derivation, not their sum.
 fn every_admitted_catalog_target_derives_complete_terms_on(backend: BackendName) {
-    let levels = support_levels();
+    let served = serves();
+    let required = |name: &str| served(name) || REQUIRED.contains(&name);
     let targets = headers::index()
         .iter()
         .filter(|component| component.role == ComponentRole::Target)
@@ -127,7 +136,7 @@ fn every_admitted_catalog_target_derives_complete_terms_on(backend: BackendName)
                 scope.spawn(|| {
                     let mut derived = Vec::new();
                     while let Some(component) = targets.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-                        derived.push((component.model.as_str(), derive_target(component, backend, &levels)));
+                        derived.push((component.model.as_str(), derive_target(component, backend, required(component.model.as_str()))));
                     }
                     derived
                 })
@@ -183,8 +192,10 @@ struct Derived {
 }
 
 /// Catalog target `component`'s resident load on `backend`, and its banked
-/// load where its experts stream there, derived to complete terms.
-fn derive_target(component: &CatalogComponent, backend: BackendName, levels: &BTreeMap<String, String>) -> Derived {
+/// load where its experts stream there, derived to complete terms; `required`
+/// where its terms must derive (the catalog serves it, or `REQUIRED` names
+/// it).
+fn derive_target(component: &CatalogComponent, backend: BackendName, required: bool) -> Derived {
     let identity = PackageIdentity {
         target: ArtifactIdentity([7; 32]),
         projector: None,
@@ -193,15 +204,8 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, levels: &BT
     let Derived { admitted, refused, failures } = &mut derived;
     let name = component.model.as_str();
     let target = headers::component(component);
-    // A target that must serve: its catalog model is neither disabled nor
-    // deprecated, or it is named in `REQUIRED`.
-    let served = REQUIRED.contains(&name)
-        || !matches!(
-            levels.get(name).map(String::as_str),
-            Some("disabled" | "deprecated")
-        );
     let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
-        if served {
+        if required {
             failures.push(format!("{name}: no family recognizes the target"));
         }
         return derived;
@@ -209,7 +213,7 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, levels: &BT
     let definition = match family.inspect(&target, None, identity) {
         Ok(definition) => definition,
         Err(error) => {
-            sort(format!("{name}: its family fails to inspect it: {error}"), served, failures, refused);
+            sort(format!("{name}: its family fails to inspect it: {error}"), required, failures, refused);
             return derived;
         }
     };
@@ -220,10 +224,10 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, levels: &BT
     let manifest = target_manifest(component, &target, identity);
     let load = match plain_load(&manifest, &definition, backend) {
         Ok(load) => load,
-        // A target that must serve derives its load on every backend;
-        // another may lack a resident form.
+        // A required target derives its load on every backend; another
+        // may lack a resident form.
         Err(error) => {
-            sort(format!("{name} {}: {error}", backend.as_str()), served, failures, refused);
+            sort(format!("{name} {}: {error}", backend.as_str()), required, failures, refused);
             return derived;
         }
     };
@@ -234,19 +238,19 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, levels: &BT
         Ok((reservation, host)) => Some(load.bank_floor(&definition, 1, LIMITS.flights(), reservation, host).and_then(|floor| {
             load.clone().with_expert_bank(&definition, floor, 1, LIMITS.flights(), reservation, host)
         })),
-        // A served target that routes experts streams them on every backend
+        // A required target that routes experts streams them on every backend
         // whose recorded device streams experts at all: only a fact of the
         // device or its backend refuses it.
         Err(PlanError::Unstreamed(reason)) => {
             let line = format!("{name} {} banked: {reason}", backend.as_str());
-            match served && !matches!(reason, UnstreamedExperts::Unrouted) && !refused_by_the_device(&reason) {
+            match required && !matches!(reason, UnstreamedExperts::Unrouted) && !refused_by_the_device(&reason) {
                 true => failures.push(line),
                 false => refused.push(line),
             }
             None
         }
         Err(error) => {
-            sort(format!("{name} {} banked: {error}", backend.as_str()), served, failures, refused);
+            sort(format!("{name} {} banked: {error}", backend.as_str()), required, failures, refused);
             None
         }
     };
@@ -255,11 +259,11 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, levels: &BT
     for (form, load) in loads {
         let line = |error: &dyn std::fmt::Display| format!("{name} {} {form}: {error}", backend.as_str());
         match load.map(|load| derive_terms(&definition, &load, SELECTION, backend)) {
-            Err(error) => sort(line(&error), served, failures, refused),
+            Err(error) => sort(line(&error), required, failures, refused),
             Ok(Ok(terms)) => admitted.push(line(&terms)),
-            // Only a missing native refuses a target that need not serve;
+            // Only a missing native refuses a target that is not required;
             // any other failure of its terms fails.
-            Ok(Err(underived)) => match !served && underived.unoffered {
+            Ok(Err(underived)) => match !required && underived.unoffered {
                 true => refused.push(line(&underived.line)),
                 false => failures.push(line(&underived.line)),
             },
@@ -268,10 +272,10 @@ fn derive_target(component: &CatalogComponent, backend: BackendName, levels: &BT
     derived
 }
 
-/// Lists what a target fails: a failure where it must serve, a refusal
-/// where it need not.
-fn sort(line: String, served: bool, failures: &mut Vec<String>, refused: &mut Vec<String>) {
-    match served {
+/// Lists what a target fails: a failure where it is required, a refusal
+/// where it is not.
+fn sort(line: String, required: bool, failures: &mut Vec<String>, refused: &mut Vec<String>) {
+    match required {
         true => failures.push(line),
         false => refused.push(line),
     }
@@ -361,7 +365,7 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
         target: ArtifactIdentity([7; 32]),
         projector: None,
     };
-    let levels = support_levels();
+    let served = serves();
     // Each form on each backend, and the targets that stream it.
     let mut forms = BTreeMap::<(BackendName, String, String, [u64; 2]), Vec<String>>::new();
     for component in headers::index() {
@@ -369,12 +373,7 @@ fn every_streamed_record_converts_on_the_host_as_its_reference() {
             continue;
         }
         let name = component.model.as_str();
-        let served = REQUIRED.contains(&name)
-            || !matches!(
-                levels.get(name).map(String::as_str),
-                Some("disabled" | "deprecated")
-            );
-        if !served {
+        if !served(name) {
             continue;
         }
         let target = headers::component(component);
