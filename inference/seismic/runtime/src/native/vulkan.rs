@@ -266,7 +266,7 @@ pub(super) fn encode(
                             if std::mem::take(&mut divided.stale) {
                                 let mut blocks = Vec::new();
                                 each_launch(list, calls.clone(), &encoded, |launch| {
-                                    blocks.extend(launch.filter(|launch| !launch.is_empty()).map(DirectLaunch::argument_block));
+                                    blocks.extend(launch.map(DirectLaunch::argument_block));
                                     Ok(())
                                 })?;
                                 rebind = Some(blocks);
@@ -1023,8 +1023,20 @@ fn vulkan_timeline(operation: &TimelineOperation) -> &VulkanTimeline {
     timeline
 }
 
+/// A launch of call `index` as it is encoded: `None` when inactive, left
+/// out by `encoded`, or empty ([`super::LaunchGeometry::is_empty`]): an
+/// empty launch does no device work, so no path records or dispatches it.
+fn encoded_launch(
+    launch: Option<super::LaunchGeometry>,
+    encoded: &[Vec<bool>],
+    index: usize,
+    ordinal: usize,
+) -> Option<super::LaunchGeometry> {
+    launch.filter(|launch| encoded[index][ordinal] && !launch.is_empty())
+}
+
 /// Visit every launch of the calls `calls` of one pass over `list` in
-/// order; `None` for an inactive launch or one `encoded` leaves out.
+/// order; `None` for a launch not encoded ([`encoded_launch`]).
 fn each_launch(
     list: &impl DispatchList,
     calls: Range<usize>,
@@ -1050,7 +1062,7 @@ fn each_launch(
             .scalar_slots()
             .map(|slots| (vulkan_buffer(slots), 0));
         for (ordinal, launch) in dispatch.launches.iter().enumerate() {
-            let launch = launch.filter(|_| encoded[index][ordinal]).map(|launch| {
+            let launch = encoded_launch(*launch, encoded, index, ordinal).map(|launch| {
                 let (module, function) = launches.launch(ordinal);
                 DirectLaunch {
                     module,
@@ -1083,7 +1095,7 @@ fn bindings(list: &impl DispatchList, calls: Range<usize>, encoded: &[Vec<bool>]
         let address = |(allocation, offset): &(&Allocation, u64)| vulkan_buffer(allocation).address() + offset;
         bound.extend(buffers.iter().map(address));
         for (ordinal, launch) in dispatch.launches.iter().enumerate() {
-            if let Some(grid) = launch.filter(|_| encoded[index][ordinal]).and_then(|launch| launch.grid) {
+            if let Some(grid) = encoded_launch(*launch, encoded, index, ordinal).and_then(|launch| launch.grid) {
                 grids.push(address(&buffers[dispatch.kernel.argument(grid)]));
             }
         }
@@ -1094,6 +1106,23 @@ fn bindings(list: &impl DispatchList, calls: Range<usize>, encoded: &[Vec<bool>]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an active, encoded launch with work is encoded: an empty grid or
+    /// an empty group is left out like an inactive launch, so recording,
+    /// rebinding and the graph's shape all see the same launches.
+    #[test]
+    fn empty_launches_are_not_encoded() {
+        let launch = |groups, threads| {
+            Some(super::super::LaunchGeometry { groups, grid: None, barrier: None, threads, shared_bytes: 0 })
+        };
+        let encoded = vec![vec![true, false]];
+        let work = launch([2, 1, 1], [32, 1, 1]);
+        assert_eq!(encoded_launch(work, &encoded, 0, 0), work);
+        assert_eq!(encoded_launch(work, &encoded, 0, 1), None);
+        assert_eq!(encoded_launch(None, &encoded, 0, 0), None);
+        assert_eq!(encoded_launch(launch([0, 1, 1], [32, 1, 1]), &encoded, 0, 0), None);
+        assert_eq!(encoded_launch(launch([2, 1, 1], [0, 1, 1]), &encoded, 0, 0), None);
+    }
 
     /// Parts and marks each end a segment, once where they meet; a mark is
     /// held by the part it ends or lies in, and one before any launch makes

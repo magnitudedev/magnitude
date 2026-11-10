@@ -109,7 +109,7 @@ impl Toolchain for CudaToolchain {
         &self,
         artifact: &Cubin,
         entries: &[ProgramEntry],
-    ) -> Result<DirectModule, NativeCompilationError> {
+    ) -> Result<Option<DirectModule>, NativeCompilationError> {
         let kernels = entries
             .iter()
             .map(|entry| {
@@ -126,7 +126,7 @@ impl Toolchain for CudaToolchain {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        DirectModule::load(&self.device, &artifact.image, &kernels)
+        DirectModule::load(&self.device, &artifact.image, &kernels).map(Some)
     }
 
     fn statistics(program: &DirectModule, entry: usize) -> &[ProgramStatistic] {

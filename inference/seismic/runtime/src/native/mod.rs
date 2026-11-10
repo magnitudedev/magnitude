@@ -847,28 +847,51 @@ impl NativeHandoffKey {
     }
 }
 
-/// The pipeline geometry of every launch of a Vulkan implementation: its
-/// workgroup size and group-memory view lengths. Both read only static
-/// dimensions and parameters (the checker's Vulkan rule), so every pipeline
-/// is formed, and checked against the device, at preparation.
-#[cfg(not(target_os = "macos"))]
-fn vulkan_geometry(
-    opened: &crate::backends::VulkanOpened,
+/// The launches `implementation` forms at `specialization`, by declaration
+/// ordinal: those some call within the specialization's ranges activates
+/// ([`NativeImplementation::reachable`]). Every other launch has no entry
+/// and nothing of it is formed or evaluated: a guarded launch's extents
+/// mean something only where its guard holds.
+fn formed_launches(
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+) -> Vec<bool> {
+    (0..implementation.launches.len())
+        .map(|ordinal| implementation.reachable(specialization, ordinal))
+        .collect()
+}
+
+/// The geometry a pipeline fixes for one launch (Vulkan's specialization
+/// constants): its threads per group and group-shared bytes.
+#[cfg(any(test, not(target_os = "macos")))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PipelineGeometry {
+    threads: [u64; 3],
+    shared_bytes: u64,
+}
+
+/// The pipeline geometry of every launch `formed` names, by declaration
+/// ordinal (`None` for a launch not formed, whose extents are never
+/// evaluated). Both read only static dimensions and parameters (the
+/// checker's Vulkan rule), so they are known at preparation. A formed launch
+/// with no thread on an axis is a declaration that cannot run the work it
+/// is formed for: refused.
+#[cfg(any(test, not(target_os = "macos")))]
+fn pipeline_geometry(
     name: &str,
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
-) -> Result<Vec<([u32; 3], Vec<u32>)>, PrepareError> {
-    let limits = opened.service().facts().limits;
-    let properties = *opened.service().properties();
-    let narrow = |value: u64, what: &str| {
-        u32::try_from(value)
-            .map_err(|_| preparation(format!("`{name}`: {what} {value} exceeds the Vulkan ABI")))
-    };
+    formed: &[bool],
+) -> Result<Vec<Option<PipelineGeometry>>, PrepareError> {
     implementation
         .launches
         .iter()
+        .zip(formed)
         .enumerate()
-        .map(|(ordinal, launch)| {
+        .map(|(ordinal, (launch, &formed))| {
+            if !formed {
+                return Ok(None);
+            }
             let kernel = &launch.kernel;
             let evaluate = |expression: &NativeNatExpr| {
                 expression
@@ -882,9 +905,44 @@ fn vulkan_geometry(
                 evaluate(&launch.group_extent[1])?,
                 evaluate(&launch.group_extent[2])?,
             ];
+            if threads.contains(&0) {
+                return Err(preparation(format!(
+                    "`{name}` launch `{kernel}` is formed with {threads:?} threads per group"
+                )));
+            }
+            Ok(Some(PipelineGeometry { threads, shared_bytes: evaluate(&launch.shared_bytes)? }))
+        })
+        .collect()
+}
+
+/// The pipeline geometry of every formed launch of a Vulkan implementation
+/// ([`pipeline_geometry`]), checked against the device: its workgroup size
+/// and group-memory view lengths. Every pipeline is formed, and checked, at
+/// preparation.
+#[cfg(not(target_os = "macos"))]
+fn vulkan_geometry(
+    opened: &crate::backends::VulkanOpened,
+    name: &str,
+    implementation: &NativeImplementation,
+    specialization: &NativeSpecialization,
+    formed: &[bool],
+) -> Result<Vec<Option<([u32; 3], Vec<u32>)>>, PrepareError> {
+    let limits = opened.service().facts().limits;
+    let properties = *opened.service().properties();
+    let narrow = |value: u64, what: &str| {
+        u32::try_from(value)
+            .map_err(|_| preparation(format!("`{name}`: {what} {value} exceeds the Vulkan ABI")))
+    };
+    pipeline_geometry(name, implementation, specialization, formed)?
+        .into_iter()
+        .zip(&implementation.launches)
+        .map(|(geometry, launch)| {
+            let Some(PipelineGeometry { threads, shared_bytes }) = geometry else {
+                return Ok(None);
+            };
+            let kernel = &launch.kernel;
             let invocations = threads.iter().try_fold(1u64, |product, value| product.checked_mul(*value));
-            if threads.contains(&0)
-                || invocations.is_none_or(|invocations| invocations > properties.max_group_threads.get())
+            if invocations.is_none_or(|invocations| invocations > properties.max_group_threads.get())
                 || threads.iter().zip(limits.max_group_size).any(|(threads, limit)| *threads > limit)
             {
                 return Err(preparation(format!(
@@ -892,7 +950,6 @@ fn vulkan_geometry(
                     limits.max_group_size, properties.max_group_threads.get()
                 )));
             }
-            let shared_bytes = evaluate(&launch.shared_bytes)?;
             let footprint = abi::vulkan::shared_footprint(shared_bytes);
             if footprint > properties.shared_bytes_per_group.get() {
                 return Err(preparation(format!(
@@ -900,7 +957,7 @@ fn vulkan_geometry(
                     properties.shared_bytes_per_group.get()
                 )));
             }
-            Ok((
+            Ok(Some((
                 [
                     narrow(threads[0], "a workgroup extent")?,
                     narrow(threads[1], "a workgroup extent")?,
@@ -910,7 +967,7 @@ fn vulkan_geometry(
                     .into_iter()
                     .map(|length| narrow(length, "a shared view length"))
                     .collect::<Result<_, _>>()?,
-            ))
+            )))
         })
         .collect()
 }
@@ -1436,9 +1493,7 @@ fn rendered_programs(
     implementation: &NativeImplementation,
     specialization: &NativeSpecialization,
 ) -> Result<(Vec<ProgramSource>, Vec<Option<(usize, ProgramEntry)>>), PrepareError> {
-    let reachable = (0..implementation.launches.len())
-        .map(|ordinal| implementation.reachable(specialization, ordinal))
-        .collect::<Vec<_>>();
+    let reachable = formed_launches(implementation, specialization);
     // A whole-entry source keeps the entries of its reachable launches, and
     // each reachable launch runs its own entry of it.
     let whole = |mut source: ProgramSource| {
@@ -1517,9 +1572,11 @@ fn rendered_programs(
                 &entry_name(module, entry),
                 implementation,
                 specialization,
+                &reachable,
             )?;
-            // Each entry's constants are its workgroup size, then its
-            // group-memory views: the pipeline's specialization.
+            // Each formed entry's constants are its workgroup size, then its
+            // group-memory views: the pipeline's specialization. A launch
+            // not formed keeps its place by name only, and `whole` drops it.
             let source = ProgramSource {
                 text: abi::render_source(
                     abi::Dialect::Vulkan(opened.features()),
@@ -1533,10 +1590,13 @@ fn rendered_programs(
                     .launches
                     .iter()
                     .zip(&geometry)
-                    .map(|(launch, (threads, views))| ProgramEntry {
-                        symbol: launch.kernel.clone(),
-                        group_size: Some(*threads),
-                        constants: views.clone(),
+                    .map(|(launch, geometry)| match geometry {
+                        Some((threads, views)) => ProgramEntry {
+                            symbol: launch.kernel.clone(),
+                            group_size: Some(*threads),
+                            constants: views.clone(),
+                        },
+                        None => ProgramEntry::named(launch.kernel.as_str()),
                     })
                     .collect(),
             };
@@ -4308,6 +4368,50 @@ mod issue_lifecycle_tests {
 mod admission_tests {
     use super::*;
     use seismic_lang::checked::{check_source_with, SourceFile, SourceSet};
+
+    /// A launch no call at the specialization activates is not formed, so
+    /// its pipeline geometry is never evaluated: a guarded launch's extent
+    /// need hold only under its guard (here `P` threads, zero where
+    /// `RO == 0`, as `attention_prefill_rotate` declares), and the launches
+    /// that are formed take theirs.
+    #[test]
+    fn an_inactive_launch_has_no_pipeline_geometry() {
+        let module = check_source_with(
+            SourceSet::new(vec![SourceFile {
+                path: "rotate.seismic".into(),
+                text: "fn rotate[N, P, RO](x: &mut tensor[N] f32, pairs: &tensor[P] f32, form: &tensor[RO] i32):\n    \
+                       for i in 0..N:\n        x[i] = 0.0\n\n\
+                       native rotate for vulkan from \"rotate.comp\":\n    static (P, RO)\n    \
+                       where RO <= 1 and (RO == 0 or P > 0)\n    launch body:\n        \
+                       threadgroups (N, 1, 1)\n        threads_per_threadgroup (64, 1, 1)\n    \
+                       launch rotate when RO == 1:\n        threadgroups (N, 1, 1)\n        \
+                       threads_per_threadgroup (ceil_div(P, 32) * 32, 1, 1)\n"
+                    .into(),
+            }]),
+            &mut |_entry: &str, _native: &NativeImplementation| {
+                Ok::<_, std::convert::Infallible>(Some("void body() {}\nvoid rotate() {}\n".into()))
+            },
+        )
+        .expect("rotate source checks");
+        let entry = module.entry_named("rotate").expect("rotate entry");
+        let implementation = module
+            .native_implementation(entry, BackendName::Vulkan)
+            .expect("Vulkan implementation");
+        let geometry = |pairs, rotates| {
+            let specialization = NativeSpecialization::new()
+                .with_static("P", pairs)
+                .with_static("RO", rotates);
+            let formed = formed_launches(implementation, &specialization);
+            pipeline_geometry("rotate", implementation, &specialization, &formed)
+                .expect("every formed launch has threads")
+        };
+        let body = Some(PipelineGeometry { threads: [64, 1, 1], shared_bytes: 0 });
+        assert_eq!(geometry(0, 0), vec![body, None]);
+        assert_eq!(
+            geometry(4, 1),
+            vec![body, Some(PipelineGeometry { threads: [32, 1, 1], shared_bytes: 0 })]
+        );
+    }
 
     /// A request's admission is decided without a device, by preparation's own
     /// checks: admitted where the declaration takes it, refused with
