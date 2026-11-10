@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use magnitude_service_utils::file_cache::{read_bytes, write_bytes_atomic};
+use magnitude_service_utils::file_cache::{read_bytes, write_bytes_atomic, write_bytes_atomic_waiting};
 use sha2::{Digest, Sha256};
 
 use magnitude_artifacts::gguf::{Entry, HEADER_LIMIT, Walk, walk};
@@ -102,6 +102,7 @@ pub(crate) struct HeaderCache {
     flights: Arc<Mutex<BTreeMap<String, tokio::sync::watch::Receiver<bool>>>>,
     heads_backfilled: Arc<std::sync::Once>,
     lock: PathBuf,
+    heads_lock: PathBuf,
     capacity: u64,
     grace: Duration,
     state: Arc<Mutex<SweepState>>,
@@ -122,6 +123,7 @@ impl HeaderCache {
             flights: Arc::new(Mutex::new(BTreeMap::new())),
             heads_backfilled: Arc::new(std::sync::Once::new()),
             lock: root.join(".locks/gguf-headers.lock"),
+            heads_lock: root.join(".locks/gguf-header-heads.lock"),
             capacity,
             grace,
             state: Arc::new(Mutex::new(SweepState {
@@ -144,7 +146,6 @@ impl HeaderCache {
         {
             Some(header) => {
                 touch(&path);
-                self.index_heads(&header, digest);
                 Some(header)
             }
             None => {
@@ -243,7 +244,7 @@ impl HeaderCache {
                     {
                         touch(&path);
                     } else {
-                        write_bytes_atomic(&path, &self.lock, bytes, HEADER_LIMIT);
+                        write_bytes_atomic_waiting(&path, &self.lock, bytes, HEADER_LIMIT);
                         written += bytes.len() as u64;
                     }
                     segments.push(Segment::Chunk {
@@ -258,7 +259,7 @@ impl HeaderCache {
                 inline.extend_from_slice(&header[cursor..]);
             }
             let recipe = encode_recipe(&segments, &inline);
-            write_bytes_atomic(&recipe_path, &self.lock, &recipe, HEADER_LIMIT);
+            write_bytes_atomic_waiting(&recipe_path, &self.lock, &recipe, HEADER_LIMIT);
             written += recipe.len() as u64;
             state.written_since_sweep += written;
         }
@@ -320,12 +321,6 @@ impl HeaderCache {
     }
 
     /// Records, for each large entry of `header`, that this header holds it.
-    fn index_heads(&self, header: &[u8], digest: &str) {
-        if let Ok(Walk::Complete(layout)) = walk(header) {
-            self.index_entries(header, &layout.entries, digest);
-        }
-    }
-
     fn index_entries(&self, header: &[u8], entries: &[Entry<'_>], digest: &str) {
         for entry in entries.iter().filter(|entry| shared(entry)) {
             self.index_head(&header[entry.head().start..entry.head().end], digest);
@@ -344,7 +339,7 @@ impl HeaderCache {
             .take(MAX_HEAD_REFERENCES)
             .collect::<Vec<_>>()
             .join("\n");
-        write_bytes_atomic(&path, &self.lock, kept.as_bytes(), HEADS_INDEX_BYTES);
+        write_bytes_atomic(&path, &self.heads_lock, kept.as_bytes(), HEADS_INDEX_BYTES);
     }
 
     /// Indexes the headers stored before the index existed (the release catalog's among them)

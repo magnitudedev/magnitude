@@ -94,8 +94,24 @@ pub fn write_json_atomic<T: Serialize>(
     write_bytes_atomic(path, lock_path, &bytes, maximum_bytes);
 }
 
-/// Publishes bounded bytes as a complete replacement. Failure is intentionally invisible.
+/// Publishes bounded bytes as a complete replacement, skipped while another writer holds the lock.
+/// Failure is intentionally invisible.
 pub fn write_bytes_atomic(path: &Path, lock_path: &Path, bytes: &[u8], maximum_bytes: usize) {
+    publish(path, lock_path, bytes, maximum_bytes, false);
+}
+
+/// Publishes bounded bytes as a complete replacement, waiting for another writer to finish: for
+/// content a later read depends on. Failure is intentionally invisible.
+pub fn write_bytes_atomic_waiting(
+    path: &Path,
+    lock_path: &Path,
+    bytes: &[u8],
+    maximum_bytes: usize,
+) {
+    publish(path, lock_path, bytes, maximum_bytes, true);
+}
+
+fn publish(path: &Path, lock_path: &Path, bytes: &[u8], maximum_bytes: usize, wait: bool) {
     if bytes.len() > maximum_bytes {
         return;
     }
@@ -131,7 +147,12 @@ pub fn write_bytes_atomic(path: &Path, lock_path: &Path, bytes: &[u8], maximum_b
     else {
         return;
     };
-    if lock.try_lock_exclusive().is_err() {
+    let locked = if wait {
+        lock.lock_exclusive()
+    } else {
+        lock.try_lock_exclusive()
+    };
+    if locked.is_err() {
         return;
     }
     let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
