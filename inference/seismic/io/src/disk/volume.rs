@@ -56,13 +56,6 @@ impl Shape {
         if due { self.due_read } else { self.ahead_read }
     }
 
-    /// The workers that hold its deepest flight, a knee read ahead and the
-    /// due depth beside it, in pieces of the least size: as many as its
-    /// pieces in flight can be (a range smaller than a read is a piece of
-    /// its own).
-    pub(crate) fn workers(&self) -> usize {
-        (self.due + self.knee).div_ceil(LEAST_READ) as usize
-    }
 }
 
 /// How the rule before the curve read a volume for a request: five figures

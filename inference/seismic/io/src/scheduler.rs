@@ -15,7 +15,7 @@ mod queue;
 pub use engine::{engine_work, read_buffers, read_workers, EngineWork, Flight, Outstanding};
 pub use handle::{Ending, Handle};
 
-pub(crate) use engine::{deepen, reading, totals, Buffers, Reading};
+pub(crate) use engine::{need, reading, totals, Buffers, Need, Reading};
 pub(crate) use handle::RequestState;
 pub(crate) use queue::{pieces, Piece, Queued, Span};
 #[cfg(test)]
@@ -242,12 +242,20 @@ impl std::fmt::Debug for Panic {
 }
 
 /// Queue `ranges` of `file` on its volume's link for `want`, cut as
-/// `volume` says, counted in `outstanding` until the request ends: a
-/// reader's request ([`crate::Reader::request`]), or a probe's lone one.
+/// `volume` says, under `need`'s claim on the pool's workers, counted in
+/// `outstanding` until the request ends: a reader's request
+/// ([`crate::Reader::request`]), or a probe's.
 ///
 /// # Safety
 /// As [`crate::Reader::request`].
-pub(crate) unsafe fn request(file: &Arc<SourceFile>, volume: &VolumeReads, outstanding: &Arc<std::sync::atomic::AtomicUsize>, ranges: Vec<Range>, want: Want) -> Result<Handle, Error> {
+pub(crate) unsafe fn request(
+    file: &Arc<SourceFile>,
+    volume: &VolumeReads,
+    need: &Arc<Need>,
+    outstanding: &Arc<std::sync::atomic::AtomicUsize>,
+    ranges: Vec<Range>,
+    want: Want,
+) -> Result<Handle, Error> {
     let engine = engine();
     let outside = Arc::new(Error::Invalid("read outside the file".into()));
     let mut failed = Vec::new();
@@ -271,12 +279,16 @@ pub(crate) unsafe fn request(file: &Arc<SourceFile>, volume: &VolumeReads, outst
     order.sort_by_key(|(_, span)| span.offset);
     let read = volume.shape.read(want.due());
     let pieces = pieces(&order, file.size, read);
+    // The pool holds a worker for each piece its link may admit, up to its
+    // device's queue depth, before any is queued.
+    need.submitted(&pieces)?;
     outstanding.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let state = RequestState::new(pieces.len(), failed, outstanding.clone(), ranges);
     // One worker per piece the link may start now: a worker woken with no
     // piece it may take would only contend for the queue with the
     // submitter's next request.
-    let (id, woken) = engine.queue().push(Queued { state: state.clone(), file: file.clone(), volume: volume.clone(), pieces: pieces.into() }, want);
+    let queued = Queued { state: state.clone(), file: file.clone(), volume: volume.clone(), need: need.clone(), pieces: pieces.into() };
+    let (id, woken) = engine.queue().push(queued, want);
     engine.wake(woken);
     Ok(Handle { id, ending: handle::Ending(state), engine })
 }

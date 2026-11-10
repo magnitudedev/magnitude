@@ -1,3 +1,4 @@
+use super::engine::Need;
 use super::handle::{first_failures, RequestState};
 use super::{Deadline, Ended, Standing, Want, COALESCE_GAP};
 use crate::accounting::{Book, Wait};
@@ -120,21 +121,25 @@ pub(crate) fn pieces(ranges: &[(usize, Span)], size: u64, read: u64) -> Vec<Piec
     pieces
 }
 
-/// A request's pieces not yet taken.
+/// A request's pieces not yet taken, and its claim on the pool's workers,
+/// held while any of them is queued or in flight.
 pub(crate) struct Queued {
     pub(crate) state: Arc<RequestState>,
     pub(crate) file: Arc<SourceFile>,
     pub(crate) volume: VolumeReads,
+    pub(crate) need: Arc<Need>,
     pub(crate) pieces: VecDeque<Piece>,
 }
 
-/// A piece a worker took, with its request (by its submission, and its
-/// state), file and volume, and how its request stood when it was taken.
+/// A piece a worker took, with its request (by its submission, its state
+/// and its claim on the pool), file and volume, and how its request stood
+/// when it was taken.
 pub(crate) struct Taken {
     pub(crate) id: u64,
     pub(crate) state: Arc<RequestState>,
     pub(crate) file: Arc<SourceFile>,
     pub(crate) volume: VolumeReads,
+    pub(crate) need: Arc<Need>,
     pub(crate) piece: Piece,
     pub(crate) standing: Standing,
 }
@@ -142,18 +147,19 @@ pub(crate) struct Taken {
 impl Taken {
     /// This piece, its read returned at `at`, to end ([`Queue::ended`]).
     pub(crate) fn returned(&self, at: Instant) -> Returned {
-        Returned { id: self.id, volume: self.volume.id, standing: self.standing, bytes: self.piece.end - self.piece.start, at }
+        Returned { id: self.id, volume: self.volume.id, standing: self.standing, bytes: self.piece.end - self.piece.start, at, need: self.need.clone() }
     }
 }
 
-/// A taken piece whose read returned at `at`: what ending it counts.
-#[derive(Clone, Copy)]
+/// A taken piece whose read returned at `at`: what ending it counts, its
+/// claim's among it.
 pub(crate) struct Returned {
     id: u64,
     volume: Volume,
     standing: Standing,
     bytes: u64,
     at: Instant,
+    need: Arc<Need>,
 }
 
 /// Every volume's link, and each request's wait. Every count of a piece
@@ -162,6 +168,8 @@ pub(crate) struct Returned {
 #[derive(Default)]
 pub(crate) struct Queue {
     submitted: u64,
+    /// The pieces taken and not yet ended, on every link.
+    taken: usize,
     /// Each volume the queue has held a request of.
     pub(crate) links: HashMap<Volume, Link>,
     /// Each queued request's volume and want, by its submission.
@@ -356,7 +364,16 @@ impl Queue {
         let bytes = piece.end - piece.start;
         crate::timeline::note_at(now, crate::timeline::Kind::Take, key.1, (piece.start as i64, bytes as i64, flight as i64));
         request.state.started.get_or_init(|| now);
-        let taken = Taken { id: key.1, state: request.state.clone(), file: request.file.clone(), volume: request.volume.clone(), piece, standing };
+        let taken = Taken {
+            id: key.1,
+            state: request.state.clone(),
+            file: request.file.clone(),
+            volume: request.volume.clone(),
+            need: request.need.clone(),
+            piece,
+            standing,
+        };
+        self.taken += 1;
         if request.pieces.is_empty() {
             map.remove(&key);
             self.wants.remove(&key.1);
@@ -365,6 +382,11 @@ impl Queue {
         link.book.began(standing.due(), now);
         self.waits.get_mut(&key.1).expect("a queued request is waited").taken(standing.due(), &mut link.book, now);
         Some(taken)
+    }
+
+    /// The pieces taken and not yet ended, on every link.
+    pub(crate) fn taken(&self) -> usize {
+        self.taken
     }
 
     /// Whether any link's next piece may start now: what a worker that
@@ -378,8 +400,10 @@ impl Queue {
     /// book and its request's wait: whether the link holds a request
     /// queued, whose next piece the room it freed may admit.
     pub(crate) fn ended(&mut self, returned: Returned) -> bool {
-        let Returned { id, volume, standing, bytes, at } = returned;
+        let Returned { id, volume, standing, bytes, at, need } = returned;
+        need.ended(1);
         let link = self.links.get_mut(&volume).expect("an ended piece was in flight");
+        self.taken -= 1;
         *link.flight.of(standing) -= bytes;
         link.book.ended(standing.due(), bytes, at);
         settle(&mut self.waits, id, |wait| wait.ended(&mut link.book, at));
@@ -408,6 +432,7 @@ impl Queue {
         let request = link.map(&want).remove(&(want, id)).expect("a queued request");
         crate::timeline::note(crate::timeline::Kind::Cancel, id, (request.pieces.len() as i64, 0, 0));
         settle(&mut self.waits, id, |wait| wait.cancelled(&mut link.book, Instant::now()));
+        request.need.ended(request.pieces.len());
         Some(request)
     }
 }

@@ -478,10 +478,12 @@ fn queued(pieces: usize) -> (Queued, Arc<RequestState>) {
     let file = Reader::open(path, CachePolicy::Uncached)
         .unwrap()
         .file;
-    let request = Queued {
+    let volume = volume(0, (u64::MAX, u64::MAX), LEAST_READ);
+    let mut request = Queued {
         state: state.clone(),
         file,
-        volume: volume(0, (u64::MAX, u64::MAX), LEAST_READ),
+        need: crate::scheduler::need(&volume),
+        volume,
         pieces: (0..pieces as u64)
             .map(|index| Piece {
                 start: index,
@@ -490,6 +492,7 @@ fn queued(pieces: usize) -> (Queued, Arc<RequestState>) {
             })
             .collect(),
     };
+    request.need.submitted(request.pieces.make_contiguous()).unwrap();
     (request, state)
 }
 
@@ -497,7 +500,9 @@ fn queued(pieces: usize) -> (Queued, Arc<RequestState>) {
 fn queued_on(volume: &VolumeReads, spans: &[(u64, u64)]) -> Queued {
     let (mut request, _) = queued(0);
     request.volume = volume.clone();
+    request.need = crate::scheduler::need(volume);
     request.pieces = spans.iter().map(|&(start, end)| Piece { start, end, parts: Vec::new() }).collect();
+    request.need.submitted(request.pieces.make_contiguous()).unwrap();
     request
 }
 

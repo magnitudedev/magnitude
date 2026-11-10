@@ -648,7 +648,8 @@ pub(super) fn begin_as(shared: &Arc<Shared>, launches: &[(StepRoute, LaunchWork)
 
 /// Demand reads standing in the read engine's pool ahead of a test's until
 /// it finishes them: a file of 16 MiB read whole, as many times at once as
-/// the pool has workers and two more, into one record nothing reads. Each
+/// the pool has workers once the line stands, and two more, into one record
+/// nothing reads. Each
 /// read is submitted again as it ends, by the worker that ended it, before
 /// that worker takes another piece (`seismic_io::read_workers`). So a
 /// read of the line not queued has a piece on a worker, or its end runs on
@@ -658,8 +659,10 @@ pub(super) fn begin_as(shared: &Arc<Shared>, launches: &[(StepRoute, LaunchWork)
 /// resubmission: a read the test issues behind it at a lesser priority (a
 /// hint's, a fill's) is not taken until the test finishes the line ("Order
 /// and depth"), and one at demand waits for the reads queued as it was
-/// issued. The pool grows only as a reader opens whose volume needs more
-/// workers, and a test that queues a line holds the pool alone (`alone`).
+/// issued. The pool grows only as reads are submitted, to at most what
+/// their links can hold in flight, so the line stands until it is two reads
+/// longer than the pool with the line's own reads submitted; a test that
+/// queues a line holds the pool alone (`alone`).
 pub(super) struct Ahead {
     line: Arc<AheadLine>,
     path: std::path::PathBuf,
@@ -727,7 +730,11 @@ impl Ahead {
         let sink = Tensor::shared(&cpu(), Element::i32(), &[1, Self::FILE / 4]).unwrap();
         let records = Records::new(sink, Self::FILE, 1).unwrap();
         let line = Arc::new(AheadLine { source, records: Mutex::new(records), done: Default::default(), tickets: Mutex::default(), late });
-        (0..seismic_io::read_workers() + 2).for_each(|_| line.stand());
+        let mut standing = 0;
+        while standing < seismic_io::read_workers() + 2 {
+            line.stand();
+            standing += 1;
+        }
         Self { line, path }
     }
 
