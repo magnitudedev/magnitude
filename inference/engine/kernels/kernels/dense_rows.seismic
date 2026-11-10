@@ -531,19 +531,19 @@ fn project_rows[M, G, K, N, WS, WB](source: &tensor[M, G * K] A, weight: &tensor
 # weight tile).
 #
 # Groups: every launch but the G = 1 forms' runs group g at grid z (z = g in
-# the GEMV, batched and finalize launches, z = g * split + part in the
-# GEMMs), over the group's source columns, weight rows and output columns,
-# and its own G-th of the split partials. The tall, packed, matrix and
-# NVFP4-operand forms stage or pack the whole source row or weight, and run
-# only G = 1.
+# the GEMV, batched, finalize, relayout and tall launches, z = g * split +
+# part in the GEMMs), over the group's source columns, weight rows and
+# output columns, and its own G-th of the split partials and of the tall
+# form's fragments. The packed, matrix and NVFP4-operand forms stage or pack
+# the whole source row or weight, and run only G = 1.
 native project_rows for metal from "metal/project_rows.metal":
     static (G, K, N, WS, WB)
     params (arithmetic BATCH_FROM in [5, 3, 9, 2] default 5, arithmetic SPLIT in [1, 2, 4] default 1, form TALL in [1, 0] default 1,
         arithmetic form PACK in [0, 1] default 0, arithmetic form RESIDUE in [1, 2] default 1)
-    where WS <= 1 and (G == 1 or (TALL == 0 and PACK == 0 and MATRIX == 0 and operands(W) == 0)) and (TALL == 0 or (SPLIT == 1 and K % 128 == 0)) and (PACK == 0 or (TALL == 1 and K % 256 == 0 and K < 1048576 and N % 64 == 0 and form(W, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and WB > 0 and form(W, PACK_RESIDUE) == 1)) and (MATRIX == 0 or form(W, MATRIX_SYMMETRIC) == 1)
+    where WS <= 1 and (G == 1 or (PACK == 0 and MATRIX == 0 and operands(W) == 0)) and (TALL == 0 or (SPLIT == 1 and K % 128 == 0)) and (PACK == 0 or (TALL == 1 and K % 256 == 0 and K < 1048576 and N % 64 == 0 and form(W, PACK) == 1)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and WB > 0 and form(W, PACK_RESIDUE) == 1)) and (MATRIX == 0 or form(W, MATRIX_SYMMETRIC) == 1)
     scratch partials bytes (SPLIT * G * M * N * 4) when M > 64 and SPLIT > 1
     scratch small_partials bytes (4 * G * M * N * 4) when M > 16 and M <= 64
-    scratch fragments bytes (ceil_div(M, 64) * 64 * K * 2) when M > 64 and TALL == 1 and PACK == 0
+    scratch fragments bytes (G * ceil_div(M, 64) * 64 * K * 2) when M > 64 and TALL == 1 and PACK == 0
     scratch packed bytes (ceil_div(M, 128) * 128 * K * 2 + 1024) when M > 64 and PACK == 1
     scratch token_factors bytes (ceil_div(M, 128) * 128 * (K / 32) * 4 * RESIDUE) when M > 64 and PACK == 1
     scratch weight_factors bytes (N * (K / 32) * 4) when M > 64 and PACK == 1
@@ -578,11 +578,11 @@ native project_rows for metal from "metal/project_rows.metal":
         threadgroups (ceil_div(M * N, 256), 1, G)
         threads_per_threadgroup (256, 1, 1)
     launch project_rows_relayout when M > 64 and TALL == 1 and PACK == 0:
-        threadgroups (ceil_div(ceil_div(M, 64) * K, 256), 1, 1)
+        threadgroups (ceil_div(ceil_div(M, 64) * K, 256), 1, G)
         threads_per_threadgroup (256, 1, 1)
     launch project_rows_tall when M > 64 and TALL == 1 and PACK == 0:
         params (TALL_M in [128, 256, 512] default 128, TALL_K in [64, 128] default 64, STAGERS in [2, 1] default 2)
-        threadgroups (ceil_div(N, 32), ceil_div(M, TALL_M), 1)
+        threadgroups (ceil_div(N, 32), ceil_div(M, TALL_M), G)
         threads_per_threadgroup ((TALL_M / 32 + STAGERS) * 32, 1, 1)
     launch project_rows_pack when M > 64 and PACK == 1:
         reads (RESIDUE)

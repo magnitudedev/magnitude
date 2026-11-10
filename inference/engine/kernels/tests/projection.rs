@@ -6095,7 +6095,8 @@ fn grouped_devices() -> Vec<Device> {
 
 /// `project_rows` over a `groups`-group weight at its default
 /// specialization (activation rows in, F32 rows out, no scale or bound),
-/// with Metal's GEMM past 64 rows and Vulkan's past 8 split `split` ways.
+/// with Metal's GEMM past 64 rows and Vulkan's past 8 split `split` ways,
+/// and Metal's TALL form `tall` where given.
 fn grouped_project_rows_native(
     device: &Device,
     act: Act,
@@ -6103,6 +6104,7 @@ fn grouped_project_rows_native(
     groups: usize,
     source: &[f32],
     split: u64,
+    tall: Option<u64>,
 ) -> Vec<f32> {
     let (k, n) = (weight.k, weight.rows / groups);
     let rows = source.len() / (groups * k);
@@ -6124,6 +6126,10 @@ fn grouped_project_rows_native(
     let statics = match device.backend() {
         BackendName::Metal | BackendName::Vulkan => statics.with_param("SPLIT", split),
         _ => statics,
+    };
+    let statics = match tall {
+        Some(tall) => statics.with_param("TALL", tall),
+        None => statics,
     };
     let specialization = implementation
         .default_specialization(&statics)
@@ -6283,7 +6289,7 @@ fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
                     _ => &[1, 2, 4],
                 };
                 for &split in splits {
-                    let native = grouped_project_rows_native(&device, act, &weight, groups, &source, split);
+                    let native = grouped_project_rows_native(&device, act, &weight, groups, &source, split, None);
                     assert_within(
                         &format!(
                             "grouped project_rows {repr:?} M {rows} split {split} on {:?}",
@@ -6296,6 +6302,37 @@ fn grouped_project_rows_matches_its_portable_body_and_the_per_group_products() {
                 }
             }
         }
+    }
+}
+
+/// Metal's grouped `project_rows` past 64 rows on the tall GEMM equals its
+/// staged tiles bit for bit (they sum each output in the same K order),
+/// where a group's addressing could break it: three groups of 40 weight rows
+/// (a partial 32-row tall tile) over 256 columns at 70 rows (a partial
+/// 64-row fragment tile), so each group's relaid rows and outputs lie at
+/// its own offsets.
+#[test]
+fn metal_grouped_tall_project_rows_equals_its_staged_tiles() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let (groups, n, k, rows) = (3usize, 40usize, 256usize, 70usize);
+    for repr in [Repr::Bf16, Repr::Gguf(Format::F8_E4M3)] {
+        let weight = weight(repr, groups * n, k, 91, 1.0);
+        let mut rng = Rng::new(170);
+        let source = (0..rows * groups * k)
+            .map(|_| act.round(rng.symmetric()))
+            .collect::<Vec<_>>();
+        let tiled = |tall| grouped_project_rows_native(&device, act, &weight, groups, &source, 1, Some(tall));
+        let (tall, staged) = (tiled(1), tiled(0));
+        assert!(
+            tall.iter().zip(&staged).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "grouped project_rows {repr:?} M {rows}: the tall GEMM differs from the staged tiles"
+        );
     }
 }
 
@@ -6326,7 +6363,7 @@ fn grouped_projection_at_deepseek_v41_wo_a_matches_the_per_group_products() {
                 .collect::<Vec<_>>();
             let (expected, bound) = under(rows, || grouped_reference(&weight, groups, &source));
             for device in &devices {
-                let native = grouped_project_rows_native(device, act, &weight, groups, &source, 1);
+                let native = grouped_project_rows_native(device, act, &weight, groups, &source, 1, None);
                 assert_within(
                     &format!("wo_a {repr:?} M {rows} on {:?}", device.backend()),
                     &native,
@@ -6914,4 +6951,116 @@ fn metal_normalize_prepass_matches_small_row_tree() {
 /// The inject port of a single residual stream: no columns.
 fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
     seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
+}
+
+/// The time of `project_rows` on Metal at DeepSeek V4.1 Flash's prefill
+/// `wo_a`: 8 groups of `[1024, 4096]` F8_E4M3 under its UE8M0 grid
+/// (mxfp8g32) over a 2048-token prompt's `[2048, 32768]` BF16 rows, in the
+/// tall GEMM (TALL 1: relayout, then 128 x 32 tiles) and the staged tiles
+/// (TALL 0: 64 x 64). Each configuration is timed as the default of its own
+/// survey with every parameter fixed, so the survey's domain is that one
+/// configuration. It prints the median device seconds a call and the rate
+/// of its arithmetic (2 · 2048 · 8 · 1024 · 4096 FLOP).
+#[test]
+#[ignore = "times project_rows at V4.1's prefill wo_a on Metal; run it by name under a timed hold"]
+fn mxfp8_grouped_project_rows_at_deepseek_v41_prefill_wo_a_times() {
+    let Some(device) = devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let act = Act::Bf16;
+    let (m, groups, n, k) = (2048usize, 8usize, 1024usize, 4096usize);
+    let weight = periodic_weight(Repr::Gguf(Format::F8_E4M3), groups * n, k, 84);
+    let mut rng = Rng::new(85);
+    let source = (0..m * groups * k)
+        .map(|_| act.round(rng.symmetric()))
+        .collect::<Vec<_>>();
+    let source = act_tensor(&device, act, &[m, groups * k], &source);
+    let weight_tensor = weight.tensor(&device);
+    let scale = no_scale(&device);
+    let bound = absent_bound(&device);
+    let elements = || project_rows::Elements {
+        A: act.element(),
+        W: weight.repr.resident(&device),
+        Y: Element::f32(),
+    };
+    let entry = project_rows::native_entry_with(elements());
+    let statics = [("G", groups), ("K", k), ("N", n), ("WS", 0), ("WB", 0)]
+        .into_iter()
+        .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(name, value as u64));
+    let fixed = [
+        ("BATCH_FROM", 5),
+        ("SPLIT", 1),
+        ("PACK", 0),
+        ("RESIDUE", 1),
+        ("SIMDGROUPS", 16),
+        ("ROWS", 1),
+        ("LANES", 16),
+        ("BATCH_SIMDGROUPS", 8),
+        ("BATCH_ROWS", 2),
+        ("BATCH_PARTS", 2),
+        ("MATRIX", 0),
+        ("TILE_M", 64),
+        ("TILE_N", 64),
+        ("TALL_M", 128),
+        ("TALL_K", 64),
+        ("STAGERS", 2),
+        ("PACK_TOKENS", 4),
+        ("WEIGHTS_AHEAD", 0),
+    ]
+    .into_iter()
+    .fold(statics, |spec, (name, value)| spec.with_param(name, value));
+    for (name, tall) in [("tall 128x32", 1u64), ("staged 64x64", 0)] {
+        let configuration = fixed.clone().with_param("TALL", tall);
+        if !entry.specialization_valid(&device, &configuration).unwrap() {
+            println!("project_rows v41 wo_a m{m} {name}: inadmissible");
+            continue;
+        }
+        let point = seismic::TuningPoint {
+            label: "m2048".into(),
+            weight: 1.0,
+            class: None,
+            cost: 1.0,
+            workload: seismic::WorkloadRotation::All,
+            rotation: vec![project_rows::Args {
+                source: &source,
+                weight: &weight_tensor,
+                weight_scale: &scale,
+                weight_bound: &bound,
+            }],
+            initialize: None,
+            written: Default::default(),
+        };
+        let result = project_rows::native_tune_with(
+            &device,
+            elements(),
+            &configuration,
+            vec![point],
+            seismic::NumericalRequirement::RoundingSteps {
+                alpha: 8.,
+                activation: Some(seismic::DType::BF16),
+            },
+            seismic::Strategy::Survey(seismic::SurveyPlan {
+                samples: 15,
+                min_sample_seconds: 0.001,
+                domains: Default::default(),
+            }),
+        )
+        .unwrap();
+        let [record] = &result.configurations[..] else {
+            panic!("{name}: a fixed configuration surveys itself alone");
+        };
+        let seismic::Outcome::Measured { points, .. } = &record.outcome else {
+            panic!("{name}: the default is measured");
+        };
+        let median = points[0].median_seconds;
+        let flops = (2 * m * groups * n * k) as f64;
+        println!(
+            "project_rows v41 wo_a m{m} {name}: {:.3} ms a call, {:.2} TFLOPS",
+            median * 1e3,
+            flops / median / 1e12
+        );
+    }
 }

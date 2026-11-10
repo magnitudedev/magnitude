@@ -6,10 +6,11 @@
 // F32, RMS-normalized with the query norm when NQ = 1, rotated at the row's
 // coordinates and rounded with the indexer's trained rounding, as
 // `indexer_keys` prepares a key. Then thread t scores ordinal j = 256 x + t
-// of the row's list: the j-th key-plane row of its spans (each thread walks
-// the spans to it), streaming the key's columns once in fours into one
-// accumulator per head, so each head's dot is the ascending FMA chain of
-// the portable body; s = scale * sum_h relu(dot_h) * w_h, heads ascending.
+// of the row's list: the j-th key-plane row of its spans (its simdgroup
+// scans the spans 32 at a time, `indexer::simd_span_row`), streaming the
+// key's columns once in fours into one accumulator per head, so each
+// head's dot is the ascending FMA chain of the portable body;
+// s = scale * sum_h relu(dot_h) * w_h, heads ascending.
 // Every score past the list is -inf.
 //
 // Dynamic extents and parameters read `seismic_words`.
@@ -50,12 +51,12 @@ kernel void indexer_score(
     const ulong n = ulong(SEISMIC_DIM_N);
     const uint r = uint(SEISMIC_DIM_R);
     device const int *row_spans = spans + row * r * 2;
-    // The row's listed rows: those of its spans, at most N scored.
-    ulong listed = 0;
-    for (uint span = 0; span < r; ++span)
-        listed += indexer::span_length(row_spans[span * 2], row_spans[span * 2 + 1]);
-    listed = listed < n ? listed : n;
     const ulong ordinal = ulong(group.x) * 256 + thread_index;
+    // The row's listed rows (those of its spans, at most N scored) and the
+    // ordinal's key-plane row.
+    int at = -1;
+    ulong listed = indexer::simd_span_row(row_spans, r, uint(ordinal), lane, at);
+    listed = listed < n ? listed : n;
     device float *out = scores + row * n;
     if (ulong(group.x) * 256 >= listed) {
         if (ordinal < n)
@@ -91,18 +92,6 @@ kernel void indexer_score(
     if (ordinal >= listed) {
         out[ordinal] = -INFINITY;
         return;
-    }
-    // The ordinal's key-plane row: its span's first row plus its place.
-    int at = 0;
-    ulong before = 0;
-    for (uint span = 0; span < r; ++span) {
-        const int lo = row_spans[span * 2];
-        const ulong length = indexer::span_length(lo, row_spans[span * 2 + 1]);
-        if (ordinal < before + length) {
-            at = lo + int(ordinal - before);
-            break;
-        }
-        before += length;
     }
     device const float *k = slab::row<float>(keys, ulong(at), ulong(SEISMIC_PARAM_SLAB_ROWS), SCORE_W);
     float dot[SCORE_H];
