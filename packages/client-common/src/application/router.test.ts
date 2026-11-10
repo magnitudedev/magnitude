@@ -9,7 +9,7 @@ describe("application routes", () => {
   })
   it("treats the root and trailing slashes as the same route", () => {
     expect(pageFromPath("/")).toEqual(Option.some("models"))
-    expect(pageFromPath("/onboarding/")).toEqual(Option.some("onboarding"))
+    expect(pageFromPath("/chat/")).toEqual(Option.some("chat"))
   })
   it("rejects paths that are not pages", () => {
     expect(pageFromPath("/inference/v1")).toEqual(Option.none())

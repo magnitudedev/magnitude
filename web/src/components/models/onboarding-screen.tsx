@@ -6,7 +6,8 @@ import { useSession } from "../../session"
 import { useServiceObservation } from "../../service-view"
 import { discoveredModel, unrunnableFile } from "./data"
 import { machineView } from "./machine"
-import { Onboarding, type PreparationStep, type Recommendation } from "./onboarding"
+import { Onboarding, preparationLabels, type PreparationStep, type Recommendation } from "./onboarding"
+import { recordOnboardingCompleted } from "./onboarding-record"
 import { useRecommendations } from "./recommendations"
 
 /** First run on the service's data: the machine, models already found, and the top recommendations that run well here. */
@@ -28,11 +29,11 @@ export function OnboardingScreen() {
   const preparation = local?.preparation
   const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`
   const progress: readonly { label: string; done: boolean; detail: string | null; fraction: number | null }[] = [
-    { label: "Starting Magnitude", done: Result.isSuccess(observation.service) && observation.service.value._tag === "Ready", detail: null, fraction: null },
-    { label: "Reading your hardware", done: Result.isSuccess(hardware), detail: null, fraction: null },
-    { label: "Looking for models already on this computer", done: preparation?.discovery.complete ?? false,
+    { label: preparationLabels[0], done: Result.isSuccess(observation.service) && observation.service.value._tag === "Ready", detail: null, fraction: null },
+    { label: preparationLabels[1], done: Result.isSuccess(hardware), detail: null, fraction: null },
+    { label: preparationLabels[2], done: preparation?.discovery.complete ?? false,
       detail: preparation && (preparation.discovery.complete || preparation.discovery.modelsFound > 0) ? `${plural(preparation.discovery.modelsFound, "model")} found` : null, fraction: null },
-    { label: "Measuring how models run on your machine", done: (preparation?.assessment.complete ?? false) && recommendations.ready && recommendations.measuring === null,
+    { label: preparationLabels[3], done: (preparation?.assessment.complete ?? false) && recommendations.ready && recommendations.measuring === null,
       detail: preparation && preparation.assessment.totalModels > 0 ? `${preparation.assessment.settledModels} of ${plural(preparation.assessment.totalModels, "model")}` : null,
       fraction: preparation && preparation.assessment.totalModels > 0 ? preparation.assessment.settledModels / preparation.assessment.totalModels : null },
   ]
@@ -59,5 +60,5 @@ export function OnboardingScreen() {
     setUsOnly={setUsOnly}
     owned={owned}
     onDownload={(_, quant) => install(quant.key as CatalogFormModelId)}
-    onFinish={() => complete()} />
+    onFinish={() => { recordOnboardingCompleted(true); complete() }} />
 }

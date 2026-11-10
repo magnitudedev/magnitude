@@ -9,7 +9,6 @@ import { Button, buttonVariants } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./components/ui/select"
 import { MagnitudeMark } from "./components/magnitude-mark"
-import { BootScreen } from "./components/brand-header"
 import {
   ChatCircleIcon,
   SidebarSimpleIcon,
@@ -26,7 +25,7 @@ import {
   BookOpenIcon,
 } from "@phosphor-icons/react"
 import { CopyCommand } from "./components/copy-command"
-import { Fragment, useMemo, useState, type ReactNode } from "react"
+import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
 import { type ProviderModelId } from "@magnitudedev/sdk"
@@ -59,6 +58,7 @@ import { HostNotices } from "./components/host-notices"
 import { ModelsScreen } from "./components/models/models-screen"
 import { Explore } from "./components/models/explore"
 import { OnboardingScreen } from "./components/models/onboarding-screen"
+import { onboardingCompletedHere, recordOnboardingCompleted } from "./components/models/onboarding-record"
 import { useRecommendations } from "./components/models/recommendations"
 
 const ALL_INTERFACES = "all"
@@ -67,7 +67,7 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
-const pageNames: Record<ApplicationPage, string> = { onboarding: "Welcome", chat: "Chat", models: "Models", connections: "Connections", usage: "Usage", settings: "Settings" }
+const pageNames: Record<ApplicationPage, string> = { chat: "Chat", models: "Models", connections: "Connections", usage: "Usage", settings: "Settings" }
 const pageIcons = { models: CubeIcon, chat: ChatCircleIcon, connections: PlugIcon, usage: ChartBarIcon, settings: SlidersIcon }
 
 /** The Models page and its Explore models modal; a Hugging Face link opens Explore on that repository. */
@@ -379,14 +379,14 @@ function SettingsPage({ observation }: { observation: ServiceObservation }) {
 export function App() {
   const session = useSession()
   const observation = useServiceObservation()
-  const decided = useAtomValue(session.page)
+  const page = useAtomValue(session.page)
+  const known = useAtomValue(session.onboardingPending)
+  useEffect(() => { if (Option.isSome(known)) recordOnboardingCompleted(!known.value) }, [known])
+  const onboarding = Option.getOrElse(known, () => !onboardingCompletedHere())
   const navigate = useNavigate()
   const service = Result.isSuccess(observation.service) ? observation.service.value : null
   const platform = Option.getOrUndefined(Option.map(session.clientWindow, window => window.platform))
-  if (Option.isNone(decided)) return <BootScreen />
-  const page = decided.value
-  if (page === "onboarding") return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><OnboardingScreen /></>
-  return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
+  return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog />{onboarding && <OnboardingScreen />}<AppShell page={page} navigate={navigate} platform={platform}>
       {page === "settings" ? <SettingsPage observation={observation} />
       : service?._tag === "Unreachable" ? <CannotReachMagnitude />
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />

@@ -3,7 +3,7 @@ import { CaretDownIcon, CaretRightIcon, CheckIcon, CircleNotchIcon, DownloadSimp
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { Button } from "../ui/button"
 import { HuggingFaceLogo, type ModelLab } from "../model-logo"
-import { BrandHeader } from "../brand-header"
+import { Dialog, DialogContent, DialogTitle } from "../ui/dialog"
 import { cn } from "@/lib/utils"
 import { cardClass, LabMark, MachineCard, Section } from "./parts"
 import { MachineCardSkeleton, OfferedModelsSkeleton } from "./skeletons"
@@ -36,6 +36,14 @@ export interface PreparationStep {
   readonly fraction: number | null
 }
 
+/** What the service does before it can recommend, in order. */
+export const preparationLabels = [
+  "Starting Magnitude",
+  "Reading your hardware",
+  "Looking for models already on this computer",
+  "Measuring how models run on your machine",
+] as const
+
 function PreparationProgress({ steps }: { steps: readonly PreparationStep[] }) {
   return <div role="status" aria-live="polite" className={cn(cardClass, "mt-3 px-5 py-4")}>
     <ol className="space-y-2">
@@ -57,7 +65,14 @@ function PreparationProgress({ steps }: { steps: readonly PreparationStep[] }) {
   </div>
 }
 
-/** First run: what's already here, and one recommended model to download. */
+/** Onboarding before the app has reached the service: the first step under way, the rest to come. */
+export function OnboardingStarting() {
+  return <Onboarding machine={null} discovered={[]} unrunnable={[]} recommendations={[]} usOnly={false} setUsOnly={() => {}} owned={new Set()}
+    preparation={preparationLabels.map((label, index) => ({ label, detail: null, fraction: null, state: index === 0 ? "active" : "pending" }))}
+    onDownload={() => {}} onFinish={() => {}} />
+}
+
+/** First run, in a modal over the app: what's already here, and one recommended model to download. */
 export function Onboarding({ machine, preparation, discovered, unrunnable, recommendations, usOnly, setUsOnly, owned, onDownload, onFinish }: {
   machine: MachineView | null; preparation: readonly PreparationStep[] | null; discovered: readonly DiscoveredModel[]; unrunnable: readonly UnrunnableFile[]
   recommendations: readonly Recommendation[]; usOnly: boolean; setUsOnly: (value: boolean) => void; owned: ReadonlySet<string>
@@ -70,11 +85,14 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
   const selected = selection === undefined ? recommendations[0]?.model.key ?? null : selection
   const picked = recommendations.find(entry => entry.model.key === selected)?.model
   const pickedQuant = picked ? picked.quants.find(quant => quant.key === quantChoice) ?? picked.quants.find(quant => quant.key === picked.recommended) : undefined
-  return <div className="h-screen overflow-y-auto bg-slate-50 font-sans text-slate-900 dark:bg-slate-925 dark:text-slate-200">
-    <BrandHeader><Button variant="ghost" size="sm" onClick={onFinish}>Skip</Button></BrandHeader>
-    <div className="mx-auto w-full max-w-3xl px-8 pb-24 pt-10">
-      <h1 className="font-heading text-[28px] font-semibold tracking-tight">Choose a model</h1>
-      <div className="mt-6">{machine ? <MachineCard machine={machine} /> : <MachineCardSkeleton />}</div>
+  return <Dialog open onOpenChange={open => { if (!open) onFinish() }} disablePointerDismissal>
+    <DialogContent showCloseButton={false} className="flex h-[88vh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl">
+    <div className="flex items-center justify-between gap-4 border-b border-slate-200 px-6 py-4 dark:border-slate-750">
+      <DialogTitle className="font-heading text-lg font-semibold">Choose a model</DialogTitle>
+      <Button variant="ghost" size="sm" onClick={onFinish}>Skip</Button>
+    </div>
+    <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 px-6 pb-6 pt-5 dark:bg-slate-900/40">
+      <div>{machine ? <MachineCard machine={machine} /> : <MachineCardSkeleton />}</div>
       {preparation && <PreparationProgress steps={preparation} />}
 
       {discovered.length > 0 && <div className={`${cardClass} mt-4 px-4 py-3`}>
@@ -108,12 +126,15 @@ export function Onboarding({ machine, preparation, discovered, unrunnable, recom
           </div>}
       </Section>
 
-      {!measuring && <div className="mt-8 flex items-center justify-end gap-2">
-        {picked && pickedQuant && discovered.length > 0 && <Button size="lg" variant="ghost" onClick={onFinish}>Continue without downloading</Button>}
-        {picked && pickedQuant
-          ? <Button size="lg" disabled={!pickedQuant.fits} onClick={() => { onDownload(picked, pickedQuant); onFinish() }}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
-          : <Button size="lg" onClick={onFinish}>Continue</Button>}
-      </div>}
     </div>
-  </div>
+    <div className="flex items-center justify-end gap-2 border-t border-slate-200 px-6 py-4 dark:border-slate-750">
+      {measuring ? <Button disabled><DownloadSimpleIcon />Download</Button> : <>
+        {picked && pickedQuant && discovered.length > 0 && <Button variant="ghost" onClick={onFinish}>Continue without downloading</Button>}
+        {picked && pickedQuant
+          ? <Button disabled={!pickedQuant.fits} onClick={() => { onDownload(picked, pickedQuant); onFinish() }}><DownloadSimpleIcon />Download {formatStorageSize(pickedQuant.downloadBytes)}</Button>
+          : <Button onClick={onFinish}>Continue</Button>}
+      </>}
+    </div>
+    </DialogContent>
+  </Dialog>
 }

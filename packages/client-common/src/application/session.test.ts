@@ -87,7 +87,7 @@ describe("host actions", () => {
     yield* Deferred.await(delivered)
     const registry = Context.get(context, Registry.AtomRegistry)
     const session = Context.get(context, ApplicationSession)
-    registry.get(session.page)
+    registry.get(session.onboardingPending)
     yield* Registry.toStream(registry, effectQuery.Configuration.GetOnboarding({})).pipe(
       Stream.filter(state => Result.isSuccess(state.result)),
       Stream.take(1),
@@ -96,26 +96,25 @@ describe("host actions", () => {
     return yield* use(session, registry)
   })))
 
-  it("starts on onboarding while it is pending, whatever page is requested", () => withSession([{ _tag: "Navigate", page: "chat" }], (session, registry) => Effect.gen(function* () {
-    expect(registry.get(session.page)).toEqual(Option.some("onboarding"))
-    yield* session.navigate("settings")
-    expect(registry.get(session.page)).toEqual(Option.some("onboarding"))
+  it("reports onboarding pending over the requested page", () => withSession([{ _tag: "Navigate", page: "chat" }], (session, registry) => Effect.sync(() => {
+    expect(registry.get(session.onboardingPending)).toEqual(Option.some(true))
+    expect(registry.get(session.page)).toBe("chat")
   }), { current: "Pending" }))
 
   it("opens Models once onboarding is completed", () => withSession([{ _tag: "Navigate", page: "chat" }], (session, registry) => Effect.gen(function* () {
     registry.set(session.completeOnboarding, undefined)
     yield* Registry.getResult(registry, session.completeOnboarding, { suspendOnWaiting: true })
-    expect(registry.get(session.page)).toEqual(Option.some("models"))
-    yield* session.navigate("chat")
-    expect(registry.get(session.page)).toEqual(Option.some("chat"))
+    expect(registry.get(session.onboardingPending)).toEqual(Option.some(false))
+    expect(registry.get(session.page)).toBe("models")
   }), { current: "Pending" }))
 
-  it("starts on Models when onboarding was completed before", () => withSession([], (session, registry) => Effect.sync(() => {
-    expect(registry.get(session.page)).toEqual(Option.some("models"))
+  it("starts on Models with no onboarding when it was completed before", () => withSession([], (session, registry) => Effect.sync(() => {
+    expect(registry.get(session.onboardingPending)).toEqual(Option.some(false))
+    expect(registry.get(session.page)).toBe("models")
   })))
 
   it("opens a Hugging Face link on Models with the add request set", () => withSession([{ _tag: "OpenHuggingFaceModel", repository, file: Option.some(file) }], (session, registry) => Effect.sync(() => {
-    expect(registry.get(session.page)).toEqual(Option.some("models"))
+    expect(registry.get(session.page)).toBe("models")
     expect(registry.get(session.addModelRequest)).toEqual(Option.some({ _tag: "HuggingFace", repository, file: Option.some(file) }))
   })))
 
@@ -123,7 +122,7 @@ describe("host actions", () => {
     yield* session.navigate("chat")
     expect(registry.get(session.addModelRequest)).toEqual(Option.none())
     yield* session.requestAddModel({ _tag: "Search", query: "Qwen3.6 27B" })
-    expect(registry.get(session.page)).toEqual(Option.some("models"))
+    expect(registry.get(session.page)).toBe("models")
     expect(registry.get(session.addModelRequest)).toEqual(Option.some({ _tag: "Search", query: "Qwen3.6 27B" }))
     yield* session.clearAddModelRequest
     expect(registry.get(session.addModelRequest)).toEqual(Option.none())

@@ -1,4 +1,5 @@
-import type { ReactNode } from "react"
+import { useState, type ReactNode } from "react"
+import { Skeleton } from "../ui/skeleton"
 import { ArrowSquareOutIcon, CheckIcon, CubeIcon, GraphicsCardIcon, HardDrivesIcon, MemoryIcon } from "@phosphor-icons/react"
 import { formatContext, formatMemoryCapacity, formatStorageSize } from "@magnitudedev/client-common"
 import { cn } from "@/lib/utils"
@@ -114,6 +115,19 @@ export function Section({ title, aside, children, className = "mt-8" }: { title:
   </section>
 }
 
+/** The machine's photo: a placeholder until it has loaded, and nothing if it can't load. */
+function MachinePhoto({ photo }: { photo: NonNullable<MachineView["photo"]> }) {
+  const [state, setState] = useState<"loading" | "loaded" | "failed">("loading")
+  const frame = photo.framing
+  if (!frame || state === "failed") return null
+  return <div className="relative aspect-[4/3] w-16 shrink-0">
+    {state === "loading" && <Skeleton className="absolute inset-0" />}
+    <svg role="img" aria-label={photo.subject} viewBox={`${frame.x} ${frame.y} ${frame.width} ${frame.height}`} className={cn("h-full w-full", state === "loading" && "invisible")} preserveAspectRatio="xMidYMid meet">
+      <image href={photo.src} width={frame.sourceWidth} height={frame.sourceHeight} onLoad={() => setState("loaded")} onError={() => setState("failed")} />
+    </svg>
+  </div>
+}
+
 /** The machine everything is measured against: what it is and its numbers. */
 export function MachineCard({ machine }: { machine: MachineView }) {
   const gpu = machine.gpus[machine.servingGpu]
@@ -124,11 +138,8 @@ export function MachineCard({ machine }: { machine: MachineView }) {
     ...(machine.unifiedMemoryBytes === null ? [{ icon: MemoryIcon, name: "RAM", value: formatMemoryCapacity(machine.ramBytes), note: null }] : []),
     ...(machine.freeDiskBytes !== null ? [{ icon: HardDrivesIcon, name: "Free disk", value: formatStorageSize(machine.freeDiskBytes), note: null }] : []),
   ]
-  const frame = machine.photo?.framing
   return <div className={cn(cardClass, "flex flex-wrap items-center gap-x-4 gap-y-4 px-5 py-4")}>
-    {machine.photo && frame && <div className="aspect-[4/3] w-16 shrink-0">
-      <svg role="img" aria-label={machine.photo.subject} viewBox={`${frame.x} ${frame.y} ${frame.width} ${frame.height}`} className="h-full w-full" preserveAspectRatio="xMidYMid meet"><image href={machine.photo.src} width={frame.sourceWidth} height={frame.sourceHeight} /></svg>
-    </div>}
+    {machine.photo && <MachinePhoto photo={machine.photo} />}
     <div className="min-w-56 flex-1">
       <h2 className="font-heading text-base font-semibold">Your machine</h2>
       <p className="truncate text-[14px] text-slate-700 dark:text-slate-300">{machine.name}{(several || machine.chip) && <span className="text-slate-500"> · {several ? `${machine.gpus.length} GPUs` : machine.chip}</span>}</p>

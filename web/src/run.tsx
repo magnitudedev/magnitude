@@ -13,8 +13,10 @@ import { initializeAppearance } from "./stores/appearance-store"
 import { appearanceReadError } from "./appearance"
 import { SessionProvider } from "./session"
 import { ServiceConnectionProvider } from "./service-view"
-import { App } from "./app"
-import { BootScreen } from "./components/brand-header"
+import { App, AppShell } from "./app"
+import { ModelsSkeleton } from "./components/models/skeletons"
+import { OnboardingStarting } from "./components/models/onboarding"
+import { onboardingCompletedHere } from "./components/models/onboarding-record"
 import { ErrorNotice } from "./components/error-notice"
 import { RemoteAccessProvider, SignIn } from "./remote-access"
 
@@ -29,12 +31,17 @@ export interface ApplicationEntry<E> {
   readonly reconnect: "Automatic" | "OnConnect"
 }
 
-function SessionGate() {
+/** The app before it has reached the service, with onboarding already open when this window hasn't finished it. */
+function BootShell({ platform }: { platform: string | undefined }) {
+  return <><AppShell page="models" platform={platform}><ModelsSkeleton /></AppShell>{!onboardingCompletedHere() && <OnboardingStarting />}</>
+}
+
+function SessionGate({ platform }: { platform: string | undefined }) {
   const client = useAgentClient()
   const session = useAtomValue(useMemo(() => client.runtime.atom(ApplicationSession), [client]))
   if (Result.isSuccess(session)) return <SessionProvider session={session.value}><App /></SessionProvider>
   if (Result.isFailure(session)) return <div className="p-6"><ErrorNotice title="Magnitude couldn’t open" description="Reload this window. If it still won’t open, restart Magnitude." /></div>
-  return <BootScreen />
+  return <BootShell platform={platform} />
 }
 
 /** Renders the app into `#root` for one host; this is the entry's single Effect boundary. */
@@ -45,7 +52,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
   const boot = Effect.gen(function* () {
     const appearance = yield* entry.host.appearance.read.pipe(Effect.either)
     initializeAppearance(Either.isRight(appearance) ? appearance.right : "system")
-    root.render(<BootScreen />)
+    root.render(<BootShell platform={platform} />)
     const origin = yield* entry.origin
     // A browser on another device signs in before it connects. If the service can't be reached yet,
     // the app shows that, and asks for the key once the service answers again.
@@ -64,7 +71,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
     const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
     const client = createAgentClient(connection.client, { host: entry.host, navigation: entry.navigation })
     const readError = Either.isLeft(appearance) ? "The saved appearance could not be read. Using System appearance." : null
-    root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><ServiceConnectionProvider connection={connection.client.connection}><RemoteAccessProvider access={{ origin, canSignIn: entry.canSignIn, remote }}><SessionGate /></RemoteAccessProvider></ServiceConnectionProvider></AgentClientProvider></RegistryProvider>)
+    root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><ServiceConnectionProvider connection={connection.client.connection}><RemoteAccessProvider access={{ origin, canSignIn: entry.canSignIn, remote }}><SessionGate platform={platform} /></RemoteAccessProvider></ServiceConnectionProvider></AgentClientProvider></RegistryProvider>)
   })
   Effect.runPromise(boot).catch(error => {
     console.error(error)
