@@ -27,6 +27,7 @@ import {
 import { Effect, Option, Schema } from "effect"
 import {
   catalogProducts,
+  knowsModel,
   readCatalog,
   readHardware,
   readRecommendations,
@@ -35,7 +36,7 @@ import {
 import { describeLocalHardware, formatContext } from "./inference-format"
 import { inspectionJson, readInspection, renderInspection, type InspectionView } from "./hugging-face-runtime"
 import { CatalogModelJsonSchema, LocalInferenceHardwareJsonSchema, LocalModelJsonSchema } from "./json-schemas"
-import { isLocalPathReference, ModelCommandError, parseHuggingFaceReference } from "./model-references"
+import { huggingFaceFileOfModelId, isLocalPathReference, ModelCommandError, parseHuggingFaceReference } from "./model-references"
 import {
   modelDetailResultJson,
   readModelDetail,
@@ -309,7 +310,15 @@ export const showModel = (input: string, options: JsonOption = {}) => commandEff
       return yield* new ModelCommandError({ message: `${SHOW_REFERENCE}: ${reference}` })
     }
     if (Schema.is(ModelIdSchema)(reference)) {
-      return { _tag: "Model" as const, result: yield* withClient((client) => readModelDetail(client, reference)) }
+      const modelId = reference
+      return yield* withClient((client) => Effect.gen(function* () {
+        // A Hugging Face model's ID names its file, so one not on this computer is shown as that file in its repository.
+        const hubFile = huggingFaceFileOfModelId(modelId)
+        if (Option.isSome(hubFile) && !(yield* knowsModel(client, modelId))) {
+          return { _tag: "Repository" as const, view: yield* readInspection(client, hubFile.value) }
+        }
+        return { _tag: "Model" as const, result: yield* readModelDetail(client, modelId) }
+      }))
     }
     if (Option.isNone(parseHuggingFaceReference(reference))) {
       return yield* new ModelCommandError({ message: `${SHOW_REFERENCE}: ${reference}` })

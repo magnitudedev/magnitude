@@ -40,12 +40,14 @@ import {
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema, Stream } from "effect"
 import { renderDrafterChoices } from "./drafter-output"
-import { catalogProducts, readCatalog, readHardware, withClient, type CliModelsClient } from "./inference-client"
+import { catalogProducts, knowsModel, readCatalog, readHardware, withClient, type CliModelsClient } from "./inference-client"
 import { CandidateInspectionJsonSchema, HuggingFaceSearchResponseJsonSchema } from "./json-schemas"
 import {
   absolutePath,
+  huggingFaceFileOfModelId,
   ModelCommandError,
   parseDrafterArgument,
+  parseHuggingFaceReference,
   parsePullReference,
   type DrafterArgument,
   type HuggingFaceReference,
@@ -619,8 +621,22 @@ export const pull = (
   switch (reference._tag) {
     case "Catalog": return client.models.syncLocalModel({ modelId: reference.modelId }).pipe(
       Effect.map(({ outcome }) => ({ _tag: "Catalog" as const, modelId: reference.modelId, outcome })))
-    case "Custom": return client.models.syncLocalModel({ modelId: reference.modelId }).pipe(
-      Effect.map(({ outcome }) => ({ _tag: "Custom" as const, modelId: reference.modelId, outcome })))
+    case "Custom": {
+      const { modelId } = reference
+      return Effect.gen(function* () {
+        // A Hugging Face model's ID names its file, so one not on this computer is added from that file.
+        const hubFile = huggingFaceFileOfModelId(modelId)
+        if (Option.isSome(hubFile) && !(yield* knowsModel(client, modelId))) {
+          const [owner, repository, ...path] = hubFile.value.split("/")
+          return yield* Option.match(parseHuggingFaceReference(`${owner}/${repository}`), {
+            onNone: () => Effect.fail(new ModelCommandError({ message: `Expected a model ID, a Hugging Face link, or owner/repo[:QUANT]: ${input}` })),
+            onSome: (hub) => addHuggingFaceModel(client, hubFile.value, { ...hub, file: Option.some(path.join("/")) }, drafter, force),
+          })
+        }
+        const { outcome } = yield* client.models.syncLocalModel({ modelId })
+        return { _tag: "Custom" as const, modelId, outcome }
+      })
+    }
     case "HuggingFace": return addHuggingFaceModel(client, input, reference.reference, drafter, force)
   }
 }

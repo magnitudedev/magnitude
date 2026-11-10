@@ -92,6 +92,10 @@ const parseRepositoryReference = (input: string): Option.Option<HuggingFaceRefer
 export const parseHuggingFaceReference = (input: string): Option.Option<HuggingFaceReference> =>
   /^https?:\/\//i.test(input) ? parseHuggingFaceUrl(input) : parseRepositoryReference(input)
 
+/** The Hugging Face file an `hf:owner/repo/path.gguf` model ID names, as the service reads it: `owner/repo/path.gguf`. */
+export const huggingFaceFileOfModelId = (modelId: string): Option.Option<string> =>
+  /^hf:[^/]+\/[^/]+\/.+\.gguf$/i.test(modelId) ? Option.some(modelId.slice("hf:".length)) : Option.none()
+
 export type PullReference =
   | { readonly _tag: "Catalog"; readonly modelId: CatalogFormModelId }
   | { readonly _tag: "Custom"; readonly modelId: CustomFormModelId }

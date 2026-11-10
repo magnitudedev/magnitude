@@ -686,6 +686,24 @@ describe("pull and model mutations", () => {
     expect(result).toMatchObject({ _tag: "Right", right: { versionRequested: true } })
   })
 
+  it("adds a Hugging Face model by the ID search gives it, before it is on this computer", async () => {
+    const { client, models } = fakeClient({
+      getCatalog: () => Effect.succeed(catalogState()),
+      streamModelCandidateInspection: inspected(makeInspection({ selectedVersion: Option.some("Q4_K_P") })),
+      addHuggingFaceModel: () => Effect.succeed(added("Started")),
+    })
+    const result = await run(pull(client, ADDED_MODEL_ID, pullReference(ADDED_MODEL_ID), drafterArgument("none")))
+    expect(models.streamModelCandidateInspection).toHaveBeenCalledWith({ reference: `${TEST_REPOSITORY}/Qwen-Test-Q4_K_P.gguf` })
+    expect(models.addHuggingFaceModel).toHaveBeenCalledWith({
+      repository: TEST_REPOSITORY,
+      revision: Option.some(TEST_COMMIT),
+      version: Option.some("Q4_K_P"),
+      drafter: { _tag: "None" },
+      force: false,
+    })
+    expect(result).toMatchObject({ _tag: "Right", right: { versionRequested: true } })
+  })
+
   it("refuses a drafter the engine rejects", async () => {
     const rejected = makeDrafterCandidate({
       category: "Other",
@@ -1155,7 +1173,10 @@ describe("drafter updates", () => {
 
   it("syncs a custom model when models pull names its ID", async () => {
     expect(Effect.runSync(parsePullReference(FOUND_MODEL_ID))).toEqual({ _tag: "Custom", modelId: FOUND_MODEL_ID })
-    const { client, models } = fakeClient({ syncLocalModel: () => Effect.succeed({ outcome: "Updating" }) })
+    const { client, models } = fakeClient({
+      getCatalog: () => Effect.succeed(catalogState([makeFoundModel()])),
+      syncLocalModel: () => Effect.succeed({ outcome: "Updating" }),
+    })
     const result = await run(pull(client, FOUND_MODEL_ID, Effect.runSync(parsePullReference(FOUND_MODEL_ID)), { _tag: "Auto" }))
     expect(models.syncLocalModel).toHaveBeenCalledWith({ modelId: FOUND_MODEL_ID })
     expect(result).toMatchObject({ _tag: "Right", right: { _tag: "Custom", modelId: FOUND_MODEL_ID, outcome: "Updating" } })

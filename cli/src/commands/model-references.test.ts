@@ -5,6 +5,7 @@ import {
   absolutePath,
   decodeCustomModelId,
   drafterReferenceArgument,
+  huggingFaceFileOfModelId,
   isLocalPathReference,
   parseDrafterArgument,
   parseHuggingFaceReference,
@@ -24,6 +25,13 @@ describe("model references", () => {
     expect(Either.isLeft(pullReference("owner/repo:"))).toBe(true)
     expect(Either.isLeft(pullReference("owner"))).toBe(true)
     expect(Either.isLeft(pullReference("a/b/c"))).toBe(true)
+  })
+
+  it("reads the Hugging Face file a model ID names", () => {
+    expect(huggingFaceFileOfModelId("hf:owner/Repo-GGUF/sub/model-Q4_K_M.gguf")).toEqual(Option.some("owner/Repo-GGUF/sub/model-Q4_K_M.gguf"))
+    expect(huggingFaceFileOfModelId("hf:owner/Repo-GGUF")).toEqual(Option.none())
+    expect(huggingFaceFileOfModelId("local:model-q4:0123456789ab")).toEqual(Option.none())
+    expect(huggingFaceFileOfModelId("qwen-test:gguf:q4")).toEqual(Option.none())
   })
 
   it("parses huggingface.co links with revisions and files", () => {

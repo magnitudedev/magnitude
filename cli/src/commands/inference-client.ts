@@ -1,4 +1,4 @@
-import type { CountryCode, LocalModel, MagnitudeClient, ModelCatalogState } from "@magnitudedev/sdk"
+import type { CountryCode, LocalModel, MagnitudeClient, ModelCatalogState, ModelId } from "@magnitudedev/sdk"
 import { Context, Effect, Option, type Scope } from "effect"
 import { existingAcnConnection } from "../server/acn-connection"
 
@@ -29,3 +29,9 @@ export const catalogProducts = (catalog: ModelCatalogState): readonly LocalModel
 /** Every model a command can address by ID: the visible ones and the ones the person hid. */
 export const addressableModels = (catalog: ModelCatalogState): readonly LocalModel[] =>
   catalog._tag === "Initializing" ? [] : [...catalogProducts(catalog), ...catalog.hiddenLocalModels]
+
+/** Whether a model ID names a model on this computer: offered, hidden, or one the engine can't run. */
+export const knowsModel = (client: CliModelsClient, modelId: ModelId) => Effect.map(readCatalog(client), (catalog) =>
+  catalog._tag !== "Initializing" && (
+    addressableModels(catalog).some((model) => model.modelId === modelId)
+    || catalog.unsupportedLocalModels.some((model) => Option.contains(model.modelId, modelId))))
