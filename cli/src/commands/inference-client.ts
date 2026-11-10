@@ -1,6 +1,7 @@
 import type { CountryCode, LocalModel, MagnitudeClient, ModelCatalogState, ModelId } from "@magnitudedev/sdk"
 import { Context, Effect, Option, type Scope } from "effect"
 import { existingAcnConnection } from "../server/acn-connection"
+import { ModelCommandError } from "./model-references"
 
 export type CliModelsClient = Pick<MagnitudeClient, "models" | "huggingFace">
 
@@ -30,8 +31,9 @@ export const catalogProducts = (catalog: ModelCatalogState): readonly LocalModel
 export const addressableModels = (catalog: ModelCatalogState): readonly LocalModel[] =>
   catalog._tag === "Initializing" ? [] : [...catalogProducts(catalog), ...catalog.hiddenLocalModels]
 
-/** Whether a model ID names a model on this computer: offered, hidden, or one the engine can't run. */
-export const knowsModel = (client: CliModelsClient, modelId: ModelId) => Effect.map(readCatalog(client), (catalog) =>
-  catalog._tag !== "Initializing" && (
-    addressableModels(catalog).some((model) => model.modelId === modelId)
-    || catalog.unsupportedLocalModels.some((model) => Option.contains(model.modelId, modelId))))
+/** Whether a model ID names a model on this computer: offered, hidden, or one the engine can't run; unknown until local models are read. */
+export const knowsModel = (client: CliModelsClient, modelId: ModelId) => Effect.flatMap(readCatalog(client), (catalog) =>
+  catalog._tag === "Initializing"
+    ? Effect.fail(new ModelCommandError({ message: "Local models are initializing. Try again shortly." }))
+    : Effect.succeed(addressableModels(catalog).some((model) => model.modelId === modelId)
+      || catalog.unsupportedLocalModels.some((model) => Option.contains(model.modelId, modelId))))
